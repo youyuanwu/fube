@@ -158,10 +158,10 @@ and the unchanged 30-second retry are lifecycle evidence, not new schemas.
 Actual two-child destination app termination, lost ACK/metadata reply replay
 and healthy Primary writes do not establish native C++ handler execution,
 runtime disposal or replacement permission. The oracle remains 139 cases.
-The same lifecycle path now covers AppHostDown during normal RAP Close
-started from the original opened Idle. Committed Close-origin lineage and
+The same lifecycle path now covers AppHostDown during normal RAP Close/Drop
+started from the original opened Idle. Committed opened-origin lineage and
 late-Close rejection keep partial cleanup separate from disposal; actual held
-provider/service process-loss acceptance and Close/loss/ACK commit barriers
+provider/service process-loss acceptance and intent/loss/ACK commit barriers
 remain independent from these unchanged codec cases and native-handler evidence.
 Successful normal Close of the original opened peer Idle now uses those same
 report/ACK/metadata shapes without HostDown. Its Applied completion and actual
@@ -178,6 +178,11 @@ remain independent from FM acknowledgment and Primary pending-remove; no
 replacement is enabled. Intent/completion/ACK commit tests and controlled real
 provider/service disposal, lost-ACK retry and metadata replay add lifecycle
 evidence only. The oracle remains 139 cases, not native C++ handler execution.
+For pending Drop, matching HostDown supersedes it with ReplicaDown stage;
+successful Drop committing first instead retains ReplicaDropped and original
+disposal proof. Both races, stale RAP replies, failed/unknown commits and real
+provider/service process loss with a lost-ACK retry add no wire cases or reuse
+authority. Initial-Open and Abort/ForceAbort loss remain gated.
 
 ### Stage-two node control/load and endpoint codecs
 

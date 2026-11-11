@@ -3657,6 +3657,8 @@ pub(crate) mod report_tests {
         GracefulCloseService,
         DropProvider,
         DropService,
+        DropLossProvider,
+        DropLossService,
     }
 
     pub(crate) async fn run_peer_creation_removal(
@@ -3678,6 +3680,7 @@ pub(crate) mod report_tests {
                 | PeerCreationOutcome::CloseLossProvider
                 | PeerCreationOutcome::GracefulCloseProvider
                 | PeerCreationOutcome::DropProvider
+                | PeerCreationOutcome::DropLossProvider
         );
         let opening = matches!(
             outcome,
@@ -3694,16 +3697,25 @@ pub(crate) mod report_tests {
         let actual_failure = failed_registration || failed_open;
         let closing_loss = matches!(
             outcome,
-            PeerCreationOutcome::CloseLossProvider | PeerCreationOutcome::CloseLossService
+            PeerCreationOutcome::CloseLossProvider
+                | PeerCreationOutcome::CloseLossService
+                | PeerCreationOutcome::DropLossProvider
+                | PeerCreationOutcome::DropLossService
         );
         let dropping = matches!(
             outcome,
-            PeerCreationOutcome::DropProvider | PeerCreationOutcome::DropService
+            PeerCreationOutcome::DropProvider
+                | PeerCreationOutcome::DropService
+                | PeerCreationOutcome::DropLossProvider
+                | PeerCreationOutcome::DropLossService
         );
         let graceful = matches!(
             outcome,
-            PeerCreationOutcome::GracefulCloseProvider | PeerCreationOutcome::GracefulCloseService
-        ) || dropping;
+            PeerCreationOutcome::GracefulCloseProvider
+                | PeerCreationOutcome::GracefulCloseService
+                | PeerCreationOutcome::DropProvider
+                | PeerCreationOutcome::DropService
+        );
         let normal_close = closing_loss || graceful;
         let (mut source, source_store) = create_node(&launches[0]).await?;
         let (mut target, target_store) = create_node(&launches[1]).await?;
@@ -4059,7 +4071,7 @@ pub(crate) mod report_tests {
                             return Err("terminal-report fixture did not own an opened Idle".into());
                         }
                         let mode = if dropping { ra::CloseMode::Drop } else { ra::CloseMode::Close };
-                        let expected_stage = if dropping { ra::FmStage::ReplicaDropped } else { ra::FmStage::ReplicaDown };
+                        let expected_stage = if dropping && graceful { ra::FmStage::ReplicaDropped } else { ra::FmStage::ReplicaDown };
                         target.close(body.unit.id.clone(), mode).map_err(err)?;
                         let mut target_traffic = Traffic::default();
                         until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
@@ -4121,7 +4133,7 @@ pub(crate) mod report_tests {
                                 disposal: proof.clone(),
                             }, std::process::id())?;
                         }
-                        for stale_kind in 0..if dropping { 2 } else { 1 } {
+                        for stale_kind in 0..if expected_stage == ra::FmStage::ReplicaDropped { 2 } else { 1 } {
                             let mut stale = reply.clone();
                             if stale_kind == 1 {
                                 stale.replicas.0[0].replicas.0[0].description.state = 2;
@@ -4135,7 +4147,7 @@ pub(crate) mod report_tests {
                                 || target.instance_disposal().is_some() != graceful
                             { return Err("stale/non-dropped ACK completed the original terminal-report obligation".into()); }
                         }
-                        if graceful {
+                        if graceful || dropping {
                             if timer(&mut target_adapter)?.due.saturating_duration_since(Instant::now()) < Duration::from_secs(25) {
                                 return Err("Close/Drop did not retain the native 30-second report retry".into());
                             }

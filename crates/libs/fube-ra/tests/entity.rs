@@ -2743,8 +2743,13 @@ async fn peer_host_loss_and_processed_ack_preserve_separate_commit_and_usage_bar
 }
 
 #[tokio::test]
-async fn peer_normal_close_host_loss_preserves_open_origin_and_fences_late_close_replies() {
-    for close_wins in [false, true] {
+async fn peer_normal_close_or_drop_host_loss_preserves_open_origin_and_fences_late_close_replies() {
+    for (mode, close_wins) in [
+        (CloseMode::Close, false),
+        (CloseMode::Close, true),
+        (CloseMode::Drop, false),
+        (CloseMode::Drop, true),
+    ] {
         let (store, executor, _) = setup(WAIT).await;
         let request = make_peer_idle_ready(&executor).await;
         let host = state(&executor).runtime.as_ref().unwrap().host.clone();
@@ -2752,17 +2757,28 @@ async fn peer_normal_close_host_loss_preserves_open_origin_and_fences_late_close
             &executor,
             Command::CloseLocal {
                 unit: request.replica.0.unit.id.clone(),
-                mode: CloseMode::Close,
+                mode,
             },
         )
         .await;
         let closing = state(&executor);
         assert!(closing.peer_creation.as_ref().unwrap().close_started_open);
         assert!(!closing.peer_host_loss());
-        assert!(matches!(
-            effects(&executor).as_slice(),
-            [Effect::Close { flags: 0, .. }]
-        ));
+        assert!(matches!(effects(&executor).as_slice(),
+            [Effect::Close { flags, .. }] if *flags == if mode == CloseMode::Drop { 8 } else { 0 }));
+        assert_eq!(
+            run(
+                &executor,
+                Command::HostDown(Box::new(HostDown {
+                    unit: request.replica.0.unit.id.clone(),
+                    host: "different-host".into(),
+                }))
+            )
+            .await,
+            Disposition::IgnoredStale
+        );
+        assert!(Arc::ptr_eq(&closing, &state(&executor)));
+        assert!(effects(&executor).is_empty());
         let completion = close_completion(&executor, 0);
         let host_down = Command::HostDown(Box::new(HostDown {
             unit: request.replica.0.unit.id.clone(),
@@ -2782,6 +2798,15 @@ async fn peer_normal_close_host_loss_preserves_open_origin_and_fences_late_close
             assert!(Arc::ptr_eq(&closed, &state(&executor)));
             assert!(!closed.peer_host_loss());
             assert!(closed.peer_terminal_report());
+            assert!(closed.peer_creation.as_ref().unwrap().close_completed);
+            assert_eq!(
+                closed.fm_stage,
+                if mode == CloseMode::Drop {
+                    FmStage::ReplicaDropped
+                } else {
+                    FmStage::ReplicaDown
+                }
+            );
             assert_eq!(
                 run(&executor, Command::RetryReport(request.replica.0.unit.id)).await,
                 Disposition::Applied
@@ -2794,6 +2819,7 @@ async fn peer_normal_close_host_loss_preserves_open_origin_and_fences_late_close
             run(&executor, host_down).await;
             let lost = state(&executor);
             assert!(lost.peer_host_loss());
+            assert!(!lost.peer_creation.as_ref().unwrap().close_completed);
             assert_eq!(
                 (lost.phase, lost.fm_stage),
                 (Phase::Closed, FmStage::ReplicaDown)
@@ -2850,8 +2876,15 @@ async fn peer_normal_close_host_loss_preserves_open_origin_and_fences_late_close
 }
 
 #[tokio::test]
-async fn peer_normal_close_origin_loss_and_ack_each_require_their_own_applied_commit() {
-    for step in 0..3 {
+async fn peer_normal_close_or_drop_origin_loss_and_ack_each_require_their_own_applied_commit() {
+    for (mode, step) in [
+        (CloseMode::Close, 0),
+        (CloseMode::Close, 1),
+        (CloseMode::Close, 2),
+        (CloseMode::Drop, 0),
+        (CloseMode::Drop, 1),
+        (CloseMode::Drop, 2),
+    ] {
         for (unknown, fail) in [(false, true), (true, false), (true, true)] {
             let (store, executor, hooks) = setup(if unknown {
                 Duration::from_millis(50)
@@ -2863,7 +2896,7 @@ async fn peer_normal_close_origin_loss_and_ack_each_require_their_own_applied_co
             let host = state(&executor).runtime.as_ref().unwrap().host.clone();
             let close = || Command::CloseLocal {
                 unit: request.replica.0.unit.id.clone(),
-                mode: CloseMode::Close,
+                mode,
             };
             let loss = || {
                 Command::HostDown(Box::new(HostDown {
@@ -2935,7 +2968,17 @@ async fn peer_normal_close_origin_loss_and_ack_each_require_their_own_applied_co
             let applied = state(&executor);
             assert!(applied.peer_creation.as_ref().unwrap().close_started_open);
             assert_eq!(applied.peer_host_loss(), step != 0);
+            assert_eq!(applied.peer_terminal_report(), step != 0);
+            assert!(!applied.peer_creation.as_ref().unwrap().close_completed);
             assert_eq!(applied.local_deleted, step == 2);
+            assert_eq!(
+                applied.fm_stage,
+                if step == 1 {
+                    FmStage::ReplicaDown
+                } else {
+                    FmStage::None
+                }
+            );
             let actions = effects(&executor);
             assert_eq!(
                 actions
@@ -2948,6 +2991,13 @@ async fn peer_normal_close_origin_loss_and_ack_each_require_their_own_applied_co
                 actions
                     .iter()
                     .filter(|effect| matches!(effect, Effect::ReleaseUsage { .. }))
+                    .count(),
+                usize::from(step == 1)
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|effect| matches!(effect, Effect::RequestReportRetry))
                     .count(),
                 usize::from(step == 1)
             );
@@ -2967,8 +3017,13 @@ async fn peer_normal_close_origin_loss_and_ack_each_require_their_own_applied_co
 }
 
 #[tokio::test]
-async fn peer_unopened_or_drop_pending_close_does_not_gain_host_loss_reporting() {
-    for opened in [false, true] {
+async fn peer_unopened_force_abort_and_escalated_drop_do_not_gain_host_loss_reporting() {
+    for (opened, mode, escalate) in [
+        (false, CloseMode::Close, false),
+        (false, CloseMode::Drop, false),
+        (true, CloseMode::ForceAbort, false),
+        (true, CloseMode::Drop, true),
+    ] {
         let (store, executor, _) = setup(WAIT).await;
         let request = if opened {
             make_peer_idle_ready(&executor).await
@@ -2985,11 +3040,7 @@ async fn peer_unopened_or_drop_pending_close_does_not_gain_host_loss_reporting()
             &executor,
             Command::CloseLocal {
                 unit: request.replica.0.unit.id.clone(),
-                mode: if opened {
-                    CloseMode::Drop
-                } else {
-                    CloseMode::Close
-                },
+                mode,
             },
         )
         .await;
@@ -3000,8 +3051,17 @@ async fn peer_unopened_or_drop_pending_close_does_not_gain_host_loss_reporting()
                 .as_ref()
                 .unwrap()
                 .close_started_open,
-            opened
+            opened && mode == CloseMode::Drop
         );
+        if escalate {
+            executor
+                .config()
+                .set(RetryState::Closing, Threshold::Drop, 1);
+            close_done(&executor, -55).await;
+            assert_eq!(state(&executor).close_mode, Some(CloseMode::ForceAbort));
+            assert!(!state(&executor).peer_terminal_report());
+            effects(&executor);
+        }
         run(
             &executor,
             Command::HostDown(Box::new(HostDown {

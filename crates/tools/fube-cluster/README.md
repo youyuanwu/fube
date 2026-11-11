@@ -155,15 +155,18 @@ Actual two-child acceptance kills the original destination app, holds Primary
 removal, exercises stale/lost ACK and metadata reply replay, and verifies
 continued Primary writes. Pending-Add and commit/owner cases have separate
 model/store coverage.
-Normal RAP Close now preserves the original committed opened Idle's origin
-through Closing. AppHostDown can supersede that pending Close and use the same
+Normal RAP Close/Drop now preserves the original committed opened Idle's origin
+through Closing. AppHostDown can supersede that pending Close/Drop and use the same
 loss path, without treating partial provider/service cleanup or a late Close
-reply as disposal. Close winning first instead leaves later HostDown stale.
+reply as disposal. Successful Close/Drop winning first instead leaves later
+HostDown stale; completed Drop keeps ReplicaDropped stage and its disposal proof.
 Controlled owned-Node/process/Channel tests hold real provider/service disposal,
 kill the app, and verify metadata reply replay, late traffic and independent
-Primary removal/writes. Separate Close-origin/loss/ACK commit barriers are
+Primary removal/writes. The pending-Drop provider-held case also exercises
+an actual 30-second lost-ACK retry while both original Nodes/peer/FM links progress.
+Separate opened-origin/loss/ACK commit barriers and both races for each mode are
 covered by model/store tests. No child-node Close-control feature is added.
-Opening loss, other pending-close modes and broader unknown targets remain
+Opening loss, Abort/ForceAbort loss and broader unknown targets remain
 gated; no wire schema or native handler qualification is added.
 
 Successful normal Close of that original opened Idle now uses the same native
@@ -191,7 +194,9 @@ authority. A later Drop cannot supersede an already-closing Close or relabel
 its closed Down report. Controlled provider/service disposal, actual 30-second
 lost-ACK retry, stable proof/metadata replay and healthy Primary writes are
 covered separately from intent/completion/ACK commit and both-list ACK tests.
-Initial-Open, failed/ForceAbort and HostDown-during-Drop reporting remain gated.
+Matching HostDown during opened-origin Drop now uses ReplicaDown instead and
+cannot turn partial cleanup or late RAP replies into disposal proof.
+Initial-Open and failed/ForceAbort reporting remain gated.
 No new wire types, child-node control operation or native handler qualification
 is added; see the [bounded Drop guide](../../../docs/cluster/MinimalFmCluster.md#normal-opened-destination-drop-reporting).
 

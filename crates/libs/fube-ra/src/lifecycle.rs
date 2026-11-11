@@ -345,7 +345,7 @@ fn start_close_inner(
             if mode == CloseMode::AppHostDown
                 && (state.phase == Phase::Ready
                     || (state.phase == Phase::Closing
-                        && state.close_mode == Some(CloseMode::Close)
+                        && matches!(state.close_mode, Some(CloseMode::Close | CloseMode::Drop))
                         && peer.close_started_open))
             {
                 peer.host_down = true;

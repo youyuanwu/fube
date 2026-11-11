@@ -1859,6 +1859,25 @@ async fn peer_normal_close_host_loss_with_held_provider_or_service_never_fabrica
 }
 
 #[tokio::test]
+async fn peer_pending_drop_host_loss_with_held_provider_or_service_never_fabricates_disposal() {
+    for outcome in [
+        node::report_tests::PeerCreationOutcome::DropLossProvider,
+        node::report_tests::PeerCreationOutcome::DropLossService,
+    ] {
+        let fixture = Fixture::new("peer-idle-dropping-host-loss");
+        let mut config = fixture.config();
+        config.profile = ServiceProfile::StatefulPeerIdle;
+        config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+        let mut cluster = Cluster::new(config).unwrap();
+        cluster.prepare().unwrap();
+        let launches = [cluster.ledger.placements[0].launch.clone(), cluster.ledger.placements[1].launch.clone()];
+        let result = node::report_tests::run_peer_creation_removal(&launches, outcome).await;
+        assert_eq!(cluster.shutdown().await["clean"], true);
+        result.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn failed_open_delete_waits_for_actual_abort_and_disposal_then_replays_lost_reply() {
     for outcome in [
         node::report_tests::PeerCreationOutcome::DeleteFailedOpenProvider,
