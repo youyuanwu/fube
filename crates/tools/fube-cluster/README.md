@@ -31,6 +31,21 @@ Local explicit removal cancels the FM add obligation and fences late success,
 without claiming FM RemoveReplicaReply or destination disposal. Original session
 loss yields unknown, never recovery or transparent adoption.
 
+`Cluster::activate_idle_replica().await` is the separate opt-in same-Primary
+configuration path after successful FM Idle build. It sends native
+DoReconfiguration with a versioned service-size update to target/minimum 2/1.
+Real RAP catch-up, peer Activate/Reply, secondary role callbacks and the final
+RAP EndReconfiguration precede DoReconfigurationReply. Poll root
+`configuration.ready`; neither an Idle build nor peer activation completes FM.
+The destination becomes ActiveSecondary, not another Primary or a new
+application listener. The original Primary endpoint remains unchanged.
+Current two-member and previous singleton quorum obligations stay distinct:
+loss of the Secondary cannot acknowledge a fresh write from the old singleton.
+Exact original requests retry/replay without repeating Open/build/role work.
+While this configuration is owned, Idle removal/replacement, node/service
+mutations, generation upload and additional configurations remain gated; owner
+shutdown remains available. See the [source mapping and acceptance boundaries](../../../docs/cluster/MinimalFmCluster.md#same-primary-active-configuration-stage-5-increment).
+
 `Cluster::remove_idle_replica_via_fm().await` lets FM cancel its original pending
 creation, retire failed creation or abandon the original opened Idle through native RemoveReplica/Reply,
 whether unbuilt, building, built or failed build.

@@ -998,6 +998,80 @@ native C++ deletion-handler execution.
 These are native-derived model/store and native-free real-process contracts,
 not full C++ handler traces or native Federation interoperability.
 
+## Same-Primary active configuration (stage-5 increment)
+
+In the existing `--stateful-peer-idle` profile,
+`Cluster::activate_idle_replica()` explicitly admits the successfully FM-built
+Idle into one two-member configuration. The original Primary stays Primary;
+the original destination (or its one supported fresh successor) becomes
+ActiveSecondary. This is a separate opt-in programmatic operation, not a new
+CLI action, automatic scaling, primary transfer or failover.
+
+The native DoReconfiguration body carries a versioned service-size update from
+target/minimum 1/1 to 2/1, the next full configuration epoch in the same primary
+epoch, and exact original P/P and I/S descriptions. Both original nodes must
+remain admitted, active and healthy. Unanswered/failed Add, pending removal or
+deletion, generation upload, node/service work and unknown ownership reject.
+Service/package identity, replica IDs/incarnations and Primary endpoints do not
+change. Native configuration descriptions contain the local replica as well
+as the remote member; quorum counts do not come from a reduced remote-only list.
+
+Pinned SF source remains `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`:
+
+| Source | Preserved bounded flow |
+|---|---|
+| `ra/ReconfigurationAgent.cpp:2142-2238`; `ra/FailoverUnit.cpp:1386-1468,1754-1772,1909-1924` | Existing-Primary `Other` reconfiguration, durable new intent before effects, native service-description update and direct phase-2 catch-up rather than GetLSN or a role setter. |
+| `ra/FailoverUnit.cpp:736-818,2596-2637,3127-3162` | Matching successful RAP Catchup reply advances the phase. PC contains only the unchanged local Primary, so phase 3 has no peer deactivation work before phase 4. Errors remain pending; no invented catch-up success. |
+| `ra/ReconfigurationAgent.cpp:2685-2849`; `ra/FailoverUnit.cpp:959-1001,2703-2873` | Peer Activate records the exact new configuration, then invokes real RAP UpdateConfiguration on the existing Idle. ActivateReply follows matching role-update completion and its commit. The Primary waits for that exact reply before RAP EndReconfiguration. |
+| `ra/FailoverUnit.cpp:3164-3272,3487-3496` | Final matching RAP EndReconfiguration and commit precede DoReconfigurationReply. Stable completion clears previous epoch/roles; neither a transport write nor peer activation alone completes FM work. |
+
+The production Hosting IPC allowlist now admits native
+UpdateConfiguration/Reply on lifecycle-enabled original sessions. RAP retains
+its native empty-runtime/default-service control shape and flags:
+Catchup=2, secondary update=0, EndReconfiguration=1. The existing public runtime
+and data replicator perform the actual callbacks, configuration projection and
+application-ACK quorum waits. No direct engine configuration, private runtime
+state mutation or qualification-only execution hook supplies completion.
+
+Poll `status()["configuration"]` for `state=ready`/`ready=true`; only an exact
+ordinary-FM DoReconfigurationReply produces that result. Both placements then
+record their active replica roles; `peer_idle.active_secondary` distinguishes
+membership from historical Idle build completion. The Secondary has no new
+application listener/discovery endpoint, and cannot write as Primary. The
+existing Primary application endpoint remains independently contactable.
+
+FM retries its frozen request with the existing 10/60-second action cadence;
+the Node retains the existing 15-second pending RAP/peer retry. Identical
+completed requests replay the retained semantic result without repeating
+Open/build/role callbacks. Stale epochs/incarnations and late RAP completions
+cannot advance another phase. Store veto/uncertainty keeps proposed state,
+activation ACKs and final FM success private until actual resolution.
+
+Current configuration has two write-quorum members; previous configuration
+contains only the original Primary. The real process test first copies nonempty
+state, then acknowledges a new write under the active configuration. After
+positive original Secondary app-host loss, native down reporting/processed ACK
+marks configuration observation unknown without authorizing replacement. A
+distinct third write is admitted/applied locally but receives **no ACK** from
+the old singleton quorum. Original owners still perform independent shutdown
+and cleanup; loss is not graceful disposal or automatic reconfiguration.
+
+Model/store tests cover phase ordering, retryable RAP error, exact identities,
+duplicate/stale traffic, separate PC/CC descriptions, creation/activation commit
+veto/uncertainty and the final reply commit barrier. Actual original-child tests
+cover real ActiveSecondary callbacks, nonempty data/continuing ACKs, lost final
+reply/replay without a second Open and loss without quorum fallback.
+The maintained native-stream gate adds four action contracts and twelve cases:
+151 bidirectional cases, 81 schema types/248 fields, 155 bundle files and
+43 actual native truncation rejections, retaining every prior case.
+
+This qualifies only the frozen, same-Primary 1-to-2 admission and terminal
+observation path. Configuration supersession, active-member removal/replacement,
+primary transfer, GetLSN/Deactivate, endpoint changes/publication, data loss,
+FMM, generation upload, reconnect and restart remain gated. Codec/schema
+execution and native-free process acceptance are not complete original C++
+handler traces or native FM/Federation interoperability.
+
 ## Initial stateful FM control
 
 Run the same executable with `--app /absolute/hosting-local-app

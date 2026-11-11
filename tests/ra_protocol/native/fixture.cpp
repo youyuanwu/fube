@@ -314,6 +314,36 @@ int main(int argc,char** argv) {
         cancelled_create.errorCode_.value_=Enum(0);
         run(mode,dir,"in-create-remove-replica-reply",cancelled_create);
         reject_truncated(cancelled_create);
+        DoReconfigurationMessageBody reconfig;
+        run(mode,dir,"default-do-reconfiguration",reconfig);
+        c=0; rich(reconfig,c);
+        run(mode,dir,"rich-do-reconfiguration",reconfig);
+        reject_truncated(reconfig);
+        ConfigurationReplyMessageBody configured;
+        run(mode,dir,"default-do-reconfiguration-reply",configured);
+        c=0; rich(configured,c);
+        run(mode,dir,"rich-do-reconfiguration-reply",configured);
+        reject_truncated(configured);
+        ActivateMessageBody peer_activate;
+        run(mode,dir,"default-activate",peer_activate);
+        c=0; rich(peer_activate,c);
+        run(mode,dir,"rich-activate",peer_activate);
+        reject_truncated(peer_activate);
+        ReplicaReplyMessageBody peer_activated;
+        run(mode,dir,"default-activate-reply",peer_activated);
+        c=0; rich(peer_activated,c);
+        run(mode,dir,"rich-activate-reply",peer_activated);
+        reject_truncated(peer_activated);
+        if(DoReconfigurationActor!=12 || DoReconfigurationReplyActor!=11 ||
+           ActivateActor!=12 || ActivateReplyActor!=12 ||
+           !DoReconfigurationPriority || !DoReconfigurationReplyPriority ||
+           !ActivatePriority || !ActivateReplyPriority)
+            throw std::runtime_error("native configuration factory metadata mismatch");
+        for(auto name:{u"DoReconfiguration",u"DoReconfigurationReply",u"Activate",u"ActivateReply"}) {
+            action.action_=text(name);
+            std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
+            run(mode,dir,"action-"+ascii,action);
+        }
         // Native empty ctor leaves bools unspecified: explicitly initialize the fixture.
         ReplicaUpMessageBody up;
         up.isLastReplicaUpMessage_=false; up.isFromFMM_=false;
@@ -540,7 +570,7 @@ int main(int argc,char** argv) {
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
         ++native_truncation_rejections;
-        if(native_truncation_rejections!=39)
+        if(native_truncation_rejections!=43)
             throw std::runtime_error("native truncation coverage mismatch");
         std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;

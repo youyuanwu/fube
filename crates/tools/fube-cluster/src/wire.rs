@@ -56,6 +56,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                 | "AddInstanceReply"
                 | "AddPrimaryReply"
                 | "AddReplicaReply"
+                | "DoReconfigurationReply"
                 | "RemoveReplicaReply"
                 | "RemoveInstanceReply"
                 | "DeleteReplicaReply"
@@ -76,6 +77,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                     | "AddInstanceReply"
                     | "AddPrimaryReply"
                     | "AddReplicaReply"
+                    | "DoReconfigurationReply"
                     | "RemoveReplicaReply"
                     | "RemoveInstanceReply"
                     | "DeleteReplicaReply"
@@ -97,6 +99,7 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
                 "AddInstance"
                     | "AddPrimary"
                     | "AddReplica"
+                    | "DoReconfiguration"
                     | "RemoveReplica"
                     | "RemoveInstance"
                     | "DeleteReplica"
@@ -109,6 +112,7 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
             "AddInstance"
                 | "AddPrimary"
                 | "AddReplica"
+                | "DoReconfiguration"
                 | "RemoveReplica"
                 | "RemoveInstance"
                 | "DeleteReplica"
@@ -184,7 +188,7 @@ fn peer_ingress(message: &Message, props: &Properties) -> fube_transport::Result
         || props.uncorrelated_reply
         || !matches!(
             props.action.as_str(),
-            "CreateReplica" | "CreateReplicaReply"
+            "CreateReplica" | "CreateReplicaReply" | "Activate" | "ActivateReply"
         )
         || message
             .headers
@@ -274,6 +278,18 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 pub fn predecode(message: &Message) -> Result<()> {
     use fube_ra::protocol::*;
     match message.properties().map_err(err)?.action.as_str() {
+        "DoReconfiguration" => {
+            decode::<DoReconfiguration>(&message.body)?;
+        }
+        "DoReconfigurationReply" => {
+            decode::<ConfigurationReply>(&message.body)?;
+        }
+        "Activate" => {
+            decode::<Activate>(&message.body)?;
+        }
+        "ActivateReply" => {
+            decode::<ActivateReply>(&message.body)?;
+        }
         "GenerationProposal" => {
             if !message.body.is_empty() {
                 return Err("GenerationProposal must be bodyless".into());

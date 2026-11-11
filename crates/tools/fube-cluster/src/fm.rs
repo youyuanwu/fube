@@ -85,6 +85,8 @@ pub struct Placement {
     pub observed: Observed,
     pub created: bool,
     pub endpoint: Option<String>,
+    pub ready_replica: Option<Replica>,
+    pub active_unit: Option<FailoverUnit>,
     pub create_op: Option<String>,
     pub delete_op: Option<String>,
     pub error: Option<String>,
@@ -114,6 +116,14 @@ pub struct Ledger {
     pub(crate) idle_removal: Option<IdleRemoval>,
     pub(crate) idle_deletion: Option<IdleDeletion>,
     pub(crate) idle_predecessor: Option<Value>,
+    pub(crate) configuration: Option<ActiveConfiguration>,
+}
+pub(crate) struct ActiveConfiguration {
+    pub body: DoReconfiguration,
+    pub reply: Option<ConfigurationReply>,
+    unknown: bool,
+    started: Instant,
+    last: Instant,
 }
 pub(crate) struct IdleDeletion {
     pub body: DeleteReplica,
@@ -297,6 +307,8 @@ impl Placement {
             observed: Observed::Absent,
             created: false,
             endpoint: None,
+            ready_replica: None,
+            active_unit: None,
             create_op: None,
             delete_op: None,
             error: None,
@@ -331,6 +343,14 @@ impl Placement {
         );
         body.replica.id = replica;
         body.replica.instance = incarnation;
+        if let Some(unit) = &self.active_unit {
+            body.unit = unit.clone();
+            if let Some(ready) = &self.ready_replica {
+                body.replica = ready.clone();
+                body.replica.id = replica;
+                body.replica.instance = incarnation;
+            }
+        }
         if let Some(service) = &self.service_description {
             body.service = service.clone();
         }
@@ -484,7 +504,8 @@ fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Resul
 }
 impl Ledger {
     pub fn begin_generation(&mut self) -> Result<()> {
-        if self.generation.is_some()
+        if self.configuration.is_some()
+            || self.generation.is_some()
             || self.placements.iter().any(|placement| {
                 placement.bootstrap != Bootstrap::Admitted
                     || !placement.link_alive
@@ -516,6 +537,9 @@ impl Ledger {
             && placement.bootstrap == Bootstrap::Admitted
             && placement.launch.profile.stateful()
         {
+            if let Some(configuration) = &mut self.configuration {
+                configuration.unknown = true;
+            }
             if !placement.loss_reported {
                 let now = Instant::now();
                 placement.action_updated_at = Some(now);
@@ -834,6 +858,7 @@ impl Ledger {
             idle_removal: None,
             idle_deletion: None,
             idle_predecessor: None,
+            configuration: None,
         }
     }
     pub fn accept(&mut self, command: Command) -> Result<Accepted> {
@@ -853,6 +878,9 @@ impl Ledger {
             return Err(
                 "generation rebuild is awaiting gated LFUM upload; mutations disabled".into(),
             );
+        }
+        if self.configuration.is_some() && !matches!(command.action.as_str(), "status" | "quit") {
+            return Err("active-configuration lifecycle changes remain gated".into());
         }
         if self.placements[0].launch.profile == crate::ServiceProfile::StatefulPeerIdle
             && (matches!(
@@ -1144,6 +1172,9 @@ impl Ledger {
         }
     }
     pub fn lost(&mut self, index: usize, error: String) {
+        if let Some(configuration) = &mut self.configuration {
+            configuration.unknown = true;
+        }
         if index == 1 && !self.idle_deletion_complete() {
             if let Some(deletion) = &mut self.idle_deletion {
                 deletion.unknown = true;
@@ -1228,6 +1259,17 @@ impl Ledger {
             return Err("unadmitted semantic reply".into());
         }
         let expected = placement.body()?;
+        if placement.active_unit.is_some()
+            && body.unit.id == expected.unit.id
+            && body.unit.current.older_than(expected.unit.current)
+        {
+            exact_replica(
+                &expected.replica,
+                &body.replica,
+                removing && body.error == 0,
+            )?;
+            return Ok(());
+        }
         if body.unit != expected.unit {
             return Err("foreign/stale reply partition or epoch".into());
         }
@@ -1322,6 +1364,7 @@ impl Ledger {
         } else {
             placement.pending = None;
             placement.observed = Observed::Running;
+            placement.ready_replica = Some(body.replica.clone());
             placement.endpoint = endpoint;
         }
         placement.error = None;
@@ -1436,6 +1479,7 @@ impl Ledger {
             "idle_removal":self.idle_removal_status(),
             "idle_deletion":self.idle_deletion_status(),
             "idle_predecessor":self.idle_predecessor,
+            "configuration":self.configuration_status(),
             "generation_handshake": self.generation.as_ref().map(GenerationHandshake::status),
             "operations":self.operations.iter().map(|op|
                 if op.command.action == "status" {
@@ -1445,7 +1489,8 @@ impl Ledger {
             "unsupported":"all native families outside the selected fixed lifecycle profile"})
     }
     pub fn request_idle(&mut self, now: Instant) -> Result<AddReplica> {
-        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
+        if self.configuration.is_some()
+            || self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
             || self.placements[1].loss_reported
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
@@ -1483,7 +1528,156 @@ impl Ledger {
         });
         Ok(body)
     }
+    pub fn request_configuration(&mut self, now: Instant) -> Result<DoReconfiguration> {
+        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
+            || self.generation.is_some()
+            || self.idle_removal.is_some()
+            || self.idle_deletion.is_some()
+            || self.placements[0].observed != Observed::Running
+            || self.placements.iter().any(|p| {
+                !p.link_alive
+                    || !p.activated
+                    || p.loss_reported
+                    || p.bootstrap != Bootstrap::Admitted
+                    || p.pending.is_some()
+                    || p.node_control.is_some()
+                    || p.service_update.is_some()
+            })
+        {
+            return Err("configuration requires the two original healthy admitted nodes".into());
+        }
+        if let Some(configuration) = &mut self.configuration {
+            if configuration.unknown {
+                return Err("configuration owner is unknown".into());
+            }
+            configuration.last = now;
+            return Ok(configuration.body.clone());
+        }
+        let idle = self
+            .idle
+            .as_ref()
+            .filter(|idle| !idle.cancelled && !idle.unknown)
+            .and_then(|idle| idle.reply.as_ref())
+            .filter(|reply| reply.error == 0)
+            .ok_or("configuration requires successful FM Idle build")?;
+        let mut primary = self.placements[0]
+            .ready_replica
+            .clone()
+            .ok_or("missing original Primary reply")?;
+        let mut secondary = idle.replica.clone();
+        primary.previous_role = 4;
+        secondary.previous_role = 2;
+        secondary.current_role = 3;
+        let mut body = self.placements[0].body()?;
+        body.unit.previous = body.unit.current;
+        body.unit.current.configuration = body
+            .unit
+            .current
+            .configuration
+            .checked_add(1)
+            .ok_or("configuration epoch exhausted")?;
+        if body.unit.current.configuration & !0xffff_ffff
+            != body.unit.previous.configuration & !0xffff_ffff
+        {
+            return Err("same-Primary configuration epoch exhausted".into());
+        }
+        body.unit.target = 2;
+        body.service.target = 2;
+        body.service.update_version = body
+            .service
+            .update_version
+            .checked_add(1)
+            .ok_or("service version exhausted")?;
+        let body = DoReconfiguration {
+            configuration: Configuration {
+                unit: body.unit,
+                service: body.service,
+                replicas: ObjectArray(vec![primary, secondary]),
+            },
+            phase0_duration: i64::MAX,
+        };
+        self.configuration = Some(ActiveConfiguration {
+            body: body.clone(),
+            reply: None,
+            unknown: false,
+            started: now,
+            last: now,
+        });
+        Ok(body)
+    }
+    pub fn configuration_reply(&mut self, index: usize, body: ConfigurationReply) -> Result<()> {
+        let Some(config) = &mut self.configuration else {
+            return Ok(());
+        };
+        if index != 0
+            || config.unknown
+            || config.reply.is_some()
+            || body.error != 0
+            || self
+                .placements
+                .iter()
+                .any(|p| !p.link_alive || p.loss_reported)
+        {
+            return Ok(());
+        }
+        let mut expected = config.body.configuration.clone();
+        expected.unit.previous = Epoch::default();
+        for replica in &mut expected.replicas.0 {
+            replica.previous_role = 1;
+        }
+        if body.unit != expected.unit || body.replicas != expected.replicas {
+            return Ok(());
+        }
+        for placement in &mut self.placements {
+            placement.active_unit = Some(expected.unit.clone());
+            placement.service_description = Some(expected.service.clone());
+            placement.ready_replica = expected
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.node == placement.launch.node)
+                .cloned();
+            placement.desired = Desired::Running;
+            placement.observed = Observed::Running;
+            placement.created = true;
+        }
+        config.reply = Some(body);
+        Ok(())
+    }
+    pub fn configuration_retry(&mut self, now: Instant) -> Option<DoReconfiguration> {
+        let config = self.configuration.as_mut()?;
+        if config.unknown
+            || config.reply.is_some()
+            || self
+                .placements
+                .iter()
+                .any(|p| !p.link_alive || p.loss_reported)
+            || !action_retry_due(config.started, config.last, now)
+        {
+            return None;
+        }
+        config.last = now;
+        Some(config.body.clone())
+    }
+    pub fn configuration_status(&self) -> Value {
+        let Some(config) = &self.configuration else {
+            return json!({"state":"absent","ready":false});
+        };
+        let state = if config.unknown {
+            "unknown"
+        } else if config.reply.is_some() {
+            "ready"
+        } else {
+            "pending"
+        };
+        json!({"state":state,"ready":state == "ready","kind":"same_primary_configuration",
+            "request":{"configuration":config.body.configuration,"phase0_duration":config.body.phase0_duration},
+            "reply":config.reply,"primary_transfer":false})
+    }
     pub fn request_idle_replacement(&mut self, now: Instant) -> Result<AddReplica> {
+        if self.configuration.is_some() {
+            return Err("configured-secondary replacement is gated".into());
+        }
         if self.idle_predecessor.is_some() {
             return self.request_idle(now);
         }
@@ -1645,7 +1839,8 @@ impl Ledger {
                 && self.idle_removal.as_ref().is_none_or(|removal| removal.reply.is_none())})
     }
     pub fn request_idle_removal(&mut self, now: Instant) -> Result<RemoveReplica> {
-        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
+        if self.configuration.is_some()
+            || self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
             || self.generation.is_some()
             || self.placements[0].observed != Observed::Running
             || self
@@ -1827,7 +2022,8 @@ impl Ledger {
         target: IdleDeleteTarget,
         force: bool,
     ) -> Result<DeleteReplica> {
-        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
+        if self.configuration.is_some()
+            || self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
             || self.generation.is_some()
             || !self.placements[1].link_alive
             || !self.placements[1].activated

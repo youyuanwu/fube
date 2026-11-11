@@ -776,6 +776,115 @@ fn peer_contracts(input: &Path, output: &Path) {
     }
 }
 
+fn configuration_contracts(input: &Path, output: &Path) {
+    let c = &mut 0;
+    let config = filled::<Configuration>(c);
+    let duration = filled::<i64>(c);
+    for (name, body) in [
+        ("default-do-reconfiguration", DoReconfiguration::default()),
+        (
+            "rich-do-reconfiguration",
+            DoReconfiguration {
+                configuration: config,
+                phase0_duration: duration,
+            },
+        ),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "DoReconfiguration",
+            body,
+            do_reconfiguration_message,
+            decode_do_reconfiguration,
+        );
+    }
+    let c = &mut 0;
+    let config = filled::<Configuration>(c);
+    let deactivation = filled::<ReplicaDeactivationInfo>(c);
+    for (name, body) in [
+        ("default-activate", Activate::default()),
+        (
+            "rich-activate",
+            Activate {
+                configuration: config,
+                deactivation,
+            },
+        ),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "Activate",
+            body,
+            activate_message,
+            decode_activate,
+        );
+    }
+    for (name, body) in [
+        ("default-activate-reply", ActivateReply::default()),
+        ("rich-activate-reply", filled::<ActivateReply>(&mut 0)),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "ActivateReply",
+            body,
+            activate_reply_message,
+            decode_activate_reply,
+        );
+    }
+    for (name, body) in [
+        (
+            "default-do-reconfiguration-reply",
+            ConfigurationReply::default(),
+        ),
+        (
+            "rich-do-reconfiguration-reply",
+            filled::<ConfigurationReply>(&mut 0),
+        ),
+    ] {
+        check(input, output, name, body.clone());
+        for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
+            let mut native = stage_two_envelope(input, name, "DoReconfigurationReply", actor, None);
+            native
+                .headers
+                .iter_mut()
+                .find(|h| h.id == HIGH_PRIORITY)
+                .unwrap()
+                .value = fs::read(input.join("priority.bin")).unwrap();
+            assert_eq!(
+                decode_do_reconfiguration_reply(&native).unwrap(),
+                (body.clone(), owner)
+            );
+            factory_contract(
+                &native,
+                &do_reconfiguration_reply_message(&body, owner).unwrap(),
+            );
+            assert!(decode_add_replica_reply(&native).is_err());
+        }
+        reject_prefixes::<ConfigurationReply>(input, name);
+    }
+    for action in [
+        "DoReconfiguration",
+        "DoReconfigurationReply",
+        "Activate",
+        "ActivateReply",
+    ] {
+        check(
+            input,
+            output,
+            &format!("action-{action}"),
+            Scalar {
+                value: action.to_string(),
+            },
+        );
+    }
+}
+
 fn replica_contracts(input: &Path, output: &Path) {
     let mut request = support::rich_request();
     request.unit.target = 1;
@@ -1179,6 +1288,7 @@ fn main() {
         .expect("clap requires Rust output");
     assert!(input.is_dir() && output.is_dir());
     peer_contracts(input, output);
+    configuration_contracts(input, output);
     replica_contracts(input, output);
     check(input, output, "default-request", AddInstance::default());
     check(input, output, "rich-request", support::rich_request());

@@ -349,7 +349,10 @@ fn start_close_inner(
         return;
     }
     let was_creating = state.phase == Phase::Opening;
-    if state.body.replica.current_role == 2 && state.runtime.is_some() && state.usage.is_some() {
+    if matches!(state.body.replica.current_role, 2 | 3)
+        && state.runtime.is_some()
+        && state.usage.is_some()
+    {
         if let Some(peer) = &mut state.peer_creation {
             if matches!(mode, CloseMode::Close | CloseMode::Drop | CloseMode::Abort)
                 && state.phase == Phase::Ready
@@ -623,6 +626,7 @@ pub(super) fn transition(
                 primary_deactivation: stateful.then_some((Epoch::default(), -2)),
                 peer_creation: None,
                 remote_idle: None,
+                reconfiguration: None,
                 // TryCreateFailoverUnit constructs from ID, consistency and
                 // service, NOT the incoming previous epoch/target/minimum.
                 body: Arc::new(AddInstance {

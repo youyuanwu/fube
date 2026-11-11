@@ -133,6 +133,8 @@ impl Adapter {
                         receipt.dispatch.effect,
                         ra::Effect::PeerCreateReplica { .. }
                             | ra::Effect::PeerCreateReplicaReply { .. }
+                            | ra::Effect::PeerActivate { .. }
+                            | ra::Effect::PeerActivateReply { .. }
                     )
                 {
                     if let ra::Effect::PeerCreateReplicaReply { body, .. } =
@@ -147,6 +149,7 @@ impl Adapter {
                     && matches!(
                         receipt.dispatch.effect,
                         ra::Effect::NodeActivateReply(_)
+                            | ra::Effect::DoReconfigurationReply(_)
                             | ra::Effect::NodeDeactivateReply(_)
                             | ra::Effect::NodeUpdateServiceReply(_)
                             | ra::Effect::Reply(_)
@@ -275,6 +278,22 @@ impl Adapter {
         self.commands(node)?;
         if let (Some(link), Some(peer), Some(reply)) = (peer_link, peer, self.peer_replies.front())
         {
+            if let ra::Effect::PeerActivateReply { body, .. } = &reply.effect {
+                let snapshot = node.snapshot(reply.entity);
+                if snapshot.fenced
+                    || snapshot.committed.is_none_or(|state| {
+                        state.phase != ra::Phase::Ready
+                            || state.body.unit != body.unit
+                            || state.body.replica != body.replica
+                            || state.reconfiguration.as_ref().is_none_or(|config| {
+                                config.stage != ra::ConfigurationStage::Complete
+                            })
+                    })
+                {
+                    self.peer_replies.pop_front();
+                    return Ok(());
+                }
+            }
             let sent = async {
                 let message = match &reply.effect {
                     ra::Effect::PeerCreateReplica { target, body } if target == &peer.node => {
@@ -282,6 +301,12 @@ impl Adapter {
                     }
                     ra::Effect::PeerCreateReplicaReply { target, body } if target == &peer.node => {
                         create_replica_reply_message(body, link.generation())
+                    }
+                    ra::Effect::PeerActivate { target, body } if target == &peer.node => {
+                        activate_message(body, link.generation())
+                    }
+                    ra::Effect::PeerActivateReply { target, body } if target == &peer.node => {
+                        activate_reply_message(body, link.generation())
                     }
                     _ => return Err("peer receipt does not match the original bound peer".into()),
                 }
@@ -339,6 +364,22 @@ impl Adapter {
         }
         if let Some(link) = link {
             if let Some(reply) = self.replies.front() {
+                if let ra::Effect::DoReconfigurationReply(body) = &reply.effect {
+                    let snapshot = node.snapshot(reply.entity);
+                    if snapshot.fenced
+                        || snapshot.committed.is_none_or(|state| {
+                            state.phase != ra::Phase::Ready
+                                || !state.fm_primary
+                                || state.body.unit != body.unit
+                                || state.reconfiguration.as_ref().is_none_or(|config| {
+                                    config.stage != ra::ConfigurationStage::Complete
+                                })
+                        })
+                    {
+                        self.replies.pop_front();
+                        return Ok(());
+                    }
+                }
                 if let ra::Effect::AddReplicaReply(body) | ra::Effect::RemoveReplicaReply(body) =
                     &reply.effect
                 {
@@ -377,6 +418,9 @@ impl Adapter {
                         node_update_service_reply_message(body, Owner::Fm)
                     }
                     ra::Effect::Reply(body) => add_instance_reply_message(body, Owner::Fm),
+                    ra::Effect::DoReconfigurationReply(body) => {
+                        do_reconfiguration_reply_message(body, Owner::Fm)
+                    }
                     ra::Effect::PrimaryReply(body) => add_primary_reply_message(body, Owner::Fm),
                     ra::Effect::AddReplicaReply(body) => add_replica_reply_message(body, Owner::Fm),
                     ra::Effect::RemoveReplicaReply(body) => {
@@ -1061,6 +1105,9 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         "open_token":state.open_token, "usage":format!("{:?}",state.usage),
                         "fm_stage":format!("{:?}",state.fm_stage),
                         "local_deleted":state.local_deleted,
+                        "configuration":state.reconfiguration.as_ref().map(|config| serde_json::json!({
+                            "stage":format!("{:?}", config.stage), "request":config.request, "error":config.error,
+                        })),
                         "pre_open_failure":node.pre_open_registration_failure(),
                         "runtime_open_failure":node.runtime_open_failure(),
                         "host_lost":node.activation().process_status().is_some_and(|process| process.exit_observed),
@@ -1116,6 +1163,10 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             .find_map(|line| line.split_once("LOCAL_IDLE_DATA_ERROR ").map(|(_, error)| error)),
                         "opens":app_logs.iter().filter(|line| line.contains("LOCAL_CALLBACK open")).count(),
                         "provider_acquisitions":app_logs.iter().filter(|line| line.contains("LOCAL_DATA_PROVIDER acquired")).count(),
+                        "primary_last_admitted":app_logs.iter().rev().find_map(|line|
+                            line.split_once("LOCAL_PRIMARY admitted sequence=").and_then(|(_, n)| n.trim().parse::<i64>().ok())),
+                        "primary_last_acknowledged":app_logs.iter().rev().find_map(|line|
+                            line.split_once("LOCAL_PRIMARY acknowledged sequence=").and_then(|(_, n)| n.trim().parse::<i64>().ok())),
                         "idle_access_denied":app_logs.iter().any(|line| line.contains("LOCAL_ACCESS denied")),
                         "idle_write_denials":app_logs.iter().filter(|line| line.contains("LOCAL_DATA write_denied NotPrimary assigned=0")).count(),
                     },
@@ -1217,6 +1268,22 @@ fn receive_peer(
     wire::predecode(message)?;
     let peer = launch.peer.as_ref().ok_or("unbound peer ingress")?;
     let result = match message.properties().map_err(err)?.action.as_str() {
+        "Activate" if launch.placement == 2 => {
+            let (body, generation) = decode_activate(message).map_err(err)?;
+            node.activate_replica_from_peer(body, &peer.node, &generation)
+        }
+        "ActivateReply" if launch.placement == 1 => {
+            let (body, generation) = decode_activate_reply(message).map_err(err)?;
+            fixed_idle_target(
+                launch,
+                &body.unit.id,
+                &body.replica,
+                &peer.node,
+                peer.replica,
+                peer.incarnation,
+            )?;
+            node.activate_reply_from_peer(body, &peer.node, &generation)
+        }
         "CreateReplica" if launch.placement == 2 => {
             let (body, generation) = decode_create_replica(message).map_err(err)?;
             fixed_idle_target(
@@ -1535,6 +1602,14 @@ fn receive_command(
         "AddPrimary" => {
             let (body, generation) = decode_add_primary(message).map_err(err)?;
             node.add_primary_from_fm(body, &launch.fm, &generation)
+                .map_err(err)?;
+        }
+        "DoReconfiguration" => {
+            if launch.profile != ServiceProfile::StatefulPeerIdle || launch.placement != 1 {
+                return Err("DoReconfiguration requires the original coordinating Primary".into());
+            }
+            let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
+            node.reconfigure_from_fm(body, &launch.fm, &generation)
                 .map_err(err)?;
         }
         "AddReplica" | "RemoveReplica" => {

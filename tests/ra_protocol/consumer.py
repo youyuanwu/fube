@@ -87,8 +87,17 @@ REPLICA_CASES = {
     "in-create-remove-replica-reply",
 }
 CASES |= REPLICA_CASES
-SCHEMA_TYPES = 77
-SCHEMA_FIELDS = 240
+CONFIGURATION_FACTORIES = {
+    action: {"actor": 11 if action == "DoReconfigurationReply" else 12, "high_priority": True}
+    for action in ["DoReconfiguration", "DoReconfigurationReply", "Activate", "ActivateReply"]
+}
+CONFIGURATION_CASES = {
+    f"{profile}-{root}" for profile in ["default", "rich"]
+    for root in ["do-reconfiguration", "do-reconfiguration-reply", "activate", "activate-reply"]
+} | {f"action-{action}" for action in CONFIGURATION_FACTORIES}
+CASES |= CONFIGURATION_CASES
+SCHEMA_TYPES = 81
+SCHEMA_FIELDS = 248
 
 
 def validate(bundle, expected_head, expected_source):
@@ -114,6 +123,7 @@ def validate(bundle, expected_head, expected_source):
             or manifest.get("generation_factories") != GENERATION_FACTORIES
             or manifest.get("peer_factories") != PEER_FACTORIES
             or manifest.get("replica_factories") != REPLICA_FACTORIES
+            or manifest.get("configuration_factories") != CONFIGURATION_FACTORIES
             or not manifest.get("native_sources")):
         raise ValueError("source/schema manifest mismatch")
     expected_files = {"schema.h", "native-oracle", "ra-conformance"} | {

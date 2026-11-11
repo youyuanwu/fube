@@ -154,6 +154,11 @@ pub struct PackageRegistration {
 }
 #[derive(Clone)]
 enum Work {
+    Reconfigure(Arc<DoReconfiguration>, NodeInstance, GenerationHeader),
+    Activate(Arc<Activate>, NodeInstance, GenerationHeader),
+    Activated(Arc<ActivateReply>, NodeInstance, GenerationHeader),
+    Configured(ra::ConfigurationCompletion),
+    RetryConfiguration(PartitionId),
     BuildIdle(PartitionId),
     Built(ra::BuildCompletion),
     RemoveIdle(PartitionId),
@@ -1240,6 +1245,83 @@ impl Node {
             generation.clone(),
         ))
     }
+    pub fn reconfigure_from_fm(
+        &mut self,
+        body: DoReconfiguration,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        self.admit_fm(source, generation)?;
+        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary {
+            return Err(Error::Unsupported);
+        }
+        self.admit_configuration(&body.configuration)?;
+        self.enqueue(Work::Reconfigure(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn activate_replica_from_peer(
+        &mut self,
+        body: Activate,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+            || self.ra.peer().as_ref() != Some(source)
+            || generation.for_fm_replica
+        {
+            return Err(Error::Unsupported);
+        }
+        self.admit_configuration(&body.configuration)?;
+        self.enqueue(Work::Activate(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn activate_reply_from_peer(
+        &mut self,
+        body: ActivateReply,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            || self.ra.peer().as_ref() != Some(source)
+            || generation.for_fm_replica
+        {
+            return Err(Error::Unsupported);
+        }
+        self.enqueue(Work::Activated(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    fn admit_configuration(&self, body: &Configuration) -> Result<()> {
+        if !self.live.load(Ordering::SeqCst)
+            || self.ra.generation_state().upload_pending
+            || !self.ra.consumer_lifetime().is_accepting()
+            || body.replicas.0.len() != 2
+            || to_vec(body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
+        {
+            return Err(Error::Unsupported);
+        }
+        let current = self
+            .ra
+            .snapshot(body.unit.id.guid.0)
+            .committed
+            .ok_or(Error::Unsupported)?;
+        if current.body.unit.id != body.unit.id
+            || current.body.unit.consistency != body.unit.consistency
+            || (body.service != current.body.service
+                && !ra::secondary_service(&current.body.service, &body.service))
+        {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
+    }
     pub fn remove_replica_from_fm(
         &mut self,
         body: RemoveReplica,
@@ -1501,6 +1583,23 @@ impl Node {
     }
     fn build(&self, work: &Work) -> ra::Command {
         match work {
+            Work::Reconfigure(body, source, generation) => ra::Command::DoReconfiguration {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::Activate(body, source, generation) => ra::Command::Activate {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::Activated(body, source, generation) => ra::Command::ActivateReply {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::Configured(body) => ra::Command::CompleteConfiguration(Box::new(body.clone())),
+            Work::RetryConfiguration(unit) => ra::Command::RetryConfiguration(unit.clone()),
             Work::BuildIdle(unit) => ra::Command::BuildRemoteIdle(unit.clone()),
             Work::Built(event) => ra::Command::CompleteBuild(Box::new(event.clone())),
             Work::AddReplica(body, source, generation) => ra::Command::AddReplica {
@@ -1937,6 +2036,12 @@ impl Node {
                     let unit = body.unit.id.clone();
                     if matches!(state.phase, ra::Phase::Opening | ra::Phase::Closing) {
                         self.retry(unit)?;
+                    } else if state
+                        .reconfiguration
+                        .as_ref()
+                        .is_some_and(|config| config.stage != ra::ConfigurationStage::Complete)
+                    {
+                        self.enqueue(Work::RetryConfiguration(unit))?;
                     } else if state.service_description_pending {
                         self.enqueue(Work::RetryDescription(unit))?;
                     }
@@ -2169,6 +2274,49 @@ impl Node {
                 self.lookup(*token, *lookup, body, *usage)?;
                 LocalDisposition::LocalResponse
             }
+            ra::Effect::UpdateConfiguration {
+                body,
+                local,
+                flags,
+                registration,
+            } => {
+                let Some(lease) = self.activation.host_lease() else {
+                    return Err(Error::OwnerLost);
+                };
+                if self
+                    .activation
+                    .identity()
+                    .is_none_or(|id| id.host_id != registration.host)
+                {
+                    return Err(Error::Protocol);
+                }
+                let bytes = to_vec(&rap::Request {
+                    runtime: String::new(),
+                    unit: body.unit.clone(),
+                    local: (**local).clone(),
+                    remote: body.replicas.clone(),
+                    service: Service::default(),
+                    flags: *flags,
+                })
+                .map_err(|_| Error::Protocol)?;
+                if bytes.len() > BODY {
+                    return Err(Error::Capacity);
+                }
+                match lease.send_lifecycle("UpdateConfiguration", bytes) {
+                    Ok(send) => {
+                        self.route = Some(Route {
+                            runtime: registration.runtime.clone(),
+                            lease,
+                        });
+                        self.effects.pop_front();
+                        self.sending = Some(Sending { dispatch, send });
+                        return Ok(());
+                    }
+                    Err(fube_transport::Error::ResourceLimit(_)) => return Ok(()),
+                    Err(fube_transport::Error::Protocol(_)) => return Err(Error::Protocol),
+                    Err(_) => LocalDisposition::WriteFailed,
+                }
+            }
             ra::Effect::RuntimeOpen {
                 body, registration, ..
             }
@@ -2285,6 +2433,9 @@ impl Node {
                 LocalDisposition::LocalResponse
             }
             ra::Effect::Reply(_)
+            | ra::Effect::DoReconfigurationReply(_)
+            | ra::Effect::PeerActivate { .. }
+            | ra::Effect::PeerActivateReply { .. }
             | ra::Effect::PeerCreateReplica { .. }
             | ra::Effect::PeerCreateReplicaReply { .. }
             | ra::Effect::NodeActivateReply(_)
@@ -2376,8 +2527,10 @@ impl Node {
             action.as_str(),
             "ReplicatorBuildIdleReplicaReply" | "ReplicatorRemoveIdleReplicaReply"
         );
+        let configuration = action == "UpdateConfigurationReply";
         if (idle && (body.remote.0.len() != 1 || body.flags != 0))
-            || (!idle && (!body.remote.0.is_empty() || body.flags & !12 != 0))
+            || (configuration && (body.remote.0.len() != 2 || body.flags & !3 != 0))
+            || (!idle && !configuration && (!body.remote.0.is_empty() || body.flags & !12 != 0))
         {
             return Err(Error::Protocol);
         }
@@ -2398,6 +2551,13 @@ impl Node {
             return Err(Error::Protocol);
         }
         let work = match reply.action().map_err(|_| Error::Protocol)?.as_str() {
+            "UpdateConfigurationReply" => Work::Configured(ra::ConfigurationCompletion {
+                unit: body.unit,
+                local: body.local,
+                replicas: body.remote,
+                flags: body.flags,
+                error: body.error.error,
+            }),
             "ReplicatorBuildIdleReplicaReply" | "ReplicatorRemoveIdleReplicaReply" => {
                 let event = ra::BuildCompletion {
                     unit: body.unit,

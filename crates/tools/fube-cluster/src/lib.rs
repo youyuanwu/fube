@@ -342,6 +342,14 @@ impl Cluster {
         let action = incoming.message.properties().map_err(err)?.action;
         let generation = self.children[index].launch.generation.clone();
         match action.as_str() {
+            "DoReconfigurationReply" => {
+                let (body, owner) =
+                    decode_do_reconfiguration_reply(&incoming.message).map_err(err)?;
+                if owner != Owner::Fm {
+                    return Err("FMM configuration reply is gated".into());
+                }
+                self.ledger.configuration_reply(index, body)?;
+            }
             "GenerationUpdateReject" => {
                 let current = decode_generation_update_reject(&incoming.message).map_err(err)?;
                 if let Some(round) = &mut self.ledger.generation {
@@ -557,6 +565,16 @@ impl Cluster {
             let result = match result {
                 Ok(()) => self.retry_idle_deletion(index).await,
                 Err(error) => Err(error),
+            };
+            let result = match result {
+                Ok(()) if index == 0 => {
+                    if let Some(body) = self.ledger.configuration_retry(Instant::now()) {
+                        self.send_configuration(&body).await
+                    } else {
+                        Ok(())
+                    }
+                }
+                result => result,
             };
             if let Err(error) = result {
                 self.ledger.lost(index, error);
@@ -815,15 +833,17 @@ impl Cluster {
             let removing = source["peer_idle"]["removal"].is_object();
             let removed = removing && source["peer_idle"]["removal"]["result"] == 0;
             let destination_lost = self.ledger.placements[1].loss_reported;
+            let configured = self.ledger.configuration_status()["ready"] == true;
             let built = !destination_lost
                 && opened
                 && !removing
                 && source["peer_idle"]["build"]["result"] == 0;
             status["peer_idle"] = json!({
                 "requested":self.peer_idle_requested,
-                "state": if destination_lost { "lost" } else if removed { "removed" } else if removing { "removing" } else if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
+                "state": if configured { "active_secondary" } else if destination_lost { "lost" } else if removed { "removed" } else if removing { "removing" } else if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
                 "error": if failed { reply["error"].clone() } else { Value::Null },
                 "built":built, "serving":false,
+                "active_secondary":configured,
                 "build":source["peer_idle"]["build"],
                 "fm":self.ledger.idle_status(),
                 "fm_removal":self.ledger.idle_removal_status(),
@@ -925,7 +945,8 @@ impl Cluster {
     /// FM AddReplica owns peer creation, RAP build and semantic Ready-Idle completion.
     pub async fn add_idle_replica(&mut self) -> Result<Value> {
         let current = self.ledger.idle_status();
-        if self.finished.is_some()
+        if self.ledger.configuration.is_some()
+            || self.finished.is_some()
             || self.children.len() != 2
             || self.config.profile != ServiceProfile::StatefulPeerIdle
             || (self.ledger.idle_removal.is_some() && current["state"] != "failed")
@@ -946,7 +967,8 @@ impl Cluster {
     }
     /// Explicitly authorize one fresh Idle after original FM removal and proved disposal.
     pub async fn replace_idle_replica(&mut self) -> Result<Value> {
-        if self.finished.is_some()
+        if self.ledger.configuration.is_some()
+            || self.finished.is_some()
             || self.children.len() != 2
             || self.config.profile != ServiceProfile::StatefulPeerIdle
         {
@@ -963,6 +985,32 @@ impl Cluster {
             return Err(error);
         }
         Ok(self.ledger.idle_status())
+    }
+    pub async fn activate_idle_replica(&mut self) -> Result<Value> {
+        if self.finished.is_some() || self.children.len() != 2 {
+            return Err("configuration requires the original running cluster".into());
+        }
+        let body = self.ledger.request_configuration(Instant::now())?;
+        if self.ledger.configuration_status()["ready"] == true {
+            return Ok(self.ledger.configuration_status());
+        }
+        if let Err(error) = self.send_configuration(&body).await {
+            self.ledger.lost(0, error.clone());
+            return Err(error);
+        }
+        Ok(self.ledger.configuration_status())
+    }
+    async fn send_configuration(&self, body: &DoReconfiguration) -> Result<()> {
+        let child = self
+            .children
+            .first()
+            .ok_or("missing original Primary owner")?;
+        child
+            .link
+            .as_ref()
+            .ok_or("missing original Primary link")?
+            .send(do_reconfiguration_message(body, &child.launch.generation).map_err(err)?)
+            .await
     }
     /// Remove the original Idle from the Primary's replicator, not its remote
     /// application. Pending calls retry cancellation/cleanup; success is terminal.

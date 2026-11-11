@@ -219,6 +219,45 @@ fn peer_idle_ledger() -> Ledger {
 }
 
 #[test]
+fn same_primary_configuration_requires_semantic_build_and_exact_current_reply() {
+    let mut ledger = peer_idle_ledger();
+    let now = Instant::now();
+    let original_primary_reply = ready_reply(&ledger.placements[0]);
+    assert!(ledger.request_configuration(now).is_err());
+    let add = ledger.request_idle(now).unwrap();
+    assert!(ledger.request_configuration(now).is_err());
+    let mut replica = add.replica.clone();
+    replica.state = 2;
+    replica.replication_endpoint = "127.0.0.1:12346".into();
+    ledger.idle_reply(0, AddReplicaReply { unit: add.unit, replica, error: 0 }).unwrap();
+    let body = ledger.request_configuration(now).unwrap();
+    assert_eq!(ledger.request_configuration(now).unwrap(), body);
+    assert!(ledger.begin_generation().is_err());
+    assert!(ledger.request_idle_removal(now).is_err());
+    assert!(ledger.request_idle_replacement(now).is_err());
+    let mut reply = ConfigurationReply { unit: body.configuration.unit.clone(),
+        replicas: body.configuration.replicas.clone(), error: 0 };
+    reply.unit.previous = Epoch::default();
+    for replica in &mut reply.replicas.0 { replica.previous_role = 1; }
+    let mut stale = reply.clone();
+    stale.replicas.0[1].instance -= 1;
+    ledger.configuration_reply(0, stale).unwrap();
+    ledger.configuration_reply(1, reply.clone()).unwrap();
+    assert_eq!(ledger.configuration_status()["state"], "pending");
+    let retry = ledger.configuration_retry(now + Duration::from_secs(11)).unwrap();
+    assert_eq!(retry, body);
+    ledger.configuration_reply(0, reply.clone()).unwrap();
+    assert_eq!(ledger.configuration_status()["state"], "ready");
+    ledger.reply(0, original_primary_reply, false).unwrap();
+    assert_eq!(ledger.placements[1].observed, Observed::Running);
+    assert!(ledger.configuration_retry(now + Duration::from_secs(100)).is_none());
+    ledger.lost(1, "original Secondary node owner lost".into());
+    ledger.configuration_reply(0, reply).unwrap();
+    assert_eq!(ledger.configuration_status()["state"], "unknown");
+    assert!(ledger.request_configuration(now).is_err());
+}
+
+#[test]
 fn idle_replacement_requires_both_semantic_barriers_and_original_disposal() {
     for missing in 0..9 {
         let mut ledger = peer_idle_ledger();
@@ -2585,6 +2624,110 @@ async fn fm_deletes_original_built_idle_destination_without_replacing_or_stoppin
         assert_eq!(data_contact(&primary, b"read\n"), write);
         Ok::<(), String>(())
     }).await;
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn same_primary_configuration_lost_final_reply_retries_without_reapplying_roles() {
+    let fixture = Fixture::new("active-secondary-reply-retry");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::StatefulPeerIdle;
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.start().await.unwrap();
+    let result = peer_idle_catch(async {
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
+        let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        until(&mut cluster, |_| data_contact(&endpoint, b"read\n").starts_with("OK ")).await;
+        assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+        cluster.add_idle_replica().await?;
+        until(&mut cluster, |c| c.ledger.idle_status()["ready"] == true).await;
+        cluster.activate_idle_replica().await?;
+        let frozen = cluster.ledger.configuration.as_ref().unwrap().body.clone();
+        let lost = hold_peer_loss_frame(&mut cluster, 0, "DoReconfigurationReply", Duration::from_secs(12)).await?;
+        let (reply, owner) = decode_do_reconfiguration_reply(&lost).map_err(err)?;
+        assert_eq!(owner, Owner::Fm);
+        assert_eq!(cluster.ledger.configuration_status()["state"], "pending");
+        assert!(data_contact(&endpoint, b"write-more\n").contains("committed=2"));
+        let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11))
+            .ok_or("missing native DoReconfiguration retry")?;
+        assert_eq!(retry, frozen);
+        cluster.send_configuration(&retry).await?;
+        until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true
+            && c.status()["nodes"][1]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 2).await;
+        assert_eq!(cluster.ledger.configuration.as_ref().unwrap().reply.as_ref(), Some(&reply));
+        let mut stale = frozen;
+        stale.configuration.unit.current.configuration -= 1;
+        cluster.send_configuration(&stale).await?;
+        for _ in 0..10 { cluster.drive().await; }
+        let status = cluster.status();
+        assert_eq!(status["configuration"]["state"], "ready");
+        assert_eq!(status["nodes"][0]["retained_work"]["app_observation"]["opens"], 1);
+        assert_eq!(status["nodes"][1]["retained_work"]["app_observation"]["opens"], 1);
+        assert_eq!(status["peer_idle"]["command_error"], json!([null, null]));
+        assert!(cluster.ledger.begin_generation().is_err());
+        Ok::<(), String>(())
+    }).await;
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn same_primary_configuration_activates_secondary_and_never_acks_without_its_quorum() {
+    let fixture = Fixture::new("active-secondary");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::StatefulPeerIdle;
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.start().await.unwrap();
+    let result = peer_idle_catch(async {
+        assert!(cluster.activate_idle_replica().await.is_err());
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
+        let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        until(&mut cluster, |_| data_contact(&endpoint, b"read\n").starts_with("OK ")).await;
+        assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+        cluster.add_idle_replica().await?;
+        until(&mut cluster, |c| c.ledger.idle_status()["ready"] == true).await;
+        assert_eq!(cluster.activate_idle_replica().await?["state"], "pending");
+        until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true
+            && c.status()["peer_idle"]["target"]["configuration"]["stage"] == "Complete").await;
+        let status = cluster.status();
+        assert_eq!(status["peer_idle"]["target"]["replica"]["current_role"], 3);
+        assert_eq!(status["peer_idle"]["target"]["configuration"]["stage"], "Complete");
+        assert_eq!(status["configuration"]["request"]["configuration"]["replicas"][0]["previous_role"], 4);
+        assert_eq!(status["configuration"]["request"]["configuration"]["replicas"][1]["previous_role"], 2);
+        assert_eq!(cluster.activate_idle_replica().await?["state"], "ready");
+        assert!(cluster.remove_idle_replica_via_fm().await.is_err());
+        assert!(cluster.replace_idle_replica().await.is_err());
+        let write = data_contact(&endpoint, b"write-more\n");
+        assert!(write.contains("committed=2"), "{write}");
+        until(&mut cluster, |c| c.status()["nodes"][1]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 2).await;
+        let secondary = cluster.status()["nodes"][1]["retained_work"]["app_observation"]["idle_data"].clone();
+        assert_eq!(secondary["role"], "ActiveSecondary");
+        assert_ne!(secondary["write"], "Granted");
+        let destination = cluster.ledger.placements[1].profile.as_ref().unwrap().app_pid;
+        assert!(std::process::Command::new("kill").args(["-KILL", &destination.to_string()]).status().unwrap().success());
+        until(&mut cluster, |c| c.ledger.configuration_status()["state"] == "unknown").await;
+        let mut pending = TcpStream::connect(&endpoint).map_err(err)?;
+        pending.set_read_timeout(Some(Duration::from_millis(250))).map_err(err)?;
+        pending.write_all(b"write-final\n").map_err(err)?;
+        until(&mut cluster, |c| c.status()["nodes"][0]["retained_work"]["app_observation"]["primary_last_admitted"] == 3).await;
+        let mut bytes = [0; 1024];
+        let read = pending.read(&mut bytes);
+        assert!(matches!(read, Err(ref e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+            "lost Secondary must not ACK from the old singleton quorum: {read:?}");
+        assert_eq!(cluster.status()["nodes"][0]["retained_work"]["app_observation"]["primary_last_acknowledged"], 2);
+        assert_eq!(cluster.ledger.placements[0].endpoint.as_deref(), Some(endpoint.as_str()));
+        Ok::<(), String>(())
+    }).await;
+    if !matches!(&result, Ok(Ok(()))) {
+        eprintln!("CONFIGURATION_NODE_LOGS {:?}", bounded_logs(cluster.children[0].process.as_ref().unwrap()));
+    }
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
     result.unwrap().unwrap();

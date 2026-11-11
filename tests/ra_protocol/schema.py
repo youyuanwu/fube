@@ -51,6 +51,10 @@ MODELS = [
     ("RAReplicaMessageBody", COMMON + "RAReplicaMessageBody.h", "ReplicaMessageBody"),
     ("DeleteReplicaMessageBody", COMMON + "DeleteReplicaMessageBody.h", "ReplicaMessageBody"),
     ("ReplicaReplyMessageBody", COMMON + "ReplicaReplyMessageBody.h", ""),
+    ("ConfigurationMessageBody", COMMON + "ConfigurationMessageBody.h", ""),
+    ("DoReconfigurationMessageBody", COMMON + "DoReconfigurationMessageBody.h", "ConfigurationMessageBody"),
+    ("ActivateMessageBody", COMMON + "ActivateMessageBody.h", "ConfigurationMessageBody"),
+    ("ConfigurationReplyMessageBody", COMMON + "ConfigurationReplyMessageBody.h", ""),
     ("ReplicaInfo", COMMON + "ReplicaInfo.h", ""),
     ("FailoverUnitInfo", COMMON + "FailoverUnitInfo.h", ""),
     ("ReplicaUpMessageBody", COMMON + "ReplicaUpMessageBody.h", ""),
@@ -158,6 +162,7 @@ DEFAULTS = {
     ("ReplicaDescription", "firstAcknowledgedLSN_"): "-1",
     ("ReplicaDescription", "state_"): "Enum(2)",
     ("ReplicaDeactivationInfo", "catchupLSN_"): "-1",
+    ("DoReconfigurationMessageBody", "phase0Duration_"): "TimeSpan::maximum()",
     ("ServiceDescription", "defaultMoveCost_"): "1",
     ("ServiceDescription", "replicaRestartWaitDuration_"): "TimeSpan::minimum()",
     ("ServiceDescription", "quorumLossWaitDuration_"): "TimeSpan::minimum()",
@@ -293,10 +298,28 @@ def replica_factories(native):
     return result
 
 
+def configuration_factories(native):
+    text = (native / "src/prod/src" / COMMON / "RSMessage.cpp").read_text()
+    result = {}
+    for action, factory, actor in [
+        ("DoReconfiguration", "CreateFMToRAMessage", 12),
+        ("DoReconfigurationReply", "CreateRAToFMMessage", 11),
+        ("Activate", "CreateRAToRAMessage", 12),
+        ("ActivateReply", "CreateRAToRAMessage", 12),
+    ]:
+        matches = re.findall(
+            rf'RSMessage::{action}\s*=\s*(\w+)\(L"([^"]+)",\s*(true|false)\b', text,
+        )
+        if matches != [(factory, action, "true")]:
+            raise ValueError(f"native configuration factory changed: {action}")
+        result[action] = {"actor": actor, "high_priority": True}
+    return result
+
+
 def generate(native, destination):
     models = extract(native)
     constants = native_constants(native)
-    factories = generation_factories(native) | peer_factories(native) | replica_factories(native)
+    factories = generation_factories(native) | peer_factories(native) | replica_factories(native) | configuration_factories(native)
     output = [
         "// Generated from pinned native headers; source macro/member provenance below.",
         "#pragma once", "#include <Serialization.h>", "#include <FabricSerializationHelper.h>",
@@ -336,6 +359,7 @@ def generate(native, destination):
             output.append(f" {cpp} {field} = {default}; // {native_type}")
         if name == "TimeSpan":
             output.append(" static TimeSpan minimum() { TimeSpan t; t.ticks_ = INT64_MIN; return t; }")
+            output.append(" static TimeSpan maximum() { TimeSpan t; t.ticks_ = INT64_MAX; return t; }")
         if name == "ReplicaDescription":
             output.append(
                 " ReplicaDescription() { packageVersionInstance_.version_.appVersion_.value_.major_=0;"

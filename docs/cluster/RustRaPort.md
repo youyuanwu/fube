@@ -87,6 +87,12 @@ Remove completion and normal destination Delete joined with genuine disposal.
 It preserves predecessor history, recopies real state and continues replication
 on the original node/app sessions. It grants no active membership, host-loss
 replacement, second successor or recovery.
+The [same-Primary configuration increment](MinimalFmCluster.md#same-primary-active-configuration-stage-5-increment)
+now admits one successfully built Idle as ActiveSecondary through actual native
+DoReconfiguration/Reply, Activate/Reply and RAP catch-up/final configuration.
+The current two-member and previous singleton quorums remain separate; real
+Secondary loss cannot acknowledge a new write from the previous singleton.
+This does not enable active-member replacement, Primary transfer or restart.
 Broader removal branches, active membership and reconfiguration
 remain gated.
 
@@ -543,9 +549,9 @@ complete every native branch of its handlers.
 The [source-pinned catalog](NativeRaProtocol.md) contains **58 FM-boundary action
 definitions**, including common registration, plus **eight peer RA actions**.
 There are 67 directional contracts because DoReconfiguration also has a peer
-send path. The current 31 selected FM-boundary and two selected peer action
+send path. The current 37 selected FM-boundary and four selected peer action
 codecs have bounded handler/helper coverage, not complete native contracts;
-27 FM-boundary actions and six peer actions
+21 FM-boundary actions and four peer actions
 remain unselected, alongside broader branches of the selected handlers.
 
 Stage 1 is now implemented for the bounded volatile 1/1 FM profile; see
@@ -558,7 +564,7 @@ This does not qualify every native handler branch or complete P4/M2.
 | 2. Complete node-wide coordination | Bounded implementation: broader P2 multi-entity execution; NodeActivateRequest/Reply, NodeDeactivateRequest/Reply, NodeUpdateServiceRequest/Reply, ServiceTypeEnabled/Disabled and their replies, existing registration notifications and complete ReportLoad codecs/forwarding. ReplicaEndpointUpdated/Reply codecs and endpoint helper only; live publication moves to stage 5. | Preserve sequence/version checks and action-specific completion barriers. Deactivation replies follow required replica closure, not admission; ReportLoad remains best-effort without an invented per-report ACK. Keep one FT per deployed Node; qualify multiple FTs in RA model/store tests. |
 | 3. Complete ordinary-FM generation and upload | Bounded generation-handshake increment implemented: GenerationProposal/Reply and GenerationUpdate/Reject. Remaining: LFUMUpload/Reply, nonempty NodeUp/NodeUpAck reconciliation and full ReplicaUp/Reply batching/final-upload handling. | Preserve proposed/receive/send generations and per-entity commit barriers. Only the correct semantic completion advances upload/readiness; keep restart serving disabled until stage 6. |
 | 4. Build and remove remote replicas | Bounded original two-node volatile Idle creation, nonempty copy/continuing replication, FM Add/build, pending/failed/opened Primary removal and same-lifetime retry/replay are implemented. The [original-session destination Delete contract](MinimalFmCluster.md#complete-original-session-destination-delete-contract) covers normal/force and opening/closing/closed/failed/absent/lost targets and separate original cleanup proofs. Close/Drop/Abort and host-loss reporting retain native stage/ACK distinctions. [Explicit fresh replacement](MinimalFmCluster.md#explicit-fresh-idle-replacement) now rebuilds one successor after original successful build, Primary removal and normal Delete/disposal. Remaining: broader replacement/lifecycle/report profiles, active configuration/reconfiguration/removal and native interoperability qualification. | Copy completion grants no active membership or serving; AddReplicaReply completes FM build and Ready/Idle is not ActiveSecondary. Only RemoveReplicaReply clears Primary pending-remove. Destination Delete independently joins its semantic reply with original cleanup evidence. Neither metadata/report ACK nor cleanup proof authorizes a successor: the bounded replacement requires a separate explicit FM request and destination-local disposal/drain admission. Original history and stale-incarnation fences survive replacement. |
-| 5. Implement reconfiguration | DoReconfiguration/Reply, peer GetLSN/Reply, Deactivate/Reply and Activate/Reply, ChangeConfiguration and DatalossReport. Include peer swap continuation. | Preserve native phase ordering, separate previous/current quorum obligations, catch-up/cancellation, old-primary fencing and endpoint publication. Qualify secondary replacement before primary transfer. |
+| 5. Implement reconfiguration | Bounded unchanged-Primary 1-to-2 DoReconfiguration/Reply and Activate/Reply now perform real catch-up, secondary activation and final RAP configuration. Remaining: configured-secondary removal/replacement, broader reconfiguration, GetLSN/Reply, Deactivate/Reply, ChangeConfiguration, DatalossReport, peer swap continuation and endpoint publication. | Preserve native phase ordering, separate previous/current quorum obligations, catch-up/cancellation, old-primary fencing and endpoint publication. Qualify secondary replacement before primary transfer. Current source-stream and native-free evidence is not complete original-handler/interoperability qualification. |
 | 6. Enable durable RA restart | P5 loading/fixups, crash-window reconciliation, fresh incarnation and recovery with the original FM surviving. | Historical records cannot restore Primary authority. Prove predecessor fencing; rebuild volatile replicas from eligible survivors with valid history/quorum evidence or report data loss. |
 | 7. Add FMM ownership/rebuild | Independent FM/FMM readiness and generation domains, owner-specific uploads, GFUMTransfer and FM-service replica handling. | Supply matching FM/FMM/common-layer counterparts and required FM-service functionality. Ordinary FM acknowledgments cannot stand in for FMM; this does not authorize transparent FM restart. |
 | 8. Finish upgrades and catalog closure | Application/fabric upgrade and cancellation pairs, real Hosting/version adapters, remaining supported profiles and legacy/deprecated behavior. Resolve the PartitionNotification endpoint gap. | Every catalog entry needs its exact implementation or source-defined rejection/no-op behavior and evidence. Do not invent a successful handler to conceal a missing counterpart. |

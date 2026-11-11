@@ -46,8 +46,13 @@ mod generation;
 pub use generation::{GenerationState, GenerationUpdateOutcome};
 #[path = "peer.rs"]
 mod peer;
+#[path = "reconfiguration.rs"]
+mod reconfiguration;
 pub use peer::{
     BuildCompletion, PeerCreation, RemoteBuild, RemoteIdle, RemoteRemoval, RemovalCompletion,
+};
+pub use reconfiguration::{
+    secondary_service, ConfigurationCompletion, ConfigurationStage, Reconfiguration,
 };
 
 pub type EntityId = [u8; 16];
@@ -264,6 +269,23 @@ pub struct OpenCompletion {
     pub detail: ProxyErrorDetail,
 }
 pub enum Command {
+    DoReconfiguration {
+        body: Box<DoReconfiguration>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    Activate {
+        body: Box<Activate>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    ActivateReply {
+        body: Box<ActivateReply>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CompleteConfiguration(Box<ConfigurationCompletion>),
+    RetryConfiguration(PartitionId),
     HostingServiceTypeStatus {
         service_type: ServiceType,
         sequence: u64,
@@ -409,6 +431,20 @@ pub enum Command {
     },
 }
 enum Kind {
+    DoReconfiguration {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    Activate {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    ActivateReply {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CompleteConfiguration,
+    RetryConfiguration,
     RemoveReplica {
         source: NodeInstance,
         generation: GenerationHeader,
@@ -550,6 +586,8 @@ pub struct EntityState {
     pub peer_creation: Option<PeerCreation>,
     /// Session-only remote Open/build observations, never active membership.
     pub remote_idle: Option<RemoteIdle>,
+    /// Session-only phase ownership; persisted descriptions cannot restore authority.
+    pub reconfiguration: Option<Reconfiguration>,
     pub phase: Phase,
     pub open_token: u64,
     /// Volatile retry bookkeeping; not a native disk record or durable outbox.
@@ -582,6 +620,21 @@ pub struct Snapshot {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    DoReconfigurationReply(ConfigurationReply),
+    PeerActivate {
+        target: NodeInstance,
+        body: Box<Activate>,
+    },
+    PeerActivateReply {
+        target: NodeInstance,
+        body: Box<ActivateReply>,
+    },
+    UpdateConfiguration {
+        body: Box<Configuration>,
+        local: Box<Replica>,
+        flags: i64,
+        registration: RuntimeRegistration,
+    },
     AddReplicaReply(AddReplicaReply),
     RemoveReplicaReply(RemoveReplicaReply),
     RemoveIdle {
@@ -949,6 +1002,41 @@ impl Executor {
                 Kind::AddPrimary { source, generation },
                 to_vec(&body),
             ),
+            Command::DoReconfiguration {
+                body,
+                source,
+                generation,
+            } => (
+                body.configuration.unit.id.guid.0,
+                Kind::DoReconfiguration { source, generation },
+                to_vec(&body),
+            ),
+            Command::Activate {
+                body,
+                source,
+                generation,
+            } => (
+                body.configuration.unit.id.guid.0,
+                Kind::Activate { source, generation },
+                to_vec(&body),
+            ),
+            Command::ActivateReply {
+                body,
+                source,
+                generation,
+            } => (
+                body.unit.id.guid.0,
+                Kind::ActivateReply { source, generation },
+                to_vec(&body),
+            ),
+            Command::CompleteConfiguration(body) => (
+                body.unit.id.guid.0,
+                Kind::CompleteConfiguration,
+                to_vec(&body),
+            ),
+            Command::RetryConfiguration(unit) => {
+                (unit.guid.0, Kind::RetryConfiguration, to_vec(&unit))
+            }
             Command::AddReplica {
                 body,
                 source,
@@ -1137,7 +1225,15 @@ impl Executor {
             return Err(Failure::Closed);
         }
         let new_entity = !node_work && !view.entities.contains_key(&entity);
-        if new_entity && matches!(kind, Kind::AddReplica { .. } | Kind::RemoveReplica { .. }) {
+        if new_entity
+            && matches!(
+                kind,
+                Kind::AddReplica { .. }
+                    | Kind::RemoveReplica { .. }
+                    | Kind::DoReconfiguration { .. }
+                    | Kind::Activate { .. }
+            )
+        {
             return Err(Failure::Admission(
                 "replica command requires an existing FT",
             ));
@@ -1594,6 +1690,11 @@ fn transition(
         #[cfg(feature = "qualification")]
         Kind::QualificationTerminate => panic!("explicit qualification worker termination"),
         Kind::CreateRemoteIdle => peer::start_remote(work, state, admission, peer),
+        Kind::DoReconfiguration { .. }
+        | Kind::Activate { .. }
+        | Kind::ActivateReply { .. }
+        | Kind::CompleteConfiguration
+        | Kind::RetryConfiguration => reconfiguration::transition(work, state, admission, peer),
         Kind::AddReplica { source, generation } => {
             peer::add_from_fm(work, state, source, generation, admission, peer)
         }
@@ -1882,6 +1983,7 @@ fn transition(
                     primary_deactivation: fm_primary.then_some((body.unit.current, 0)),
                     peer_creation,
                     remote_idle: None,
+                    reconfiguration: None,
                     phase: Phase::Opening,
                     open_token: work.id,
                     retry_attempts: 0,
@@ -2179,6 +2281,10 @@ async fn entity_worker(
                     | Kind::RemoveRemoteIdle
                     | Kind::AddReplica { .. }
                     | Kind::RemoveReplica { .. }
+                    | Kind::DoReconfiguration { .. }
+                    | Kind::Activate { .. }
+                    | Kind::ActivateReply { .. }
+                    | Kind::RetryConfiguration
             ) && view.generations.upload_pending
             {
                 Err(Failure::Unsupported(

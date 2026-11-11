@@ -5700,6 +5700,335 @@ fn fm_remove_idle(body: RemoveReplica) -> Command {
     }
 }
 
+fn secondary_configuration(primary: &AddInstance, secondary: &Replica) -> Configuration {
+    let mut unit = primary.unit.clone();
+    unit.previous = unit.current;
+    unit.current.configuration += 1;
+    unit.target = 2;
+    let mut service = primary.service.clone();
+    service.target = 2;
+    service.update_version += 1;
+    let mut p = primary.replica.clone();
+    p.current_role = 4;
+    p.previous_role = 4;
+    p.state = 2;
+    let mut s = secondary.clone();
+    s.current_role = 3;
+    s.previous_role = 2;
+    s.state = 2;
+    Configuration {
+        unit,
+        service,
+        replicas: fube_transport::serialization::serde::ObjectArray(vec![p, s]),
+    }
+}
+fn reconfigure(body: Configuration) -> Command {
+    Command::DoReconfiguration {
+        body: Box::new(DoReconfiguration {
+            configuration: body,
+            phase0_duration: i64::MAX,
+        }),
+        source: admission().fm_source,
+        generation: GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        },
+    }
+}
+fn configured(actions: &[Effect]) -> ConfigurationCompletion {
+    actions
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::UpdateConfiguration {
+                body, local, flags, ..
+            } => Some(ConfigurationCompletion {
+                unit: body.unit.clone(),
+                local: (**local).clone(),
+                replicas: body.replicas.clone(),
+                flags: *flags,
+                error: 0,
+            }),
+            _ => None,
+        })
+        .expect("actual RAP configuration effect")
+}
+async fn built_fm_idle(executor: &Executor) -> Configuration {
+    executor.bind_peer(peer_source()).unwrap();
+    make_ready(executor, &primary_body()).await;
+    let primary = state(executor);
+    let request = fm_idle_request(&primary);
+    run(executor, fm_add_idle(request.clone())).await;
+    effects(executor);
+    let mut opened = CreateReplicaReply {
+        unit: request.unit,
+        replica: request.replica,
+        error: 0,
+    };
+    opened.replica.replication_endpoint = "127.0.0.1:12346".into();
+    run(executor, peer_opened(opened.clone())).await;
+    effects(executor);
+    run(
+        executor,
+        Command::CompleteBuild(Box::new(BuildCompletion {
+            unit: primary.body.unit.clone(),
+            local: primary.body.replica.clone(),
+            remote: opened.replica.clone(),
+            error: 0,
+            detail: ProxyErrorDetail::default(),
+        })),
+    )
+    .await;
+    effects(executor);
+    secondary_configuration(&primary.body, &opened.replica)
+}
+
+#[tokio::test]
+async fn same_primary_configuration_requires_catchup_peer_activation_and_end_reply_in_order() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let config = built_fm_idle(&executor).await;
+    let original = state(&executor);
+    for kind in 0..3 {
+        let mut invalid = config.clone();
+        match kind {
+            0 => invalid.replicas.0[1].instance += 1,
+            1 => invalid.replicas.0[0].service_endpoint = "foreign".into(),
+            _ => invalid.replicas.0[1].service_endpoint = "foreign".into(),
+        }
+        assert!(executor
+            .submit(reconfigure(invalid))
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .is_err());
+    }
+    assert!(effects(&executor).is_empty());
+    run(&executor, reconfigure(config.clone())).await;
+    let actions = effects(&executor);
+    let mut catchup = configured(&actions);
+    assert_eq!(catchup.flags, 2);
+    assert_eq!(
+        catchup
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.previous_role >= 3)
+            .count(),
+        1
+    );
+    assert_eq!(
+        catchup
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.current_role >= 3)
+            .count(),
+        2
+    );
+    catchup.error = -993;
+    run(
+        &executor,
+        Command::CompleteConfiguration(Box::new(catchup.clone())),
+    )
+    .await;
+    assert!(effects(&executor).is_empty());
+    assert_eq!(
+        state(&executor).reconfiguration.as_ref().unwrap().stage,
+        ConfigurationStage::Catchup
+    );
+    run(
+        &executor,
+        Command::RetryConfiguration(config.unit.id.clone()),
+    )
+    .await;
+    assert_eq!(configured(&effects(&executor)).flags, 2);
+    catchup.error = 0;
+    run(
+        &executor,
+        Command::CompleteConfiguration(Box::new(catchup.clone())),
+    )
+    .await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerActivate { body, .. }]
+        if body.configuration == config)
+    );
+    let mut premature = catchup;
+    premature.flags = 1;
+    assert_eq!(
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(premature))
+        )
+        .await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    let mut unit = config.unit.clone();
+    unit.previous = Epoch::default();
+    let mut replica = config.replicas.0[1].clone();
+    replica.previous_role = 1;
+    run(
+        &executor,
+        Command::ActivateReply {
+            body: Box::new(ActivateReply {
+                unit,
+                replica,
+                error: 0,
+            }),
+            source: peer_source(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        },
+    )
+    .await;
+    let end = configured(&effects(&executor));
+    assert_eq!(end.flags, 1);
+    let (entered, release) = hooks.pause(false);
+    let completed = executor
+        .submit(Command::CompleteConfiguration(Box::new(end.clone())))
+        .unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    assert_eq!(
+        state(&executor).reconfiguration.as_ref().unwrap().stage,
+        ConfigurationStage::End
+    );
+    release.send(()).unwrap();
+    completed.wait(WAIT).await.unwrap();
+    let reply = effects(&executor);
+    assert!(
+        matches!(reply.as_slice(), [Effect::DoReconfigurationReply(body)]
+        if body.unit.previous == Epoch::default() && body.replicas.0.iter().all(|r| r.previous_role == 1))
+    );
+    assert_eq!(
+        state(&executor).reconfiguration.as_ref().unwrap().stage,
+        ConfigurationStage::Complete
+    );
+    assert_eq!(state(&executor).runtime, original.runtime);
+    run(&executor, reconfigure(config.clone())).await;
+    assert_eq!(effects(&executor), reply);
+    assert_eq!(
+        run(&executor, Command::CompleteConfiguration(Box::new(end))).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn same_primary_configuration_creation_commit_failure_and_uncertainty_publish_no_actions() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        let config = built_fm_idle(&executor).await;
+        let original = state(&executor);
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor.submit(reconfigure(config)).unwrap();
+        entered.await.unwrap();
+        assert!(Arc::ptr_eq(&original, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot(original.body.unit.id.guid.0).fenced);
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(Arc::ptr_eq(&original, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+            assert_eq!(configured(&effects(&executor)).flags, 2);
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn secondary_activation_ack_waits_for_real_rap_result_and_its_commit() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        make_peer_idle_ready(&executor).await;
+        let original = state(&executor);
+        let mut primary = (*original.body).clone();
+        primary.replica.node = peer_source();
+        primary.replica.id += 1;
+        primary.replica.instance += 1;
+        primary.replica.replication_endpoint = "127.0.0.1:12346".into();
+        let config = secondary_configuration(&primary, &original.body.replica);
+        let command = || Command::Activate {
+            body: Box::new(Activate {
+                configuration: config.clone(),
+                deactivation: original
+                    .peer_creation
+                    .as_ref()
+                    .unwrap()
+                    .deactivation
+                    .clone(),
+            }),
+            source: peer_source(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        };
+        run(&executor, command()).await;
+        let completion = configured(&effects(&executor));
+        assert_eq!(completion.flags, 0);
+        run(&executor, command()).await;
+        assert_eq!(configured(&effects(&executor)).flags, 0);
+        let pending = state(&executor);
+        let mut stale = completion.clone();
+        stale.local.instance -= 1;
+        assert_eq!(
+            run(&executor, Command::CompleteConfiguration(Box::new(stale))).await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty());
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::CompleteConfiguration(Box::new(completion.clone())))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(Arc::ptr_eq(&pending, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(effects(&executor).is_empty());
+            run(
+                &executor,
+                Command::CompleteConfiguration(Box::new(completion)),
+            )
+            .await;
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        let reply = effects(&executor);
+        assert!(
+            matches!(reply.as_slice(), [Effect::PeerActivateReply { body, .. }]
+            if body.replica.current_role == 3 && body.replica.previous_role == 1
+                && body.unit.previous == Epoch::default())
+        );
+        run(&executor, command()).await;
+        assert_eq!(effects(&executor), reply);
+        finish(&store, &executor).await;
+    }
+}
+
 #[tokio::test]
 async fn fm_idle_replacement_requires_completed_removal_and_ignores_predecessor_traffic() {
     let (store, executor, _) = setup(WAIT).await;

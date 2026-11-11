@@ -37,7 +37,19 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 139 inputs.
+The C++ producer independently constructs expected values and emits 151 inputs.
+The same-Primary configuration extension adds twelve independent cases for
+DoReconfiguration/Reply and Activate/Reply: four default/rich body pairs and
+four literal action headers. Four native schema types add eight fields
+(81 types/248 fields in total). The inherited ConfigurationMessageBody keeps
+native unit/replica-vector/service order, with derived phase-0 duration or
+deactivation information in its own scope. Default phase-0 duration remains
+TimeSpan::MaxValue; configuration replies contain the full replica vector.
+Production Rust factories/decoders verify both reply owners, exact priority/
+generation and cross-action rejection. Proper-prefix checks cover every new
+body; the actual native decoder now rejects 43 truncations. This is source
+stream/schema-adapter evidence, not native handler execution or FMM admission.
+All previous 139 inputs and 39 truncation rejections remain retained.
 The existing 36 cases and their contracts are retained:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp

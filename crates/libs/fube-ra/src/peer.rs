@@ -20,7 +20,8 @@ impl EntityState {
     /// Original opened-peer lineage for admission, not cleanup or replacement proof.
     pub fn peer_opened_lifetime(&self) -> bool {
         self.peer_creation.as_ref().is_some_and(|peer| {
-            self.body.replica.current_role == 2
+            (self.body.replica.current_role == 2
+                || (self.body.replica.current_role == 3 && self.reconfiguration.is_some()))
                 && match self.phase {
                     Phase::Ready => self.runtime.is_some() && self.usage.is_some(),
                     Phase::Closing | Phase::Closed => peer.close_started_open || peer.host_down,
@@ -229,6 +230,11 @@ fn create_remote(
     let current = current.ok_or(Failure::Admission(
         "remote creation needs an existing Primary",
     ))?;
+    if current.reconfiguration.is_some() {
+        return Err(Failure::Unsupported(
+            "active-configuration replica changes are gated",
+        ));
+    }
     if !admission.node_open || !admission.owner_ready || !admission.node_activated {
         return Ok(Transition::ignored(Disposition::IgnoredNotReady));
     }
@@ -616,6 +622,11 @@ pub(super) fn start_removal(
     peer: Option<&NodeInstance>,
 ) -> Result<Transition> {
     let current = current.ok_or(Failure::Admission("removal requires an existing Primary"))?;
+    if current.reconfiguration.is_some() {
+        return Err(Failure::Unsupported(
+            "configured-secondary removal is gated",
+        ));
+    }
     if !admission.node_open || !admission.owner_ready || !admission.node_activated {
         return Ok(Transition::ignored(Disposition::IgnoredNotReady));
     }
