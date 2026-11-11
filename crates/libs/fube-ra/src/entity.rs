@@ -1634,6 +1634,7 @@ fn transition(
                         host_down: false,
                         close_started_open: false,
                         close_completed: false,
+                        delete_operation: 0,
                     })
                 }
                 _ => None,

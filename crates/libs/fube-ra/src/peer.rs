@@ -12,6 +12,8 @@ pub struct PeerCreation {
     pub close_started_open: bool,
     /// Matching successful RAP completion, not an FM ACK or disposal receipt.
     pub close_completed: bool,
+    /// First applied Delete/Obliterate intent in this original session.
+    pub delete_operation: u64,
 }
 
 impl EntityState {
@@ -28,9 +30,11 @@ impl EntityState {
     }
 
     pub fn peer_terminal_report(&self) -> bool {
-        self.peer_creation
-            .as_ref()
-            .is_some_and(|peer| peer.host_down || peer.close_completed)
+        self.peer_creation.as_ref().is_some_and(|peer| {
+            peer.host_down
+                || peer.close_completed
+                || (peer.delete_operation != 0 && self.phase == Phase::Closed)
+        })
     }
 
     pub fn peer_host_loss(&self) -> bool {

@@ -1,6 +1,6 @@
 use crate::profile::{
     absent_replica_body, add_body, dropped_replica, pre_open_cancelled_body, AbsenceReceipt,
-    ActualProfile, FailedOpenReceipt, FailedRegistrationReceipt, Launch,
+    ActualProfile, FailedOpenReceipt, FailedRegistrationReceipt, HostLossReceipt, Launch,
     PreOpenCancellationReceipt, Result, RetirementReceipt,
 };
 use fube_ra::protocol::*;
@@ -122,6 +122,7 @@ pub(crate) struct IdleDeletion {
     cancellation: Option<PreOpenCancellationReceipt>,
     failed_registration: Option<FailedRegistrationReceipt>,
     failed_open: Option<FailedOpenReceipt>,
+    host_loss: Option<HostLossReceipt>,
     failure_error: Option<i64>,
     unknown: bool,
     started: Instant,
@@ -554,6 +555,63 @@ impl Ledger {
         let receipt = crate::profile::read_json(path)?;
         self.retirement(index, receipt, node_pid)
     }
+    pub fn read_host_loss(
+        &mut self,
+        index: usize,
+        path: &std::path::Path,
+        node_pid: u32,
+    ) -> Result<()> {
+        if !path.try_exists().map_err(crate::profile::err)? {
+            return Ok(());
+        }
+        self.host_loss(index, crate::profile::read_json(path)?, node_pid)
+    }
+    pub fn host_loss(&mut self, index: usize, proof: HostLossReceipt, node_pid: u32) -> Result<()> {
+        let placement = &self.placements[index];
+        proof.validate(
+            &placement.launch,
+            placement.profile.as_ref().ok_or("missing profile")?,
+            node_pid,
+        )?;
+        let Some(deletion) = &mut self.idle_deletion else {
+            return Ok(());
+        };
+        if deletion.unknown || !placement.link_alive {
+            return Ok(());
+        }
+        if index != 1
+            || !matches!(
+                deletion.target,
+                IdleDeleteTarget::Runtime
+                    | IdleDeleteTarget::PreRegistration
+                    | IdleDeleteTarget::Unobserved
+            )
+            || deletion.absence.is_some()
+            || deletion.cancellation.is_some()
+            || deletion.failed_registration.is_some()
+            || deletion.failed_open.is_some()
+            || deletion.host_loss.as_ref().is_some_and(|old| {
+                old.loss.creation != proof.loss.creation
+                    || old.loss.operation != proof.loss.operation
+                    || old.loss.host != proof.loss.host
+            })
+            || proof.loss.body.unit != deletion.body.replica.0.unit
+            || proof.loss.body.replica.node != deletion.body.replica.0.replica.node
+            || proof.loss.body.replica.id != deletion.body.replica.0.replica.id
+            || proof.loss.body.replica.instance != deletion.body.replica.0.replica.instance
+            || deletion
+                .reply
+                .as_ref()
+                .is_some_and(|reply| reply.unit != proof.loss.body.unit)
+            || placement.retirement.is_some()
+        {
+            return Err("host loss cannot replace another destination cleanup origin".into());
+        }
+        deletion.host_loss = Some(proof);
+        self.placements[1].created = true;
+        self.finish_idle_deletion();
+        Ok(())
+    }
     pub fn read_absence(
         &mut self,
         index: usize,
@@ -579,6 +637,7 @@ impl Ledger {
             return Ok(());
         }
         if deletion.target != IdleDeleteTarget::Unobserved
+            || deletion.host_loss.is_some()
             || placement.retirement.is_some()
             || deletion.cancellation.is_some()
             || deletion.failed_registration.is_some()
@@ -630,6 +689,7 @@ impl Ledger {
                 | IdleDeleteTarget::FailedRegistration
                 | IdleDeleteTarget::FailedOpen
         ) || deletion.absence.is_some()
+            || deletion.host_loss.is_some()
             || placement.retirement.is_some()
             || deletion.failed_registration.is_some()
             || deletion.failed_open.is_some()
@@ -676,11 +736,20 @@ impl Ledger {
         if deletion.unknown || !placement.link_alive {
             return Ok(());
         }
-        if deletion.target != IdleDeleteTarget::FailedRegistration
-            || deletion.failure_error != Some(proof.deletion.failure.error)
+        let origin_matches = match deletion.target {
+            IdleDeleteTarget::FailedRegistration => {
+                deletion.failure_error == Some(proof.deletion.failure.error)
+            }
+            IdleDeleteTarget::PreRegistration | IdleDeleteTarget::Unobserved => {
+                deletion.failure_error.is_none()
+            }
+            _ => false,
+        };
+        if !origin_matches
             || deletion.absence.is_some()
             || deletion.cancellation.is_some()
             || deletion.failed_open.is_some()
+            || deletion.host_loss.is_some()
             || placement.retirement.is_some()
             || proof.deletion.failure.body != pre_open_cancelled_body(&deletion.body.replica.0)
             || deletion
@@ -725,11 +794,20 @@ impl Ledger {
         if deletion.unknown || !placement.link_alive {
             return Ok(());
         }
-        if deletion.target != IdleDeleteTarget::FailedOpen
-            || deletion.failure_error != Some(proof.deletion.failure.error)
+        let origin_matches = match deletion.target {
+            IdleDeleteTarget::FailedOpen => {
+                deletion.failure_error == Some(proof.deletion.failure.error)
+            }
+            IdleDeleteTarget::Runtime
+            | IdleDeleteTarget::PreRegistration
+            | IdleDeleteTarget::Unobserved => deletion.failure_error.is_none(),
+            _ => false,
+        };
+        if !origin_matches
             || deletion.absence.is_some()
             || deletion.cancellation.is_some()
             || deletion.failed_registration.is_some()
+            || deletion.host_loss.is_some()
             || placement.retirement.is_some()
             || proof.deletion.failure.disposal.body != deletion.body.replica.0
             || deletion
@@ -1273,12 +1351,15 @@ impl Ledger {
             return Err("unrecognized retirement lifetime".into());
         }
         if index == 1 && placement.launch.profile == crate::ServiceProfile::StatefulPeerIdle {
-            if placement.loss_reported {
+            if placement.loss_reported && self.idle_deletion.is_none() {
                 return Ok(());
             }
             if self.idle_deletion.as_ref().is_some_and(|deletion| {
                 deletion.absence.is_some()
                     || deletion.cancellation.is_some()
+                    || deletion.host_loss.is_some()
+                    || deletion.failed_registration.is_some()
+                    || deletion.failed_open.is_some()
                     || matches!(
                         deletion.target,
                         IdleDeleteTarget::FailedRegistration | IdleDeleteTarget::FailedOpen
@@ -1635,6 +1716,7 @@ impl Ledger {
                         || deletion.cancellation.is_some()
                         || deletion.failed_registration.is_some()
                         || deletion.failed_open.is_some()
+                        || deletion.host_loss.is_some()
                 }))
     }
     pub fn idle_absence_allowed(&self) -> bool {
@@ -1661,8 +1743,15 @@ impl Ledger {
         now: Instant,
         target: IdleDeleteTarget,
     ) -> Result<DeleteReplica> {
+        self.request_idle_deletion_with_force(now, target, false)
+    }
+    pub fn request_idle_deletion_with_force(
+        &mut self,
+        now: Instant,
+        target: IdleDeleteTarget,
+        force: bool,
+    ) -> Result<DeleteReplica> {
         if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
-            || self.placements[1].loss_reported
             || self.generation.is_some()
             || !self.placements[1].link_alive
             || !self.placements[1].activated
@@ -1678,6 +1767,9 @@ impl Ledger {
                 return Err("original destination deletion is unknown".into());
             }
             deletion.last = now;
+            if force {
+                deletion.body.deletion.0.force = true;
+            }
             return Ok(deletion.body.clone());
         }
         let removal = self
@@ -1687,7 +1779,7 @@ impl Ledger {
         if removal.unknown || self.placements[0].observed != Observed::Running {
             return Err("original Idle abandonment owner is unknown".into());
         }
-        let body = DeleteReplica::new(removal.body.clone(), false);
+        let body = DeleteReplica::new(removal.body.clone(), force);
         let failure_error = self.idle_failed_creation_error();
         if (matches!(
             target,
@@ -1708,6 +1800,7 @@ impl Ledger {
             cancellation: None,
             failed_registration: None,
             failed_open: None,
+            host_loss: None,
             failure_error: if matches!(
                 target,
                 IdleDeleteTarget::FailedRegistration | IdleDeleteTarget::FailedOpen
@@ -1752,6 +1845,10 @@ impl Ledger {
             .absence
             .as_ref()
             .is_some_and(|proof| proof.absence.body.unit != body.unit)
+            || deletion
+                .host_loss
+                .as_ref()
+                .is_some_and(|proof| proof.loss.body.unit != body.unit)
             || deletion
                 .cancellation
                 .as_ref()
@@ -1809,9 +1906,13 @@ impl Ledger {
         };
         let complete = self.idle_deletion_complete();
         json!({"state":if complete { "deleted" } else if deletion.unknown { "unknown" } else { "pending" },
+            "cleanup_state":if complete { "complete" } else if deletion.unknown { "unknown" }
+                else if deletion.reply.is_some() { "unproved" } else { "pending_reply" },
             "kind":"fm_idle_deletion", "request":deletion.body, "reply":deletion.reply,
             "destination_deleted":self.idle_destination_deleted(),
             "disposed":self.placements[1].retirement.is_some() || deletion.failed_open.is_some(),
+            "host_lost":deletion.host_loss.is_some(),
+            "force":deletion.body.deletion.0.force,
             "never_created":deletion.absence.is_some(),
             "pre_open_cancelled":deletion.cancellation.is_some(),
             "failed_registration":deletion.failed_registration.is_some(),
@@ -1820,7 +1921,8 @@ impl Ledger {
                 else if deletion.absence.is_some() { Some("never_created") }
                 else if deletion.cancellation.is_some() { Some("pre_open_cancelled") }
                 else if deletion.failed_registration.is_some() { Some("failed_registration") }
-                else if deletion.failed_open.is_some() { Some("failed_open") } else { None },
+                else if deletion.failed_open.is_some() { Some("failed_open") }
+                else if deletion.host_loss.is_some() { Some("host_lost") } else { None },
             "complete":complete, "cleanup_required":!complete,
             "pending_remove":self.idle_removal.as_ref().is_some_and(|removal| removal.reply.is_none()),
             "reusable":false, "serving":false})
@@ -1830,6 +1932,9 @@ impl Ledger {
         self.retry_body(index, PendingPhase::Create, now)
     }
     pub fn deletion_retry(&mut self, index: usize, now: Instant) -> Result<Option<DeleteReplica>> {
+        if index == 1 && self.idle_deletion.is_some() {
+            return Ok(self.idle_deletion_retry(index, now));
+        }
         if self.placements[index].remove_received {
             return Ok(None);
         }

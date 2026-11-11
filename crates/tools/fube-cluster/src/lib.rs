@@ -762,6 +762,11 @@ impl Cluster {
             index,
             &child.launch.directory.join("failed-open-deletion.json"),
             node_pid,
+        )?;
+        self.ledger.read_host_loss(
+            index,
+            &child.launch.directory.join("host-loss.json"),
+            node_pid,
         )
     }
     pub fn status(&self) -> Value {
@@ -1020,6 +1025,10 @@ impl Cluster {
     /// cancellation, known creation failure or never-created absence;
     /// none authorizes a successor.
     pub async fn delete_idle_replica_via_fm(&mut self) -> Result<Value> {
+        self.delete_idle_replica_via_fm_with_force(false).await
+    }
+    /// Explicit native force authorization for the original destination only.
+    pub async fn delete_idle_replica_via_fm_with_force(&mut self, force: bool) -> Result<Value> {
         if self.finished.is_some()
             || self.children.len() != 2
             || self.config.profile != ServiceProfile::StatefulPeerIdle
@@ -1050,12 +1059,16 @@ impl Cluster {
                 && target["runtime_open_failure"]["error"]
                     .as_i64()
                     .is_some_and(|error| self.ledger.idle_failed_creation_error() == Some(error));
+            let terminal = target["phase"] == "Closed"
+                || target["phase"] == "Closing"
+                || target["phase"] == "Opening";
             if target["open"] != true
                 && !registered_open
                 && !pre_registration
                 && !unobserved
                 && !failed_registration
                 && !failed_open
+                && !terminal
             {
                 return Err("FM Idle deletion requires an original opening/opened or known creation-failed destination, or an absent unanswered FM Add".into());
             }
@@ -1071,9 +1084,13 @@ impl Cluster {
                 fm::IdleDeleteTarget::Runtime
             };
         }
-        let body = self
-            .ledger
-            .request_idle_deletion(Instant::now(), target_kind)?;
+        let body = if force {
+            self.ledger
+                .request_idle_deletion_with_force(Instant::now(), target_kind, true)?
+        } else {
+            self.ledger
+                .request_idle_deletion(Instant::now(), target_kind)?
+        };
         if let Err(error) = self.send_idle_deletion(&body).await {
             self.ledger.lost(1, error.clone());
             return Err(error);

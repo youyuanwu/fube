@@ -224,7 +224,9 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
         {
             // Close/AppHostDown use OnReplicaDown; other terminal origins use OnDropped.
             // Both serialize the closed volatile FT in ReplicaUp's dropped list.
-            state.fm_stage = if matches!(
+            state.fm_stage = if state.local_deleted {
+                FmStage::None
+            } else if matches!(
                 mode,
                 CloseMode::Close | CloseMode::DeactivateNode | CloseMode::AppHostDown
             ) {
@@ -235,7 +237,7 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
             if !state.local_deleted {
                 effects.push(Effect::RequestReportRetry);
             }
-        } else if !state.fm_primary && mode != CloseMode::Delete {
+        } else if !state.fm_primary && mode != CloseMode::Delete && !state.local_deleted {
             effects.push(Effect::StatefulClosePending {
                 body: state.body.clone(),
                 mode,
@@ -323,6 +325,16 @@ fn start_close_inner(
     effects: &mut Vec<Effect>,
     dispatch_retry: bool,
 ) {
+    if matches!(
+        mode,
+        CloseMode::Delete | CloseMode::ForceDelete | CloseMode::Obliterate
+    ) {
+        if let Some(peer) = &mut state.peer_creation {
+            if peer.delete_operation == 0 {
+                peer.delete_operation = token;
+            }
+        }
+    }
     if state.phase == Phase::Closed {
         if mode.deletes() {
             mark_deleted(state);
@@ -347,8 +359,11 @@ fn start_close_inner(
             if mode == CloseMode::AppHostDown
                 && (state.phase == Phase::Ready
                     || (state.phase == Phase::Closing
-                        && matches!(state.close_mode, Some(CloseMode::Close | CloseMode::Drop))
-                        && peer.close_started_open))
+                        && ((matches!(
+                            state.close_mode,
+                            Some(CloseMode::Close | CloseMode::Drop)
+                        ) && peer.close_started_open)
+                            || peer.delete_operation != 0)))
             {
                 peer.host_down = true;
             }
@@ -574,16 +589,7 @@ pub(super) fn transition(
                     ));
                 }
                 if let Some(original) = current.filter(|state| state.peer_creation.is_some()) {
-                    if request.deletion.0.force
-                        || !(original.phase == Phase::Ready
-                            || (original.phase == Phase::Opening
-                                && original.runtime.is_some() == original.usage.is_some())
-                            || original.failed_registration_error().is_some()
-                            || original.failed_open_error().is_some()
-                            || original.peer_terminal_report()
-                            || original.local_deleted)
-                        || original.body.replica.current_role != 2
-                    {
+                    if original.body.replica.current_role != 2 {
                         return Err(Failure::Unsupported(
                             "peer deletion requires an original opening or opened Idle",
                         ));

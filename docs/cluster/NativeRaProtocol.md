@@ -300,6 +300,25 @@ qualification. HostDown during Abort, failed/ForceAbort reporting and
 replacement remain gated. See the
 [opened destination Abort guide](MinimalFmCluster.md#normal-opened-destination-abort-reporting).
 
+The [complete original-session Delete subprofile](MinimalFmCluster.md#complete-original-session-destination-delete-contract)
+now covers normal/force Delete of the original opening, closing, closed, failed,
+absent or lost Idle. [RA:777-834][ra-main] selects Delete for closed FTs and
+Obliterate for open force; [FT:4781-4842,4916-5070][ft] supplies wait/supersession,
+no-registration completion and exact original-host termination.
+`FMMessageState.cpp:99-113,148-176,336-342` keeps deleted FTs at stage None:
+Delete-error ForceAbort and loss during normal Delete cannot leave a synthetic
+report obligation. Closed Delete retries reply without another RAP call.
+Metadata success still joins distinct original disposal, absence, cancellation,
+known failure or positive owned-process-loss evidence. Historical applied facts
+survive later app exit, never Node-owner adoption; unproved metadata and owner
+loss remain incomplete/unknown. Host loss is not graceful disposal and no
+Delete outcome authorizes replacement or clears Primary pending-remove.
+Model/store and original process/Channel matrices qualify these bounded paths,
+including held disposal, force supersession, no-runtime force, proof conflicts,
+commit uncertainty and reply replay. The codec oracle remains 139 cases;
+native C++ handlers, full FM/Federation interop, recovery and broader profiles
+are separate qualification.
+
 ### Stage-two native codec contracts and execution boundary
 
 The pinned [RSMessage.cpp:52–55,111–112,130,210–219][registry] initializers use
@@ -610,9 +629,11 @@ reporting `failed_open` with genuine disposal while retaining the Add failure
 and independent Primary pending-remove. Held provider/service disposal and
 actual process/Channel acceptance use the existing dynamic Open Drop=1 policy
 for qualification only; production defaults remain unchanged.
-Opening/other-close-mode host-loss and other failed/unknown absent lifetimes, force, arbitrary targets
-and replacement remain gated. No wire type/shape or native handler qualification
-is added by the trusted-local absence DTO.
+The complete original-session Delete contract above now includes closing/closed/
+lost and explicit force paths. Unproved ownership and foreign/later incarnations
+never become absence or disposal; general reporting, replacement and recovery
+remain separate gates. Trusted-local cleanup/loss DTOs add no wire shape or
+native C++ handler qualification.
 
 | Actions and actual direction | Sender → receiver; metadata; schema | Preconditions, semantic completion and retry; native tests; status |
 |---|---|---|

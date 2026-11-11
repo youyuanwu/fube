@@ -70,10 +70,39 @@ loss does not undo independently owned destination deletion.
 The app host/package remain resident and `reusable=false`; no replacement is
 authorized. Normal Delete produces no terminal ReplicaUp report. Delayed
 original CreateReplica is ignored by the deleted tombstone and cannot reopen
-the Idle. Force and broader peer cleanup remain gated.
+the Idle. Original-session closing/closed/lost and explicit force deletion now
+follow the complete bounded contract below; foreign identities and replacement
+remain gated.
 An original failed Add keeps its error even if an already-opened destination is
 explicitly deleted; semantic deletion clears to-be-dropped, and joined disposal
 clears destination-cleanup-required, separately from pending-remove.
+
+The original-session Delete subprofile also covers normal Delete during an
+existing Close/Drop/Abort, closed metadata, host loss and Delete-error escalation
+to ForceAbort. Normal Delete waits/retries rather than superseding another
+close; a later closed Delete sends no second RAP call. Error escalation sends
+real RAP Abort on the existing retry and cannot report a locally deleted FT.
+
+`delete_idle_replica_via_fm_with_force(true)` explicitly authorizes native force
+for that same original target. Open force uses Obliterate/termination of the
+original acquired app host, including superseding held cleanup. Without adopted
+registration it finishes closure without killing the factory; closed/missing
+force uses normal metadata Delete. Retries retain the original descriptor and
+any explicitly escalated force flag.
+
+`completion=host_lost` joins the native metadata reply with `host-loss.json`:
+positive original-process exit, original Applied Delete intent, closed/deleted
+unfenced RA state and fully drained original ownership. It sets
+`host_lost=true`, **not** `disposed=true`. Original applied disposal/no-runtime/
+failure histories remain valid after later app exit while the same Node owns
+them, and take precedence over host-loss classification.
+Unsolicited terminal reports still supply no operator-delete/reuse authority;
+explicit Delete can join the original retained cleanup fact after such a report.
+Metadata without proof stays incomplete with `cleanup_state=unproved`; losing
+the original Node session leaves `state=unknown`.
+All outcomes preserve independent Primary pending-remove, `reusable=false`,
+historical Add errors and no recovery/replacement permission.
+See the [complete bounded contract and acceptance matrix](../../../docs/cluster/MinimalFmCluster.md#complete-original-session-destination-delete-contract).
 
 For the original **unanswered FM Add**, deletion also admits a destination
 that has no FT yet. RA commits the native missing-FT deleted tombstone and
@@ -137,7 +166,7 @@ and fail the initial Idle role callback within RAP Open, using the existing
 dynamic Open Drop=1 threshold for qualification only. Production defaults and
 native wire schemas are unchanged.
 Host loss (including later registration failure after runtime loss),
-other failed/unknown absent lifetimes, arbitrary targets,
+unproved cleanup histories, arbitrary targets,
 future incarnations and replacement are not authorized by this branch.
 
 The separate original **opened Idle app-host-loss** path sends native

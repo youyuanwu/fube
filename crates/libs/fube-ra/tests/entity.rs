@@ -2889,7 +2889,7 @@ async fn peer_normal_close_or_drop_host_loss_preserves_open_origin_and_fences_la
 }
 
 #[tokio::test]
-async fn peer_normal_close_or_drop_origin_loss_and_ack_each_require_their_own_applied_commit() {
+async fn peer_close_drop_or_force_delete_loss_and_ack_each_require_their_own_applied_commit() {
     for (mode, step) in [
         (CloseMode::Close, 0),
         (CloseMode::Close, 1),
@@ -2897,6 +2897,9 @@ async fn peer_normal_close_or_drop_origin_loss_and_ack_each_require_their_own_ap
         (CloseMode::Drop, 0),
         (CloseMode::Drop, 1),
         (CloseMode::Drop, 2),
+        (CloseMode::Obliterate, 0),
+        (CloseMode::Obliterate, 1),
+        (CloseMode::Obliterate, 2),
     ] {
         for (unknown, fail) in [(false, true), (true, false), (true, true)] {
             let (store, executor, hooks) = setup(if unknown {
@@ -2907,9 +2910,15 @@ async fn peer_normal_close_or_drop_origin_loss_and_ack_each_require_their_own_ap
             .await;
             let request = make_peer_idle_ready(&executor).await;
             let host = state(&executor).runtime.as_ref().unwrap().host.clone();
-            let close = || Command::CloseLocal {
-                unit: request.replica.0.unit.id.clone(),
-                mode,
+            let close = || {
+                if mode == CloseMode::Obliterate {
+                    primary_delete(request.replica.0.clone(), true)
+                } else {
+                    Command::CloseLocal {
+                        unit: request.replica.0.unit.id.clone(),
+                        mode,
+                    }
+                }
             };
             let loss = || {
                 Command::HostDown(Box::new(HostDown {
@@ -2979,15 +2988,29 @@ async fn peer_normal_close_or_drop_origin_loss_and_ack_each_require_their_own_ap
                 }
             }
             let applied = state(&executor);
-            assert!(applied.peer_creation.as_ref().unwrap().close_started_open);
-            assert_eq!(applied.peer_host_loss(), step != 0);
+            assert_eq!(
+                applied.peer_creation.as_ref().unwrap().close_started_open,
+                mode != CloseMode::Obliterate
+            );
+            assert_eq!(
+                applied.peer_host_loss(),
+                step != 0 && mode != CloseMode::Obliterate
+            );
+            assert_eq!(
+                applied.peer_creation.as_ref().unwrap().delete_operation != 0,
+                mode == CloseMode::Obliterate || step == 2
+            );
             assert_eq!(applied.peer_terminal_report(), step != 0);
             assert!(!applied.peer_creation.as_ref().unwrap().close_completed);
             assert_eq!(applied.local_deleted, step == 2);
             assert_eq!(
                 applied.fm_stage,
                 if step == 1 {
-                    FmStage::ReplicaDown
+                    if mode == CloseMode::Obliterate {
+                        FmStage::ReplicaDropped
+                    } else {
+                        FmStage::ReplicaDown
+                    }
                 } else {
                     FmStage::None
                 }
@@ -2996,7 +3019,10 @@ async fn peer_normal_close_or_drop_origin_loss_and_ack_each_require_their_own_ap
             assert_eq!(
                 actions
                     .iter()
-                    .filter(|effect| matches!(effect, Effect::Close { .. }))
+                    .filter(|effect| matches!(
+                        effect,
+                        Effect::Close { .. } | Effect::TerminateHost { .. }
+                    ))
                     .count(),
                 usize::from(step == 0)
             );
@@ -3795,14 +3821,6 @@ async fn fm_peer_idle_delete_uses_stateful_reply_and_retains_original_deleted_to
         run(&executor, primary_delete(stale, false)).await,
         Disposition::IgnoredStale
     );
-    assert!(matches!(
-        executor
-            .submit(primary_delete(request.replica.0.clone(), true))
-            .unwrap()
-            .wait(WAIT)
-            .await,
-        Err(Failure::Unsupported(_))
-    ));
     assert!(Arc::ptr_eq(&original, &state(&executor)));
     assert!(effects(&executor).is_empty());
     let mut incoming = request.replica.0.clone();
@@ -3837,7 +3855,11 @@ async fn fm_peer_idle_delete_uses_stateful_reply_and_retains_original_deleted_to
     assert!(closed.local_deleted && closed.cleanup_pending);
     assert_eq!(closed.fm_stage, FmStage::None);
     assert!(closed.usage.is_none() && closed.runtime.is_none());
-    assert_eq!(closed.peer_creation, original.peer_creation);
+    assert!(closed.peer_creation.as_ref().unwrap().delete_operation != 0);
+    assert_eq!(
+        closed.peer_creation.as_ref().unwrap().source,
+        original.peer_creation.as_ref().unwrap().source
+    );
     let writes = hooks.calls.load(Ordering::SeqCst);
     run(&executor, primary_delete(request.replica.0.clone(), false)).await;
     assert!(
@@ -3988,7 +4010,7 @@ async fn fm_absent_peer_delete_commit_barrier_fences_reply_and_queued_creation()
 }
 
 #[tokio::test]
-async fn fm_peer_idle_delete_rejects_unowned_closed_cleanup() {
+async fn fm_peer_idle_closed_delete_is_metadata_only_without_claiming_runtime_cleanup() {
     let (store, executor, _) = setup(WAIT).await;
     executor.bind_peer(peer_source()).unwrap();
     let request = peer_request();
@@ -4004,19 +4026,258 @@ async fn fm_peer_idle_delete_rejects_unowned_closed_cleanup() {
     .await;
     effects(&executor);
     assert_eq!(state(&executor).phase, Phase::Closed);
-    let before = state(&executor);
+    run(&executor, primary_delete(request.replica.0.clone(), false)).await;
     assert!(matches!(
-        executor
-            .submit(primary_delete(request.replica.0.clone(), false))
-            .unwrap()
-            .wait(WAIT)
-            .await,
-        Err(Failure::Unsupported(_))
+        effects(&executor).as_slice(),
+        [Effect::DeleteReplicaReply(_)]
     ));
-    assert!(Arc::ptr_eq(&before, &state(&executor)));
-    assert!(effects(&executor).is_empty());
-    assert!(!state(&executor).local_deleted);
+    assert!(state(&executor).local_deleted && state(&executor).runtime.is_none());
     finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn peer_delete_waits_for_existing_close_then_deletes_metadata_without_second_rap() {
+    for mode in [CloseMode::Close, CloseMode::Drop, CloseMode::Abort] {
+        let (store, executor, _) = setup(WAIT).await;
+        let request = make_peer_idle_ready(&executor).await;
+        run(
+            &executor,
+            Command::CloseLocal {
+                unit: request.replica.0.unit.id.clone(),
+                mode,
+            },
+        )
+        .await;
+        effects(&executor);
+        let closing = state(&executor);
+        assert_eq!(
+            run(&executor, primary_delete(request.replica.0.clone(), false)).await,
+            Disposition::IgnoredPending
+        );
+        assert_eq!(state(&executor), closing);
+        assert!(effects(&executor).is_empty());
+        close_done(&executor, 0).await;
+        effects(&executor);
+        for force in [false, true] {
+            run(&executor, primary_delete(request.replica.0.clone(), force)).await;
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::DeleteReplicaReply(_)]
+            ));
+            assert!(state(&executor).local_deleted && state(&executor).cleanup_pending);
+            assert_eq!(state(&executor).fm_stage, FmStage::None);
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn peer_force_delete_obliterates_only_live_registered_original_and_acks_closed_metadata() {
+    for origin in 0..5 {
+        let (store, executor, _) = setup(WAIT).await;
+        let request = if origin == 0 || origin == 4 {
+            executor.bind_peer(peer_source()).unwrap();
+            let request = peer_request();
+            run(&executor, peer_create(request.clone())).await;
+            effects(&executor);
+            if origin == 4 {
+                registered(&executor, &request.replica.0, state(&executor).open_token).await;
+            }
+            request
+        } else {
+            make_peer_idle_ready(&executor).await
+        };
+        let host = state(&executor)
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.host.clone());
+        if matches!(origin, 2 | 3) {
+            run(
+                &executor,
+                Command::CloseLocal {
+                    unit: request.replica.0.unit.id.clone(),
+                    mode: CloseMode::Close,
+                },
+            )
+            .await;
+            effects(&executor);
+            if origin == 3 {
+                close_done(&executor, 0).await;
+                effects(&executor);
+            }
+        }
+        let mut force = request.replica.0.clone();
+        if origin == 1 {
+            force.unit.current.configuration -= 1;
+        }
+        run(&executor, primary_delete(force, true)).await;
+        let operation = state(&executor)
+            .peer_creation
+            .as_ref()
+            .unwrap()
+            .delete_operation;
+        let actions = effects(&executor);
+        if origin == 3 {
+            assert!(matches!(
+                actions.as_slice(),
+                [Effect::DeleteReplicaReply(_)]
+            ));
+        } else {
+            if let Some(host) = host {
+                assert!(matches!(actions.as_slice(), [Effect::TerminateHost { .. }]));
+                assert_eq!(state(&executor).close_mode, Some(CloseMode::Obliterate));
+                assert!(!state(&executor).local_deleted);
+                run(
+                    &executor,
+                    Command::HostDown(Box::new(HostDown {
+                        unit: request.replica.0.unit.id.clone(),
+                        host,
+                    })),
+                )
+                .await;
+                let released = effects(&executor);
+                assert_eq!(
+                    released
+                        .iter()
+                        .filter(|e| matches!(e, Effect::ReleaseUsage { .. }))
+                        .count(),
+                    1
+                );
+                assert!(!released
+                    .iter()
+                    .any(|e| matches!(e, Effect::Close { .. } | Effect::DeleteReplicaReply(_))));
+                assert_eq!(
+                    state(&executor)
+                        .peer_creation
+                        .as_ref()
+                        .unwrap()
+                        .delete_operation,
+                    operation
+                );
+            } else {
+                assert!(actions
+                    .iter()
+                    .all(|e| matches!(e, Effect::RequestReportRetry | Effect::Health(_))));
+            }
+            assert_eq!(state(&executor).fm_stage, FmStage::ReplicaDropped);
+            run(
+                &executor,
+                Command::RetryReport(request.replica.0.unit.id.clone()),
+            )
+            .await;
+            let Effect::ReplicaUp(report) = effects(&executor).remove(0) else {
+                panic!("dropped report");
+            };
+            run(&executor, ack(*report, false)).await;
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::DeleteReplicaReply(_)]
+            ));
+        }
+        assert_eq!(state(&executor).phase, Phase::Closed);
+        assert!(state(&executor).local_deleted && state(&executor).usage.is_none());
+        assert_eq!(state(&executor).fm_stage, FmStage::None);
+        assert_eq!(
+            state(&executor)
+                .peer_creation
+                .as_ref()
+                .unwrap()
+                .delete_operation,
+            operation
+        );
+        assert_eq!(
+            run(&executor, peer_create(request)).await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty());
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn peer_delete_error_force_abort_requires_applied_cleanup_and_original_delete_retry() {
+    for (unknown, fail) in [(false, true), (true, false), (true, true)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        let request = make_peer_idle_ready(&executor).await;
+        executor
+            .config()
+            .set(RetryState::Deleting, Threshold::Drop, 1);
+        run(&executor, primary_delete(request.replica.0.clone(), false)).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::Close { flags: 8, .. }]
+        ));
+        close_done(&executor, -55).await;
+        assert!(effects(&executor).is_empty());
+        assert_eq!(state(&executor).close_mode, Some(CloseMode::ForceAbort));
+        assert!(state(&executor).local_deleted);
+        run(
+            &executor,
+            Command::RetryClose(request.replica.0.unit.id.clone()),
+        )
+        .await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::Close { flags: 4, .. }]
+        ));
+        let original = state(&executor);
+        let completion = close_completion(&executor, 0);
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::CompleteClose(Box::new(completion.clone())))
+            .unwrap();
+        tokio::time::timeout(WAIT, entered).await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&original, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot([1; 16]).fenced);
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(Arc::ptr_eq(&original, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+            if unknown {
+                finish(&store, &executor).await;
+                continue;
+            }
+            run(&executor, Command::CompleteClose(Box::new(completion))).await;
+        } else {
+            assert_eq!(ticket.resolve(WAIT).await, Ok(Disposition::Applied));
+        }
+        let actions = effects(&executor);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|e| matches!(e, Effect::ReleaseUsage { .. }))
+                .count(),
+            1
+        );
+        assert!(!actions.iter().any(|e| matches!(
+            e,
+            Effect::RequestReportRetry
+                | Effect::StatefulClosePending { .. }
+                | Effect::DeleteReplicaReply(_)
+        )));
+        assert_eq!(state(&executor).phase, Phase::Closed);
+        if unknown {
+            finish(&store, &executor).await;
+            continue;
+        }
+        run(&executor, primary_delete(request.replica.0, false)).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::DeleteReplicaReply(_)]
+        ));
+        assert_eq!(state(&executor).fm_stage, FmStage::None);
+        finish(&store, &executor).await;
+    }
 }
 
 async fn fail_peer_registration(executor: &Executor, request: &CreateReplica, error: i64) {
@@ -4201,15 +4462,11 @@ async fn runtime_open_failure_has_distinct_delete_origin_and_host_loss_does_not(
         assert_eq!(state(&executor).failed_registration_error(), None);
         if registration_after_runtime_loss {
             assert_eq!(state(&executor).failed_open_error(), None);
+            run(&executor, primary_delete(request.replica.0, false)).await;
             assert!(matches!(
-                executor
-                    .submit(primary_delete(request.replica.0, false))
-                    .unwrap()
-                    .wait(WAIT)
-                    .await,
-                Err(Failure::Unsupported(_))
+                effects(&executor).as_slice(),
+                [Effect::DeleteReplicaReply(_)]
             ));
-            assert!(effects(&executor).is_empty());
         } else {
             assert_eq!(state(&executor).failed_open_error(), Some(-55));
             let failed = state(&executor);
@@ -4359,7 +4616,11 @@ async fn fm_pre_registration_peer_delete_drains_late_lookup_without_rap_or_absen
     assert_ne!(closed.close_token, 0);
     assert_eq!(closed.registration_lookups, opening.registration_lookups);
     assert!(closed.runtime.is_none() && closed.usage.is_none());
-    assert_eq!(closed.peer_creation, opening.peer_creation);
+    assert!(closed.peer_creation.as_ref().unwrap().delete_operation != 0);
+    assert_eq!(
+        closed.peer_creation.as_ref().unwrap().source,
+        opening.peer_creation.as_ref().unwrap().source
+    );
     let disposed = registration_actions(&executor, &request.replica.0, opening.open_token).await;
     assert!(
         matches!(disposed.as_slice(), [Effect::ReleaseRegistration(registration), Effect::ReleaseUsage { acquisition }]
@@ -4467,7 +4728,11 @@ async fn fm_registered_peer_idle_delete_drains_open_without_publishing_creation(
     assert!(closing.local_deleted && !closing.cleanup_pending);
     assert_eq!(closing.runtime, opening.runtime);
     assert_eq!(closing.usage, opening.usage);
-    assert_eq!(closing.peer_creation, opening.peer_creation);
+    assert!(closing.peer_creation.as_ref().unwrap().delete_operation != 0);
+    assert_eq!(
+        closing.peer_creation.as_ref().unwrap().source,
+        opening.peer_creation.as_ref().unwrap().source
+    );
     assert_eq!(
         run(&executor, peer_create(request.clone())).await,
         Disposition::IgnoredPending
@@ -7329,7 +7594,7 @@ async fn native_close_failures_warning_forceabort_and_captured_reply_mode() {
             ]
         ));
         if stateful {
-            assert_eq!(state(&executor).fm_stage, FmStage::ReplicaDropped);
+            assert_eq!(state(&executor).fm_stage, FmStage::None);
             assert_eq!(
                 run(&executor, Command::RetryReport(request.unit.id.clone())).await,
                 Disposition::IgnoredPending

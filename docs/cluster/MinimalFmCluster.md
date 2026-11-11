@@ -434,7 +434,7 @@ Status records `state=lost`, `destination_lost=true`, `ready=false`, with
 `native_replica_deleted` tracking the separate metadata reply. Historical Add
 replies/errors remain retained, but late success cannot restore readiness or
 restart creation. Physical cleanup is still owned independently:
-`destination_cleanup_required` remains true, with no retirement/disposal,
+Without explicit Delete, `destination_cleanup_required` remains true, with no retirement/disposal,
 absence, cancellation or failed-Open receipt and no reuse/replacement.
 Primary pending-remove is unchanged until its own RemoveReplicaReply; the
 existing explicit FM removal API can also retire the Primary session after
@@ -490,7 +490,8 @@ FM still records the closed volatile lifetime as `lost`, retains historical
 Add results and clears current Idle readiness. Genuine disposal evidence is
 separate from that native report acknowledgment: a validated retirement sidecar
 does not authorize retirement/reuse in this terminal-report flow. Explicit
-operator deletion remains incomplete, Primary pending-remove needs its own
+operator deletion is not implicitly created or completed; an explicit Delete
+must join its original metadata reply and retained cleanup fact. Primary pending-remove needs its own
 RemoveReplicaReply, and no replacement/recovery is authorized.
 The existing publisher may persist the original Close proof after metadata
 deletion; that does not change those FM authority boundaries.
@@ -537,7 +538,7 @@ Original-runtime disposal/accounting proof remains independently observable
 before ACK and unchanged after metadata replay. The replication listener is
 retired while the original app host/runtime/factory remain resident. FM records
 `lost`, not reusable state; neither a metadata ACK nor valid disposal sidecar
-authorizes replacement, completes explicit operator deletion or clears Primary
+authorizes replacement, implicitly completes operator deletion or clears Primary
 pending-remove. Model/store tests cover intent/completion/ACK commit barriers,
 both ACK lists, stale/late traffic and excluded origins. Controlled original
 Node/process/Channel tests hold provider/service disposal separately, exercise
@@ -572,7 +573,7 @@ The existing canonical ReplicaUp dropped entry, immediate/30-second retry,
 dropped-description ACK requirement and processed-list ACK/closed metadata
 Delete/reply path apply. A dropped-list ACK instead performs closed ForceDelete
 without that reply. FM still records lost volatile state, not reuse authority;
-disposal and metadata ACK do not clear Primary pending-remove, complete explicit
+disposal and metadata ACK do not clear Primary pending-remove, implicitly create
 operator deletion or authorize replacement.
 
 Model/store tests cover non-force admission, unavailable registration, both ACK
@@ -612,15 +613,89 @@ resident with `reusable=false`; normal shutdown still owns their cleanup.
 Destination-session loss leaves unresolved deletion unknown; source-session
 loss does not supply or undo destination completion.
 
-RA admits only this already-opened peer-created Idle and its original deletion
-retries. Native DeleteLocalReplica epoch/ReplicaId checks still apply; an older
+This opened-runtime branch retains the original peer-created Idle and deletion
+lineage. Native DeleteLocalReplica epoch/ReplicaId checks still apply; an older
 FM replica instance does not block deletion of the matching local ReplicaId.
 Delete intent and Close completion remain behind their own commits. The reply
 uses native None/None/Dropped/down metadata, invalid version/LSNs and no endpoints.
 Normal deletion schedules no ReplicaDown/ReplicaDropped report. Same-incarnation
 CreateReplica after deletion is ignored without Open, build or usage acquisition.
-Force, arbitrary unknown/replacement,
-active membership and recovery remain gated.
+Force for this original lifetime is supported by the explicit API below.
+Foreign identities, replacement, active membership and recovery remain gated.
+
+### Complete original-session destination Delete contract
+
+The bounded volatile peer-Idle profile now handles normal and force Delete for
+the original opening, closing, closed, failed, absent or lost destination.
+`delete_idle_replica_via_fm()` remains normal. Explicit
+`delete_idle_replica_via_fm_with_force(true)` authorizes the existing native
+force flag; it adds no child policy-control or implicit replacement command.
+Original FM abandonment remains required, independently of its RemoveReplicaReply.
+
+Pinned `ReconfigurationAgent.cpp:777-834` chooses normal Delete for a closed FT,
+even for a force request; an open force request selects Obliterate.
+`FailoverUnit.cpp:4781-4842,4916-5070` preserves native close admission:
+normal Delete waits/retries while another Close/Drop/Abort owns cleanup, then
+deletes closed metadata without another RAP call. Force can supersede pending
+closure and terminates only the original acquired host, never an arbitrary PID.
+Without an adopted registration, native force finishes closure without killing
+the resident factory. Missing-FT force uses the ordinary closed tombstone.
+
+Delete Close errors follow the native Deleting retry policy into ForceAbort.
+The next existing Close retry sends RAP Abort (`flags=4`); its actual cleanup,
+Applied completion and exact usage release remain required for disposal.
+`FMMessageState.cpp:99-113,148-176,336-342` suppresses both reporting stages for
+locally deleted metadata. Thus Delete-error ForceAbort, or host loss after
+normal Delete marked deleted, leaves no pending dropped/down report.
+A subsequent original Delete retry returns the canonical closed reply.
+Fresh Obliterate instead reports ReplicaDropped until processed ACK/closed
+metadata Delete; it never invents graceful disposal.
+
+The original request descriptor and target incarnation stay frozen. Explicit
+normal-to-force escalation retains that descriptor and subsequent retries keep
+force=true. No downgrade or stronger cleanup claim is inferred from transport,
+an observation snapshot, or a later replica incarnation.
+
+Native metadata acknowledgment still joins an independent original-owner fact:
+
+| `completion` | Required local fact in addition to DeleteReplicaReply |
+|---|---|
+| `disposed` | Actual successful RAP cleanup, Applied completion and exact original acquisition release, including Delete's Abort fallback. |
+| `never_created` | Applied missing-FT Delete with zero Open/Close/runtime/lookup history. |
+| `pre_open_cancelled` | Original creation and Applied cancellation, committed deleted metadata, no RAP route and drained late lookup/acquisition ownership; also covers force before registration. |
+| `failed_registration` | Original Applied pre-Open failure plus separate Applied Delete and drained ownership. |
+| `failed_open` | Original-runtime Abort/final-release failure reply, Applied failure/Delete and exact usage release. |
+| `host_lost` | Original owned process positively observed exited, original Applied Delete intent, unfenced closed/deleted metadata and fully drained original usage/lookup/command ownership. |
+
+`host-loss.json` carries the last fact from the still-owned original Node.
+It is not a destructor receipt: `host_lost=true`, `disposed=false`, no retirement
+or reuse authority. Its creation/Delete operation, FT/service/replica,
+deployment/session/generation, original node/app PIDs and runtime root are
+validated together. Positive completed cleanup/no-runtime histories are
+preferred to host-loss classification, and remain valid if the app exits later;
+the original Node, proof lineage and all draining/fencing checks must still hold.
+A late issued lookup into a retired, already-deleted host completes explicitly
+as native type-not-registered rather than acquiring a new owner or stranding
+the original lookup.
+
+Without explicit operator Delete, unsolicited Close/loss reports still do not
+retire the placement or authorize reuse. Explicit Delete can now join an
+already-closed original's independently retained cleanup proof or host-loss
+fact. Metadata alone leaves `complete=false`, `cleanup_state=unproved`;
+original Node/session loss leaves `state=unknown`. Neither is converted to
+absence, disposal or a recovered empty replica.
+
+All successful outcomes keep Primary pending-remove independent and
+`reusable=false`. Package/work roots stay owned until shutdown. Model/store
+tests cover normal/force/closed races, Delete-error escalation, force intent/
+HostDown/ACK commit failure and uncertainty, strict identity/epoch checks,
+proof ordering/conflicts and owner loss. Real original Node/process/Channel
+tests cover held provider/service closure, force supersession without releasing
+those holds, no-runtime force cancellation/absence, metadata replay, stale
+Create, historical proofs after app exit and continued Primary data access.
+These complete this original-session Delete subprofile, not persisted services,
+active membership, replacement, reconfiguration, recovery or native C++
+handler/FM-Federation interoperability qualification.
 
 ### Deleting the original registered destination during Open
 
@@ -681,8 +756,9 @@ disposal; observed pre-registration Opening cannot downgrade to missing-FT
 absence on retry. An unobserved original creation permits the corresponding
 source-bound proof for the actual outcome. If registration wins the race,
 genuine disposal remains required. The known pre-Open registration failure
-branch below is separate; other failed/unknown lifetimes, force,
-arbitrary targets, replacement and recovery remain gated.
+branch below is separate. Force and app-exit races use the contract above;
+unproved ownership, foreign targets, replacement and recovery never become
+successful absence or disposal.
 
 Real-process/Channel acceptance holds the original FT before lookup adoption,
 then holds an actual acquired lookup after the native Delete reply. It proves
@@ -729,8 +805,8 @@ Primary writes. Model/store tests cover late acquired offers, definite/unknown
 Delete commits, mismatched lineage/error and independent owner loss. This is
 controlled owned-Node/production-adapter acceptance, not a new child-node
 policy-control feature or native C++ handler/interoperability qualification.
-Unknown/missing failure lineage, other absent/down
-branches and replacement remain gated.
+Unknown/missing failure lineage permits metadata handling only, not a fabricated
+failure or disposal receipt. Replacement remains gated.
 
 ### Deleting the original destination after terminal runtime Open failure
 
@@ -767,8 +843,9 @@ Lost Delete reply/replay, late Create/Add, retained error and healthy Primary
 writes are exercised. Model/store tests cover separate failure/Delete commits,
 definite failure, uncertainty, foreign lineage/proof conflicts and owner loss.
 This adds no native wire schema or C++ handler/interoperability qualification.
-Opening/other-close-mode host-loss and other failed/unknown absent/down cleanup
-remain gated.
+Opening/loss/closed Delete and force use the original-session contract above.
+Unproved cleanup remains explicit; general unsolicited lifecycle reporting,
+replacement and recovery remain separately gated.
 
 ### Deleting the original destination before CreateReplica
 
@@ -809,7 +886,7 @@ Primary pending-remove still requires its own RemoveReplicaReply.
 Only the original unanswered FM Add permits absent cleanup. An already-opened
 original or registered in-flight Open still uses genuine disposal proof;
 pre-registration Opening uses the distinct cancellation proof above.
-Other failed or unknown absent lifetimes, force, arbitrary targets and later incarnations remain
+Foreign targets and later incarnations remain
 gated. No fresh lifetime, restart recovery or active membership is authorized.
 
 Controlled real application-process/Channel acceptance holds the original
@@ -1097,8 +1174,8 @@ ReplicaId/instance before the command's own guards
 epochs reject; force bypasses that epoch guard, never the ReplicaId guard.
 Closed force requests use normal Delete completion without killing the host.
 These metadata-only replies cannot prove disposal of a service object.
-Delete-error escalation to ForceAbort retains native ReplicaDropped stage but
-suppresses payload delivery for an already locally deleted FT. A later normal
+Delete-error escalation to ForceAbort leaves native message stage None for an
+already locally deleted FT; OnDropped does not schedule another report. A later normal
 Delete retry completes closed metadata; no gated report effect can strand its
 independently proved disposal/accounting.
 

@@ -630,6 +630,47 @@ impl RetirementReceipt {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct HostLossReceipt {
+    pub deployment: String,
+    pub session: String,
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    #[serde(with = "json_node")]
+    pub fm: NodeInstance,
+    #[serde(with = "json_generation")]
+    pub generation: GenerationHeader,
+    pub node_pid: u32,
+    pub app_pid: u32,
+    pub runtime_root: PathBuf,
+    pub loss: fube_node::local::ReplicaLoss,
+}
+impl HostLossReceipt {
+    pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        if launch.profile != ServiceProfile::StatefulPeerIdle
+            || launch.placement != 2
+            || self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node != launch.node
+            || self.fm != launch.fm
+            || self.generation != launch.generation
+            || self.node_pid != node_pid
+            || self.app_pid != profile.app_pid
+            || self.loss.app_pid != profile.app_pid
+            || self.runtime_root != profile.runtime_root
+            || self.loss.body != pre_open_cancelled_body(&add_body(launch, profile))
+            || self.loss.creation == 0
+            || self.loss.operation == 0
+            || self.loss.creation == self.loss.operation
+            || self.loss.host.is_empty()
+        {
+            return Err("host-loss proof does not match the original destination owner".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CleanupReceipt {
     pub deployment: String,
     pub session: String,

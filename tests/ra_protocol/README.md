@@ -194,6 +194,18 @@ Both-list dropped ACKs, commit barriers, real held-disposal/lost-ACK retry and
 metadata replay add lifecycle evidence only: 139 codec cases remain unchanged.
 HostDown during Abort, ForceAbort reporting and replacement remain gated.
 
+The original-session destination Delete matrix now covers normal/force,
+opening/closing/closed/failed/absent/lost targets, Delete-error ForceAbort and
+native deleted-FT stage-None suppression. The force flag and all native replies
+reuse existing codecs. Distinct local positive process-loss evidence joins
+metadata acknowledgment as `host_lost`, never graceful disposal or reuse.
+Applied cleanup histories surviving later app exit, exact original ownership,
+model/store commit barriers and actual held-disposal/force/no-runtime/lost-reply
+acceptance add behavioral evidence only. Unproved cleanup/Node-owner loss stays
+explicitly incomplete/unknown. No new schema types or cases are claimed:
+the oracle remains 139 bidirectional native-stream/schema-adapter cases, not
+native RA handler execution or FM/Federation interoperability.
+
 ### Stage-two node control/load and endpoint codecs
 
 All original 58 cases, 59 types/199 fields, 62 files and eleven native

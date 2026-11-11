@@ -296,6 +296,18 @@ pub struct FailedOpenDeletion {
     pub command: u64,
     pub ra_operation: u64,
 }
+/// Committed metadata deletion after actual original app-process loss.
+/// This certifies neither graceful disposal nor permission to reuse a lifetime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaLoss {
+    #[serde(with = "disposal_body")]
+    pub body: AddInstance,
+    pub creation: u64,
+    pub operation: u64,
+    pub host: String,
+    pub app_pid: u32,
+}
 fn pre_open_cancelled(state: &ra::EntityState, creation: u64) -> bool {
     state.phase == ra::Phase::Closed
         && state.local_deleted
@@ -609,22 +621,10 @@ impl Node {
                                 && ((never_created(state)
                                     && state.body.replica.instance == incoming.replica.instance)
                                     || (state.peer_creation.is_some()
-                                        && state.body.replica.current_role == 2
-                                        && (state.phase == ra::Phase::Ready
-                                            || (state.phase == ra::Phase::Opening
-                                                && state.runtime.is_some()
-                                                    == state.usage.is_some())
-                                            || (state.failed_registration_error().is_some()
-                                                && self.registration_failure.is_some()
-                                                && self.route.is_none())
-                                            || (state.failed_open_error().is_some()
-                                                && self.runtime_open_failure().is_some())
-                                            || state.peer_terminal_report()
-                                            || state.local_deleted)))
+                                        && state.body.replica.current_role == 2))
                         }
                     };
-                    if body.deletion.0.force
-                        || !eligible
+                    if !eligible
                         || (current.is_none()
                             && (incoming.replica.current_role != 2
                                 || incoming.replica.previous_role != 1
@@ -637,7 +637,13 @@ impl Node {
                         return Err(Error::Unsupported);
                     }
                 }
-                if (!self.live.load(Ordering::SeqCst) && !closed)
+                let retained_delete = current.as_ref().is_some_and(|state| {
+                    state
+                        .peer_creation
+                        .as_ref()
+                        .is_some_and(|peer| peer.delete_operation != 0)
+                });
+                if (!self.live.load(Ordering::SeqCst) && !closed && !retained_delete)
                     || !self.ra.consumer_lifetime().is_accepting()
                     || self.selected.as_ref().is_some_and(|selected| {
                         incoming.unit.id != selected.unit.id
@@ -774,15 +780,27 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
+        let base = &body.replica.0;
+        let retired_original =
+            self.ra
+                .snapshot(base.unit.id.guid.0)
+                .committed
+                .is_some_and(|state| {
+                    state.phase == ra::Phase::Closed
+                        && state.local_deleted
+                        && state.body.replica.node == base.replica.node
+                        && state.body.replica.id == base.replica.id
+                        && state.body.replica.instance == base.replica.instance
+                        && state.body.unit == base.unit
+                });
         if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
             || self.ra.peer().as_ref() != Some(source)
             || generation.for_fm_replica
-            || !self.live.load(Ordering::SeqCst)
+            || (!self.live.load(Ordering::SeqCst) && !retired_original)
             || !self.ra.consumer_lifetime().is_accepting()
         {
             return Err(Error::Unsupported);
         }
-        let base = &body.replica.0;
         self.check_service(base, true)?;
         if to_vec(&body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
             || self.selected.as_ref().is_some_and(|selected| {
@@ -891,6 +909,7 @@ impl Node {
     /// reply. Publish only after that exact command committed and the original
     /// paired acquisition was released. Replica FM escrow is separately owned
     /// by the caller and must also retire before admitting a successor.
+    /// Once deleted, proven cleanup history survives later app exit, not Node-owner loss.
     pub fn instance_disposal(&self) -> Option<InstanceDisposal> {
         let witness = self.disposal.as_ref()?;
         if !witness.applied
@@ -902,8 +921,6 @@ impl Node {
             || !self.receipts.is_empty()
             || self.rejected_reply.is_some()
             || self.last_error.is_some()
-            || !self.activation.session_status().ok().flatten()?.connected
-            || self.activation.process_status()?.exit_observed
         {
             return None;
         }
@@ -912,6 +929,9 @@ impl Node {
         let old = &witness.proof.body;
         if snapshot.fenced
             || state.phase != ra::Phase::Closed
+            || (!state.local_deleted
+                && (!self.activation.session_status().ok().flatten()?.connected
+                    || self.activation.process_status()?.exit_observed))
             || state.body.unit != old.unit
             || state.body.service != old.service
             || state.body.replica.node != old.replica.node
@@ -929,6 +949,56 @@ impl Node {
         Some(witness.proof.clone())
     }
 
+    /// Positive original-process exit and Applied Delete with drained local ownership.
+    pub fn replica_loss(&self) -> Option<ReplicaLoss> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+            || self.ra.peer().is_none()
+            || !self.ra.consumer_lifetime().is_accepting()
+            || !self.quiescent()
+            || !self.commands.is_empty()
+            || !self.receipts.is_empty()
+            || self.rejected_reply.is_some()
+            || self.last_error.is_some()
+        {
+            return None;
+        }
+        let process = self.activation.process_status()?;
+        if !process.exit_observed {
+            return None;
+        }
+        let selected = self.selected.as_ref()?;
+        let snapshot = self.ra.snapshot(selected.unit.id.guid.0);
+        let state = snapshot.committed?;
+        let peer = state.peer_creation.as_ref()?;
+        if snapshot.fenced
+            || state.phase != ra::Phase::Closed
+            || !state.local_deleted
+            || !state.cleanup_pending
+            || state.fm_stage != ra::FmStage::None
+            || state.open_token == 0
+            || peer.delete_operation == 0
+            || state.runtime.is_some()
+            || state.usage.is_some()
+            || !state.registration_lookups.is_empty()
+        {
+            return None;
+        }
+        if self.instance_disposal().is_some()
+            || self.pre_open_cancellation().is_some()
+            || self.failed_registration_deletion().is_some()
+            || self.failed_open_deletion().is_some()
+        {
+            return None;
+        }
+        Some(ReplicaLoss {
+            body: (*state.body).clone(),
+            creation: state.open_token,
+            operation: peer.delete_operation,
+            host: self.activation.identity()?.host_id.clone(),
+            app_pid: process.pid,
+        })
+    }
+
     /// Publish applied absent-Delete lineage only while the never-opened
     /// tombstone remains committed and all original local work is drained.
     pub fn replica_absence(&self) -> Option<ReplicaAbsence> {
@@ -944,8 +1014,7 @@ impl Node {
             || self.last_error.is_some()
             || self.route.is_some()
             || self.disposal.is_some()
-            || !self.activation.session_status().ok().flatten()?.connected
-            || self.activation.process_status()?.exit_observed
+            || self.pre_open.is_some()
         {
             return None;
         }
@@ -971,8 +1040,6 @@ impl Node {
             || self.route.is_some()
             || self.disposal.is_some()
             || self.absence.is_some()
-            || !self.activation.session_status().ok().flatten()?.connected
-            || self.activation.process_status()?.exit_observed
         {
             return None;
         }
@@ -998,10 +1065,8 @@ impl Node {
             && state.open_token == failure.creation
             && *state.body == failure.body
             && self.route.is_none()
-            && self.last_error.is_none()
-            && self.activation.session_status().ok().flatten()?.connected
-            && !self.activation.process_status()?.exit_observed)
-            .then(|| failure.clone())
+            && self.last_error.is_none())
+        .then(|| failure.clone())
     }
 
     pub fn failed_registration_deletion(&self) -> Option<FailedRegistrationDeletion> {
@@ -1045,9 +1110,7 @@ impl Node {
             && self.rejected_reply.is_none()
             && self.last_error.is_none()
             && self.route.as_ref()?.runtime == proof.runtime
-            && self.activation.identity()?.host_id == proof.host
-            && self.activation.session_status().ok().flatten()?.connected
-            && !self.activation.process_status()?.exit_observed)
+            && self.activation.identity()?.host_id == proof.host)
             .then(|| RuntimeOpenFailure {
                 disposal: proof.clone(),
                 creation: witness.creation,
@@ -1713,7 +1776,12 @@ impl Node {
                         let ticket = front.ticket.as_ref().unwrap();
                         let snapshot = self.ra.snapshot(body.replica.0.unit.id.guid.0);
                         if let Some(state) = snapshot.committed.filter(|_| !snapshot.fenced) {
-                            if pre_open_cancelled(&state, creation)
+                            if (pre_open_cancelled(&state, creation)
+                                || (body.deletion.0.force
+                                    && state.phase == ra::Phase::Closed
+                                    && state.open_token == creation
+                                    && state.runtime.is_none()
+                                    && state.usage.is_none()))
                                 && state.close_token == ticket.id
                             {
                                 self.pre_open = Some(PreOpenCancellation {
@@ -1885,6 +1953,31 @@ impl Node {
         }
         if !self.room() || (usage.is_none() && self.usage.len() == SLOTS) {
             return Err(Error::Capacity);
+        }
+        // An issued lookup can outlive Delete; complete its explicit failure to drain RA.
+        let retired_lookup = self.activation.cleanup_status().logical_retired
+            && self
+                .ra
+                .snapshot(body.unit.id.guid.0)
+                .committed
+                .is_some_and(|state| {
+                    state.phase == ra::Phase::Closed
+                        && state.local_deleted
+                        && state.runtime.is_none()
+                        && state
+                            .registration_lookups
+                            .get(&lookup)
+                            .is_some_and(|(issued, _)| *issued == token)
+                });
+        if retired_lookup {
+            self.enqueue(Work::Registered(ra::RegistrationCompletion {
+                unit: body.unit.id.clone(),
+                token,
+                lookup,
+                error: ra::HOSTING_SERVICE_TYPE_NOT_REGISTERED,
+                ..Default::default()
+            }))?;
+            return Ok(());
         }
         let premise = self.activation.premise().ok_or(Error::Protocol)?;
         let result = self.activation.lookup_registration(&h::LookupRequest {
@@ -2109,7 +2202,12 @@ impl Node {
                     || self
                         .route
                         .as_ref()
-                        .is_none_or(|route| route.runtime != registration.runtime)
+                        .is_some_and(|route| route.runtime != registration.runtime)
+                    || !self.usage.iter().any(|usage| {
+                        usage.lookup == registration.acquisition
+                            && usage.paired
+                            && usage.owner.is_some()
+                    })
                 {
                     return Err(Error::Unsupported);
                 }
