@@ -21,7 +21,8 @@ impl EntityState {
     pub fn peer_opened_lifetime(&self) -> bool {
         self.peer_creation.as_ref().is_some_and(|peer| {
             (self.body.replica.current_role == 2
-                || (self.body.replica.current_role == 3 && self.reconfiguration.is_some()))
+                || (matches!(self.body.replica.current_role, 1 | 3)
+                    && self.reconfiguration.is_some()))
                 && match self.phase {
                     Phase::Ready => self.runtime.is_some() && self.usage.is_some(),
                     Phase::Closing | Phase::Closed => peer.close_started_open || peer.host_down,
@@ -230,10 +231,28 @@ fn create_remote(
     let current = current.ok_or(Failure::Admission(
         "remote creation needs an existing Primary",
     ))?;
-    if current.reconfiguration.is_some() {
+    if current.reconfiguration.is_some() && !retired_configuration(current) {
         return Err(Failure::Unsupported(
             "active-configuration replica changes are gated",
         ));
+    }
+    if let Some(retired) = current
+        .reconfiguration
+        .as_ref()
+        .filter(|_| retired_configuration(current))
+    {
+        if retired
+            .request
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.node != admission.local_node)
+            .any(|r| target.id <= r.id || target.instance <= r.instance)
+        {
+            return Err(Failure::Unsupported(
+                "retired configuration requires a fresh replica incarnation",
+            ));
+        }
     }
     if !admission.node_open || !admission.owner_ready || !admission.node_activated {
         return Ok(Transition::ignored(Disposition::IgnoredNotReady));
@@ -260,7 +279,7 @@ fn create_remote(
         || target.version != current.body.service.version
         || !target.service_endpoint.is_empty()
         || !target.replication_endpoint.is_empty()
-        || deactivation != (current.body.unit.current, 0)
+        || (deactivation != (current.body.unit.current, 0) && !retired_configuration(current))
     {
         return Err(Failure::Unsupported(
             "not the admitted fresh remote Idle profile",

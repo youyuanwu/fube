@@ -54,6 +54,7 @@ MODELS = [
     ("ConfigurationMessageBody", COMMON + "ConfigurationMessageBody.h", ""),
     ("DoReconfigurationMessageBody", COMMON + "DoReconfigurationMessageBody.h", "ConfigurationMessageBody"),
     ("ActivateMessageBody", COMMON + "ActivateMessageBody.h", "ConfigurationMessageBody"),
+    ("DeactivateMessageBody", COMMON + "DeactivateMessageBody.h", "ConfigurationMessageBody"),
     ("ConfigurationReplyMessageBody", COMMON + "ConfigurationReplyMessageBody.h", ""),
     ("ReplicaInfo", COMMON + "ReplicaInfo.h", ""),
     ("FailoverUnitInfo", COMMON + "FailoverUnitInfo.h", ""),
@@ -306,6 +307,8 @@ def configuration_factories(native):
         ("DoReconfigurationReply", "CreateRAToFMMessage", 11),
         ("Activate", "CreateRAToRAMessage", 12),
         ("ActivateReply", "CreateRAToRAMessage", 12),
+        ("Deactivate", "CreateRAToRAMessage", 12),
+        ("DeactivateReply", "CreateRAToRAMessage", 12),
     ]:
         matches = re.findall(
             rf'RSMessage::{action}\s*=\s*(\w+)\(L"([^"]+)",\s*(true|false)\b', text,

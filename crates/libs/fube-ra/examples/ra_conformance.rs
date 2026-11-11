@@ -779,6 +779,45 @@ fn peer_contracts(input: &Path, output: &Path) {
 fn configuration_contracts(input: &Path, output: &Path) {
     let c = &mut 0;
     let config = filled::<Configuration>(c);
+    let force = filled::<bool>(c);
+    let deactivation = filled::<ReplicaDeactivationInfo>(c);
+    for (name, body) in [
+        ("default-deactivate", Deactivate::default()),
+        (
+            "rich-deactivate",
+            Deactivate {
+                configuration: config,
+                force,
+                deactivation,
+            },
+        ),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "Deactivate",
+            body,
+            deactivate_message,
+            decode_deactivate,
+        );
+    }
+    for (name, body) in [
+        ("default-deactivate-reply", DeactivateReply::default()),
+        ("rich-deactivate-reply", filled::<DeactivateReply>(&mut 0)),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "DeactivateReply",
+            body,
+            deactivate_reply_message,
+            decode_deactivate_reply,
+        );
+    }
+    let c = &mut 0;
+    let config = filled::<Configuration>(c);
     let duration = filled::<i64>(c);
     for (name, body) in [
         ("default-do-reconfiguration", DoReconfiguration::default()),
@@ -873,6 +912,8 @@ fn configuration_contracts(input: &Path, output: &Path) {
         "DoReconfigurationReply",
         "Activate",
         "ActivateReply",
+        "Deactivate",
+        "DeactivateReply",
     ] {
         check(
             input,

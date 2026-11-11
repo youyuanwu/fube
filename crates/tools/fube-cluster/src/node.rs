@@ -135,6 +135,8 @@ impl Adapter {
                             | ra::Effect::PeerCreateReplicaReply { .. }
                             | ra::Effect::PeerActivate { .. }
                             | ra::Effect::PeerActivateReply { .. }
+                            | ra::Effect::PeerDeactivate { .. }
+                            | ra::Effect::PeerDeactivateReply { .. }
                     )
                 {
                     if let ra::Effect::PeerCreateReplicaReply { body, .. } =
@@ -278,6 +280,24 @@ impl Adapter {
         self.commands(node)?;
         if let (Some(link), Some(peer), Some(reply)) = (peer_link, peer, self.peer_replies.front())
         {
+            if let ra::Effect::PeerDeactivateReply { body, .. } = &reply.effect {
+                let snapshot = node.snapshot(reply.entity);
+                if snapshot.fenced
+                    || snapshot.committed.is_none_or(|state| {
+                        state.phase != ra::Phase::Closed
+                            || state.body.unit != body.unit
+                            || state.body.replica.id != body.replica.id
+                            || state.body.replica.instance != body.replica.instance
+                            || state
+                                .peer_creation
+                                .as_ref()
+                                .is_none_or(|p| !p.close_completed || p.host_down)
+                    })
+                {
+                    self.peer_replies.pop_front();
+                    return Ok(());
+                }
+            }
             if let ra::Effect::PeerActivateReply { body, .. } = &reply.effect {
                 let snapshot = node.snapshot(reply.entity);
                 if snapshot.fenced
@@ -307,6 +327,12 @@ impl Adapter {
                     }
                     ra::Effect::PeerActivateReply { target, body } if target == &peer.node => {
                         activate_reply_message(body, link.generation())
+                    }
+                    ra::Effect::PeerDeactivate { target, body } if target == &peer.node => {
+                        deactivate_message(body, link.generation())
+                    }
+                    ra::Effect::PeerDeactivateReply { target, body } if target == &peer.node => {
+                        deactivate_reply_message(body, link.generation())
                     }
                     _ => return Err("peer receipt does not match the original bound peer".into()),
                 }
@@ -1268,6 +1294,22 @@ fn receive_peer(
     wire::predecode(message)?;
     let peer = launch.peer.as_ref().ok_or("unbound peer ingress")?;
     let result = match message.properties().map_err(err)?.action.as_str() {
+        "Deactivate" if launch.placement == 2 => {
+            let (body, generation) = decode_deactivate(message).map_err(err)?;
+            node.deactivate_replica_from_peer(body, &peer.node, &generation)
+        }
+        "DeactivateReply" if launch.placement == 1 => {
+            let (body, generation) = decode_deactivate_reply(message).map_err(err)?;
+            fixed_idle_target(
+                launch,
+                &body.unit.id,
+                &body.replica,
+                &peer.node,
+                peer.replica,
+                peer.incarnation,
+            )?;
+            node.deactivate_reply_from_peer(body, &peer.node, &generation)
+        }
         "Activate" if launch.placement == 2 => {
             let (body, generation) = decode_activate(message).map_err(err)?;
             node.activate_replica_from_peer(body, &peer.node, &generation)

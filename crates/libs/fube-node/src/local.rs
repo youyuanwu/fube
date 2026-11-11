@@ -155,6 +155,8 @@ pub struct PackageRegistration {
 #[derive(Clone)]
 enum Work {
     Reconfigure(Arc<DoReconfiguration>, NodeInstance, GenerationHeader),
+    Deactivate(Arc<Deactivate>, NodeInstance, GenerationHeader),
+    Deactivated(Arc<DeactivateReply>, NodeInstance, GenerationHeader),
     Activate(Arc<Activate>, NodeInstance, GenerationHeader),
     Activated(Arc<ActivateReply>, NodeInstance, GenerationHeader),
     Configured(ra::ConfigurationCompletion),
@@ -632,7 +634,14 @@ impl Node {
                                 && ((never_created(state)
                                     && state.body.replica.instance == incoming.replica.instance)
                                     || (state.peer_creation.is_some()
-                                        && state.body.replica.current_role == 2))
+                                        && (state.body.replica.current_role == 2
+                                            || (incoming.replica.id < state.body.replica.id
+                                                && incoming.replica.instance
+                                                    < state.body.replica.instance)
+                                            || (state.phase == ra::Phase::Closed
+                                                && state.reconfiguration.as_ref().is_some_and(
+                                                    |c| c.stage == ra::ConfigurationStage::Retiring,
+                                                )))))
                         }
                     };
                     if !eligible
@@ -659,7 +668,13 @@ impl Node {
                     || self.selected.as_ref().is_some_and(|selected| {
                         incoming.unit.id != selected.unit.id
                             || incoming.unit.consistency != selected.unit.consistency
-                            || incoming.service != selected.service
+                            || (incoming.service != selected.service
+                                && current.as_ref().is_none_or(|s| {
+                                    incoming.service != s.body.service
+                                        && s.reconfiguration.as_ref().is_none_or(|c| {
+                                            !c.history.iter().any(|b| b.service == incoming.service)
+                                        })
+                                }))
                     })
                     || incoming.replica.id < 0
                     || incoming.replica.instance < 0
@@ -849,7 +864,11 @@ impl Node {
         self.check_service(base, true)?;
         if to_vec(&body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
             || self.selected.as_ref().is_some_and(|selected| {
-                selected.unit.id != base.unit.id || selected.service != base.service
+                selected.unit.id != base.unit.id
+                    || (selected.service != base.service
+                        && current
+                            .as_ref()
+                            .is_none_or(|s| s.body.service != base.service))
             })
         {
             return Err(Error::Unsupported);
@@ -1281,6 +1300,43 @@ impl Node {
             generation.clone(),
         ))
     }
+    pub fn deactivate_replica_from_peer(
+        &mut self,
+        body: Deactivate,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+            || self.ra.peer().as_ref() != Some(source)
+            || generation.for_fm_replica
+        {
+            return Err(Error::Unsupported);
+        }
+        self.admit_configuration(&body.configuration)?;
+        self.enqueue(Work::Deactivate(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn deactivate_reply_from_peer(
+        &mut self,
+        body: DeactivateReply,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            || self.ra.peer().as_ref() != Some(source)
+            || generation.for_fm_replica
+        {
+            return Err(Error::Unsupported);
+        }
+        self.enqueue(Work::Deactivated(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
     pub fn activate_reply_from_peer(
         &mut self,
         body: ActivateReply,
@@ -1315,7 +1371,8 @@ impl Node {
             .ok_or(Error::Unsupported)?;
         if current.body.unit.id != body.unit.id
             || current.body.unit.consistency != body.unit.consistency
-            || (body.service != current.body.service
+            || (!body.unit.current.older_than(current.body.unit.current)
+                && body.service != current.body.service
                 && !ra::secondary_service(&current.body.service, &body.service))
         {
             return Err(Error::Unsupported);
@@ -1346,9 +1403,17 @@ impl Node {
             || !self.live.load(Ordering::SeqCst)
             || self.ra.generation_state().upload_pending
             || self.ra.peer().as_ref() != Some(&body.replica.node)
-            || self.selected.as_ref().is_none_or(|selected| {
-                body.unit != selected.unit || body.service != selected.service
-            })
+            || self
+                .ra
+                .snapshot(body.unit.id.guid.0)
+                .committed
+                .as_ref()
+                .is_none_or(|current| {
+                    (body.unit != current.body.unit || body.service != current.body.service)
+                        && self.selected.as_ref().is_none_or(|selected| {
+                            body.unit != selected.unit || body.service != selected.service
+                        })
+                })
             || to_vec(&body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
         {
             return Err(Error::Unsupported);
@@ -1583,6 +1648,16 @@ impl Node {
     }
     fn build(&self, work: &Work) -> ra::Command {
         match work {
+            Work::Deactivate(body, source, generation) => ra::Command::Deactivate {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::Deactivated(body, source, generation) => ra::Command::DeactivateReply {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
             Work::Reconfigure(body, source, generation) => ra::Command::DoReconfiguration {
                 body: Box::new((**body).clone()),
                 source: source.clone(),
@@ -2436,6 +2511,8 @@ impl Node {
             | ra::Effect::DoReconfigurationReply(_)
             | ra::Effect::PeerActivate { .. }
             | ra::Effect::PeerActivateReply { .. }
+            | ra::Effect::PeerDeactivate { .. }
+            | ra::Effect::PeerDeactivateReply { .. }
             | ra::Effect::PeerCreateReplica { .. }
             | ra::Effect::PeerCreateReplicaReply { .. }
             | ra::Effect::NodeActivateReply(_)

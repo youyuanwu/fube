@@ -618,6 +618,15 @@ pub struct RetirementReceipt {
 }
 impl RetirementReceipt {
     pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        self.validate_body(launch, profile, node_pid, &add_body(launch, profile))
+    }
+    pub fn validate_body(
+        &self,
+        launch: &Launch,
+        profile: &ActualProfile,
+        node_pid: u32,
+        body: &AddInstance,
+    ) -> Result<()> {
         let proof = &self.disposal;
         if self.deployment != launch.deployment
             || self.session != launch.session
@@ -627,8 +636,8 @@ impl RetirementReceipt {
             || self.node_pid != node_pid
             || self.app_pid != profile.app_pid
             || self.runtime_root != profile.runtime_root
-            || proof.body.unit != add_body(launch, profile).unit
-            || proof.body.service != add_body(launch, profile).service
+            || proof.body.unit != body.unit
+            || proof.body.service != body.service
             || proof.body.replica.node != launch.node
             || proof.body.replica.version != profile.version
             || proof.command == 0

@@ -46,6 +46,24 @@ While this configuration is owned, Idle removal/replacement, node/service
 mutations, generation upload and additional configurations remain gated; owner
 shutdown remains available. See the [source mapping and acceptance boundaries](../../../docs/cluster/MinimalFmCluster.md#same-primary-active-configuration-stage-5-increment).
 
+`Cluster::retire_secondary_replica().await` explicitly retires the **healthy
+original ActiveSecondary**, keeping the same Primary. Native 2-to-1
+DoReconfiguration retains the two-member previous quorum until real RAP Catchup
+succeeds, then Deactivate drops/closes the original Secondary before replying.
+Final RAP EndReconfiguration and committed native FM completion remove the
+retired member. Poll `configuration.kind=same_primary_retirement` and
+`configuration.ready=true`; `peer_idle.state=retired_secondary` is not active
+membership. No synthetic Idle RemoveReplica/Reply completes this path.
+Explicit `delete_idle_replica_via_fm()` must still join its semantic reply with
+independent original disposal/usage-release proof before
+`replace_idle_replica()` can build the one fresh successor.
+`activate_idle_replica()` then reactivates that built Idle through real RAP.
+`configuration.history`/`idle_predecessor` preserve the predecessor results.
+Original processes, factory/runtime owners and Primary endpoint stay unchanged.
+Host loss never authorizes retirement or restores singleton quorum; second
+replacement, concurrent supersession, Primary transfer and restart stay gated.
+See the [source mapping and evidence limits](../../../docs/cluster/MinimalFmCluster.md#healthy-configured-secondary-retirement-and-replacement).
+
 `Cluster::remove_idle_replica_via_fm().await` lets FM cancel its original pending
 creation, retire failed creation or abandon the original opened Idle through native RemoveReplica/Reply,
 whether unbuilt, building, built or failed build.

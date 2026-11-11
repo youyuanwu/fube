@@ -89,15 +89,15 @@ REPLICA_CASES = {
 CASES |= REPLICA_CASES
 CONFIGURATION_FACTORIES = {
     action: {"actor": 11 if action == "DoReconfigurationReply" else 12, "high_priority": True}
-    for action in ["DoReconfiguration", "DoReconfigurationReply", "Activate", "ActivateReply"]
+    for action in ["DoReconfiguration", "DoReconfigurationReply", "Activate", "ActivateReply", "Deactivate", "DeactivateReply"]
 }
 CONFIGURATION_CASES = {
     f"{profile}-{root}" for profile in ["default", "rich"]
-    for root in ["do-reconfiguration", "do-reconfiguration-reply", "activate", "activate-reply"]
+    for root in ["do-reconfiguration", "do-reconfiguration-reply", "activate", "activate-reply", "deactivate", "deactivate-reply"]
 } | {f"action-{action}" for action in CONFIGURATION_FACTORIES}
 CASES |= CONFIGURATION_CASES
-SCHEMA_TYPES = 81
-SCHEMA_FIELDS = 248
+SCHEMA_TYPES = 82
+SCHEMA_FIELDS = 250
 
 
 def validate(bundle, expected_head, expected_source):

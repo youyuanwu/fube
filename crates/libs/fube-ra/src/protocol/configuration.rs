@@ -95,6 +95,80 @@ impl<'de> Deserialize<'de> for Activate {
 }
 pub type ActivateReply = AddInstanceReply;
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Deactivate {
+    pub configuration: Configuration,
+    pub force: bool,
+    pub deactivation: ReplicaDeactivationInfo,
+}
+#[derive(Serialize, Deserialize)]
+struct DeactivateOptions {
+    force: bool,
+    deactivation: ReplicaDeactivationInfo,
+}
+impl Serialize for Deactivate {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            base: Inline<&'a Configuration>,
+            options: Derived<DeactivateOptions>,
+        }
+        Body {
+            base: Inline(&self.configuration),
+            options: Derived(DeactivateOptions {
+                force: self.force,
+                deactivation: self.deactivation.clone(),
+            }),
+        }
+        .serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for Deactivate {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Body {
+            base: Inline<Configuration>,
+            options: Derived<DeactivateOptions>,
+        }
+        let body = Body::deserialize(deserializer)?;
+        Ok(Self {
+            configuration: body.base.0,
+            force: body.options.0.force,
+            deactivation: body.options.0.deactivation,
+        })
+    }
+}
+pub type DeactivateReply = AddInstanceReply;
+
+pub fn deactivate_message(body: &Deactivate, generation: &GenerationHeader) -> Result<Message> {
+    reliability_message(body, "Deactivate", RA_ACTOR, true, Some(generation))
+}
+pub fn decode_deactivate(message: &Message) -> Result<(Deactivate, GenerationHeader)> {
+    check_factory(message, "Deactivate", &[RA_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+    ))
+}
+pub fn deactivate_reply_message(
+    body: &DeactivateReply,
+    generation: &GenerationHeader,
+) -> Result<Message> {
+    reliability_message(body, "DeactivateReply", RA_ACTOR, true, Some(generation))
+}
+pub fn decode_deactivate_reply(message: &Message) -> Result<(DeactivateReply, GenerationHeader)> {
+    check_factory(message, "DeactivateReply", &[RA_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+    ))
+}
+
 pub fn do_reconfiguration_message(
     body: &DoReconfiguration,
     generation: &GenerationHeader,

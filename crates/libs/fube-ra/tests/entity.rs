@@ -6029,6 +6029,332 @@ async fn secondary_activation_ack_waits_for_real_rap_result_and_its_commit() {
     }
 }
 
+fn retiring_configuration(active: &Configuration) -> Configuration {
+    let mut body = active.clone();
+    body.unit.previous = body.unit.current;
+    body.unit.current.configuration += 1;
+    body.unit.target = 1;
+    body.service.target = 1;
+    body.service.update_version += 1;
+    for r in &mut body.replicas.0 {
+        r.previous_role = r.current_role;
+        if r.current_role == 3 {
+            r.current_role = 1;
+        }
+    }
+    body
+}
+fn deactivation_reply(config: &Configuration) -> DeactivateReply {
+    let s = &config.replicas.0[1];
+    DeactivateReply {
+        unit: config.unit.clone(),
+        replica: Replica {
+            node: s.node.clone(),
+            id: s.id,
+            instance: s.instance,
+            up: false,
+            state: 3,
+            ..Replica::default()
+        },
+        error: 0,
+    }
+}
+fn peer_deactivated(body: DeactivateReply) -> Command {
+    Command::DeactivateReply {
+        body: Box::new(body),
+        source: peer_source(),
+        generation: GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        },
+    }
+}
+async fn complete_primary_activation(executor: &Executor, config: &Configuration) {
+    run(executor, reconfigure(config.clone())).await;
+    let completion = configured(&effects(executor));
+    run(
+        executor,
+        Command::CompleteConfiguration(Box::new(completion)),
+    )
+    .await;
+    effects(executor);
+    let mut unit = config.unit.clone();
+    unit.previous = Epoch::default();
+    let mut replica = config.replicas.0[1].clone();
+    replica.previous_role = 1;
+    run(
+        executor,
+        Command::ActivateReply {
+            body: Box::new(ActivateReply {
+                unit,
+                replica,
+                error: 0,
+            }),
+            source: peer_source(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        },
+    )
+    .await;
+    let completion = configured(&effects(executor));
+    run(
+        executor,
+        Command::CompleteConfiguration(Box::new(completion)),
+    )
+    .await;
+    effects(executor);
+}
+
+#[tokio::test]
+async fn configured_secondary_retirement_preserves_both_quorums_and_exact_phase_commit_barriers() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let active = built_fm_idle(&executor).await;
+    complete_primary_activation(&executor, &active).await;
+    let retirement = retiring_configuration(&active);
+    for field in 0..3 {
+        let mut bad = retirement.clone();
+        match field {
+            0 => bad.replicas.0[1].instance += 1,
+            1 => bad.replicas.0[1].replication_endpoint = "foreign".into(),
+            _ => bad.replicas.0[0].service_endpoint = "foreign".into(),
+        }
+        assert!(executor
+            .submit(reconfigure(bad))
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .is_err());
+    }
+    run(&executor, reconfigure(retirement.clone())).await;
+    let mut catchup = configured(&effects(&executor));
+    assert_eq!(catchup.flags, 2);
+    assert_eq!(
+        catchup
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.previous_role >= 3)
+            .count(),
+        2
+    );
+    assert_eq!(
+        catchup
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.current_role >= 3)
+            .count(),
+        1
+    );
+    assert_eq!(
+        run(&executor, peer_deactivated(deactivation_reply(&retirement))).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    catchup.error = -99;
+    run(
+        &executor,
+        Command::CompleteConfiguration(Box::new(catchup.clone())),
+    )
+    .await;
+    assert!(effects(&executor).is_empty());
+    run(
+        &executor,
+        Command::RetryConfiguration(retirement.unit.id.clone()),
+    )
+    .await;
+    assert_eq!(configured(&effects(&executor)).flags, 2);
+    catchup.error = 0;
+    run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+    let deactivate = effects(&executor);
+    assert!(
+        matches!(deactivate.as_slice(), [Effect::PeerDeactivate { body, .. }] if body.configuration == retirement && !body.force)
+    );
+    run(&executor, reconfigure(retirement.clone())).await;
+    assert_eq!(effects(&executor), deactivate);
+    let mut stale = deactivation_reply(&retirement);
+    stale.replica.instance -= 1;
+    assert_eq!(
+        run(&executor, peer_deactivated(stale)).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    run(&executor, peer_deactivated(deactivation_reply(&retirement))).await;
+    let end = configured(&effects(&executor));
+    assert_eq!(end.flags, 1);
+    let (entered, release) = hooks.pause(false);
+    let ticket = executor
+        .submit(Command::CompleteConfiguration(Box::new(end)))
+        .unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    assert!(state(&executor).remote_idle.is_some());
+    release.send(()).unwrap();
+    ticket.wait(WAIT).await.unwrap();
+    let reply = effects(&executor);
+    assert!(
+        matches!(reply.as_slice(), [Effect::DoReconfigurationReply(body)] if body.replicas.0.len() == 1 && body.unit.previous == Epoch::default())
+    );
+    assert!(state(&executor).remote_idle.is_none());
+    run(&executor, reconfigure(retirement)).await;
+    assert_eq!(effects(&executor), reply);
+    assert_eq!(
+        run(&executor, reconfigure(active)).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    let mut successor = fm_idle_request(&state(&executor));
+    successor.replica.id += 10;
+    successor.replica.instance += 10;
+    run(&executor, fm_add_idle(successor.clone())).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerCreateReplica { body, .. }] if body.replica.0.replica == successor.replica)
+    );
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn configured_secondary_deactivate_ack_requires_successful_close_and_resolved_commit() {
+    for (unknown, fail, lost) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (false, false, true),
+    ] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        make_peer_idle_ready(&executor).await;
+        let idle = state(&executor);
+        let mut primary = (*idle.body).clone();
+        primary.replica.node = peer_source();
+        primary.replica.id += 1;
+        primary.replica.instance += 1;
+        primary.replica.replication_endpoint = "127.0.0.1:12346".into();
+        let active = secondary_configuration(&primary, &idle.body.replica);
+        let deactivation = idle.peer_creation.as_ref().unwrap().deactivation.clone();
+        run(
+            &executor,
+            Command::Activate {
+                body: Box::new(Activate {
+                    configuration: active.clone(),
+                    deactivation: deactivation.clone(),
+                }),
+                source: peer_source(),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+        )
+        .await;
+        let completion = configured(&effects(&executor));
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(completion)),
+        )
+        .await;
+        effects(&executor);
+        let retirement = retiring_configuration(&active);
+        let command = || Command::Deactivate {
+            body: Box::new(Deactivate {
+                configuration: retirement.clone(),
+                deactivation: deactivation.clone(),
+                force: false,
+            }),
+            source: peer_source(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        };
+        let (entered, release) = hooks.pause(false);
+        let start = executor.submit(command()).unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        assert_eq!(state(&executor).phase, Phase::Ready);
+        release.send(()).unwrap();
+        start.wait(WAIT).await.unwrap();
+        assert!(effects(&executor)
+            .iter()
+            .any(|e| matches!(e, Effect::Close { flags: 8, .. })));
+        let closed = state(&executor);
+        if lost {
+            run(
+                &executor,
+                Command::HostDown(Box::new(HostDown {
+                    unit: closed.body.unit.id.clone(),
+                    host: closed.runtime.as_ref().unwrap().host.clone(),
+                })),
+            )
+            .await;
+            let actions = effects(&executor);
+            assert!(state(&executor).peer_host_loss());
+            assert_eq!(state(&executor).phase, Phase::Closed);
+            assert_eq!(state(&executor).fm_stage, FmStage::ReplicaDown);
+            assert!(!actions
+                .iter()
+                .any(|e| matches!(e, Effect::PeerDeactivateReply { .. })));
+            run(&executor, command()).await;
+            assert!(effects(&executor).is_empty());
+            finish(&store, &executor).await;
+            continue;
+        }
+        let mut completion = CloseCompletion {
+            unit: closed.body.unit.clone(),
+            replica: closed.body.replica.clone(),
+            error: -99,
+        };
+        run(
+            &executor,
+            Command::CompleteClose(Box::new(completion.clone())),
+        )
+        .await;
+        assert!(!effects(&executor)
+            .iter()
+            .any(|e| matches!(e, Effect::PeerDeactivateReply { .. })));
+        run(&executor, command()).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::Close { .. }]
+        ));
+        completion.error = 0;
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::CompleteClose(Box::new(completion.clone())))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        assert_eq!(state(&executor).phase, Phase::Closing);
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(effects(&executor).is_empty());
+            run(&executor, Command::CompleteClose(Box::new(completion))).await;
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        let actions = effects(&executor);
+        assert!(actions.iter().any(|e| matches!(e, Effect::PeerDeactivateReply { body, .. } if body.replica.state == 3 && !body.replica.up)));
+        assert_eq!(state(&executor).phase, Phase::Closed);
+        assert!(state(&executor).runtime.is_none() && state(&executor).usage.is_none());
+        run(&executor, command()).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::PeerDeactivateReply { .. }]
+        ));
+        finish(&store, &executor).await;
+    }
+}
+
 #[tokio::test]
 async fn fm_idle_replacement_requires_completed_removal_and_ignores_predecessor_traffic() {
     let (store, executor, _) = setup(WAIT).await;

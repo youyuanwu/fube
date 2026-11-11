@@ -334,12 +334,23 @@ int main(int argc,char** argv) {
         c=0; rich(peer_activated,c);
         run(mode,dir,"rich-activate-reply",peer_activated);
         reject_truncated(peer_activated);
+        DeactivateMessageBody peer_deactivate;
+        peer_deactivate.isForce_=false;
+        run(mode,dir,"default-deactivate",peer_deactivate);
+        c=0; rich(peer_deactivate,c);
+        run(mode,dir,"rich-deactivate",peer_deactivate);
+        reject_truncated(peer_deactivate);
+        ReplicaReplyMessageBody peer_deactivated;
+        run(mode,dir,"default-deactivate-reply",peer_deactivated);
+        c=0; rich(peer_deactivated,c);
+        run(mode,dir,"rich-deactivate-reply",peer_deactivated);
+        reject_truncated(peer_deactivated);
         if(DoReconfigurationActor!=12 || DoReconfigurationReplyActor!=11 ||
-           ActivateActor!=12 || ActivateReplyActor!=12 ||
+           ActivateActor!=12 || ActivateReplyActor!=12 || DeactivateActor!=12 || DeactivateReplyActor!=12 ||
            !DoReconfigurationPriority || !DoReconfigurationReplyPriority ||
-           !ActivatePriority || !ActivateReplyPriority)
+           !ActivatePriority || !ActivateReplyPriority || !DeactivatePriority || !DeactivateReplyPriority)
             throw std::runtime_error("native configuration factory metadata mismatch");
-        for(auto name:{u"DoReconfiguration",u"DoReconfigurationReply",u"Activate",u"ActivateReply"}) {
+        for(auto name:{u"DoReconfiguration",u"DoReconfigurationReply",u"Activate",u"ActivateReply",u"Deactivate",u"DeactivateReply"}) {
             action.action_=text(name);
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);
@@ -570,7 +581,7 @@ int main(int argc,char** argv) {
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
         ++native_truncation_rejections;
-        if(native_truncation_rejections!=43)
+        if(native_truncation_rejections!=45)
             throw std::runtime_error("native truncation coverage mismatch");
         std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;

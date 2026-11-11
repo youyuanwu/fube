@@ -52,7 +52,8 @@ pub use peer::{
     BuildCompletion, PeerCreation, RemoteBuild, RemoteIdle, RemoteRemoval, RemovalCompletion,
 };
 pub use reconfiguration::{
-    secondary_service, ConfigurationCompletion, ConfigurationStage, Reconfiguration,
+    retired_configuration, secondary_service, ConfigurationCompletion, ConfigurationStage,
+    Reconfiguration,
 };
 
 pub type EntityId = [u8; 16];
@@ -269,6 +270,16 @@ pub struct OpenCompletion {
     pub detail: ProxyErrorDetail,
 }
 pub enum Command {
+    Deactivate {
+        body: Box<Deactivate>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    DeactivateReply {
+        body: Box<DeactivateReply>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
     DoReconfiguration {
         body: Box<DoReconfiguration>,
         source: NodeInstance,
@@ -431,6 +442,14 @@ pub enum Command {
     },
 }
 enum Kind {
+    Deactivate {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    DeactivateReply {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
     DoReconfiguration {
         source: NodeInstance,
         generation: GenerationHeader,
@@ -620,6 +639,14 @@ pub struct Snapshot {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    PeerDeactivate {
+        target: NodeInstance,
+        body: Box<Deactivate>,
+    },
+    PeerDeactivateReply {
+        target: NodeInstance,
+        body: Box<DeactivateReply>,
+    },
     DoReconfigurationReply(ConfigurationReply),
     PeerActivate {
         target: NodeInstance,
@@ -1002,6 +1029,24 @@ impl Executor {
                 Kind::AddPrimary { source, generation },
                 to_vec(&body),
             ),
+            Command::Deactivate {
+                body,
+                source,
+                generation,
+            } => (
+                body.configuration.unit.id.guid.0,
+                Kind::Deactivate { source, generation },
+                to_vec(&body),
+            ),
+            Command::DeactivateReply {
+                body,
+                source,
+                generation,
+            } => (
+                body.unit.id.guid.0,
+                Kind::DeactivateReply { source, generation },
+                to_vec(&body),
+            ),
             Command::DoReconfiguration {
                 body,
                 source,
@@ -1231,6 +1276,7 @@ impl Executor {
                 Kind::AddReplica { .. }
                     | Kind::RemoveReplica { .. }
                     | Kind::DoReconfiguration { .. }
+                    | Kind::Deactivate { .. }
                     | Kind::Activate { .. }
             )
         {
@@ -1691,6 +1737,8 @@ fn transition(
         Kind::QualificationTerminate => panic!("explicit qualification worker termination"),
         Kind::CreateRemoteIdle => peer::start_remote(work, state, admission, peer),
         Kind::DoReconfiguration { .. }
+        | Kind::Deactivate { .. }
+        | Kind::DeactivateReply { .. }
         | Kind::Activate { .. }
         | Kind::ActivateReply { .. }
         | Kind::CompleteConfiguration
@@ -1724,7 +1772,24 @@ fn transition(
                     if generation.number.older_than(&admission.generation) {
                         return Ok(Transition::ignored(Disposition::IgnoredStale));
                     }
-                    if deactivation.epoch != body.unit.current || deactivation.catchup_lsn != 0 {
+                    if state.is_some_and(|s| body.unit.current.older_than(s.body.unit.current)) {
+                        return Ok(Transition::ignored(Disposition::IgnoredStale));
+                    }
+                    let retired_peer = state.is_some_and(|s| {
+                        s.phase == Phase::Closed
+                            && s.local_deleted
+                            && s.reconfiguration
+                                .as_ref()
+                                .is_some_and(|c| c.stage == ConfigurationStage::Retiring)
+                            && s.peer_creation
+                                .as_ref()
+                                .is_some_and(|p| p.deactivation == *deactivation)
+                            && s.body.unit.current == body.unit.current
+                    });
+                    if !retired_peer
+                        && (deactivation.epoch != body.unit.current
+                            || deactivation.catchup_lsn != 0)
+                    {
                         return Err(Failure::Unsupported("only initial-primary peer creation"));
                     }
                     Some(PeerCreation {
@@ -2282,6 +2347,8 @@ async fn entity_worker(
                     | Kind::AddReplica { .. }
                     | Kind::RemoveReplica { .. }
                     | Kind::DoReconfiguration { .. }
+                    | Kind::Deactivate { .. }
+                    | Kind::DeactivateReply { .. }
                     | Kind::Activate { .. }
                     | Kind::ActivateReply { .. }
                     | Kind::RetryConfiguration

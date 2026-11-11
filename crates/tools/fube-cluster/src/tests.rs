@@ -258,6 +258,62 @@ fn same_primary_configuration_requires_semantic_build_and_exact_current_reply() 
 }
 
 #[test]
+fn configured_secondary_replacement_requires_retirement_delete_disposal_and_live_owners() {
+    for missing in 0..6 {
+        let mut ledger = peer_idle_ledger();
+        let now = Instant::now();
+        let add = ledger.request_idle(now).unwrap();
+        let mut replica = add.replica.clone();
+        replica.state = 2;
+        replica.replication_endpoint = "127.0.0.1:12346".into();
+        ledger.idle_reply(0, AddReplicaReply { unit: add.unit, replica, error: 0 }).unwrap();
+        let activate = ledger.request_configuration(now).unwrap();
+        let mut reply = ConfigurationReply { unit: activate.configuration.unit.clone(), replicas: activate.configuration.replicas.clone(), error: 0 };
+        reply.unit.previous = Epoch::default();
+        for r in &mut reply.replicas.0 { r.previous_role = 1; }
+        ledger.configuration_reply(0, reply.clone()).unwrap();
+        let retire = ledger.request_secondary_retirement(now).unwrap();
+        assert_eq!(ledger.request_secondary_retirement(now).unwrap(), retire);
+        assert!(ledger.request_idle_replacement(now).is_err());
+        ledger.configuration_reply(0, reply).unwrap();
+        assert_eq!(ledger.configuration_status()["state"], "pending");
+        let mut proof = retirement(&ledger.placements[1]);
+        proof.disposal.body.replica.state = 3;
+        ledger.retirement(1, proof.clone(), 555).unwrap();
+        assert!(ledger.placements[1].retirement.is_none());
+        if missing == 0 { continue; }
+        let mut reply = ConfigurationReply { unit: retire.configuration.unit, replicas: retire.configuration.replicas, error: 0 };
+        reply.unit.previous = Epoch::default();
+        reply.replicas.0.retain(|r| r.current_role >= 3);
+        for r in &mut reply.replicas.0 { r.previous_role = 1; }
+        ledger.configuration_reply(0, reply).unwrap();
+        assert!(ledger.request_idle_deletion_with_force(now, IdleDeleteTarget::Runtime, true).is_err());
+        ledger.request_idle_deletion(now, IdleDeleteTarget::Runtime).unwrap();
+        if missing != 1 {
+            let deletion = ledger.idle_deletion.as_ref().unwrap();
+            ledger.idle_deletion_reply(1, DeleteReplicaReply {
+                unit: deletion.body.replica.0.unit.clone(),
+                replica: dropped_replica(&deletion.body.replica.0.replica), error: 0,
+            }).unwrap();
+        }
+        if missing != 2 { ledger.retirement(1, proof, 555).unwrap(); }
+        if missing == 3 { ledger.lost(0, "Primary owner lost".into()); }
+        if missing == 4 { ledger.lost(1, "Secondary owner lost".into()); }
+        if missing < 5 {
+            let before = ledger.status();
+            assert!(ledger.request_idle_replacement(now).is_err());
+            assert_eq!(ledger.status(), before);
+        } else {
+            let next = ledger.request_idle_replacement(now).unwrap();
+            assert!(next.replica.id > add.replica.id && next.replica.instance > add.replica.instance);
+            assert_eq!(next.replica.current_role, 2);
+            assert_eq!(next.replica.state, 1);
+            assert!(next.replica.replication_endpoint.is_empty());
+        }
+    }
+}
+
+#[test]
 fn idle_replacement_requires_both_semantic_barriers_and_original_disposal() {
     for missing in 0..9 {
         let mut ledger = peer_idle_ledger();
@@ -2713,6 +2769,7 @@ async fn same_primary_configuration_activates_secondary_and_never_acks_without_i
         let destination = cluster.ledger.placements[1].profile.as_ref().unwrap().app_pid;
         assert!(std::process::Command::new("kill").args(["-KILL", &destination.to_string()]).status().unwrap().success());
         until(&mut cluster, |c| c.ledger.configuration_status()["state"] == "unknown").await;
+        assert!(cluster.retire_secondary_replica().await.is_err());
         let mut pending = TcpStream::connect(&endpoint).map_err(err)?;
         pending.set_read_timeout(Some(Duration::from_millis(250))).map_err(err)?;
         pending.write_all(b"write-final\n").map_err(err)?;
@@ -2727,6 +2784,90 @@ async fn same_primary_configuration_activates_secondary_and_never_acks_without_i
     }).await;
     if !matches!(&result, Ok(Ok(()))) {
         eprintln!("CONFIGURATION_NODE_LOGS {:?}", bounded_logs(cluster.children[0].process.as_ref().unwrap()));
+    }
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn configured_secondary_retirement_replaces_and_reactivates_real_data() {
+    let fixture = Fixture::new("configured-secondary-replacement");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::StatefulPeerIdle;
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.start().await.unwrap();
+    let result = peer_idle_catch(async {
+        assert!(cluster.retire_secondary_replica().await.is_err());
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
+        let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        until(&mut cluster, |_| data_contact(&endpoint, b"read\n").starts_with("OK ")).await;
+        assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+        cluster.add_idle_replica().await?;
+        until(&mut cluster, |c| c.ledger.idle_status()["ready"] == true).await;
+        let predecessor_add = cluster.ledger.idle.as_ref().unwrap().body.clone();
+        cluster.activate_idle_replica().await?;
+        until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+        let predecessor_configuration = cluster.ledger.configuration.as_ref().unwrap().body.clone();
+        let owners = cluster.status()["nodes"].as_array().unwrap().iter()
+            .map(|n| (n["node_pid"].clone(), n["app_pid"].clone(), n["runtime_root"].clone())).collect::<Vec<_>>();
+        assert!(cluster.delete_idle_replica_via_fm().await.is_err());
+        cluster.retire_secondary_replica().await?;
+        assert!(cluster.replace_idle_replica().await.is_err());
+        let retirement = cluster.ledger.configuration.as_ref().unwrap().body.clone();
+        let lost = hold_peer_loss_frame(&mut cluster, 0, "DoReconfigurationReply", Duration::from_secs(12)).await?;
+        let (reply, _) = decode_do_reconfiguration_reply(&lost).map_err(err)?;
+        assert_eq!(reply.replicas.0.len(), 1);
+        assert_eq!(cluster.ledger.configuration_status()["state"], "pending");
+        assert!(cluster.replace_idle_replica().await.is_err());
+        cluster.send_configuration(&retirement).await?;
+        until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true
+            && c.status()["peer_idle"]["target"]["phase"] == "Closed").await;
+        assert_eq!(cluster.ledger.configuration.as_ref().unwrap().reply.as_ref(), Some(&reply));
+        assert_eq!(cluster.status()["peer_idle"]["active_secondary"], false);
+        assert_eq!(cluster.status()["peer_idle"]["state"], "retired_secondary");
+        assert!(cluster.ledger.placements.iter().all(|p| !p.loss_reported && p.link_alive));
+        assert!(cluster.replace_idle_replica().await.is_err());
+        assert!(data_contact(&endpoint, b"write-more\n").contains("committed=2"));
+        cluster.delete_idle_replica_via_fm().await?;
+        let predecessor_delete = cluster.ledger.idle_deletion.as_ref().unwrap().body.clone();
+        until(&mut cluster, |c| c.ledger.idle_deletion_status()["complete"] == true).await;
+        assert_eq!(cluster.replace_idle_replica().await?["state"], "pending");
+        until(&mut cluster, |c| c.ledger.idle_status()["ready"] == true
+            && c.status()["nodes"][1]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 2).await;
+        let successor = cluster.ledger.idle.as_ref().unwrap().body.clone();
+        assert!(successor.replica.id > predecessor_add.replica.id);
+        assert!(successor.replica.instance > predecessor_add.replica.instance);
+        cluster.activate_idle_replica().await?;
+        until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true
+            && c.status()["peer_idle"]["target"]["configuration"]["stage"] == "Complete").await;
+        cluster.send_configuration(&predecessor_configuration).await?;
+        cluster.send_configuration(&retirement).await?;
+        cluster.send_idle(&predecessor_add).await?;
+        cluster.send_idle_deletion(&predecessor_delete).await?;
+        assert!(data_contact(&endpoint, b"write-final\n").contains("committed=3"));
+        until(&mut cluster, |c| c.status()["nodes"][1]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 3).await;
+        let status = cluster.status();
+        assert_eq!(status["nodes"][1]["retained_work"]["app_observation"]["idle_data"]["role"], "ActiveSecondary");
+        assert_eq!(status["peer_idle"]["command_error"], json!([null, null]));
+        assert_eq!(status["peer_idle"]["peer_error"], json!([null, null]));
+        assert_eq!(status["nodes"][0]["retained_work"]["app_observation"]["opens"], 1);
+        assert_eq!(status["nodes"][1]["retained_work"]["app_observation"]["opens"], 2);
+        assert_eq!(status["configuration"]["history"].as_array().unwrap().len(), 2);
+        assert_eq!(cluster.ledger.placements[0].endpoint.as_deref(), Some(endpoint.as_str()));
+        for (i, owner) in owners.into_iter().enumerate() {
+            assert_eq!(owner, (status["nodes"][i]["node_pid"].clone(), status["nodes"][i]["app_pid"].clone(), status["nodes"][i]["runtime_root"].clone()));
+        }
+        assert!(cluster.retire_secondary_replica().await.is_err());
+        Ok::<(), String>(())
+    }).await;
+    if !matches!(&result, Ok(Ok(()))) {
+        eprintln!("RETIREMENT_STATUS {}", cluster.status());
+        for child in &cluster.children {
+            eprintln!("RETIREMENT_LOG {:?}", bounded_logs(child.process.as_ref().unwrap()));
+        }
     }
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");

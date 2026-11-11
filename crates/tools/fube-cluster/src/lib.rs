@@ -833,14 +833,19 @@ impl Cluster {
             let removing = source["peer_idle"]["removal"].is_object();
             let removed = removing && source["peer_idle"]["removal"]["result"] == 0;
             let destination_lost = self.ledger.placements[1].loss_reported;
-            let configured = self.ledger.configuration_status()["ready"] == true;
+            let configuration = self.ledger.configuration_status();
+            let configured = configuration["ready"] == true
+                && configuration["kind"] == "same_primary_configuration";
+            let retired = configuration["ready"] == true
+                && configuration["kind"] == "same_primary_retirement"
+                && self.ledger.idle_predecessor.is_none();
             let built = !destination_lost
                 && opened
                 && !removing
                 && source["peer_idle"]["build"]["result"] == 0;
             status["peer_idle"] = json!({
                 "requested":self.peer_idle_requested,
-                "state": if configured { "active_secondary" } else if destination_lost { "lost" } else if removed { "removed" } else if removing { "removing" } else if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
+                "state": if configured { "active_secondary" } else if retired { "retired_secondary" } else if destination_lost { "lost" } else if removed { "removed" } else if removing { "removing" } else if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
                 "error": if failed { reply["error"].clone() } else { Value::Null },
                 "built":built, "serving":false,
                 "active_secondary":configured,
@@ -967,8 +972,7 @@ impl Cluster {
     }
     /// Explicitly authorize one fresh Idle after original FM removal and proved disposal.
     pub async fn replace_idle_replica(&mut self) -> Result<Value> {
-        if self.ledger.configuration.is_some()
-            || self.finished.is_some()
+        if self.finished.is_some()
             || self.children.len() != 2
             || self.config.profile != ServiceProfile::StatefulPeerIdle
         {
@@ -997,6 +1001,19 @@ impl Cluster {
         if let Err(error) = self.send_configuration(&body).await {
             self.ledger.lost(0, error.clone());
             return Err(error);
+        }
+        Ok(self.ledger.configuration_status())
+    }
+    pub async fn retire_secondary_replica(&mut self) -> Result<Value> {
+        if self.finished.is_some() || self.children.len() != 2 {
+            return Err("Secondary retirement requires the original running cluster".into());
+        }
+        let body = self.ledger.request_secondary_retirement(Instant::now())?;
+        if self.ledger.configuration_status()["ready"] != true {
+            if let Err(error) = self.send_configuration(&body).await {
+                self.ledger.lost(0, error.clone());
+                return Err(error);
+            }
         }
         Ok(self.ledger.configuration_status())
     }

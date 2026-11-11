@@ -1065,12 +1065,67 @@ The maintained native-stream gate adds four action contracts and twelve cases:
 151 bidirectional cases, 81 schema types/248 fields, 155 bundle files and
 43 actual native truncation rejections, retaining every prior case.
 
-This qualifies only the frozen, same-Primary 1-to-2 admission and terminal
-observation path. Configuration supersession, active-member removal/replacement,
-primary transfer, GetLSN/Deactivate, endpoint changes/publication, data loss,
+This qualifies the frozen same-Primary admission and terminal observation path;
+the bounded healthy retirement/replacement extension is described below.
+Arbitrary configuration supersession, primary transfer, GetLSN, broader
+Deactivate, endpoint changes/publication, data loss,
 FMM, generation upload, reconnect and restart remain gated. Codec/schema
 execution and native-free process acceptance are not complete original C++
 handler traces or native FM/Federation interoperability.
+
+### Healthy configured-Secondary retirement and replacement
+
+After the original successful 1-to-2 admission,
+`Cluster::retire_secondary_replica()` explicitly requests a healthy, unchanged-
+Primary 2-to-1 reconfiguration. Both original admitted sessions must remain
+healthy; no down-report, missing process or old singleton quorum authorizes it.
+The next same-Primary epoch carries P/P and S/N, a versioned target-size change
+from 2/1 to 1/1, and both full previous/current configurations.
+
+Pinned SF source `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the flow:
+
+| Source | Preserved contract |
+|---|---|
+| `ra/FailoverUnit.cpp:736-818,2596-2702` | Real RAP Catchup (flags=2) must satisfy the two-member PC and singleton CC before phase-3 Deactivate is sent. Neither a transport write nor a report ACK supplies catch-up completion. |
+| `ra/ReconfigurationAgent.cpp:2620-2665,671-706`; `ra/FailoverUnit.cpp:5472-5540` | Non-force S/N Deactivate commits intent, closes the original volatile destination through real RAP Drop/Close (flags=8), releases its original ownership, then commits the canonical dropped DeactivateReply. Failed Close stays pending. |
+| `ra/FailoverUnit.cpp:1192-1222,2953-2960,3164-3272,3376-3415,3487-3496` | Exact peer completion precedes final RAP EndReconfiguration (flags=1). Final committed completion removes the non-CC peer from the Primary RA view and replies with only the surviving current Primary, with previous epoch/role cleared. It does not synthesize a separate Idle RemoveReplica/Reply. |
+| `common/DeactivateMessageBody.h:15-49` | Native ConfigurationMessageBody inheritance plus derived `isForce_`, nested deactivation information, exact peer actor/priority and sender generation. Force/restart and other Deactivate branches remain gated. |
+
+Poll `configuration` for `kind=same_primary_retirement` and `ready=true`.
+`peer_idle.active_secondary=false`/`state=retired_secondary` distinguishes
+retirement from active membership. Dropped reporting and processed-list ACKs
+remain native metadata exchanges, not loss-driven membership repair or
+replacement permission. In particular, a report-triggered deleted tombstone
+and disposal sidecar alone cannot authorize a successor.
+
+Explicit `delete_idle_replica_via_fm()` still joins its exact semantic reply
+with the original applied successful Close and independently validated disposal/
+usage-release proof. Only then may `replace_idle_replica()` authorize the one
+fresh successor. Existing native Add/Create/build recopies nonempty Primary
+state under a strictly newer replica ID/incarnation; `activate_idle_replica()`
+then performs the real 1-to-2 activation again. Original node, app, package,
+factory and runtime owners stay unchanged. `configuration.history` and
+`idle_predecessor` preserve the completed predecessor requests/replies and
+proofs. Same-phase retries replay retained work/results; stale predecessor
+epochs, replies, deletion and reports cannot complete or retire the successor.
+
+Model/store tests cover separate PC/CC descriptions, failed RAP catch-up/Close,
+exact identity/endpoints, duplicate/stale messages, commit veto/uncertainty and
+Close/final-reply commit barriers. HostDown during retirement retains native
+down reporting without a DeactivateReply or disposal claim.
+Original-process acceptance exercises lost
+retirement completion, explicit deletion/proof gating, singleton writes after
+safe retirement, successor nonempty copy, reactivation and new application ACKs
+without another Primary Open or process-owner replacement.
+The maintained native-stream gate now covers 157 bidirectional cases,
+82 types/250 fields, 161 bundle files and 45 actual native truncation rejections.
+
+This enables one healthy original configured-Secondary replacement, not a
+second replacement, retirement of an already-replaced Idle, concurrent/new
+reconfiguration supersession, Primary transfer, automatic failure repair,
+endpoint publication, FMM, generation upload, reconnect or durable restart.
+Original C++ handler traces and native FM/Federation interoperability remain
+unqualified.
 
 ## Initial stateful FM control
 

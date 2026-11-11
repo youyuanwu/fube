@@ -188,7 +188,12 @@ fn peer_ingress(message: &Message, props: &Properties) -> fube_transport::Result
         || props.uncorrelated_reply
         || !matches!(
             props.action.as_str(),
-            "CreateReplica" | "CreateReplicaReply" | "Activate" | "ActivateReply"
+            "CreateReplica"
+                | "CreateReplicaReply"
+                | "Activate"
+                | "ActivateReply"
+                | "Deactivate"
+                | "DeactivateReply"
         )
         || message
             .headers
@@ -289,6 +294,12 @@ pub fn predecode(message: &Message) -> Result<()> {
         }
         "ActivateReply" => {
             decode::<ActivateReply>(&message.body)?;
+        }
+        "Deactivate" => {
+            decode::<Deactivate>(&message.body)?;
+        }
+        "DeactivateReply" => {
+            decode::<DeactivateReply>(&message.body)?;
         }
         "GenerationProposal" => {
             if !message.body.is_empty() {
