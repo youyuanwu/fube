@@ -184,6 +184,16 @@ disposal proof. Both races, stale RAP replies, failed/unknown commits and real
 provider/service process loss with a lost-ACK retry add no wire cases or reuse
 authority. Initial-Open and Abort/ForceAbort loss remain gated.
 
+Normal non-force Abort of the original opened peer Idle now uses the same
+ReplicaDropped-stage/canonical ReplicaUp shapes and closed metadata ACK path.
+RAP Abort uses existing `flags=4`; shared original-open admission preserves
+native non-force behavior and rejects local-only/initial-Open/unowned lifetimes.
+Actual provider/service Abort disposal and exact original Applied completion/
+usage release remain independent of metadata acknowledgment and Primary removal.
+Both-list dropped ACKs, commit barriers, real held-disposal/lost-ACK retry and
+metadata replay add lifecycle evidence only: 139 codec cases remain unchanged.
+HostDown during Abort, ForceAbort reporting and replacement remain gated.
+
 ### Stage-two node control/load and endpoint codecs
 
 All original 58 cases, 59 types/199 fields, 62 files and eleven native

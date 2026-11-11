@@ -8,13 +8,25 @@ pub struct PeerCreation {
     pub registration_error: Option<i64>,
     pub open_error: Option<i64>,
     pub host_down: bool,
-    /// Normal Close or Drop committed from the original successfully opened Idle.
+    /// Normal Close, Drop or Abort committed from the original successfully opened Idle.
     pub close_started_open: bool,
     /// Matching successful RAP completion, not an FM ACK or disposal receipt.
     pub close_completed: bool,
 }
 
 impl EntityState {
+    /// Original opened-peer lineage for admission, not cleanup or replacement proof.
+    pub fn peer_opened_lifetime(&self) -> bool {
+        self.peer_creation.as_ref().is_some_and(|peer| {
+            self.body.replica.current_role == 2
+                && match self.phase {
+                    Phase::Ready => self.runtime.is_some() && self.usage.is_some(),
+                    Phase::Closing | Phase::Closed => peer.close_started_open || peer.host_down,
+                    Phase::Opening => false,
+                }
+        })
+    }
+
     pub fn peer_terminal_report(&self) -> bool {
         self.peer_creation
             .as_ref()

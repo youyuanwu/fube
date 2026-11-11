@@ -1367,7 +1367,14 @@ impl Node {
                     | ra::CloseMode::ForceAbort
             )
             || (mode == ra::CloseMode::Abort
-                && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary)
+                && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+                && !(self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
+                    && self.ra.peer().is_some()
+                    && self
+                        .ra
+                        .snapshot(unit.guid.0)
+                        .committed
+                        .is_some_and(|state| state.peer_opened_lifetime())))
             || self.selected.as_ref().is_none_or(|b| b.unit.id != unit)
         {
             return Err(Error::Unsupported);

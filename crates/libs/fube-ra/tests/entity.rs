@@ -1125,6 +1125,19 @@ async fn local_stateful_idle_open_is_commit_gated_and_cannot_enable_primary_or_n
         Ok(Disposition::IgnoredStale)
     );
     assert!(executor.take_effects().is_empty());
+    assert!(matches!(
+        executor
+            .submit(Command::CloseLocal {
+                unit: request.unit.id.clone(),
+                mode: CloseMode::Abort,
+            })
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    assert_eq!(executor.snapshot([1; 16]).committed.unwrap(), state);
+    assert!(executor.take_effects().is_empty());
     executor
         .submit(Command::CloseLocal {
             unit: request.unit.id.clone(),
@@ -3017,12 +3030,14 @@ async fn peer_normal_close_or_drop_origin_loss_and_ack_each_require_their_own_ap
 }
 
 #[tokio::test]
-async fn peer_unopened_force_abort_and_escalated_drop_do_not_gain_host_loss_reporting() {
+async fn peer_unsupported_pending_close_origins_do_not_gain_host_loss_reporting() {
     for (opened, mode, escalate) in [
         (false, CloseMode::Close, false),
         (false, CloseMode::Drop, false),
         (true, CloseMode::ForceAbort, false),
         (true, CloseMode::Drop, true),
+        (true, CloseMode::Abort, false),
+        (true, CloseMode::Abort, true),
     ] {
         let (store, executor, _) = setup(WAIT).await;
         let request = if opened {
@@ -3051,7 +3066,7 @@ async fn peer_unopened_force_abort_and_escalated_drop_do_not_gain_host_loss_repo
                 .as_ref()
                 .unwrap()
                 .close_started_open,
-            opened && mode == CloseMode::Drop
+            opened && matches!(mode, CloseMode::Drop | CloseMode::Abort)
         );
         if escalate {
             executor
@@ -3085,12 +3100,12 @@ async fn peer_unopened_force_abort_and_escalated_drop_do_not_gain_host_loss_repo
 }
 
 #[tokio::test]
-async fn peer_opened_close_and_drop_report_only_after_success_and_ack_only_closed_metadata() {
-    for mode in [CloseMode::Close, CloseMode::Drop] {
-        let expected_stage = if mode == CloseMode::Drop {
-            FmStage::ReplicaDropped
-        } else {
+async fn peer_opened_close_drop_and_abort_report_only_after_success_and_ack_only_closed_metadata() {
+    for mode in [CloseMode::Close, CloseMode::Drop, CloseMode::Abort] {
+        let expected_stage = if mode == CloseMode::Close {
             FmStage::ReplicaDown
+        } else {
+            FmStage::ReplicaDropped
         };
         for in_dropped in [false, true] {
             let (store, executor, _) = setup(WAIT).await;
@@ -3106,7 +3121,11 @@ async fn peer_opened_close_and_drop_report_only_after_success_and_ack_only_close
             .await;
             assert!(!state(&executor).peer_terminal_report());
             assert!(matches!(effects(&executor).as_slice(),
-            [Effect::Close { flags, .. }] if *flags == if mode == CloseMode::Drop { 8 } else { 0 }));
+            [Effect::Close { flags, .. }] if *flags == match mode {
+                CloseMode::Drop => 8,
+                CloseMode::Abort => 4,
+                _ => 0,
+            }));
             let completion = close_completion(&executor, 0);
             run(
                 &executor,
@@ -3173,7 +3192,11 @@ async fn peer_opened_close_and_drop_report_only_after_success_and_ack_only_close
                     ..Replica::default()
                 }
             );
-            for stale in 0..if mode == CloseMode::Drop { 5 } else { 4 } {
+            for stale in 0..if expected_stage == FmStage::ReplicaDropped {
+                5
+            } else {
+                4
+            } {
                 let mut invalid = (*report).clone();
                 let info = &mut invalid.dropped.0[0];
                 match stale {
@@ -3223,8 +3246,8 @@ async fn peer_opened_close_and_drop_report_only_after_success_and_ack_only_close
 }
 
 #[tokio::test]
-async fn peer_opened_close_and_drop_intent_completion_and_ack_preserve_commit_barriers() {
-    for mode in [CloseMode::Close, CloseMode::Drop] {
+async fn peer_opened_close_drop_and_abort_intent_completion_and_ack_preserve_commit_barriers() {
+    for mode in [CloseMode::Close, CloseMode::Drop, CloseMode::Abort] {
         for step in 0..3 {
             for (unknown, fail) in [(false, true), (true, false), (true, true)] {
                 let (store, executor, hooks) = setup(if unknown {
@@ -3270,7 +3293,7 @@ async fn peer_opened_close_and_drop_intent_completion_and_ack_preserve_commit_ba
                 let original = state(&executor);
                 let (entered, release) = hooks.pause(fail);
                 let ticket = executor.submit(command()).unwrap();
-                entered.await.unwrap();
+                tokio::time::timeout(WAIT, entered).await.unwrap().unwrap();
                 assert!(Arc::ptr_eq(&original, &state(&executor)));
                 assert!(effects(&executor).is_empty());
                 if unknown {
@@ -3299,10 +3322,10 @@ async fn peer_opened_close_and_drop_intent_completion_and_ack_preserve_commit_ba
                 assert_eq!(
                     applied.fm_stage,
                     if step == 1 {
-                        if mode == CloseMode::Drop {
-                            FmStage::ReplicaDropped
-                        } else {
+                        if mode == CloseMode::Close {
                             FmStage::ReplicaDown
+                        } else {
+                            FmStage::ReplicaDropped
                         }
                     } else {
                         FmStage::None
@@ -3347,13 +3370,14 @@ async fn peer_opened_close_and_drop_intent_completion_and_ack_preserve_commit_ba
 }
 
 #[tokio::test]
-async fn peer_close_and_drop_reporting_excludes_unopened_failed_and_force_abort_origins() {
+async fn peer_normal_close_reporting_excludes_unopened_failed_and_force_abort_origins() {
     for (mode, opened, fails) in [
         (CloseMode::Close, false, false),
         (CloseMode::Drop, false, false),
         (CloseMode::ForceAbort, true, false),
         (CloseMode::Close, true, true),
         (CloseMode::Drop, true, true),
+        (CloseMode::Abort, true, true),
     ] {
         let (store, executor, _) = setup(WAIT).await;
         let request = if !opened {
@@ -3410,8 +3434,8 @@ async fn peer_close_and_drop_reporting_excludes_unopened_failed_and_force_abort_
 }
 
 #[tokio::test]
-async fn peer_drop_does_not_supersede_or_relabel_closing_and_closed_lifetimes() {
-    for mode in [CloseMode::Close, CloseMode::Drop] {
+async fn peer_normal_closes_do_not_supersede_or_relabel_closing_and_closed_lifetimes() {
+    for mode in [CloseMode::Close, CloseMode::Drop, CloseMode::Abort] {
         let (store, executor, _) = setup(WAIT).await;
         let request = make_peer_idle_ready(&executor).await;
         run(
@@ -3424,7 +3448,7 @@ async fn peer_drop_does_not_supersede_or_relabel_closing_and_closed_lifetimes() 
         .await;
         effects(&executor);
         let closing = state(&executor);
-        for later in [CloseMode::Close, CloseMode::Drop] {
+        for later in [CloseMode::Close, CloseMode::Drop, CloseMode::Abort] {
             assert_eq!(
                 run(
                     &executor,
@@ -3445,14 +3469,14 @@ async fn peer_drop_does_not_supersede_or_relabel_closing_and_closed_lifetimes() 
             let closed = state(&executor);
             assert_eq!(
                 closed.fm_stage,
-                if mode == CloseMode::Drop {
-                    FmStage::ReplicaDropped
-                } else {
+                if mode == CloseMode::Close {
                     FmStage::ReplicaDown
+                } else {
+                    FmStage::ReplicaDropped
                 }
             );
             assert_eq!(closed.report_sequence, u64::from(reported));
-            for later in [CloseMode::Close, CloseMode::Drop] {
+            for later in [CloseMode::Close, CloseMode::Drop, CloseMode::Abort] {
                 run(
                     &executor,
                     Command::CloseLocal {
@@ -3481,17 +3505,22 @@ async fn peer_drop_does_not_supersede_or_relabel_closing_and_closed_lifetimes() 
 }
 
 #[tokio::test]
-async fn peer_drop_ack_requires_dropped_state_before_first_retry() {
+async fn peer_drop_and_abort_ack_requires_dropped_state_before_first_retry() {
     use fube_transport::serialization::serde::ObjectArray;
 
-    for in_dropped in [false, true] {
+    for (mode, in_dropped) in [
+        (CloseMode::Drop, false),
+        (CloseMode::Drop, true),
+        (CloseMode::Abort, false),
+        (CloseMode::Abort, true),
+    ] {
         let (store, executor, _) = setup(WAIT).await;
         let request = make_peer_idle_ready(&executor).await;
         run(
             &executor,
             Command::CloseLocal {
                 unit: request.replica.0.unit.id.clone(),
-                mode: CloseMode::Drop,
+                mode,
             },
         )
         .await;
@@ -3545,6 +3574,132 @@ async fn peer_drop_ack_requires_dropped_state_before_first_retry() {
         }
         finish(&store, &executor).await;
     }
+}
+
+#[tokio::test]
+async fn peer_abort_rejects_unopened_and_unowned_closed_lifetimes() {
+    for (adopted, closed) in [(false, false), (true, false), (true, true)] {
+        let (store, executor, _) = setup(WAIT).await;
+        executor.bind_peer(peer_source()).unwrap();
+        let request = peer_request();
+        run(&executor, peer_create(request.clone())).await;
+        effects(&executor);
+        if adopted {
+            registered(&executor, &request.replica.0, state(&executor).open_token).await;
+        }
+        if closed {
+            run(
+                &executor,
+                Command::CloseLocal {
+                    unit: request.replica.0.unit.id.clone(),
+                    mode: CloseMode::Drop,
+                },
+            )
+            .await;
+            effects(&executor);
+            close_done(&executor, 0).await;
+            effects(&executor);
+        }
+        let original = state(&executor);
+        assert!(matches!(
+            executor
+                .submit(Command::CloseLocal {
+                    unit: request.replica.0.unit.id,
+                    mode: CloseMode::Abort,
+                })
+                .unwrap()
+                .wait(WAIT)
+                .await,
+            Err(Failure::Unsupported(_))
+        ));
+        assert!(Arc::ptr_eq(&original, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn peer_abort_is_non_force_without_runtime_and_does_not_relabel_closed_down() {
+    for mode in [CloseMode::Close, CloseMode::Drop, CloseMode::Abort] {
+        let (store, executor, _) = setup(WAIT).await;
+        let request = make_peer_idle_ready(&executor).await;
+        run(
+            &executor,
+            Command::CloseLocal {
+                unit: request.replica.0.unit.id.clone(),
+                mode,
+            },
+        )
+        .await;
+        effects(&executor);
+        executor
+            .config()
+            .set(RetryState::Closing, Threshold::Drop, -1);
+        close_done(&executor, APPLICATION_HOST_CRASH).await;
+        effects(&executor);
+        let closing = state(&executor);
+        assert_eq!(closing.close_mode, Some(mode));
+        assert!(closing.runtime.is_none() && closing.usage.is_some());
+        assert_eq!(
+            run(
+                &executor,
+                Command::CloseLocal {
+                    unit: request.replica.0.unit.id.clone(),
+                    mode: CloseMode::Abort,
+                }
+            )
+            .await,
+            Disposition::IgnoredPending
+        );
+        assert!(Arc::ptr_eq(&closing, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        run(&executor, Command::RetryClose(request.replica.0.unit.id)).await;
+        let retried = state(&executor);
+        assert_eq!(retried.phase, Phase::Closing);
+        assert_eq!(retried.close_mode, closing.close_mode);
+        assert_eq!(retried.close_token, closing.close_token);
+        assert_eq!(retried.usage, closing.usage);
+        assert!(
+            retried.runtime.is_none() && !retried.peer_terminal_report() && !retried.local_deleted
+        );
+        assert!(matches!(effects(&executor).as_slice(),
+            [Effect::FindRegistration { token, lookup, .. }]
+            if *token == closing.close_token
+                && retried.registration_lookups.get(lookup) == Some(&(*token, true))));
+        finish(&store, &executor).await;
+    }
+    let (store, executor, _) = setup(WAIT).await;
+    let request = make_peer_idle_ready(&executor).await;
+    let host = state(&executor).runtime.as_ref().unwrap().host.clone();
+    run(
+        &executor,
+        Command::HostDown(Box::new(HostDown {
+            unit: request.replica.0.unit.id.clone(),
+            host,
+        })),
+    )
+    .await;
+    effects(&executor);
+    let closed = state(&executor);
+    run(
+        &executor,
+        Command::CloseLocal {
+            unit: request.replica.0.unit.id,
+            mode: CloseMode::Abort,
+        },
+    )
+    .await;
+    assert_eq!(state(&executor), closed);
+    assert_eq!(state(&executor).fm_stage, FmStage::ReplicaDown);
+    assert!(
+        !state(&executor)
+            .peer_creation
+            .as_ref()
+            .unwrap()
+            .close_completed
+    );
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
 }
 
 #[tokio::test]

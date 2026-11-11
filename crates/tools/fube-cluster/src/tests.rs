@@ -1840,6 +1840,25 @@ async fn peer_drop_waits_for_real_disposal_and_retries_dropped_stage_without_aut
 }
 
 #[tokio::test]
+async fn peer_abort_waits_for_real_disposal_and_retries_dropped_stage_without_authorizing_replacement() {
+    for outcome in [
+        node::report_tests::PeerCreationOutcome::AbortProvider,
+        node::report_tests::PeerCreationOutcome::AbortService,
+    ] {
+        let fixture = Fixture::new("peer-idle-abort");
+        let mut config = fixture.config();
+        config.profile = ServiceProfile::StatefulPeerIdle;
+        config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+        let mut cluster = Cluster::new(config).unwrap();
+        cluster.prepare().unwrap();
+        let launches = [cluster.ledger.placements[0].launch.clone(), cluster.ledger.placements[1].launch.clone()];
+        let result = node::report_tests::run_peer_creation_removal(&launches, outcome).await;
+        assert_eq!(cluster.shutdown().await["clean"], true);
+        result.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn peer_normal_close_host_loss_with_held_provider_or_service_never_fabricates_disposal() {
     for outcome in [
         node::report_tests::PeerCreationOutcome::CloseLossProvider,

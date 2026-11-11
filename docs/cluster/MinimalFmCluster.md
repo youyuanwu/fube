@@ -473,8 +473,8 @@ description travels in ReplicaUp's **dropped list**, just as for host loss.
 Only a matching successful RAP Close of the committed opened-origin normal
 Close records this terminal origin. The completion commit precedes original
 registration/usage release and report work; initial-Open cancellation, failed
-Close, Abort/ForceAbort and arbitrary closed lifetimes do not gain this authority.
-Normal Drop has its distinct stage semantics described below.
+Close, ForceAbort and arbitrary closed lifetimes do not gain this authority.
+Normal Drop/Abort have their distinct stage semantics described below.
 If HostDown wins first, late Close replies remain stale and provide no
 disposal proof. If successful Close wins, later HostDown cannot reclassify it.
 
@@ -544,6 +544,46 @@ Node/process/Channel tests hold provider/service disposal separately, exercise
 an actual lost-ACK retry and metadata reply replay, and retain healthy Primary
 writes and independent removal. These add lifecycle evidence, not native C++
 handler execution or FM/Federation interoperability qualification.
+
+### Normal opened destination Abort reporting
+
+The existing local Node `close` with `CloseMode::Abort` now supports the original
+successfully opened peer Idle. Pinned `ReplicaCloseMode.h` distinguishes Abort
+from ForceAbort: both use RAP Abort (`flags=4`), but only ForceAbort implies
+force-close admission. Native `FailoverUnit.cpp:4781-4842,5472-5544` preserves
+that distinction and calls OnDropped after successful Abort cleanup.
+
+Node and RA share original opened-peer admission: the live opened Idle must
+own its runtime/usage, or retain that original open lineage through closing or
+closed state. Local-only Idles, initial Open and arbitrary unowned closed
+lifetimes remain rejected. Non-force Abort cannot supersede an already-closing
+operation, even if its runtime registration has disappeared. Closed Abort is
+a no-op and cannot relabel a prior Down/Dropped report or certify disposal.
+
+Committed opened-origin Abort intent and matching successful RAP completion
+enable **ReplicaDropped stage**, not ReplicaDown. Real replicator/service Abort
+and final release precede that reply, Applied completion, exact original usage
+release and report work. The existing original `instance_disposal()` proof is
+independently observable before ACK and unchanged through metadata replay.
+The replication listener retires while the original app host/runtime/factory
+stay resident. No successful service Close callback is fabricated.
+
+The existing canonical ReplicaUp dropped entry, immediate/30-second retry,
+dropped-description ACK requirement and processed-list ACK/closed metadata
+Delete/reply path apply. A dropped-list ACK instead performs closed ForceDelete
+without that reply. FM still records lost volatile state, not reuse authority;
+disposal and metadata ACK do not clear Primary pending-remove, complete explicit
+operator deletion or authorize replacement.
+
+Model/store tests cover non-force admission, unavailable registration, both ACK
+lists before/after reporting, stale/late traffic and intent/completion/ACK commit
+failure and uncertainty. Controlled original Node/process/Channel acceptance
+holds provider/service disposal separately, verifies actual Abort rather than
+Close, loses/retries an ACK at the unchanged native cadence and replays metadata
+replies with stable original proof and independent Primary removal/writes.
+Initial-Open cleanup, failed/ForceAbort reporting, HostDown during Abort and
+replacement remain gated. No wire schema, child-node control feature or native
+C++ handler/FM-Federation interoperability qualification is added.
 
 ### Deleting the original opened destination Idle
 

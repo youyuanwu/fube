@@ -200,6 +200,23 @@ Initial-Open and failed/ForceAbort reporting remain gated.
 No new wire types, child-node control operation or native handler qualification
 is added; see the [bounded Drop guide](../../../docs/cluster/MinimalFmCluster.md#normal-opened-destination-drop-reporting).
 
+Normal non-force `CloseMode::Abort` now supports that original opened Idle too.
+It sends RAP Abort (`flags=4`) and reports **ReplicaDropped stage** only after
+matching successful cleanup and Applied completion. Shared Node/RA admission
+requires original opened-peer lineage; local-only Idles, initial Open and
+arbitrary closed origins remain rejected. Non-force Abort cannot supersede a
+pending close, even without runtime registration, or relabel a closed report.
+The existing original disposal/usage proof remains independently available
+before ACK and stable through metadata replay, without a fabricated Close
+callback. Strict dropped-description ACKs, the unchanged 30-second retry,
+metadata deletion and independent Primary removal/no-reuse boundaries are
+preserved. Controlled real provider/service disposal verifies actual Abort,
+lost-ACK retry and stable proof/metadata replay; model/store tests cover
+admission, both ACK lists and intent/completion/ACK commit barriers.
+HostDown during Abort, failed/ForceAbort reporting and replacement remain
+gated. No new child-node control feature or native handler qualification is
+added; see the [bounded Abort guide](../../../docs/cluster/MinimalFmCluster.md#normal-opened-destination-abort-reporting).
+
 After an original CreateReplicaReply error, the Primary retains only a failed
 observation/tombstone (`creation_aborted=true`), not live creation/build authority.
 FM sends the original Add descriptor, never fields from the failed reply.

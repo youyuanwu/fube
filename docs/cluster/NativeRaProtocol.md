@@ -283,6 +283,23 @@ non-dropped ACK rejection and controlled provider/service disposal/lost-ACK
 retry/metadata replay add lifecycle evidence only. See the
 [opened destination Drop guide](MinimalFmCluster.md#normal-opened-destination-drop-reporting).
 
+Normal non-force Abort now extends the original opened-peer profile as well.
+`ReplicaCloseMode.h` selects RAP Abort (`flags=4`) without ForceAbort's
+force-close admission; [FT:4781-4842,5472-5544][ft] preserves native admission
+and OnDropped/ReplicaDropped-stage reporting. Node and RA share original
+opened-peer lineage checks, rejecting local-only, initial-Open and arbitrary
+closed origins. An unavailable runtime cannot turn Abort into forced closure;
+closed no-ops cannot relabel a prior report or certify disposal.
+Matching Applied RAP success and exact original usage release precede report
+work; actual original-runtime Abort/final-release proof stays independent of
+the processed ACK/closed metadata Delete and Primary pending-remove.
+Strict dropped-description ACKs, both ACK lists, intent/completion/ACK commit
+barriers and controlled real provider/service Abort disposal/lost-ACK retry/
+metadata replay extend lifecycle evidence, not wire schemas or native handler
+qualification. HostDown during Abort, failed/ForceAbort reporting and
+replacement remain gated. See the
+[opened destination Abort guide](MinimalFmCluster.md#normal-opened-destination-abort-reporting).
+
 ### Stage-two native codec contracts and execution boundary
 
 The pinned [RSMessage.cpp:52–55,111–112,130,210–219][registry] initializers use

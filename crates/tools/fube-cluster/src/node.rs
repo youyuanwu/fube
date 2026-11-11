@@ -3659,6 +3659,8 @@ pub(crate) mod report_tests {
         DropService,
         DropLossProvider,
         DropLossService,
+        AbortProvider,
+        AbortService,
     }
 
     pub(crate) async fn run_peer_creation_removal(
@@ -3681,6 +3683,7 @@ pub(crate) mod report_tests {
                 | PeerCreationOutcome::GracefulCloseProvider
                 | PeerCreationOutcome::DropProvider
                 | PeerCreationOutcome::DropLossProvider
+                | PeerCreationOutcome::AbortProvider
         );
         let opening = matches!(
             outcome,
@@ -3709,12 +3712,18 @@ pub(crate) mod report_tests {
                 | PeerCreationOutcome::DropLossProvider
                 | PeerCreationOutcome::DropLossService
         );
+        let aborting = matches!(
+            outcome,
+            PeerCreationOutcome::AbortProvider | PeerCreationOutcome::AbortService
+        );
         let graceful = matches!(
             outcome,
             PeerCreationOutcome::GracefulCloseProvider
                 | PeerCreationOutcome::GracefulCloseService
                 | PeerCreationOutcome::DropProvider
                 | PeerCreationOutcome::DropService
+                | PeerCreationOutcome::AbortProvider
+                | PeerCreationOutcome::AbortService
         );
         let normal_close = closing_loss || graceful;
         let (mut source, source_store) = create_node(&launches[0]).await?;
@@ -3918,6 +3927,9 @@ pub(crate) mod report_tests {
                             return Err("destination Open deadline".into());
                         }
                     }
+                    if opening && target.close(body.unit.id.clone(), ra::CloseMode::Abort).is_ok() {
+                        return Err("unopened peer acquired non-force Abort authority".into());
+                    }
                     if failed_open {
                         if target.runtime_open_failure().is_some() || target.failed_open_deletion().is_some()
                             || target.instance_disposal().is_some() || target.retained_usage() != 1
@@ -4070,8 +4082,8 @@ pub(crate) mod report_tests {
                         if original.phase != ra::Phase::Ready || original.runtime.is_none() || target.retained_usage() != 1 {
                             return Err("terminal-report fixture did not own an opened Idle".into());
                         }
-                        let mode = if dropping { ra::CloseMode::Drop } else { ra::CloseMode::Close };
-                        let expected_stage = if dropping && graceful { ra::FmStage::ReplicaDropped } else { ra::FmStage::ReplicaDown };
+                        let mode = if aborting { ra::CloseMode::Abort } else if dropping { ra::CloseMode::Drop } else { ra::CloseMode::Close };
+                        let expected_stage = if (dropping || aborting) && graceful { ra::FmStage::ReplicaDropped } else { ra::FmStage::ReplicaDown };
                         target.close(body.unit.id.clone(), mode).map_err(err)?;
                         let mut target_traffic = Traffic::default();
                         until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
@@ -4210,10 +4222,11 @@ pub(crate) mod report_tests {
                             || ledger.idle_status()["state"] != "lost"
                             || target_adapter.peer_command_error.is_some() || source_adapter.peer_command_error.is_some()
                             || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK open")).count() != 1
-                            || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK close")).count() != if graceful { 1 } else { usize::from(!provider) }
+                            || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK close")).count() != if aborting { 0 } else if graceful { 1 } else { usize::from(!provider) }
+                            || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK abort")).count() != usize::from(aborting)
                             || logs.iter().filter(|line| line.contains("LOCAL_DATA_PROVIDER acquired")).count() != 1
                             || logs.iter().any(|line| line.contains("LOCAL_DISPOSE complete")) != graceful
-                        { return Err(format!("Close/Drop terminal ACK/late traffic violated ownership (mode={mode:?}, graceful={graceful}): state={:?}, usage={}, disposal={:?}, pending_remove={}, idle={}, target_error={:?}, source_error={:?}, logs={logs:?}",
+                        { return Err(format!("terminal ACK/late traffic violated ownership (mode={mode:?}, graceful={graceful}): state={:?}, usage={}, disposal={:?}, pending_remove={}, idle={}, target_error={:?}, source_error={:?}, logs={logs:?}",
                             target.snapshot(entity).committed.map(|state| (state.phase, state.fm_stage, state.local_deleted, state.peer_host_loss())),
                             target.retained_usage(), target.instance_disposal(),
                             ledger.idle_removal_status()["pending_remove"], ledger.idle_status()["state"],
