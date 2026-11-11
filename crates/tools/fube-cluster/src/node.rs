@@ -3655,6 +3655,8 @@ pub(crate) mod report_tests {
         CloseLossService,
         GracefulCloseProvider,
         GracefulCloseService,
+        DropProvider,
+        DropService,
     }
 
     pub(crate) async fn run_peer_creation_removal(
@@ -3675,6 +3677,7 @@ pub(crate) mod report_tests {
                 | PeerCreationOutcome::DeleteFailedOpenProvider
                 | PeerCreationOutcome::CloseLossProvider
                 | PeerCreationOutcome::GracefulCloseProvider
+                | PeerCreationOutcome::DropProvider
         );
         let opening = matches!(
             outcome,
@@ -3693,11 +3696,15 @@ pub(crate) mod report_tests {
             outcome,
             PeerCreationOutcome::CloseLossProvider | PeerCreationOutcome::CloseLossService
         );
-        let graceful_close = matches!(
+        let dropping = matches!(
+            outcome,
+            PeerCreationOutcome::DropProvider | PeerCreationOutcome::DropService
+        );
+        let graceful = matches!(
             outcome,
             PeerCreationOutcome::GracefulCloseProvider | PeerCreationOutcome::GracefulCloseService
-        );
-        let normal_close = closing_loss || graceful_close;
+        ) || dropping;
+        let normal_close = closing_loss || graceful;
         let (mut source, source_store) = create_node(&launches[0]).await?;
         let (mut target, target_store) = create_node(&launches[1]).await?;
         if failed_registration {
@@ -4049,20 +4056,22 @@ pub(crate) mod report_tests {
                     let result = async {
                         let original = target.snapshot(entity).committed.ok_or("missing original opened Idle")?;
                         if original.phase != ra::Phase::Ready || original.runtime.is_none() || target.retained_usage() != 1 {
-                            return Err("Close-loss fixture did not own an opened Idle".into());
+                            return Err("terminal-report fixture did not own an opened Idle".into());
                         }
-                        target.close(body.unit.id.clone(), ra::CloseMode::Close).map_err(err)?;
+                        let mode = if dropping { ra::CloseMode::Drop } else { ra::CloseMode::Close };
+                        let expected_stage = if dropping { ra::FmStage::ReplicaDropped } else { ra::FmStage::ReplicaDown };
+                        target.close(body.unit.id.clone(), mode).map_err(err)?;
                         let mut target_traffic = Traffic::default();
                         until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
                             &mut target_traffic, |node, _, _| node.activation().logs().iter().any(|line|
                                 line.contains(if provider { "LOCAL_DATA_PROVIDER dispose begin" } else { "LOCAL_DISPOSE begin" }))).await?;
                         let closing = target.snapshot(entity).committed.ok_or("missing committed Close")?;
-                        if closing.phase != ra::Phase::Closing || closing.close_mode != Some(ra::CloseMode::Close)
+                        if closing.phase != ra::Phase::Closing || closing.close_mode != Some(mode)
                             || !closing.peer_creation.as_ref().is_some_and(|peer| peer.close_started_open)
                             || closing.peer_terminal_report() || target.retained_usage() != 1
                             || target.instance_disposal().is_some() || !target_traffic.reports.is_empty()
-                        { return Err("held normal Close published loss/disposal before its owner died".into()); }
-                        if graceful_close {
+                        { return Err("held Close/Drop published a report or disposal before cleanup".into()); }
+                        if graceful {
                             release_disposal(&target, if provider { StatefulDown::CloseProvider } else { StatefulDown::CloseService })?;
                         } else {
                             let pid = target.activation().process_status().ok_or("missing original app process")?.pid;
@@ -4072,21 +4081,31 @@ pub(crate) mod report_tests {
                         }
                         until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
                             &mut target_traffic, |node, _, traffic| !traffic.reports.is_empty()
-                                && (!graceful_close || node.instance_disposal().is_some())).await?;
+                                && (!graceful || node.instance_disposal().is_some())).await?;
                         let report = target_traffic.reports[0].clone();
                         let disposal = target.instance_disposal();
                         let lost = target.snapshot(entity).committed.ok_or("missing lost Closing Idle")?;
-                        if lost.phase != ra::Phase::Closed || lost.fm_stage != ra::FmStage::ReplicaDown
-                            || !lost.peer_terminal_report() || lost.peer_host_loss() != !graceful_close
+                        if lost.phase != ra::Phase::Closed || lost.fm_stage != expected_stage
+                            || !lost.peer_terminal_report() || lost.peer_host_loss() != !graceful
                             || lost.local_deleted || lost.usage.is_some()
-                            || target.retained_usage() != 0 || disposal.is_some() != graceful_close
+                            || target.retained_usage() != 0 || disposal.is_some() != graceful
                             || !report.replicas.0.is_empty() || report.dropped.0.len() != 1
-                        { return Err("normal Close terminal origin did not preserve native reporting/disposal semantics".into()); }
+                        { return Err("Close/Drop terminal origin did not preserve native reporting/disposal semantics".into()); }
                         if let Some(proof) = &disposal {
                             let runtime = original.runtime.as_ref().ok_or("missing original runtime")?;
                             if original.usage != Some(proof.lookup) || proof.host != runtime.host || proof.runtime != runtime.runtime
-                                || proof.acquisition == 0 || proof.command == 0 || proof.ra_operation == 0
-                            { return Err("graceful Close lost exact original disposal/accounting lineage".into()); }
+                                || proof.acquisition != runtime.acquisition || proof.command == 0 || proof.ra_operation == 0
+                                || proof.body.unit != original.body.unit || proof.body.service != original.body.service
+                                || proof.body.replica.node != original.body.replica.node
+                                || proof.body.replica.id != original.body.replica.id
+                                || proof.body.replica.instance != original.body.replica.instance
+                                || proof.body.replica.current_role != 2
+                            { return Err("successful Close/Drop lost exact original disposal/accounting lineage".into()); }
+                            let replication_address = original.body.replica.replication_endpoint.split_once('/')
+                                .ok_or("original Idle replication endpoint lacks actor suffix")?.0;
+                            if tokio::net::TcpStream::connect(replication_address).await.is_ok()
+                                || target.activation().process_status().is_none_or(|status| status.exit_observed)
+                            { return Err("successful Close/Drop did not retire the listener in its original live host".into()); }
                         }
                         let reply = ledger.report(1, &report)?.ok_or("missing native processed loss ACK")?;
                         if reply.replicas != report.dropped || !reply.dropped.0.is_empty()
@@ -4102,17 +4121,23 @@ pub(crate) mod report_tests {
                                 disposal: proof.clone(),
                             }, std::process::id())?;
                         }
-                        let mut stale = reply.clone();
-                        stale.replicas.0[0].replicas.0[0].description.instance -= 1;
-                        acknowledge_without_sending_captured_report(&launches[1], &mut target, &mut target_adapter,
-                            &target_fm, &target_fm_link, &stale).await?;
-                        target_adapter.advance(&mut target, Some(&target_fm_link)).await?;
-                        if target.snapshot(entity).committed.is_none_or(|state| state.fm_stage != ra::FmStage::ReplicaDown)
-                            || target.instance_disposal().is_some() != graceful_close
-                        { return Err("stale ACK completed the Closing-loss obligation".into()); }
-                        if graceful_close {
+                        for stale_kind in 0..if dropping { 2 } else { 1 } {
+                            let mut stale = reply.clone();
+                            if stale_kind == 1 {
+                                stale.replicas.0[0].replicas.0[0].description.state = 2;
+                            } else {
+                                stale.replicas.0[0].replicas.0[0].description.instance -= 1;
+                            }
+                            acknowledge_without_sending_captured_report(&launches[1], &mut target, &mut target_adapter,
+                                &target_fm, &target_fm_link, &stale).await?;
+                            target_adapter.advance(&mut target, Some(&target_fm_link)).await?;
+                            if target.snapshot(entity).committed.is_none_or(|state| state.fm_stage != expected_stage)
+                                || target.instance_disposal().is_some() != graceful
+                            { return Err("stale/non-dropped ACK completed the original terminal-report obligation".into()); }
+                        }
+                        if graceful {
                             if timer(&mut target_adapter)?.due.saturating_duration_since(Instant::now()) < Duration::from_secs(25) {
-                                return Err("graceful Close did not retain the native 30-second report retry".into());
+                                return Err("Close/Drop did not retain the native 30-second report retry".into());
                             }
                             if provider {
                                 let before = target_traffic.reports.len();
@@ -4126,10 +4151,10 @@ pub(crate) mod report_tests {
                                         .map_err(|error| format!("Close report retry source FM progress: {error}"))?;
                                     step(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link, &mut target_traffic).await
                                         .map_err(|error| format!("Close report retry destination FM progress: {error}"))?;
-                                    if Instant::now() >= end { return Err("graceful Close lost-ACK retry deadline".into()); }
+                                    if Instant::now() >= end { return Err("Close/Drop lost-ACK retry deadline".into()); }
                                 }
                                 if target_traffic.reports.last() != Some(&report) || target.retained_usage() != 0 {
-                                    return Err("graceful Close lost-ACK retry changed the original lifetime".into());
+                                    return Err("Close/Drop lost-ACK retry changed the original lifetime".into());
                                 }
                             }
                         }
@@ -4160,10 +4185,10 @@ pub(crate) mod report_tests {
                         }
                         let logs = target.activation().logs();
                         if target.snapshot(entity).committed.is_none_or(|state| !state.local_deleted || !state.peer_terminal_report()
-                                || state.peer_host_loss() != !graceful_close
+                                || state.peer_host_loss() != !graceful
                                 || state.phase != ra::Phase::Closed || state.fm_stage != ra::FmStage::None
                                 || state.open_token != original.open_token)
-                            || target.retained_usage() != 0 || target.instance_disposal().is_some() != graceful_close
+                            || target.retained_usage() != 0 || target.instance_disposal().is_some() != graceful
                             || serde_json::to_value(target.instance_disposal()).map_err(err)? != serde_json::to_value(&disposal).map_err(err)?
                             || target.replica_absence().is_some() || target.pre_open_cancellation().is_some()
                             || target.failed_open_deletion().is_some() || target.failed_registration_deletion().is_some()
@@ -4173,10 +4198,10 @@ pub(crate) mod report_tests {
                             || ledger.idle_status()["state"] != "lost"
                             || target_adapter.peer_command_error.is_some() || source_adapter.peer_command_error.is_some()
                             || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK open")).count() != 1
-                            || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK close")).count() != if graceful_close { 1 } else { usize::from(!provider) }
+                            || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK close")).count() != if graceful { 1 } else { usize::from(!provider) }
                             || logs.iter().filter(|line| line.contains("LOCAL_DATA_PROVIDER acquired")).count() != 1
-                            || logs.iter().any(|line| line.contains("LOCAL_DISPOSE complete")) != graceful_close
-                        { return Err(format!("normal Close terminal ACK/late traffic violated ownership (graceful={graceful_close}): state={:?}, usage={}, disposal={:?}, pending_remove={}, idle={}, target_error={:?}, source_error={:?}, logs={logs:?}",
+                            || logs.iter().any(|line| line.contains("LOCAL_DISPOSE complete")) != graceful
+                        { return Err(format!("Close/Drop terminal ACK/late traffic violated ownership (mode={mode:?}, graceful={graceful}): state={:?}, usage={}, disposal={:?}, pending_remove={}, idle={}, target_error={:?}, source_error={:?}, logs={logs:?}",
                             target.snapshot(entity).committed.map(|state| (state.phase, state.fm_stage, state.local_deleted, state.peer_host_loss())),
                             target.retained_usage(), target.instance_disposal(),
                             ledger.idle_removal_status()["pending_remove"], ledger.idle_status()["state"],

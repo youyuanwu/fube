@@ -468,7 +468,8 @@ description travels in ReplicaUp's **dropped list**, just as for host loss.
 Only a matching successful RAP Close of the committed opened-origin normal
 Close records this terminal origin. The completion commit precedes original
 registration/usage release and report work; initial-Open cancellation, failed
-Close, Drop/Abort and arbitrary closed lifetimes do not gain this authority.
+Close, Abort/ForceAbort and arbitrary closed lifetimes do not gain this authority.
+Normal Drop has its distinct stage semantics described below.
 If HostDown wins first, late Close replies remain stale and provide no
 disposal proof. If successful Close wins, later HostDown cannot reclassify it.
 
@@ -498,6 +499,43 @@ continue to progress during that retry. Model/store tests cover separate
 completion/ACK commit failure and uncertainty, excluded Close origins and late
 HostDown. No child-node Close-control feature, wire schema or native C++
 handler/interoperability qualification is added.
+
+### Normal opened destination Drop reporting
+
+The existing local Node `close` with `CloseMode::Drop` now reports the original
+successfully opened peer Idle. This adds no FM message or child-node control
+operation. The committed opened-origin Close/Drop intent and matching successful
+RAP completion are required; initial-Open cancellation, failed Close/Drop,
+ForceAbort and arbitrary closed lifetimes remain excluded.
+
+Pinned `FailoverUnit.cpp:5472-5544` calls OnDropped for Drop, rather than Close's
+OnReplicaDown. `FMMessageState.cpp:99-113` selects **ReplicaDropped stage**,
+while the canonical volatile dropped entry still travels in ReplicaUp's
+**dropped list**, not the legacy ReplicaDropped wire action.
+Real provider/service cleanup and the completion commit precede reporting and
+exact original registration/usage release. Held cleanup and definite/unknown
+commit outcomes cannot publish success.
+
+Native `FailoverUnit.cpp:5734-5753` requires a dropped description to acknowledge
+this stage, even before the first report retry. A delayed non-dropped down/Ready
+description cannot clear it. The existing immediate/30-second reporting,
+processed-list ACK and closed metadata Delete/reply path are reused; a
+dropped-list ACK instead performs closed ForceDelete without that reply.
+Normal Drop cannot supersede an already-closing Close, and a later Close/Drop
+does not relabel an already-closed lifetime's original report.
+HostDown during Drop remains gated rather than borrowing normal-Close origin.
+
+Original-runtime disposal/accounting proof remains independently observable
+before ACK and unchanged after metadata replay. The replication listener is
+retired while the original app host/runtime/factory remain resident. FM records
+`lost`, not reusable state; neither a metadata ACK nor valid disposal sidecar
+authorizes replacement, completes explicit operator deletion or clears Primary
+pending-remove. Model/store tests cover intent/completion/ACK commit barriers,
+both ACK lists, stale/late traffic and excluded origins. Controlled original
+Node/process/Channel tests hold provider/service disposal separately, exercise
+an actual lost-ACK retry and metadata reply replay, and retain healthy Primary
+writes and independent removal. These add lifecycle evidence, not native C++
+handler execution or FM/Federation interoperability qualification.
 
 ### Deleting the original opened destination Idle
 

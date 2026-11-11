@@ -170,6 +170,15 @@ held provider/service disposal, a real lost-ACK retry and metadata replay add
 lifecycle evidence, not wire cases, schema types, reuse authority or native
 C++ handler execution.
 
+Normal Drop of that original opened Idle now uses OnDropped/ReplicaDropped
+stage with the same canonical ReplicaUp dropped entry, processed-list ACK and
+closed metadata Delete shapes. Non-dropped ACKs cannot clear this stage, even
+before the first report. Real disposal and committed original ownership release
+remain independent from FM acknowledgment and Primary pending-remove; no
+replacement is enabled. Intent/completion/ACK commit tests and controlled real
+provider/service disposal, lost-ACK retry and metadata replay add lifecycle
+evidence only. The oracle remains 139 cases, not native C++ handler execution.
+
 ### Stage-two node control/load and endpoint codecs
 
 All original 58 cases, 59 types/199 fields, 62 files and eleven native

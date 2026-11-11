@@ -8,7 +8,7 @@ pub struct PeerCreation {
     pub registration_error: Option<i64>,
     pub open_error: Option<i64>,
     pub host_down: bool,
-    /// Normal Close committed from the original successfully opened Idle.
+    /// Normal Close or Drop committed from the original successfully opened Idle.
     pub close_started_open: bool,
     /// Matching successful RAP completion, not an FM ACK or disposal receipt.
     pub close_completed: bool,

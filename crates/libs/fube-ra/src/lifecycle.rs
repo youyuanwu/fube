@@ -339,7 +339,7 @@ fn start_close_inner(
     let was_creating = state.phase == Phase::Opening;
     if state.body.replica.current_role == 2 && state.runtime.is_some() && state.usage.is_some() {
         if let Some(peer) = &mut state.peer_creation {
-            if mode == CloseMode::Close && state.phase == Phase::Ready {
+            if matches!(mode, CloseMode::Close | CloseMode::Drop) && state.phase == Phase::Ready {
                 peer.close_started_open = true;
             }
             if mode == CloseMode::AppHostDown
@@ -829,7 +829,10 @@ pub(super) fn transition(
             let mode = state.close_mode.unwrap();
             let mut effects = Vec::new();
             if event.error == 0 {
-                if mode == CloseMode::Close && state.runtime.is_some() && state.usage.is_some() {
+                if matches!(mode, CloseMode::Close | CloseMode::Drop)
+                    && state.runtime.is_some()
+                    && state.usage.is_some()
+                {
                     if let Some(peer) = &mut state.peer_creation {
                         peer.close_completed = peer.close_started_open;
                     }

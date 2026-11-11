@@ -262,6 +262,20 @@ lost-ACK retry, metadata reply replay and stable original proof have controlled
 Node/process/Channel coverage, separately from completion/ACK commit tests and
 native C++ handler execution.
 
+Normal Drop now extends that original opened-peer profile through
+[FT:5472-5544][ft]'s OnDropped path and
+`FMMessageState.cpp:99-113`'s ReplicaDropped stage, not ReplicaDown.
+Both use ReplicaUp's canonical dropped entry. The existing
+[FT:5734-5753][ft] ACK gate requires a dropped description, before or after
+the first report; the processed-list ACK and closed metadata Delete/reply do
+not replace actual original-runtime disposal/accounting proof or complete
+Primary pending-remove. A later Drop cannot supersede an in-flight Close or
+relabel its closed Down report. Initial-Open, failed/ForceAbort and HostDown
+during Drop remain gated. Intent/completion/ACK commit barriers, both ACK lists,
+non-dropped ACK rejection and controlled provider/service disposal/lost-ACK
+retry/metadata replay add lifecycle evidence only. See the
+[opened destination Drop guide](MinimalFmCluster.md#normal-opened-destination-drop-reporting).
+
 ### Stage-two native codec contracts and execution boundary
 
 The pinned [RSMessage.cpp:52–55,111–112,130,210–219][registry] initializers use

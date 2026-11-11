@@ -178,7 +178,22 @@ authority in this terminal-report flow, and Primary pending-remove needs its
 own reply. Controlled process/Channel tests hold provider/service disposal,
 lose/retry an ACK at the unchanged 30-second cadence, replay metadata replies
 and retain healthy Primary writes. Initial-Open, failed or other-mode Close
-does not gain this reporting authority.
+does not gain this down-stage reporting authority.
+
+Normal `CloseMode::Drop` of that original opened Idle now uses
+**ReplicaDropped stage**, not ReplicaDown, while sending the same canonical
+ReplicaUp dropped entry. Only committed opened-origin intent and matching
+successful RAP completion enable this path. A non-dropped down/Ready ACK
+cannot clear it, even before the first retry. The processed-list ACK/closed
+metadata Delete and original disposal/usage proof remain independent, with
+no second RAP Close, Primary pending-remove completion or reuse/replacement
+authority. A later Drop cannot supersede an already-closing Close or relabel
+its closed Down report. Controlled provider/service disposal, actual 30-second
+lost-ACK retry, stable proof/metadata replay and healthy Primary writes are
+covered separately from intent/completion/ACK commit and both-list ACK tests.
+Initial-Open, failed/ForceAbort and HostDown-during-Drop reporting remain gated.
+No new wire types, child-node control operation or native handler qualification
+is added; see the [bounded Drop guide](../../../docs/cluster/MinimalFmCluster.md#normal-opened-destination-drop-reporting).
 
 After an original CreateReplicaReply error, the Primary retains only a failed
 observation/tombstone (`creation_aborted=true`), not live creation/build authority.
