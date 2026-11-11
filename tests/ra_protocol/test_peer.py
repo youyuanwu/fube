@@ -82,7 +82,7 @@ class RAReplicaMessageBody : public ReplicaMessageBody {
         self.assertEqual(len(peer), 8)
         self.assertEqual({row["action"] for row in peer if "selected" in row["status"]},
                          consumer.PEER_ACTIONS | {"Activate", "ActivateReply", "Deactivate", "DeactivateReply", "GetLSN", "GetLSNReply"})
-        self.assertEqual(sum("selected" in row["status"] for row in rows if row not in peer), 37)
+        self.assertEqual(sum("selected" in row["status"] for row in rows if row not in peer), 39)
         records = {row["action"]: row for row in rows}
         self.assertEqual(records["CreateReplica"]["ra_metadata"], "FC")
         self.assertEqual(records["CreateReplicaReply"]["ra_metadata"], "F")

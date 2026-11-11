@@ -147,7 +147,7 @@ fn mark_deleted(state: &mut EntityState) {
         state.cleanup_pending = true;
     }
 }
-fn dropped_description(state: &EntityState) -> Replica {
+pub(super) fn dropped_description(state: &EntityState) -> Replica {
     // Native CreateDroppedReplicaDescription resets roles, package, LSNs and endpoints.
     Replica {
         node: state.body.replica.node.clone(),

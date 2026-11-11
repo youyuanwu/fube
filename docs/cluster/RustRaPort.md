@@ -100,6 +100,12 @@ now adds old-Primary demotion, peer continuation, real GetLSN/promotion/catch-up
 peer activation and final endpoint publication without another Open.
 Loss-driven quorum reduction, automatic failover, restart and broader
 reconfiguration remain gated.
+The [live-session LFUM upload](MinimalFmCluster.md#live-session-lfum-upload)
+now completes one ordinary-FM generation round on the original stateless or
+independent singleton sessions. Per-entity read barriers precede correlated
+inventory upload; only the matching reply advances RA send generation.
+This is metadata reconciliation with the surviving FM, not runtime adoption,
+peer-configuration upload, nonempty NodeUp reconciliation or durable restart.
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's
@@ -554,9 +560,9 @@ complete every native branch of its handlers.
 The [source-pinned catalog](NativeRaProtocol.md) contains **58 FM-boundary action
 definitions**, including common registration, plus **eight peer RA actions**.
 There are 67 directional contracts because DoReconfiguration also has a peer
-send path. The current 37 selected FM-boundary and eight selected peer action
+send path. The current 39 selected FM-boundary and eight selected peer action
 codecs have bounded handler/helper coverage, not complete native contracts;
-21 FM-boundary actions remain unselected, alongside broader branches of the
+19 FM-boundary actions remain unselected, alongside broader branches of the
 selected handlers.
 
 Stage 1 is now implemented for the bounded volatile 1/1 FM profile; see
@@ -567,7 +573,7 @@ This does not qualify every native handler branch or complete P4/M2.
 |---|---|---|
 | 1. Finish singleton lifecycle | Abort/ForceAbort reporting, closed-AddPrimary handling and remaining DeleteReplica branches, then explicitly authorized fresh-lifetime recreation. | Preserve native close/report/ACK semantics and exact original accounting. Reporting and metadata completion cannot substitute for disposal proof or relabel lost volatile data as recovered empty state. |
 | 2. Complete node-wide coordination | Bounded implementation: broader P2 multi-entity execution; NodeActivateRequest/Reply, NodeDeactivateRequest/Reply, NodeUpdateServiceRequest/Reply, ServiceTypeEnabled/Disabled and their replies, existing registration notifications and complete ReportLoad codecs/forwarding. ReplicaEndpointUpdated/Reply codecs and helper integrate with bounded planned-swap publication in stage 5. | Preserve sequence/version checks and action-specific completion barriers. Deactivation replies follow required replica closure, not admission; ReportLoad remains best-effort without an invented per-report ACK. Keep one FT per deployed Node; qualify multiple FTs in RA model/store tests. |
-| 3. Complete ordinary-FM generation and upload | Bounded generation-handshake increment implemented: GenerationProposal/Reply and GenerationUpdate/Reject. Remaining: LFUMUpload/Reply, nonempty NodeUp/NodeUpAck reconciliation and full ReplicaUp/Reply batching/final-upload handling. | Preserve proposed/receive/send generations and per-entity commit barriers. Only the correct semantic completion advances upload/readiness; keep restart serving disabled until stage 6. |
+| 3. Complete ordinary-FM generation and upload | Bounded GenerationProposal/Reply, GenerationUpdate/Reject and live-session LFUMUpload/Reply are implemented. The original stateless/independent singleton sessions upload committed metadata and resume new-generation control. Remaining: nonempty NodeUp/NodeUpAck reconciliation, full ReplicaUp/Reply batching/final-upload handling, peer-configuration inventories and full FM rebuild. | Preserve proposed/receive/send generations and per-entity commit barriers. Only the correct semantic completion advances upload/readiness; keep restart serving disabled until stage 6. |
 | 4. Build and remove remote replicas | Bounded original two-node volatile Idle creation, nonempty copy/continuing replication, FM Add/build, pending/failed/opened Primary removal and same-lifetime retry/replay are implemented. The [original-session destination Delete contract](MinimalFmCluster.md#complete-original-session-destination-delete-contract) covers normal/force and opening/closing/closed/failed/absent/lost targets and separate original cleanup proofs. Close/Drop/Abort and host-loss reporting retain native stage/ACK distinctions. [Explicit fresh replacement](MinimalFmCluster.md#explicit-fresh-idle-replacement) now rebuilds one successor after original successful build, Primary removal and normal Delete/disposal. Remaining: broader replacement/lifecycle/report profiles, active configuration/reconfiguration/removal and native interoperability qualification. | Copy completion grants no active membership or serving; AddReplicaReply completes FM build and Ready/Idle is not ActiveSecondary. Only RemoveReplicaReply clears Primary pending-remove. Destination Delete independently joins its semantic reply with original cleanup evidence. Neither metadata/report ACK nor cleanup proof authorizes a successor: the bounded replacement requires a separate explicit FM request and destination-local disposal/drain admission. Original history and stale-incarnation fences survive replacement. |
 | 5. Implement reconfiguration | Bounded unchanged-Primary admission, healthy retirement/replacement and one healthy planned Primary transfer are implemented. Planned swap adds phase-0 demotion, peer continuation, real local/remote GetLSN, promotion/catch-up, activation, final configuration and endpoint publication without another Open. Remaining: loss-driven repair, broader reconfiguration/GetLSN/Deactivate, swap abort/reverse transfer, ChangeConfiguration and DatalossReport. | Preserve native phase ordering, separate previous/current quorum obligations, catch-up/cancellation, old-primary fencing and endpoint publication. New-Primary loss cannot restore the demoted writer or reduce quorum. Current source-stream and native-free evidence is not complete original-handler/interoperability qualification. |
 | 6. Enable durable RA restart | P5 loading/fixups, crash-window reconciliation, fresh incarnation and recovery with the original FM surviving. | Historical records cannot restore Primary authority. Prove predecessor fencing; rebuild volatile replicas from eligible survivors with valid history/quorum evidence or report data loss. |
@@ -608,11 +614,12 @@ of receive/send and replies through the original correlated request context.
 GenerationUpdate accepts only the current proposal, drops below-receive traffic
 and otherwise rejects with the native proposed-generation body. Entity workers
 read the current receive generation under the publication lock; private/unknown
-commits remain owned and cannot become inventory or upload success. Send
-generation never advances from the handshake. LFUM snapshot jobs and their
-per-entity completion barriers are still part of the next increment, not
-implemented by an `upload_pending` flag. The local FM-service epoch/ForceAbort
-branch and FMM domain remain capability-gated.
+commits remain owned and cannot become inventory or upload success. The
+live-session LFUM increment now queues snapshot jobs behind each captured
+entity's admitted work and retains the aggregated inventory for correlated
+upload/retry. Only the matched current-generation reply advances send generation;
+an `upload_pending` flag or transport receipt is not completion. The local
+FM-service epoch/ForceAbort branch and FMM domain remain capability-gated.
 
 The endpoint helper preserves the native separation from FM message state.
 Its timeout and pending/completed/reset behavior now integrate with real RAP

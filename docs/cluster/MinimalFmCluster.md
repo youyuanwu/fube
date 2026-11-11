@@ -156,9 +156,8 @@ An unmatched Update sends the native proposed-generation rejection; messages
 below receive are ignored. The generation/publication lock also protects
 locked-entity admission. Already-running commits retain their original
 operation/fence; definite failure and uncertainty cannot publish private state
-or fabricate an uploaded inventory. No snapshot job, LFUMUpload or upload ACK
-is implemented yet, so the handshake never advances send generation or grants
-new serving/restart authority.
+or fabricate an uploaded inventory. The live-session LFUM increment below now
+completes inventory upload without granting new serving/restart authority.
 
 Programmatic `Cluster::begin_generation_handshake()` opts the two original,
 admitted nodes into a bounded FM round only when lifecycle/control requests
@@ -166,21 +165,62 @@ are not pending. It is not a new CLI command and does not change default
 startup. The FM retries proposals and pending updates, restarting negotiation
 above a higher proposal or qualifying rejection. Retry timing uses native
 five-/ten-second defaults; dynamic FM rebuild configuration and Federation
-broadcast membership are not enabled. The round intentionally remains
-`awaiting_upload`, `complete=false`, with mutations/service updates gated.
+broadcast membership are not enabled. The round remains `awaiting_upload`,
+`complete=false`, with mutations/service updates gated until both original
+nodes' LFUM inventories are processed.
 Existing replicas are not reopened or relabeled as recovered; independent
 owner shutdown and real application access remain available.
 
-Only generation-control messages bypass the deployed envelope's frozen launch
-generation. Other live action families remain restricted to that original
-generation until LFUM completion is implemented; the generic RA model does
-apply current receive-generation admission. This is not a fully rebuilt FM or
-native Federation interoperability. Focused model/store tests cover stale and
-duplicate traffic, reordered proposals, definite/unknown commits and queued
-entity admission. Real nodes exercise correlated replies, rejection,
-renegotiation, unchanged send generation and independent sibling access.
+Generation-control messages and correlated LFUM replies have their own native
+admission; ordinary traffic uses the current receive-generation lower bound.
+This is not a fully rebuilt FM or native Federation interoperability.
+Focused model/store tests cover stale and duplicate traffic, reordered
+proposals, definite/unknown commits and queued entity admission. Real nodes
+exercise correlated replies, rejection, renegotiation and independent sibling access.
 Bidirectional native codecs and native ordering/admission helpers are separate
 from the still-required complete C++ handler traces and interoperability gates.
+
+### Live-session LFUM upload
+
+`Cluster::begin_generation_handshake()` now continues through ordinary-FM
+LFUMUpload/Reply on the same two admitted stateless or independent volatile
+singleton sessions. LFUM is the local failover-unit map: this uploads replica
+metadata, not application data, a database backup or a new runtime lifetime.
+The peer-Idle/active-configuration profile remains fixed-generation and excluded.
+
+Pinned SF revision `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the boundaries:
+
+| Source | Preserved contract |
+|---|---|
+| `ra/GenerationStateManager.cpp:359-455` | Capture the ordinary-FM entity set and AnyReplicaFound, then queue a read behind each entity's admitted work. Aggregate only after all jobs finish; no private or uncertain commit is sampled. |
+| `ra/FailoverUnit.cpp:3999-4134`; `ra/Replica.cpp:217-230`; `ra/ReconfigurationAgent.cpp:4345-4357` | Omit locally deleted replicas, retain canonical dropped descriptions for closed replicas, clear reported LSNs and preserve local-map AnyReplicaFound independently of the emitted list. Singleton intermediate epoch/role remain invalid/None. |
+| `common/LFUMMessageBody.h:18-61`; `common/RSMessage.cpp:181-182` | Body order is generation, full NodeDescription, FailoverUnitInfo vector, AnyReplicaFound. High-priority FM request has no GenerationHeader; the high-priority RA reply is bodyless and carries the echoed generation. |
+| `common/RALFUMUploadOperation.cpp:14-39`; `common/FailoverConfig.h:30` | A consuming correlated request owns the frozen upload. Timeout retains that body for a new request after the native 30-second retry interval; node drive and owner shutdown remain independent. |
+| `fm/RebuildContext.cpp:389-486`; `fm/FailoverManager.cpp:2620-2647` | Process inventory before acknowledgment. A duplicate/already-ready or different-generation upload receives its echoed reply without replacing accepted inventory or completing a different round. |
+| `ra/GenerationStateManager.cpp:318-337` | Only a reply equal to current receive generation advances send generation. An older in-flight reply cannot finish a superseding round. |
+
+The bounded surviving FM reconciles reports against its exact original node,
+partition, service, configuration and replica ownership; it does not reconstruct
+unknown partitions or elect writers from reports. `generation_handshake.uploads`
+retains each accepted inventory. Both processed uploads set
+`phase=complete`, `complete=true`, allowing ordinary control/service updates in
+the new generation. An individual RA keeps its upload pending until its own
+matching semantic reply; transport receipt and diagnostic observation files
+cannot substitute for that reply. A lost reply replays the same inventory even
+after FM has completed the round.
+
+Model/store tests cover multi-entity barriers, failed/unknown private commits,
+empty maps versus deleted-only maps, exact/stale/FMM replies and duplicate FM
+receipts. Original-process acceptance covers empty/nonempty inventories,
+renegotiation, resumed new-generation Add/Delete, an actually lost LFUM reply
+and native-interval retry, and continuing nonempty Primary data on the original
+app/runtime owners. FM-channel loss during an owned upload leaves it pending
+without advancing send generation or shutting down the original serving app.
+Native-stream/schema-adapter evidence adds six cases:
+169 bidirectional cases, 84 types/255 fields, 173 bundle files and 49 actual
+native truncation rejections. Full C++ handler traces/interoperability,
+nonempty NodeUp reconciliation, full ReplicaUp batching/final upload, peer
+configuration upload, FM/FMM rebuild and durable restart remain unqualified.
 
 ## Peer-created Idle replica (stage-4 increment)
 

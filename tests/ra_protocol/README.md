@@ -37,7 +37,15 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 163 inputs.
+The C++ producer independently constructs expected values and emits 169 inputs.
+Live-session LFUM adds empty/rich/deleted-only metadata bodies, a bodyless
+correlated reply and both action headers. Native LFUMMessageBody extraction
+preserves generation/NodeDescription/FailoverUnitInfo-vector/AnyReplicaFound
+order; the request has no GenerationHeader and the reply echoes it.
+The maintained gate covers 84 types/255 fields, 173 bundle files and 49 actual
+native truncation rejections. All prior 163 cases and 47 rejections remain.
+The empty LFUM fixture explicitly initializes AnyReplicaFound=false; the native
+body's empty constructor does not initialize that scalar.
 Healthy planned Primary transfer adds six default/rich/action cases for
 GetLSN/Reply. GetLSN reuses ReplicaMessageBody; GetLSNReply inherits
 ReplicaReplyMessageBody and adds nested deactivation information in its derived

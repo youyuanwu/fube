@@ -316,6 +316,7 @@ async fn generation_update_does_not_publish_private_commits_and_queued_work_rech
         );
         assert!(executor.snapshot([1; 16]).committed.is_none());
         assert!(executor.take_effects().is_empty());
+        assert!(executor.lfum_inventory().unwrap().is_none());
         if !fail {
             assert_eq!(first.wait(WAIT).await, Err(Failure::Unknown));
             assert!(executor.snapshot([1; 16]).fenced);
@@ -345,9 +346,222 @@ async fn generation_update_does_not_publish_private_commits_and_queued_work_rech
         }
         assert_eq!(executor.generation_state().send, admission().generation);
         assert!(executor.generation_state().upload_pending);
+        let inventory = wait_lfum(&executor).await;
+        assert!(inventory.any_replica_found);
+        assert_eq!(inventory.units.0.len(), usize::from(!fail));
+        if !fail {
+            assert_eq!(inventory.units.0[0].unit, body(1).unit);
+            assert_eq!(
+                inventory.units.0[0].replicas.0[0].description,
+                body(1).replica
+            );
+        }
         finish(&store, &executor).await;
     }
 }
+async fn wait_lfum(executor: &Executor) -> LfumInventory {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(inventory) = executor.lfum_inventory().unwrap() {
+                return inventory;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn lfum_snapshot_filters_deleted_entries_and_ack_fences_superseded_generations() {
+    let (store, executor, _) = setup(WAIT).await;
+    let source = admission().fm_source;
+    let update = GenerationUpdate::default();
+    assert!(executor.lfum_inventory().unwrap().is_none());
+    executor
+        .process_generation_proposal(&source, &generation_header(8))
+        .unwrap();
+    executor
+        .process_generation_update(&source, &update, &generation_header(8))
+        .unwrap();
+    let empty = wait_lfum(&executor).await;
+    assert!(!empty.any_replica_found);
+    assert!(empty.units.0.is_empty());
+    assert!(!executor
+        .process_lfum_upload_reply(&source, &generation_header(7))
+        .unwrap());
+    assert!(executor
+        .process_lfum_upload_reply(&source, &generation_header(8))
+        .unwrap());
+    assert_eq!(
+        executor.generation_state().send,
+        generation_header(8).number
+    );
+    assert!(!executor.generation_state().upload_pending);
+
+    // Missing-FT Delete retains a real deleted tombstone, not an uploaded replica.
+    run(
+        &executor,
+        Command::Remove {
+            body: Box::new(RemoveInstance::new(body(2), false)),
+            source: source.clone(),
+            generation: generation_header(8),
+        },
+    )
+    .await;
+    assert!(executor.snapshot([2; 16]).committed.unwrap().local_deleted);
+    executor.take_effects();
+    executor
+        .process_generation_proposal(&source, &generation_header(9))
+        .unwrap();
+    executor
+        .process_generation_update(&source, &update, &generation_header(9))
+        .unwrap();
+    assert!(!executor
+        .process_lfum_upload_reply(&source, &generation_header(8))
+        .unwrap());
+    let inventory = wait_lfum(&executor).await;
+    assert!(inventory.any_replica_found);
+    assert!(inventory.units.0.is_empty());
+    assert_eq!(executor.lfum_inventory().unwrap(), Some(inventory.clone()));
+    assert_eq!(
+        executor.generation_state().send,
+        generation_header(8).number
+    );
+    let mut fmm = generation_header(9);
+    fmm.for_fm_replica = true;
+    assert!(executor.process_lfum_upload_reply(&source, &fmm).is_err());
+    assert!(executor
+        .process_lfum_upload_reply(&NodeInstance::default(), &generation_header(9))
+        .is_err());
+    assert!(executor
+        .process_lfum_upload_reply(&source, &generation_header(9))
+        .unwrap());
+    assert!(executor
+        .process_lfum_upload_reply(&source, &generation_header(9))
+        .unwrap());
+    assert!(!executor.generation_state().upload_pending);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn lfum_read_jobs_capture_each_committed_replica_without_advancing_runtime_authority() {
+    let (store, executor, _) = setup(WAIT).await;
+    for id in [1, 2] {
+        run(&executor, add(body(id))).await;
+    }
+    executor.take_effects();
+    let before = [1, 2].map(|id| executor.snapshot([id; 16]).committed.unwrap());
+    let source = admission().fm_source;
+    executor
+        .process_generation_proposal(&source, &generation_header(8))
+        .unwrap();
+    executor
+        .process_generation_update(&source, &GenerationUpdate::default(), &generation_header(8))
+        .unwrap();
+    assert!(executor
+        .process_lfum_upload_reply(&source, &generation_header(8))
+        .is_err());
+    let inventory = wait_lfum(&executor).await;
+    assert_eq!(inventory.units.0.len(), 2);
+    for (info, state) in inventory.units.0.iter().zip(&before) {
+        assert_eq!(info.unit, state.body.unit);
+        assert_eq!(info.service, state.body.service);
+        assert!(!info.report_from_primary);
+        assert!(!info.local_deleted);
+        assert_eq!(info.replicas.0[0].intermediate_role, 1);
+        assert_eq!(info.replicas.0[0].description, state.body.replica);
+        assert_eq!(
+            executor
+                .snapshot(state.body.unit.id.guid.0)
+                .committed
+                .as_deref(),
+            Some(state.as_ref())
+        );
+    }
+    assert!(executor.take_effects().is_empty());
+    assert!(executor
+        .process_lfum_upload_reply(&source, &generation_header(8))
+        .unwrap());
+    finish(&store, &executor).await;
+}
+#[tokio::test]
+async fn lfum_reports_open_then_canonical_closed_replica_without_claiming_deletion() {
+    let (store, executor, _) = setup(WAIT).await;
+    let request = body(1);
+    let open = executor.submit(add(request.clone())).unwrap();
+    open.wait(WAIT).await.unwrap();
+    executor.take_effects();
+    registered(&executor, &request, open.id).await;
+    let normalized = executor.snapshot([1; 16]).committed.unwrap().body.clone();
+    let completion = complete(&normalized, open.id);
+    run(&executor, Command::CompleteOpen(Box::new(completion))).await;
+    executor.take_effects();
+    assert!(!executor
+        .snapshot([1; 16])
+        .committed
+        .unwrap()
+        .body
+        .replica
+        .service_endpoint
+        .is_empty());
+    let source = admission().fm_source;
+    executor
+        .process_generation_proposal(&source, &generation_header(8))
+        .unwrap();
+    executor
+        .process_generation_update(&source, &GenerationUpdate::default(), &generation_header(8))
+        .unwrap();
+    let inventory = wait_lfum(&executor).await;
+    assert_eq!(inventory.units.0[0].replicas.0[0].description.first_lsn, -1);
+    assert_eq!(inventory.units.0[0].replicas.0[0].description.last_lsn, -1);
+    executor
+        .process_lfum_upload_reply(&source, &generation_header(8))
+        .unwrap();
+    run(
+        &executor,
+        Command::CloseLocal {
+            unit: request.unit.id,
+            mode: CloseMode::Drop,
+        },
+    )
+    .await;
+    let closing = executor.snapshot([1; 16]).committed.unwrap();
+    run(
+        &executor,
+        Command::CompleteClose(Box::new(CloseCompletion {
+            unit: closing.body.unit.clone(),
+            replica: closing.body.replica.clone(),
+            error: 0,
+        })),
+    )
+    .await;
+    assert!(!executor.snapshot([1; 16]).committed.unwrap().local_deleted);
+    executor.take_effects();
+    executor
+        .process_generation_proposal(&source, &generation_header(9))
+        .unwrap();
+    executor
+        .process_generation_update(&source, &GenerationUpdate::default(), &generation_header(9))
+        .unwrap();
+    let closed = wait_lfum(&executor).await;
+    let replica = &closed.units.0[0].replicas.0[0].description;
+    assert!(closed.any_replica_found);
+    assert!(!closed.units.0[0].report_from_primary);
+    assert_eq!(
+        *replica,
+        Replica {
+            node: admission().local_node,
+            id: 40,
+            instance: 50,
+            up: false,
+            state: 3,
+            ..Replica::default()
+        }
+    );
+    finish(&store, &executor).await;
+}
+
 #[tokio::test]
 async fn generation_update_cannot_skip_the_local_fm_service_epoch_branch() {
     let (store, executor, _) = setup(WAIT).await;

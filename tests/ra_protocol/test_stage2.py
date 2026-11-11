@@ -19,7 +19,7 @@ class StageTwoCatalogTests(unittest.TestCase):
         records = {row["action"]: row for row in rows}
         self.assertEqual(len(rows), 119)
         self.assertEqual(sum(row["boundary"] == "true" for row in rows), 66)
-        self.assertEqual(sum("selected" in row["status"] for row in rows), 45)
+        self.assertEqual(sum("selected" in row["status"] for row in rows), 47)
         for action in consumer.STAGE_TWO_ACTIONS:
             with self.subTest(action=action):
                 row = records[action]

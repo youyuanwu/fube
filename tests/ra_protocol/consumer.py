@@ -48,9 +48,10 @@ CASES |= {"fmm-node-activate-request", "fmm-node-deactivate-request",
           "legacy-report-load", "modern-report-load"}
 GENERATION_ACTIONS = {
     "GenerationProposal", "GenerationProposalReply", "GenerationUpdate", "GenerationUpdateReject",
+    "LFUMUpload", "LFUMUploadReply",
 }
 GENERATION_FACTORIES = {
-    action: {"actor": 12 if action in {"GenerationProposal", "GenerationUpdate"} else 11,
+    action: {"actor": 12 if action in {"GenerationProposal", "GenerationUpdate", "LFUMUploadReply"} else 11,
              "high_priority": True}
     for action in GENERATION_ACTIONS
 }
@@ -61,6 +62,8 @@ GENERATION_CASES = {
     "default-generation-update", "rich-generation-update",
     "default-generation-update-reject", "high-generation-update-reject",
     "tie-generation-update-reject",
+    "empty-lfum-upload", "rich-lfum-upload", "deleted-only-lfum-upload",
+    "empty-lfum-upload-reply",
 } | {f"action-{action}" for action in GENERATION_ACTIONS}
 CASES |= GENERATION_CASES
 PEER_ACTIONS = {"CreateReplica", "CreateReplicaReply"}
@@ -96,8 +99,8 @@ CONFIGURATION_CASES = {
     for root in ["do-reconfiguration", "do-reconfiguration-reply", "activate", "activate-reply", "deactivate", "deactivate-reply", "get-lsn", "get-lsn-reply"]
 } | {f"action-{action}" for action in CONFIGURATION_FACTORIES}
 CASES |= CONFIGURATION_CASES
-SCHEMA_TYPES = 83
-SCHEMA_FIELDS = 251
+SCHEMA_TYPES = 84
+SCHEMA_FIELDS = 255
 
 
 def validate(bundle, expected_head, expected_source):

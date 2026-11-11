@@ -511,10 +511,19 @@ ordinary-FM GenerationProposal/Reply and GenerationUpdate/Reject round.
 It requires two admitted nodes without pending lifecycle/control requests.
 This is opt-in, not a CLI command or a change to default bootstrap. Proposed,
 receive and send generations remain distinct; only receive changes on a
-matching Update. The round stops at `awaiting_upload`, `complete=false`:
-LFUM upload is not implemented, send generation does not advance, and new
-mutations/service updates are gated. Existing serving replicas and independent
-owned shutdown are not replaced. See the [stage-3 increment and remaining gates](../../../docs/cluster/MinimalFmCluster.md#ordinary-fm-generation-handshake-stage-3-increment).
+matching Update. The round waits at `awaiting_upload`, `complete=false`:
+the RA queues per-entity committed-inventory reads, then sends native correlated
+LFUMUpload/Reply on the same session. Only a reply matching current receive
+generation advances send generation. FM retains both exact original inventories
+in `generation_handshake.uploads`; both processed reports set `phase=complete`,
+`complete=true` and allow new-generation mutations/service updates.
+Lost replies retry the frozen metadata after the native 30-second interval,
+without blocking owner shutdown or reopening replicas. Existing Primary data
+and original node/app/runtime ownership remain intact. This is one live-session
+round for stateless/independent singleton profiles, not application-data upload,
+unknown-partition reconstruction, peer-profile upload, nonempty NodeUp,
+full ReplicaUp batching, FM/FMM recovery or durable restart.
+See the [source mapping and remaining gates](../../../docs/cluster/MinimalFmCluster.md#live-session-lfum-upload).
 
 Native NodeUp/Ack and the final empty ReplicaUp/Reply precede RA construction.
 FM learns the actual generated package version from the original node's bounded

@@ -43,7 +43,7 @@ mod hosting_events;
 pub use hosting_events::*;
 #[path = "generation.rs"]
 mod generation;
-pub use generation::{GenerationState, GenerationUpdateOutcome};
+pub use generation::{GenerationState, GenerationUpdateOutcome, LfumInventory};
 #[path = "peer.rs"]
 mod peer;
 #[path = "reconfiguration.rs"]
@@ -462,6 +462,9 @@ pub enum Command {
     },
 }
 enum Kind {
+    GetLfum {
+        generation: GenerationNumber,
+    },
     GetLsn {
         source: NodeInstance,
         generation: GenerationHeader,
@@ -870,6 +873,7 @@ struct View {
     peer: Option<NodeInstance>,
     generations: GenerationState,
     generations_touched: bool,
+    lfum: Option<generation::LfumSnapshot>,
     statuses: Option<LocalStatusConsumer>,
     entities: BTreeMap<EntityId, Snapshot>,
     effects: VecDeque<Dispatched>,
@@ -1325,6 +1329,17 @@ impl Executor {
                 to_vec(&body),
             ),
         };
+        let mut view = lock(&self.shared.view);
+        self.enqueue_locked(entity, kind, bytes, &mut view)
+    }
+
+    fn enqueue_locked(
+        &self,
+        entity: EntityId,
+        kind: Kind,
+        bytes: fube_transport::Result<Vec<u8>>,
+        view: &mut View,
+    ) -> Result<Ticket> {
         // Add may report a closed replica then return StaleRequest. Lifecycle
         // commands may release, clear warnings, report health, schedule FM work
         // and reply. Bounds are checked again before any persistence/effects.
@@ -1338,7 +1353,7 @@ impl Executor {
             | Kind::OpenLocalStateful
             | Kind::OpenLocalPrimary => 2,
             Kind::Retry | Kind::RetryReport | Kind::RetryServiceDescription => 1,
-            Kind::CompleteServiceDescription => 0,
+            Kind::CompleteServiceDescription | Kind::GetLfum { .. } => 0,
             Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => 8,
             Kind::NodeDeactivate { .. } => 3,
             Kind::CheckNodeDeactivation => self.shared.settings.max_entities + 1,
@@ -1354,7 +1369,6 @@ impl Executor {
             return Err(Failure::Capacity);
         }
         let charge = bytes.len() + 256;
-        let mut view = lock(&self.shared.view);
         if !view.accepting {
             return Err(Failure::Closed);
         }
@@ -1826,6 +1840,7 @@ fn transition(
         return swap::transition(work, state, admission, config, peer);
     }
     match &work.kind {
+        Kind::GetLfum { .. } => Ok(Transition::ignored(Disposition::Applied)),
         #[cfg(feature = "qualification")]
         Kind::QualificationTerminate => panic!("explicit qualification worker termination"),
         Kind::CreateRemoteIdle => peer::start_remote(work, state, admission, peer),
@@ -2574,6 +2589,13 @@ async fn entity_worker(
                 Err(error)
             }
         };
+        if let Kind::GetLfum { generation } = &work.kind {
+            if result.is_ok() {
+                if let Some(snapshot) = &mut view.lfum {
+                    snapshot.complete(generation, work.entity, committed.as_deref());
+                }
+            }
+        }
         view.entities.get_mut(&work.entity).unwrap().fenced = false;
         let reserved_node_replies = view.node.reserved_replies();
         if bound && matches!(work.kind, Kind::CloseForNodeDeactivation) {

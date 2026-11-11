@@ -80,6 +80,7 @@ pub struct Placement {
     pub type_sequence: u64,
     pub launch: Launch,
     pub profile: Option<ActualProfile>,
+    pub node_description: Option<NodeDescription>,
     pub bootstrap: Bootstrap,
     pub desired: Desired,
     pub observed: Observed,
@@ -178,6 +179,7 @@ fn action_retry_due(started: Instant, last: Instant, now: Instant) -> bool {
 pub(crate) enum GenerationPhase {
     Proposing,
     AwaitingUpload,
+    Complete,
 }
 pub(crate) enum GenerationWork {
     Propose(GenerationHeader),
@@ -188,6 +190,7 @@ pub(crate) struct GenerationHandshake {
     pub phase: GenerationPhase,
     proposed: [bool; 2],
     pub updates_sent: [bool; 2],
+    pub uploads: [Option<LfumUpload>; 2],
     retry_at: [Instant; 2],
 }
 impl GenerationHandshake {
@@ -197,6 +200,7 @@ impl GenerationHandshake {
             phase: GenerationPhase::Proposing,
             proposed: [false; 2],
             updates_sent: [false; 2],
+            uploads: [None, None],
             retry_at: [Instant::now(); 2],
         })
     }
@@ -215,6 +219,7 @@ impl GenerationHandshake {
         self.phase = GenerationPhase::Proposing;
         self.proposed = [false; 2];
         self.updates_sent = [false; 2];
+        self.uploads = [None, None];
         self.retry_at = [Instant::now(); 2];
         Ok(())
     }
@@ -239,7 +244,7 @@ impl GenerationHandshake {
         Ok(())
     }
     pub fn reject(&mut self, current: &GenerationNumber) -> Result<()> {
-        if !current.older_than(&self.number) {
+        if self.phase != GenerationPhase::Complete && !current.older_than(&self.number) {
             self.restart(current)?;
         }
         Ok(())
@@ -257,7 +262,7 @@ impl GenerationHandshake {
                 self.retry_at[index] = now + Duration::from_secs(5);
                 Some(GenerationWork::Propose(header))
             }
-            GenerationPhase::AwaitingUpload => {
+            GenerationPhase::AwaitingUpload if self.uploads[index].is_none() => {
                 let retry = if self.updates_sent[index] { 10 } else { 5 };
                 self.updates_sent[index] = true;
                 self.retry_at[index] = now + Duration::from_secs(retry);
@@ -272,11 +277,13 @@ impl GenerationHandshake {
             "phase": match self.phase {
                 GenerationPhase::Proposing => "proposing",
                 GenerationPhase::AwaitingUpload => "awaiting_upload",
+                GenerationPhase::Complete => "complete",
             },
             "proposal_replies": self.proposed,
             "updates_sent": self.updates_sent,
-            "upload_supported": false,
-            "complete": false,
+            "uploads":self.uploads,
+            "upload_supported": true,
+            "complete": self.phase == GenerationPhase::Complete,
         })
     }
 }
@@ -305,6 +312,7 @@ impl Placement {
             incarnation: launch.incarnation,
             launch,
             profile: None,
+            node_description: None,
             bootstrap: Bootstrap::NodeUp,
             desired: Desired::Absent,
             observed: Observed::Absent,
@@ -506,12 +514,84 @@ fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Resul
     Ok(())
 }
 impl Ledger {
+    pub fn generation_pending(&self) -> bool {
+        self.generation
+            .as_ref()
+            .is_some_and(|round| round.phase != GenerationPhase::Complete)
+    }
+
+    pub fn lfum_upload(&mut self, index: usize, body: LfumUpload) -> Result<GenerationHeader> {
+        let placement = &self.placements[index];
+        if !placement.link_alive || placement.bootstrap != Bootstrap::Admitted {
+            return Err("LFUM upload requires the original admitted session".into());
+        }
+        let header = GenerationHeader {
+            number: body.generation.clone(),
+            for_fm_replica: false,
+        };
+        let Some(round) = &mut self.generation else {
+            // Native ready FM acknowledges delayed uploads without rebuilding.
+            return Ok(header);
+        };
+        if round.phase != GenerationPhase::AwaitingUpload
+            || body.generation != round.number
+            || round.uploads[index].is_some()
+        {
+            return Ok(header);
+        }
+        if placement.node_description.as_ref() != Some(&body.node)
+            || body.units.0.len() > 1
+            || body.any_replica_found != placement.created
+            || (placement.observed == Observed::Running && body.units.0.len() != 1)
+            || (!placement.created && !body.units.0.is_empty())
+        {
+            return Err("LFUM node/inventory does not match the admitted live profile".into());
+        }
+        let expected = placement.created.then(|| placement.body()).transpose()?;
+        for info in &body.units.0 {
+            let expected = expected.as_ref().ok_or("unowned LFUM partition")?;
+            if info.service != expected.service
+                || info.unit != expected.unit
+                || info.intermediate != Epoch::default()
+                || info.local_deleted
+                || info.replicas.0.len() != 1
+            {
+                return Err(
+                    "LFUM report changed the admitted partition/service/configuration".into(),
+                );
+            }
+            let replica = &info.replicas.0[0];
+            let dropped = replica.description.state == 3;
+            exact_replica(&expected.replica, &replica.description, dropped)?;
+            if replica.intermediate_role != 1
+                || (placement.observed == Observed::Running
+                    && (Some(&replica.description) != placement.ready_replica.as_ref() || dropped))
+                || info.report_from_primary != (!dropped && expected.service.stateful)
+                || (dropped
+                    && (replica.description.up
+                        || !replica.description.service_endpoint.is_empty()
+                        || !replica.description.replication_endpoint.is_empty()))
+            {
+                return Err("LFUM replica state does not match the known original lifetime".into());
+            }
+        }
+        round.uploads[index] = Some(body);
+        if round.uploads.iter().all(Option::is_some) {
+            round.phase = GenerationPhase::Complete;
+        }
+        Ok(header)
+    }
+
     pub fn begin_generation(&mut self) -> Result<()> {
         if self.configuration.is_some()
             || self.generation.is_some()
             || self.placements.iter().any(|placement| {
                 placement.bootstrap != Bootstrap::Admitted
                     || !placement.link_alive
+                    || matches!(
+                        placement.observed,
+                        Observed::Lost | Observed::Unknown | Observed::Error
+                    )
                     || placement.pending.is_some()
                     || placement.node_control.is_some()
                     || placement.service_update.is_some()
@@ -933,10 +1013,8 @@ impl Ledger {
                 Err("operation identity reused with different canonical content".into())
             };
         }
-        if self.generation.is_some() && !matches!(command.action.as_str(), "status" | "quit") {
-            return Err(
-                "generation rebuild is awaiting gated LFUM upload; mutations disabled".into(),
-            );
+        if self.generation_pending() && !matches!(command.action.as_str(), "status" | "quit") {
+            return Err("generation rebuild is awaiting LFUM upload; mutations disabled".into());
         }
         if self.configuration.is_some() && !matches!(command.action.as_str(), "status" | "quit") {
             return Err("active-configuration lifecycle changes remain gated".into());

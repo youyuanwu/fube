@@ -34,6 +34,14 @@ struct ChildOwner {
     link: Option<Link>,
     metadata: Option<Metadata>,
 }
+impl ChildOwner {
+    fn generation(&self) -> GenerationHeader {
+        self.link
+            .as_ref()
+            .map(Link::generation)
+            .unwrap_or_else(|| self.launch.generation.clone())
+    }
+}
 
 /// One ephemeral foreground authority; no reconnect, automatic replacement or adoption.
 /// Keep this owner through explicit shutdown, including after any error.
@@ -340,8 +348,25 @@ impl Cluster {
             .ok_or("original node link absent")?;
         wire::predecode(&incoming.message)?;
         let action = incoming.message.properties().map_err(err)?.action;
-        let generation = self.children[index].launch.generation.clone();
+        let generation = self.children[index].generation();
         match action.as_str() {
+            "LFUMUpload" => {
+                let body = decode_lfum_upload(&incoming.message).map_err(err)?;
+                let header = self.ledger.lfum_upload(index, body)?;
+                let response = lfum_upload_reply_message(&header).map_err(err)?;
+                incoming
+                    .reply
+                    .take()
+                    .ok_or("LFUMUpload missing consuming reply authority")?
+                    .reply(link.seal(response)?, wire::deadline())
+                    .await
+                    .map_err(err)?;
+                if self.ledger.generation.as_ref().is_some_and(|round| {
+                    round.number == header.number && round.uploads[index].is_some()
+                }) {
+                    link.advance_generation(&header);
+                }
+            }
             "ReplicaEndpointUpdated" => {
                 let (body, owner) =
                     decode_replica_endpoint_updated(&incoming.message).map_err(err)?;
@@ -429,6 +454,7 @@ impl Cluster {
                         "unexpected/stale native NodeUp identity or recovery contents".into(),
                     );
                 }
+                placement.node_description = Some(body.node.clone());
                 let ack = NodeUpAck::fresh_activated(body.node.version, 1).map_err(err)?;
                 placement.activation_sequence = ack.activation_sequence;
                 placement.activated = ack.activated;
@@ -448,7 +474,7 @@ impl Cluster {
                 if owner != Owner::Fm {
                     return Err("FMM report unsupported".into());
                 }
-                if self.ledger.generation.is_some() {
+                if self.ledger.generation_pending() {
                     if let Some(handoff) = incoming.handoff.as_mut() {
                         handoff.acknowledge();
                     }
@@ -554,7 +580,7 @@ impl Cluster {
             };
             let result = result.and_then(|()| self.read_retirement(index));
             let result = match result {
-                Ok(()) if self.ledger.generation.is_some() => self.retry_generation(index).await,
+                Ok(()) if self.ledger.generation_pending() => self.retry_generation(index).await,
                 Ok(()) => self.retry_primary(index).await,
                 Err(error) => Err(error),
             };
@@ -596,8 +622,8 @@ impl Cluster {
             }
         }
     }
-    /// Begin the bounded native handshake, not a completed FM rebuild. New
-    /// mutations remain gated until the future LFUM implementation completes.
+    /// Begin one live-session ordinary-FM inventory reconciliation. New
+    /// mutations remain gated until both native LFUM uploads are processed.
     pub fn begin_generation_handshake(&mut self) -> Result<Value> {
         if self.config.profile == ServiceProfile::StatefulPeerIdle {
             return Err("peer-idle profile is bound to the original fixed generation".into());
@@ -647,12 +673,13 @@ impl Cluster {
                     .map_err(err)?,
                 )
                 .await?;
+                link.advance_generation(&header);
             }
         }
         Ok(())
     }
     async fn retry_node_work(&mut self, index: usize) -> Result<()> {
-        if self.ledger.generation.is_some() {
+        if self.ledger.generation_pending() {
             return Ok(());
         }
         let now = Instant::now();
@@ -662,17 +689,16 @@ impl Cluster {
         let link = child.link.as_ref().ok_or("original node link absent")?;
         if let Some((activate, body)) = control {
             let message = if activate {
-                node_activate_request_message(&body, &child.launch.generation)
+                node_activate_request_message(&body, &child.generation())
             } else {
-                node_deactivate_request_message(&body, &child.launch.generation)
+                node_deactivate_request_message(&body, &child.generation())
             }
             .map_err(err)?;
             link.send(message).await?;
         }
         if let Some(body) = service {
             link.send(
-                node_update_service_request_message(&body, &child.launch.generation)
-                    .map_err(err)?,
+                node_update_service_request_message(&body, &child.generation()).map_err(err)?,
             )
             .await?;
         }
@@ -683,7 +709,7 @@ impl Cluster {
             return Ok(());
         };
         let child = &self.children[index];
-        let message = add_primary_message(&body, &child.launch.generation).map_err(err)?;
+        let message = add_primary_message(&body, &child.generation()).map_err(err)?;
         child
             .link
             .as_ref()
@@ -706,7 +732,7 @@ impl Cluster {
             .link
             .as_ref()
             .ok_or("original Primary link absent")?
-            .send(add_replica_message(body, &child.launch.generation).map_err(err)?)
+            .send(add_replica_message(body, &child.generation()).map_err(err)?)
             .await
     }
     async fn retry_idle_removal(&mut self, index: usize) -> Result<()> {
@@ -724,18 +750,18 @@ impl Cluster {
             .link
             .as_ref()
             .ok_or("original Primary link absent")?
-            .send(remove_replica_message(body, &child.launch.generation).map_err(err)?)
+            .send(remove_replica_message(body, &child.generation()).map_err(err)?)
             .await
     }
     async fn retry_deletion(&mut self, index: usize) -> Result<()> {
-        if self.ledger.generation.is_some() {
+        if self.ledger.generation_pending() {
             return Ok(());
         }
         let Some(body) = self.ledger.deletion_retry(index, Instant::now())? else {
             return Ok(());
         };
         let child = &self.children[index];
-        let message = delete_replica_message(&body, &child.launch.generation).map_err(err)?;
+        let message = delete_replica_message(&body, &child.generation()).map_err(err)?;
         child
             .link
             .as_ref()
@@ -758,7 +784,7 @@ impl Cluster {
             .link
             .as_ref()
             .ok_or("original destination link absent")?
-            .send(delete_replica_message(body, &child.launch.generation).map_err(err)?)
+            .send(delete_replica_message(body, &child.generation()).map_err(err)?)
             .await
     }
     fn read_retirement(&mut self, index: usize) -> Result<()> {
@@ -1051,7 +1077,7 @@ impl Cluster {
             .link
             .as_ref()
             .ok_or("missing original Primary link")?
-            .send(do_reconfiguration_message(body, &child.launch.generation).map_err(err)?)
+            .send(do_reconfiguration_message(body, &child.generation()).map_err(err)?)
             .await
     }
     /// Remove the original Idle from the Primary's replicator, not its remote
@@ -1216,7 +1242,7 @@ impl Cluster {
         let op = command.op.clone();
         match self.ledger.accept(command)? {
             Accepted::NodeControl(index, activate, body) => {
-                let generation = &self.children[index].launch.generation;
+                let generation = &self.children[index].generation();
                 let message = if activate {
                     node_activate_request_message(&body, generation)
                 } else {
@@ -1240,8 +1266,7 @@ impl Cluster {
                 } else {
                     add_instance_message
                 };
-                let message =
-                    factory(&body, &self.children[index].launch.generation).map_err(err)?;
+                let message = factory(&body, &self.children[index].generation()).map_err(err)?;
                 let result = self.children[index]
                     .link
                     .as_ref()
@@ -1258,8 +1283,7 @@ impl Cluster {
                 } else {
                     remove_instance_message
                 };
-                let message =
-                    factory(&body, &self.children[index].launch.generation).map_err(err)?;
+                let message = factory(&body, &self.children[index].generation()).map_err(err)?;
                 let result = self.children[index]
                     .link
                     .as_ref()
@@ -1285,7 +1309,7 @@ impl Cluster {
         if self.config.profile == ServiceProfile::StatefulPeerIdle {
             return Err("peer-idle service description is fixed for the original lifetime".into());
         }
-        if self.ledger.generation.is_some() {
+        if self.ledger.generation_pending() {
             return Err("service update is gated while generation upload is pending".into());
         }
         let placement = self
@@ -1323,7 +1347,7 @@ impl Cluster {
             &NodeUpdateServiceRequest {
                 service: service.clone(),
             },
-            &placement.launch.generation,
+            &self.children[index].generation(),
         )
         .map_err(err)?;
         self.children[index]

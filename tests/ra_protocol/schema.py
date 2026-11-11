@@ -73,6 +73,7 @@ MODELS = [
     ("FabricVersionInstance", "Common/FabricVersionInstance.h", ""),
     ("Uri", "Common/Uri.h", ""),
     ("NodeDescription", COMMON + "NodeDescription.h", ""),
+    ("LFUMMessageBody", COMMON + "LFUMMessageBody.h", ""),
     ("ServicePackageInfo", COMMON + "NodeUpMessageBody.h", ""),
     ("NodeUpMessageBody", COMMON + "NodeUpMessageBody.h", ""),
     ("ServicePackageUpgradeSpecification", MODEL + "ServicePackageUpgradeSpecification.h", ""),
@@ -257,6 +258,8 @@ def generation_factories(native):
         ("GenerationProposalReply", "CreateRAToFMMessage", 11),
         ("GenerationUpdate", "CreateFMToRAMessage", 12),
         ("GenerationUpdateReject", "CreateRAToFMMessage", 11),
+        ("LFUMUpload", "CreateRAToFMMessage", 11),
+        ("LFUMUploadReply", "CreateFMToRAMessage", 12),
     ]:
         match = re.findall(
             rf'RSMessage::{action}\s*=\s*(\w+)\(L"([^"]+)",\s*(true|false)\b',

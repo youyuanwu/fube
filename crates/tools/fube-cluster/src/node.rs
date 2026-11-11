@@ -6,7 +6,9 @@ use fube_hosting::local::{Activation, NodeContext, Options};
 use fube_node::local::{FmWork, LocalDisposition, Node};
 use fube_ra::{entity as ra, protocol::*};
 use fube_ra_store::{MemoryBackend, Settings, Store};
-use std::{collections::VecDeque, fs, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque, fs, future::Future, path::Path, pin::Pin, sync::Arc, time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::TcpListener,
@@ -340,31 +342,31 @@ impl Adapter {
             let sent = async {
                 let message = match &reply.effect {
                     ra::Effect::PeerCreateReplica { target, body } if target == &peer.node => {
-                        create_replica_message(body, link.generation())
+                        create_replica_message(body, &link.generation())
                     }
                     ra::Effect::PeerCreateReplicaReply { target, body } if target == &peer.node => {
-                        create_replica_reply_message(body, link.generation())
+                        create_replica_reply_message(body, &link.generation())
                     }
                     ra::Effect::PeerActivate { target, body } if target == &peer.node => {
-                        activate_message(body, link.generation())
+                        activate_message(body, &link.generation())
                     }
                     ra::Effect::PeerActivateReply { target, body } if target == &peer.node => {
-                        activate_reply_message(body, link.generation())
+                        activate_reply_message(body, &link.generation())
                     }
                     ra::Effect::PeerDeactivate { target, body } if target == &peer.node => {
-                        deactivate_message(body, link.generation())
+                        deactivate_message(body, &link.generation())
                     }
                     ra::Effect::PeerDeactivateReply { target, body } if target == &peer.node => {
-                        deactivate_reply_message(body, link.generation())
+                        deactivate_reply_message(body, &link.generation())
                     }
                     ra::Effect::PeerContinueSwap { target, body } if target == &peer.node => {
-                        do_reconfiguration_message(body, link.generation())
+                        do_reconfiguration_message(body, &link.generation())
                     }
                     ra::Effect::PeerGetLsn { target, body } if target == &peer.node => {
-                        get_lsn_message(body, link.generation())
+                        get_lsn_message(body, &link.generation())
                     }
                     ra::Effect::PeerGetLsnReply { target, body } if target == &peer.node => {
-                        get_lsn_reply_message(body, link.generation())
+                        get_lsn_reply_message(body, &link.generation())
                     }
                     _ => return Err("peer receipt does not match the original bound peer".into()),
                 }
@@ -945,11 +947,44 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut published_failed_registration = None;
     let mut published_failed_open = None;
     let mut published_host_loss = false;
+    type UploadRequest =
+        Pin<Box<dyn Future<Output = Result<Option<fube_transport::message::Message>>> + Send>>;
+    let mut upload_request: Option<UploadRequest> = None;
+    let mut upload_body: Option<LfumUpload> = None;
+    let mut upload_retry_at = Instant::now();
     if failure.is_none() {
         loop {
             // Owned stop remains independent of FM connectivity. Link loss is
             // not permission to stop an existing app or fake lifecycle replies.
             tokio::select! {
+                reply = async {
+                    match upload_request.as_mut() {
+                        Some(request) => request.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    upload_request = None;
+                    match reply {
+                        Ok(Some(message)) => {
+                            let processed = wire::predecode(&message).and_then(|()| {
+                                let generation = decode_lfum_upload_reply(&message).map_err(err)?;
+                                node.process_lfum_upload_reply(&launch.fm, &generation).map_err(err)
+                            });
+                            match processed {
+                                Ok(true) => upload_body = None,
+                                Ok(false) => {}
+                                Err(error) => adapter.error = Some(error),
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => adapter.error = Some(error),
+                    }
+                    let ticks = node.native_config().node(ra::NodeProperty::LfumUploadRetryIntervalTicks).max(1);
+                    upload_retry_at = Instant::now() + Duration::new(
+                        ticks as u64 / 10_000_000,
+                        ((ticks as u64 % 10_000_000) * 100) as u32,
+                    );
+                }
                 control = control_line(&mut control) => {
                     match control {
                         Ok(Some(line)) if line == format!("stop {}\n", launch.capability).as_bytes() => break,
@@ -1018,6 +1053,56 @@ async fn run_owned(launch: &Launch) -> Result<()> {
             if let Err(error) = node.drive() {
                 failure = Some(err(error));
                 break;
+            }
+            let generations = node.generation_state();
+            if upload_request.is_none()
+                && upload_body
+                    .as_ref()
+                    .is_some_and(|body| body.generation != generations.receive)
+            {
+                upload_body = None;
+                upload_retry_at = Instant::now();
+            }
+            if generations.upload_pending && upload_body.is_none() && upload_request.is_none() {
+                upload_retry_at = Instant::now();
+            }
+            if generations.upload_pending
+                && link.is_some()
+                && adapter.error.is_none()
+                && upload_request.is_none()
+                && Instant::now() >= upload_retry_at
+            {
+                let inventory = node.lfum_inventory().map_err(err);
+                match inventory {
+                    Ok(Some(inventory)) => {
+                        let body = upload_body.get_or_insert_with(|| LfumUpload {
+                            generation: inventory.generation,
+                            node: up.node.clone(),
+                            units: inventory.units,
+                            any_replica_found: inventory.any_replica_found,
+                        });
+                        if let Some(owner) = &link {
+                            match lfum_upload_message(body) {
+                                Ok(request) => {
+                                    let owner = owner.clone();
+                                    upload_request = Some(Box::pin(async move {
+                                        owner.request_optional(request).await
+                                    }));
+                                }
+                                Err(error) => {
+                                    adapter.error = Some(err(error));
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => adapter.error = Some(error),
+                }
+            }
+            if adapter.error.is_some() {
+                if let Some(old) = link.take() {
+                    let _ = old.close().await;
+                }
             }
             if let Err(error) = adapter
                 .advance_with_peer(
@@ -1249,7 +1334,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     "generations": {
                         "proposed":generations.proposed, "receive":generations.receive,
                         "send":generations.send, "upload_pending":generations.upload_pending,
-                        "upload_supported":false,
+                        "upload_supported":launch.profile != ServiceProfile::StatefulPeerIdle,
                     },
                 });
                 if let Err(error) =
@@ -1262,6 +1347,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
             }
         }
     }
+    drop(upload_request);
     if let Some(link) = link.take() {
         let _ = link.close().await;
     }
@@ -1860,12 +1946,16 @@ async fn receive_generation(
         "GenerationUpdate" => {
             wire::predecode(message)?;
             let (body, header) = decode_generation_update(message).map_err(err)?;
-            if let ra::GenerationUpdateOutcome::Rejected(proposed) = node
+            match node
                 .process_generation_update(&launch.fm, &body, &header)
                 .map_err(err)?
             {
-                link.send(generation_update_reject_message(&proposed).map_err(err)?)
-                    .await?;
+                ra::GenerationUpdateOutcome::Rejected(proposed) => {
+                    link.send(generation_update_reject_message(&proposed).map_err(err)?)
+                        .await?;
+                }
+                ra::GenerationUpdateOutcome::UploadRequired => link.advance_generation(&header),
+                _ => {}
             }
         }
         _ => return Ok(false),

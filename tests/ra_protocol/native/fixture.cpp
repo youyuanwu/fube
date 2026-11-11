@@ -540,8 +540,21 @@ int main(int argc,char** argv) {
         generation_reject.owner_.low_=UINT64_MAX-1;
         run(mode,dir,"tie-generation-update-reject",generation_reject);
         reject_truncated(generation_reject);
+        LFUMMessageBody lfum;
+        lfum.anyReplicaFound_=false;
+        if(LFUMUploadActor!=11 || LFUMUploadReplyActor!=12 || !LFUMUploadPriority || !LFUMUploadReplyPriority)
+            throw std::runtime_error("native LFUM factory metadata mismatch");
+        run(mode,dir,"empty-lfum-upload",lfum);
+        c=0; rich(lfum,c);
+        run(mode,dir,"rich-lfum-upload",lfum);
+        reject_truncated(lfum);
+        lfum.failoverUnitInfos_.clear();
+        lfum.anyReplicaFound_=true;
+        run(mode,dir,"deleted-only-lfum-upload",lfum);
+        reject_truncated(lfum);
+        bodyless(mode,dir,"empty-lfum-upload-reply");
         for(auto name:{u"GenerationProposal",u"GenerationProposalReply",
-                      u"GenerationUpdate",u"GenerationUpdateReject"}) {
+                      u"GenerationUpdate",u"GenerationUpdateReject",u"LFUMUpload",u"LFUMUploadReply"}) {
             action.action_=text(name);
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);
@@ -591,7 +604,7 @@ int main(int argc,char** argv) {
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
         ++native_truncation_rejections;
-        if(native_truncation_rejections!=47)
+        if(native_truncation_rejections!=49)
             throw std::runtime_error("native truncation coverage mismatch");
         std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;

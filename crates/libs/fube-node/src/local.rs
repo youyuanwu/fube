@@ -176,7 +176,7 @@ enum Work {
     Status(ServiceType, u64, bool),
     Load(Box<ReportLoad>),
     Description(Box<ra::ServiceDescriptionCompletion>),
-    Add(Arc<AddInstance>),
+    Add(Arc<AddInstance>, NodeInstance, GenerationHeader),
     StatefulOpen(Arc<AddInstance>),
     PrimaryOpen(Arc<AddInstance>),
     AddPrimary(Arc<AddPrimary>, NodeInstance, GenerationHeader),
@@ -510,7 +510,9 @@ impl Node {
     fn admit_fm(&self, source: &NodeInstance, generation: &GenerationHeader) -> Result<()> {
         if source != &self.admission.fm_source
             || generation.for_fm_replica
-            || generation.number != self.admission.generation
+            || generation
+                .number
+                .older_than(&self.ra.generation_state().receive)
         {
             return Err(Error::Protocol);
         }
@@ -527,7 +529,7 @@ impl Node {
             return Err(Error::Unsupported);
         }
         self.admit_fm(source, generation)?;
-        self.add(body)
+        self.authorize_open(body, 1, Some((source.clone(), generation.clone())))
     }
     pub fn fm_work(&mut self, work: FmWork) -> Result<u64> {
         let stateless = self.activation.profile() == h::local::Profile::Stateless;
@@ -927,6 +929,16 @@ impl Node {
         Ok(self
             .ra
             .process_generation_update(source, body, generation)?)
+    }
+    pub fn lfum_inventory(&self) -> Result<Option<ra::LfumInventory>> {
+        Ok(self.ra.lfum_inventory()?)
+    }
+    pub fn process_lfum_upload_reply(
+        &self,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<bool> {
+        Ok(self.ra.process_lfum_upload_reply(source, generation)?)
     }
     pub fn apply_fresh_node_up_ack(
         &self,
@@ -1673,7 +1685,18 @@ impl Node {
             }
             (4, None) => Work::PrimaryOpen(Arc::new(body.clone())),
             (2, _) => Work::StatefulOpen(Arc::new(body.clone())),
-            _ => Work::Add(Arc::new(body.clone())),
+            (_, fm) => {
+                let (source, generation) = fm.unwrap_or_else(|| {
+                    (
+                        self.admission.fm_source.clone(),
+                        GenerationHeader {
+                            number: self.ra.generation_state().receive,
+                            for_fm_replica: false,
+                        },
+                    )
+                });
+                Work::Add(Arc::new(body.clone()), source, generation)
+            }
         };
         let id = self.enqueue(work)?;
         if self.disposal.as_ref().is_some_and(|witness| {
@@ -1825,13 +1848,10 @@ impl Node {
                 source: source.clone(),
                 generation: generation.clone(),
             },
-            Work::Add(body) => ra::Command::Add {
+            Work::Add(body, source, generation) => ra::Command::Add {
                 body: Box::new((**body).clone()),
-                source: self.admission.fm_source.clone(),
-                generation: GenerationHeader {
-                    number: self.admission.generation.clone(),
-                    for_fm_replica: false,
-                },
+                source: source.clone(),
+                generation: generation.clone(),
             },
             Work::Fm(work) => match work {
                 FmWork::CaptureTypeStatus => ra::Command::CaptureServiceTypeStatus,

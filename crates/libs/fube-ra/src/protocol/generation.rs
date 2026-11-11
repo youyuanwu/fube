@@ -1,5 +1,46 @@
-//! Generation negotiation schemas, not LFUM upload or rebuild completion.
+//! Ordinary-FM generation negotiation and local inventory upload.
 use super::*;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LfumUpload {
+    pub generation: GenerationNumber,
+    pub node: NodeDescription,
+    pub units: ObjectArray<Vec<FailoverUnitInfo>>,
+    pub any_replica_found: bool,
+}
+
+/// The request carries generation in its body, not a GenerationHeader.
+pub fn lfum_upload_message(body: &LfumUpload) -> Result<Message> {
+    reliability_message(body, "LFUMUpload", FM_ACTOR, true, None)
+}
+
+pub fn decode_lfum_upload(message: &Message) -> Result<LfumUpload> {
+    without_generation(message, "LFUMUpload")?;
+    from_slice(&message.body)
+}
+
+pub fn lfum_upload_reply_message(generation: &GenerationHeader) -> Result<Message> {
+    ordinary_fm(generation)?;
+    Ok(Message {
+        headers: vec![
+            Header::actor(RA_ACTOR)?,
+            Header::action("LFUMUploadReply")?,
+            Header::boolean(HIGH_PRIORITY, true)?,
+            generation.header()?,
+        ],
+        body: Vec::new(),
+    })
+}
+
+pub fn decode_lfum_upload_reply(message: &Message) -> Result<GenerationHeader> {
+    check_factory(message, "LFUMUploadReply", &[RA_ACTOR])?;
+    if !message.body.is_empty() {
+        return Err(Error::Protocol("LFUMUploadReply must be bodyless"));
+    }
+    let generation = from_slice(&unique(message, GENERATION_HEADER)?.value)?;
+    ordinary_fm(&generation)?;
+    Ok(generation)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationProposalReply {
@@ -56,7 +97,7 @@ pub fn decode_generation_proposal_reply(message: &Message) -> Result<GenerationP
 
 fn ordinary_fm(generation: &GenerationHeader) -> Result<()> {
     if generation.for_fm_replica {
-        return Err(Error::Protocol("FMM GenerationUpdate is not supported"));
+        return Err(Error::Protocol("FMM generation control is not supported"));
     }
     Ok(())
 }
