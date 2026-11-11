@@ -192,6 +192,8 @@ pub struct LocalStatusConsumer {
     message_sequence: u64,
     now: i64,
     next_cleanup: i64,
+    cleanup_interval: i64,
+    history_ttl: i64,
     max_types: usize,
     max_bytes: usize,
 }
@@ -206,9 +208,15 @@ impl LocalStatusConsumer {
             message_sequence: 0,
             now: 0,
             next_cleanup: 36_000_000_000,
+            cleanup_interval: 36_000_000_000,
+            history_ttl: 6_000_000_000,
             max_types,
             max_bytes,
         })
+    }
+    pub(super) fn configure_history(&mut self, config: &NativeConfig) {
+        self.cleanup_interval = config.node(NodeProperty::StatusCleanupIntervalTicks).max(1);
+        self.history_ttl = config.node(NodeProperty::StatusHistoryTtlTicks);
     }
     /// Native cleanup timer is hourly; sequence entries retain ten minutes.
     /// Cleanup removes history only, never pending unacknowledged status.
@@ -216,16 +224,24 @@ impl LocalStatusConsumer {
         if now < self.now {
             return Err(Failure::Admission("status clock regressed"));
         }
-        let next_cleanup = if now >= self.next_cleanup {
-            now.checked_add(36_000_000_000).ok_or(Failure::Capacity)?
-        } else {
-            self.next_cleanup
-        };
         if now >= self.next_cleanup {
-            self.history
-                .retain(|h| now.saturating_sub(h.updated) < 6_000_000_000);
-            self.next_cleanup = next_cleanup;
+            return self.cleanup(now);
         }
+        self.now = now;
+        Ok(())
+    }
+    /// An actual timer callback performs cleanup even if clock/timer domains
+    /// put it just before the lazy event-processing deadline.
+    pub fn cleanup(&mut self, now: i64) -> Result<()> {
+        if now < self.now {
+            return Err(Failure::Admission("status clock regressed"));
+        }
+        let next = now
+            .checked_add(self.cleanup_interval)
+            .ok_or(Failure::Capacity)?;
+        self.history
+            .retain(|h| now.saturating_sub(h.updated) < self.history_ttl);
+        self.next_cleanup = next;
         self.now = now;
         Ok(())
     }
@@ -328,7 +344,42 @@ impl LocalStatusConsumer {
             Some(true)
         }
     }
-    // No capture/send/ACK API exists while the FM consumer is capability-gated.
+    pub fn capture(&mut self) -> Result<Option<(bool, ServiceTypeUpdate)>> {
+        let Some(enabled) = self.next_enabled() else {
+            return Ok(None);
+        };
+        let sequence = self
+            .message_sequence
+            .checked_add(1)
+            .ok_or(Failure::Capacity)?;
+        let mut types: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|entry| entry.enabled == enabled)
+            .map(|entry| entry.service_type.clone())
+            .collect();
+        types.sort_by(compare_service_types);
+        let body = ServiceTypeUpdate {
+            types: fube_transport::serialization::serde::ObjectArray(types),
+            sequence,
+        };
+        if fube_transport::serialization::serde::to_vec(&body)
+            .map_err(|_| Failure::Capacity)?
+            .len()
+            > self.max_bytes
+        {
+            return Err(Failure::Capacity);
+        }
+        self.message_sequence = sequence;
+        Ok(Some((enabled, body)))
+    }
+    pub fn acknowledge(&mut self, enabled: bool, sequence: u64) -> bool {
+        if sequence != self.message_sequence {
+            return false;
+        }
+        self.pending.retain(|entry| entry.enabled != enabled);
+        true
+    }
 }
 fn type_bytes(id: &ServiceType) -> usize {
     128 + id.package.application.type_name.len() + id.package.name.len() + id.name.len()

@@ -268,7 +268,15 @@ impl HostLease {
         if !self.lifecycle_enabled {
             return Err(protocol("registration-only Hosting profile"));
         }
-        if !matches!(action, "ReplicaOpen" | "ReplicaClose") || body.len() > MAX_INPUT {
+        if !matches!(
+            action,
+            "ReplicaOpen"
+                | "ReplicaClose"
+                | "ProxyUpdateServiceDescription"
+                | "ReplicatorBuildIdleReplica"
+                | "ReplicatorRemoveIdleReplica"
+        ) || body.len() > MAX_INPUT
+        {
             return Err(protocol("unsupported local lifecycle action/body"));
         }
         if !session_live(&self.entry) || !self.entry.ready.load(Ordering::SeqCst) {
@@ -1360,7 +1368,15 @@ async fn run_connection(
         if p.actor == 12 {
             if !entry.ready.load(Ordering::SeqCst)
                 || incoming.reply.is_some()
-                || !matches!(p.action.as_str(), "ReplicaOpenReply" | "ReplicaCloseReply")
+                || !matches!(
+                    p.action.as_str(),
+                    "ReplicaOpenReply"
+                        | "ReplicaCloseReply"
+                        | "ProxyUpdateServiceDescriptionReply"
+                        | "ReplicatorBuildIdleReplicaReply"
+                        | "ReplicatorRemoveIdleReplicaReply"
+                        | "RAPReportLoad"
+                )
             {
                 return Err(protocol("unsupported semantic RAP input"));
             }
@@ -1445,7 +1461,14 @@ fn hosting_composition() -> TransportResult<ChannelComposition> {
     fn outbound(_: &Message, p: &message::Properties, kind: OutboundKind) -> TransportResult<()> {
         if kind != OutboundKind::Raw
             || p.actor != 12
-            || !matches!(p.action.as_str(), "ReplicaOpen" | "ReplicaClose")
+            || !matches!(
+                p.action.as_str(),
+                "ReplicaOpen"
+                    | "ReplicaClose"
+                    | "ProxyUpdateServiceDescription"
+                    | "ReplicatorBuildIdleReplica"
+                    | "ReplicatorRemoveIdleReplica"
+            )
             || p.expects_reply
             || p.relates_to != MessageId::default()
         {

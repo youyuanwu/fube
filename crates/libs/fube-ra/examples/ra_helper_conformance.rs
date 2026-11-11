@@ -1,9 +1,17 @@
 //! Independently construct helper cases using real production functions.
+use clap::Parser;
 use fube_ra::{entity::*, protocol::*};
 use fube_ra_store::{MemoryBackend, Settings as StoreSettings, Store};
 use std::{cmp::Ordering, fs, sync::Arc, time::Duration};
 
 const WAIT: Duration = Duration::from_secs(3);
+
+#[derive(Parser)]
+#[command(about = "Construct RA helper conformance cases")]
+struct Arguments {
+    #[arg(long)]
+    identity: bool,
+}
 
 fn order(value: Ordering) -> i32 {
     match value {
@@ -239,15 +247,14 @@ fn generations() -> [GenerationNumber; 8] {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let args: Vec<_> = std::env::args_os().collect();
-    if args.len() == 2 && args[1] == "--identity" {
+    let args = Arguments::parse();
+    if args.identity {
         println!(
             "{}",
             option_env!("FUBE_RA_SOURCE_DIGEST").unwrap_or("unbound")
         );
         return;
     }
-    assert_eq!(args.len(), 1, "usage: ra_helper_conformance [--identity]");
     let units: Vec<u8> = (0..=u16::MAX)
         .flat_map(|unit| native_upper_unit(unit).to_le_bytes())
         .collect();

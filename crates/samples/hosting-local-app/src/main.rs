@@ -1,7 +1,8 @@
 //! Explicitly minimal native-free local Hosting package fixtures.
+use clap::Parser;
 use fube_data::{
-    extensions::ReplicationEndpointOptions, IOperationDataStream, IStateProvider, MemoryProvider,
-    Mutation,
+    extensions::ReplicationEndpointOptions, IOperation, IOperationDataStream, IStateProvider,
+    MemoryProvider, Mutation,
 };
 use fube_runtime::{
     extensions::{
@@ -9,9 +10,9 @@ use fube_runtime::{
     },
     ApiFuture, Cancellation, Epoch, Error, IPrimaryReplicator, IReplicator,
     IStatefulServiceFactory, IStatefulServicePartition, IStatefulServiceReplica,
-    IStatelessServiceFactory, IStatelessServiceInstance, IStatelessServicePartition, OpenMode,
-    ReplicaInformation, ReplicaRole, ReplicaSetConfig, ReplicaSetQuorumMode, Result, Runtime,
-    RuntimeReplicator, ServicePartitionAccessStatus,
+    IStatelessServiceFactory, IStatelessServiceInstance, IStatelessServicePartition, LoadMetric,
+    OpenMode, ReplicaInformation, ReplicaRole, ReplicaSetConfig, ReplicaSetQuorumMode, Result,
+    Runtime, RuntimeReplicator, ServicePartitionAccessStatus,
 };
 use std::{
     io::Write,
@@ -23,6 +24,54 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[derive(Parser)]
+#[command(version, about = "Native-free local Hosting lifecycle fixture",
+    group(clap::ArgGroup::new("fault").args([
+        "delay_ms", "crash_after_ms", "shutdown_after_ms", "no_register",
+        "exit_before_attach", "stateful_register", "block_dispose",
+        "close_error_block_dispose", "block_provider_dispose", "open_delay_ms",
+        "block_registration",
+    ])),
+    group(clap::ArgGroup::new("data").args(["stateful_primary", "data_replicator"]).multiple(true)))]
+struct Arguments {
+    #[arg(long, conflicts_with_all = ["stateful_lifecycle", "data_replicator"])]
+    stateful_primary: bool,
+    #[arg(long)]
+    stateful_lifecycle: bool,
+    #[arg(long, requires = "stateful_lifecycle")]
+    data_replicator: bool,
+    #[arg(long)]
+    delay_ms: Option<u64>,
+    #[arg(long)]
+    crash_after_ms: Option<u64>,
+    #[arg(long)]
+    shutdown_after_ms: Option<u64>,
+    #[arg(long)]
+    no_register: bool,
+    #[arg(long)]
+    exit_before_attach: bool,
+    #[arg(long)]
+    stateful_register: bool,
+    #[arg(long)]
+    block_dispose: bool,
+    #[arg(long)]
+    close_error_block_dispose: bool,
+    #[arg(long, requires = "data")]
+    block_provider_dispose: bool,
+    #[arg(long)]
+    open_delay_ms: Option<u64>,
+    #[arg(
+        long,
+        requires = "stateful_lifecycle",
+        conflicts_with_all = ["open_delay_ms", "stateful_primary"]
+    )]
+    block_open: bool,
+    #[arg(long, requires = "stateful_lifecycle", conflicts_with_all = ["stateful_primary", "block_open"])]
+    block_registration: bool,
+    #[arg(long, requires = "data_replicator", conflicts_with_all = ["stateful_primary", "block_open", "block_registration", "open_delay_ms"])]
+    fail_open: bool,
+}
+
 #[derive(Clone, Copy, Default)]
 struct Mode {
     primary: bool,
@@ -30,6 +79,8 @@ struct Mode {
     block_provider_dispose: bool,
     close_error: bool,
     open_delay: u64,
+    block_open: bool,
+    fail_open: bool,
 }
 struct Factory(Mode);
 struct StatefulFactory {
@@ -42,6 +93,8 @@ struct StatefulReplica {
     partition: Mutex<Option<Arc<dyn IStatefulServicePartition>>>,
     native: Option<NativeRuntimeIntegration>,
     data: Mutex<Option<Arc<RuntimeReplicator>>>,
+    memory: Mutex<Option<Arc<MemoryProvider>>>,
+    secondary: Mutex<Option<SecondaryPump>>,
     primary: Mutex<Option<PrimaryService>>,
 }
 struct ObservedProvider {
@@ -52,6 +105,10 @@ struct ObservedProvider {
 }
 struct PrimaryService {
     address: String,
+    stopped: Cancellation,
+    thread: Option<JoinHandle<()>>,
+}
+struct SecondaryPump {
     stopped: Cancellation,
     thread: Option<JoinHandle<()>>,
 }
@@ -114,6 +171,8 @@ impl IStatefulServiceFactory for StatefulFactory {
             partition: Mutex::new(None),
             native,
             data: Mutex::new(None),
+            memory: Mutex::new(None),
+            secondary: Mutex::new(None),
             primary: Mutex::new(None),
         }))
     }
@@ -123,7 +182,7 @@ impl IStatefulServiceReplica for StatefulReplica {
         &self,
         mode: OpenMode,
         partition: Arc<dyn IStatefulServicePartition>,
-        _: Cancellation,
+        cancel: Cancellation,
     ) -> ApiFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
             assert_eq!(mode, OpenMode::New);
@@ -147,6 +206,7 @@ impl IStatefulServiceReplica for StatefulReplica {
                     primary: self.resource.mode.primary,
                 });
                 let memory = provider.memory.clone();
+                *self.memory.lock().unwrap() = Some(memory.clone());
                 marker("LOCAL_DATA_PROVIDER acquired");
                 let control = native.create_replicator(
                     partition.clone(),
@@ -181,6 +241,30 @@ impl IStatefulServiceReplica for StatefulReplica {
                 Box::new(LocalControl(Mutex::new(None)))
             };
             tokio::time::sleep(Duration::from_millis(self.resource.mode.open_delay)).await;
+            if self.resource.mode.block_open {
+                marker("LOCAL_OPEN held");
+                let release = self.resource.resource.with_file_name("local-open.release");
+                std::fs::write(release.with_file_name("local-open.held"), b"original Open")
+                    .expect("publish fixture Open barrier");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut cancelled = false;
+                    while !release.exists() {
+                        if cancel.is_cancelled() && !cancelled {
+                            marker("LOCAL_OPEN cancelled");
+                            std::fs::write(
+                                release.with_file_name("local-open.cancelled"),
+                                b"original Close",
+                            )
+                            .expect("publish fixture Open cancellation");
+                            cancelled = true;
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .expect("bounded fixture Open barrier timed out");
+                marker("LOCAL_OPEN released");
+            }
             Ok(control)
         })
     }
@@ -194,6 +278,13 @@ impl IStatefulServiceReplica for StatefulReplica {
                 ));
             }
             marker(&format!("LOCAL_CALLBACK role {role:?}"));
+            if role == ReplicaRole::IdleSecondary && self.resource.mode.fail_open {
+                marker("LOCAL_OPEN failed");
+                return Err(Error::Remote {
+                    code: 0x80004005u32 as i32 as i64,
+                    message: "fixture initial Idle service role failure".into(),
+                });
+            }
             if role == ReplicaRole::Primary {
                 let data = self.data.lock().unwrap().clone().expect("real data owner");
                 let before = data.snapshot();
@@ -275,6 +366,16 @@ impl IStatefulServiceReplica for StatefulReplica {
                             after.progress.assigned
                         ));
                     }
+                    let mut secondary = self.secondary.lock().unwrap();
+                    if secondary.is_some() {
+                        return Err(Error::Protocol("Idle pump already owns the streams"));
+                    }
+                    *secondary = Some(SecondaryPump::start(
+                        self.native.as_ref().expect("real data integration").clone(),
+                        partition,
+                        data,
+                        self.memory.lock().unwrap().clone().expect("real provider"),
+                    )?);
                 }
             }
             Ok(String::new())
@@ -291,6 +392,9 @@ impl IStatefulServiceReplica for StatefulReplica {
 }
 impl StatefulReplica {
     fn release_data(&self) {
+        if let Some(mut secondary) = self.secondary.lock().unwrap().take() {
+            secondary.join();
+        }
         if let Some(mut primary) = self.primary.lock().unwrap().take() {
             primary.join();
         }
@@ -350,14 +454,27 @@ impl Drop for ObservedProvider {
             );
         }
         let state = self.memory.snapshot();
-        if self.primary && state.last != 0 {
-            assert_eq!(state.last, 1);
+        if state.copy_in_progress {
+            assert!(!self.primary, "Primary cannot own partial destination copy");
+        }
+        if state.last != 0 {
+            assert!((1..=2).contains(&state.last));
             assert_eq!(
                 state.values.get("value").map(String::as_str),
-                Some("acknowledged")
+                Some(if state.last == 1 {
+                    "acknowledged"
+                } else {
+                    "continued"
+                })
             );
             assert_eq!(state.results.get("primary-write"), Some(&1));
-            assert_eq!((state.values.len(), state.results.len()), (1, 1));
+            if state.last == 2 {
+                assert_eq!(state.results.get("primary-write-2"), Some(&2));
+            }
+            assert_eq!(
+                (state.values.len(), state.results.len()),
+                (1, state.last as usize)
+            );
         } else {
             assert_eq!(state.last, 0);
             assert!(state.values.is_empty() && state.results.is_empty());
@@ -400,17 +517,26 @@ impl PrimaryState {
     }
     async fn request(&self, request: &[u8], stopped: Cancellation) -> Result<String> {
         match request {
-            b"write\n" => {
+            b"write\n" | b"write-more\n" => {
                 self.authority(true)?;
+                let more = request == b"write-more\n";
+                if more && !self.memory.snapshot().results.contains_key("primary-write") {
+                    return Err(Error::InvalidInput(
+                        "continuing write requires the original write",
+                    ));
+                }
                 let mutation = Mutation {
-                    id: "primary-write".into(),
+                    id: if more {
+                        "primary-write-2"
+                    } else {
+                        "primary-write"
+                    }
+                    .into(),
                     key: "value".into(),
-                    value: "acknowledged".into(),
+                    value: if more { "continued" } else { "acknowledged" }.into(),
                 };
                 if self.memory.admission(&mutation)?.is_some() {
-                    return Err(Error::InvalidInput(
-                        "fixture permits one acknowledged write",
-                    ));
+                    return Err(Error::InvalidInput("fixture request already acknowledged"));
                 }
                 let operation =
                     mutation.operation_for_epoch(self.native.status()?.current_epoch.primary())?;
@@ -426,7 +552,35 @@ impl PrimaryState {
                 marker(&format!("LOCAL_PRIMARY acknowledged sequence={sequence}"));
             }
             b"read\n" => self.authority(false)?,
-            _ => return Err(Error::InvalidInput("fixture accepts only read/write")),
+            b"state\n" => {
+                self.authority(false)?;
+                return Ok(format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "provider":self.memory.snapshot(), "peers":self.data.snapshot().peers,
+                    })
+                ));
+            }
+            b"load\n" => {
+                self.authority(false)?;
+                let partition = self.partition.clone();
+                self.native
+                    .execution()
+                    .try_reserve()?
+                    .run_owned(move || {
+                        partition.report_load(&[LoadMetric {
+                            name: "LocalWork".into(),
+                            value: 7,
+                        }])
+                    })
+                    .await?;
+                return Ok("OK load=7\n".into());
+            }
+            _ => {
+                return Err(Error::InvalidInput(
+                    "fixture accepts only read/write/write-more/state/load",
+                ))
+            }
         }
         let native = self.native.status()?;
         let engine = self.data.snapshot();
@@ -532,6 +686,116 @@ impl PrimaryService {
     }
 }
 impl Drop for PrimaryService {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
+fn apply_secondary(
+    provider: &MemoryProvider,
+    operation: &dyn IOperation,
+    copy: bool,
+) -> Result<()> {
+    let data = operation.get_data()?;
+    if copy {
+        provider.apply_copy(&data)?;
+    } else {
+        provider.apply_replication(operation.get_metadata()?.sequence_number, &data)?;
+    }
+    operation.acknowledge()
+}
+
+impl SecondaryPump {
+    fn start(
+        native: NativeRuntimeIntegration,
+        partition: Arc<dyn IStatefulServicePartition>,
+        data: Arc<RuntimeReplicator>,
+        memory: Arc<MemoryProvider>,
+    ) -> Result<Self> {
+        let state = data.get_state_replicator();
+        let copy = state.get_copy_stream()?;
+        let replication = state.get_replication_stream()?;
+        let data = Arc::downgrade(&data);
+        let stopped = Cancellation::default();
+        let stop = stopped.clone();
+        let (ready, readiness) = std::sync::mpsc::sync_channel(1);
+        let thread =
+            std::thread::Builder::new()
+                .name("local-idle-copy".into())
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            ready.send(Err(error)).expect("report pump startup failure");
+                            return;
+                        }
+                    };
+                    ready.send(Ok(())).expect("report owned pump startup");
+                    runtime.block_on(async {
+                        let result = async {
+                        // Copy EOS and replication EOS are independent. Consuming copy
+                        // first prevents application replication into a partial snapshot.
+                        for (stream, copying) in [(copy, true), (replication, false)] {
+                            loop {
+                                let operation = tokio::select! {
+                                    biased;
+                                    _ = stop.cancelled() => return Ok(()),
+                                    item = stream.get_operation(stop.clone()) => item?,
+                                };
+                                let Some(operation) = operation else { break };
+                                native.status()?;
+                                apply_secondary(&memory, operation.as_ref(), copying)?;
+                                if !memory.snapshot().copy_in_progress {
+                                    let owner = data.upgrade().ok_or(Error::Closed)?;
+                                    marker(&format!("LOCAL_IDLE_DATA {}", serde_json::json!({
+                                        "provider":memory.snapshot(),
+                                        "role":format!("{:?}",owner.snapshot().role),
+                                        "ready":owner.snapshot().ready,
+                                        "read":format!("{:?}",partition.get_read_status()?),
+                                        "write":format!("{:?}",partition.get_write_status()?),
+                                        "application_acknowledged":true,
+                                    })));
+                                }
+                            }
+                        }
+                        Ok::<(), Error>(())
+                    }.await;
+                        if let Err(error) = result {
+                            if !stop.is_cancelled() {
+                                if let Some(data) =
+                                    data.upgrade().filter(|data| !data.snapshot().closed)
+                                {
+                                    marker(&format!("LOCAL_IDLE_DATA_ERROR {error}"));
+                                    data.close(Cancellation::default())
+                                        .await
+                                        .expect("fence failed destination pump");
+                                }
+                            }
+                        }
+                    });
+                })?;
+        if let Err(error) = readiness.recv().expect("pump startup receipt") {
+            thread.join().expect("join failed pump startup");
+            return Err(error.into());
+        }
+        Ok(Self {
+            stopped,
+            thread: Some(thread),
+        })
+    }
+    fn join(&mut self) {
+        self.stopped.cancel();
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .expect("join actual destination application pump");
+        }
+    }
+}
+impl Drop for SecondaryPump {
     fn drop(&mut self) {
         self.join();
     }
@@ -689,64 +953,47 @@ impl Drop for Instance {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // These explicit fault modes are for owned-lifecycle qualification only.
-    let args: Vec<_> = std::env::args().skip(1).collect();
-    let primary = args.first().is_some_and(|s| s == "--stateful-primary");
-    let stateful_lifecycle = primary || args.first().is_some_and(|s| s == "--stateful-lifecycle");
-    let args = if stateful_lifecycle {
-        &args[1..]
-    } else {
-        &args[..]
-    };
-    let explicit_data =
-        !primary && stateful_lifecycle && args.first().is_some_and(|s| s == "--data-replicator");
-    let data_replicator = primary || explicit_data;
-    let args = if explicit_data { &args[1..] } else { args };
-    let delay = match args {
-        [flag, value]
-            if flag == "--delay-ms"
-                || flag == "--crash-after-ms"
-                || flag == "--shutdown-after-ms" =>
-        {
-            Some((
-                flag.as_str(),
-                value.parse::<u64>().expect("integer milliseconds"),
-            ))
-        }
-        [] => None,
-        [flag] if flag == "--no-register" || flag == "--exit-before-attach" => None,
-        [flag] if flag == "--stateful-register" => None,
-        [flag] if flag == "--block-dispose" || flag == "--close-error-block-dispose" => None,
-        [flag] if flag == "--block-provider-dispose" && data_replicator => None,
-        [flag, _] if flag == "--open-delay-ms" => None,
-        _ => panic!("unsupported fixture arguments"),
-    };
-    if args.first().is_some_and(|s| s == "--exit-before-attach") {
+    let args = Arguments::parse();
+    let primary = args.stateful_primary;
+    let stateful_lifecycle = primary || args.stateful_lifecycle;
+    let data_replicator = primary || args.data_replicator;
+    if args.exit_before_attach {
         std::process::exit(17);
     }
-    if let Some(("--delay-ms", ms)) = delay {
+    if let Some(ms) = args.delay_ms {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
     let runtime = Runtime::attach().await.expect("owned Hosting attach");
+    if args.block_registration {
+        let work =
+            PathBuf::from(std::env::var_os("Fabric_Folder_App_Work").expect("owned work folder"));
+        std::fs::write(
+            work.join("local-registration.held"),
+            b"original registration",
+        )
+        .expect("publish fixture registration barrier");
+        marker("LOCAL_REGISTRATION held");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !work.join("local-registration.release").exists() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("bounded fixture registration barrier timed out");
+        marker("LOCAL_REGISTRATION released");
+    }
     let mode = Mode {
         primary,
-        block_dispose: args
-            .first()
-            .is_some_and(|s| s == "--block-dispose" || s == "--close-error-block-dispose"),
-        block_provider_dispose: args
-            .first()
-            .is_some_and(|s| s == "--block-provider-dispose"),
-        close_error: args
-            .first()
-            .is_some_and(|s| s == "--close-error-block-dispose"),
-        open_delay: if args.first().is_some_and(|s| s == "--open-delay-ms") {
-            args[1].parse().expect("integer callback milliseconds")
-        } else {
-            0
-        },
+        block_dispose: args.block_dispose || args.close_error_block_dispose,
+        block_provider_dispose: args.block_provider_dispose,
+        close_error: args.close_error_block_dispose,
+        open_delay: args.open_delay_ms.unwrap_or(0),
+        block_open: args.block_open,
+        fail_open: args.fail_open,
     };
-    let stateful_registration = args.first().is_some_and(|s| s == "--stateful-register");
+    let stateful_registration = args.stateful_register;
     let native = data_replicator.then(|| runtime.native_integration_provider());
-    let _runtime = if args.first().is_some_and(|s| s == "--no-register") {
+    let _runtime = if args.no_register {
         runtime
     } else {
         runtime
@@ -779,11 +1026,19 @@ async fn main() {
     std::io::stdout()
         .flush()
         .expect("flush registration marker");
-    if let Some(("--crash-after-ms", ms)) = delay {
+    if args.block_registration {
+        std::fs::write(
+            PathBuf::from(std::env::var_os("Fabric_Folder_App_Work").expect("owned work folder"))
+                .join("local-registration.complete"),
+            b"original factory registered",
+        )
+        .expect("publish fixture registration completion");
+    }
+    if let Some(ms) = args.crash_after_ms {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         std::process::exit(23);
     }
-    if let Some(("--shutdown-after-ms", ms)) = delay {
+    if let Some(ms) = args.shutdown_after_ms {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         _runtime
             .shutdown()
@@ -791,4 +1046,176 @@ async fn main() {
             .expect("orderly Runtime/session shutdown");
     }
     std::future::pending::<()>().await;
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+
+    struct Operation {
+        sequence: i64,
+        data: fube_data::OperationData,
+        acknowledgement: Box<dyn Fn() -> Result<()> + Send + Sync>,
+    }
+    impl IOperation for Operation {
+        fn get_metadata(&self) -> Result<fube_data::OperationMetadata> {
+            Ok(fube_data::OperationMetadata {
+                operation_type: fube_data::OperationType::Normal,
+                sequence_number: self.sequence,
+                atomic_group_id: -1,
+            })
+        }
+        fn get_data(&self) -> Result<fube_data::OperationData> {
+            Ok(self.data.clone())
+        }
+        fn acknowledge(&self) -> Result<()> {
+            (self.acknowledgement)()
+        }
+    }
+
+    #[tokio::test]
+    async fn destination_applies_copy_and_replication_before_ack_and_never_acks_failed_apply() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let source = MemoryProvider::new();
+        let target = MemoryProvider::new();
+        let first = Mutation {
+            id: "original".into(),
+            key: "value".into(),
+            value: "copied".into(),
+        }
+        .operation()
+        .unwrap();
+        source.apply_replication(1, &first).unwrap();
+        let stream = source.get_copy_state(1, None).unwrap();
+        let mut copied = Vec::new();
+        while let Some(data) = stream.get_next(Cancellation::default()).await.unwrap() {
+            copied.push(data);
+        }
+        let count = copied.len();
+        let acknowledgements = Arc::new(AtomicUsize::new(0));
+        for (index, data) in copied.into_iter().enumerate() {
+            let target_at_ack = target.clone();
+            let acknowledgements = acknowledgements.clone();
+            let operation = Operation {
+                sequence: index as i64 + 1,
+                data,
+                acknowledgement: Box::new(move || {
+                    if index + 1 == count {
+                        let state = target_at_ack.snapshot();
+                        assert!(!state.copy_in_progress);
+                        assert_eq!(state.last, 1);
+                        assert_eq!(state.values["value"], "copied");
+                        assert_eq!(state.results["original"], 1);
+                    }
+                    acknowledgements.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            };
+            apply_secondary(&target, &operation, true).unwrap();
+        }
+        let at_ack = target.clone();
+        let acks = acknowledgements.clone();
+        let second = Mutation {
+            id: "tail".into(),
+            key: "value".into(),
+            value: "replicated".into(),
+        }
+        .operation()
+        .unwrap();
+        let operation = Operation {
+            sequence: 2,
+            data: second.clone(),
+            acknowledgement: Box::new(move || {
+                let state = at_ack.snapshot();
+                assert_eq!(state.last, 2);
+                assert_eq!(state.values["value"], "replicated");
+                assert_eq!(state.results["tail"], 2);
+                acks.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        };
+        apply_secondary(&target, &operation, false).unwrap();
+        assert_eq!(acknowledgements.load(Ordering::SeqCst), count + 1);
+        let invalid = Operation {
+            sequence: 4,
+            data: Mutation {
+                id: "gap".into(),
+                key: "value".into(),
+                value: "invalid".into(),
+            }
+            .operation()
+            .unwrap(),
+            acknowledgement: Box::new(|| panic!("failed apply cannot acknowledge")),
+        };
+        assert!(apply_secondary(&target, &invalid, false).is_err());
+        assert_eq!(target.snapshot().last, 2);
+    }
+
+    fn parse(suffix: &str) -> std::result::Result<Arguments, clap::Error> {
+        let input = format!("hosting-local-app {suffix}");
+        Arguments::try_parse_from(input.split_whitespace())
+    }
+
+    #[test]
+    fn preserves_stateful_data_and_exclusive_fault_modes() {
+        assert!(!parse("").unwrap().stateful_lifecycle);
+        let args = parse("--stateful-lifecycle --data-replicator --open-delay-ms 4000").unwrap();
+        assert!(args.stateful_lifecycle && args.data_replicator);
+        assert_eq!(args.open_delay_ms, Some(4000));
+        assert!(
+            parse("--stateful-primary --block-provider-dispose")
+                .unwrap()
+                .stateful_primary
+        );
+        assert!(parse("--stateful-register").unwrap().stateful_register);
+        assert!(parse("--delay-ms 0").is_ok());
+        assert!(
+            parse("--stateful-lifecycle --data-replicator --block-registration")
+                .unwrap()
+                .block_registration
+        );
+        assert!(
+            parse("--stateful-lifecycle --data-replicator --block-open --block-dispose")
+                .unwrap()
+                .block_open
+        );
+        for hold in ["--block-dispose", "--block-provider-dispose"] {
+            assert!(
+                parse(&format!(
+                    "--stateful-lifecycle --data-replicator --fail-open {hold}"
+                ))
+                .unwrap()
+                .fail_open
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_profiles_faults_and_invalid_delays() {
+        for suffix in [
+            "--stateful-primary --stateful-lifecycle",
+            "--stateful-primary --data-replicator",
+            "--data-replicator",
+            "--block-provider-dispose",
+            "--stateful-lifecycle --block-provider-dispose",
+            "--no-register --delay-ms 1",
+            "--block-dispose --close-error-block-dispose",
+            "--delay-ms",
+            "--open-delay-ms invalid",
+            "--block-open",
+            "--fail-open",
+            "--stateful-lifecycle --fail-open",
+            "--stateful-lifecycle --data-replicator --fail-open --block-open",
+            "--stateful-lifecycle --data-replicator --fail-open --block-registration",
+            "--stateful-primary --block-open",
+            "--stateful-lifecycle --block-open --open-delay-ms 1",
+            "--block-registration",
+            "--stateful-primary --block-registration",
+            "--stateful-lifecycle --block-registration --block-open",
+            "--delay-ms -1",
+            "--crash-after-ms 18446744073709551616",
+        ] {
+            assert!(parse(suffix).is_err(), "{suffix}");
+        }
+    }
 }

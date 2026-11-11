@@ -1,4 +1,4 @@
-//! Bounded entity execution, not a running RA, Hosting adapter or outbox.
+//! Bounded entity/node execution, not full RA/Federation or a durable outbox.
 //! Stateless native messages and separate trusted-local volatile Idle lifecycle.
 //!
 //! One owned supervisor hosts bounded per-entity workers independently of caller
@@ -32,9 +32,23 @@ pub use description::ServiceDescriptionCompletion;
 #[path = "config.rs"]
 mod config;
 pub use config::*;
+#[path = "node_coordination.rs"]
+mod node_coordination;
+pub use node_coordination::NodeActivationInfo;
+#[path = "endpoint_publish.rs"]
+mod endpoint_publish;
+pub use endpoint_publish::EndpointPublishState;
 #[path = "hosting_events.rs"]
 mod hosting_events;
 pub use hosting_events::*;
+#[path = "generation.rs"]
+mod generation;
+pub use generation::{GenerationState, GenerationUpdateOutcome};
+#[path = "peer.rs"]
+mod peer;
+pub use peer::{
+    BuildCompletion, PeerCreation, RemoteBuild, RemoteIdle, RemoteRemoval, RemovalCompletion,
+};
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -250,6 +264,47 @@ pub struct OpenCompletion {
     pub detail: ProxyErrorDetail,
 }
 pub enum Command {
+    HostingServiceTypeStatus {
+        service_type: ServiceType,
+        sequence: u64,
+        enabled: bool,
+    },
+    CaptureServiceTypeStatus,
+    CleanupServiceTypeStatus,
+    ServiceTypeStatusReply {
+        enabled: bool,
+        body: ServiceTypeUpdateReply,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    ReportLoad(Box<ReportLoad>),
+    NodeActivate {
+        body: NodeActivateRequest,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    NodeDeactivate {
+        body: NodeDeactivateRequest,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CheckNodeDeactivation {
+        sequence: i64,
+    },
+    NodeUpdateService {
+        body: Box<NodeUpdateServiceRequest>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CloseForNodeDeactivation {
+        unit: PartitionId,
+        sequence: i64,
+    },
+    UpdateServiceForNode {
+        unit: PartitionId,
+        work: u64,
+        body: Box<NodeUpdateServiceRequest>,
+    },
     #[cfg(feature = "qualification")]
     QualificationTerminate(PartitionId),
     Add {
@@ -259,6 +314,37 @@ pub enum Command {
     },
     AddPrimary {
         body: Box<AddPrimary>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    AddReplica {
+        body: Box<AddReplica>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    RemoveReplica {
+        body: Box<RemoveReplica>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CreateReplica {
+        body: Box<CreateReplica>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    /// Trusted local authorization to open a learner, not FM AddReplica.
+    CreateRemoteIdle {
+        unit: PartitionId,
+        replica: Replica,
+    },
+    /// Trusted local authorization to copy into the opened original peer Idle.
+    BuildRemoteIdle(PartitionId),
+    CompleteBuild(Box<BuildCompletion>),
+    /// Terminal Primary-side Idle removal, not destination DeleteReplica.
+    RemoveRemoteIdle(PartitionId),
+    CompleteRemoval(Box<RemovalCompletion>),
+    CreateReplicaReply {
+        body: Box<CreateReplicaReply>,
         source: NodeInstance,
         generation: GenerationHeader,
     },
@@ -323,6 +409,54 @@ pub enum Command {
     },
 }
 enum Kind {
+    RemoveReplica {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    AddReplica {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CreateReplica {
+        source: NodeInstance,
+        generation: GenerationHeader,
+        deactivation: ReplicaDeactivationInfo,
+    },
+    CreateRemoteIdle,
+    BuildRemoteIdle,
+    CompleteBuild,
+    RemoveRemoteIdle,
+    CompleteRemoval,
+    CreateReplicaReply {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    HostingServiceTypeStatus,
+    CaptureServiceTypeStatus,
+    CleanupServiceTypeStatus,
+    ServiceTypeStatusReply {
+        enabled: bool,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    ReportLoad,
+    NodeActivate {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    NodeDeactivate {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CheckNodeDeactivation,
+    NodeUpdateService {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CloseForNodeDeactivation,
+    UpdateServiceForNode {
+        work: u64,
+    },
     #[cfg(feature = "qualification")]
     QualificationTerminate,
     Add {
@@ -374,7 +508,16 @@ impl Kind {
     fn node_work(&self) -> bool {
         matches!(
             self,
-            Self::NotificationRequest
+            Self::HostingServiceTypeStatus
+                | Self::CaptureServiceTypeStatus
+                | Self::CleanupServiceTypeStatus
+                | Self::ServiceTypeStatusReply { .. }
+                | Self::ReportLoad
+                | Self::NodeActivate { .. }
+                | Self::NodeDeactivate { .. }
+                | Self::CheckNodeDeactivation
+                | Self::NodeUpdateService { .. }
+                | Self::NotificationRequest
                 | Self::NotificationCapture
                 | Self::NotificationComplete
                 | Self::NotificationTimer
@@ -403,6 +546,10 @@ pub struct EntityState {
     pub fm_primary: bool,
     /// Native FM Primary deactivation info, including the dropped tombstone sentinel.
     pub primary_deactivation: Option<(Epoch, i64)>,
+    /// Session-only original peer responsibility; never restored by metadata.
+    pub peer_creation: Option<PeerCreation>,
+    /// Session-only remote Open/build observations, never active membership.
+    pub remote_idle: Option<RemoteIdle>,
     pub phase: Phase,
     pub open_token: u64,
     /// Volatile retry bookkeeping; not a native disk record or durable outbox.
@@ -435,6 +582,48 @@ pub struct Snapshot {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    AddReplicaReply(AddReplicaReply),
+    RemoveReplicaReply(RemoveReplicaReply),
+    RemoveIdle {
+        body: Arc<AddInstance>,
+        replica: Box<Replica>,
+        registration: RuntimeRegistration,
+    },
+    BuildIdle {
+        body: Arc<AddInstance>,
+        replica: Box<Replica>,
+        registration: RuntimeRegistration,
+    },
+    PeerCreateReplica {
+        target: NodeInstance,
+        body: Box<CreateReplica>,
+    },
+    PeerCreateReplicaReply {
+        target: NodeInstance,
+        body: Box<CreateReplicaReply>,
+    },
+    ServiceTypeStatusWork,
+    ServiceTypeStatus {
+        enabled: bool,
+        body: Box<ServiceTypeUpdate>,
+    },
+    ReportLoad(Box<ReportLoad>),
+    NodeActivateReply(NodeActivateReply),
+    NodeDeactivateReply(NodeDeactivateReply),
+    NodeUpdateServiceReply(NodeUpdateServiceReply),
+    NodeDeactivateUnits {
+        sequence: i64,
+        units: Vec<EntityId>,
+    },
+    ArmNodeDeactivationCheck {
+        sequence: i64,
+        after_ticks: i64,
+    },
+    NodeUpdateServiceUnits {
+        work: u64,
+        body: Box<NodeUpdateServiceRequest>,
+        units: Vec<EntityId>,
+    },
     /// Resolve service-type registration. RAP Open may run only after Registered
     /// has published RuntimeOpen for this token.
     Open {
@@ -448,12 +637,12 @@ pub enum Effect {
     PrimaryReply(Box<AddPrimaryReply>),
     /// Local observation only; never serialize this as AddInstance/CreateReplicaReply.
     LocalStatefulOpenReply(Box<AddInstanceReply>),
-    /// Retained terminal reporting outside the FM singleton Close/AppHostDown/Drop slice.
+    /// Retained terminal reporting for local-only stateful profiles.
     StatefulClosePending {
         body: Arc<AddInstance>,
         mode: CloseMode,
     },
-    /// Native closed AddPrimary's dropped report, retained without a fake FM ACK.
+    /// Legacy gated observation; enabled closed AddPrimary sends ReplicaUp directly.
     StatefulDroppedPending(Arc<AddPrimary>),
     RuntimeOpen {
         token: u64,
@@ -467,7 +656,7 @@ pub enum Effect {
         registration: RuntimeRegistration,
         flags: i64,
     },
-    /// Trusted local RAP adapter obligation, NOT an enabled IPC wire codec.
+    /// Owned original-session RAP obligation, independent of the node/FM reply.
     /// The captured body remains sendable even if a subsequent Close clears pending.
     UpdateServiceDescription {
         body: Arc<AddInstance>,
@@ -513,6 +702,18 @@ pub enum Effect {
     },
     OpeningHealth(Box<OpeningHealthReport>),
 }
+impl Effect {
+    /// Per-replica report obligations, distinct from node-wide type notifications.
+    pub fn is_replica_reporting(&self) -> bool {
+        matches!(
+            self,
+            Self::RequestReportRetry
+                | Self::ReplicaUp(_)
+                | Self::StatefulClosePending { .. }
+                | Self::StatefulDroppedPending(_)
+        )
+    }
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dispatched {
     pub operation: u64,
@@ -530,14 +731,23 @@ pub struct Statistics {
 }
 #[derive(Default)]
 struct View {
+    peer: Option<NodeInstance>,
+    generations: GenerationState,
+    generations_touched: bool,
+    statuses: Option<LocalStatusConsumer>,
     entities: BTreeMap<EntityId, Snapshot>,
     effects: VecDeque<Dispatched>,
     stats: Statistics,
     reserved_effects: usize,
     accepting: bool,
+    activation_seeded: bool,
     notification: notification::Coordinator,
+    node: node_coordination::Coordinator,
 }
 struct Shared {
+    local_node: NodeInstance,
+    fm_source: NodeInstance,
+    node_open: bool,
     consumer_lifetime: ConsumerLifetime,
     view: Mutex<View>,
     settings: Settings,
@@ -591,13 +801,22 @@ impl Executor {
         let (sender, receiver) = mpsc::channel(settings.max_outstanding);
         let (done, closed) = watch::channel(None);
         let shared = Arc::new(Shared {
+            local_node: admission.local_node.clone(),
+            fm_source: admission.fm_source.clone(),
+            node_open: admission.node_open,
             consumer_lifetime: ConsumerLifetime {
                 accepting: Arc::new(AtomicBool::new(true)),
             },
             config: Arc::new(NativeConfig::new(&settings)),
             notification_clock,
             view: Mutex::new(View {
+                generations: GenerationState::seeded(admission.generation.clone()),
+                statuses: Some(LocalStatusConsumer::new(
+                    settings.max_service_types,
+                    settings.max_command_bytes,
+                )?),
                 accepting: true,
+                node: node_coordination::Coordinator::new(admission.node_activated),
                 ..View::default()
             }),
             settings,
@@ -639,6 +858,76 @@ impl Executor {
 
     pub fn submit(&self, command: Command) -> Result<Ticket> {
         let (entity, kind, bytes) = match command {
+            Command::HostingServiceTypeStatus {
+                service_type,
+                sequence,
+                enabled,
+            } => (
+                [0; 16],
+                Kind::HostingServiceTypeStatus,
+                to_vec(&(service_type, sequence, enabled)),
+            ),
+            Command::CaptureServiceTypeStatus => {
+                ([0; 16], Kind::CaptureServiceTypeStatus, to_vec(&0u64))
+            }
+            Command::CleanupServiceTypeStatus => {
+                ([0; 16], Kind::CleanupServiceTypeStatus, to_vec(&0u64))
+            }
+            Command::ServiceTypeStatusReply {
+                enabled,
+                body,
+                source,
+                generation,
+            } => (
+                [0; 16],
+                Kind::ServiceTypeStatusReply {
+                    enabled,
+                    source,
+                    generation,
+                },
+                to_vec(&body),
+            ),
+            Command::ReportLoad(body) => ([0; 16], Kind::ReportLoad, to_vec(&body)),
+            Command::NodeActivate {
+                body,
+                source,
+                generation,
+            } => (
+                [0; 16],
+                Kind::NodeActivate { source, generation },
+                to_vec(&body),
+            ),
+            Command::NodeDeactivate {
+                body,
+                source,
+                generation,
+            } => (
+                [0; 16],
+                Kind::NodeDeactivate { source, generation },
+                to_vec(&body),
+            ),
+            Command::CheckNodeDeactivation { sequence } => {
+                ([0; 16], Kind::CheckNodeDeactivation, to_vec(&sequence))
+            }
+            Command::NodeUpdateService {
+                body,
+                source,
+                generation,
+            } => (
+                [0; 16],
+                Kind::NodeUpdateService { source, generation },
+                to_vec(&body),
+            ),
+            Command::CloseForNodeDeactivation { unit, sequence } => (
+                unit.guid.0,
+                Kind::CloseForNodeDeactivation,
+                to_vec(&sequence),
+            ),
+            Command::UpdateServiceForNode { unit, work, body } => (
+                unit.guid.0,
+                Kind::UpdateServiceForNode { work },
+                to_vec(&body),
+            ),
             #[cfg(feature = "qualification")]
             Command::QualificationTerminate(unit) => {
                 (unit.guid.0, Kind::QualificationTerminate, to_vec(&unit))
@@ -658,6 +947,57 @@ impl Executor {
             } => (
                 body.unit.id.guid.0,
                 Kind::AddPrimary { source, generation },
+                to_vec(&body),
+            ),
+            Command::AddReplica {
+                body,
+                source,
+                generation,
+            } => (
+                body.unit.id.guid.0,
+                Kind::AddReplica { source, generation },
+                to_vec(&body),
+            ),
+            Command::RemoveReplica {
+                body,
+                source,
+                generation,
+            } => (
+                body.unit.id.guid.0,
+                Kind::RemoveReplica { source, generation },
+                to_vec(&body),
+            ),
+            Command::CreateReplica {
+                body,
+                source,
+                generation,
+            } => (
+                body.replica.0.unit.id.guid.0,
+                Kind::CreateReplica {
+                    source,
+                    generation,
+                    deactivation: body.deactivation.clone(),
+                },
+                to_vec(&body.replica.0),
+            ),
+            Command::CreateRemoteIdle { unit, replica } => {
+                (unit.guid.0, Kind::CreateRemoteIdle, to_vec(&replica))
+            }
+            Command::BuildRemoteIdle(unit) => (unit.guid.0, Kind::BuildRemoteIdle, to_vec(&unit)),
+            Command::CompleteBuild(body) => {
+                (body.unit.id.guid.0, Kind::CompleteBuild, to_vec(&body))
+            }
+            Command::RemoveRemoteIdle(unit) => (unit.guid.0, Kind::RemoveRemoteIdle, to_vec(&unit)),
+            Command::CompleteRemoval(body) => {
+                (body.unit.id.guid.0, Kind::CompleteRemoval, to_vec(&body))
+            }
+            Command::CreateReplicaReply {
+                body,
+                source,
+                generation,
+            } => (
+                body.unit.id.guid.0,
+                Kind::CreateReplicaReply { source, generation },
                 to_vec(&body),
             ),
             Command::CompleteOpen(body) => (body.unit.id.guid.0, Kind::Complete, to_vec(&body)),
@@ -772,11 +1112,14 @@ impl Executor {
             // resources synchronously. Closed Add reports + stale-replies at most.
             Kind::Add { .. }
             | Kind::AddPrimary { .. }
+            | Kind::CreateReplica { .. }
             | Kind::OpenLocalStateful
             | Kind::OpenLocalPrimary => 2,
             Kind::Retry | Kind::RetryReport | Kind::RetryServiceDescription => 1,
             Kind::CompleteServiceDescription => 0,
             Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => 8,
+            Kind::NodeDeactivate { .. } => 3,
+            Kind::CheckNodeDeactivation => self.shared.settings.max_entities + 1,
             kind if kind.node_work() => 2,
             _ => 8,
         };
@@ -794,6 +1137,11 @@ impl Executor {
             return Err(Failure::Closed);
         }
         let new_entity = !node_work && !view.entities.contains_key(&entity);
+        if new_entity && matches!(kind, Kind::AddReplica { .. } | Kind::RemoveReplica { .. }) {
+            return Err(Failure::Admission(
+                "replica command requires an existing FT",
+            ));
+        }
         if view.stats.outstanding >= settings.max_outstanding
             || view.stats.queued_bytes + charge > settings.max_queued_bytes
             || view.effects.len() + view.reserved_effects + reserved_effects > settings.max_effects
@@ -834,6 +1182,34 @@ impl Executor {
             .get(&entity)
             .cloned()
             .unwrap_or_default()
+    }
+    pub fn node_activation(&self) -> NodeActivationInfo {
+        lock(&self.shared.view).node.activation
+    }
+    pub fn pending_node_deactivation(&self) -> Option<i64> {
+        lock(&self.shared.view).node.pending_deactivation()
+    }
+    pub fn has_service_type_status(&self) -> bool {
+        lock(&self.shared.view)
+            .statuses
+            .as_ref()
+            .is_some_and(|state| !state.pending().is_empty())
+    }
+    pub fn seed_fresh_node_activation(&self, info: NodeActivationInfo) -> Result<()> {
+        let mut view = lock(&self.shared.view);
+        if !view.accepting
+            || !view.entities.is_empty()
+            || view.activation_seeded
+            || view.generations_touched
+            || view.stats.accepted != 0
+        {
+            return Err(Failure::Unsupported(
+                "nonempty node activation bootstrap is gated",
+            ));
+        }
+        view.node.activation = info;
+        view.activation_seeded = true;
+        Ok(())
     }
     /// Bounded current routing inventory; the serialized worker still performs
     /// final committed-state validation after this potentially stale snapshot.
@@ -940,14 +1316,152 @@ async fn supervise(
 
 fn finish_node(shared: &Shared, work: Submission, admission: &Admission) {
     let mut view = lock(&shared.view);
+    let mut admission = admission.clone();
+    admission.generation = view.generations.receive.clone();
+    let admission = &admission;
     // Work/byte/effect admission is already reserved. A fallible clock/counter/
     // codec preparation never publishes a partially advanced coordinator.
     let mut notification = view.notification.clone();
+    let mut node = view.node.clone();
+    let mut statuses = view
+        .statuses
+        .clone()
+        .expect("initialized node status owner");
+    statuses.configure_history(&shared.config);
     let mut disposition = Disposition::Applied;
     let outcome = if !admission.owner_ready {
+        disposition = Disposition::IgnoredNotReady;
         Ok(vec![])
     } else {
         match &work.kind {
+            Kind::HostingServiceTypeStatus => from_slice::<(ServiceType, u64, bool)>(&work.bytes)
+                .map_err(|_| Failure::Admission("invalid Hosting type status"))
+                .and_then(|(id, sequence, enabled)| {
+                    let previous = statuses.message_sequence();
+                    let result = statuses.consume(
+                        id,
+                        sequence,
+                        enabled,
+                        admission.owner_ready,
+                        shared.notification_clock.now_ticks(),
+                    )?;
+                    disposition = result;
+                    Ok(if statuses.message_sequence() != previous {
+                        vec![Effect::ServiceTypeStatusWork]
+                    } else {
+                        vec![]
+                    })
+                }),
+            Kind::CaptureServiceTypeStatus => statuses.capture().map(|body| {
+                body.map_or_else(Vec::new, |(enabled, body)| {
+                    vec![Effect::ServiceTypeStatus {
+                        enabled,
+                        body: Box::new(body),
+                    }]
+                })
+            }),
+            Kind::CleanupServiceTypeStatus => statuses
+                .cleanup(shared.notification_clock.now_ticks())
+                .map(|_| vec![]),
+            Kind::CheckNodeDeactivation => from_slice::<i64>(&work.bytes)
+                .map_err(|_| Failure::Admission("invalid node deactivation monitor"))
+                .map(|sequence| {
+                    node.check(
+                        sequence,
+                        &view.entities,
+                        shared.notification_clock.now_ticks(),
+                        &shared.config,
+                    )
+                }),
+            Kind::ServiceTypeStatusReply {
+                enabled,
+                source,
+                generation,
+            } => node_coordination::admit(source, generation, admission).and_then(|ready| {
+                if !ready {
+                    disposition = Disposition::IgnoredStale;
+                    return Ok(vec![]);
+                }
+                let body: ServiceTypeUpdateReply = from_slice(&work.bytes)
+                    .map_err(|_| Failure::Admission("invalid type status reply"))?;
+                if !statuses.acknowledge(*enabled, body.sequence) {
+                    disposition = Disposition::IgnoredStale;
+                }
+                Ok(vec![])
+            }),
+            Kind::ReportLoad => from_slice::<ReportLoad>(&work.bytes)
+                .map_err(|_| Failure::Admission("invalid RAP load report"))
+                .and_then(|body| {
+                    if !body.legacy.0.is_empty()
+                        || body.reports.0.is_empty()
+                        || body.reports.0.iter().any(|report| {
+                            view.entities.get(&report.partition.0).is_none_or(|entry| {
+                                entry.committed.as_ref().is_none_or(|state| {
+                                    entry.fenced
+                                        || state.runtime.is_none()
+                                        || state.body.service.name != report.service
+                                        || state.body.service.stateful != report.stateful
+                                })
+                            })
+                        })
+                    {
+                        return Err(Failure::Admission(
+                            "load report is outside current runtime ownership",
+                        ));
+                    }
+                    Ok(vec![Effect::ReportLoad(Box::new(body))])
+                }),
+            Kind::NodeActivate { source, generation }
+            | Kind::NodeDeactivate { source, generation }
+            | Kind::NodeUpdateService { source, generation } => {
+                node_coordination::admit(source, generation, admission).and_then(|ready| {
+                    if !ready {
+                        disposition = Disposition::IgnoredStale;
+                        return Ok(vec![]);
+                    }
+                    match &work.kind {
+                        Kind::NodeActivate { .. } | Kind::NodeDeactivate { .. } => {
+                            let body: NodeActivationRequest = from_slice(&work.bytes)
+                                .map_err(|_| Failure::Admission("invalid node activation body"))?;
+                            if body.from_fmm {
+                                return Err(Failure::Unsupported("FMM node control is gated"));
+                            }
+                            if matches!(work.kind, Kind::NodeActivate { .. }) {
+                                Ok(node.activate(&body))
+                            } else {
+                                let units = view.entities.keys().copied().collect();
+                                let mut effects = node.deactivate(&body, units);
+                                if effects.iter().any(|effect| {
+                                    matches!(effect, Effect::NodeDeactivateUnits { .. })
+                                }) {
+                                    effects.push(Effect::ArmNodeDeactivationCheck {
+                                        sequence: body.sequence,
+                                        after_ticks: shared
+                                            .config
+                                            .node(NodeProperty::DeactivationCheckIntervalTicks)
+                                            .max(1),
+                                    });
+                                }
+                                Ok(effects)
+                            }
+                        }
+                        Kind::NodeUpdateService { .. } => {
+                            let body: NodeUpdateServiceRequest = from_slice(&work.bytes)
+                                .map_err(|_| Failure::Admission("invalid node service update"))?;
+                            // Include accepted entries whose first commit is private.
+                            // Each serialized job rechecks service identity/version.
+                            let units = view.entities.keys().copied().collect();
+                            node.update_service(
+                                work.id,
+                                body,
+                                units,
+                                shared.settings.max_outstanding,
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+            }
             Kind::NotificationRequest => {
                 notification.request(&shared.config, &*shared.notification_clock)
             }
@@ -1005,8 +1519,13 @@ fn finish_node(shared: &Shared, work: Submission, admission: &Admission) {
     };
     let result = match outcome {
         Ok(effects) => {
-            assert!(effects.len() <= work.reserved_effects);
+            let retained = node.reserved_replies();
+            let previous = view.node.reserved_replies();
+            assert!(effects.len() + retained.saturating_sub(previous) <= work.reserved_effects);
+            view.reserved_effects = view.reserved_effects + retained - previous;
             view.notification = notification;
+            view.node = node;
+            view.statuses = Some(statuses);
             for effect in effects {
                 view.effects.push_back(Dispatched {
                     operation: work.id,
@@ -1068,21 +1587,64 @@ fn transition(
     state: Option<&EntityState>,
     admission: &Admission,
     config: &NativeConfig,
+    peer: Option<&NodeInstance>,
 ) -> Result<Transition> {
     let decode_error = |_| Failure::Admission("invalid native command payload");
     match &work.kind {
         #[cfg(feature = "qualification")]
         Kind::QualificationTerminate => panic!("explicit qualification worker termination"),
+        Kind::CreateRemoteIdle => peer::start_remote(work, state, admission, peer),
+        Kind::AddReplica { source, generation } => {
+            peer::add_from_fm(work, state, source, generation, admission, peer)
+        }
+        Kind::RemoveReplica { source, generation } => {
+            peer::remove_from_fm(work, state, source, generation, admission, peer)
+        }
+        Kind::BuildRemoteIdle => peer::start_build(state, admission, peer),
+        Kind::CompleteBuild => peer::complete_build(work, state),
+        Kind::RemoveRemoteIdle => peer::start_removal(state, admission, peer),
+        Kind::CompleteRemoval => peer::complete_removal(work, state),
+        Kind::CreateReplicaReply { source, generation } => {
+            peer::complete_remote(work, state, source, generation, admission, peer)
+        }
         Kind::Add { .. }
         | Kind::AddPrimary { .. }
+        | Kind::CreateReplica { .. }
         | Kind::OpenLocalStateful
         | Kind::OpenLocalPrimary => {
             let body: AddInstance = from_slice(&work.bytes).map_err(decode_error)?;
+            let peer_creation = match &work.kind {
+                Kind::CreateReplica {
+                    source,
+                    generation,
+                    deactivation,
+                } => {
+                    peer::admit(source, generation, admission, peer)?;
+                    if generation.number.older_than(&admission.generation) {
+                        return Ok(Transition::ignored(Disposition::IgnoredStale));
+                    }
+                    if deactivation.epoch != body.unit.current || deactivation.catchup_lsn != 0 {
+                        return Err(Failure::Unsupported("only initial-primary peer creation"));
+                    }
+                    Some(PeerCreation {
+                        source: source.clone(),
+                        deactivation: deactivation.clone(),
+                        registration_error: None,
+                        open_error: None,
+                        host_down: false,
+                        close_started_open: false,
+                        close_completed: false,
+                        delete_operation: 0,
+                    })
+                }
+                _ => None,
+            };
             let fm_primary = matches!(work.kind, Kind::AddPrimary { .. });
-            let local_stateful =
-                fm_primary || matches!(work.kind, Kind::OpenLocalStateful | Kind::OpenLocalPrimary);
+            let local_stateful = fm_primary
+                || peer_creation.is_some()
+                || matches!(work.kind, Kind::OpenLocalStateful | Kind::OpenLocalPrimary);
             let role = match work.kind {
-                Kind::OpenLocalStateful => 2,
+                Kind::OpenLocalStateful | Kind::CreateReplica { .. } => 2,
                 Kind::OpenLocalPrimary | Kind::AddPrimary { .. } => 4,
                 _ => 1,
             };
@@ -1156,6 +1718,29 @@ fn transition(
             // Native locked-entity TCP admission precedes processor prechecks,
             // description updates and identity decisions. No receipt-time latch.
             if let Some(current) = state {
+                if peer_creation.is_some() && current.phase == Phase::Closed {
+                    // Native SendReplicaDroppedMessage suppresses a locally deleted replica.
+                    let mut service = body.service.clone();
+                    if service.version == current.requested_version {
+                        service.version = current.body.service.version.clone();
+                    }
+                    if current.local_deleted
+                        && body.replica.id == current.body.replica.id
+                        && body.replica.instance == current.body.replica.instance
+                        && body.unit.current == current.body.unit.current
+                        && service == current.body.service
+                    {
+                        return Ok(Transition::ignored(Disposition::IgnoredStale));
+                    }
+                    return Err(Failure::Unsupported("peer tombstone recreation is gated"));
+                }
+                if current.peer_creation.as_ref().map(|origin| &origin.source)
+                    != peer_creation.as_ref().map(|origin| &origin.source)
+                {
+                    return Err(Failure::Unsupported(
+                        "cannot change original peer creation authority",
+                    ));
+                }
                 if current.body.service.stateful != local_stateful {
                     return Err(Failure::Unsupported(
                         "cannot change entity lifecycle profile",
@@ -1168,6 +1753,7 @@ fn transition(
                 }
                 if local_stateful
                     && !fm_primary
+                    && peer_creation.is_none()
                     && (current.body.replica.id != body.replica.id
                         || current.body.replica.instance != body.replica.instance
                         || current.body.replica.current_role != role
@@ -1191,6 +1777,20 @@ fn transition(
                     if body.replica.instance < current.body.replica.instance {
                         return Ok(Transition::ignored(Disposition::IgnoredStale));
                     }
+                    if peer_creation.is_some() {
+                        let mut requested_service = body.service.clone();
+                        if requested_service.version == current.requested_version {
+                            requested_service.version = current.body.service.version.clone();
+                        }
+                        if requested_service != current.body.service
+                            || body.replica.id != current.body.replica.id
+                            || body.unit.current != current.body.unit.current
+                        {
+                            return Err(Failure::Unsupported(
+                                "peer restart/replacement/reconfiguration is gated",
+                            ));
+                        }
+                    }
                     if body.replica.id == current.body.replica.id
                         && body.replica.instance > current.body.replica.instance
                     {
@@ -1206,18 +1806,29 @@ fn transition(
             if !admission.node_activated {
                 return Ok(Transition {
                     update: Update::None,
-                    effects: vec![reply(&body, RA_NOT_READY, fm_primary)],
+                    effects: vec![if let Some(peer) = &peer_creation {
+                        Effect::PeerCreateReplicaReply {
+                            target: peer.source.clone(),
+                            body: Box::new(CreateReplicaReply {
+                                unit: body.unit.clone(),
+                                replica: body.replica.clone(),
+                                error: RA_NOT_READY,
+                            }),
+                        }
+                    } else {
+                        reply(&body, RA_NOT_READY, fm_primary)
+                    }],
                     disposition: Disposition::Applied,
                 });
             }
             if let Some(current) = state {
                 if fm_primary {
-                    return lifecycle::primary_existing(current, &body);
+                    return lifecycle::primary_existing(work, current, &body);
                 }
                 if local_stateful {
                     return Ok(Transition {
                         update: Update::None,
-                        effects: vec![reply(&current.body, 0, false)],
+                        effects: vec![peer::creation_reply(current, &current.body, 0)],
                         disposition: Disposition::Applied,
                     });
                 }
@@ -1230,6 +1841,8 @@ fn transition(
                     requested_version: body.service.version.clone(),
                     fm_primary,
                     primary_deactivation: fm_primary.then_some((body.unit.current, 0)),
+                    peer_creation,
+                    remote_idle: None,
                     phase: Phase::Opening,
                     open_token: work.id,
                     retry_attempts: 0,
@@ -1260,6 +1873,35 @@ fn transition(
             })
         }
         Kind::Complete => opening::complete(work, state, config),
+        Kind::CloseForNodeDeactivation => {
+            let Some(current) = state.filter(|state| state.phase != Phase::Closed) else {
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
+            };
+            let mut state = current.clone();
+            let mut effects = vec![];
+            if !lifecycle::start_close(&mut state, CloseMode::DeactivateNode, work.id, &mut effects)
+            {
+                return Ok(Transition::ignored(Disposition::IgnoredPending));
+            }
+            Ok(lifecycle::changed(state, effects, true))
+        }
+        Kind::UpdateServiceForNode { .. } => {
+            let body: NodeUpdateServiceRequest = from_slice(&work.bytes).map_err(decode_error)?;
+            let Some(current) = state else {
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
+            };
+            let mut state = current.clone();
+            let mut effects = vec![];
+            if description::update(&mut state, &body.service, &mut effects) {
+                Ok(lifecycle::changed(state, effects, true))
+            } else {
+                Ok(Transition {
+                    update: Update::None,
+                    effects,
+                    disposition: Disposition::Applied,
+                })
+            }
+        }
         Kind::CompleteServiceDescription | Kind::RetryServiceDescription => {
             description::transition(work, state, admission)
         }
@@ -1465,7 +2107,60 @@ async fn entity_worker(
 ) {
     let mut committed: Option<Arc<EntityState>> = None;
     while let Some(work) = receiver.recv().await {
-        let mut outcome = transition(&work, committed.as_deref(), &admission, &shared.config);
+        let binding = match &work.kind {
+            Kind::CloseForNodeDeactivation => from_slice::<i64>(&work.bytes)
+                .map_err(|_| Failure::Admission("invalid deactivation job"))
+                .map(|sequence| lock(&shared.view).node.admits_close(sequence, work.entity)),
+            Kind::UpdateServiceForNode { work: parent } => {
+                from_slice::<NodeUpdateServiceRequest>(&work.bytes)
+                    .map_err(|_| Failure::Admission("invalid node service job"))
+                    .and_then(|body| {
+                        if lock(&shared.view)
+                            .node
+                            .admits_update(*parent, work.entity, &body)
+                        {
+                            Ok(true)
+                        } else {
+                            Err(Failure::Admission("service job does not match owned group"))
+                        }
+                    })
+            }
+            _ => Ok(true),
+        };
+        let bound = binding == Ok(true);
+        let mut outcome = if bound {
+            let view = lock(&shared.view);
+            let mut effective_admission = admission.clone();
+            effective_admission.node_activated = view.node.activation.activated;
+            effective_admission.generation = view.generations.receive.clone();
+            if matches!(
+                work.kind,
+                Kind::CreateRemoteIdle
+                    | Kind::BuildRemoteIdle
+                    | Kind::RemoveRemoteIdle
+                    | Kind::AddReplica { .. }
+                    | Kind::RemoveReplica { .. }
+            ) && view.generations.upload_pending
+            {
+                Err(Failure::Unsupported(
+                    "peer control is gated during generation rebuild",
+                ))
+            } else {
+                transition(
+                    &work,
+                    committed.as_deref(),
+                    &effective_admission,
+                    &shared.config,
+                    view.peer.as_ref(),
+                )
+            }
+        } else {
+            binding.map(|_| Transition::ignored(Disposition::IgnoredStale))
+        };
+        let service_changed = matches!(work.kind, Kind::UpdateServiceForNode { .. })
+            && outcome
+                .as_ref()
+                .is_ok_and(|transition| matches!(transition.update, Update::Durable(_)));
         if let Ok(transition) = &mut outcome {
             if let Err(error) =
                 track_lookups(&work, committed.as_deref(), transition, &shared.settings)
@@ -1571,6 +2266,40 @@ async fn entity_worker(
             }
         };
         view.entities.get_mut(&work.entity).unwrap().fenced = false;
+        let reserved_node_replies = view.node.reserved_replies();
+        if bound && matches!(work.kind, Kind::CloseForNodeDeactivation) {
+            if let Ok(sequence) = from_slice(&work.bytes) {
+                view.node.complete_deactivation_job(
+                    sequence,
+                    work.entity,
+                    shared.notification_clock.now_ticks(),
+                );
+            }
+        }
+        if let Kind::UpdateServiceForNode { work: parent } = work.kind {
+            if bound {
+                if let Some(effect) =
+                    view.node
+                        .complete_update(parent, work.entity, service_changed, result.is_ok())
+                {
+                    view.effects.push_back(Dispatched {
+                        operation: work.id,
+                        entity: [0; 16],
+                        effect,
+                    });
+                }
+            }
+        }
+        let entities = view.entities.clone();
+        if let Some(effect) = view.node.check_closed(&entities) {
+            view.effects.push_back(Dispatched {
+                operation: work.id,
+                entity: [0; 16],
+                effect,
+            });
+        }
+        view.reserved_effects =
+            view.reserved_effects + view.node.reserved_replies() - reserved_node_replies;
         view.stats.outstanding -= 1;
         view.stats.queued_bytes -= work.charge;
         view.reserved_effects -= work.reserved_effects;
@@ -1716,8 +2445,9 @@ mod tests {
             reserved_effects: 2,
             result,
         };
-        let Update::Durable(mut state) =
-            transition(&work, None, &admission, &config).unwrap().update
+        let Update::Durable(mut state) = transition(&work, None, &admission, &config, None)
+            .unwrap()
+            .update
         else {
             panic!("creation");
         };
@@ -1732,7 +2462,7 @@ mod tests {
             for upgrading in [false, true] {
                 admission.node_activated = false;
                 admission.fabric_upgrading = upgrading;
-                let result = transition(&work, Some(&state), &admission, &config).unwrap();
+                let result = transition(&work, Some(&state), &admission, &config, None).unwrap();
                 assert_eq!(result.disposition, Disposition::IgnoredPending);
                 assert!(matches!(result.update, Update::None));
                 assert!(result.effects.is_empty());

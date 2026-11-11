@@ -221,6 +221,16 @@ cargo test --locked --workspace --all-features --doc
 python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'
 ```
 
+For stage-two RA/FM coordination, prebuild workspace binaries/examples and run
+the affected RA/store/Hosting/Node/cluster/runtime/data and sample targets with
+nextest `--test-threads 4`. Bounded concurrency preserves the finite process,
+SQLite-bootstrap and callback budgets on shared hosts. The
+[stage-two profile](cluster/MinimalFmCluster.md#node-wide-coordination-stage-2)
+separates multi-FT model/store tests, real single-FT IPC/process acceptance and
+the 101-case source-pinned codec producer/compiler-free consumer. Native handler
+traces, live endpoint publication and clean-commit release-native qualification
+remain separate gates.
+
 For task-owned alternate Cargo output storage, build with `CARGO_TARGET_DIR`
 and pass that same root explicitly to the maintained data/runtime
 `--build-bundle ... --target-dir ...` or standalone native-runtime
@@ -425,8 +435,15 @@ independently across metadata ACKs. Normal Drop adds native ReplicaDropped-stage
 reporting, non-dropped ACK rejection in both lists and before the first retry,
 held provider/service disposal with public access fencing and lost-ACK retry.
 `fm_stateful_drop` cases also preserve already-closing/closed Down lifetimes.
-Abort/ForceAbort and closed-AddPrimary reporting remain gated, as do local-only
-profile FM authority and stateful recreation.
+Abort/ForceAbort now use RAP Abort and native ReplicaDropped stage, with both
+real disposal barriers. `fm_stateful_closed_add_primary`,
+`fm_stateful_force_delete`, `fm_stateful_delete_tombstones` and
+`fm_stateful_fresh_recreation` cover the remaining bounded singleton branches;
+force Delete terminates the original host without a graceful disposal receipt.
+Normal deletion plus independent original proof now permits explicit fresh
+recreation, with empty public data, new acknowledged writes/acquisitions and
+stale predecessor frames on the original session. Local-only profile FM
+authority, live replacement/adoption, reconfiguration and recovery remain gated.
 Run the `fube-cluster` unit and
 foreground targets as well as RA protocol/entity and local-app lifecycle tests.
 Archived tests require both fixed app binaries; the nextest inventory declares

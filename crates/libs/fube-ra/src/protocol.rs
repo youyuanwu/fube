@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 
 pub mod bootstrap;
 pub use bootstrap::*;
+pub mod generation;
+pub use generation::*;
+pub mod node_control;
+pub use node_control::*;
+pub mod peer;
+pub use peer::*;
 
 pub const GENERATION_HEADER: u16 = 0x8018;
 pub const RA_ACTOR: i64 = 12;
@@ -337,6 +343,10 @@ pub struct AddInstanceReply {
 /// AddPrimary uses the same native ReplicaMessageBody, not a new wire schema.
 pub type AddPrimary = AddInstance;
 pub type AddPrimaryReply = AddInstanceReply;
+pub type AddReplica = AddInstance;
+pub type AddReplicaReply = AddInstanceReply;
+pub type RemoveReplica = AddInstance;
+pub type RemoveReplicaReply = AddInstanceReply;
 
 /// DeleteReplicaMessageBody inherits ReplicaMessageBody's scope, then adds force.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -526,6 +536,21 @@ pub fn add_primary_message(body: &AddPrimary, generation: &GenerationHeader) -> 
 pub fn add_primary_reply_message(body: &AddPrimaryReply, owner: Owner) -> Result<Message> {
     reliability_message(body, "AddPrimaryReply", owner_actor(owner), true, None)
 }
+pub fn add_replica_message(body: &AddReplica, generation: &GenerationHeader) -> Result<Message> {
+    reliability_message(body, "AddReplica", RA_ACTOR, true, Some(generation))
+}
+pub fn add_replica_reply_message(body: &AddReplicaReply, owner: Owner) -> Result<Message> {
+    reliability_message(body, "AddReplicaReply", owner_actor(owner), true, None)
+}
+pub fn remove_replica_message(
+    body: &RemoveReplica,
+    generation: &GenerationHeader,
+) -> Result<Message> {
+    reliability_message(body, "RemoveReplica", RA_ACTOR, true, Some(generation))
+}
+pub fn remove_replica_reply_message(body: &RemoveReplicaReply, owner: Owner) -> Result<Message> {
+    reliability_message(body, "RemoveReplicaReply", owner_actor(owner), true, None)
+}
 
 fn unique(message: &Message, id: u16) -> Result<&Header> {
     let mut headers = message.headers.iter().filter(|h| h.id == id);
@@ -577,6 +602,42 @@ pub fn decode_add_primary(message: &Message) -> Result<(AddPrimary, GenerationHe
 }
 pub fn decode_add_primary_reply(message: &Message) -> Result<(AddPrimaryReply, Owner)> {
     let actor = check_factory(message, "AddPrimaryReply", &[FM_ACTOR, FMM_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        if actor == FM_ACTOR {
+            Owner::Fm
+        } else {
+            Owner::Fmm
+        },
+    ))
+}
+pub fn decode_add_replica(message: &Message) -> Result<(AddReplica, GenerationHeader)> {
+    check_factory(message, "AddReplica", &[RA_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+    ))
+}
+pub fn decode_add_replica_reply(message: &Message) -> Result<(AddReplicaReply, Owner)> {
+    let actor = check_factory(message, "AddReplicaReply", &[FM_ACTOR, FMM_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        if actor == FM_ACTOR {
+            Owner::Fm
+        } else {
+            Owner::Fmm
+        },
+    ))
+}
+pub fn decode_remove_replica(message: &Message) -> Result<(RemoveReplica, GenerationHeader)> {
+    check_factory(message, "RemoveReplica", &[RA_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+    ))
+}
+pub fn decode_remove_replica_reply(message: &Message) -> Result<(RemoveReplicaReply, Owner)> {
+    let actor = check_factory(message, "RemoveReplicaReply", &[FM_ACTOR, FMM_ACTOR])?;
     Ok((
         from_slice(&message.body)?,
         if actor == FM_ACTOR {

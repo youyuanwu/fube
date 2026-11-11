@@ -25,6 +25,7 @@ struct StatefulCalls {
     configuration_release: Notify,
     remove_release: Notify,
     configuration_failure: AtomicBool,
+    uncertain_removal: AtomicBool,
     configurations: Mutex<Vec<(ReplicaSetConfiguration, Option<ReplicaSetConfiguration>)>>,
     builds: Mutex<Vec<crate::ReplicaInformation>>,
     removals: Mutex<Vec<crate::ReplicaRemoval>>,
@@ -198,6 +199,7 @@ impl IStatefulServiceReplica for StatefulFixture {
                     _ = &mut released => {},
                     _ = cancellation.cancelled() => return Err(Error::Closed),
                 },
+                9 => cancellation.cancelled().await,
                 _ => {}
             }
             Ok(Box::new(ReplicatorFixture(
@@ -437,7 +439,7 @@ impl IPrimaryReplicator for ReplicatorFixture {
             released.as_mut().enable();
             self.0.record("build");
             self.0.builds.lock().unwrap().push(replica);
-            if matches!(self.1, 40 | 42) && self.0.builds.lock().unwrap().len() == 1 {
+            if matches!(self.1, 40 | 42 | 43) && self.0.builds.lock().unwrap().len() == 1 {
                 return Err(Error::Remote {
                     code: -993,
                     message: "partial build resources require cleanup".into(),
@@ -462,6 +464,17 @@ impl IPrimaryReplicator for ReplicatorFixture {
         }
         self.0.record("remove");
         self.0.removals.lock().unwrap().push(reason);
+        if matches!(self.1, 43 | 44) {
+            let error = Error::Remote {
+                code: 0x80071be8u32 as i32 as i64,
+                message: "replica does not exist".into(),
+            };
+            return Err(if self.0.uncertain_removal.load(Ordering::Acquire) {
+                error.uncertain()
+            } else {
+                error
+            });
+        }
         if matches!(self.1, 41 | 42)
             && self
                 .0
@@ -929,6 +942,34 @@ async fn stateful_abort_cancels_open_owner_and_fences_old_incarnation() {
     h.send("ReplicaClose", &request).await;
     h.no_reply().await;
     assert!(new.validate().is_ok());
+}
+
+#[tokio::test]
+async fn cancelled_open_returning_control_aborts_replicator_before_service_and_close_ack() {
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let mut open = request(&h, 2, 1, 9);
+    h.send("ReplicaOpen", &open).await;
+    tokio::time::timeout(Duration::from_secs(2), calls.open_entered.notified())
+        .await
+        .unwrap();
+    open.flags = 8;
+    h.send("ReplicaClose", &open).await;
+    let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
+    assert_ne!(reply.error.error, 0);
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    assert_eq!(
+        &calls.events.lock().unwrap()[..],
+        ["create", "serviceOpen", "replicatorAbort", "serviceAbort"]
+    );
+    h.send("ReplicaClose", &open).await;
+    let reply: ProxyReply = from_slice(&h.receive("ReplicaCloseReply").await.body).unwrap();
+    assert_eq!(reply.error.error, 0);
+    assert_eq!(
+        &calls.events.lock().unwrap()[..],
+        ["create", "serviceOpen", "replicatorAbort", "serviceAbort"]
+    );
+    assert!(calls.partitions.lock().unwrap()[0].validate().is_err());
 }
 
 #[tokio::test]

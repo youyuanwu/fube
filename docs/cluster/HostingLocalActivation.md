@@ -9,6 +9,13 @@ separate Linux x86-64 SF **11.8.121.4** profile, not binaries asserted built fro
 that source. See [Hosting design](RustHosting.md) and
 [registration/events](HostingRegistrationEvents.md) for the adjacent boundaries.
 
+The separate [stage-two FM composition](MinimalFmCluster.md#node-wide-coordination-stage-2)
+now carries native node intent, service-description updates and public load
+reports through the original local session. Actor-12 admission includes
+ProxyUpdateServiceDescriptionReply/RAPReportLoad; registration-only owners still
+reject lifecycle sends. This does not enable reconfiguration, FMM, multi-FT
+deployment, new data-engine hooks or recovered serving.
+
 ## Profile and package
 
 The public [`local::Activation`](../../crates/libs/fube-hosting/src/local.rs#L92-L185)
@@ -241,10 +248,15 @@ disposal and exact H2 release; independently joined Node disposal proof survives
 metadata ACK processing. Normal Drop of the original FM singleton now reports
 with native ReplicaDropped stage and requires a dropped-description ACK, with
 the same real RAP cleanup/commit/exact-release boundaries. It cannot relabel an
-already-closing/closed Down lifetime. Local-only Close/Drop, Abort/ForceAbort
-and closed-AddPrimary reporting remain staged.
-Stateful force deletion/reconfiguration, replacement/reopen, FMM and recovery
-remain gated; local profiles still reject network deletion.
+already-closing/closed Down lifetime. Local-only FM reporting remains staged.
+The [singleton lifecycle completion](MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation)
+adds Abort/ForceAbort and closed-AddPrimary reporting, native force Delete and
+missing/closed tombstone handling. Explicit fresh recreation after verified
+normal deletion uses the resident original host but new service/provider
+objects, real Open(New), initial deactivation and exact new H2 acquisition.
+Terminal loss/metadata completion cannot authorize FM reuse.
+Stateful reconfiguration, live replacement/adoption, FMM and recovery remain
+gated; local profiles still reject network deletion/recreation.
 
 Real foreground/channel tests exercise exact semantic completion, a lost reply
 and original-lifetime retry, public acknowledged write/readback, normal FM

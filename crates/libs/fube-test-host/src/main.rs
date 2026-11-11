@@ -1,43 +1,99 @@
 //! Thin native-profile command runner; scenario behavior lives in the library.
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).is_some_and(|v| v == "manifest") {
-        if args.len() < 8 {
-            eprintln!("usage: fube-test-host manifest NATIVE_DIRECTORY DEPENDENCY_DIRECTORY PACKAGE_DIRECTORY RUN_PARENT close|abort APPLICATION_URI [NAME=VALUE ...]");
-            std::process::exit(2);
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Run native Hosting qualification scenarios",
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true
+)]
+struct Arguments {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[arg(required = true)]
+    native_directory: Option<PathBuf>,
+    #[arg(required = true)]
+    dependency_directory: Option<PathBuf>,
+    #[arg(required = true)]
+    app_executable: Option<PathBuf>,
+    #[arg(required = true)]
+    run_parent: Option<PathBuf>,
+    #[arg(required = true, value_enum)]
+    scenario: Option<Scenario>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Scenario {
+    Bootstrap,
+    Close,
+    Abort,
+    HostingLeases,
+    HostingRegistration,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Terminal {
+    Close,
+    Abort,
+}
+
+impl From<Terminal> for fube_test_host::Scenario {
+    fn from(value: Terminal) -> Self {
+        match value {
+            Terminal::Close => Self::Close,
+            Terminal::Abort => Self::Abort,
         }
-        let parameters: Result<Vec<_>, _> = args[8..]
-            .iter()
-            .map(|arg| {
-                arg.split_once('=')
-                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
-                    .ok_or_else(|| format!("override must be NAME=VALUE: {arg}"))
-            })
-            .collect();
-        let parameters = parameters.unwrap_or_else(|error| {
-            eprintln!("{error}");
-            std::process::exit(2);
-        });
-        let scenario = match args[6].as_str() {
-            "close" => fube_test_host::Scenario::Close,
-            "abort" => fube_test_host::Scenario::Abort,
-            _ => {
-                eprintln!("manifest scenario must be close or abort");
-                std::process::exit(2);
-            }
-        };
+    }
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Activate a manifest package and close or abort its service.
+    Manifest {
+        native_directory: PathBuf,
+        dependency_directory: PathBuf,
+        package_directory: PathBuf,
+        run_parent: PathBuf,
+        #[arg(value_enum)]
+        scenario: Terminal,
+        application_uri: String,
+        #[arg(value_name = "NAME=VALUE", value_parser = parameter)]
+        parameters: Vec<(String, String)>,
+    },
+}
+
+fn parameter(value: &str) -> Result<(String, String), String> {
+    value
+        .split_once('=')
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .ok_or_else(|| format!("override must be NAME=VALUE: {value}"))
+}
+
+fn main() {
+    let args = Arguments::parse();
+    if let Some(Command::Manifest {
+        native_directory,
+        dependency_directory,
+        package_directory,
+        run_parent,
+        scenario,
+        application_uri,
+        parameters,
+    }) = args.command
+    {
         report(fube_test_host::run_manifest(
             fube_test_host::ManifestOptions {
-                native_directory: PathBuf::from(&args[2]),
-                dependency_directory: PathBuf::from(&args[3]),
-                package_directory: PathBuf::from(&args[4]),
-                run_parent: PathBuf::from(&args[5]),
-                application_name: args[7].clone(),
+                native_directory,
+                dependency_directory,
+                package_directory,
+                run_parent,
+                application_name: application_uri,
                 parameters,
             },
-            scenario,
+            scenario.into(),
             |event| {
                 println!(
                     "MSSF_LIFECYCLE {}",
@@ -49,36 +105,23 @@ fn main() {
         ));
         return;
     }
-    if args.len() != 6 {
-        eprintln!(
-            "usage: fube-test-host NATIVE_DIRECTORY DEPENDENCY_DIRECTORY APP_EXECUTABLE RUN_PARENT bootstrap|close|abort|hosting-leases|hosting-registration"
-        );
-        std::process::exit(2);
-    }
     let options = fube_test_host::Options {
-        native_directory: PathBuf::from(&args[1]),
-        dependency_directory: PathBuf::from(&args[2]),
-        executable: PathBuf::from(&args[3]),
-        run_parent: PathBuf::from(&args[4]),
+        native_directory: args
+            .native_directory
+            .expect("clap requires native directory"),
+        dependency_directory: args
+            .dependency_directory
+            .expect("clap requires dependency directory"),
+        executable: args.app_executable.expect("clap requires app executable"),
+        run_parent: args.run_parent.expect("clap requires run parent"),
     };
-    if args[5] == "hosting-leases" {
-        report(fube_test_host::run_hosting_leases(options));
-        return;
-    }
-    if args[5] == "hosting-registration" {
-        report(fube_test_host::run_hosting_registration(options));
-        return;
-    }
-    let scenario = match args[5].as_str() {
-        "bootstrap" => fube_test_host::Scenario::Bootstrap,
-        "close" => fube_test_host::Scenario::Close,
-        "abort" => fube_test_host::Scenario::Abort,
-        _ => {
-            eprintln!("unsupported scenario");
-            std::process::exit(2);
-        }
-    };
-    report(fube_test_host::run(options, scenario));
+    report(match args.scenario.expect("clap requires scenario") {
+        Scenario::HostingLeases => fube_test_host::run_hosting_leases(options),
+        Scenario::HostingRegistration => fube_test_host::run_hosting_registration(options),
+        Scenario::Bootstrap => fube_test_host::run(options, fube_test_host::Scenario::Bootstrap),
+        Scenario::Close => fube_test_host::run(options, fube_test_host::Scenario::Close),
+        Scenario::Abort => fube_test_host::run(options, fube_test_host::Scenario::Abort),
+    });
 }
 
 fn report(result: fube_test_host::Result<fube_test_host::RunReport>) {
@@ -87,6 +130,94 @@ fn report(result: fube_test_host::Result<fube_test_host::RunReport>) {
         Err(error) => {
             eprintln!("native scenario FAILED: {error}");
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_direct_scenarios_and_manifest_overrides() {
+        for scenario in [
+            "bootstrap",
+            "close",
+            "abort",
+            "hosting-leases",
+            "hosting-registration",
+        ] {
+            let args = Arguments::try_parse_from([
+                "fube-test-host",
+                "/native",
+                "/deps",
+                "/app",
+                "/runs",
+                scenario,
+            ])
+            .unwrap();
+            assert!(args.command.is_none());
+            assert_eq!(args.app_executable, Some(PathBuf::from("/app")));
+        }
+        let args = Arguments::try_parse_from([
+            "fube-test-host",
+            "manifest",
+            "/native",
+            "/deps",
+            "/package",
+            "/runs",
+            "abort",
+            "fabric:/App",
+            "Arguments=a=b",
+            "Empty=",
+        ])
+        .unwrap();
+        let Some(Command::Manifest {
+            parameters,
+            scenario: Terminal::Abort,
+            ..
+        }) = args.command
+        else {
+            panic!("expected manifest abort");
+        };
+        assert_eq!(
+            parameters,
+            [
+                ("Arguments".into(), "a=b".into()),
+                ("Empty".into(), "".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_missing_invalid_and_extra_arguments() {
+        for args in [
+            vec![],
+            vec!["/native", "/deps", "/app", "/runs", "unknown"],
+            vec!["/native", "/deps", "/app", "/runs", "close", "extra"],
+            vec![
+                "manifest",
+                "/native",
+                "/deps",
+                "/package",
+                "/runs",
+                "bootstrap",
+                "fabric:/App",
+            ],
+            vec![
+                "manifest",
+                "/native",
+                "/deps",
+                "/package",
+                "/runs",
+                "close",
+                "fabric:/App",
+                "invalid",
+            ],
+        ] {
+            assert!(
+                Arguments::try_parse_from(std::iter::once("fube-test-host").chain(args)).is_err()
+            );
         }
     }
 }

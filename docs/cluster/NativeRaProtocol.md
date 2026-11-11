@@ -27,7 +27,13 @@ selected action codecs. The [minimal FM profile](MinimalFmCluster.md) adds full
 `NodeUp`/`NodeUpAck` schema closure and fixed fresh-empty bootstrap.
 Distinct `AddPrimary`/`AddPrimaryReply` and `DeleteReplica`/`DeleteReplicaReply`
 factories reuse the native schemas for the bounded volatile singleton profile:
-**fourteen selected action codecs; 52 required boundary actions remain unselected**.
+Stage-two node control/load and codec-only endpoint contracts add thirteen more;
+the generation-handshake-only increment adds four, for
+31 selected FM-boundary codecs before AddReplica/Reply and RemoveReplica/Reply add four more.
+Including the first peer-creation codec pair, there are now
+**37 selected action codecs; 29 required boundary actions remain unselected**.
+The FM accounting is 35 selected/23 remaining of 58; peer accounting is
+2 selected/6 remaining of 8. The catalog still has 67 directional contracts.
 The bounded entity seam alone does not implement Hosting or authorize serving.
 The implementation mapping below supplies actual Rust mappings and evidence
 as each phase lands. A native test anchor is a reference to existing source, not a
@@ -38,8 +44,20 @@ exchanges to real local RA/Hosting/RAP and independent application contact.
 Its bootstrap completes the final empty ReplicaUp/Reply before Node admission;
 other rebuild/FMM and unsupported families remain staged. The historical entity
 seam mapping below does not itself describe that separate runnable profile.
-The maintained source-stream oracle now has 58 inputs, 59 types/199 fields and
-62 bundle files, preserving the original 51 cases (including the original 36).
+The maintained source-stream oracle now has 139 inputs, 77 types/240 fields,
+143 bundle files and 39 native truncation rejections. The preceding opened-Idle
+removal gate's 138 inputs, 142 bundle files and 38 rejections remain preserved.
+The preceding FM-build gate's
+131 inputs, 135 bundle files and 36 native truncation rejections remain preserved.
+The preceding peer gate's
+124 inputs, 77 types/240 fields, 128 bundle files and 34 native truncation
+rejections remain preserved. The preceding generation gate's 116 inputs, 75 types/237 fields,
+120 bundle files and 31 native truncation rejections remain preserved.
+The preceding stage-two gate's 101 inputs, 73 types/233 fields,
+105 bundle files and 26 native truncation rejections remain preserved, including
+all prior 58 inputs (and the original 36). The current gate executes
+39 native truncation rejections and Rust proper-prefix rejection for every new
+nonempty root fixture. A bodyless proposal is exactly zero bytes.
 It is not deployed native
 FM/Federation evidence; see the [oracle disclosure](../../tests/ra_protocol/README.md).
 
@@ -79,8 +97,9 @@ are correlated request replies, while `DoReconfiguration` has two senders.
 | Generation | [common/GenerationHeader.h:11–42,62–64][generation-header] serializes `(GenerationNumber generation_, bool isForFMReplica_)`; `ReadFromMessage` asserts presence. [GenerationNumber.h:56–60][generation-number] = `(int64 generation_, Federation::NodeId owner_)`. It is not a single counter or transport-session generation. |
 | FM/FMM routing | [FederationWrapper.cpp:162–195,394–414][federation] rewrites Actor to FMM on FMM sends/requests. [ra/Communication.FMTransport.h:118–135][fm-transport] chooses FM/FMM by owner; owner of FM-service FT is FMM. Ordinary FM is not interchangeable with FMM. |
 | FM→RA partition messages | [fm/SendMessageAction.cpp:28–47][fm-send] adds `(FM.Generation, body.FT.IsForFMReplica)` GenerationHeader. `AddInstance`, `AddPrimary` and `DeleteReplica` are Actor RA, high priority true, with this header. |
-| RA→RA partition messages | [ra/Infrastructure.SendMessageActions.h:53–88][send-actions] adds the **sender RA's send generation for that owner**, then sends to a specific NodeInstance. Includes peer `DoReconfiguration`. |
+| RA→RA partition messages | [ra/Infrastructure.SendMessageActions.h:53–88][send-actions] and [GenerationStateManager.cpp:23–27][generation-state] unconditionally add the **sender RA's send generation for that owner**, then send to a specific NodeInstance. Includes both CreateReplica and CreateReplicaReply, and peer `DoReconfiguration`. FederationWrapper preserves it. Missing peer generation is not a zero/default header: [MessageHandler.cpp:237–244,815–822][handler] uses the presence-asserting native reader. |
 | RA→FM entity replies | [ra/Communication.FMTransport.h:45–63][fm-transport], [ra/Infrastructure.MessageUtility.h:15–23][message-utility] construct body/factory headers and entity transport-test property; **these helpers do not add GenerationHeader**. Do not invent a mandatory generation header on `AddInstanceReply`, `AddPrimaryReply` or `DeleteReplicaReply` from symmetry with the request. |
+| Generation handshake | All four factories at [RSMessage.cpp:177–180][registry] default priority=true. Proposal and Update target RA=12 and carry GenerationHeader. Proposal is bodyless and uses BroadcastRequest ([rebuild:85–88][rebuild]); [ReliabilitySubsystem.cpp:383–386][rs] replies on the original context with Actor FM=11, **no GenerationHeader and no FMM actor rewrite**. UpdateReject is a separate one-way direct GenerationNumber body, Actor FM=11/no GenerationHeader; its actual FMM SendToFMM path rewrites actor=10 and remains gated in the selected ordinary-FM profile ([generation-state:272–282][generation-state]). |
 | Transport wrapper details | [FederationWrapper.cpp:31–75,176–230][federation] supplies route timeouts, validates target node incarnation on direct sends, and may set `Idempotent=false` on direct P2P. The test-only partition property is not another serialized body field. Activity headers are optional for trace correlation ([ra/MessageHandler.cpp:32–41][handler]); don't require one merely because a message has an activity ID in logging. |
 
 ### RA admission and metadata
@@ -158,20 +177,32 @@ selected first codec pair; `C2` denotes removal/reporting codecs and bounded
 stateless execution; `C3` denotes service-type notification codecs and bounded
 node coordination; `C4` denotes bounded fresh volatile AddPrimary control;
 `C5` denotes distinct normal DeleteReplica/Reply codec evidence; `S` means
-other staged protocol work; `L`
+other staged protocol work; `C6` denotes stage-two node-control/load and
+codec-only endpoint contracts; `L`
 means retained legacy contract; `D` means native explicit rejection; `G` means
-an observed pinned-source endpoint gap. C1/C2/C3/C4/C5 have the bounded implementation below;
+an observed pinned-source endpoint gap. `C7` is generation-handshake-only codec
+selection, not LFUM upload or complete stage three. `C8` selects only the
+CreateReplica/CreateReplicaReply peer codecs, not build/copy or AddReplica.
+`C9` adds AddReplica/Reply codecs and bounded original-Idle FM build orchestration.
+`C10` adds RemoveReplica/Reply codecs, original pending/failed FM creation cleanup
+and opened-original-Idle FM removal.
+C1/C2/C3/C4/C5/C6/C7/C8/C9/C10 have the mapping below;
 the other contracts remain staged.
 
 ### Rust implementation and test mapping
 
 | Inventory class | Rust mapping at catalog delivery | Required delivery/admission gate |
 |---|---|---|
-| C1: AddInstance/AddInstanceReply | Public schemas/headers: [protocol.rs](../../crates/libs/fube-ra/src/protocol.rs); selected [entity execution](../../crates/libs/fube-ra/src/entity.rs), [native opening policy](RaStatelessOpening.md) and [Drop/FM-resend replacement/direct description helpers](RaStatelessReplacement.md). [Protocol tests](../../crates/libs/fube-ra/tests/protocol.rs), [entity tests](../../crates/libs/fube-ra/tests/entity.rs), [native source-stream gate](../../tests/ra_protocol/README.md). | Current 58 bidirectional native-stream/schema-adapter cases (59 types/199 fields), retaining all original 36 cases (43 types/129 fields), and selected entity barriers. No new IPC wire codec; description work is a trusted local RAP obligation. Full Hosting/transport/native trace qualification and excluded lifecycle branches remain required; no deployed capability admission. |
-| C2: RemoveInstance/RemoveInstanceReply, ReplicaUp/ReplicaUpReply | [Native-shaped schemas](../../crates/libs/fube-ra/src/protocol.rs), [native helper closure](../../crates/libs/fube-ra/src/lifecycle.rs), [stateless mappings and limits](RaStatelessRemoval.md), [original singleton AppHostDown reporting](MinimalFmCluster.md#unexpected-singleton-app-host-loss), [graceful Close](MinimalFmCluster.md#graceful-singleton-close-reporting) and [normal Drop](MinimalFmCluster.md#normal-singleton-drop-reporting). | Selected stateless removal/close/reporting plus one-FT non-final FM singleton AppHostDown/Close/Drop delivery: native ReplicaDown versus ReplicaDropped stages, canonical dropped payload, processed-list ACK and closed-FT metadata deletion. Normal Drop requires a dropped-description ACK and cannot relabel closing/closed Down lifetimes. Close/Drop have independently joined original-runtime disposal; ACKs do not create disposal/recovery proof. Commit/unknown, original accounting and real app/lease/held-disposal/channel tests preserve those boundaries. Abort/ForceAbort and closed-AddPrimary reporting, full upload/batching/FMM, GC/restart and broad lifecycle remain staged. RemoveReplica remains unselected; distinct DeleteReplica action codecs are C5. |
+| C1: AddInstance/AddInstanceReply | Public schemas/headers: [protocol.rs](../../crates/libs/fube-ra/src/protocol.rs); selected [entity execution](../../crates/libs/fube-ra/src/entity.rs), [native opening policy](RaStatelessOpening.md) and [Drop/FM-resend replacement/direct description helpers](RaStatelessReplacement.md). [Protocol tests](../../crates/libs/fube-ra/tests/protocol.rs), [entity tests](../../crates/libs/fube-ra/tests/entity.rs), [native source-stream gate](../../tests/ra_protocol/README.md). | Current 139 bidirectional native-stream/schema-adapter cases (77 types/240 fields), retaining all original 36 cases (43 types/129 fields), and selected entity barriers. No new IPC wire codec; description work is a trusted local RAP obligation. Full Hosting/transport/native trace qualification and excluded lifecycle branches remain required; no deployed capability admission. |
+| C2: RemoveInstance/RemoveInstanceReply, ReplicaUp/ReplicaUpReply | [Native-shaped schemas](../../crates/libs/fube-ra/src/protocol.rs), [native helper closure](../../crates/libs/fube-ra/src/lifecycle.rs), [stateless mappings and limits](RaStatelessRemoval.md), [original singleton loss](MinimalFmCluster.md#unexpected-singleton-app-host-loss), [graceful Close](MinimalFmCluster.md#graceful-singleton-close-reporting), [normal Drop](MinimalFmCluster.md#normal-singleton-drop-reporting) and [singleton lifecycle completion](MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation). | Selected stateless removal/close/reporting plus one-FT non-final FM singleton AppHostDown/Close/Drop/Abort/ForceAbort/Obliterate and closed-AddPrimary delivery. Native ReplicaDown versus ReplicaDropped stages, canonical dropped payload, processed-list ACK and closed metadata deletion remain distinct. Dropped-stage ACKs require a dropped description; later closes cannot relabel closed Down lifetimes. Real RAP disposal is independent of metadata ACKs; force host termination supplies no graceful disposal/recovery proof. Commit/unknown, original accounting and real app/lease/held-disposal/channel tests preserve those boundaries. Full upload/batching/FMM, GC/restart and broad lifecycle remain staged. Distinct DeleteReplica action codecs are C5; bounded RemoveReplica is C10. |
 | C3: ServiceTypeNotification/ServiceTypeNotificationReply | [VersionedServiceType, ServiceTypeInfo, ServiceTypeNotification and distinct factories/decoders](../../crates/libs/fube-ra/src/protocol.rs), [bounded node ledger](../../crates/libs/fube-ra/src/notification.rs#L1-L421), [behavior/evidence limits](RaStatelessOpening.md#shared-node-registration-notifications), [protocol tests](../../crates/libs/fube-ra/tests/protocol.rs), [independent native-stream/helper cases](../../tests/ra_protocol/README.md). | Request Actor FM=11/no generation; reply Actor RA=12/actual FM GenerationHeader; both priority=false. Generic receive-generation lower-bound admission precedes key+instance-only ack. Native UTF-16-unit startup-C-locale identity accepts non-ASCII names and retains actual returned spelling. Dynamic work/retry timers and captured sends preserve native-visible histories. Schema/helper evidence does not establish live Hosting/FM delivery or full original-handler execution. |
-| C4: AddPrimary/AddPrimaryReply | Shared native ReplicaMessageBody/ReplicaReplyMessageBody with distinct factories/decoders; source-derived RA network command, original reply lineage, initial `(CC epoch,0)` deactivation info, commit/unknown barriers and duplicate/stale behavior. [Minimal FM stateful control](MinimalFmCluster.md#initial-stateful-fm-control), RA model/protocol tests and the 58-case native stream/schema-adapter oracle retaining all six AddPrimary cases. | One fresh volatile 1/1 Primary lifetime per configured node. Actual FM/RA/RAP and independent acknowledged public write/readback; native 10/60-second action retry without new identity. Replacement/reopen, terminal-report origins other than the C2 AppHostDown/Close/Drop slice, broader deletion/reconfiguration, FMM and recovery remain staged. No full original-native-handler trace or native FM interoperability claim. |
-| C5: DeleteReplica/DeleteReplicaReply | [protocol.rs](../../crates/libs/fube-ra/src/protocol.rs): `DeleteReplica = RemoveInstance` retains native DeleteReplicaMessageBody base/derived scopes; `DeleteReplicaReply = AddInstanceReply` retains native ReplicaReplyMessageBody. Distinct `delete_replica_message`/`decode_delete_replica` and `delete_replica_reply_message`/`decode_delete_replica_reply` use literal actions. [Focused protocol tests](../../crates/libs/fube-ra/tests/protocol.rs) and [native-stream oracle](../../tests/ra_protocol/README.md) add seven cases to all prior 51, including normal force=false volatile 1/1 Primary fields and success/StaleRequest reply values. | Request Actor RA=12/high priority=true/actual FM GenerationHeader; reply Actor FM=11 (FMM=10 schema owner supported)/high priority=true/no mandatory generation. Rust rejects every proper prefix of all five new bodies; native executes two additional truncation rejections. Codec evidence does not execute original handlers, authorize force deletion, recreation/reconfiguration, FMM or recovery, or establish native FM interoperability. Bounded application semantics require separate [minimal FM composition](MinimalFmCluster.md) validation. |
+| C4: AddPrimary/AddPrimaryReply | Shared native ReplicaMessageBody/ReplicaReplyMessageBody with distinct factories/decoders; source-derived RA network command, original reply lineage, initial `(CC epoch,0)` deactivation info, commit/unknown barriers and duplicate/stale behavior. [Minimal FM stateful control](MinimalFmCluster.md#initial-stateful-fm-control), [disposal-gated fresh recreation](MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation), RA model/protocol tests and the 124-case native stream/schema-adapter oracle retaining all prior 116 cases, including all six AddPrimary cases. | Volatile 1/1 Primary lifetimes with actual FM/RA/RAP, independent acknowledged public write/readback and native 10/60-second same-lifetime retry. Explicit fresh recreation follows normal deletion plus original disposal/accounting proof, resetting deactivation/report state and creating empty data under new replica/instance identities. Terminal loss stays nonreusable. Live replacement/adoption, description changes, reconfiguration, FMM and recovery remain staged. No full original-native-handler trace or native FM interoperability claim. |
+| C5: DeleteReplica/DeleteReplicaReply | [protocol.rs](../../crates/libs/fube-ra/src/protocol.rs): `DeleteReplica = RemoveInstance` retains native DeleteReplicaMessageBody base/derived scopes; `DeleteReplicaReply = AddInstanceReply` retains native ReplicaReplyMessageBody. Distinct `delete_replica_message`/`decode_delete_replica` and `delete_replica_reply_message`/`decode_delete_replica_reply` use literal actions. [Focused protocol tests](../../crates/libs/fube-ra/tests/protocol.rs) and [native-stream oracle](../../tests/ra_protocol/README.md) add seven cases to all prior 51, including normal force=false volatile 1/1 Primary fields and success/StaleRequest reply values. | Request Actor RA=12/high priority=true/actual FM GenerationHeader; reply Actor FM=11 (FMM=10 schema owner supported)/high priority=true/no mandatory generation. Rust rejects every proper prefix of all five new bodies; native executes two additional truncation rejections. Codec evidence does not execute original handlers, authorize force deletion, recreation/reconfiguration, FMM or recovery, or establish native FM interoperability. Separate [minimal FM composition](MinimalFmCluster.md) validates bounded singleton lifecycle and normal original-Idle destination deletion: semantic reply joins original disposal/accounting for an opened lifetime or distinct applied-Delete absence proof for the unanswered FM Add, independently of Primary pending-remove. No new wire shape or replacement authority is introduced. |
+| C6: NodeActivateRequest/Reply, NodeDeactivateRequest/Reply, NodeUpdateServiceRequest/Reply, ServiceTypeEnabled/Disabled and both replies, ReplicaEndpointUpdated/Reply, ReportLoad | [node_control.rs](../../crates/libs/fube-ra/src/protocol/node_control.rs) supplies all thirteen distinct literal-action factories/decoders and complete load closure. [Protocol tests](../../crates/libs/fube-ra/tests/protocol.rs) and [source-stream qualification](../../tests/ra_protocol/README.md#stage-two-node-controlload-and-endpoint-codecs) add 43 independent inputs while retaining every prior case and adapter. | All thirteen native factory defaults are priority=false. FM→RA requests and type-status/endpoint replies retain actual GenerationHeader; RA→FM replies/status/load/endpoint sends do not invent generation. Node replies and endpoint sends preserve FM/FMM codec ownership; status/load send to ordinary FM only. This row qualifies codecs, not complete native handlers/FM parity. Bounded execution is separately implemented with one FT per real Node and multi-FT RA model/store coordination; production remains ordinary FM only. Live endpoint publication is deferred to stage 5. |
+| C7: GenerationProposal/Reply, GenerationUpdate/Reject | [generation.rs](../../crates/libs/fube-ra/src/protocol/generation.rs) supplies bodyless proposal, reply `(proposed,current,error:i64)`, update `(fm_service_epoch:Epoch)` and direct GenerationNumber rejection, with eight distinct public builders/decoders. [Protocol tests](../../crates/libs/fube-ra/tests/protocol.rs) and [native-stream qualification](../../tests/ra_protocol/README.md#generation-handshake-only-codecs) add 15 inputs, two types/four fields, preserving every prior 101 case. | Exact native action/actor/high-priority/default/header asymmetry; correlated proposal context is distinct from one-way Update/Reject. Ordinary FM Update requires its epoch body; the FMM bodyless branch is explicitly rejected, not a successful stub. GFUMTransfer, LFUMUpload/Reply, rebuild completion, recovery and FMM execution remain staged. Update receive-generation progress alone does not advance send generation or authorize new-generation ordinary traffic; upload pending is not LFUM completion. |
+| C8: CreateReplica/CreateReplicaReply | [peer.rs](../../crates/libs/fube-ra/src/protocol/peer.rs) retains RAReplicaMessageBody's base/derived scopes and nested ReplicaDeactivationInfo, plus a distinct literal-action reply alias of ReplicaReplyMessageBody. Both builders/decoders carry GenerationHeader. [Protocol tests](../../crates/libs/fube-ra/tests/protocol.rs) and [native-stream qualification](../../tests/ra_protocol/README.md#first-peer-creation-codecs) add eight cases, two types/three fields, retaining all prior 116 cases. | Both Actor RA=12/priority=true, not FM replies. This codec evidence alone does not enable build/copy, quorum, serving, GetLSN, Deactivate or Activate. C9 separately connects bounded FM build orchestration to actual RAP copy. Full original-native-handler/runtime interoperability remains staged. |
+| C9: AddReplica/AddReplicaReply | [protocol.rs](../../crates/libs/fube-ra/src/protocol.rs) supplies distinct literal-action factories/decoders over native ReplicaMessageBody/ReplicaReplyMessageBody. [Native-stream qualification](../../tests/ra_protocol/README.md#fm-addreplicareply-codecs) adds seven cases without new schema fields. [Primary peer state](../../crates/libs/fube-ra/src/peer.rs), [bounded FM ledger](../../crates/tools/fube-cluster/src/fm.rs) and actual-process acceptance cover original-session creation, copy, failure, lost replies and removal races. | Native metadata F, not a creating FT command. Request RA=12/high priority/actual generation; reply FM=11 (FMM=10 codec owner only)/high priority/no mandatory generation. Ready in the Primary/FM view remains an unconfigured Idle, not an ActiveSecondary. Fixed-generation, one original two-node partition only; replacement, reconfiguration, recovery and native-runtime interoperability remain staged. C10 adds bounded FM removal. |
+| C10: RemoveReplica/RemoveReplicaReply | Distinct [protocol factories/decoders](../../crates/libs/fube-ra/src/protocol.rs) reuse ReplicaMessageBody/ReplicaReplyMessageBody, not inherited DeleteReplica scopes. [Native-stream qualification](../../tests/ra_protocol/README.md#fm-removereplicareply-codecs) adds eight cases, including the exact original-descriptor echo shared by InCreate and absent-after-abort cleanup. [RA](../../crates/libs/fube-ra/src/peer.rs) and [FM ledger](../../crates/tools/fube-cluster/src/fm.rs) retain frozen removal intent, retry errors and replay successful replies. | Metadata F cannot create an FT. Original pending/failed FM creation completes locally with the exact InBuild descriptor and no RAP; the opened Idle uses RAP cancellation/removal and a Dropped descriptor. Failed Add preserves its error/to-be-dropped obligation and automatically marks pending-remove; only RemoveReplicaReply clears that flag. Lost replies, late CreateReplicaReply/build/AddReplicaReply and original-owner Close/loss cannot fabricate completion or resurrect the Idle. Destination deletion uses the independent bounded C5 path, including registered/pre-registration Opening, known pre-Open registration failure and definitive runtime Open failure with distinct original-owner proofs; other failed/unknown absent-lifetime and down/arbitrary-unknown cleanup, replacement, active membership and native-runtime interoperability remain gated. |
 | S: all other active boundary contracts | No Rust codec/handler/trace implementation asserted. The CSV's per-action body, direction and evidence map each missing implementation individually. | Port exact referenced schema and sender/receiver semantics, corresponding native tests and normalized traces before capability admission. No successful stubs or permanent omission. |
 | L: retained legacy | No Rust wire implementation asserted; retained current/native legacy behavior must be tested explicitly. | Preserve source-baseline old action definitions/handling versus current ReplicaUp replacement distinctions. |
 | D: deprecated ChangeConfigurationReply | No Rust dispatcher asserted. | Rejection/deprecation test, not successful no-op. |
@@ -189,7 +220,157 @@ adds real disposal evidence without treating native ACKs as disposal receipts.
 The [normal Drop guide](MinimalFmCluster.md#normal-singleton-drop-reporting) adds
 native ReplicaDropped-stage delivery through that same wire action, with
 dropped-description ACK and no-relabeling checks.
-The 14 selected actions, 58 stream cases and 59-type/199-field closure are unchanged.
+At stage one, the 14 selected actions, 58 stream cases and 59-type/199-field
+closure were unchanged; C6 extends the current oracle as documented above.
+The [singleton lifecycle completion](MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation)
+extends the same schemas with Abort/ForceAbort, closed-AddPrimary, native
+force Delete/tombstone behavior and disposal-gated fresh recreation. The
+additional model/process evidence does not change codec counts or establish
+full native handler execution.
+The original opened peer Idle now uses the same AppHostDown down-stage/dropped
+report and processed-list ACK, followed by closed metadata Delete without RAP.
+Only loss observed in the original open peer lifetime, or a normal Close/Drop that
+committed from that opened lifetime, gains RA report authority;
+FM requires its frozen original Add and exact live destination session/lineage.
+Known pending Add can join this loss report, never serving/build success.
+The existing immediate-send/30-second retry and 10/60-second metadata Delete
+retry preserve loss independently from Primary pending-remove and disposal.
+Historical Add replies remain retained while current Idle readiness becomes
+lost; no cleanup receipt, recovery or replacement is fabricated.
+Actual two-child app-process loss, stale/lost ACK, metadata reply replay and
+healthy Primary writes are qualified separately from model/store commit/owner
+barriers and native C++ handler execution. See the
+[opened destination loss guide](MinimalFmCluster.md#unexpected-opened-destination-app-host-loss).
+For normal Close/Drop in flight, native [RA:1144-1181,3903-3924][ra-main] and
+[FT:4831-4840,5422-5424,4948-5014][ft] allow volatile AppHostDown to supersede
+Close/Drop and ignore its late reply after closure. The Rust RA retains actual
+opened-origin Close/Drop lineage only after its intent commit, not for initial Open
+or Abort/ForceAbort. Held real provider/service disposal followed by
+process loss uses the existing report/ACK/metadata path without a disposal
+receipt. Controlled Node/process/Channel acceptance and separate three-stage
+commit/race tests add no wire types or native handler execution claim.
+Successful normal Close now uses [FT:5472-5511][ft]'s OnReplicaDown path for
+the original opened peer Idle as well, without requiring AppHostDown.
+Only the matching Applied successful RAP Close records that terminal origin;
+failure/initial-Open/other-mode cleanup remains gated. The real runtime's
+disposal-before-reply and exact original usage-release proof remain distinct
+from ReplicaUp's processed ACK and closed metadata Delete/reply, with no second
+RAP Close or release. FM records lost volatile state and preserves independent
+Primary removal and no-reuse gates; a retirement sidecar is not replacement
+authority in this flow. Held provider/service disposal, actual 30-second
+lost-ACK retry, metadata reply replay and stable original proof have controlled
+Node/process/Channel coverage, separately from completion/ACK commit tests and
+native C++ handler execution.
+
+Normal Drop now extends that original opened-peer profile through
+[FT:5472-5544][ft]'s OnDropped path and
+`FMMessageState.cpp:99-113`'s ReplicaDropped stage, not ReplicaDown.
+Both use ReplicaUp's canonical dropped entry. The existing
+[FT:5734-5753][ft] ACK gate requires a dropped description, before or after
+the first report; the processed-list ACK and closed metadata Delete/reply do
+not replace actual original-runtime disposal/accounting proof or complete
+Primary pending-remove. A later Drop cannot supersede an in-flight Close or
+relabel its closed Down report. Matching AppHostDown during committed
+opened-origin Drop now replaces that pending mode and selects ReplicaDown,
+not ReplicaDropped. If successful Drop commits first, later HostDown stays
+stale and does not alter its original stage or disposal proof.
+Partial disposal and late RAP replies after loss never certify cleanup.
+Initial-Open and failed/ForceAbort reporting remain gated.
+Intent/loss/ACK commit failures and uncertainty, both race outcomes, real held
+provider/service process loss and an actual lost-ACK retry cover this extension.
+Intent/completion/ACK commit barriers, both ACK lists,
+non-dropped ACK rejection and controlled provider/service disposal/lost-ACK
+retry/metadata replay add lifecycle evidence only. See the
+[opened destination Drop guide](MinimalFmCluster.md#normal-opened-destination-drop-reporting).
+
+Normal non-force Abort now extends the original opened-peer profile as well.
+`ReplicaCloseMode.h` selects RAP Abort (`flags=4`) without ForceAbort's
+force-close admission; [FT:4781-4842,5472-5544][ft] preserves native admission
+and OnDropped/ReplicaDropped-stage reporting. Node and RA share original
+opened-peer lineage checks, rejecting local-only, initial-Open and arbitrary
+closed origins. An unavailable runtime cannot turn Abort into forced closure;
+closed no-ops cannot relabel a prior report or certify disposal.
+Matching Applied RAP success and exact original usage release precede report
+work; actual original-runtime Abort/final-release proof stays independent of
+the processed ACK/closed metadata Delete and Primary pending-remove.
+Strict dropped-description ACKs, both ACK lists, intent/completion/ACK commit
+barriers and controlled real provider/service Abort disposal/lost-ACK retry/
+metadata replay extend lifecycle evidence, not wire schemas or native handler
+qualification. HostDown during Abort, failed/ForceAbort reporting and
+replacement remain gated. See the
+[opened destination Abort guide](MinimalFmCluster.md#normal-opened-destination-abort-reporting).
+
+The [complete original-session Delete subprofile](MinimalFmCluster.md#complete-original-session-destination-delete-contract)
+now covers normal/force Delete of the original opening, closing, closed, failed,
+absent or lost Idle. [RA:777-834][ra-main] selects Delete for closed FTs and
+Obliterate for open force; [FT:4781-4842,4916-5070][ft] supplies wait/supersession,
+no-registration completion and exact original-host termination.
+`FMMessageState.cpp:99-113,148-176,336-342` keeps deleted FTs at stage None:
+Delete-error ForceAbort and loss during normal Delete cannot leave a synthetic
+report obligation. Closed Delete retries reply without another RAP call.
+Metadata success still joins distinct original disposal, absence, cancellation,
+known failure or positive owned-process-loss evidence. Historical applied facts
+survive later app exit, never Node-owner adoption; unproved metadata and owner
+loss remain incomplete/unknown. Host loss is not graceful disposal and no
+Delete outcome authorizes replacement or clears Primary pending-remove.
+Model/store and original process/Channel matrices qualify these bounded paths,
+including held disposal, force supersession, no-runtime force, proof conflicts,
+commit uncertainty and reply replay. The codec oracle remains 139 cases;
+native C++ handlers, full FM/Federation interop, recovery and broader profiles
+are separate qualification.
+
+### Stage-two native codec contracts and execution boundary
+
+The pinned [RSMessage.cpp:52–55,111–112,130,210–219][registry] initializers use
+ordinary factory defaults for all thirteen C6 actions, not the high-priority
+defaults of AddPrimary/DeleteReplica. Node activation/deactivation requests
+serialize signed sequence then embedded `isFromFmm`; their separate native
+request/reply classes are all extracted, even where Rust reuses an identical
+wire shape. Service update retains the full ServiceDescription request and
+the `(serviceName, uint64 serviceInstance, uint64 serviceUpdateVersion)` reply.
+Enabled/disabled bodies retain multiple full ServiceTypeIdentifiers and uint64
+sequence, while their replies contain only sequence.
+
+Actual request GenerationHeaders are added by
+[NodeCache.cpp:1915–1923][node-cache],
+[DeactivateNodesContext.cpp:366–379][deactivate-context] and
+[UpdateServiceContext.cpp:99–110][update-context]. Status replies add
+`(FM.Generation, isMaster_)` at [FailoverManager.cpp:2457–2465][fm].
+Endpoint replies use [SendMessageAction.cpp:28–47,239–245][fm-send].
+The RA send paths [FMTransport:28–63,118–135][fm-transport],
+[ServiceTypeUpdateProcessor:236–258][service-update] and
+[ReconfigurationAgent:3719–3725][ra-main] add no invented generation.
+Owner-capable node replies/endpoint sends support FM/FMM as wire contracts,
+but the bounded execution profile does not enable FMM.
+
+The complete ReportLoad graph preserves legacy `reports_`, modern
+`reportsNew_` and primitive StopwatchTime `senderTime_`. ReportLoadInfo's
+`isStateful_` and LoadOrMoveCostDescription's `isReset_` are deliberately
+**absent** from their native field macros. `NodeLoads` retains the native map's
+ArrayPair scope, raw 16-byte NodeId key and object-array LoadMetricStats value;
+stats preserve both doubles, unsigned value/count and signed primitive time.
+Empty, combined legacy/modern, legacy-only and modern-only roots are qualified.
+Production may emit an empty legacy vector without deleting its wire schema.
+
+The 43 new inputs cover initialized empty/nondefault roots for every new
+action, all literal actions, negative/high-bit activation sequences, FM/FMM
+headers/owners, multiple types, legacy metrics and modern node-map stats.
+Rust compares decoded fields and production factories against native-produced
+headers/body values, writes independently constructed bodies and the actual
+native stream re-decodes them. Native constructors with unspecified scalars
+are explicitly initialized; deterministic Rust defaults are not native
+empty-constructor guarantees. The previous 58 inputs, 59 types/199 fields,
+62 bundle files and eleven native rejection cases remain preserved.
+
+**Live `ReplicaEndpointUpdated` publication is deferred to stage 5**, not
+implemented as an immediate serving acknowledgment. Pinned
+[EndpointPublishState.cpp:130–155][endpoint-state] derives its timeout from
+current reconfiguration duration and asserts publication pending requires
+active reconfiguration. Codec/owner coverage alone cannot establish those
+state-machine preconditions. The bounded production choice is one FT per real
+Node; multi-FT RA model/store coordination is separate execution evidence.
+No full original-native-handler trace, deployed native FM interoperability or
+unbounded cluster capability is claimed here.
 
 Offline catalog integrity tests live in
 [`test_ra_catalog.py`](../../tests/offline/cluster/test_ra_catalog.py).
@@ -203,10 +384,10 @@ the exact pinned checkout; it does not build native code.
 |---|---|---|
 | `AddInstance`; RA; FM→RA. `AddInstanceReply`; FM*; RA→FM | [fm/SendMessageAction.cpp:125–131][fm-send], [fm/Replica.cpp:632–649][fm-replica] → [ra/MessageHandler.cpp:475–485][handler], [ReconfigurationAgent.cpp:1639–1724][ra-main]; FC; `ReplicaMessageBody`. Reverse: RA :894–902,1645–1719 → [FM:960–967][fm], [fm/FailoverUnitMessageProcessor.cpp:22–43][fm-processor]; `ReplicaReplyMessageBody`; —. | Stateless InBuild work generated by [PendingTask.cpp:180–201][pending]; throttled retry [Replica.cpp:661–667][fm-replica]. Actual success means runtime open completed or identical ready instance already exists, not request admission/store insertion. Detailed decision table below. Tests [Test.StateMachine.cpp:3552–3605,5529–5538,6836,7195–7197][ra-tests], [AddFailoverUnitChecks:95–115][add-check-tests], [FM StateMachineTask.Test.cpp:474][fm-tests]. **C1**. |
 | `RemoveInstance`; RA; FM→RA. `RemoveInstanceReply`; FM*; RA→FM | [fm/SendMessageAction.cpp:135–150][fm-send] → [MessageHandler.cpp:486–496][handler], [RA:1726–1729,777–829][ra-main]; FC; `DeleteReplicaMessageBody` (not bare ReplicaMessageBody). Reverse [RA:698–706][ra-main] → [FM:961][fm], [fm-task:151–154][fm-task]; `ReplicaReplyMessageBody`. | Closed identity/epoch update precedes own guards; lower instance accepted. Closed always Delete, open force Obliterate; captured Delete completion selects RemoveInstanceReply, not generic force success. [PendingTask.cpp:38–45,184–195][pending] retries until removal. Actual stateless removal [Close:367–384][close-tests]; shared helper [DeleteReplica:214–275,347–415][delete-tests] includes misleadingly named nonforce DeleteReplica inputs. [Port mappings](RaStatelessRemoval.md). **C2**; complete lifecycle/runtime remains staged. |
-| `AddPrimary`; RA; FM/FMM→RA. `AddPrimaryReply`; FM*; RA→owner | [fm-send:163–169][fm-send] → [handler:497–507][handler], [RA:1731–1821][ra-main]; FC; `ReplicaMessageBody`. Reverse [RA:906–917,1771–1819][ra-main] → [FM:963][fm], [fm-processor:46–62][fm-processor]; `ReplicaReplyMessageBody`. | Persisted FM replica rebuild may require TryDropFMReplica; create uses Primary role and empty replica deactivation info. Ready duplicate replies; newer requested replica closes old local replica first; closed/stale handling includes dropped report. FM requires creating-primary, up and matching node instance. PendingTask :165–175 retries. Tests [Rebuild:188–217][rebuild-tests], [ReplicaLifecycle:1342][lifecycle-tests]. **C4** for the fresh volatile profile only; persisted rebuild, replacement/reopen and terminal-report delivery remain staged. |
-| `AddReplica`; RA; FM→primary RA. `AddReplicaReply`; FM*; primary RA→owner | [fm-send:173–179][fm-send] → [handler:508–518][handler], [RA:1823–2051][ra-main]; F; `ReplicaMessageBody`. Reverse [RA:1893,2905,2935,4089][ra-main], [FailoverUnit.cpp:1345–1352][ft] → [FM:962][fm], [fm-processor:64–89][fm-processor]; `ReplicaReplyMessageBody`. | Equal epoch; local primary/allowed swap build, open/up and remote replica incarnation/state gates. Primary first sends CreateReplica to peer, then RAP build; build/activation completion controls FM reply. FM only completes an up InBuild replica with reconfiguration primary available; failures can drop replica. Tests [Reconfiguration:61–117][reconfiguration-tests], [ReplicaLifecycle:1342][lifecycle-tests]. **S**. |
-| `RemoveReplica`; RA; FM→primary RA. `RemoveReplicaReply`; FM*; primary RA→owner | [fm-send:183–189][fm-send] → [handler:519–529][handler], [RA:2053–2140,3098–3135][ra-main]; F; `ReplicaMessageBody`. Reverse [RA:2077,2103,2137,4148][ra-main] → [FM:964][fm], [fm-processor:201–214][fm-processor]; `ReplicaReplyMessageBody`. | Equal epoch and primary/local-open checks; removes remote idle replica from primary/replicator, **not** synonym for deleting that replica on its node. In-create can be removed locally; other states require RAP idle-replica removal. PendingTask :124–130 retries pending removals. **S**; native lifecycle/reconfiguration tests above. |
-| `DeleteReplica`; RA; FM/FMM→replica RA. `DeleteReplicaReply`; FM*; RA→owner | [fm-send:193–217][fm-send] → [handler:541–551][handler], [RA:2239–2242,776–834][ra-main]; FC; `DeleteReplicaMessageBody`. Reverse [RA:696–709][ra-main] → [FM:965][fm], [fm-task:167–170,207][fm-task], [fm-processor:224–255][fm-processor]; `ReplicaReplyMessageBody`. | Tombstone creation, own replica ID, force/epoch behavior; force uses Obliterate, normal uses Delete. Closed stale state still updates identity according to UpdateInstanceForClosedReplica. Reply can be processed when FM FT absent. Tests [DeleteReplica][delete-tests], [Close:346–350][close-tests]. **C5** for distinct codec evidence of the normal volatile singleton slice only; force, recreation, reconfiguration, FMM and recovery remain excluded. Original-handler execution remains separate qualification. |
+| `AddPrimary`; RA; FM/FMM→RA. `AddPrimaryReply`; FM*; RA→owner | [fm-send:163–169][fm-send] → [handler:497–507][handler], [RA:1731–1821][ra-main]; FC; `ReplicaMessageBody`. Reverse [RA:906–917,1771–1819][ra-main] → [FM:963][fm], [fm-processor:46–62][fm-processor]; `ReplicaReplyMessageBody`. | Persisted FM replica rebuild may require TryDropFMReplica; create uses Primary role and empty replica deactivation info. Ready duplicate replies; newer requested replica closes old local replica first; closed/stale handling includes dropped report. FM requires creating-primary, up and matching node instance. PendingTask :165–175 retries. Tests [Rebuild:188–217][rebuild-tests], [ReplicaLifecycle:1342][lifecycle-tests]. **C4** for the volatile singleton profile, including closed/stale reporting and explicitly requested fresh lifetimes after normal deletion/disposal proof. Persisted rebuild, live replacement/adoption, FMM and broader choreography remain staged. |
+| `AddReplica`; RA; FM→primary RA. `AddReplicaReply`; FM*; primary RA→owner | [fm-send:173–179][fm-send] → [handler:508–518][handler], [RA:1823–2051][ra-main]; F; `ReplicaMessageBody`. Reverse [RA:1893,2905,2935,4089][ra-main], [FailoverUnit.cpp:1345–1352][ft] → [FM:962][fm], [fm-processor:64–89][fm-processor]; `ReplicaReplyMessageBody`. | Equal epoch; local primary/allowed swap build, open/up and remote replica incarnation/state gates. Primary first sends CreateReplica to peer, then RAP build; build/activation completion controls FM reply. FM only completes an up InBuild replica with reconfiguration primary available; failures can drop replica. Tests [Reconfiguration:61–117][reconfiguration-tests], [ReplicaLifecycle:1342][lifecycle-tests]. **C9** selects codecs and original volatile Idle build; secondary/reconfiguration/replacement branches remain staged. |
+| `RemoveReplica`; RA; FM→primary RA. `RemoveReplicaReply`; FM*; primary RA→owner | [fm-send:183–189][fm-send] → [handler:519–529][handler], [RA:2044–2140,3098–3135][ra-main]; F; `ReplicaMessageBody`. Reverse [RA:2077,2103,2137,4148][ra-main] → [FM:964][fm], [fm-processor:201–214][fm-processor]; `ReplicaReplyMessageBody`. | Equal epoch and primary/local-open checks; removes remote idle replica from primary/replicator, **not** synonym for deleting that replica on its node. InCreate and absent-after-abort cleanup echo FM's original descriptor without RAP; opened/up uses RAP removal. PendingTask :124–130 retries pending removals. **C10** selects original pending/failed creation and opened-Idle removal; native down/arbitrary-not-found/reconfiguration branches remain gated. |
+| `DeleteReplica`; RA; FM/FMM→replica RA. `DeleteReplicaReply`; FM*; RA→owner | [fm-send:193–217][fm-send] → [handler:541–551][handler], [RA:2239–2242,776–834][ra-main]; FC; `DeleteReplicaMessageBody`. Reverse [RA:696–709][ra-main] → [FM:965][fm], [fm-task:167–170,207][fm-task], [fm-processor:224–255][fm-processor]; `ReplicaReplyMessageBody`. | Tombstone creation, own replica ID, force/epoch behavior; force uses Obliterate, normal uses Delete. Closed stale state still updates identity according to UpdateInstanceForClosedReplica. Reply can be processed when FM FT absent. Tests [DeleteReplica][delete-tests], [Close:346–350][close-tests]. **C5** distinct codec evidence plus bounded singleton normal/force and missing/closed tombstone semantics, and normal opened/opening/never-created original-Idle destination deletion independent of pending-remove. Physical disposal, pre-Open cancellation and zero-history absence have distinct original-owner proof joins. Force host termination has no graceful disposal/reuse proof; fresh singleton recreation requires verified normal deletion, while peer replacement remains gated. Reconfiguration, FMM and recovery remain excluded. Original-handler execution remains separate qualification. |
 | `DoReconfiguration`; RA; **FM/FMM→RA and old-primary RA→new-primary RA**. `DoReconfigurationReply`; FM*; RA→owner | FM [fm-send:153–159][fm-send]; peer [RA:3435–3451][ra-main], [FT:3497–3541][ft] → [handler:530–540][handler], [RA:2142–2238][ra-main]; FC; **`DoReconfigurationMessageBody : ConfigurationMessageBody`**. Reverse [FT:3487–3495][ft] → [FM:974–976][fm], [fm-task:187–190][fm-task]; `ConfigurationReplyMessageBody`. | Peer swap continuation carries phase0Duration, full FT/config/service fields. Closed/missing FT becomes tombstone and reports dropped, not a successful live replica. Open must actually have local replica and matching incarnation. FT phase algorithms drive reply after completion; peer continuation does **not** redirect final reply to peer. Retry [FT:3710–3791][ft]; tests [DoReconfiguration:41–169][doreconfig-tests], [Reconfiguration:61–117][reconfiguration-tests]. **S**; preserve both actual directions. |
 | `ChangeConfiguration`; FM*; RA→owner. `ChangeConfigurationReply`; RA; owner→RA | [FT:3457–3468][ft] → [FM:969–972][fm], [fm-task:179–182][fm-task], [fm-processor:531–662][fm-processor]; `ConfigurationMessageBody`. Reverse [fm-send:229–236][fm-send]; `FailoverUnitReplyMessageBody`; **D** at [metadata:46][metadata], rejected [handler:161–165][handler]. | Request reports candidate/configuration information, processed only in suitable reconfiguration/source state by FM; ChangeConfigurationReply is **not** an RA progress gate in this baseline. Retain its definition and explicit deprecation behavior. Tests [DoReconfiguration:137–154,221][doreconfig-tests]. **S / D**. |
 | `DatalossReport`; FM*; RA→owner; no dedicated reply action | [FT:3470–3484][ft] → [FM:969–972][fm], [fm-task:175–178][fm-task], [fm-processor:663–end][fm-processor]; `ConfigurationMessageBody`; —. | Contains full configuration/service; retransmitted while current DataLossVersion has not advanced past version being reported. [FT:3776][ft] includes it in retries. It is not a generic fault event. Native phase/get-LSN/reconfiguration tests; **S**. |
@@ -217,7 +398,7 @@ the exact pinned checkout; it does not build native code.
 | Actions; actor/direction | Actual sender → receiver; metadata; schemas | Completion/retry/owner semantics; native test/status |
 |---|---|---|
 | `ReplicaUp`; FM*; RA→FM/FMM. `ReplicaUpReply`; RA; owner→RA | [Communication.FMMessageBuilder.cpp:22–40,75–87][fm-builder], [Node.PendingReplicaUploadStateProcessor.cpp:124–135][upload-processor], [FT:4739][ft] → [fm/CommonJobQueue.cpp:35–38][fm-queue], [FM:2328–2337][fm], [ReplicasUpdateOperation.cpp:144–201,343–421][replicas-update]. Reverse :410–421 → [handler:262–265][handler], [RA:3287–3408][ra-main]; NC. **Both use `ReplicaUpMessageBody`**. | Carries normal **and dropped** `vector<FailoverUnitInfo>`, last flag, FM/FMM flag. Reply lists are per-FT semantic processing/deletion instructions, not merely echoed received IDs. FM validates owner vs FM-service FT, waits for NodeUp incarnation, commits final node ReplicaUploaded before last=true reply. RA handles both lists and only acknowledges last after all entity work succeeds and RA is open. Retried by FMMessageRetry plus pending-upload processor. Tests [ReplicaUpReply:208–309][replicaup-tests], [LastReplicaUp:296–456][last-tests], [ReplicaUploadAcknowledgement:164][ack-tests]. **C2** for codecs and one-FT non-last removal reporting/ack; full upload/batch/FMM execution remains staged. |
-| `ReplicaEndpointUpdated`; FM*; RA→owner. `ReplicaEndpointUpdatedReply`; RA; owner→RA | [fm-builder:38–39][fm-builder] → [FM:955–958][fm], [fm-task:139–142][fm-task], [fm-processor:310–358][fm-processor]. Reply [fm-send:239–245][fm-send] → [handler:552–562][handler], [RA:1630–1637][ra-main]; F. `ReplicaMessageBody` / `ReplicaReplyMessageBody`. | Endpoint-publish state and incarnation/epoch gates; reply stops the corresponding endpoint publication stage, not all FT work. Tests [EndpointPublish][endpoint-tests]. **S**. |
+| `ReplicaEndpointUpdated`; FM*; RA→owner. `ReplicaEndpointUpdatedReply`; RA; owner→RA | [fm-builder:38–39][fm-builder] → [FM:955–958][fm], [fm-task:139–142][fm-task], [fm-processor:310–358][fm-processor]. Reply [fm-send:239–245][fm-send] → [handler:552–562][handler], [RA:1630–1637][ra-main]; F. `ReplicaMessageBody` / `ReplicaReplyMessageBody`. | Endpoint-publish state and incarnation/epoch gates; reply stops the corresponding endpoint publication stage, not all FT work. Tests [EndpointPublish][endpoint-tests]. **C6 codecs only; live publication deferred to stage 5**, requiring active reconfiguration. |
 | `ReplicaDropped`; FM*; legacy RA→owner. `ReplicaDroppedReply`; RA; owner→legacy RA | Retained FM receive [FM:955–958][fm], [fm-task:113–114,135–138][fm-task], [fm-processor:269–308][fm-processor]; `ReplicaMessageBody`. Reply [fm-send:220–227][fm-send]; `ReplicaReplyMessageBody`. **No direct current RA sender** of this action found; `SendReplicaDroppedMessage` directly constructs **ReplicaUp** with a dropped FT list ([FT:4720–4742][ft]); pending FM retry stages also use the ReplicaUp builder. **No RA metadata/dispatch for ReplicaDroppedReply**, despite residual [RA:1601–1612][ra-main] processor. | Keep distinction: current dropped reporting uses dropped entries inside ReplicaUp, not this old action. Native FM missing-FT behavior is retained. Incoming legacy reply is unknown to current RA and rejected rather than processed by residual method. **L**, not declared `Deprecated` by native metadata. Current semantic replacement tests [ReplicaUpReply:233–250][replicaup-tests]. |
 | `ReplicaDown`; FM*; legacy RA→owner. `ReplicaDownReply`; RA; owner→legacy RA | Retained FM receive [fm-queue:39–42][fm-queue], [FM:2340–2351][fm]; `ReplicaListMessageBody`. Reply [fm/ReplicaDownOperation.cpp:126–137][down-operation]; `ReplicaListMessageBody`. No current direct RA sender/receive metadata found; builder [fm-builder:29–35][fm-builder] routes down stage through ReplicaUp. | Do not label the symbolic FMMessageStage::ReplicaDown or scenario helper `ProcessReplicaDownReply` as a wire action: current replies arrive as ReplicaUpReply. **L**, not native Deprecated metadata. Current tests [ReplicaUpReply:252–309][replicaup-tests]. |
 
@@ -242,9 +423,221 @@ They exchange **replica reliability state**, independently of the transport
 used to deliver them. The ninth peer direction, `DoReconfiguration` swap
 continuation, is already included above.
 
+#### First peer creation: codec and completion boundary
+
+Only CreateReplica/CreateReplicaReply are selected (`C8`); the other six peer
+factories remain unselected. The wire gate has 124 inputs, 77 types/240 fields,
+128 bundle files and 34 native truncation rejections. Every preceding
+generation/stage-two fixture is retained unchanged.
+
+[RAReplicaMessageBody.h:10–34][ra-replica-body] inherits ReplicaMessageBody's
+`(FailoverUnit, Replica, Service)` scope, then adds a **nested** deactivation
+object in its next scope. [ReplicaDeactivationInfo.h:44,63–64][deactivation-info]
+writes `(Epoch deactivationEpoch_, int64 catchupLSN_)`; Epoch order is
+configuration then data loss. Native [default construction calls Clear:15–17,54–58][deactivation-info-impl]:
+zero InvalidEpoch and catchupLSN=-1, not a synthesized valid epoch or zero LSN.
+The public Rust API is `CreateReplica { replica: Derived<AddInstance>,
+deactivation: ReplicaDeactivationInfo { epoch, catchup_lsn } }`, constructed by
+`CreateReplica::new(body, info)`. Its private Serde wire adapter deliberately
+writes `Inline<AddInstance>` followed by
+`Derived<CreateReplicaOptions { info: ReplicaDeactivationInfo }>`. Deriving
+Serde directly on the public shape would move the scope boundary onto the base
+instead of the info; flattening the info would also change native shape.
+
+The reply is `CreateReplicaReply = AddInstanceReply` with literal peer action,
+not AddPrimaryReply or AddReplicaReply. Both peer builders take
+`(&body, &GenerationHeader)`; both decoders return `(body, GenerationHeader)`.
+Native [RA:3453–3468,3504–3528][ra-main] routes requests and semantic replies
+through the same SendMessageToRAAction. Its per-owner **send** generation is
+mandatory in both directions. No missing-header fallback, actor FM/FMM
+rewrite or reply-generation omission is borrowed from the FM reply helpers.
+Both owner flags are preserved by the codec without enabling FMM execution.
+
+The source metadata is CreateReplica **FC** and CreateReplicaReply **F**
+([metadata:78,82][metadata]), both process-during-node-close=false and
+FTFailover-staleness checked. Pending Open/Close does not admit ordinary peer
+traffic. Creating an entry, accepting a transport context or emitting an Open
+request is not semantic creation completion.
+
+Native [FT:5250–5370][ft] completes actual RAP Open first: Idle becomes
+**InBuild=1**, not Ready; OpenPending clears, local open becomes true, and
+service/replication endpoints are updated. [RA:887–931][ra-main] then returns
+CreateReplicaReply to the recorded sender. Initial creation carries the
+Primary's deactivation epoch/catchup LSN (fresh Primary commonly CC epoch/0);
+the codec preserves arbitrary signed values without converting primary epochs.
+[FT:330–346][ft] accepts the actual opened package version, even if different
+from requested. A version equality policy is not implied by the native schema.
+
+The complete native Primary receiver [RA:2851–2939][ra-main] immediately starts
+RAP build after successful creation, and later sends AddReplicaReply to FM.
+That is an explicitly **excluded continuation** in this first increment:
+CreateReplicaReply is not AddReplicaReply, a build/copy receipt, quorum
+admission or serving permission. C9 now implements that bounded FM continuation
+separately, without broadening the original C8 codec claim. The native-stream/schema-adapter evidence
+executes neither that handler nor a production Federation session.
+
+#### Bounded FM-driven Idle build
+
+`Cluster::add_idle_replica()` sends native AddReplica to the original Primary.
+RA publishes its original request before peer CreateReplica, then its actual
+Open observation/build obligation before RAP BuildIdleReplica. Only matching RAP
+success sets the Primary-side Idle description Ready and sends AddReplicaReply;
+the destination still reports Idle/InBuild, denied access and no service endpoint.
+FM requires that native reply, not child telemetry or a frame-write receipt.
+
+Equal original FT epoch, normal FM/generation and remote incarnation are required.
+FM retries the frozen AddReplica on the native 10/60-second action cadence.
+Pending create retries resend CreateReplica; pending/failed build retries use
+the existing RAP path and nonterminal retry cleanup. Ready duplicates resend
+the same AddReplicaReply without another build or local Open. Native Create
+failure returns an error reply; ordinary RAP build errors do not finish FM add.
+The bounded profile retains failed creation's original observation for error
+replay and required FM removal, rather than authorizing fresh replacement.
+
+Close/removal fences late build completion and queued FM success replies.
+Local explicit removal cancels the FM add obligation before any later reply can
+mark it Ready; cancellation is not a RemoveReplicaReply or destination disposal.
+FM creation errors automatically mark original pending-remove/to-be-dropped,
+retaining the failed Add outcome independently of Primary-side cleanup.
+Source-baseline serializer receipts and native-free real-process acceptance do
+not qualify full native handlers, Federation or recovery.
+
+#### Bounded FM-driven Idle removal
+
+`Cluster::remove_idle_replica_via_fm()` sends RemoveReplica to the original
+Primary for its original pending/failed FM creation or an opened manual/FM-owned Idle.
+The original request is frozen and retried on the native 10/60-second cadence.
+After Open, RA publishes InDrop intent before dispatching RAP removal, cancelling an
+in-flight build first and retaining ordinary errors for retry. Terminal success
+emits RemoveReplicaReply with the RAP Dropped descriptor; duplicate FM requests
+replay that reply without another user removal. RA retains a session-only
+incarnation tombstone rather than authorizing replacement.
+
+Only the matching original Primary/FT/remote-incarnation success clears FM's
+pending-remove obligation ([fm-processor:201–214][fm-processor]). Diagnostic RAP
+success or a transport ACK is insufficient. Removal cancels any FM add obligation
+and fences late build/AddReplicaReply, including queued outbound success. An
+unresolved removal becomes unknown on original-session loss; no reconnect or
+recovery follows. For post-Open removal, the destination remains Idle/InBuild with copied data,
+registration and usage intact. No DeleteReplica or active-configuration
+completion is implied. Arbitrary-unknown/down cleanup, replacement
+and reconfiguration remain gated.
+
+Before the Primary accepts CreateReplicaReply, native
+[RA:2092–2106][ra-main] completes InCreate removal locally and echoes FM's
+exact InBuild=1/empty-endpoint descriptor without an InDrop transition or RAP
+call. The bounded original FM request is required; a session-only tombstone
+fences late CreateReplicaReply success/error and build completion. This means
+creation bookkeeping was cancelled, not that the destination never opened.
+An already dispatched CreateReplica can Open before or after cancellation;
+the original destination remains owned until explicit cleanup or shutdown.
+If Open wins at the Primary, the existing RAP branch applies instead.
+FM accepts only the exact frozen echo for this branch and reports
+`completion=creation_cancelled`, distinct from `replicator_removed`.
+
+An original CreateReplicaReply error aborts creation in
+[RA:2898–2910][ra-main], removing its native entry through AbortAddIdleReplica
+([FT:348–352][ft]). The bounded RA retains a failed observation/tombstone for
+error replay and original-incarnation fencing, not live creation authority.
+FM follows [fm-processor:64–89][fm-processor]: preserve the Add error,
+mark to-be-dropped and freeze pending-remove. Its RemoveReplica uses the original
+FM descriptor; failed reply endpoints/state/version do not redefine that request.
+The absent-replica branch [RA:2070–2080][ra-main] echoes it without RAP.
+Only the exact semantic reply clears pending-remove and reports
+`completion=failed_creation_retired`; the Add stays failed and
+`destination_cleanup_required` remains true. Original-session loss leaves unknown
+instead of granting recovery, replacement or disposal. Destination DeleteReplica
+is a separate original-opened-Idle path, not completion of this removal.
+Other failed/unknown absent-lifetime cleanup and ApplicationInstanceDeleted-driven application/service
+deletion remain gated.
+The existing echo codec fixture covers this identical wire shape; separate
+controlled-peer/native-free process tests qualify the failure/removal sequence.
+
+For an already-opened original abandoned destination,
+`Cluster::delete_idle_replica_via_fm()` uses the existing C5 inherited bodies
+with force=false. Native PendingTask :124-157 schedules it independently of
+Primary pending-remove; DeleteReplicaReply processes dropped/deleted metadata,
+not RemoveReplicaReply's independent flag. RA uses IsStateful (not initial
+Primary ownership) to select DeleteReplicaReply after committed normal Delete.
+Its exact original disposal/committed-Close/usage-release receipt remains a
+separate input. Only both complete cleanup; neither grants peer recreation.
+Real application-process/Channel tests hold provider/service disposal, replay a
+lost Delete reply, preserve pending-remove until its own reply and reject
+late-creation/build resurrection. No new codec shape or native C++ handler trace
+is claimed.
+
+For the original unanswered FM Add whose destination has no FT, the same C5
+path commits a native missing-FT deleted tombstone without lookup or RAP.
+TryCreateFailoverUnit [RA:4279–4293][ra-main] constructs from ID/consistency/service
+([FT:49–73][ft]); UpdateInstanceForClosedReplica [FT:366–391][ft] installs the
+identity/epoch. The reply retains constructor-default previous epoch and zero
+target/minimum, not FM's 1/1 Add description, plus native None/Dropped/down metadata.
+A separate original-node applied-Delete absence sidecar certifies zero Open/Close
+history, no usage/runtime and drained committed state. Only its join with the
+matching semantic reply reports `completion=never_created`; `disposed=false`
+and no runtime retirement receipt remain explicit. Native closed/equal-instance
+Create [RA:2283–2323][ra-main] cannot open it; locally deleted metadata suppresses
+the dropped report [FT:4015–4037,4720–4738][ft]. Actual original app/Channel tests
+lose/replay Delete, deliver held late Create and preserve a writable Primary with
+zero destination Open/acquisition. Production child-adapter/sidecar acceptance
+also completes Delete before original peer binding and independent Remove reply.
+Registered in-flight original Idle Open also uses normal C5 Delete, after
+committed registration/usage ownership. [FT:4916–5028][ft] clears Open-pending
+and starts Close; [RA:3782–3828][ra-main] ignores its late Open reply.
+`ra/ReconfigurationAgentProxy.cpp:451–568` cancels incompatible work without
+acknowledging Close until the old operation drains and RA retries.
+The existing runtime retains a cancelled Open's returned control for
+replicator-before-service Abort through public interfaces. The native
+DeleteReplicaReply still joins genuine original-runtime/committed-Close/usage
+release proof; frozen admission forbids never-created fallback on retry.
+Real held Open, provider/service disposal, native Close retry, lost-reply replay,
+late traffic and original child-adapter tests cover this branch without new
+wire types, native C++ execution or interoperability claims.
+Pre-registration original Opening uses [FT:4980–5028][ft]'s immediate Close
+without ServiceTypeRegistration, retaining the created 1/1 FT description.
+Late lookup results release their exact unused registration/usage offers without
+RuntimeOpen. A separate original-node `pre-open-cancellation.json` receipt
+binds actual creation and applied Delete lineage, and publishes only after all
+lookup/acquisition work drains with no runtime route. Its native reply join
+reports `pre_open_cancelled`, never runtime disposal or zero-history absence.
+Observed target admission remains frozen on retry; registration winning a race
+still requires genuine disposal. Held actual acquired lookup ownership after
+the native reply, late registration/traffic, commit barriers, reply replay and
+real child adapters qualify these source-derived semantics, not native handler
+execution or a new wire schema.
+Known pre-Open registration failure now uses closed Delete
+([FT:5212–5235,5610–5657][ft], [RA:777–834][ra-main]).
+Its original native error is retained only before runtime/usage adoption;
+later registration failure after runtime loss does not qualify.
+Distinct applied failure/creation/lookup and Delete command/ticket lineage,
+original-owner liveness and drained local accounting are carried in
+`failed-registration-deletion.json`. FM freezes/matches the failed Add error
+and joins the receipt with the canonical native reply, reporting
+`failed_registration`, never disposal, cancellation or missing-FT absence.
+Deleted metadata suppresses only the corresponding failed-create report
+placeholder. Actual owned-Node/production-adapter/process/Channel acceptance
+uses the native dynamic registration Drop=1 threshold for qualification,
+without changing production defaults or adding a child policy-control feature.
+Terminal runtime Open failure follows [FT:5212-5235][ft]: RAP has already
+closed the failed lifetime, so the subsequent closed Delete issues no RAP Close.
+The original Node separately captures the error reply after actual Abort/final
+release, its Applied terminal failure, exact original lookup/acquisition release
+and Applied Delete. Drained original ownership produces
+`failed-open-deletion.json`, not a successful-Close receipt or no-runtime proof.
+FM freezes the failed Add error and joins that proof with DeleteReplicaReply,
+reporting `failed_open` with genuine disposal while retaining the Add failure
+and independent Primary pending-remove. Held provider/service disposal and
+actual process/Channel acceptance use the existing dynamic Open Drop=1 policy
+for qualification only; production defaults remain unchanged.
+The complete original-session Delete contract above now includes closing/closed/
+lost and explicit force paths. Unproved ownership and foreign/later incarnations
+never become absence or disposal; general reporting, replacement and recovery
+remain separate gates. Trusted-local cleanup/loss DTOs add no wire shape or
+native C++ handler qualification.
+
 | Actions and actual direction | Sender → receiver; metadata; schema | Preconditions, semantic completion and retry; native tests; status |
 |---|---|---|
-| `CreateReplica`; primary/old-primary RA→remote replica RA. `CreateReplicaReply`; remote RA→requesting RA | [FT:2437–2480][ft] chooses an up, InCreate, remote configuration replica while local is Primary or swapping out; [RA:3453–3468][ra-main] builds request → [handler:565–575][handler], [RA:2245–2423][ra-main]; **FC**; `RAReplicaMessageBody` (ReplicaMessageBody base + DI). Reply [RA:918–929,2260,2314,2408][ra-main] → [handler:611–621][handler], [RA:2851–2939][ra-main]; **F**; `ReplicaReplyMessageBody`. | Upgrade/deactivation admission check may reject as RANotReadyForUse or silently defer upgrading node; local newer replica closes old first, closed equal/older instance reports dropped/StaleRequest; allowed requested role Idle/Secondary. Creates locally as Idle, records requesting FromInstance for eventual reply; primary-epoch change may require restart/drop and rebuilding. Ready duplicate may reply immediately; initial reply follows actual open. On primary, require open local Primary/allowed swap build, up/exact remote instance. Success advances InCreate→InBuild and triggers RAP build; **CreateReplicaReply is not AddReplicaReply**. Failure is sent to FM for idle add and aborts creation. [FT:3710–3720,2437–2506][ft] retries lifecycle while state remains pending. Tests [ReplicaLifecycle:1342][lifecycle-tests], [Rebuild:219–248][rebuild-tests], [Reconfiguration:61–117][reconfiguration-tests]. **S**. |
+| `CreateReplica`; primary/old-primary RA→remote replica RA. `CreateReplicaReply`; remote RA→requesting RA | [FT:2437–2480][ft] chooses an up, InCreate, remote configuration replica while local is Primary or swapping out; [RA:3453–3468][ra-main] builds request → [handler:565–575][handler], [RA:2245–2423][ra-main]; **FC**; `RAReplicaMessageBody` (ReplicaMessageBody base + DI). Reply [RA:918–929,2260,2314,2408][ra-main] → [handler:611–621][handler], [RA:2851–2939][ra-main]; **F**; `ReplicaReplyMessageBody`. | Upgrade/deactivation admission check may reject as RANotReadyForUse or silently defer upgrading node; local newer replica closes old first, closed equal/older instance reports dropped/StaleRequest; allowed requested role Idle/Secondary. Creates locally as Idle, records requesting FromInstance for eventual reply; primary-epoch change may require restart/drop and rebuilding. Ready duplicate may reply immediately; initial reply follows actual open. On primary, require open local Primary/allowed swap build, up/exact remote instance. Native success advances InCreate→InBuild and triggers RAP build; **CreateReplicaReply is not AddReplicaReply**. Failure is sent to FM for idle add and aborts creation. [FT:3710–3720,2437–2506][ft] retries lifecycle while state remains pending. Tests [ReplicaLifecycle:1342][lifecycle-tests], [Rebuild:219–248][rebuild-tests], [Reconfiguration:61–117][reconfiguration-tests]. **C8** selects codecs/Idle-open boundary only; the native build continuation remains staged. |
 | `GetLSN`; primary-candidate RA→other replica RA. `GetLSNReply`; replica RA→requesting RA | [FT:2204–2268][ft] phase1 send, [RA:3418–3433][ra-main] generic request helper → [handler:576–586][handler], [RA:2425–2492][ra-main]; **FC**; `ReplicaMessageBody`. Reply [RA:3541–3577][ra-main] normal/not-found helper and :2476–2484 closed base-only variant → [handler:622–632][handler], [RA:2942–2957][ra-main], [FT:519–645][ft]; **F**; `GetLSNReplyMessageBody : ReplicaReplyMessageBody` (closed variant base only). | Missing FT returns **NotFound without durable FT insert**, despite creating empty entry permission. Closed same replica replies Success+Dropped using **requested instance**, not newer local instance, for older-peer compatibility; closed different replica returns NotFound. Open replica updates epoch/PC as needed, records FromInstance and asks RAP status. Reply accepted only Success/NotFound, local open/not-closing, phase1, known replica RAReplyPending and exact instance. NotFound marks unknown LSN; Dropped updates durable dropped state; otherwise deactivation epoch/catchup progress used. Phase1 quorum/LSN selection drives continuation, not a generic ack. Retry via pending message stage until phase progress clears it. Tests [Test.StateMachine.GetLsn.cpp:110–189][getlsn-tests], [GetLSNReply.cpp:70–90][getlsn-reply-tests]. **S**. |
 | `Deactivate`; coordinating primary/old-primary RA→other replica RA. `DeactivateReply`; other RA→requesting RA | [FT:2409–2434,2566–2593,2649–2700][ft] (deactivation-info update, forced restart, phase3); [RA:3487–3503][ra-main] → [handler:587–597][handler], [RA:2495–2682][ra-main]; **F**; `DeactivateMessageBody : ConfigurationMessageBody` + isForce/DI. Reply [RA:691,2540,2675][ra-main] → [handler:633–643][handler], [RA:2960–2989][ra-main], [FT:1110–1239][ft]; **F**; `ReplicaReplyMessageBody`. | Closed FT updates CC epoch and replies with incoming replica instance if matching replica ID exists in list. Open requires actual open/not-InCreate, local NodeInstance member and nonstale incarnation/config. Force is remote restart/deactivate, **does not** use normal deactivation-epoch protocol; persisted vs nonpersisted close differs. Normal traffic updates DI and intermediate/previous configuration, may close excluded S/N replica and reply only after close. Successful reply drives DeactivateCompleted/phase progress; non-success does not clear pending. Phase3 sends only remote up RAReplyPending, not creating, not still building unless ToBeDeactivated, not restarting. Retry stops on message-stage/phase transitions/quorum conditions, not delivery receipt. [Reconfiguration:61–117][reconfiguration-tests], [GetLsn tests:137–155][getlsn-tests]. **S**. |
 | `Activate`; coordinating primary/old-primary RA→other replica RA. `ActivateReply`; other RA→requesting RA | [FT:2828–2875][ft], [RA:3470–3484][ra-main] → [handler:598–608][handler], [RA:2685–2849][ra-main]; **F**; `ActivateMessageBody : ConfigurationMessageBody` + DI. Reply [RA:2726,2844,3982][ra-main] → [handler:644–654][handler], [RA:2992–3021][ra-main], [FT:1242–1357][ft]; **F**; `ReplicaReplyMessageBody`. | Remote CC member, up, RAReplyPending, not create/still-build/restart at send. Closed receiver echoes incoming instance for matching replica ID after updating epoch. Open receiver requires local open/not-closing, membership/instance; cannot be activated as Primary; always considers DI update after staleness gates. Pending RAP role update is retried and **sender FromInstance updated** because coordinator may change. Role/config change may require RAP UpdateConfiguration before reply; unchanged local case can complete immediately. Successful ActivateReply clears appropriate pending stage and checks phase4 or finishes build/AddReplicaReply; does not by itself mean whole partition reconfigured. Tests [Reconfiguration:61–117,148–end][reconfiguration-tests], [DoReconfiguration:156–169][doreconfig-tests]. **S**. |
@@ -254,26 +647,26 @@ continuation, is already included above.
 | Actions; actor/direction | Actual sender → receiver; metadata; schemas | Semantic completion, retry, native evidence/status |
 |---|---|---|
 | `NodeUp`; FM*; common node→FM/FMM. `NodeUpAck`; RS registry actor; correlated owner→common→RA | [ReliabilitySubsystem.cpp:588–596][rs], [common/NodeUpOperation.cpp:14–50][nodeup] → [FM:1077–1079,1739–1769][fm]. Ack is consumed by `SendReceiveToFMOperation` then `RA.ProcessNodeUpAck` [RA:1501–1528][ra-main], [NodeUpAckProcessor.cpp:37–154][nodeup-processor]; OP. `NodeUpMessageBody` / `NodeUpAckMessageBody`. | Independent FM/FMM request operations/readiness. NodeUp carries packages/node/anyReplicaFound; ack carries upgrades, FabricVersionInstance, activation bool+sequence, GenerationHeader. Update receive/send/proposed generations; process all owner FTs before setting ready and pending replica upload. FMM cannot initiate fabric upgrade via NodeUpAck. Retry [SendReceiveToFMOperation.cpp:34–129][send-receive] until **expected ack action**; wrong-action/transport success is not completion. Tests [NodeUpAckProcessing][nodeup-tests], [Test.Unit.NodeUpOperationFactory.cpp][nodeup-factory-tests]. **S**, required despite common rather than RA factory. |
-| `GenerationProposal`; RA; FM/FMM→common RA actor preprocessor. `GenerationProposalReply`; FM registry actor; correlated RA/common→proposer | [fm/RebuildContext.cpp:76–95][rebuild] → [ReliabilitySubsystem.cpp:318–388][rs] → [GenerationStateManager.cpp:295–311][generation-state]; RR, bypass metadata. Request **empty** + GenerationHeader; reply `GenerationProposalReplyMessageBody`. | New generation updates per-owner proposed generation. Reply records requested and highest current proposed generation plus ErrorCode. FM consumes via multi-reply context (:132–239 in RebuildContext), retries/restarts proposal if greater generation found or decode fails. Replies are not normal one-way FM messages. **S**; [Rebuild tests:250–end][rebuild-tests]. |
+| `GenerationProposal`; RA; FM/FMM→common RA actor preprocessor. `GenerationProposalReply`; FM registry actor; correlated RA/common→proposer | [fm/RebuildContext.cpp:76–95][rebuild] → [ReliabilitySubsystem.cpp:318–388][rs] → [GenerationStateManager.cpp:295–311][generation-state]; RR, bypass metadata. Request **empty** + GenerationHeader; reply `GenerationProposalReplyMessageBody`. | New generation updates per-owner proposed generation. Reply records requested and highest current proposed generation plus ErrorCode. FM consumes via multi-reply context (:132–239 in RebuildContext), retries/restarts proposal if greater generation found or decode fails. Replies are not normal one-way FM messages; Actor FM=11 is retained on the original reply context, with no GenerationHeader. **C7 handshake codecs**, not LFUM upload or full rebuild; [Rebuild tests:250–end][rebuild-tests]. |
 | `GFUMTransfer`; FM registry actor; **former FMM/common saved state→new FMM**, correlated alternative to GenerationProposalReply | Saved state created [FM:737–771][fm]; actual send [RS:374–380][rs] when FMM proposal and savedGFUM exist; receive [rebuild:167–186][rebuild] → [FM:2545–2608][fm]; RR; `fm::GFUMMessageBody`. | Clears savedGFUM after handing to reply; restores global state and completes update/recover rather than normal LFUM rebuild. Contains NodeInfo vector and **full fm::FailoverUnit**, not a FailoverUnitInfo list. Neither “RA requests GFUM” nor ordinary RA peer lifecycle. **S**, within required registration/rebuild inventory. |
-| `GenerationUpdate`; RA; FM/FMM→RA. `GenerationUpdateReject`; FM*; RA→proposer/owner | [rebuild:282–314][rebuild] → [handler:258–261][handler], [RA:4200–4214][ra-main], [generation-state:46–287][generation-state]; N. **FM body `GenerationUpdateMessageBody`; FMM body empty.** Reject body `GenerationNumber`; send :272–282 → [FM:2610–2618][fm], [rebuild:368–387][rebuild]. | Receive generation only updates if proposed generation matches. FM path may first examine/abort stale FM-service local replica using FMServiceEpoch, under FT lock, before LFUM snapshot; FMM handles its separate domain. Reject restarts generation negotiation, not a generic negative ack. Retry broadcast until pending-node LFUM progress completes. **S**, [Rebuild:250–end][rebuild-tests]. |
+| `GenerationUpdate`; RA; FM/FMM→RA. `GenerationUpdateReject`; FM*; RA→proposer/owner | [rebuild:282–314][rebuild] → [handler:258–261][handler], [RA:4200–4214][ra-main], [generation-state:46–287][generation-state]; N. **FM body `GenerationUpdateMessageBody`; FMM body empty.** Reject body `GenerationNumber`; send :272–282 → [FM:2610–2618][fm], [rebuild:368–387][rebuild]. | Receive generation only updates if proposed generation matches. FM path may first examine/abort stale FM-service local replica using FMServiceEpoch, under FT lock, before LFUM snapshot; FMM handles its separate domain. Reject restarts generation negotiation, not a generic negative ack. Retry broadcast until pending-node LFUM progress completes. **C7 ordinary-FM handshake codecs**; FMM bodyless branch and LFUM progress remain gated, [Rebuild:250–end][rebuild-tests]. |
 | `LFUMUpload`; FM*; RA/common→owner. `LFUMUploadReply`; RA registry actor; correlated owner→common→RA | [generation-state:359–end][generation-state], [RS:599–646][rs], [common/RALFUMUploadOperation.cpp:14–39][lfum-operation] → [FM:2620–2647][fm], [rebuild:389–end][rebuild]. OP. Request `LFUMMessageBody`; reply **empty** plus echoed request generation+FM/FMM GenerationHeader. | FMM LFUM contains at most FM-service FT; ordinary FM LFUM excludes it. Body generation/node/list/anyReplicaFound all matter. Retry operation expects LFUMUploadReply; RA advances **send generation only when reply generation equals receive generation** ([generation-state:318–337][generation-state]). **S**, [Rebuild tests][rebuild-tests]. |
 
 ### Node/service controls, upgrades, load
 
 | Actions; actor/direction | Sender → receiver; metadata; body | Semantic completion/retry/test; staged obligation |
 |---|---|---|
-| `ServiceTypeEnabled` / `ServiceTypeDisabled`; FM; RA→FM. `ServiceTypeEnabledReply` / `ServiceTypeDisabledReply`; RA; FM→RA | [Node.ServiceTypeUpdateProcessor.cpp:236–258][service-update] → [fm-queue:43–50][fm-queue], [FM:2363–2465][fm]. Reply :2457–2465 → [handler:277–284][handler], [service-update:277–end][service-update]; N. `ServiceTypeUpdateMessageBody` / `ServiceTypeUpdateReplyMessageBody`. | Vector of ServiceTypeIdentifier plus sequence; node/service updates and node sequence commit precede FM reply; RA removes only corresponding pending update at matching sequence; stale replies do not stop newer retry. FM only, not FMM. [ServiceTypeEnabledDisabled:164–306][service-type-tests]. **S**. |
+| `ServiceTypeEnabled` / `ServiceTypeDisabled`; FM; RA→FM. `ServiceTypeEnabledReply` / `ServiceTypeDisabledReply`; RA; FM→RA | [Node.ServiceTypeUpdateProcessor.cpp:236–258][service-update] → [fm-queue:43–50][fm-queue], [FM:2363–2465][fm]. Reply :2457–2465 → [handler:277–284][handler], [service-update:277–end][service-update]; N. `ServiceTypeUpdateMessageBody` / `ServiceTypeUpdateReplyMessageBody`. | Vector of ServiceTypeIdentifier plus sequence; node/service updates and node sequence commit precede FM reply; RA removes only corresponding pending update at matching sequence; stale replies do not stop newer retry. FM only, not FMM. [ServiceTypeEnabledDisabled:164–306][service-type-tests]. **C6 codecs; execution evidence separate**. |
 | `ServiceTypeNotification`; FM; RA→FM. `ServiceTypeNotificationReply`; RA; FM→RA | [FMTransport:65–74][fm-transport] called by Hosting service-type map → [fm-queue:31–34][fm-queue], [FM:2478–2513][fm]. Reply → [handler:308–311][handler], [RA:1326–1334][ra-main]. N; `ServiceTypeNotificationRequestMessageBody` / `ServiceTypeNotificationReplyMessageBody`. | Full versioned type/code-package identity; reply contains only processed infos, pending infos continue retry. Distinct from enabled/disabled sequence protocol. Both factories priority=false; request normal FM/no generation, reply RA/actual FM generation. [ServiceTypeNotification:158–311][service-notification-tests]. **C3** codecs; live node/runtime integration remains staged. |
 | `PartitionNotification`; FM; RA→FM. `PartitionNotificationReply`; RA; intended FM→RA | Actual RA send [service-update:261–275][service-update]; full-source search finds **no FM receive branch and no reply construction** in this baseline. FM one-way fallthrough [FM:1014–1058][fm] has no PartitionNotification. RA receive [handler:312–315][handler], [service-update:287–325][service-update]; N. Request `PartitionNotificationMessageBody`; reply decoded as `ServiceTypeUpdateReplyMessageBody`. | Disabled partition list plus sequence; RA retries/removes by sequence. Native RA tests synthesize the reply [PartitionEnabledDisabled:220–306][partition-tests]. **G**: sender/receiver contract required, but a working native FM endpoint is not evidenced. This is an explicit known source gap, not an omitted or invented handler. |
-| `NodeActivateRequest`; RA; FM/FMM→RA. `NodeActivateReply`; FM*; RA→sender owner | [fm/NodeCache.cpp:1912–1923][node-cache] → [handler:267–270][handler], [Node.NodeDeactivationMessageProcessor.cpp:21–29,42–59][activation]; N. Request `NodeActivateRequestMessageBody`; reply `NodeActivateReplyMessageBody`; send :117–126 → [fm-queue:51–54][fm-queue], [FM:1288–1296][fm]. | Request embeds owner bool+int64 sequence. Must have that owner's NodeUpAck readiness. FM activation can update both FM/FMM local activation state; FMM activation only itself. Activate reply immediate after state request (including stale-request ack), not proof all reopened replicas are serving. [NodeActivationDeactivation:176–273][activation-tests]. **S**. |
-| `NodeDeactivateRequest`; RA; FM/FMM→RA. `NodeDeactivateReply`; FM*; RA→sender owner | [fm/DeactivateNodesContext.cpp:366–379][deactivate-context] → [handler:271–274][handler], [activation:31–40,42–96][activation]; N. Request `NodeDeactivateRequestMessageBody`; reply `NodeDeactivateReplyMessageBody`; [Node.NodeDeactivationState.cpp:117–170][activation-state] → [fm-queue:55–58][fm-queue], [FM:1277–1285][fm]. | Owner/sequence readiness checks. Reply **after all replicas are closed**, with state/sequence rechecks; not immediate admission. Closing monitor and sequence staleness at :195–204. Retry owned by FM deactivation context. [NodeActivationDeactivation:212–250][activation-tests]. **S**. |
-| `NodeUpdateServiceRequest`; RA; FM/FMM→RA. `NodeUpdateServiceReply`; FM*; RA→owner | [fm/UpdateServiceContext.cpp:99–110][update-context] → [handler:304–307][handler], [RA:1285–1324,3139–3230][ra-main]; N. Request `NodeUpdateServiceRequestMessageBody`; reply `NodeUpdateServiceReplyMessageBody`; [FM:1034–1036,2352–2361][fm]. | Enumerates owner FTs, validates service identity/instance/update-version, finishes multi-entity work then replies. Reply is service name/instance/update-version, no generic ErrorCode. [UpdateServiceDescription:318–344,393–403][update-tests]. **S**. |
+| `NodeActivateRequest`; RA; FM/FMM→RA. `NodeActivateReply`; FM*; RA→sender owner | [fm/NodeCache.cpp:1912–1923][node-cache] → [handler:267–270][handler], [Node.NodeDeactivationMessageProcessor.cpp:21–29,42–59][activation]; N. Request `NodeActivateRequestMessageBody`; reply `NodeActivateReplyMessageBody`; send :117–126 → [fm-queue:51–54][fm-queue], [FM:1288–1296][fm]. | Request serializes int64 sequence then owner bool. Must have that owner's NodeUpAck readiness. FM activation can update both FM/FMM local activation state; FMM activation only itself. Activate reply immediate after state request (including stale-request ack), not proof all reopened replicas are serving. [NodeActivationDeactivation:176–273][activation-tests]. **C6 codecs; execution evidence separate**. |
+| `NodeDeactivateRequest`; RA; FM/FMM→RA. `NodeDeactivateReply`; FM*; RA→sender owner | [fm/DeactivateNodesContext.cpp:366–379][deactivate-context] → [handler:271–274][handler], [activation:31–40,42–96][activation]; N. Request `NodeDeactivateRequestMessageBody`; reply `NodeDeactivateReplyMessageBody`; [Node.NodeDeactivationState.cpp:117–170][activation-state] → [fm-queue:55–58][fm-queue], [FM:1277–1285][fm]. | Owner/sequence readiness checks. Reply **after all replicas are closed**, with state/sequence rechecks; not immediate admission. Closing monitor and sequence staleness at :195–204. Retry owned by FM deactivation context. [NodeActivationDeactivation:212–250][activation-tests]. **C6 codecs; execution evidence separate**. |
+| `NodeUpdateServiceRequest`; RA; FM/FMM→RA. `NodeUpdateServiceReply`; FM*; RA→owner | [fm/UpdateServiceContext.cpp:99–110][update-context] → [handler:304–307][handler], [RA:1285–1324,3139–3230][ra-main]; N. Request `NodeUpdateServiceRequestMessageBody`; reply `NodeUpdateServiceReplyMessageBody`; [FM:1034–1036,2352–2361][fm]. | Enumerates owner FTs, validates service identity/instance/update-version, finishes multi-entity work then replies. Reply is service name/instance/update-version, no generic ErrorCode. [UpdateServiceDescription:318–344,393–403][update-tests]. **C6 codecs; execution evidence separate**. |
 | `NodeUpgradeRequest`; RA; FM→RA. `NodeUpgradeReply`; FM; RA→FM | [fm/Upgrade.cpp:483–486,179–216][upgrade] → [handler:287–290][handler], [RA:1418–1465][ra-main]; N. `UpgradeDescription` (ApplicationUpgradeSpecification), **not the administrative UpgradeRequestMessageBody wrapper**. Reply [FMTransport:76–85][fm-transport] → [FM:1022–1024,2274–2299][fm]; `NodeUpgradeReplyMessageBody`. | RA ready, app-upgrade table open; atomic version-table/FT enumeration under upgrade lock; version/instance-aware upgrade processing and completed-instance reply replay. Reply includes application ID, instance and full ReplicaUp body. FM context retries pending nodes. [Upgrade.UpgradeMessageProcessor.cpp:324–474][upgrade-processor], [Test.Unit.UpgradeMessageProcessor.cpp][upgrade-tests]. **S**. |
 | `CancelApplicationUpgradeRequest`; RA; FM→RA. `CancelApplicationUpgradeReply`; FM; RA→FM | [fm/ApplicationUpgradeContext.cpp:200–211][application-upgrade-context] → [handler:291–294][handler], [RA:1469–1488][ra-main]; N. `UpgradeDescription`. Reply [FMTransport:98–107][fm-transport] → [FM:1030–1032,2313–2326][fm]; `NodeUpgradeReplyMessageBody`. | Cancel instance barriers; [UpgradeMessageProcessor:245–322][upgrade-processor] says cancellation reply waits for matching active upgrade cancellation completion; not transport cancellation. [Test.StateMachine.CancelUpgradeContext.cpp][cancel-tests]. **S**. |
 | `NodeFabricUpgradeRequest`; RA; FM→RA. `NodeFabricUpgradeReply`; FM; RA→FM | [upgrade:425–428,179–216][upgrade] → [handler:296–299][handler], [RA:1337–1397][ra-main]; N. `FabricUpgradeSpecification`. Reply [FMTransport:87–96][fm-transport] → [fm-queue:59–62][fm-queue], [FM:2259–2272][fm]; `NodeFabricUpgradeReplyMessageBody`. | RA readiness and FabricVersionInstance staleness classifier; upgrade-not-required returns matching semantic reply, upgrade-required enters upgrade state machine, incompatible unexpected case ignored/test-asserted. [Test.Unit.Upgrade.FabricUpgradeStalenessChecker.cpp][fabric-check-tests]. **S**. |
 | `CancelFabricUpgradeRequest`; RA; FM→RA. `CancelFabricUpgradeReply`; FM; RA→FM | [fm/FabricUpgradeContext.cpp:289–300][fabric-upgrade-context] → [handler:300–303][handler], [RA:1399–1416][ra-main]; N. `FabricUpgradeSpecification`. Reply [FMTransport:109–118][fm-transport] → [FM:1026–1028,2300–2311][fm]; `NodeFabricUpgradeReplyMessageBody`. | Ready/version/instance-aware cancellation; reply is FabricVersionInstance, not bool/ErrorCode. Upgrade/cancel processor retains old/new instance ordering. [CancelUpgradeContext][cancel-tests], [UpgradeMessageProcessor tests][upgrade-tests]. **S**. |
-| `ReportLoad`; FM; RA→FM; no dedicated reply | [RA:3693–3725][ra-main] forwards local RAP report after decode → [FM:1018–1020,2516–2543][fm]; `ReportLoadMessageBody`; —. | Best-effort reports include legacy reports vector, modern LoadOrMoveCostDescription vector and sender StopwatchTime; do not reduce to a single metric or interpret a route ack as reliable per-report completion. Local IPC source is RAMessage ReportLoad, different registry. Resource usage conversion is adjacent. [Test.StateMachine.ResourceMonitorProcessing.cpp][load-tests]. **S**. |
+| `ReportLoad`; FM; RA→FM; no dedicated reply | [RA:3693–3725][ra-main] forwards local RAP report after decode → [FM:1018–1020,2516–2543][fm]; `ReportLoadMessageBody`; —. | Best-effort reports include legacy reports vector, modern LoadOrMoveCostDescription vector and sender StopwatchTime; do not reduce to a single metric or interpret a route ack as reliable per-report completion. Local IPC source is RAMessage ReportLoad, different registry. Resource usage conversion is adjacent. [Test.StateMachine.ResourceMonitorProcessing.cpp][load-tests]. **C6 complete codecs; execution evidence separate**. |
 
 Additional completion details:
 
@@ -965,6 +1358,7 @@ platform adapters. No full SF tree build, running FM/RA or publication is claime
 [package-defaults]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/ServicePackageVersion.cpp
 [version-defaults]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/ServicePackageVersionInstance.cpp
 [deactivation-info]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/common/ReplicaDeactivationInfo.h
+[deactivation-info-impl]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/common/ReplicaDeactivationInfo.cpp
 [ft-info]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/common/FailoverUnitInfo.h
 [replica-info]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/common/ReplicaInfo.h
 [node-description]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/common/NodeDescription.h
@@ -1007,6 +1401,7 @@ platform adapters. No full SF tree build, running FM/RA or publication is claime
 [last-tests]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Test.StateMachine.LastReplicaUp.cpp
 [ack-tests]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Test.StateMachine.ReplicaUploadAcknowledgement.cpp
 [endpoint-tests]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Test.StateMachine.EndpointPublish.cpp
+[endpoint-state]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/EndpointPublishState.cpp
 [nodeup-tests]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Test.StateMachine.NodeUpAckProcessing.cpp
 [nodeup-factory-tests]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Test.Unit.NodeUpOperationFactory.cpp
 [service-type-tests]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Test.StateMachine.ServiceTypeEnabledDisabled.cpp

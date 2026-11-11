@@ -1,14 +1,30 @@
 //! Compiler-free consumer of independently native-produced fixtures.
 mod support;
 
+use clap::Parser;
 use fube_ra::protocol::*;
 use fube_transport::{
     message::{Header, Message, ACTION, ACTOR, HIGH_PRIORITY},
     serialization::serde::{from_slice, to_vec, CountedStrings, ObjectArray},
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{fmt::Debug, fs, path::Path};
+use std::{
+    fmt::Debug,
+    fs,
+    path::{Path, PathBuf},
+};
 use support::Rich;
+
+#[derive(Parser)]
+#[command(about = "Consume independently native-produced RA protocol fixtures")]
+struct Arguments {
+    #[arg(required_unless_present = "identity")]
+    native_input: Option<PathBuf>,
+    #[arg(required_unless_present = "identity")]
+    rust_output: Option<PathBuf>,
+    #[arg(long, conflicts_with_all = ["native_input", "rust_output"])]
+    identity: bool,
+}
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Scalar<T> {
@@ -51,6 +67,35 @@ rich_fields!(FabricVersion: code, config);
 rich_fields!(FabricVersionInstance: version, instance);
 rich_fields!(ServicePackageInfo: package, version);
 rich_fields!(ServicePackageResourceGovernance: governed, legacy_cpu_cores, memory_mb, cpu_cores);
+rich_fields!(NodeActivationRequest: sequence, from_fmm);
+rich_fields!(NodeActivationReply: sequence);
+rich_fields!(NodeUpdateServiceRequest: service);
+rich_fields!(NodeUpdateServiceReply: service, instance, version);
+rich_fields!(ServiceTypeUpdate: types, sequence);
+rich_fields!(ServiceTypeUpdateReply: sequence);
+rich_fields!(LoadMetricValue: name, value);
+rich_fields!(LoadMetricStats: name, value, count, weighted_sum, weight, time);
+rich_fields!(NodeLoads: node, loads);
+rich_fields!(ReportLoad: legacy, reports, time);
+rich_fields!(ReplicaDeactivationInfo: epoch, catchup_lsn);
+
+impl Rich for LegacyLoadReport {
+    fn rich(&mut self, c: &mut i32) {
+        self.unit.rich(c);
+        self.role = enumeration(c);
+        self.metrics.rich(c);
+    }
+}
+impl Rich for LoadDescription {
+    fn rich(&mut self, c: &mut i32) {
+        self.partition.rich(c);
+        self.service.rich(c);
+        self.stateful.rich(c);
+        self.primary.rich(c);
+        self.secondary.rich(c);
+        self.nodes = ObjectArray(vec![filled(c)]);
+    }
+}
 
 fn strings(c: &mut i32) -> CountedStrings<Vec<String>> {
     CountedStrings(vec![filled(c), filled(c)])
@@ -238,6 +283,38 @@ fn rich_deletion() -> DeleteReplica {
     DeleteReplica::new(body, false)
 }
 
+fn rich_creation(initial: bool) -> CreateReplica {
+    let c = &mut 0;
+    let mut body = filled::<AddInstance>(c);
+    let mut info = filled::<ReplicaDeactivationInfo>(c);
+    body.unit.target = 1;
+    body.unit.minimum = 1;
+    body.service.target = 1;
+    body.service.minimum = 1;
+    body.service.stateful = true;
+    body.service.persisted = false;
+    body.replica.current_role = 2;
+    body.replica.previous_role = 1;
+    body.replica.state = 1;
+    body.replica.up = true;
+    if initial {
+        info.epoch = body.unit.current;
+        info.catchup_lsn = 0;
+    }
+    CreateReplica::new(body, info)
+}
+
+fn rich_creation_reply(error: i64) -> CreateReplicaReply {
+    let mut reply = support::rich_reply(error);
+    reply.unit.target = 1;
+    reply.unit.minimum = 1;
+    reply.replica.current_role = 2;
+    reply.replica.previous_role = 1;
+    reply.replica.state = 1;
+    reply.replica.up = true;
+    reply
+}
+
 fn rich_deletion_reply(error: i64) -> DeleteReplicaReply {
     let mut body = support::rich_reply(error);
     body.unit.target = 1;
@@ -321,23 +398,788 @@ fn check<T: Serialize + DeserializeOwned + Debug + PartialEq>(
     println!("{name} native->Rust OK; Rust output produced");
 }
 
+fn stage_two_envelope(
+    input: &Path,
+    name: &str,
+    action: &str,
+    actor: &str,
+    generation: Option<bool>,
+) -> Message {
+    let mut headers: Vec<_> = [
+        (ACTOR, actor.to_string()),
+        (ACTION, format!("action-{action}")),
+        (HIGH_PRIORITY, "priority-false".to_string()),
+    ]
+    .into_iter()
+    .map(|(id, name)| Header {
+        id,
+        value: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+    })
+    .collect();
+    if let Some(fmm) = generation {
+        headers.push(Header {
+            id: GENERATION_HEADER,
+            value: fs::read(input.join(if fmm {
+                "fmm-generation.bin"
+            } else {
+                "fm-generation.bin"
+            }))
+            .unwrap(),
+        });
+    }
+    Message {
+        headers,
+        body: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+    }
+}
+
+fn check_incoming<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
+    input: &Path,
+    output: &Path,
+    name: &str,
+    action: &str,
+    expected: T,
+    make: fn(&T, &GenerationHeader) -> fube_transport::Result<Message>,
+    decode: fn(&Message) -> fube_transport::Result<(T, GenerationHeader)>,
+) {
+    check(input, output, name, expected.clone());
+    for fmm in [false, true] {
+        let native = stage_two_envelope(input, name, action, "actor-12", Some(fmm));
+        let generation = support::rich_generation(fmm);
+        assert_eq!(
+            decode(&native).unwrap(),
+            (expected.clone(), generation.clone())
+        );
+        let made = make(&expected, &generation).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(
+            made.body,
+            fs::read(output.join(format!("{name}.bin"))).unwrap()
+        );
+        assert_eq!(decode(&made).unwrap(), (expected.clone(), generation));
+    }
+    reject_prefixes::<T>(input, name);
+}
+
+fn check_owner_outgoing<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
+    input: &Path,
+    output: &Path,
+    name: &str,
+    action: &str,
+    expected: T,
+    make: fn(&T, Owner) -> fube_transport::Result<Message>,
+    decode: fn(&Message) -> fube_transport::Result<(T, Owner)>,
+) {
+    check(input, output, name, expected.clone());
+    for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
+        let native = stage_two_envelope(input, name, action, actor, None);
+        assert_eq!(decode(&native).unwrap(), (expected.clone(), owner));
+        let made = make(&expected, owner).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(
+            made.body,
+            fs::read(output.join(format!("{name}.bin"))).unwrap()
+        );
+        assert_eq!(decode(&made).unwrap(), (expected.clone(), owner));
+    }
+    reject_prefixes::<T>(input, name);
+}
+
+fn check_fm_outgoing<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
+    input: &Path,
+    output: &Path,
+    name: &str,
+    action: &str,
+    expected: T,
+    make: fn(&T) -> fube_transport::Result<Message>,
+    decode: fn(&Message) -> fube_transport::Result<T>,
+) {
+    check(input, output, name, expected.clone());
+    let native = stage_two_envelope(input, name, action, "actor-11", None);
+    assert_eq!(decode(&native).unwrap(), expected);
+    let made = make(&expected).unwrap();
+    factory_contract(&native, &made);
+    assert_eq!(
+        made.body,
+        fs::read(output.join(format!("{name}.bin"))).unwrap()
+    );
+    assert_eq!(decode(&made).unwrap(), expected);
+    reject_prefixes::<T>(input, name);
+}
+
+fn stage_two(input: &Path, output: &Path) {
+    for (profile, rich) in [("empty", false), ("rich", true)] {
+        macro_rules! expected {
+            ($t:ty) => {
+                if rich {
+                    filled::<$t>(&mut 0)
+                } else {
+                    <$t>::default()
+                }
+            };
+        }
+        for (root, action, make, decode) in [
+            (
+                "node-activate-request",
+                "NodeActivateRequest",
+                node_activate_request_message as fn(&NodeActivationRequest, &GenerationHeader) -> _,
+                decode_node_activate_request as fn(&Message) -> _,
+            ),
+            (
+                "node-deactivate-request",
+                "NodeDeactivateRequest",
+                node_deactivate_request_message,
+                decode_node_deactivate_request,
+            ),
+        ] {
+            let mut body = expected!(NodeActivationRequest);
+            body.from_fmm = false;
+            check_incoming(
+                input,
+                output,
+                &format!("{profile}-{root}"),
+                action,
+                body,
+                make,
+                decode,
+            );
+        }
+        for (root, action, make, decode) in [
+            (
+                "node-activate-reply",
+                "NodeActivateReply",
+                node_activate_reply_message as fn(&NodeActivationReply, Owner) -> _,
+                decode_node_activate_reply as fn(&Message) -> _,
+            ),
+            (
+                "node-deactivate-reply",
+                "NodeDeactivateReply",
+                node_deactivate_reply_message,
+                decode_node_deactivate_reply,
+            ),
+        ] {
+            check_owner_outgoing(
+                input,
+                output,
+                &format!("{profile}-{root}"),
+                action,
+                expected!(NodeActivationReply),
+                make,
+                decode,
+            );
+        }
+        check_incoming(
+            input,
+            output,
+            &format!("{profile}-node-update-service-request"),
+            "NodeUpdateServiceRequest",
+            expected!(NodeUpdateServiceRequest),
+            node_update_service_request_message,
+            decode_node_update_service_request,
+        );
+        check_owner_outgoing(
+            input,
+            output,
+            &format!("{profile}-node-update-service-reply"),
+            "NodeUpdateServiceReply",
+            expected!(NodeUpdateServiceReply),
+            node_update_service_reply_message,
+            decode_node_update_service_reply,
+        );
+        for (root, action, make, decode) in [
+            (
+                "service-type-enabled",
+                "ServiceTypeEnabled",
+                service_type_enabled_message as fn(&ServiceTypeUpdate) -> _,
+                decode_service_type_enabled as fn(&Message) -> _,
+            ),
+            (
+                "service-type-disabled",
+                "ServiceTypeDisabled",
+                service_type_disabled_message,
+                decode_service_type_disabled,
+            ),
+        ] {
+            check_fm_outgoing(
+                input,
+                output,
+                &format!("{profile}-{root}"),
+                action,
+                expected!(ServiceTypeUpdate),
+                make,
+                decode,
+            );
+        }
+        for (root, action, make, decode) in [
+            (
+                "service-type-enabled-reply",
+                "ServiceTypeEnabledReply",
+                service_type_enabled_reply_message
+                    as fn(&ServiceTypeUpdateReply, &GenerationHeader) -> _,
+                decode_service_type_enabled_reply as fn(&Message) -> _,
+            ),
+            (
+                "service-type-disabled-reply",
+                "ServiceTypeDisabledReply",
+                service_type_disabled_reply_message,
+                decode_service_type_disabled_reply,
+            ),
+        ] {
+            check_incoming(
+                input,
+                output,
+                &format!("{profile}-{root}"),
+                action,
+                expected!(ServiceTypeUpdateReply),
+                make,
+                decode,
+            );
+        }
+        check_owner_outgoing(
+            input,
+            output,
+            &format!("{profile}-replica-endpoint-updated"),
+            "ReplicaEndpointUpdated",
+            expected!(AddInstance),
+            replica_endpoint_updated_message,
+            decode_replica_endpoint_updated,
+        );
+        let endpoint_reply = if rich {
+            support::rich_reply(-2_147_017_398)
+        } else {
+            AddInstanceReply::default()
+        };
+        check_incoming(
+            input,
+            output,
+            &format!("{profile}-replica-endpoint-updated-reply"),
+            "ReplicaEndpointUpdatedReply",
+            endpoint_reply,
+            replica_endpoint_updated_reply_message,
+            decode_replica_endpoint_updated_reply,
+        );
+        check_fm_outgoing(
+            input,
+            output,
+            &format!("{profile}-report-load"),
+            "ReportLoad",
+            expected!(ReportLoad),
+            report_load_message,
+            decode_report_load,
+        );
+    }
+    for (root, action, make, decode) in [
+        (
+            "node-activate-request",
+            "NodeActivateRequest",
+            node_activate_request_message as fn(&NodeActivationRequest, &GenerationHeader) -> _,
+            decode_node_activate_request as fn(&Message) -> _,
+        ),
+        (
+            "node-deactivate-request",
+            "NodeDeactivateRequest",
+            node_deactivate_request_message,
+            decode_node_deactivate_request,
+        ),
+    ] {
+        check_incoming(
+            input,
+            output,
+            &format!("fmm-{root}"),
+            action,
+            NodeActivationRequest {
+                sequence: i64::MIN + 17,
+                from_fmm: true,
+            },
+            make,
+            decode,
+        );
+    }
+    for legacy in [false, true] {
+        let c = &mut 0;
+        let mut body = ReportLoad::default();
+        if legacy {
+            body.legacy = filled(c);
+        } else {
+            body.reports = filled(c);
+        }
+        body.time = filled(c);
+        check_fm_outgoing(
+            input,
+            output,
+            if legacy {
+                "legacy-report-load"
+            } else {
+                "modern-report-load"
+            },
+            "ReportLoad",
+            body,
+            report_load_message,
+            decode_report_load,
+        );
+    }
+}
+
+fn generation_number(generation: i64, high: u64, low: u64) -> GenerationNumber {
+    let mut owner = [0; 16];
+    owner[..8].copy_from_slice(&high.to_le_bytes());
+    owner[8..].copy_from_slice(&low.to_le_bytes());
+    GenerationNumber { generation, owner }
+}
+
+fn peer_contracts(input: &Path, output: &Path) {
+    for (name, body) in [
+        ("default-create-replica", CreateReplica::default()),
+        ("rich-create-replica", rich_creation(false)),
+        ("initial-create-replica", rich_creation(true)),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "CreateReplica",
+            body,
+            create_replica_message,
+            decode_create_replica,
+        );
+    }
+    for (name, body) in [
+        (
+            "default-create-replica-reply",
+            CreateReplicaReply::default(),
+        ),
+        ("rich-create-replica-reply-0", rich_creation_reply(0)),
+        (
+            "rich-create-replica-reply--2147017398",
+            rich_creation_reply(-2_147_017_398),
+        ),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "CreateReplicaReply",
+            body,
+            create_replica_reply_message,
+            decode_create_replica_reply,
+        );
+    }
+    for action in ["CreateReplica", "CreateReplicaReply"] {
+        check(
+            input,
+            output,
+            &format!("action-{action}"),
+            Scalar {
+                value: action.to_string(),
+            },
+        );
+    }
+}
+
+fn replica_contracts(input: &Path, output: &Path) {
+    let mut request = support::rich_request();
+    request.unit.target = 1;
+    request.unit.minimum = 1;
+    request.service.target = 1;
+    request.service.minimum = 1;
+    request.service.stateful = true;
+    request.service.persisted = false;
+    request.replica.current_role = 2;
+    request.replica.previous_role = 1;
+    request.replica.state = 1;
+    request.replica.up = true;
+    for (name, body) in [
+        ("default-add-replica", AddReplica::default()),
+        ("rich-add-replica", request.clone()),
+    ] {
+        check(input, output, name, body.clone());
+        for fmm in [false, true] {
+            let native = generation_envelope(input, name, "AddReplica", true, fmm);
+            let generation = support::rich_generation(fmm);
+            assert_eq!(
+                decode_add_replica(&native).unwrap(),
+                (body.clone(), generation.clone())
+            );
+            factory_contract(&native, &add_replica_message(&body, &generation).unwrap());
+            assert!(decode_add_primary(&native).is_err());
+            assert!(decode_create_replica(&native).is_err());
+        }
+        reject_prefixes::<AddReplica>(input, name);
+    }
+    let mut replies = vec![(
+        "default-add-replica-reply".to_owned(),
+        AddReplicaReply::default(),
+    )];
+    for error in [0, -2_147_017_398] {
+        let mut reply = support::rich_reply(error);
+        reply.unit.target = 1;
+        reply.unit.minimum = 1;
+        reply.replica.current_role = 2;
+        reply.replica.previous_role = 1;
+        reply.replica.state = if error == 0 { 2 } else { 1 };
+        reply.replica.up = true;
+        reply.replica.service_endpoint.clear();
+        replies.push((format!("rich-add-replica-reply-{error}"), reply));
+    }
+    for (name, body) in replies {
+        check(input, output, &name, body.clone());
+        for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
+            let mut native = stage_two_envelope(input, &name, "AddReplicaReply", actor, None);
+            native
+                .headers
+                .iter_mut()
+                .find(|h| h.id == HIGH_PRIORITY)
+                .unwrap()
+                .value = fs::read(input.join("priority.bin")).unwrap();
+            assert_eq!(
+                decode_add_replica_reply(&native).unwrap(),
+                (body.clone(), owner)
+            );
+            factory_contract(&native, &add_replica_reply_message(&body, owner).unwrap());
+            assert!(decode_add_primary_reply(&native).is_err());
+            assert!(decode_create_replica_reply(&native).is_err());
+        }
+        reject_prefixes::<AddReplicaReply>(input, &name);
+    }
+    for (name, body) in [
+        ("default-remove-replica", RemoveReplica::default()),
+        ("rich-remove-replica", request.clone()),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "RemoveReplica",
+            body,
+            remove_replica_message,
+            decode_remove_replica,
+        );
+        let native = generation_envelope(input, name, "RemoveReplica", true, false);
+        assert!(decode_add_replica(&native).is_err());
+        assert!(decode_remove_instance(&native).is_err());
+        assert!(decode_delete_replica(&native).is_err());
+    }
+    let mut replies = vec![(
+        "default-remove-replica-reply".to_owned(),
+        RemoveReplicaReply::default(),
+    )];
+    let mut cancelled_create = RemoveReplicaReply {
+        unit: request.unit,
+        replica: request.replica,
+        error: 0,
+    };
+    cancelled_create.replica.service_endpoint.clear();
+    cancelled_create.replica.replication_endpoint.clear();
+    replies.push((
+        "in-create-remove-replica-reply".to_owned(),
+        cancelled_create,
+    ));
+    for error in [0, -2_147_017_398] {
+        let mut reply = support::rich_reply(error);
+        reply.unit.target = 1;
+        reply.unit.minimum = 1;
+        reply.replica.current_role = 2;
+        reply.replica.previous_role = 1;
+        reply.replica.state = 3;
+        reply.replica.up = true;
+        reply.replica.service_endpoint.clear();
+        replies.push((format!("rich-remove-replica-reply-{error}"), reply));
+    }
+    for (name, body) in replies {
+        check(input, output, &name, body.clone());
+        for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
+            let mut native = stage_two_envelope(input, &name, "RemoveReplicaReply", actor, None);
+            native
+                .headers
+                .iter_mut()
+                .find(|h| h.id == HIGH_PRIORITY)
+                .unwrap()
+                .value = fs::read(input.join("priority.bin")).unwrap();
+            assert_eq!(
+                decode_remove_replica_reply(&native).unwrap(),
+                (body.clone(), owner)
+            );
+            factory_contract(
+                &native,
+                &remove_replica_reply_message(&body, owner).unwrap(),
+            );
+            assert!(decode_add_replica_reply(&native).is_err());
+            assert!(decode_delete_replica_reply(&native).is_err());
+        }
+        reject_prefixes::<RemoveReplicaReply>(input, &name);
+    }
+    for action in [
+        "AddReplica",
+        "AddReplicaReply",
+        "RemoveReplica",
+        "RemoveReplicaReply",
+    ] {
+        check(
+            input,
+            output,
+            &format!("action-{action}"),
+            Scalar {
+                value: action.to_owned(),
+            },
+        );
+    }
+}
+
+fn check_peer<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
+    input: &Path,
+    output: &Path,
+    name: &str,
+    action: &str,
+    expected: T,
+    make: fn(&T, &GenerationHeader) -> fube_transport::Result<Message>,
+    decode: fn(&Message) -> fube_transport::Result<(T, GenerationHeader)>,
+) {
+    check(input, output, name, expected.clone());
+    for fmm in [false, true] {
+        let mut native = stage_two_envelope(input, name, action, "actor-12", Some(fmm));
+        native
+            .headers
+            .iter_mut()
+            .find(|h| h.id == HIGH_PRIORITY)
+            .unwrap()
+            .value = fs::read(input.join("priority.bin")).unwrap();
+        let generation = support::rich_generation(fmm);
+        assert_eq!(
+            decode(&native).unwrap(),
+            (expected.clone(), generation.clone())
+        );
+        let made = make(&expected, &generation).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(made.body, to_vec(&expected).unwrap());
+        assert_eq!(decode(&made).unwrap(), (expected.clone(), generation));
+        native.headers.retain(|h| h.id != GENERATION_HEADER);
+        assert!(decode(&native).is_err());
+    }
+    reject_prefixes::<T>(input, name);
+}
+
+fn generation_envelope(
+    input: &Path,
+    name: &str,
+    action: &str,
+    incoming: bool,
+    fmm: bool,
+) -> Message {
+    let mut message = stage_two_envelope(
+        input,
+        name,
+        action,
+        if incoming { "actor-12" } else { "actor-11" },
+        incoming.then_some(fmm),
+    );
+    message.headers[2] = Header {
+        id: HIGH_PRIORITY,
+        value: fs::read(input.join("priority.bin")).unwrap(),
+    };
+    message
+}
+
+fn reject_generation_envelopes(
+    original: &Message,
+    with_generation: bool,
+    decode: fn(&Message) -> fube_transport::Result<()>,
+) {
+    for id in [ACTOR, ACTION, HIGH_PRIORITY]
+        .into_iter()
+        .chain(with_generation.then_some(GENERATION_HEADER))
+    {
+        let mut missing = original.clone();
+        missing.headers.retain(|h| h.id != id);
+        assert!(decode(&missing).is_err());
+        let header = original.headers.iter().find(|h| h.id == id).unwrap();
+        let mut duplicate = original.clone();
+        duplicate.headers.push(header.clone());
+        assert!(decode(&duplicate).is_err());
+        let mut malformed = original.clone();
+        malformed
+            .headers
+            .iter_mut()
+            .find(|h| h.id == id)
+            .unwrap()
+            .value
+            .pop();
+        assert!(decode(&malformed).is_err());
+    }
+    let mut wrong = original.clone();
+    wrong.headers[0] = Header::actor(FMM_ACTOR).unwrap();
+    assert!(decode(&wrong).is_err());
+    wrong.headers[0] = original.headers[0].clone();
+    wrong.headers[1] = Header::action("LFUMUpload").unwrap();
+    assert!(decode(&wrong).is_err());
+    if !with_generation {
+        let mut unexpected = original.clone();
+        unexpected
+            .headers
+            .push(GenerationHeader::default().header().unwrap());
+        assert!(decode(&unexpected).is_err());
+    }
+    let mut trailing = original.clone();
+    trailing.body.push(0);
+    assert!(decode(&trailing).is_err());
+    let mut shape = original.clone();
+    shape.body = to_vec(&GenerationHeader::default()).unwrap();
+    assert!(decode(&shape).is_err());
+}
+
+fn generation_handshake(input: &Path, output: &Path) {
+    let empty = fs::read(input.join("empty-generation-proposal.bin")).unwrap();
+    assert!(empty.is_empty());
+    for fmm in [false, true] {
+        let native = generation_envelope(
+            input,
+            "empty-generation-proposal",
+            "GenerationProposal",
+            true,
+            fmm,
+        );
+        let expected = support::rich_generation(fmm);
+        assert_eq!(decode_generation_proposal(&native).unwrap(), expected);
+        let made = generation_proposal_message(&expected).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(made.body, empty);
+        assert_eq!(decode_generation_proposal(&made).unwrap(), expected);
+        reject_generation_envelopes(&native, true, |m| decode_generation_proposal(m).map(|_| ()));
+        let mut bad = native.clone();
+        bad.body = to_vec(&GenerationNumber::default()).unwrap();
+        assert!(decode_generation_proposal(&bad).is_err());
+    }
+    fs::write(output.join("empty-generation-proposal.bin"), []).unwrap();
+    let proposed = generation_number(i64::MAX, 0x8000_0000_0000_0001, u64::MAX);
+    let current = generation_number(i64::MAX, 0x8000_0000_0000_0002, 0);
+    let mut replies = vec![(
+        "default-generation-proposal-reply".to_string(),
+        GenerationProposalReply::default(),
+    )];
+    for error in [0, -2_147_017_398, -2_147_017_441] {
+        // The native rich traversal consumes counter, owner, counter, owner, error.
+        replies.push((
+            format!("rich-generation-proposal-reply-{error}"),
+            GenerationProposalReply {
+                proposed: support::rich_generation(false).number,
+                current: generation_number(
+                    -0x1234_5678_0003,
+                    u64::from_le_bytes([4, 5, 6, 7, 8, 9, 10, 11]),
+                    u64::from_le_bytes([12, 13, 14, 15, 16, 17, 18, 19]),
+                ),
+                error,
+            },
+        ));
+    }
+    replies.push((
+        "tie-generation-proposal-reply".to_string(),
+        GenerationProposalReply {
+            proposed: proposed.clone(),
+            current: current.clone(),
+            error: -2_147_017_398,
+        },
+    ));
+    for (name, body) in replies {
+        check(input, output, &name, body.clone());
+        let native = generation_envelope(input, &name, "GenerationProposalReply", false, false);
+        assert_eq!(decode_generation_proposal_reply(&native).unwrap(), body);
+        let made = generation_proposal_reply_message(&body).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(
+            made.body,
+            fs::read(output.join(format!("{name}.bin"))).unwrap()
+        );
+        assert_eq!(decode_generation_proposal_reply(&made).unwrap(), body);
+        reject_generation_envelopes(&native, false, |m| {
+            decode_generation_proposal_reply(m).map(|_| ())
+        });
+        reject_prefixes::<GenerationProposalReply>(input, &name);
+    }
+    assert!(proposed.older_than(&current));
+    let lower_low = generation_number(i64::MAX, 0x8000_0000_0000_0001, u64::MAX - 1);
+    assert!(lower_low.older_than(&proposed));
+    assert!(!proposed.older_than(&lower_low));
+    for (name, body) in [
+        ("default-generation-update", GenerationUpdate::default()),
+        (
+            "rich-generation-update",
+            GenerationUpdate {
+                fm_service_epoch: Epoch {
+                    configuration: i64::MIN + 17,
+                    data_loss: i64::MAX - 29,
+                },
+            },
+        ),
+    ] {
+        check(input, output, name, body.clone());
+        let native = generation_envelope(input, name, "GenerationUpdate", true, false);
+        let generation = support::rich_generation(false);
+        assert_eq!(
+            decode_generation_update(&native).unwrap(),
+            (body.clone(), generation.clone())
+        );
+        let made = generation_update_message(&body, &generation).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(
+            made.body,
+            fs::read(output.join(format!("{name}.bin"))).unwrap()
+        );
+        assert_eq!(
+            decode_generation_update(&made).unwrap(),
+            (body.clone(), generation)
+        );
+        reject_generation_envelopes(&native, true, |m| decode_generation_update(m).map(|_| ()));
+        let mut fmm = generation_envelope(input, name, "GenerationUpdate", true, true);
+        assert!(decode_generation_update(&fmm).is_err());
+        fmm.body.clear();
+        assert!(decode_generation_update(&fmm).is_err());
+        assert!(generation_update_message(&body, &support::rich_generation(true)).is_err());
+        reject_prefixes::<GenerationUpdate>(input, name);
+    }
+    for (name, body) in [
+        (
+            "default-generation-update-reject",
+            GenerationNumber::default(),
+        ),
+        ("high-generation-update-reject", proposed),
+        ("tie-generation-update-reject", lower_low),
+    ] {
+        check(input, output, name, body.clone());
+        let native = generation_envelope(input, name, "GenerationUpdateReject", false, false);
+        assert_eq!(decode_generation_update_reject(&native).unwrap(), body);
+        let made = generation_update_reject_message(&body).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(
+            made.body,
+            fs::read(output.join(format!("{name}.bin"))).unwrap()
+        );
+        assert_eq!(decode_generation_update_reject(&made).unwrap(), body);
+        reject_generation_envelopes(&native, false, |m| {
+            decode_generation_update_reject(m).map(|_| ())
+        });
+        reject_prefixes::<GenerationNumber>(input, name);
+    }
+}
+
 fn main() {
-    let args: Vec<_> = std::env::args_os().collect();
-    if args.len() == 2 && args[1] == "--identity" {
+    let args = Arguments::parse();
+    if args.identity {
         println!(
             "{}",
             option_env!("FUBE_RA_SOURCE_DIGEST").unwrap_or("unbound")
         );
         return;
     }
-    assert_eq!(
-        args.len(),
-        3,
-        "usage: ra_conformance NATIVE_INPUT RUST_OUTPUT"
-    );
-    let input = Path::new(&args[1]);
-    let output = Path::new(&args[2]);
+    let input = args
+        .native_input
+        .as_deref()
+        .expect("clap requires native input");
+    let output = args
+        .rust_output
+        .as_deref()
+        .expect("clap requires Rust output");
     assert!(input.is_dir() && output.is_dir());
+    peer_contracts(input, output);
+    replica_contracts(input, output);
     check(input, output, "default-request", AddInstance::default());
     check(input, output, "rich-request", support::rich_request());
     check(input, output, "default-reply", AddInstanceReply::default());
@@ -593,6 +1435,23 @@ fn main() {
         "ServiceTypeNotificationReply",
         "NodeUp",
         "NodeUpAck",
+        "NodeActivateRequest",
+        "NodeActivateReply",
+        "NodeDeactivateRequest",
+        "NodeDeactivateReply",
+        "NodeUpdateServiceRequest",
+        "NodeUpdateServiceReply",
+        "ServiceTypeEnabled",
+        "ServiceTypeDisabled",
+        "ServiceTypeEnabledReply",
+        "ServiceTypeDisabledReply",
+        "ReplicaEndpointUpdated",
+        "ReplicaEndpointUpdatedReply",
+        "ReportLoad",
+        "GenerationProposal",
+        "GenerationProposalReply",
+        "GenerationUpdate",
+        "GenerationUpdateReject",
     ] {
         check(
             input,
@@ -694,5 +1553,34 @@ fn main() {
             }
         }
     }
-    println!("58 cases verified; all selected-body proper prefixes rejected");
+    stage_two(input, output);
+    generation_handshake(input, output);
+    println!("116 cases verified; all selected-body proper prefixes rejected");
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+
+    #[test]
+    fn identity_and_fixture_paths_are_exclusive_and_complete() {
+        assert!(
+            Arguments::try_parse_from(["ra_conformance", "--identity"])
+                .unwrap()
+                .identity
+        );
+        let args = Arguments::try_parse_from(["ra_conformance", "/input", "/output"]).unwrap();
+        assert_eq!(args.native_input, Some(PathBuf::from("/input")));
+        assert_eq!(args.rust_output, Some(PathBuf::from("/output")));
+        for args in [
+            vec![],
+            vec!["/input"],
+            vec!["--identity", "/input", "/output"],
+            vec!["/input", "/output", "extra"],
+        ] {
+            assert!(
+                Arguments::try_parse_from(std::iter::once("ra_conformance").chain(args)).is_err()
+            );
+        }
+    }
 }

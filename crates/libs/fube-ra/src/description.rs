@@ -3,7 +3,7 @@
 //! 1614–1627,1660–1668 at 3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d.
 use super::*;
 
-/// Raw trusted RAP result, not a wire-enabled IPC body or provenance witness.
+/// Native-shaped RAP result; the Node validates original IPC/session provenance.
 /// Carries the native full description; only its update version is consumed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDescriptionCompletion {

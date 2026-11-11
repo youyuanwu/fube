@@ -28,10 +28,21 @@ pub enum NotificationProperty {
     TypeIntervalTicks,
     RetryIntervalTicks,
 }
+#[derive(Debug, Clone, Copy)]
+#[repr(usize)]
+pub enum NodeProperty {
+    DeactivationCloseTimeoutTicks,
+    DeactivationCheckIntervalTicks,
+    StatusNodeIntervalTicks,
+    StatusRetryIntervalTicks,
+    StatusCleanupIntervalTicks,
+    StatusHistoryTtlTicks,
+}
 
 pub struct NativeConfig {
     thresholds: [[AtomicI32; 4]; 5],
     notification: [AtomicI64; 4],
+    node: [AtomicI64; 6],
 }
 impl NativeConfig {
     pub(super) fn new(settings: &Settings) -> Self {
@@ -72,6 +83,15 @@ impl NativeConfig {
                 ticks(settings.notification_retry_ms),
             ]
             .map(AtomicI64::new),
+            node: [
+                9_000_000_000,
+                150_000_000,
+                50_000_000,
+                300_000_000,
+                36_000_000_000,
+                6_000_000_000,
+            ]
+            .map(AtomicI64::new),
         }
     }
     fn slot(&self, state: RetryState, field: Threshold) -> &AtomicI32 {
@@ -103,6 +123,12 @@ impl NativeConfig {
     }
     pub fn notification(&self, property: NotificationProperty) -> i64 {
         self.notification[property as usize].load(Ordering::SeqCst)
+    }
+    pub fn set_node(&self, property: NodeProperty, value: i64) {
+        self.node[property as usize].store(value, Ordering::SeqCst);
+    }
+    pub fn node(&self, property: NodeProperty) -> i64 {
+        self.node[property as usize].load(Ordering::SeqCst)
     }
 }
 #[cfg(test)]

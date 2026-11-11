@@ -19,13 +19,17 @@ pub enum ServiceProfile {
     #[default]
     Stateless,
     StatefulSingleton,
+    StatefulPeerIdle,
 }
 impl ServiceProfile {
     pub fn service(self) -> &'static str {
         match self {
             Self::Stateless => SERVICE,
-            Self::StatefulSingleton => "fabric:/Cluster/Singleton",
+            Self::StatefulSingleton | Self::StatefulPeerIdle => "fabric:/Cluster/Singleton",
         }
+    }
+    pub fn stateful(self) -> bool {
+        self != Self::Stateless
     }
 }
 
@@ -159,6 +163,17 @@ mod json_generation {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Peer {
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    pub session: String,
+    pub partition: String,
+    pub replica: i64,
+    pub incarnation: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Launch {
     #[serde(default)]
     pub profile: ServiceProfile,
@@ -178,6 +193,8 @@ pub struct Launch {
     pub partition: String,
     pub replica: i64,
     pub incarnation: i64,
+    #[serde(default)]
+    pub peer: Option<Peer>,
 }
 impl Launch {
     pub fn name(&self) -> String {
@@ -207,6 +224,23 @@ impl Launch {
         ] {
             uuid::Uuid::parse_str(id).map_err(err)?;
         }
+        match (&self.peer, self.profile) {
+            (Some(peer), ServiceProfile::StatefulPeerIdle)
+                if peer.node != self.node
+                    && peer.node.id != self.fm.id
+                    && peer.node.id != self.node.id
+                    && peer.node.instance > 0
+                    && peer.session != self.session
+                    && peer.partition == self.partition
+                    && peer.replica >= 0
+                    && peer.replica != self.replica
+                    && peer.incarnation > 0 =>
+            {
+                uuid::Uuid::parse_str(&peer.session).map_err(err)?;
+            }
+            (None, ServiceProfile::Stateless | ServiceProfile::StatefulSingleton) => {}
+            _ => return Err("invalid original peer binding".into()),
+        }
         Ok(())
     }
 }
@@ -220,6 +254,8 @@ pub struct Metadata {
     pub node: NodeInstance,
     pub pid: u32,
     pub address: SocketAddr,
+    #[serde(default)]
+    pub peer_address: Option<SocketAddr>,
     pub profile: Option<ActualProfile>,
 }
 
@@ -268,7 +304,7 @@ pub fn fixed_type() -> ServiceType {
 pub fn fixed_type_for(profile: ServiceProfile) -> ServiceType {
     let (application, package, name) = match profile {
         ServiceProfile::Stateless => ("ClusterStatelessApp", "ClusterService", TYPE),
-        ServiceProfile::StatefulSingleton => (
+        ServiceProfile::StatefulSingleton | ServiceProfile::StatefulPeerIdle => (
             "HostingLocalStatefulApp",
             "LocalService",
             "LocalStatefulType",
@@ -311,12 +347,239 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
     body.service.partitions = 1;
     body.service.target = 1;
     body.service.minimum = 1;
-    if launch.profile == ServiceProfile::StatefulSingleton {
+    if launch.profile.stateful() {
         body.service.stateful = true;
         body.replica.current_role = 4;
         body.unit.current.configuration = (1 << 32) + 1;
     }
     body
+}
+
+pub fn dropped_replica(replica: &Replica) -> Replica {
+    Replica {
+        node: replica.node.clone(),
+        id: replica.id,
+        instance: replica.instance,
+        up: false,
+        state: 3,
+        ..Replica::default()
+    }
+}
+
+pub fn absent_replica_body(body: &AddInstance) -> AddInstance {
+    AddInstance {
+        unit: FailoverUnit {
+            id: body.unit.id.clone(),
+            consistency: body.unit.consistency.clone(),
+            current: body.unit.current,
+            ..FailoverUnit::default()
+        },
+        replica: dropped_replica(&body.replica),
+        service: body.service.clone(),
+    }
+}
+
+pub fn pre_open_cancelled_body(body: &AddInstance) -> AddInstance {
+    let mut body = body.clone();
+    body.replica.current_role = 2;
+    body.replica.state = 3;
+    body.replica.up = false;
+    body
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreOpenCancellationReceipt {
+    pub deployment: String,
+    pub session: String,
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    #[serde(with = "json_node")]
+    pub fm: NodeInstance,
+    #[serde(with = "json_generation")]
+    pub generation: GenerationHeader,
+    pub node_pid: u32,
+    pub app_pid: u32,
+    pub runtime_root: PathBuf,
+    pub cancellation: fube_node::local::PreOpenCancellation,
+}
+impl PreOpenCancellationReceipt {
+    pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        if launch.profile != ServiceProfile::StatefulPeerIdle
+            || launch.placement != 2
+            || launch.peer.is_none()
+            || self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node != launch.node
+            || self.fm != launch.fm
+            || self.generation != launch.generation
+            || self.node_pid != node_pid
+            || self.app_pid != profile.app_pid
+            || self.runtime_root != profile.runtime_root
+            || self.cancellation.body != pre_open_cancelled_body(&add_body(launch, profile))
+            || self.cancellation.creation == 0
+            || self.cancellation.command == 0
+            || self.cancellation.ra_operation == 0
+            || self.cancellation.creation == self.cancellation.ra_operation
+        {
+            return Err(
+                "pre-Open cancellation proof does not match the original peer creation".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailedRegistrationReceipt {
+    pub deployment: String,
+    pub session: String,
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    #[serde(with = "json_node")]
+    pub fm: NodeInstance,
+    #[serde(with = "json_generation")]
+    pub generation: GenerationHeader,
+    pub node_pid: u32,
+    pub app_pid: u32,
+    pub runtime_root: PathBuf,
+    pub deletion: fube_node::local::FailedRegistrationDeletion,
+}
+impl FailedRegistrationReceipt {
+    pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        let failure = &self.deletion.failure;
+        if launch.profile != ServiceProfile::StatefulPeerIdle
+            || launch.placement != 2
+            || launch.peer.is_none()
+            || self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node != launch.node
+            || self.fm != launch.fm
+            || self.generation != launch.generation
+            || self.node_pid != node_pid
+            || self.app_pid != profile.app_pid
+            || self.runtime_root != profile.runtime_root
+            || failure.body != pre_open_cancelled_body(&add_body(launch, profile))
+            || failure.error == 0
+            || failure.creation == 0
+            || failure.lookup == 0
+            || failure.command == 0
+            || failure.ra_operation == 0
+            || self.deletion.command == 0
+            || self.deletion.ra_operation == 0
+            || failure.command == self.deletion.command
+            || failure.ra_operation == self.deletion.ra_operation
+            || failure.creation == failure.ra_operation
+            || failure.creation == self.deletion.ra_operation
+        {
+            return Err(
+                "failed registration deletion does not match the original owner/failure lineage"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailedOpenReceipt {
+    pub deployment: String,
+    pub session: String,
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    #[serde(with = "json_node")]
+    pub fm: NodeInstance,
+    #[serde(with = "json_generation")]
+    pub generation: GenerationHeader,
+    pub node_pid: u32,
+    pub app_pid: u32,
+    pub runtime_root: PathBuf,
+    pub deletion: fube_node::local::FailedOpenDeletion,
+}
+impl FailedOpenReceipt {
+    pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        let failure = &self.deletion.failure;
+        let disposal = &failure.disposal;
+        let mut original = add_body(launch, profile);
+        original.replica.current_role = 2;
+        if launch.profile != ServiceProfile::StatefulPeerIdle
+            || launch.placement != 2
+            || launch.peer.is_none()
+            || self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node != launch.node
+            || self.fm != launch.fm
+            || self.generation != launch.generation
+            || self.node_pid != node_pid
+            || self.app_pid != profile.app_pid
+            || self.runtime_root != profile.runtime_root
+            || disposal.body != original
+            || disposal.host.is_empty()
+            || disposal.runtime.is_empty()
+            || disposal.command == 0
+            || disposal.ra_operation == 0
+            || disposal.lookup == 0
+            || disposal.acquisition == 0
+            || failure.error == 0
+            || failure.error == fube_ra::entity::APPLICATION_HOST_CRASH
+            || failure.error == fube_ra::entity::PROXY_STATE_CHANGED_ON_DATA_LOSS
+            || failure.creation == 0
+            || failure.creation == disposal.ra_operation
+            || failure.creation == self.deletion.ra_operation
+            || self.deletion.command == 0
+            || self.deletion.ra_operation == 0
+            || self.deletion.command == disposal.command
+            || self.deletion.ra_operation == disposal.ra_operation
+        {
+            return Err(
+                "failed Open deletion does not match the original runtime/failure lineage".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbsenceReceipt {
+    pub deployment: String,
+    pub session: String,
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    #[serde(with = "json_node")]
+    pub fm: NodeInstance,
+    #[serde(with = "json_generation")]
+    pub generation: GenerationHeader,
+    pub node_pid: u32,
+    pub app_pid: u32,
+    pub runtime_root: PathBuf,
+    pub absence: fube_node::local::ReplicaAbsence,
+}
+impl AbsenceReceipt {
+    pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        if launch.profile != ServiceProfile::StatefulPeerIdle
+            || launch.placement != 2
+            || launch.peer.is_none()
+            || self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node != launch.node
+            || self.fm != launch.fm
+            || self.generation != launch.generation
+            || self.node_pid != node_pid
+            || self.app_pid != profile.app_pid
+            || self.runtime_root != profile.runtime_root
+            || self.absence.body != absent_replica_body(&add_body(launch, profile))
+            || self.absence.command == 0
+            || self.absence.ra_operation == 0
+        {
+            return Err(
+                "absence proof does not match the original never-created peer replica".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Trusted local original-owner observation, deliberately outside native
@@ -360,6 +623,47 @@ impl RetirementReceipt {
             || proof.runtime.is_empty()
         {
             return Err("retirement proof does not match original owner/profile".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostLossReceipt {
+    pub deployment: String,
+    pub session: String,
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    #[serde(with = "json_node")]
+    pub fm: NodeInstance,
+    #[serde(with = "json_generation")]
+    pub generation: GenerationHeader,
+    pub node_pid: u32,
+    pub app_pid: u32,
+    pub runtime_root: PathBuf,
+    pub loss: fube_node::local::ReplicaLoss,
+}
+impl HostLossReceipt {
+    pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        if launch.profile != ServiceProfile::StatefulPeerIdle
+            || launch.placement != 2
+            || self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node != launch.node
+            || self.fm != launch.fm
+            || self.generation != launch.generation
+            || self.node_pid != node_pid
+            || self.app_pid != profile.app_pid
+            || self.loss.app_pid != profile.app_pid
+            || self.runtime_root != profile.runtime_root
+            || self.loss.body != pre_open_cancelled_body(&add_body(launch, profile))
+            || self.loss.creation == 0
+            || self.loss.operation == 0
+            || self.loss.creation == self.loss.operation
+            || self.loss.host.is_empty()
+        {
+            return Err("host-loss proof does not match the original destination owner".into());
         }
         Ok(())
     }

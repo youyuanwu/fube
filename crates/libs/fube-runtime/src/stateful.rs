@@ -750,15 +750,17 @@ impl Registry {
                 .await?;
             {
                 let mut state = unit.state.lock().unwrap();
-                if state.generation != generation
-                    || cancel.is_cancelled()
-                    || !valid.load(Ordering::Acquire)
-                {
+                if state.generation != generation {
                     return Err(Error::Closed);
                 }
                 publication.accept()?;
-                state.service_open = true;
+                // A cancelled Open's returned control still owns cleanup:
+                // abort it before the service, without opening or publishing it.
                 state.replicator = Some(replicator.clone());
+                if cancel.is_cancelled() || !valid.load(Ordering::Acquire) {
+                    return Err(Error::Closed);
+                }
+                state.service_open = true;
                 state.operation = 1;
                 state.error_api = (1, 4);
                 state.replicator_operation = 2;

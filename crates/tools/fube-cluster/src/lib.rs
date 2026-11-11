@@ -42,6 +42,7 @@ pub struct Cluster {
     config: Config,
     ledger: Ledger,
     children: Vec<ChildOwner>,
+    peer_idle_requested: bool,
     finished: Option<Value>,
 }
 impl Cluster {
@@ -69,7 +70,7 @@ impl Cluster {
             },
             for_fm_replica: false,
         };
-        let launches = [1, 2].map(|placement| Launch {
+        let mut launches = [1, 2].map(|placement| Launch {
             profile: config.profile,
             deployment: interlock.deployment.clone(),
             session: uuid::Uuid::new_v4().to_string(),
@@ -90,13 +91,28 @@ impl Cluster {
             partition: uuid::Uuid::new_v4().to_string(),
             replica: i64::from(placement),
             incarnation: (sequence() & i64::MAX as u64).max(1) as i64,
+            peer: None,
         });
+        if config.profile == ServiceProfile::StatefulPeerIdle {
+            launches[1].partition = launches[0].partition.clone();
+            for index in 0..2 {
+                let remote = &launches[1 - index];
+                launches[index].peer = Some(Peer {
+                    node: remote.node.clone(),
+                    session: remote.session.clone(),
+                    partition: remote.partition.clone(),
+                    replica: remote.replica,
+                    incarnation: remote.incarnation,
+                });
+            }
+        }
         Ok(Self {
             interlock,
             config,
             ledger: Ledger::new(launches),
             children: Vec::with_capacity(2),
             finished: None,
+            peer_idle_requested: false,
         })
     }
     pub async fn start(&mut self) -> Result<()> {
@@ -107,6 +123,26 @@ impl Cluster {
         for index in 0..2 {
             self.spawn(index).await?;
         }
+        if self.config.profile == ServiceProfile::StatefulPeerIdle {
+            let address = self.children[1]
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.peer_address)
+                .ok_or("missing original node2 peer listener")?;
+            let child = &mut self.children[0];
+            child
+                .process
+                .as_mut()
+                .ok_or("missing original Primary owner")?
+                .command(
+                    format!(
+                        "peer {} {} {address}\n",
+                        child.launch.session, child.launch.capability
+                    )
+                    .as_bytes(),
+                )
+                .map_err(err)?;
+        }
         Ok(())
     }
     fn prepare(&self) -> Result<()> {
@@ -115,7 +151,7 @@ impl Cluster {
     }
     fn assemble(&self) -> Result<()> {
         let package = self.config.root.join("deployment/package");
-        if self.config.profile == ServiceProfile::StatefulSingleton {
+        if self.config.profile.stateful() {
             private_dir(&package)?;
             private_dir(&package.join("LocalService"))?;
             private_dir(&package.join("LocalService/Code"))?;
@@ -264,10 +300,14 @@ impl Cluster {
             || !metadata.address.ip().is_loopback()
             || metadata.address.port() == 0
             || profile != metadata.profile.is_some()
-            || owner
-                .metadata
-                .as_ref()
-                .is_some_and(|prior| prior.address != metadata.address)
+            || (owner.launch.profile == ServiceProfile::StatefulPeerIdle)
+                != metadata.peer_address.is_some()
+            || metadata
+                .peer_address
+                .is_some_and(|address| !address.ip().is_loopback() || address.port() == 0)
+            || owner.metadata.as_ref().is_some_and(|prior| {
+                prior.address != metadata.address || prior.peer_address != metadata.peer_address
+            })
         {
             return Err(
                 "startup metadata not from the exact original expected child/session".into(),
@@ -282,13 +322,73 @@ impl Cluster {
         let incoming = link
             .receive(Instant::now() + Duration::from_millis(1))
             .await?;
-        let Some(mut incoming) = incoming else {
+        let Some(incoming) = incoming else {
             return Ok(());
         };
+        self.receive_message(index, incoming).await
+    }
+    async fn receive_message(
+        &mut self,
+        index: usize,
+        mut incoming: fube_transport::channel::IncomingMessage<
+            fube_transport::native_channel::GatewayTarget,
+        >,
+    ) -> Result<()> {
+        let link = self.children[index]
+            .link
+            .as_ref()
+            .ok_or("original node link absent")?;
         wire::predecode(&incoming.message)?;
         let action = incoming.message.properties().map_err(err)?.action;
         let generation = self.children[index].launch.generation.clone();
         match action.as_str() {
+            "GenerationUpdateReject" => {
+                let current = decode_generation_update_reject(&incoming.message).map_err(err)?;
+                if let Some(round) = &mut self.ledger.generation {
+                    round.reject(&current)?;
+                }
+            }
+            "ServiceTypeEnabled" | "ServiceTypeDisabled" => {
+                let enabled = action == "ServiceTypeEnabled";
+                let body = if enabled {
+                    decode_service_type_enabled(&incoming.message)
+                } else {
+                    decode_service_type_disabled(&incoming.message)
+                }
+                .map_err(err)?;
+                let reply = self.ledger.type_status(index, enabled, &body)?;
+                let message = if enabled {
+                    service_type_enabled_reply_message(&reply, &generation)
+                } else {
+                    service_type_disabled_reply_message(&reply, &generation)
+                }
+                .map_err(err)?;
+                link.send(message).await?;
+            }
+            "NodeActivateReply" | "NodeDeactivateReply" => {
+                let activate = action == "NodeActivateReply";
+                let (body, owner) = if activate {
+                    decode_node_activate_reply(&incoming.message)
+                } else {
+                    decode_node_deactivate_reply(&incoming.message)
+                }
+                .map_err(err)?;
+                if owner != Owner::Fm {
+                    return Err("FMM activation unsupported".into());
+                }
+                self.ledger.node_control_reply(index, activate, body)?;
+            }
+            "NodeUpdateServiceReply" => {
+                let (body, owner) =
+                    decode_node_update_service_reply(&incoming.message).map_err(err)?;
+                if owner != Owner::Fm {
+                    return Err("FMM service update unsupported".into());
+                }
+                self.ledger.service_reply(index, body)?;
+            }
+            "ReportLoad" => self
+                .ledger
+                .load(index, decode_report_load(&incoming.message).map_err(err)?)?,
             "NodeUp" => {
                 let body = decode_node_up(&incoming.message).map_err(err)?;
                 body.validate_fresh_stateless().map_err(err)?;
@@ -310,6 +410,8 @@ impl Cluster {
                     );
                 }
                 let ack = NodeUpAck::fresh_activated(body.node.version, 1).map_err(err)?;
+                placement.activation_sequence = ack.activation_sequence;
+                placement.activated = ack.activated;
                 let response = node_up_ack_message(&ack, &generation).map_err(err)?;
                 let context = incoming
                     .reply
@@ -325,6 +427,12 @@ impl Cluster {
                 let (body, owner) = decode_replica_up(&incoming.message).map_err(err)?;
                 if owner != Owner::Fm {
                     return Err("FMM report unsupported".into());
+                }
+                if self.ledger.generation.is_some() {
+                    if let Some(handoff) = incoming.handoff.as_mut() {
+                        handoff.acknowledge();
+                    }
+                    return Ok(()); // Rebuild cannot acknowledge inventory without LFUM support.
                 }
                 let response = self.ledger.report(index, &body)?;
                 let Some(response) = response else {
@@ -355,6 +463,22 @@ impl Cluster {
                 )
                 .await?;
             }
+            "AddReplicaReply" => {
+                let (body, owner) = decode_add_replica_reply(&incoming.message).map_err(err)?;
+                if owner != Owner::Fm || self.config.profile != ServiceProfile::StatefulPeerIdle {
+                    return Err("AddReplicaReply requires the original peer-idle FM profile".into());
+                }
+                self.ledger.idle_reply(index, body)?;
+            }
+            "RemoveReplicaReply" => {
+                let (body, owner) = decode_remove_replica_reply(&incoming.message).map_err(err)?;
+                if owner != Owner::Fm || self.config.profile != ServiceProfile::StatefulPeerIdle {
+                    return Err(
+                        "RemoveReplicaReply requires the original peer-idle FM profile".into(),
+                    );
+                }
+                self.ledger.idle_removal_reply(index, body)?;
+            }
             "AddInstanceReply"
             | "AddPrimaryReply"
             | "RemoveInstanceReply"
@@ -363,8 +487,7 @@ impl Cluster {
                     action.as_str(),
                     "RemoveInstanceReply" | "DeleteReplicaReply"
                 );
-                let primary =
-                    self.children[index].launch.profile == ServiceProfile::StatefulSingleton;
+                let primary = self.children[index].launch.profile.stateful();
                 let expected_action = match (primary, removing) {
                     (true, true) => "DeleteReplicaReply",
                     (true, false) => "AddPrimaryReply",
@@ -411,11 +534,28 @@ impl Cluster {
             };
             let result = result.and_then(|()| self.read_retirement(index));
             let result = match result {
+                Ok(()) if self.ledger.generation.is_some() => self.retry_generation(index).await,
                 Ok(()) => self.retry_primary(index).await,
                 Err(error) => Err(error),
             };
             let result = match result {
                 Ok(()) => self.retry_deletion(index).await,
+                Err(error) => Err(error),
+            };
+            let result = match result {
+                Ok(()) => self.retry_node_work(index).await,
+                Err(error) => Err(error),
+            };
+            let result = match result {
+                Ok(()) => self.retry_idle(index).await,
+                Err(error) => Err(error),
+            };
+            let result = match result {
+                Ok(()) => self.retry_idle_removal(index).await,
+                Err(error) => Err(error),
+            };
+            let result = match result {
+                Ok(()) => self.retry_idle_deletion(index).await,
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
@@ -425,6 +565,88 @@ impl Cluster {
                 }
             }
         }
+    }
+    /// Begin the bounded native handshake, not a completed FM rebuild. New
+    /// mutations remain gated until the future LFUM implementation completes.
+    pub fn begin_generation_handshake(&mut self) -> Result<Value> {
+        if self.config.profile == ServiceProfile::StatefulPeerIdle {
+            return Err("peer-idle profile is bound to the original fixed generation".into());
+        }
+        if self.finished.is_some() || self.children.len() != 2 {
+            return Err("generation handshake requires the original running cluster".into());
+        }
+        self.ledger.begin_generation()?;
+        Ok(self.status()["generation_handshake"].clone())
+    }
+    async fn retry_generation(&mut self, index: usize) -> Result<()> {
+        let Some(work) = self
+            .ledger
+            .generation
+            .as_mut()
+            .and_then(|round| round.next(index, Instant::now()))
+        else {
+            return Ok(());
+        };
+        let link = self.children[index]
+            .link
+            .as_ref()
+            .ok_or("original generation link absent")?;
+        match work {
+            fm::GenerationWork::Propose(header) => {
+                if let Some(message) = link
+                    .request_optional(generation_proposal_message(&header).map_err(err)?)
+                    .await?
+                {
+                    wire::predecode(&message)?;
+                    let body = decode_generation_proposal_reply(&message).map_err(err)?;
+                    self.ledger
+                        .generation
+                        .as_mut()
+                        .ok_or("generation owner lost")?
+                        .proposal_reply(index, &body)?;
+                }
+            }
+            fm::GenerationWork::Update(header) => {
+                link.send(
+                    generation_update_message(
+                        &GenerationUpdate {
+                            fm_service_epoch: Epoch::default(),
+                        },
+                        &header,
+                    )
+                    .map_err(err)?,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    async fn retry_node_work(&mut self, index: usize) -> Result<()> {
+        if self.ledger.generation.is_some() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let control = self.ledger.node_control_retry(index, now);
+        let service = self.ledger.service_update_retry(index, now);
+        let child = &self.children[index];
+        let link = child.link.as_ref().ok_or("original node link absent")?;
+        if let Some((activate, body)) = control {
+            let message = if activate {
+                node_activate_request_message(&body, &child.launch.generation)
+            } else {
+                node_deactivate_request_message(&body, &child.launch.generation)
+            }
+            .map_err(err)?;
+            link.send(message).await?;
+        }
+        if let Some(body) = service {
+            link.send(
+                node_update_service_request_message(&body, &child.launch.generation)
+                    .map_err(err)?,
+            )
+            .await?;
+        }
+        Ok(())
     }
     async fn retry_primary(&mut self, index: usize) -> Result<()> {
         let Some(body) = self.ledger.primary_retry(index, Instant::now())? else {
@@ -439,7 +661,46 @@ impl Cluster {
             .send(message)
             .await
     }
+    async fn retry_idle(&mut self, index: usize) -> Result<()> {
+        let Some(body) = self.ledger.idle_retry(index, Instant::now()) else {
+            return Ok(());
+        };
+        self.send_idle(&body).await
+    }
+    async fn send_idle(&self, body: &AddReplica) -> Result<()> {
+        let child = self
+            .children
+            .first()
+            .ok_or("missing original Primary owner")?;
+        child
+            .link
+            .as_ref()
+            .ok_or("original Primary link absent")?
+            .send(add_replica_message(body, &child.launch.generation).map_err(err)?)
+            .await
+    }
+    async fn retry_idle_removal(&mut self, index: usize) -> Result<()> {
+        let Some(body) = self.ledger.idle_removal_retry(index, Instant::now()) else {
+            return Ok(());
+        };
+        self.send_idle_removal(&body).await
+    }
+    async fn send_idle_removal(&self, body: &RemoveReplica) -> Result<()> {
+        let child = self
+            .children
+            .first()
+            .ok_or("missing original Primary owner")?;
+        child
+            .link
+            .as_ref()
+            .ok_or("original Primary link absent")?
+            .send(remove_replica_message(body, &child.launch.generation).map_err(err)?)
+            .await
+    }
     async fn retry_deletion(&mut self, index: usize) -> Result<()> {
+        if self.ledger.generation.is_some() {
+            return Ok(());
+        }
         let Some(body) = self.ledger.deletion_retry(index, Instant::now())? else {
             return Ok(());
         };
@@ -452,6 +713,24 @@ impl Cluster {
             .send(message)
             .await
     }
+    async fn retry_idle_deletion(&mut self, index: usize) -> Result<()> {
+        let Some(body) = self.ledger.idle_deletion_retry(index, Instant::now()) else {
+            return Ok(());
+        };
+        self.send_idle_deletion(&body).await
+    }
+    async fn send_idle_deletion(&self, body: &DeleteReplica) -> Result<()> {
+        let child = self
+            .children
+            .get(1)
+            .ok_or("missing original destination owner")?;
+        child
+            .link
+            .as_ref()
+            .ok_or("original destination link absent")?
+            .send(delete_replica_message(body, &child.launch.generation).map_err(err)?)
+            .await
+    }
     fn read_retirement(&mut self, index: usize) -> Result<()> {
         let child = &self.children[index];
         let path = child.launch.directory.join("retirement.json");
@@ -460,7 +739,35 @@ impl Cluster {
             .as_ref()
             .ok_or("original node owner absent")?
             .pid();
-        self.ledger.read_retirement(index, &path, node_pid)
+        self.ledger.read_retirement(index, &path, node_pid)?;
+        self.ledger.read_absence(
+            index,
+            &child.launch.directory.join("absence.json"),
+            node_pid,
+        )?;
+        self.ledger.read_pre_open_cancellation(
+            index,
+            &child.launch.directory.join("pre-open-cancellation.json"),
+            node_pid,
+        )?;
+        self.ledger.read_failed_registration(
+            index,
+            &child
+                .launch
+                .directory
+                .join("failed-registration-deletion.json"),
+            node_pid,
+        )?;
+        self.ledger.read_failed_open(
+            index,
+            &child.launch.directory.join("failed-open-deletion.json"),
+            node_pid,
+        )?;
+        self.ledger.read_host_loss(
+            index,
+            &child.launch.directory.join("host-loss.json"),
+            node_pid,
+        )
     }
     pub fn status(&self) -> Value {
         let mut status = self.ledger.status();
@@ -489,7 +796,306 @@ impl Cluster {
                 }
             }
         }
+        if self.config.profile == ServiceProfile::StatefulPeerIdle {
+            let source = &status["nodes"][0]["retained_work"];
+            let target = &status["nodes"][1]["retained_work"];
+            let reply = &source["peer_idle"]["reply"];
+            let failed =
+                self.peer_idle_requested && reply["error"].as_i64().is_some_and(|error| error != 0);
+            let opened = self.peer_idle_requested
+                && reply["error"] == 0
+                && reply["replica"]["id"] == self.ledger.placements[1].replica
+                && reply["replica"]["instance"] == self.ledger.placements[1].incarnation
+                && reply["replica"]["current_role"] == 2
+                && reply["replica"]["state"] == 1
+                && reply["replica"]["replication_endpoint"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+                && target["local_replica"]["open"] == true;
+            let removing = source["peer_idle"]["removal"].is_object();
+            let removed = removing && source["peer_idle"]["removal"]["result"] == 0;
+            let destination_lost = self.ledger.placements[1].loss_reported;
+            let built = !destination_lost
+                && opened
+                && !removing
+                && source["peer_idle"]["build"]["result"] == 0;
+            status["peer_idle"] = json!({
+                "requested":self.peer_idle_requested,
+                "state": if destination_lost { "lost" } else if removed { "removed" } else if removing { "removing" } else if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
+                "error": if failed { reply["error"].clone() } else { Value::Null },
+                "built":built, "serving":false,
+                "build":source["peer_idle"]["build"],
+                "fm":self.ledger.idle_status(),
+                "fm_removal":self.ledger.idle_removal_status(),
+                "fm_deletion":self.ledger.idle_deletion_status(),
+                "ready":!destination_lost && source["peer_idle"]["ready"] == true,
+                "destination_lost":destination_lost,
+                "removal":source["peer_idle"]["removal"],
+                "source":source["peer_idle"], "target":target["local_replica"],
+                "peer_link_alive":[source["peer_link_alive"],target["peer_link_alive"]],
+                "peer_error":[source["peer_error"],target["peer_error"]],
+                "command_error":[source["peer_command_error"],target["peer_command_error"]],
+            });
+        }
         status
+    }
+    /// Ask the original Primary RA to open its bound remote Idle. This is not
+    /// an FM operation, build completion, or permission to serve.
+    pub async fn create_idle_replica(&mut self) -> Result<Value> {
+        if self.ledger.idle.is_some() {
+            return Err("FM owns this Idle; use add_idle_replica".into());
+        }
+        if self.config.profile != ServiceProfile::StatefulPeerIdle
+            || self.finished.is_some()
+            || self.children.len() != 2
+            || self.ledger.generation.is_some()
+            || self.ledger.placements[0].observed != fm::Observed::Running
+            || self.ledger.placements.iter().any(|placement| {
+                !placement.link_alive
+                    || placement.bootstrap != Bootstrap::Admitted
+                    || !placement.activated
+            })
+        {
+            return Err(
+                "peer Idle requires the original admitted sessions and Ready node1 Primary".into(),
+            );
+        }
+        let current = self.status()["peer_idle"].clone();
+        if matches!(
+            current["state"].as_str(),
+            Some("failed" | "removing" | "removed")
+        ) {
+            return Ok(current);
+        }
+        let child = &mut self.children[0];
+        child
+            .process
+            .as_mut()
+            .ok_or("missing original Primary owner")?
+            .command(
+                format!(
+                    "create-idle {} {}\n",
+                    child.launch.session, child.launch.capability
+                )
+                .as_bytes(),
+            )
+            .map_err(err)?;
+        self.peer_idle_requested = true;
+        Ok(json!({"state":"pending","kind":"peer_idle_open","built":false,"serving":false}))
+    }
+    /// Ask the original Primary runtime to build its already opened peer Idle.
+    /// Completion proves copy/application ACK, not active configuration or FM AddReplica.
+    pub async fn build_idle_replica(&mut self) -> Result<Value> {
+        if self.ledger.idle.is_some() {
+            return Err("FM owns this Idle's build choreography".into());
+        }
+        if self.config.profile != ServiceProfile::StatefulPeerIdle
+            || self.finished.is_some()
+            || self.children.len() != 2
+            || self.ledger.generation.is_some()
+            || self.ledger.placements[0].observed != fm::Observed::Running
+            || self.ledger.placements.iter().any(|placement| {
+                !placement.link_alive
+                    || placement.bootstrap != Bootstrap::Admitted
+                    || !placement.activated
+            })
+            || self.status()["peer_idle"]["state"] != "open"
+        {
+            return Err("peer build requires the original Ready Primary and opened Idle".into());
+        }
+        let current = self.status()["peer_idle"].clone();
+        if current["built"] == true {
+            return Ok(current);
+        }
+        let child = &mut self.children[0];
+        child
+            .process
+            .as_mut()
+            .ok_or("missing original Primary owner")?
+            .command(
+                format!(
+                    "build-idle {} {}\n",
+                    child.launch.session, child.launch.capability
+                )
+                .as_bytes(),
+            )
+            .map_err(err)?;
+        Ok(json!({"state":"pending","kind":"peer_idle_build","built":false,"serving":false}))
+    }
+    /// FM AddReplica owns peer creation, RAP build and semantic Ready-Idle completion.
+    pub async fn add_idle_replica(&mut self) -> Result<Value> {
+        let current = self.ledger.idle_status();
+        if self.finished.is_some()
+            || self.children.len() != 2
+            || self.config.profile != ServiceProfile::StatefulPeerIdle
+            || (self.ledger.idle_removal.is_some() && current["state"] != "failed")
+            || self.peer_idle_requested && self.ledger.idle.is_none()
+        {
+            return Err("FM AddReplica requires the original unused peer-idle profile".into());
+        }
+        if current["state"] != "absent" && current["state"] != "pending" {
+            return Ok(current);
+        }
+        let body = self.ledger.request_idle(Instant::now())?;
+        self.peer_idle_requested = true;
+        if let Err(error) = self.send_idle(&body).await {
+            self.ledger.lost(0, error.clone());
+            return Err(error);
+        }
+        Ok(self.ledger.idle_status())
+    }
+    /// Remove the original Idle from the Primary's replicator, not its remote
+    /// application. Pending calls retry cancellation/cleanup; success is terminal.
+    pub async fn remove_idle_replica(&mut self) -> Result<Value> {
+        if self.ledger.idle_removal.is_some() {
+            return Err("FM owns this removal; use remove_idle_replica_via_fm".into());
+        }
+        if self.config.profile != ServiceProfile::StatefulPeerIdle
+            || self.finished.is_some()
+            || self.children.len() != 2
+            || self.ledger.generation.is_some()
+            || self.ledger.placements[0].observed != fm::Observed::Running
+            || self.ledger.placements.iter().any(|placement| {
+                !placement.link_alive
+                    || placement.bootstrap != Bootstrap::Admitted
+                    || !placement.activated
+            })
+        {
+            return Err("peer removal requires the original Ready Primary and opened Idle".into());
+        }
+        let current = self.status()["peer_idle"].clone();
+        if current["state"] == "removed" {
+            return Ok(current);
+        }
+        if !matches!(current["state"].as_str(), Some("open" | "removing")) {
+            return Err("peer removal requires the original opened Idle".into());
+        }
+        let child = &mut self.children[0];
+        child
+            .process
+            .as_mut()
+            .ok_or("missing original Primary owner")?
+            .command(
+                format!(
+                    "remove-idle {} {}\n",
+                    child.launch.session, child.launch.capability
+                )
+                .as_bytes(),
+            )
+            .map_err(err)?;
+        if let Some(idle) = &mut self.ledger.idle {
+            idle.cancelled = true;
+        }
+        Ok(json!({"state":"pending","kind":"peer_idle_removal","built":false,"serving":false}))
+    }
+    /// FM retires pending/failed creation or removes the opened/lost Idle's replication session.
+    /// Only RemoveReplicaReply clears pending_remove, never destination deletion.
+    pub async fn remove_idle_replica_via_fm(&mut self) -> Result<Value> {
+        if self.finished.is_some()
+            || self.children.len() != 2
+            || self.config.profile != ServiceProfile::StatefulPeerIdle
+        {
+            return Err("FM RemoveReplica requires the original peer-idle profile".into());
+        }
+        let current = self.ledger.idle_removal_status();
+        if current["state"] == "removed" || current["state"] == "unknown" {
+            return Ok(current);
+        }
+        if self.ledger.idle_removal.is_none()
+            && self.status()["peer_idle"]["state"] != "open"
+            && !matches!(
+                self.ledger.idle_status()["state"].as_str(),
+                Some("pending" | "failed" | "lost")
+            )
+        {
+            return Err(
+                "FM removal requires original pending/failed FM creation or an opened/lost Idle"
+                    .into(),
+            );
+        }
+        let body = self.ledger.request_idle_removal(Instant::now())?;
+        if let Err(error) = self.send_idle_removal(&body).await {
+            self.ledger.lost(0, error.clone());
+            return Err(error);
+        }
+        Ok(self.ledger.idle_removal_status())
+    }
+    /// Delete the original abandoned destination independently of Primary Remove.
+    /// Cleanup joins the native reply with original disposal, pre-Open
+    /// cancellation, known creation failure or never-created absence;
+    /// none authorizes a successor.
+    pub async fn delete_idle_replica_via_fm(&mut self) -> Result<Value> {
+        self.delete_idle_replica_via_fm_with_force(false).await
+    }
+    /// Explicit native force authorization for the original destination only.
+    pub async fn delete_idle_replica_via_fm_with_force(&mut self, force: bool) -> Result<Value> {
+        if self.finished.is_some()
+            || self.children.len() != 2
+            || self.config.profile != ServiceProfile::StatefulPeerIdle
+        {
+            return Err("FM Idle deletion requires the original peer-idle profile".into());
+        }
+        let current = self.ledger.idle_deletion_status();
+        if current["state"] == "deleted" || current["state"] == "unknown" {
+            return Ok(current);
+        }
+        let mut target_kind = fm::IdleDeleteTarget::Runtime;
+        if self.ledger.idle_deletion.is_none() {
+            let status = self.status();
+            let target = &status["peer_idle"]["target"];
+            let unobserved = target.is_null() && self.ledger.idle_absence_allowed();
+            let registered_open = target["phase"] == "Opening"
+                && target["registration"].is_object()
+                && target["retained_usage"] == 1;
+            let pre_registration = target["phase"] == "Opening"
+                && target["registration"].is_null()
+                && target["retained_usage"] == 0
+                && self.ledger.idle_absence_allowed();
+            let failed_registration = target["phase"] == "Closed"
+                && target["pre_open_failure"]["error"]
+                    .as_i64()
+                    .is_some_and(|error| self.ledger.idle_failed_creation_error() == Some(error));
+            let failed_open = target["phase"] == "Closed"
+                && target["runtime_open_failure"]["error"]
+                    .as_i64()
+                    .is_some_and(|error| self.ledger.idle_failed_creation_error() == Some(error));
+            let terminal = target["phase"] == "Closed"
+                || target["phase"] == "Closing"
+                || target["phase"] == "Opening";
+            if target["open"] != true
+                && !registered_open
+                && !pre_registration
+                && !unobserved
+                && !failed_registration
+                && !failed_open
+                && !terminal
+            {
+                return Err("FM Idle deletion requires an original opening/opened or known creation-failed destination, or an absent unanswered FM Add".into());
+            }
+            target_kind = if unobserved {
+                fm::IdleDeleteTarget::Unobserved
+            } else if pre_registration {
+                fm::IdleDeleteTarget::PreRegistration
+            } else if failed_registration {
+                fm::IdleDeleteTarget::FailedRegistration
+            } else if failed_open {
+                fm::IdleDeleteTarget::FailedOpen
+            } else {
+                fm::IdleDeleteTarget::Runtime
+            };
+        }
+        let body = if force {
+            self.ledger
+                .request_idle_deletion_with_force(Instant::now(), target_kind, true)?
+        } else {
+            self.ledger
+                .request_idle_deletion(Instant::now(), target_kind)?
+        };
+        if let Err(error) = self.send_idle_deletion(&body).await {
+            self.ledger.lost(1, error.clone());
+            return Err(error);
+        }
+        Ok(self.ledger.idle_deletion_status())
     }
     /// Returns the retained operation outcome, never transport-write success.
     /// `quit` is accepted here; the foreground then calls owned shutdown.
@@ -499,14 +1105,31 @@ impl Cluster {
         }
         let op = command.op.clone();
         match self.ledger.accept(command)? {
+            Accepted::NodeControl(index, activate, body) => {
+                let generation = &self.children[index].launch.generation;
+                let message = if activate {
+                    node_activate_request_message(&body, generation)
+                } else {
+                    node_deactivate_request_message(&body, generation)
+                }
+                .map_err(err)?;
+                let result = self.children[index]
+                    .link
+                    .as_ref()
+                    .ok_or("original link absent")?
+                    .send(message)
+                    .await;
+                if let Err(error) = result {
+                    self.ledger.lost(index, error);
+                }
+            }
             Accepted::Duplicate(outcome) => return Ok(outcome),
             Accepted::Create(index, body) => {
-                let factory =
-                    if self.children[index].launch.profile == ServiceProfile::StatefulSingleton {
-                        add_primary_message
-                    } else {
-                        add_instance_message
-                    };
+                let factory = if self.children[index].launch.profile.stateful() {
+                    add_primary_message
+                } else {
+                    add_instance_message
+                };
                 let message =
                     factory(&body, &self.children[index].launch.generation).map_err(err)?;
                 let result = self.children[index]
@@ -520,12 +1143,11 @@ impl Cluster {
                 }
             }
             Accepted::Delete(index, body) => {
-                let factory =
-                    if self.children[index].launch.profile == ServiceProfile::StatefulSingleton {
-                        delete_replica_message
-                    } else {
-                        remove_instance_message
-                    };
+                let factory = if self.children[index].launch.profile.stateful() {
+                    delete_replica_message
+                } else {
+                    remove_instance_message
+                };
                 let message =
                     factory(&body, &self.children[index].launch.generation).map_err(err)?;
                 let result = self.children[index]
@@ -548,6 +1170,61 @@ impl Cluster {
             Accepted::Quit => {}
         }
         Ok(self.ledger.result(&op))
+    }
+    pub async fn update_service(&mut self, index: usize, service: Service) -> Result<()> {
+        if self.config.profile == ServiceProfile::StatefulPeerIdle {
+            return Err("peer-idle service description is fixed for the original lifetime".into());
+        }
+        if self.ledger.generation.is_some() {
+            return Err("service update is gated while generation upload is pending".into());
+        }
+        let placement = self
+            .ledger
+            .placements
+            .get_mut(index)
+            .ok_or("node index out of range")?;
+        if !placement.link_alive
+            || placement.bootstrap != Bootstrap::Admitted
+            || placement.service_update.is_some()
+        {
+            return Err(
+                "service update requires current admitted node without pending update".into(),
+            );
+        }
+        let expected = placement.body()?.service;
+        if service.name != expected.name
+            || service.instance != expected.instance
+            || service.stateful != expected.stateful
+            || service.persisted
+            || service.group
+            || service.service_type != expected.service_type
+            || service.application != expected.application
+            || service.version != expected.version
+            || service.target != expected.target
+            || service.minimum != expected.minimum
+            || service.partitions != expected.partitions
+            || service.activation_mode != expected.activation_mode
+            || !service.scaling.0.is_empty()
+            || service.update_version < expected.update_version
+        {
+            return Err("service update is outside admitted fixed profile/version".into());
+        }
+        let message = node_update_service_request_message(
+            &NodeUpdateServiceRequest {
+                service: service.clone(),
+            },
+            &placement.launch.generation,
+        )
+        .map_err(err)?;
+        self.children[index]
+            .link
+            .as_ref()
+            .ok_or("original link absent")?
+            .send(message)
+            .await?;
+        placement.service_update = Some(service);
+        placement.service_retry_at = Some(Instant::now() + Duration::from_secs(5));
+        Ok(())
     }
     pub async fn shutdown(&mut self) -> Value {
         if let Some(receipt) = &self.finished {

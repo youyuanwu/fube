@@ -1,6 +1,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("fube supports Linux only");
 
+use clap::Parser;
 use std::{
     io::{BufRead, Read, Write},
     net::{TcpListener, TcpStream},
@@ -31,63 +32,52 @@ fn event(value: serde_json::Value) {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Parser)]
+#[command(version, about = "Native stateless Hosting fixture")]
 struct FixtureConfig {
+    #[arg(long = "manifest-fixture", requires_all = ["service_name", "terminal"])]
     manifest: bool,
+    #[arg(long)]
     hosting_lease_bootstrap_only: bool,
+    #[arg(long = "type", default_value = "NativeStatelessType")]
     service_type: String,
+    #[arg(long = "service")]
     service_name: Option<String>,
+    #[arg(long, value_parser = ["close", "abort"])]
     terminal: Option<String>,
+    #[arg(long = "endpoint", action = clap::ArgAction::Set, value_parser = endpoint_mode, default_value = "socket")]
     opaque: bool,
+    #[arg(skip)]
     creates: AtomicUsize,
+}
+
+fn endpoint_mode(value: &str) -> Result<bool, String> {
+    match value {
+        "socket" => Ok(false),
+        "opaque" => Ok(true),
+        _ => Err("endpoint must be socket or opaque".into()),
+    }
 }
 
 impl FixtureConfig {
     fn parse() -> Result<Self, Box<dyn std::error::Error>> {
-        let mut config = Self {
-            service_type: "NativeStatelessType".into(),
-            ..Self::default()
-        };
-        let mut args = std::env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--hosting-lease-bootstrap-only" => config.hosting_lease_bootstrap_only = true,
-                "--manifest-fixture" => config.manifest = true,
-                "--type" => config.service_type = args.next().ok_or("missing type")?,
-                "--service" => config.service_name = Some(args.next().ok_or("missing service")?),
-                "--terminal" => {
-                    let value = args.next().ok_or("missing terminal")?;
-                    if !["close", "abort"].contains(&value.as_str()) {
-                        return Err("invalid terminal".into());
-                    }
-                    config.terminal = Some(value);
-                }
-                "--endpoint" => {
-                    let value = args.next().ok_or("missing endpoint")?;
-                    if !["socket", "opaque"].contains(&value.as_str()) {
-                        return Err("invalid endpoint".into());
-                    }
-                    config.opaque = value == "opaque";
-                }
-                _ => return Err(format!("unexpected argument {arg}").into()),
-            }
-        }
-        if config.manifest && (config.service_name.is_none() || config.terminal.is_none()) {
-            return Err("manifest fixture requires expected service and terminal".into());
-        }
-        if config.hosting_lease_bootstrap_only
-            && (config.manifest
-                || config.service_name.is_some()
-                || config.terminal.is_some()
-                || config.opaque
-                || config.service_type != "NativeStatelessType")
+        <Self as Parser>::parse().validate()
+    }
+
+    fn validate(self) -> Result<Self, Box<dyn std::error::Error>> {
+        if self.hosting_lease_bootstrap_only
+            && (self.manifest
+                || self.service_name.is_some()
+                || self.terminal.is_some()
+                || self.opaque
+                || self.service_type != "NativeStatelessType")
         {
             return Err(
                 "Hosting lease bootstrap is mutually exclusive with service/manifest profiles"
                     .into(),
             );
         }
-        Ok(config)
+        Ok(self)
     }
 }
 
@@ -286,4 +276,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::io::stdin().lock().read_line(&mut command)?;
     event(json!({"event":"exiting"}));
     Ok(())
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+
+    fn parse(suffix: &str) -> Result<FixtureConfig, Box<dyn std::error::Error>> {
+        let input = format!("stateless-test-app {suffix}");
+        FixtureConfig::try_parse_from(input.split_whitespace())?.validate()
+    }
+
+    #[test]
+    fn preserves_manifest_identity_and_lease_profile_defaults() {
+        let config = parse("").unwrap();
+        assert_eq!(config.service_type, "NativeStatelessType");
+        assert!(!config.manifest && !config.opaque);
+        assert!(
+            parse("--hosting-lease-bootstrap-only")
+                .unwrap()
+                .hosting_lease_bootstrap_only
+        );
+        let config = parse("--manifest-fixture --type Echo --service fabric:/App/Echo --terminal abort --endpoint opaque").unwrap();
+        assert!(config.manifest && config.opaque);
+        assert_eq!(config.terminal.as_deref(), Some("abort"));
+        assert_eq!(config.service_name.as_deref(), Some("fabric:/App/Echo"));
+    }
+
+    #[test]
+    fn rejects_incomplete_manifest_and_incompatible_lease_profiles() {
+        for suffix in [
+            "--manifest-fixture",
+            "--manifest-fixture --service fabric:/App/Echo",
+            "--terminal unknown",
+            "--endpoint unknown",
+            "--hosting-lease-bootstrap-only --endpoint opaque",
+            "--hosting-lease-bootstrap-only --type Other",
+            "--hosting-lease-bootstrap-only --service fabric:/App/Echo",
+        ] {
+            assert!(parse(suffix).is_err(), "{suffix}");
+        }
+    }
 }

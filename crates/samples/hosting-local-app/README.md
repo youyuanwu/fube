@@ -116,8 +116,8 @@ authority; promotion, replacement, reopen and adoption remain rejected.
 Committed RA effects drive the existing RAP initial-Primary Open sequence and
 the actual service-returned public replicator. A write during the service role
 callback fails as ReconfigurationPending without consuming a sequence.
-An owned, joined numeric-loopback application listener accepts only `read\n`
-and `write\n`, with a 16-byte input bound and finite network waits. Before serving,
+An owned, joined numeric-loopback application listener accepts `read\n`,
+`write\n` and `load\n`, with a 16-byte input bound and finite network waits. Before serving,
 the listener requires agreement on runtime/service/replicator/engine roles,
 epoch, readiness and public partition access. `write` submits one fixed nonzero
 mutation through `IStateReplicator`, locally applies its admitted sequence to
@@ -126,6 +126,13 @@ client verifies sequence/application/completion progress and reads back the valu
 This is volatile local application and singleton acknowledgment, not durability
 or secondary application/copy ACK evidence. Repeated writes explicitly reject;
 request-ledger retry semantics are not qualified by this fixture.
+
+`load` reports `LocalWork=7` through the public stateful partition on the owned
+runtime execution context. That metric must first be declared in the service
+description. Stage-two acceptance sends a real NodeUpdateServiceRequest/RAP
+description update, observes public load reach FM without a semantic report ACK,
+and then tests node deactivation/cancellation/termination and sibling isolation.
+This adds no private data-engine access or recovered volatile lifetime.
 
 The lifecycle target holds provider and service disposal separately while local
 leases continue. Reads/writes reject during provider retirement; application and

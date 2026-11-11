@@ -2,6 +2,7 @@ use super::*;
 
 const DEMOTE_COMPLETED: i64 = 0x80071d24u32 as i32 as i64;
 const STATE_CHANGED: i64 = 0x80071d28u32 as i32 as i64;
+const REPLICA_DOES_NOT_EXIST: i64 = 0x80071be8u32 as i32 as i64;
 const MAX_REMOTE_TOMBSTONES: usize = 256;
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct AppliedConfiguration {
@@ -1368,7 +1369,19 @@ impl Registry {
         let result = match bound {
             Err(error) => Err(error),
             Ok((invocation, replicator)) => self
-                .complete(async move { replicator.remove_replica(operation_info.replica_id) })
+                .complete(async move {
+                    replicator
+                        .remove_replica(operation_info.replica_id)
+                        .or_else(|error| {
+                            if !error.is_uncertain()
+                                && error.native_code() == Some(REPLICA_DOES_NOT_EXIST)
+                            {
+                                Ok(())
+                            } else {
+                                Err(error)
+                            }
+                        })
+                })
                 .await
                 .and_then(|()| invocation.validate()),
         };

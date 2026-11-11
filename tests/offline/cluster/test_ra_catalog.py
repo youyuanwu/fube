@@ -97,7 +97,9 @@ class CatalogTests(unittest.TestCase):
                        "ServiceTypeNotification", "ServiceTypeNotificationReply",
                        "AddPrimary", "AddPrimaryReply", "DeleteReplica", "DeleteReplicaReply"]:
             self.assertIn("selected", records[action]["status"])
-        for action in ["RemoveReplica", "ReplicaDropped", "ReplicaDown"]:
+        for action in ["RemoveReplica", "RemoveReplicaReply"]:
+            self.assertIn("selected-C10", records[action]["status"])
+        for action in ["ReplicaDropped", "ReplicaDown"]:
             self.assertNotIn("selected", records[action]["status"])
         self.assertIn("not a", CATALOG.read_text())
 
@@ -139,7 +141,7 @@ class CatalogTests(unittest.TestCase):
             self.assertIn(term, replacement)
         records = {r["symbol"]: r for r in rows()}
         self.assertIn("drop-resend-replacement", records["AddInstance"]["status"])
-        self.assertEqual(sum("selected" in r["status"] for r in records.values()), 14)
+        self.assertEqual(sum("selected" in r["status"] for r in records.values()), 37)
 
 
 if __name__ == "__main__":

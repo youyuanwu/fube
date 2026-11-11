@@ -96,6 +96,25 @@ template<class T> void run(const std::string& mode,const std::filesystem::path& 
     }
     std::cout << name << " " << mode << " OK\n";
 }
+size_t native_truncation_rejections=0;
+template<class T> void reject_truncated(T value) {
+    auto bytes=encode(value);
+    bytes.resize(bytes.size()/2);
+    T received;
+    if(decode(bytes,received)) throw std::runtime_error("native accepted truncated body");
+    ++native_truncation_rejections;
+}
+inline void bodyless(const std::string& mode,const std::filesystem::path& dir,
+                     const std::string& name) {
+    auto path=dir/(name+".bin");
+    if(mode=="produce") {
+        std::ofstream output(path,std::ios::binary);
+        if(!output) throw std::runtime_error("bodyless write failed");
+    } else if(!read_file(path).empty()) {
+        throw std::runtime_error("bodyless proposal has a body");
+    }
+    std::cout << name << " " << mode << " OK\n";
+}
 inline FabricVersionInstance fresh_version() {
     FabricVersionInstance value;
     value.version_.codeVersion_.majorVersion_=1;
@@ -202,6 +221,99 @@ int main(int argc,char** argv) {
             deletion_reply.errorCode_.value_=Enum(error);
             run(mode,dir,"rich-delete-replica-reply-"+std::to_string(error),deletion_reply);
         }
+        if(CreateReplicaActor!=12 || CreateReplicaReplyActor!=12 ||
+           !CreateReplicaPriority || !CreateReplicaReplyPriority)
+            throw std::runtime_error("native peer factory metadata mismatch");
+        RAReplicaMessageBody peer;
+        run(mode,dir,"default-create-replica",peer);
+        c=0; rich(peer,c);
+        peer.fudesc_.targetReplicaSetSize_=1;
+        peer.fudesc_.minReplicaSetSize_=1;
+        peer.service_.targetReplicaSetSize_=1;
+        peer.service_.minReplicaSetSize_=1;
+        peer.service_.isStateful_=true;
+        peer.service_.hasPersistedState_=false;
+        peer.replica_.currentConfigurationRole_=Enum(2);
+        peer.replica_.previousConfigurationRole_=Enum(1);
+        peer.replica_.state_=Enum(1);
+        peer.replica_.isUp_=true;
+        run(mode,dir,"rich-create-replica",peer);
+        reject_truncated(peer);
+        peer.deactivationInfo_.deactivationEpoch_=peer.fudesc_.ccEpoch_;
+        peer.deactivationInfo_.catchupLSN_=0;
+        run(mode,dir,"initial-create-replica",peer);
+        reject_truncated(peer);
+        ReplicaReplyMessageBody peer_reply;
+        run(mode,dir,"default-create-replica-reply",peer_reply);
+        c=0; rich(peer_reply,c);
+        peer_reply.fudesc_.targetReplicaSetSize_=1;
+        peer_reply.fudesc_.minReplicaSetSize_=1;
+        peer_reply.replica_.currentConfigurationRole_=Enum(2);
+        peer_reply.replica_.previousConfigurationRole_=Enum(1);
+        peer_reply.replica_.state_=Enum(1);
+        peer_reply.replica_.isUp_=true;
+        for(LONG error:{0, -2147017398}) {
+            peer_reply.errorCode_.value_=Enum(error);
+            run(mode,dir,"rich-create-replica-reply-"+std::to_string(error),peer_reply);
+        }
+        reject_truncated(peer_reply);
+        if(AddReplicaActor!=12 || AddReplicaReplyActor!=11 ||
+           RemoveReplicaActor!=12 || RemoveReplicaReplyActor!=11 ||
+           !AddReplicaPriority || !AddReplicaReplyPriority ||
+           !RemoveReplicaPriority || !RemoveReplicaReplyPriority)
+            throw std::runtime_error("native replica factory metadata mismatch");
+        ReplicaMessageBody idle;
+        run(mode,dir,"default-add-replica",idle);
+        c=0; rich(idle,c);
+        idle.fudesc_.targetReplicaSetSize_=1;
+        idle.fudesc_.minReplicaSetSize_=1;
+        idle.service_.targetReplicaSetSize_=1;
+        idle.service_.minReplicaSetSize_=1;
+        idle.service_.isStateful_=true;
+        idle.service_.hasPersistedState_=false;
+        idle.replica_.currentConfigurationRole_=Enum(2);
+        idle.replica_.previousConfigurationRole_=Enum(1);
+        idle.replica_.state_=Enum(1);
+        idle.replica_.isUp_=true;
+        run(mode,dir,"rich-add-replica",idle);
+        reject_truncated(idle);
+        ReplicaReplyMessageBody idle_reply;
+        run(mode,dir,"default-add-replica-reply",idle_reply);
+        c=0; rich(idle_reply,c);
+        idle_reply.fudesc_.targetReplicaSetSize_=1;
+        idle_reply.fudesc_.minReplicaSetSize_=1;
+        idle_reply.replica_.currentConfigurationRole_=Enum(2);
+        idle_reply.replica_.previousConfigurationRole_=Enum(1);
+        idle_reply.replica_.isUp_=true;
+        idle_reply.replica_.serviceLocation_.clear();
+        for(LONG error:{0, -2147017398}) {
+            idle_reply.errorCode_.value_=Enum(error);
+            idle_reply.replica_.state_=Enum(error==0 ? 2 : 1);
+            run(mode,dir,"rich-add-replica-reply-"+std::to_string(error),idle_reply);
+        }
+        reject_truncated(idle_reply);
+        ReplicaMessageBody idle_remove;
+        run(mode,dir,"default-remove-replica",idle_remove);
+        idle_remove=idle;
+        run(mode,dir,"rich-remove-replica",idle_remove);
+        reject_truncated(idle_remove);
+        ReplicaReplyMessageBody idle_remove_reply;
+        run(mode,dir,"default-remove-replica-reply",idle_remove_reply);
+        idle_remove_reply=idle_reply;
+        idle_remove_reply.replica_.state_=Enum(3);
+        for(LONG error:{0, -2147017398}) {
+            idle_remove_reply.errorCode_.value_=Enum(error);
+            run(mode,dir,"rich-remove-replica-reply-"+std::to_string(error),idle_remove_reply);
+        }
+        reject_truncated(idle_remove_reply);
+        ReplicaReplyMessageBody cancelled_create;
+        cancelled_create.fudesc_=idle_remove.fudesc_;
+        cancelled_create.replica_=idle_remove.replica_;
+        cancelled_create.replica_.serviceLocation_.clear();
+        cancelled_create.replica_.replicationEndpoint_.clear();
+        cancelled_create.errorCode_.value_=Enum(0);
+        run(mode,dir,"in-create-remove-replica-reply",cancelled_create);
+        reject_truncated(cancelled_create);
         // Native empty ctor leaves bools unspecified: explicitly initialize the fixture.
         ReplicaUpMessageBody up;
         up.isLastReplicaUpMessage_=false; up.isFromFMM_=false;
@@ -211,7 +323,7 @@ int main(int argc,char** argv) {
             up.isLastReplicaUpMessage_=last!=0; up.isFromFMM_=fmm!=0;
             run(mode,dir,"rich-replica-up-"+std::to_string(last)+"-"+std::to_string(fmm),up);
         }
-        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply",u"AddPrimary",u"AddPrimaryReply",u"DeleteReplica",u"DeleteReplicaReply"}) {
+        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply",u"AddPrimary",u"AddPrimaryReply",u"DeleteReplica",u"DeleteReplicaReply",u"CreateReplica",u"CreateReplicaReply",u"AddReplica",u"AddReplicaReply",u"RemoveReplica",u"RemoveReplicaReply"}) {
             action.action_=text(name);
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);
@@ -261,41 +373,176 @@ int main(int argc,char** argv) {
         run(mode,dir,"direct-ptop",ptop);
         c=0; rich(ptop,c); ptop.actor_=Enum(2); ptop.exactInstance_=false;
         run(mode,dir,"rich-ptop",ptop);
+        // Initialized empty values, not guarantees about native empty constructors.
+        NodeActivateRequestMessageBody activate;
+        run(mode,dir,"empty-node-activate-request",activate);
+        c=0; rich(activate,c); activate.isFromFmm_=false;
+        run(mode,dir,"rich-node-activate-request",activate);
+        reject_truncated(activate);
+        activate.isFromFmm_=true; activate.sequenceNumber_=INT64_MIN+17;
+        run(mode,dir,"fmm-node-activate-request",activate);
+        NodeActivateReplyMessageBody activated;
+        run(mode,dir,"empty-node-activate-reply",activated);
+        c=0; rich(activated,c);
+        run(mode,dir,"rich-node-activate-reply",activated);
+        reject_truncated(activated);
+        NodeDeactivateRequestMessageBody deactivate;
+        run(mode,dir,"empty-node-deactivate-request",deactivate);
+        c=0; rich(deactivate,c); deactivate.isFromFmm_=false;
+        run(mode,dir,"rich-node-deactivate-request",deactivate);
+        reject_truncated(deactivate);
+        deactivate.isFromFmm_=true; deactivate.sequenceNumber_=INT64_MIN+17;
+        run(mode,dir,"fmm-node-deactivate-request",deactivate);
+        NodeDeactivateReplyMessageBody deactivated;
+        run(mode,dir,"empty-node-deactivate-reply",deactivated);
+        c=0; rich(deactivated,c);
+        run(mode,dir,"rich-node-deactivate-reply",deactivated);
+        reject_truncated(deactivated);
+        NodeUpdateServiceRequestMessageBody service_update;
+        run(mode,dir,"empty-node-update-service-request",service_update);
+        c=0; rich(service_update,c);
+        run(mode,dir,"rich-node-update-service-request",service_update);
+        reject_truncated(service_update);
+        NodeUpdateServiceReplyMessageBody service_updated;
+        run(mode,dir,"empty-node-update-service-reply",service_updated);
+        c=0; rich(service_updated,c);
+        run(mode,dir,"rich-node-update-service-reply",service_updated);
+        reject_truncated(service_updated);
+        for(auto state:{"enabled","disabled"}) {
+            ServiceTypeUpdateMessageBody types;
+            run(mode,dir,std::string("empty-service-type-")+state,types);
+            c=0; rich(types,c);
+            run(mode,dir,std::string("rich-service-type-")+state,types);
+            reject_truncated(types);
+            ServiceTypeUpdateReplyMessageBody types_reply;
+            run(mode,dir,std::string("empty-service-type-")+state+"-reply",types_reply);
+            c=0; rich(types_reply,c);
+            run(mode,dir,std::string("rich-service-type-")+state+"-reply",types_reply);
+            reject_truncated(types_reply);
+        }
+        ReplicaMessageBody endpoint;
+        run(mode,dir,"empty-replica-endpoint-updated",endpoint);
+        c=0; rich(endpoint,c);
+        run(mode,dir,"rich-replica-endpoint-updated",endpoint);
+        reject_truncated(endpoint);
+        ReplicaReplyMessageBody endpoint_reply;
+        run(mode,dir,"empty-replica-endpoint-updated-reply",endpoint_reply);
+        c=0; rich(endpoint_reply,c); endpoint_reply.errorCode_.value_=Enum(-2147017398);
+        run(mode,dir,"rich-replica-endpoint-updated-reply",endpoint_reply);
+        reject_truncated(endpoint_reply);
+        ReportLoadMessageBody load;
+        run(mode,dir,"empty-report-load",load);
+        c=0; rich(load,c);
+        run(mode,dir,"rich-report-load",load);
+        reject_truncated(load);
+        ReportLoadMessageBody legacy_load;
+        c=0; rich(legacy_load.reports_,c); rich(legacy_load.senderTime_,c);
+        run(mode,dir,"legacy-report-load",legacy_load);
+        reject_truncated(legacy_load);
+        ReportLoadMessageBody modern_load;
+        c=0; rich(modern_load.reportsNew_,c); rich(modern_load.senderTime_,c);
+        run(mode,dir,"modern-report-load",modern_load);
+        reject_truncated(modern_load);
+        for(auto name:{u"NodeActivateRequest",u"NodeActivateReply",u"NodeDeactivateRequest",
+                      u"NodeDeactivateReply",u"NodeUpdateServiceRequest",u"NodeUpdateServiceReply",
+                      u"ServiceTypeEnabled",u"ServiceTypeDisabled",u"ServiceTypeEnabledReply",
+                      u"ServiceTypeDisabledReply",u"ReplicaEndpointUpdated",
+                      u"ReplicaEndpointUpdatedReply",u"ReportLoad"}) {
+            action.action_=text(name);
+            std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
+            run(mode,dir,"action-"+ascii,action);
+        }
+        bodyless(mode,dir,"empty-generation-proposal");
+        if(GenerationProposalActor!=12 || GenerationUpdateActor!=12 ||
+           GenerationProposalReplyActor!=11 || GenerationUpdateRejectActor!=11 ||
+           !GenerationProposalPriority || !GenerationProposalReplyPriority ||
+           !GenerationUpdatePriority || !GenerationUpdateRejectPriority)
+            throw std::runtime_error("native generation factory metadata mismatch");
+        GenerationProposalReplyMessageBody proposal_reply;
+        run(mode,dir,"default-generation-proposal-reply",proposal_reply);
+        c=0; rich(proposal_reply,c);
+        for(LONG error:{0, -2147017398, -2147017441}) {
+            proposal_reply.error_.value_=Enum(error);
+            run(mode,dir,"rich-generation-proposal-reply-"+std::to_string(error),proposal_reply);
+        }
+        reject_truncated(proposal_reply);
+        proposal_reply.proposedGeneration_.generation_=INT64_MAX;
+        proposal_reply.proposedGeneration_.owner_.high_=0x8000000000000001ULL;
+        proposal_reply.proposedGeneration_.owner_.low_=UINT64_MAX;
+        proposal_reply.currentGeneration_.generation_=INT64_MAX;
+        proposal_reply.currentGeneration_.owner_.high_=0x8000000000000002ULL;
+        proposal_reply.currentGeneration_.owner_.low_=0;
+        proposal_reply.error_.value_=Enum(-2147017398);
+        run(mode,dir,"tie-generation-proposal-reply",proposal_reply);
+        reject_truncated(proposal_reply);
+        GenerationUpdateMessageBody generation_update;
+        run(mode,dir,"default-generation-update",generation_update);
+        generation_update.fmServiceEpoch_.configurationVersion_=INT64_MIN+17;
+        generation_update.fmServiceEpoch_.dataLossVersion_=INT64_MAX-29;
+        run(mode,dir,"rich-generation-update",generation_update);
+        reject_truncated(generation_update);
+        GenerationNumber generation_reject;
+        run(mode,dir,"default-generation-update-reject",generation_reject);
+        generation_reject=proposal_reply.proposedGeneration_;
+        run(mode,dir,"high-generation-update-reject",generation_reject);
+        reject_truncated(generation_reject);
+        generation_reject.owner_.low_=UINT64_MAX-1;
+        run(mode,dir,"tie-generation-update-reject",generation_reject);
+        reject_truncated(generation_reject);
+        for(auto name:{u"GenerationProposal",u"GenerationProposalReply",
+                      u"GenerationUpdate",u"GenerationUpdateReject"}) {
+            action.action_=text(name);
+            std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
+            run(mode,dir,"action-"+ascii,action);
+        }
         // Native rejection is executed, not inferred from Rust behavior.
         auto bad=encode(request); bad.resize(bad.size()/2);
         ReplicaMessageBody rejected_request;
         if(decode(bad,rejected_request)) throw std::runtime_error("native accepted truncated request");
+        ++native_truncation_rejections;
         bad=encode(reply); bad.resize(5);
         ReplicaReplyMessageBody rejected_reply;
         if(decode(bad,rejected_reply)) throw std::runtime_error("native accepted truncated reply");
+        ++native_truncation_rejections;
         bad=encode(removal); bad.resize(bad.size()/2);
         DeleteReplicaMessageBody rejected_removal;
         if(decode(bad,rejected_removal)) throw std::runtime_error("native accepted truncated removal");
+        ++native_truncation_rejections;
         bad=encode(deletion); bad.resize(bad.size()/2);
         DeleteReplicaMessageBody rejected_deletion;
         if(decode(bad,rejected_deletion)) throw std::runtime_error("native accepted truncated DeleteReplica");
+        ++native_truncation_rejections;
         bad=encode(deletion_reply); bad.resize(bad.size()/2);
         ReplicaReplyMessageBody rejected_deletion_reply;
         if(decode(bad,rejected_deletion_reply)) throw std::runtime_error("native accepted truncated DeleteReplicaReply");
+        ++native_truncation_rejections;
         bad=encode(up); bad.resize(bad.size()/2);
         ReplicaUpMessageBody rejected_up;
         if(decode(bad,rejected_up)) throw std::runtime_error("native accepted truncated report");
+        ++native_truncation_rejections;
         bad=encode(notification); bad.resize(bad.size()/2);
         ServiceTypeNotificationRequestMessageBody rejected_notification;
         if(decode(bad,rejected_notification)) throw std::runtime_error("native accepted truncated notification");
+        ++native_truncation_rejections;
         bad=encode(notification_reply); bad.resize(bad.size()/2);
         ServiceTypeNotificationReplyMessageBody rejected_notification_reply;
         if(decode(bad,rejected_notification_reply)) throw std::runtime_error("native accepted truncated notification reply");
+        ++native_truncation_rejections;
         bad=encode(node_up); bad.resize(bad.size()/2);
         NodeUpMessageBody rejected_node_up;
         if(decode(bad,rejected_node_up)) throw std::runtime_error("native accepted truncated NodeUp");
+        ++native_truncation_rejections;
         bad=encode(ack); bad.resize(bad.size()/2);
         NodeUpAckMessageBody rejected_ack;
         if(decode(bad,rejected_ack)) throw std::runtime_error("native accepted truncated NodeUpAck");
+        ++native_truncation_rejections;
         bad=encode(ptop); bad.resize(bad.size()/2);
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
-        std::cout << "native rejects 11 truncations OK\n";
+        ++native_truncation_rejections;
+        if(native_truncation_rejections!=39)
+            throw std::runtime_error("native truncation coverage mismatch");
+        std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;
     } catch(const std::exception& error) {
         std::cerr << error.what() << "\n"; return 1;

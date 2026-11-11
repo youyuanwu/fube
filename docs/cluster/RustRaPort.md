@@ -24,8 +24,8 @@ now enables native-shaped AddPrimary/Reply with source-derived commit, initial
 deactivation, duplicate/stale and retry semantics over actual FM/RA channels.
 Normal FM DeleteReplica/Reply now closes that original volatile lifetime with
 source-derived epoch/ReplicaId checks, canonical dropped replies, native retry
-and separately joined disposal/accounting proof. Force deletion, recreation,
-DoReconfiguration, peer control, recovery and complete P4/M2 remain gated.
+and separately joined disposal/accounting proof. DoReconfiguration, peer control,
+recovery and complete P4/M2 remain gated.
 The [unexpected singleton loss slice](MinimalFmCluster.md#unexpected-singleton-app-host-loss)
 now delivers AppHostDown's ReplicaDown-stage/dropped-list ReplicaUp and its
 processed-list acknowledgment, including native closed-FT deletion afterward.
@@ -35,8 +35,54 @@ committed Close, keeping original disposal proof independent.
 The [normal singleton Drop slice](MinimalFmCluster.md#normal-singleton-drop-reporting)
 now reports through native ReplicaDropped stage with dropped-description ACK
 checks, without relabeling closing/closed Down lifetimes.
-FM records lost volatile state, not recovery/reuse; Abort/ForceAbort and closed-
-AddPrimary reporting and broader stateful choreography remain staged.
+The [singleton lifecycle completion](MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation)
+adds Abort/ForceAbort reporting, closed-AddPrimary delivery, native force Delete
+and missing/closed tombstone handling, plus explicitly authorized fresh
+recreation after normal deletion joins original disposal/accounting proof.
+FM records terminal loss as lost volatile state, not recovery/reuse;
+broader stateful choreography remains staged.
+A separate [peer-created Idle increment](MinimalFmCluster.md#peer-created-idle-replica-stage-4-increment)
+now connects an original Primary RA to one destination RA for the same
+partition. Native CreateReplica/Reply opens a real volatile Idle with its
+replication endpoint, not a built or active replica. A separate explicit
+build now copies real nonempty state and continues replication through RAP
+and application ACKs. Explicit Primary-side Idle removal now uses RAP's native
+cancellation/retry/tombstone semantics, separately from failed-build retry cleanup
+and remote deletion. FM AddReplica/Reply now owns original-Idle creation/build;
+FM RemoveReplica/Reply clears pending-remove only after original RAP removal.
+Separate FM DeleteReplica/Reply now deletes the already-opened abandoned
+destination Idle, joining original disposal/accounting proof independently of
+Primary pending-remove; it grants no replacement lifetime.
+An original unanswered FM Add can also delete a never-created destination:
+the native missing-FT tombstone/reply joins a distinct applied-Delete absence
+proof, never a fabricated runtime disposal receipt.
+Normal Delete also drains the original registered in-flight Idle Open through
+RAP cancellation/retry, joining genuine disposal proof rather than absence.
+Pre-registration Opening instead joins a distinct applied-Delete/pre-Open
+cancellation proof after all original lookup/acquisition ownership drains.
+An original definitive pre-Open registration failure now uses closed Delete
+and distinct applied-failure/Delete/drained-ownership proof, retaining its Add error.
+Terminal runtime Open failure now uses closed Delete without RAP Close,
+joining actual Abort/disposal, Applied failure/Delete and exact usage-release
+lineage while retaining its failed Add error.
+Unexpected app-host loss of the original opened destination now reports
+ReplicaDown-stage/dropped-list ReplicaUp and joins the processed ACK with
+closed metadata deletion, never disposal or independent Primary removal.
+That original open origin now survives committed normal Close/Drop so AppHostDown
+can supersede in-flight RAP cleanup without trusting late Close replies.
+Successful normal Close now reports through the same native down-stage
+metadata path, retaining genuine disposal/accounting proof separately.
+Normal Drop of that original opened Idle now reports through ReplicaDropped
+stage with dropped-description ACKs and the same independent cleanup boundaries.
+Normal non-force Abort of that original opened Idle now uses real RAP Abort
+and the same dropped-stage reporting, without ForceAbort admission or reuse.
+The [original-session Delete subprofile](MinimalFmCluster.md#complete-original-session-destination-delete-contract)
+now covers normal/force and opening/closing/closed/failed/absent/lost targets,
+including Delete-error ForceAbort, independently proved host loss and retained
+cleanup history after app exit. Missing ownership remains unproved/unknown;
+no deletion outcome authorizes replacement.
+Broader removal branches, active membership and reconfiguration
+remain gated.
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's
@@ -481,6 +527,232 @@ runtime dependency must be declared in producer artifacts and the consumer
 profile. Power-loss/filesystem guarantees require separate qualification beyond
 ordinary process termination.
 
+### FM-call completion roadmap
+
+This is the recommended dependency order, not a claim of complete FM support
+or a replacement for P1–P5 and M1–M4. Split each stage into small,
+independently qualified increments; completing one bounded profile does not
+complete every native branch of its handlers.
+
+The [source-pinned catalog](NativeRaProtocol.md) contains **58 FM-boundary action
+definitions**, including common registration, plus **eight peer RA actions**.
+There are 67 directional contracts because DoReconfiguration also has a peer
+send path. The current 31 selected FM-boundary and two selected peer action
+codecs have bounded handler/helper coverage, not complete native contracts;
+27 FM-boundary actions and six peer actions
+remain unselected, alongside broader branches of the selected handlers.
+
+Stage 1 is now implemented for the bounded volatile 1/1 FM profile; see
+[its supported paths and evidence limits](MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation).
+This does not qualify every native handler branch or complete P4/M2.
+
+| Stage | Remaining scope | Completion gate |
+|---|---|---|
+| 1. Finish singleton lifecycle | Abort/ForceAbort reporting, closed-AddPrimary handling and remaining DeleteReplica branches, then explicitly authorized fresh-lifetime recreation. | Preserve native close/report/ACK semantics and exact original accounting. Reporting and metadata completion cannot substitute for disposal proof or relabel lost volatile data as recovered empty state. |
+| 2. Complete node-wide coordination | Bounded implementation: broader P2 multi-entity execution; NodeActivateRequest/Reply, NodeDeactivateRequest/Reply, NodeUpdateServiceRequest/Reply, ServiceTypeEnabled/Disabled and their replies, existing registration notifications and complete ReportLoad codecs/forwarding. ReplicaEndpointUpdated/Reply codecs and endpoint helper only; live publication moves to stage 5. | Preserve sequence/version checks and action-specific completion barriers. Deactivation replies follow required replica closure, not admission; ReportLoad remains best-effort without an invented per-report ACK. Keep one FT per deployed Node; qualify multiple FTs in RA model/store tests. |
+| 3. Complete ordinary-FM generation and upload | Bounded generation-handshake increment implemented: GenerationProposal/Reply and GenerationUpdate/Reject. Remaining: LFUMUpload/Reply, nonempty NodeUp/NodeUpAck reconciliation and full ReplicaUp/Reply batching/final-upload handling. | Preserve proposed/receive/send generations and per-entity commit barriers. Only the correct semantic completion advances upload/readiness; keep restart serving disabled until stage 6. |
+| 4. Build and remove remote replicas | Bounded original two-node volatile Idle creation, nonempty copy/continuing replication, FM Add/build, pending/failed/opened Primary removal and same-lifetime retry/replay are implemented. The [original-session destination Delete contract](MinimalFmCluster.md#complete-original-session-destination-delete-contract) now covers normal/force and opening/closing/closed/failed/absent/lost targets, Delete-error Abort fallback, native closed/no-registration handling and separate original cleanup proofs. Close/Drop/Abort and opened/Close/Drop host-loss reporting retain native stage/ACK distinctions. Unproved cleanup stays explicit, never successful empty recovery. Remaining: fresh replacement, active configuration/reconfiguration/removal, broader lifecycle/report profiles and native interoperability qualification. | Copy completion grants no active membership, serving or FM success; AddReplicaReply is required for FM build completion and Ready/Idle is not ActiveSecondary. Only RemoveReplicaReply clears Primary pending-remove. Destination Delete independently joins its semantic reply with original disposal, absence, cancellation, known failure or positive owned-process-loss evidence. Metadata/report ACK alone is none of those cleanup proofs. Every outcome preserves original ownership, historical Add results and no peer reuse/replacement authority. |
+| 5. Implement reconfiguration | DoReconfiguration/Reply, peer GetLSN/Reply, Deactivate/Reply and Activate/Reply, ChangeConfiguration and DatalossReport. Include peer swap continuation. | Preserve native phase ordering, separate previous/current quorum obligations, catch-up/cancellation, old-primary fencing and endpoint publication. Qualify secondary replacement before primary transfer. |
+| 6. Enable durable RA restart | P5 loading/fixups, crash-window reconciliation, fresh incarnation and recovery with the original FM surviving. | Historical records cannot restore Primary authority. Prove predecessor fencing; rebuild volatile replicas from eligible survivors with valid history/quorum evidence or report data loss. |
+| 7. Add FMM ownership/rebuild | Independent FM/FMM readiness and generation domains, owner-specific uploads, GFUMTransfer and FM-service replica handling. | Supply matching FM/FMM/common-layer counterparts and required FM-service functionality. Ordinary FM acknowledgments cannot stand in for FMM; this does not authorize transparent FM restart. |
+| 8. Finish upgrades and catalog closure | Application/fabric upgrade and cancellation pairs, real Hosting/version adapters, remaining supported profiles and legacy/deprecated behavior. Resolve the PartitionNotification endpoint gap. | Every catalog entry needs its exact implementation or source-defined rejection/no-op behavior and evidence. Do not invent a successful handler to conceal a missing counterpart. |
+
+Every enabled exchange requires bidirectional native codec evidence,
+source-derived behavioral scenarios, normalized native/Rust handler traces and
+real RA/Hosting/RAP acceptance where applicable. Cover stale, duplicate,
+reordered and lost traffic, definite/unknown commits and independent physical
+cleanup. Missing required evidence must fail capability admission. Existing
+codec/helper and bounded native-free results do not establish full native
+handler or interoperability qualification.
+
+Message coverage is not full SF feature parity. Every native execution branch
+also needs its backing functionality, including persisted-service storage and
+genuine upgrade infrastructure where required; SQLite RA metadata supplies
+neither. Until qualified, active unsupported branches remain explicit gates,
+not completed contracts. Preserve source-defined legacy rejection/deprecation
+and the native ServiceBusy no-op distinctly from unsupported success-shaped
+stubs. Federation membership remains excluded, but peer reliability traffic
+remains required.
+
+Stage 2 is implemented within those explicit bounds; see
+[node-wide coordination](MinimalFmCluster.md#node-wide-coordination-stage-2).
+The coordinator includes accepted entries with private creation/close commits,
+retains reply capacity through multi-entity completion, binds service jobs to
+their owned group and suppresses group success after an updated job's failed
+commit. Native 900-second close deadlines and 15-second checks terminate only
+captured original hosts, once per monitor; termination is not closure proof.
+Status work keeps native five-second minimum starts, 30-second retries,
+current-sequence acknowledgments and independent history cleanup.
+
+The first stage-3 increment implements the ordinary-FM generation handshake;
+see [its opt-in execution and upload gate](MinimalFmCluster.md#ordinary-fm-generation-handshake-stage-3-increment).
+Proposal preprocessing retains the highest proposed generation independently
+of receive/send and replies through the original correlated request context.
+GenerationUpdate accepts only the current proposal, drops below-receive traffic
+and otherwise rejects with the native proposed-generation body. Entity workers
+read the current receive generation under the publication lock; private/unknown
+commits remain owned and cannot become inventory or upload success. Send
+generation never advances from the handshake. LFUM snapshot jobs and their
+per-entity completion barriers are still part of the next increment, not
+implemented by an `upload_pending` flag. The local FM-service epoch/ForceAbort
+branch and FMM domain remain capability-gated.
+
+The endpoint helper preserves the native separation from FM message state.
+Its timeout and pending/completed/reset behavior are qualified, but live
+publication remains gated: native invariants require an active reconfiguration.
+Stage 5 must integrate that helper with real RAP endpoint updates and FM replies,
+not publish a fresh Primary endpoint through a fabricated reconfiguration.
+
+Replica support is prioritized through a bounded stage-4 increment before
+remaining stage-3 upload work. The
+[peer Idle profile](MinimalFmCluster.md#peer-created-idle-replica-stage-4-increment)
+uses fresh startup and the original fixed FM generation. Primary RA issues
+CreateReplica to the exact original peer; destination RA commits before
+registration/Open and before publishing the native reply with its real
+replication endpoint. Idle remains InBuild and non-serving. The reply records
+remote Open only; separate `Cluster::build_idle_replica()` explicitly requests
+real RAP build/copy. Its original-session semantic completion proves the
+copy/application-ACK barrier, including nonempty state and retry results;
+continuing writes are also applied and ACKed on the destination. The Idle stays
+non-serving and unconfigured. Manual copy infers no AddReplicaReply. Separate
+`Cluster::add_idle_replica()` now sends native FM AddReplica, automatically
+continues peer Open into RAP build, and emits AddReplicaReply only after matching
+build success. Primary/FM bookkeeping becomes Ready/Idle, while the actual
+destination remains Idle/InBuild. Lost replies retry/replay the original
+request/result without another Open/build; creation failures require cleanup,
+ordinary build errors retain pending retry, and Close/removal fence late success.
+No active membership, catch-up quorum or quorum change is inferred. LFUM/restart/FMM and peer
+recreation/promotion remain gated. Explicit `Cluster::remove_idle_replica()`
+now abandons that opened original Idle through
+ReplicatorRemoveIdleReplica/Reply, fencing late build completion and retaining
+terminal incarnation tombstones. Failed-build retries instead use RAP's
+nonterminal cleanup before rebuilding; no successful build implicitly requests
+removal. Neither path disposes the destination service or changes membership.
+FM `remove_idle_replica_via_fm()` also cancels the original pending creation:
+native InCreate removal replies with the original InBuild descriptor and no RAP
+call. A late destination Open remains an owned non-serving lifetime, not deletion
+or permission to build; if Open wins at the Primary, post-Open RAP removal applies.
+An original failed creation now marks FM to-be-dropped/pending-remove while
+retaining its Add error. Its original descriptor is echoed by the Primary's
+absent-after-abort path without RAP. Semantic completion clears pending-remove,
+not the failed Add outcome or the independent destination cleanup obligation.
+`delete_idle_replica_via_fm()` now separately authorizes normal deletion of the
+already-opened original abandoned destination. Its matching DeleteReplicaReply
+and original disposal/committed-Close/exact-usage-release receipt are independent
+barriers; only their join completes destination cleanup. Native FM does not wait
+for Primary RemoveReplicaReply to schedule destination Delete, and deletion
+cannot clear pending-remove. Reply-loss retry/replay, held provider/service
+disposal, delayed peer traffic and real copied-data deletion preserve original
+ownership and healthy Primary serving. No new wire shape or active membership
+is introduced. For the original unanswered FM Add, normal Delete can now precede
+destination CreateReplica: the native missing-FT tombstone/reply joins an
+independently validated applied-Delete absence sidecar, with zero Open/Close,
+lookup or usage history. Completion explicitly says `never_created`, not
+`disposed`; late creation is ignored and cannot acquire a lifetime. Lost replies,
+commit barriers, independent Primary pending-remove and public original-child
+acceptance preserve that distinction. Registered in-flight Open now follows
+native Delete/Close cancellation and retries until the original callback and
+resources drain; returned controls are aborted before the service, not discarded.
+That branch requires genuine disposal proof, never absence, and retains the
+independent Primary pending-remove and commit barriers. Controlled provider/service
+holds, lost replies, late traffic and original child adapters exercise it.
+Pre-registration Opening now follows native immediate Close without runtime
+registration, preserving the original 1/1 FT description. Applied creation/Delete
+lineage and drained late lookup/acquisition ownership produce a distinct
+`pre_open_cancelled` proof, never disposal or zero-history absence. Native
+reply/proof joins, held real acquisitions, late registration and public original
+child adapters preserve the independent cleanup/removal barriers.
+Known pre-Open registration failure now supports normal closed Delete without
+RAP Close, joining applied original failure/lookup/creation and separate Delete
+lineage with exact drained local ownership. The failed Add/error survives;
+`failed_registration` completion is neither runtime disposal, pre-Open
+cancellation nor zero-history absence. Controlled real Hosting/process/Channel
+acceptance selects the existing native Drop=1 policy; production defaults are
+unchanged. Late offers/registration/Create, reply replay and commit/owner
+barriers are qualified separately from native C++ handler execution.
+Terminal runtime Open failure now joins original-runtime Abort/final-release
+reply provenance, Applied failure, exact original usage release and separate
+Applied closed Delete without RAP Close. `failed-open-deletion.json` remains
+distinct from successful-Close and no-runtime proofs. FM freezes the Add error;
+`failed_open` completion retains that failure and independent pending-remove.
+Actual provider/service disposal holds, lost-reply replay, late Create/Add and
+healthy Primary writes use the existing native dynamic Open Drop=1 policy for
+controlled Node/process/Channel qualification, without changing production
+defaults.
+The original opened Idle's AppHostDown now retains native ReplicaDown stage,
+sends the dropped wire entry immediately and retries at the existing 30-second
+interval. FM requires its original Add and live destination node session,
+returns the processed ACK list and tracks closed metadata Delete separately
+from disposal. Pending versus acknowledged Add and independent owner/commit
+barriers have model/store coverage; actual two-child acceptance kills the
+destination app, holds Primary removal, loses/replays ACK and metadata replies
+and verifies healthy Primary writes. Historical Add replies remain retained
+without restoring readiness. No cleanup sidecar or replacement is fabricated.
+Normal Close started from the original opened Idle now retains its origin
+through Closing; AppHostDown can supersede it without converting partial
+provider/service cleanup or late Close replies into disposal proof.
+Controlled owned-Node/process/Channel acceptance holds real provider/service
+cleanup, kills the app and verifies existing report/ACK/metadata and independent
+Primary removal/write behavior. Close/loss/ACK commit barriers and both race
+outcomes have model/store coverage. No child-node Close-control feature,
+wire shape, retry cadence or native handler qualification is added.
+Successful normal Close now records a distinct Applied terminal origin and
+uses the native down-stage/dropped-list report, processed ACK and closed
+metadata deletion without HostDown or a second RAP Close. Actual original
+disposal/usage proof remains stable and independently observable before ACK
+and after metadata replay; it is not FM retirement/replacement authority in
+this terminal-report flow. Held provider/service disposal and the real native
+30-second lost-ACK retry have controlled Node/process/Channel coverage, with
+separate completion/ACK commit tests and continued Primary writes/removal.
+Normal opened-Idle Drop now uses OnDropped/ReplicaDropped stage instead,
+with dropped-description ACK eligibility before and after the first retry.
+Committed original Close/Drop intent and matching successful RAP completion
+remain separate from disposal proof, FM ACK/closed metadata deletion and
+Primary pending-remove. Held provider/service disposal, actual 30-second
+lost-ACK retry, stable proof/metadata replay and original Primary writes have
+controlled Node/process/Channel coverage; intent/completion/ACK commits, both
+ACK lists, late relabeling and excluded origins have model/store coverage.
+Matching HostDown during the original committed opened-origin Drop now supersedes
+it through AppHostDown/ReplicaDown. Late RAP replies cannot certify disposal;
+successful Drop committing first retains ReplicaDropped and genuine disposal
+proof. Held provider/service process loss, an actual 30-second lost-ACK retry,
+metadata replay, independent Primary removal/writes and separate
+intent/loss/ACK commit/race barriers qualify this bounded extension.
+Normal non-force Abort now uses RAP Abort (`flags=4`) and native
+OnDropped/ReplicaDropped reporting after actual cleanup and committed completion.
+Node/RA share original opened-peer lineage admission; local-only, initial-Open
+and arbitrary closed lifetimes remain rejected. Abort cannot supersede pending
+closure merely because registration disappeared or relabel closed report state.
+Actual original disposal/accounting proof remains independent of FM ACK/closed
+metadata deletion and Primary pending-remove. Held provider/service Abort
+disposal, actual lost-ACK retry, stable proof/metadata replay and Primary writes
+have controlled Node/process/Channel coverage; admission, both ACK lists and
+intent/completion/ACK commit barriers have model/store coverage.
+The original-session Delete matrix is now complete within the volatile fixed
+profile: normal Delete waits/retries across existing closure, closed Delete is
+metadata-only, errors escalate through real Abort, and explicit force uses native
+Obliterate/owned-host termination or no-registration/closed completion.
+Locally deleted FTs retain message stage None; no synthetic report is left by
+Delete-error ForceAbort or loss during normal Delete. Native replies join
+original disposal, absence, cancellation, known failure or positive owned-process
+loss independently of Primary pending-remove. Actual applied histories survive
+later app exit with the same Node owner, never owner adoption; creation races
+can supply the actual stronger cleanup fact without rewriting the Add outcome.
+Unproved metadata and original owner loss stay incomplete/unknown.
+The consolidated model/store and actual process/Channel matrix includes held
+cleanup, force supersession, no-runtime force, proof conflicts, commit uncertainty
+and reply replay. HostDown during Abort and failed/ForceAbort reporting outside
+explicit Delete, broader unknown/foreign identities, replacement and recovery
+remain separate gates. No wire schema, timer or native handler qualification changes.
+This detour does not complete stage 3 or the full stage-4 FM build/removal
+choreography.
+
+Stage-two codec evidence contains 101 bidirectional cases, 73 types/233 fields,
+105 bundle files and 26 native truncation rejections. Native-derived model/store
+and actual native-free process/IPC tests do not supply complete normalized C++
+handler traces or native FM/Federation interoperability. Stages 3–8 and those
+broader evidence gates remain incomplete.
+
 ## 10. Limits and remaining implementation choices
 
 SQLite solves local transactions, not state-machine correctness, app-data
@@ -497,10 +769,10 @@ optional later protocol redesign. Broader native RA feature parity, persisted
 service storage, warm app adoption, transparent FM restart and native database
 migration require separate qualification beyond message preservation.
 
-The next work is broader P2 lifecycle infrastructure and the cluster M1
-interfaces, including real Hosting/RAP integration and native behavioral traces.
+Follow the [FM-call completion roadmap](#fm-call-completion-roadmap) for the
+remaining dependency order and the P1–P5/M1–M4 gates for qualification.
 This design document itself supplies no runnable cluster commands or evidence
-of those unimplemented stages.
+of the unimplemented stages.
 
 [native-store]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Storage.Api.IKeyValueStore.h#L16-L64
 [native-adapter]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Storage.LocalStoreAdapter.cpp#L205-L245

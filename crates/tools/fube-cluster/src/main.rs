@@ -1,7 +1,31 @@
+use clap::Parser;
 use fube_cluster::{Cluster, Command, Config, Result, ServiceProfile};
 use serde_json::json;
 use std::{io::Write, path::PathBuf, time::Duration};
 use tokio::io::{AsyncBufReadExt, BufReader};
+
+#[derive(Parser)]
+#[command(version, about = "Run a bounded local FM/RA cluster")]
+struct Arguments {
+    /// Private cluster profile directory.
+    #[arg(long, required_unless_present = "internal_node")]
+    root: Option<PathBuf>,
+
+    /// Cluster application executable.
+    #[arg(long, required_unless_present = "internal_node")]
+    app: Option<PathBuf>,
+
+    /// Run one volatile stateful Primary.
+    #[arg(long, conflicts_with = "stateful_peer_idle")]
+    stateful_singleton: bool,
+
+    /// Run a Primary and a peer-created Idle replica.
+    #[arg(long)]
+    stateful_peer_idle: bool,
+
+    #[arg(long, hide = true, conflicts_with_all = ["root", "app", "stateful_singleton", "stateful_peer_idle"])]
+    internal_node: Option<PathBuf>,
+}
 
 struct Lines {
     input: BufReader<tokio::io::Stdin>,
@@ -123,38 +147,32 @@ async fn serve(cluster: &mut Cluster) -> Result<Option<String>> {
     }
     Ok(quit)
 }
-async fn run() -> Result<bool> {
-    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments.len() == 2 && arguments[0] == "--internal-node" {
-        fube_cluster::internal_node(&PathBuf::from(&arguments[1])).await?;
+async fn run(arguments: Arguments) -> Result<bool> {
+    if let Some(path) = arguments.internal_node {
+        fube_cluster::internal_node(&path).await?;
         return Ok(true);
     }
-    let profile = if arguments.len() == 5 && arguments[4] == "--stateful-singleton" {
+    let profile = if arguments.stateful_singleton {
         ServiceProfile::StatefulSingleton
-    } else if arguments.len() == 4 {
-        ServiceProfile::Stateless
+    } else if arguments.stateful_peer_idle {
+        ServiceProfile::StatefulPeerIdle
     } else {
-        return Err("expected optional --stateful-singleton after --root/--app".into());
+        ServiceProfile::Stateless
     };
-    if arguments[0] != "--root" || arguments[2] != "--app" {
-        return Err(
-            "usage: fube-cluster --root /private/profile --app /absolute/cluster-stateless-app"
-                .into(),
-        );
-    }
     foreground(
-        PathBuf::from(&arguments[1]),
-        PathBuf::from(&arguments[3]),
+        arguments.root.expect("clap requires --root"),
+        arguments.app.expect("clap requires --app"),
         profile,
     )
     .await
 }
 fn main() {
+    let arguments = Arguments::parse();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("foreground runtime");
-    let result = runtime.block_on(run());
+    let result = runtime.block_on(run(arguments));
     let code = match result {
         Ok(true) => 0,
         Ok(false) => 1,
@@ -166,4 +184,72 @@ fn main() {
     // Tokio stdin is a bounded blocking OS read. Explicit process exit avoids
     // waiting on another operator input after all owned lifecycle work closed.
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_foreground_profiles_and_original_internal_node() {
+        for profile in ["--stateful-singleton", "--stateful-peer-idle"] {
+            let args = Arguments::try_parse_from([
+                "fube-cluster",
+                profile,
+                "--app",
+                "/app",
+                "--root",
+                "/root",
+            ])
+            .unwrap();
+            assert_eq!(args.root, Some(PathBuf::from("/root")));
+            assert_eq!(args.app, Some(PathBuf::from("/app")));
+            assert_eq!(args.stateful_singleton, profile == "--stateful-singleton");
+            assert_eq!(args.stateful_peer_idle, profile == "--stateful-peer-idle");
+        }
+        let args =
+            Arguments::try_parse_from(["fube-cluster", "--internal-node", "/node.json"]).unwrap();
+        assert_eq!(args.internal_node, Some(PathBuf::from("/node.json")));
+        assert!(args.root.is_none() && args.app.is_none());
+    }
+
+    #[test]
+    fn rejects_incomplete_mixed_and_duplicate_modes() {
+        for args in [
+            vec![],
+            vec!["--root", "/root"],
+            vec!["--internal-node"],
+            vec!["--internal-node", "/node", "--app", "/app"],
+            vec!["--internal-node", "/node", "--stateful-peer-idle"],
+            vec![
+                "--root",
+                "/root",
+                "--app",
+                "/app",
+                "--stateful-singleton",
+                "--stateful-peer-idle",
+            ],
+            vec!["--root", "/root", "--root", "/other", "--app", "/app"],
+        ] {
+            assert!(
+                Arguments::try_parse_from(std::iter::once("fube-cluster").chain(args)).is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_non_unicode_paths() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let root = OsString::from_vec(b"/root-\xff".to_vec());
+        let args = Arguments::try_parse_from([
+            OsString::from("fube-cluster"),
+            OsString::from("--root"),
+            root.clone(),
+            OsString::from("--app"),
+            OsString::from("/app"),
+        ])
+        .unwrap();
+        assert_eq!(args.root, Some(PathBuf::from(root)));
+    }
 }

@@ -6,12 +6,16 @@ explicitly prebuilt Rust example. Never called by acceptance as a fallback.
 import argparse
 import hashlib
 import json
+import os
 import platform
 import shutil
 import subprocess
 from pathlib import Path
 
-from .schema import EXTRA_NATIVE_INPUTS, MODELS, REVISION, generate, native_constants
+from .schema import (
+    EXTRA_NATIVE_INPUTS, MODELS, REVISION, generate, generation_factories, native_constants,
+    peer_factories, replica_factories,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 NATIVE = ROOT / "tests/ra_protocol/native"
@@ -60,6 +64,9 @@ def produce(native, out, cxx, rust):
         raise ValueError("Rust executable not built with current FUBE_RA_SOURCE_DIGEST")
     out.mkdir(parents=True, exist_ok=False)
     (out / "native").mkdir()
+    # Keep compiler intermediates inside the caller-owned evidence directory.
+    scratch = out.parent / f"{out.name}-scratch"
+    scratch.mkdir(parents=True, exist_ok=False)
     models = generate(native, out / "schema.h")
     prod = native / "src/prod"
     serial = prod / "shared/serialization"
@@ -70,7 +77,11 @@ def produce(native, out, cxx, rust):
     command.extend(str(NATIVE / name) for name in ["platform.cpp", "fixture.cpp"])
     command.extend(str(serial / "src" / name) for name in SOURCES)
     command.extend(["-o", str(out / "native-oracle")])
-    subprocess.run(command, check=True, timeout=180)
+    try:
+        subprocess.run(command, env={**os.environ, "TMPDIR": str(scratch)},
+                       check=True, timeout=180)
+    finally:
+        shutil.rmtree(scratch)
     shutil.copy2(rust, out / "ra-conformance")
     subprocess.run([str(out / "native-oracle"), "produce", str(out / "native")],
                    check=True, timeout=30)
@@ -95,6 +106,9 @@ def produce(native, out, cxx, rust):
         "compiler_version": subprocess.check_output([str(cxx), "--version"], text=True),
         "schema_types": len(models), "schema_fields": sum(len(m[4]) for m in models),
         "native_constants": native_constants(native),
+        "generation_factories": generation_factories(native),
+        "peer_factories": peer_factories(native),
+        "replica_factories": replica_factories(native),
         "cases": sorted(p.stem for p in (out / "native").glob("*.bin")),
         "files": {str(p.relative_to(out)): digest(p) for p in sorted(out.rglob("*"))
                   if p.is_file()},

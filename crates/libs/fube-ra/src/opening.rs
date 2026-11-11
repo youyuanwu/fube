@@ -176,13 +176,27 @@ fn fail(state: &mut EntityState, error: i64, effects: &mut Vec<Effect>) {
     }
     release_usage(state, effects);
     effects.push(Effect::Health(HealthEvent::Close));
-    effects.push(reply(&captured, error, state.fm_primary));
+    effects.push(peer::creation_reply(state, &captured, error));
+    if state.peer_creation.is_some() {
+        effects.push(Effect::StatefulClosePending {
+            body: state.body.clone(),
+            mode: CloseMode::Drop,
+        });
+    }
 }
 pub(super) fn registration_success(event: &RegistrationCompletion) -> bool {
     event.error == 0
         || (event.error == HOSTING_REGISTRATION_VERSION_MISMATCH
             && !event.registration.host.is_empty()
             && (!event.upgrade_present || event.required_upgrade <= event.version.instance))
+}
+fn fail_registration(state: &mut EntityState, error: i64, effects: &mut Vec<Effect>) {
+    if state.runtime.is_none() && state.usage.is_none() {
+        if let Some(peer) = &mut state.peer_creation {
+            peer.registration_error = Some(error);
+        }
+    }
+    fail(state, error, effects);
 }
 pub(super) fn registered(
     mut state: EntityState,
@@ -250,11 +264,11 @@ pub(super) fn registered(
                     },
                 ));
             }
-            Action::Drop => fail(&mut state, event.error, &mut effects),
+            Action::Drop => fail_registration(&mut state, event.error, &mut effects),
             Action::None => {}
         }
     } else {
-        fail(&mut state, event.error, &mut effects);
+        fail_registration(&mut state, event.error, &mut effects);
     }
     // Native registration retry job selects memory update even for terminal FSR.
     Ok(lifecycle::changed(state, effects, false))
@@ -271,7 +285,14 @@ pub(super) fn runtime_failure(
         .policy(RetryState::Opening)
         .failure(&mut state.open_failures)?
     {
-        Action::Drop => fail(&mut state, error, &mut effects),
+        Action::Drop => {
+            if error != APPLICATION_HOST_CRASH && state.runtime.is_some() && state.usage.is_some() {
+                if let Some(peer) = &mut state.peer_creation {
+                    peer.open_error = Some(error);
+                }
+            }
+            fail(&mut state, error, &mut effects);
+        }
         Action::Warning => effects.push(health(HealthEvent::OpenWarning, error, detail)),
         Action::None => {}
     }
@@ -328,6 +349,9 @@ pub(super) fn complete(
                     || if current.body.replica.current_role == 4 {
                         event.replica.service_endpoint.is_empty()
                             || event.replica.replication_endpoint.is_empty()
+                    } else if current.peer_creation.is_some() {
+                        !event.replica.service_endpoint.is_empty()
+                            || event.replica.replication_endpoint.is_empty()
                     } else {
                         !event.replica.service_endpoint.is_empty()
                     }))
@@ -369,6 +393,6 @@ pub(super) fn complete(
     if state.fm_primary {
         state.primary_deactivation = Some((state.body.unit.current, 0));
     }
-    effects.push(reply(&state.body, 0, state.fm_primary));
+    effects.push(peer::creation_reply(&state, &state.body, 0));
     Ok(lifecycle::changed(state, effects, true))
 }

@@ -7,6 +7,7 @@ license = "MIT"
 description = "Test-only native classic replicator ABI fixture; not a production runtime"
 
 [dependencies]
+clap.workspace = true
 mssf-core = "0.10"
 mssf-com = { version = "0.10", features = ["ServiceFabric_FabricRuntime", "ServiceFabric_FabricCommon", "ServiceFabric_FabricTypes"] }
 windows_core = { package = "mssf-pal", version = "0.10" }

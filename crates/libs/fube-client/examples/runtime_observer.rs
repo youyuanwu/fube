@@ -1,16 +1,57 @@
 //! Independent native resolution and application RPC oracle, not runtime state.
+use clap::Parser;
 use fube_client::{
     ClientOptions, DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
     DeployedReplicaQueryDescription, DeployedReplicaQueryParameters, FabricClient, NamingUri,
     PartitionKey, PartitionQueryDescription, PartitionQueryParameters, ReplicaQueryDescription,
     ReplicaQueryParameters, ServiceEndpointRole, ServiceKind,
 };
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 type ObserverResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Parser)]
+#[command(about = "Independently observe a native service and its sample RPC endpoint",
+    group(clap::ArgGroup::new("mode").args(["deployed_replicas", "move_primary", "stateful"])))]
+struct Arguments {
+    gateway: SocketAddr,
+    service: NamingUri,
+    #[arg(value_parser = partition_key, conflicts_with = "mode")]
+    partition: Option<PartitionKey>,
+    #[arg(value_parser = report_query, requires = "partition", conflicts_with = "mode")]
+    report_query: Option<String>,
+    #[arg(long, value_name = "NODE")]
+    deployed_replicas: Option<String>,
+    #[arg(long, value_name = "NODE")]
+    move_primary: Option<String>,
+    #[arg(long)]
+    stateful: bool,
+}
+
+fn partition_key(value: &str) -> Result<PartitionKey, String> {
+    match value {
+        "-" => Ok(PartitionKey::Singleton),
+        value if value.starts_with("int:") => value[4..]
+            .parse()
+            .map(PartitionKey::Int64)
+            .map_err(|error| format!("invalid Int64 partition key: {error}")),
+        value => Ok(PartitionKey::Named(value.into())),
+    }
+}
+
+fn report_query(value: &str) -> Result<String, String> {
+    if value.len() > 1024
+        || value
+            .bytes()
+            .any(|b| !b.is_ascii_alphanumeric() && !b"-_=&".contains(&b))
+    {
+        return Err("unsupported bounded sample report query".into());
+    }
+    Ok(value.into())
+}
 
 async fn http_status(address: &str) -> ObserverResult<(u16, serde_json::Value)> {
     http_status_limit(address, 16_384).await
@@ -262,15 +303,8 @@ async fn stateful_snapshot(
     )
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
-    if !(2..=4).contains(&args.len()) {
-        return Err(
-            "usage: runtime_observer GATEWAY_IP:PORT fabric:/APP/SERVICE [NAMED_PARTITION|int:I64|-] [REPORT_QUERY]"
-                .into(),
-        );
-    }
-    let channel = FabricClient::endpoint_clear(args[0].parse()?)?
+async fn run(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
+    let channel = FabricClient::endpoint_clear(args.gateway)?
         .connect_timeout(Duration::from_secs(10))
         .connect()
         .await?;
@@ -281,9 +315,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         },
     )?;
-    let name: NamingUri = args[1].parse()?;
-    if args.len() == 4 && args[2] == "--deployed-replicas" {
-        let application: NamingUri = args[1]
+    let name = args.service;
+    let service = name.as_str();
+    if let Some(node) = args.deployed_replicas {
+        let application: NamingUri = service
             .rsplit_once('/')
             .ok_or("service application")?
             .0
@@ -291,7 +326,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let values = client
             .get_deployed_replica_list(
                 &DeployedReplicaQueryDescription::new(DeployedReplicaQueryParameters::new(
-                    &args[3],
+                    &node,
                     application,
                 )),
                 Some(Duration::from_secs(10)),
@@ -302,58 +337,46 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         let values: Vec<_> = values
             .into_iter()
-            .filter(|v| v.service_name == args[1])
+            .filter(|v| v.service_name == service)
             .collect();
         println!(
             "{}",
-            serde_json::json!({"observer":"fube-client","node":args[3],"service":args[1],
+            serde_json::json!({"observer":"fube-client","node":node,"service":service,
             "deployed":values,"fixture_contacted":false})
         );
         client.close().await?;
         return Ok(());
     }
-    if args.len() == 4 && args[2] == "--move-primary" {
+    if let Some(target) = args.move_primary {
         let before = stateful_snapshot(&client, &name).await?;
         let partition = before["partition"].as_str().ok_or("partition")?.parse()?;
         if !before["replicas"]
             .as_array()
             .ok_or("native replicas")?
             .iter()
-            .any(|replica| replica["node"] == args[3] && replica["role"] == "ActiveSecondary")
+            .any(|replica| replica["node"] == target && replica["role"] == "ActiveSecondary")
         {
             return Err("target is not an independently observed active secondary".into());
         }
         client
-            .move_primary(partition, &args[3], Some(Duration::from_secs(60)))
+            .move_primary(partition, &target, Some(Duration::from_secs(60)))
             .await?;
         println!(
             "{}",
             serde_json::json!({"request":"MovePrimary","partition":partition.to_string(),
-            "target":args[3],"constraints":"enforced","native_request_completed":true})
+            "target":target,"constraints":"enforced","native_request_completed":true})
         );
         client.close().await?;
         return Ok(());
     }
-    if args.len() == 3 && args[2] == "--stateful" {
+    if args.stateful {
         let snapshot = stateful_snapshot(&client, &name).await?;
         println!("{snapshot}");
         client.close().await?;
         return Ok(());
     }
-    let key = match args.get(2) {
-        None => PartitionKey::Singleton,
-        Some(value) if value == "-" => PartitionKey::Singleton,
-        Some(value) if value.starts_with("int:") => PartitionKey::Int64(value[4..].parse()?),
-        Some(value) => PartitionKey::Named(value.clone()),
-    };
-    let query = args.get(3).map_or("", String::as_str);
-    if query.len() > 1024
-        || query
-            .bytes()
-            .any(|b| !b.is_ascii_alphanumeric() && !b"-_=&".contains(&b))
-    {
-        return Err("unsupported bounded sample report query".into());
-    }
+    let key = args.partition.unwrap_or(PartitionKey::Singleton);
+    let query = args.report_query.as_deref().unwrap_or("");
     let resolved = client
         .resolve_service_partition(&name, &key, None, Some(Duration::from_secs(10)))
         .await?;
@@ -393,7 +416,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         let (_, body) = response.split_once("\r\n\r\n").ok_or("missing RPC body")?;
         let rpc: serde_json::Value = serde_json::from_str(body)?;
-        let application = args[1]
+        let application = service
             .rsplit_once('/')
             .ok_or("service must belong to app")?
             .0;
@@ -431,7 +454,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
+    if let Err(error) = run(Arguments::parse()).await {
         eprintln!("{error}");
         std::process::exit(1)
     }
@@ -440,6 +463,55 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(suffix: &str) -> Result<Arguments, clap::Error> {
+        let input = format!("runtime_observer 127.0.0.1:19000 fabric:/App/Service {suffix}");
+        Arguments::try_parse_from(input.split_whitespace())
+    }
+
+    #[test]
+    fn parses_legacy_observer_modes_and_partition_queries() {
+        assert!(parse("").unwrap().partition.is_none());
+        assert!(parse("--stateful").unwrap().stateful);
+        assert_eq!(
+            parse("--move-primary N1").unwrap().move_primary.as_deref(),
+            Some("N1")
+        );
+        assert_eq!(
+            parse("--deployed-replicas N2")
+                .unwrap()
+                .deployed_replicas
+                .as_deref(),
+            Some("N2")
+        );
+        let args = parse("- report=bounded").unwrap();
+        assert!(matches!(args.partition, Some(PartitionKey::Singleton)));
+        assert_eq!(args.report_query.as_deref(), Some("report=bounded"));
+        assert!(matches!(
+            parse("int:-42").unwrap().partition,
+            Some(PartitionKey::Int64(-42))
+        ));
+        assert!(
+            matches!(parse("named").unwrap().partition, Some(PartitionKey::Named(name)) if name == "named")
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_modes_and_unbounded_queries_before_connecting() {
+        for suffix in [
+            "--stateful --move-primary N1",
+            "named --stateful",
+            "--deployed-replicas",
+            "--unknown",
+            "int:invalid",
+            "- report=invalid?",
+            "- query extra",
+        ] {
+            assert!(parse(suffix).is_err(), "{suffix}");
+        }
+        assert!(parse(&format!("- {}", "a".repeat(1025))).is_err());
+    }
+
     async fn serve(body: String, padding: usize) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

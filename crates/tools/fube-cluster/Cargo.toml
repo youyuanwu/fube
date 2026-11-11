@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+clap.workspace = true
 fube-hosting = { path = "../../libs/fube-hosting" }
 fube-local-host = { path = "../../libs/fube-local-host" }
 fube-node = { path = "../../libs/fube-node" }

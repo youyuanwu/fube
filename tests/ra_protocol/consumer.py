@@ -29,6 +29,66 @@ CASES = {
     "rich-delete-replica-reply-0", "rich-delete-replica-reply--2147017398",
     "action-DeleteReplica", "action-DeleteReplicaReply",
 }
+STAGE_TWO_ACTIONS = {
+    "NodeActivateRequest", "NodeActivateReply", "NodeDeactivateRequest", "NodeDeactivateReply",
+    "NodeUpdateServiceRequest", "NodeUpdateServiceReply", "ServiceTypeEnabled",
+    "ServiceTypeDisabled", "ServiceTypeEnabledReply", "ServiceTypeDisabledReply",
+    "ReplicaEndpointUpdated", "ReplicaEndpointUpdatedReply", "ReportLoad",
+}
+STAGE_TWO_ROOTS = {
+    "node-activate-request", "node-activate-reply", "node-deactivate-request",
+    "node-deactivate-reply", "node-update-service-request", "node-update-service-reply",
+    "service-type-enabled", "service-type-disabled", "service-type-enabled-reply",
+    "service-type-disabled-reply", "replica-endpoint-updated", "replica-endpoint-updated-reply",
+    "report-load",
+}
+CASES |= {f"{profile}-{root}" for root in STAGE_TWO_ROOTS for profile in ["empty", "rich"]}
+CASES |= {f"action-{action}" for action in STAGE_TWO_ACTIONS}
+CASES |= {"fmm-node-activate-request", "fmm-node-deactivate-request",
+          "legacy-report-load", "modern-report-load"}
+GENERATION_ACTIONS = {
+    "GenerationProposal", "GenerationProposalReply", "GenerationUpdate", "GenerationUpdateReject",
+}
+GENERATION_FACTORIES = {
+    action: {"actor": 12 if action in {"GenerationProposal", "GenerationUpdate"} else 11,
+             "high_priority": True}
+    for action in GENERATION_ACTIONS
+}
+GENERATION_CASES = {
+    "empty-generation-proposal", "default-generation-proposal-reply",
+    "rich-generation-proposal-reply-0", "rich-generation-proposal-reply--2147017398",
+    "rich-generation-proposal-reply--2147017441", "tie-generation-proposal-reply",
+    "default-generation-update", "rich-generation-update",
+    "default-generation-update-reject", "high-generation-update-reject",
+    "tie-generation-update-reject",
+} | {f"action-{action}" for action in GENERATION_ACTIONS}
+CASES |= GENERATION_CASES
+PEER_ACTIONS = {"CreateReplica", "CreateReplicaReply"}
+PEER_FACTORIES = {action: {"actor": 12, "high_priority": True} for action in PEER_ACTIONS}
+PEER_CASES = {
+    "default-create-replica", "rich-create-replica", "initial-create-replica",
+    "default-create-replica-reply", "rich-create-replica-reply-0",
+    "rich-create-replica-reply--2147017398",
+} | {f"action-{action}" for action in PEER_ACTIONS}
+CASES |= PEER_CASES
+REPLICA_FACTORIES = {
+    "AddReplica": {"actor": 12, "high_priority": True},
+    "AddReplicaReply": {"actor": 11, "high_priority": True},
+    "RemoveReplica": {"actor": 12, "high_priority": True},
+    "RemoveReplicaReply": {"actor": 11, "high_priority": True},
+}
+REPLICA_CASES = {
+    "default-add-replica", "rich-add-replica", "default-add-replica-reply",
+    "rich-add-replica-reply-0", "rich-add-replica-reply--2147017398",
+    "action-AddReplica", "action-AddReplicaReply",
+    "default-remove-replica", "rich-remove-replica", "default-remove-replica-reply",
+    "rich-remove-replica-reply-0", "rich-remove-replica-reply--2147017398",
+    "action-RemoveReplica", "action-RemoveReplicaReply",
+    "in-create-remove-replica-reply",
+}
+CASES |= REPLICA_CASES
+SCHEMA_TYPES = 77
+SCHEMA_FIELDS = 240
 
 
 def validate(bundle, expected_head, expected_source):
@@ -48,9 +108,12 @@ def validate(bundle, expected_head, expected_source):
     calculated_source = hashlib.sha256(
         json.dumps(manifest.get("source_inputs", {}), sort_keys=True).encode()
     ).hexdigest()
-    if (calculated_source != expected_source or manifest.get("schema_types") != 59
-            or manifest.get("schema_fields") != 199
+    if (calculated_source != expected_source or manifest.get("schema_types") != SCHEMA_TYPES
+            or manifest.get("schema_fields") != SCHEMA_FIELDS
             or manifest.get("native_constants") != {"PToP": 0x8013, "PToPDirect": 0}
+            or manifest.get("generation_factories") != GENERATION_FACTORIES
+            or manifest.get("peer_factories") != PEER_FACTORIES
+            or manifest.get("replica_factories") != REPLICA_FACTORIES
             or not manifest.get("native_sources")):
         raise ValueError("source/schema manifest mismatch")
     expected_files = {"schema.h", "native-oracle", "ra-conformance"} | {
