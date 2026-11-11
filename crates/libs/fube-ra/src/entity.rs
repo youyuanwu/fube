@@ -1717,6 +1717,7 @@ fn transition(
             }
             // Native locked-entity TCP admission precedes processor prechecks,
             // description updates and identity decisions. No receipt-time latch.
+            let mut replacing_peer = false;
             if let Some(current) = state {
                 if peer_creation.is_some() && current.phase == Phase::Closed {
                     // Native SendReplicaDroppedMessage suppresses a locally deleted replica.
@@ -1732,7 +1733,45 @@ fn transition(
                     {
                         return Ok(Transition::ignored(Disposition::IgnoredStale));
                     }
-                    return Err(Failure::Unsupported("peer tombstone recreation is gated"));
+                    if current.local_deleted
+                        && body.replica.id < current.body.replica.id
+                        && body.replica.instance < current.body.replica.instance
+                        && body.unit.current == current.body.unit.current
+                        && service == current.body.service
+                    {
+                        let mut reply_body = body.clone();
+                        reply_body.unit = current.body.unit.clone();
+                        return Ok(Transition {
+                            update: Update::None,
+                            effects: vec![peer::creation_reply(
+                                current,
+                                &reply_body,
+                                lifecycle::STALE_REQUEST,
+                            )],
+                            disposition: Disposition::Applied,
+                        });
+                    }
+                    replacing_peer = current.local_deleted
+                        && current.fm_stage == FmStage::None
+                        && current.close_token != 0
+                        && current.runtime.is_none()
+                        && current.usage.is_none()
+                        && current.registration_lookups.is_empty()
+                        && current.peer_creation.as_ref().is_some_and(|origin| {
+                            !origin.host_down
+                                && origin.registration_error.is_none()
+                                && origin.open_error.is_none()
+                                && origin.delete_operation != 0
+                        })
+                        && body.replica.id > current.body.replica.id
+                        && body.replica.instance > current.body.replica.instance
+                        && body.unit.current == current.body.unit.current
+                        && service == current.body.service;
+                    if !replacing_peer {
+                        return Err(Failure::Unsupported(
+                            "peer recreation requires a deleted original runtime lifetime",
+                        ));
+                    }
                 }
                 if current.peer_creation.as_ref().map(|origin| &origin.source)
                     != peer_creation.as_ref().map(|origin| &origin.source)
@@ -1821,7 +1860,7 @@ fn transition(
                     disposition: Disposition::Applied,
                 });
             }
-            if let Some(current) = state {
+            if let Some(current) = state.filter(|_| !replacing_peer) {
                 if fm_primary {
                     return lifecycle::primary_existing(work, current, &body);
                 }

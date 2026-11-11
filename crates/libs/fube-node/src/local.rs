@@ -617,7 +617,13 @@ impl Node {
                                 if original == body)
                         }),
                         Some(state) => {
-                            state.body.replica.id == incoming.replica.id
+                            (state.body.replica.id == incoming.replica.id
+                                || self.selected.as_ref().is_some_and(|selected| {
+                                    incoming.replica.id == selected.replica.id
+                                        && incoming.replica.instance <= selected.replica.instance
+                                        && state.body.replica.id > selected.replica.id
+                                        && state.body.replica.instance > selected.replica.instance
+                                }))
                                 && ((never_created(state)
                                     && state.body.replica.instance == incoming.replica.instance)
                                     || (state.peer_creation.is_some()
@@ -781,18 +787,15 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         let base = &body.replica.0;
-        let retired_original =
-            self.ra
-                .snapshot(base.unit.id.guid.0)
-                .committed
-                .is_some_and(|state| {
-                    state.phase == ra::Phase::Closed
-                        && state.local_deleted
-                        && state.body.replica.node == base.replica.node
-                        && state.body.replica.id == base.replica.id
-                        && state.body.replica.instance == base.replica.instance
-                        && state.body.unit == base.unit
-                });
+        let current = self.ra.snapshot(base.unit.id.guid.0).committed;
+        let retired_original = current.as_ref().is_some_and(|state| {
+            state.phase == ra::Phase::Closed
+                && state.local_deleted
+                && state.body.replica.node == base.replica.node
+                && state.body.replica.id == base.replica.id
+                && state.body.replica.instance == base.replica.instance
+                && state.body.unit == base.unit
+        });
         if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
             || self.ra.peer().as_ref() != Some(source)
             || generation.for_fm_replica
@@ -800,6 +803,43 @@ impl Node {
             || !self.ra.consumer_lifetime().is_accepting()
         {
             return Err(Error::Unsupported);
+        }
+        if let Some(current) = current.as_ref().filter(|state| {
+            state.phase == ra::Phase::Closed && base.replica.instance > state.body.replica.instance
+        }) {
+            let admitted_retry = self.pending.iter().any(|pending| {
+                matches!(&pending.work, Work::PeerCreate(approved, ..) if approved.as_ref() == &body)
+                    && pending.ticket.as_ref().is_none_or(|ticket| {
+                        matches!(
+                            ticket.observation(),
+                            ra::TicketObservation::Status(
+                                ra::Status::Pending | ra::Status::Unknown | ra::Status::Complete(Ok(_))
+                            )
+                        )
+                    })
+            });
+            if !current.local_deleted
+                || current.fm_stage != ra::FmStage::None
+                || base.replica.id <= current.body.replica.id
+                || self
+                    .activation
+                    .session_status()?
+                    .is_none_or(|session| !session.connected)
+                || self
+                    .activation
+                    .process_status()
+                    .is_none_or(|process| process.exit_observed)
+                || (!admitted_retry
+                    && (self.instance_disposal().is_none()
+                        || !self.quiescent()
+                        || !self.commands.is_empty()
+                        || self
+                            .external
+                            .iter()
+                            .any(|work| work.effect.is_replica_reporting())))
+            {
+                return Err(Error::Busy);
+            }
         }
         self.check_service(base, true)?;
         if to_vec(&body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
@@ -2119,6 +2159,12 @@ impl Node {
             } => {
                 if !self.room() {
                     return Ok(());
+                }
+                if self.disposal.as_ref().is_some_and(|witness| {
+                    body.replica.id > witness.proof.body.replica.id
+                        && body.replica.instance > witness.proof.body.replica.instance
+                }) {
+                    self.disposal = None;
                 }
                 self.lookup(*token, *lookup, body, *usage)?;
                 LocalDisposition::LocalResponse

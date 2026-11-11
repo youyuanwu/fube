@@ -273,9 +273,21 @@ fn create_remote(
     );
     if let Some(previous) = &current.remote_idle {
         if previous.body.as_ref() != &body || previous.target != target.node {
-            return Err(Failure::Unsupported("remote Idle replacement is gated"));
-        }
-        if previous.reply.is_some() || previous.removal.is_some() {
+            let old = &previous.body.replica.0.replica;
+            if previous.target != target.node
+                || previous.fm_request.is_none()
+                || previous
+                    .removal
+                    .as_ref()
+                    .is_none_or(|removal| removal.result != Some(0) || removal.fm_request.is_none())
+                || target.id <= old.id
+                || target.instance <= old.instance
+            {
+                return Err(Failure::Unsupported(
+                    "fresh Idle requires completed original FM removal",
+                ));
+            }
+        } else if previous.reply.is_some() || previous.removal.is_some() {
             return Ok(Transition::ignored(Disposition::IgnoredStale));
         }
     }
@@ -345,9 +357,23 @@ pub(super) fn add_from_fm(
             return Ok(Transition::ignored(Disposition::IgnoredStale));
         }
         if remote.fm_request.as_deref() != Some(&body) {
-            return Err(Failure::Unsupported(
-                "remote replacement or manual-build adoption is gated",
-            ));
+            if remote.fm_request.is_none()
+                || body.replica.instance == remote.body.replica.0.replica.instance
+            {
+                return Err(Failure::Unsupported(
+                    "manual-build adoption or changed same-lifetime AddReplica is gated",
+                ));
+            }
+            let mut transition =
+                create_remote(body.replica.clone(), Some(current), admission, peer)?;
+            if let Update::Memory(state) = &mut transition.update {
+                state
+                    .remote_idle
+                    .as_mut()
+                    .expect("created remote")
+                    .fm_request = Some(Arc::new(body));
+            }
+            return Ok(transition);
         }
         if remote.removal.is_some() {
             return Ok(Transition::ignored(Disposition::IgnoredStale));

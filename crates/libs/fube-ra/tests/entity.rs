@@ -3870,19 +3870,97 @@ async fn fm_peer_idle_delete_uses_stateful_reply_and_retains_original_deleted_to
         Disposition::IgnoredStale
     );
     assert!(effects(&executor).is_empty());
-    let mut replacement = request;
+    let mut replacement = request.clone();
     replacement.replica.0.replica.id += 1;
     replacement.replica.0.replica.instance += 1;
-    assert!(matches!(
-        executor
-            .submit(peer_create(replacement))
-            .unwrap()
-            .wait(WAIT)
-            .await,
-        Err(Failure::Unsupported(_))
-    ));
-    assert_eq!(hooks.calls.load(Ordering::SeqCst), writes);
+    assert_eq!(
+        run(&executor, peer_create(replacement.clone())).await,
+        Disposition::Applied
+    );
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::Open { body, .. }]
+        if body.replica == replacement.replica.0.replica)
+    );
+    assert_eq!(hooks.calls.load(Ordering::SeqCst), writes + 1);
+    assert_eq!(state(&executor).phase, Phase::Opening);
+    assert!(!state(&executor).local_deleted);
+    registered(
+        &executor,
+        &replacement.replica.0,
+        state(&executor).open_token,
+    )
+    .await;
+    let mut completion = complete(&state(&executor).body, 0);
+    completion.replica.service_endpoint.clear();
+    completion.replica.replication_endpoint = "127.0.0.1:12346".into();
+    run(&executor, Command::CompleteOpen(Box::new(completion))).await;
+    effects(&executor);
+    run(&executor, primary_delete(replacement.replica.0, false)).await;
+    effects(&executor);
+    close_done(&executor, 0).await;
+    effects(&executor);
+    let successor_closed = state(&executor);
+    run(&executor, peer_create(request.clone())).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerCreateReplicaReply { body, .. }]
+        if body.error == STALE_REQUEST && body.replica == request.replica.0.replica)
+    );
+    assert!(Arc::ptr_eq(&successor_closed, &state(&executor)));
     finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn peer_idle_replacement_commit_barrier_keeps_old_tombstone_and_fences_old_completions() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        let original = make_peer_idle_ready(&executor).await;
+        run(&executor, primary_delete(original.replica.0.clone(), false)).await;
+        effects(&executor);
+        close_done(&executor, 0).await;
+        effects(&executor);
+        let old = state(&executor);
+        let mut next = original.clone();
+        next.replica.0.replica.id += 1;
+        next.replica.0.replica.instance += 1;
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor.submit(peer_create(next.clone())).unwrap();
+        entered.await.unwrap();
+        assert!(Arc::ptr_eq(&old, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot(original.replica.0.unit.id.guid.0).fenced);
+            assert!(effects(&executor).is_empty());
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(Arc::ptr_eq(&old, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+            run(&executor, peer_create(next.clone())).await;
+        } else {
+            assert_eq!(ticket.resolve(WAIT).await, Ok(Disposition::Applied));
+        }
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::Open { body, .. }]
+            if body.replica == next.replica.0.replica)
+        );
+        let opening = state(&executor);
+        run(&executor, primary_delete(original.replica.0.clone(), false)).await;
+        run(&executor, peer_create(original.clone())).await;
+        let mut late = complete(&old.body, old.open_token);
+        late.replica.service_endpoint.clear();
+        late.replica.replication_endpoint = old.body.replica.replication_endpoint.clone();
+        run(&executor, Command::CompleteOpen(Box::new(late))).await;
+        assert!(effects(&executor).is_empty());
+        assert!(Arc::ptr_eq(&opening, &state(&executor)));
+        finish(&store, &executor).await;
+    }
 }
 
 #[tokio::test]
@@ -5620,6 +5698,107 @@ fn fm_remove_idle(body: RemoveReplica) -> Command {
             for_fm_replica: false,
         },
     }
+}
+
+#[tokio::test]
+async fn fm_idle_replacement_requires_completed_removal_and_ignores_predecessor_traffic() {
+    let (store, executor, _) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    make_ready(&executor, &primary_body()).await;
+    let primary = state(&executor);
+    let original = fm_idle_request(&primary);
+    run(&executor, fm_add_idle(original.clone())).await;
+    effects(&executor);
+    let mut opened = CreateReplicaReply {
+        unit: original.unit.clone(),
+        replica: original.replica.clone(),
+        error: 0,
+    };
+    opened.replica.replication_endpoint = "127.0.0.1:12346".into();
+    run(&executor, peer_opened(opened.clone())).await;
+    effects(&executor);
+    let built = BuildCompletion {
+        unit: primary.body.unit.clone(),
+        local: primary.body.replica.clone(),
+        remote: opened.replica.clone(),
+        error: 0,
+        detail: ProxyErrorDetail::default(),
+    };
+    run(&executor, Command::CompleteBuild(Box::new(built.clone()))).await;
+    effects(&executor);
+    let mut removal = original.clone();
+    removal.replica = opened.replica.clone();
+    removal.replica.state = 2;
+    run(&executor, fm_remove_idle(removal.clone())).await;
+    effects(&executor);
+    let mut successor = original.clone();
+    successor.replica.id += 1;
+    successor.replica.instance += 1;
+    assert!(executor
+        .submit(fm_add_idle(successor.clone()))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .is_err());
+    assert!(effects(&executor).is_empty());
+    let mut removed = built.clone();
+    removed.remote.state = 3;
+    run(
+        &executor,
+        Command::CompleteRemoval(Box::new(removed.clone())),
+    )
+    .await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::RemoveReplicaReply(_)]
+    ));
+    run(&executor, fm_add_idle(successor.clone())).await;
+    let create = effects(&executor);
+    assert!(
+        matches!(create.as_slice(), [Effect::PeerCreateReplica { body, .. }]
+        if body.replica.0.replica == successor.replica)
+    );
+    for late in [
+        fm_add_idle(original),
+        fm_remove_idle(removal),
+        peer_opened(opened),
+        Command::CompleteBuild(Box::new(built)),
+        Command::CompleteRemoval(Box::new(removed)),
+    ] {
+        assert_eq!(run(&executor, late).await, Disposition::IgnoredStale);
+        assert!(effects(&executor).is_empty());
+    }
+    run(&executor, fm_add_idle(successor.clone())).await;
+    assert_eq!(effects(&executor), create);
+    let mut next_opened = CreateReplicaReply {
+        unit: successor.unit.clone(),
+        replica: successor.replica.clone(),
+        error: 0,
+    };
+    next_opened.replica.replication_endpoint = "127.0.0.1:12347".into();
+    run(&executor, peer_opened(next_opened.clone())).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::BuildIdle { replica, .. }]
+        if **replica == next_opened.replica)
+    );
+    run(
+        &executor,
+        Command::CompleteBuild(Box::new(BuildCompletion {
+            unit: primary.body.unit.clone(),
+            local: primary.body.replica.clone(),
+            remote: next_opened.replica,
+            error: 0,
+            detail: ProxyErrorDetail::default(),
+        })),
+    )
+    .await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::AddReplicaReply(reply)]
+        if reply.replica.id == successor.replica.id && reply.replica.state == 2)
+    );
+    assert_eq!(state(&executor).body, primary.body);
+    assert_eq!(state(&executor).runtime, primary.runtime);
+    finish(&store, &executor).await;
 }
 
 #[tokio::test]

@@ -197,6 +197,22 @@ pub struct Launch {
     pub peer: Option<Peer>,
 }
 impl Launch {
+    pub fn idle_successor(&self) -> Result<(i64, i64)> {
+        let peer = self.peer.as_ref().ok_or("missing original peer")?;
+        let destination_instance = if self.placement == 2 {
+            self.incarnation
+        } else {
+            peer.incarnation
+        };
+        let next = self
+            .replica
+            .max(peer.replica)
+            .max(destination_instance)
+            .checked_add(1)
+            .ok_or("Idle replica identity exhausted")?;
+        Ok((next, next))
+    }
+
     pub fn name(&self) -> String {
         format!("node{}", self.placement)
     }

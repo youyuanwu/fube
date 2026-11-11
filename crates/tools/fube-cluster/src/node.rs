@@ -1219,7 +1219,7 @@ fn receive_peer(
     let result = match message.properties().map_err(err)?.action.as_str() {
         "CreateReplica" if launch.placement == 2 => {
             let (body, generation) = decode_create_replica(message).map_err(err)?;
-            fixed_peer_target(
+            fixed_idle_target(
                 launch,
                 &body.replica.0.unit.id,
                 &body.replica.0.replica,
@@ -1231,7 +1231,7 @@ fn receive_peer(
         }
         "CreateReplicaReply" if launch.placement == 1 => {
             let (body, generation) = decode_create_replica_reply(message).map_err(err)?;
-            fixed_peer_target(
+            fixed_idle_target(
                 launch,
                 &body.unit.id,
                 &body.replica,
@@ -1269,6 +1269,22 @@ fn fixed_peer_target(
         return Err("peer body is outside the original fixed partition/replica topology".into());
     }
     Ok(())
+}
+
+fn fixed_idle_target(
+    launch: &Launch,
+    partition: &PartitionId,
+    replica: &Replica,
+    node: &NodeInstance,
+    id: i64,
+    instance: i64,
+) -> Result<()> {
+    let expected = if (replica.id, replica.instance) == (id, instance) {
+        (id, instance)
+    } else {
+        launch.idle_successor()?
+    };
+    fixed_peer_target(launch, partition, replica, node, expected.0, expected.1)
 }
 
 fn publish_host_loss(launch: &Launch, node: &Node, published: &mut bool) -> Result<()> {
@@ -1534,7 +1550,7 @@ fn receive_command(
                 .as_ref()
                 .filter(|_| launch.placement == 1)
                 .ok_or("replica control requires the original coordinating Primary")?;
-            fixed_peer_target(
+            fixed_idle_target(
                 launch,
                 &body.unit.id,
                 &body.replica,
@@ -1563,7 +1579,12 @@ fn receive_command(
             if launch.profile == ServiceProfile::StatefulPeerIdle && launch.placement == 2 {
                 let incoming = &body.replica.0;
                 // Native Delete matches ReplicaId, not FM's potentially older instance.
-                let instance = if incoming.replica.instance < launch.incarnation
+                let (id, expected_instance) = if incoming.replica.id == launch.replica {
+                    (launch.replica, launch.incarnation)
+                } else {
+                    launch.idle_successor()?
+                };
+                let instance = if incoming.replica.instance < expected_instance
                     && node
                         .snapshot(incoming.unit.id.guid.0)
                         .committed
@@ -1571,14 +1592,14 @@ fn receive_command(
                 {
                     incoming.replica.instance
                 } else {
-                    launch.incarnation
+                    expected_instance
                 };
                 fixed_peer_target(
                     launch,
                     &body.replica.0.unit.id,
                     &body.replica.0.replica,
                     &launch.node,
-                    launch.replica,
+                    id,
                     instance,
                 )?;
             }

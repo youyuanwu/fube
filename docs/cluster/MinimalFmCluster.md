@@ -346,7 +346,7 @@ Unresolved original-session loss leaves unknown/pending-remove, never recovery.
 Local removal cannot take over an FM-owned removal. The destination lifetime,
 data, registration and usage remain intact until separate deletion or normal shutdown; FM completion
 does not imply remote deletion or active configuration change. Native
-down/arbitrary-not-found cleanup and replacement remain gated
+down/arbitrary-not-found cleanup and broader replacement remain gated
 ([RA:2044-2140,4094-4149](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ReconfigurationAgent.cpp#L2044-L2140),
 [FM:201-214](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/fm/FailoverUnitMessageProcessor.cpp#L201-L214)).
 
@@ -460,7 +460,7 @@ commit failures and uncertainty. Pending Drop process-loss acceptance also runs
 the actual 30-second lost-ACK retry with both original Nodes/peer/FM links
 progressing. This adds no child-node Close-control feature or wire schema.
 Opening loss, Abort/ForceAbort loss, broader down/arbitrary-unknown cleanup
-and replacement remain gated.
+and replacement outside the explicit fresh-Idle slice remain gated.
 
 ### Graceful opened destination Close reporting
 
@@ -583,7 +583,7 @@ holds provider/service disposal separately, verifies actual Abort rather than
 Close, loses/retries an ACK at the unchanged native cadence and replays metadata
 replies with stable original proof and independent Primary removal/writes.
 Initial-Open cleanup, failed/ForceAbort reporting, HostDown during Abort and
-replacement remain gated. No wire schema, child-node control feature or native
+broader replacement remain gated. No wire schema, child-node control feature or native
 C++ handler/FM-Federation interoperability qualification is added.
 
 ### Deleting the original opened destination Idle
@@ -621,7 +621,7 @@ uses native None/None/Dropped/down metadata, invalid version/LSNs and no endpoin
 Normal deletion schedules no ReplicaDown/ReplicaDropped report. Same-incarnation
 CreateReplica after deletion is ignored without Open, build or usage acquisition.
 Force for this original lifetime is supported by the explicit API below.
-Foreign identities, replacement, active membership and recovery remain gated.
+Foreign identities, broader replacement, active membership and recovery remain gated.
 
 ### Complete original-session destination Delete contract
 
@@ -696,6 +696,55 @@ Create, historical proofs after app exit and continued Primary data access.
 These complete this original-session Delete subprofile, not persisted services,
 active membership, replacement, reconfiguration, recovery or native C++
 handler/FM-Federation interoperability qualification.
+
+### Explicit fresh Idle replacement
+
+`Cluster::replace_idle_replica()` explicitly authorizes **one** successor on
+the same original destination Node/app session. It requires the original
+successful FM Add, matched Primary RemoveReplicaReply, normal non-force
+DeleteReplicaReply and independently validated original runtime disposal,
+Applied Close and exact usage release. Both original node sessions must remain
+admitted, active and live, without loss reports or generation/node/service work.
+Deletion alone still leaves `reusable=false`; no timer, report ACK or cleanup
+receipt implicitly schedules replacement. Failed/absent creation, host loss,
+force deletion, arbitrary peers and a second successor remain gated.
+
+The source baseline remains `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`:
+
+| Native source | Preserved behavior |
+|---|---|
+| `fm/FailoverUnit.cpp:718-739`, `fm/Replica.cpp:555-585` | Reuse the placement only for a new replica identity/incarnation, resetting build/role/endpoint metadata. This fixed profile deterministically allocates equal new IDs above both original replica IDs and the destination instance; it does not reproduce the native wall-clock allocator. |
+| `ra/ReconfigurationAgent.cpp:1855-2038,4094-4148`, `ra/FailoverUnit.cpp:315-363` | Successful original Idle removal removes the Primary's old replica entry. A fresh FM Add then starts new CreateReplica/build work; old replies cannot complete the new incarnation. Replacement while removal remains pending is not enabled. |
+| `ra/ReconfigurationAgent.cpp:2244-2324` | A closed destination creates a fresh Idle only for a newer incarnation. Open follows durable creation; matching Open completion commits before CreateReplicaReply. Equal deleted traffic is ignored; older closed traffic receives native StaleRequest without reopening. |
+
+The destination Node separately requires its own genuine disposal proof,
+drained predecessor commands/acquisitions/reporting and a connected original
+runtime with a live owned app. No metadata acknowledgment can bypass that gate.
+The old proof remains intact through a failed/unknown creation commit and is
+cleared locally only when the committed successor's Open effect runs.
+Original node/app PIDs, Hosting package/factory and runtime root stay resident;
+this is a new service/replicator lifetime, not app restart or warm adoption.
+
+The existing AddReplica -> CreateReplica/Reply -> RAP build -> AddReplicaReply
+path opens and recopies the successor from the healthy Primary. Nonempty copy
+and continuing application ACKs are required; the destination remains
+Idle/InBuild, non-serving and unconfigured. Native action schemas and retry
+cadences are unchanged. Repeated replacement calls retry/observe the same
+successor rather than minting another identity.
+
+`status()["idle_predecessor"]` retains the frozen original Add/Remove/Delete
+outcomes and disposal proof. Current `idle_build`, `idle_removal` and
+`idle_deletion` refer to the successor; old native replies, reports and retained
+proof files cannot clear its work or replace its ownership. The successor can
+itself be explicitly removed/deleted with a new matching disposal proof.
+
+Model/store tests cover admission barriers, definite/unknown creation commits
+and stale FM/peer/RAP completions. A real public Cluster API test covers original
+cleanup, distinct successor identity on unchanged process owners, nonempty copy,
+continued replication, lost Add reply/replay, stale predecessor Add/Remove/Delete,
+retained history and successor cleanup. These are native-source-derived and
+native-free process results, not native C++ handler traces, FM/Federation
+interoperability, active membership, automatic replacement or recovery.
 
 ### Deleting the original registered destination during Open
 

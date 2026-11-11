@@ -35,7 +35,7 @@ struct ChildOwner {
     metadata: Option<Metadata>,
 }
 
-/// One ephemeral foreground authority; no reconnect, replacement or adoption.
+/// One ephemeral foreground authority; no reconnect, automatic replacement or adoption.
 /// Keep this owner through explicit shutdown, including after any error.
 pub struct Cluster {
     interlock: interlock::Interlock,
@@ -937,6 +937,26 @@ impl Cluster {
             return Ok(current);
         }
         let body = self.ledger.request_idle(Instant::now())?;
+        self.peer_idle_requested = true;
+        if let Err(error) = self.send_idle(&body).await {
+            self.ledger.lost(0, error.clone());
+            return Err(error);
+        }
+        Ok(self.ledger.idle_status())
+    }
+    /// Explicitly authorize one fresh Idle after original FM removal and proved disposal.
+    pub async fn replace_idle_replica(&mut self) -> Result<Value> {
+        if self.finished.is_some()
+            || self.children.len() != 2
+            || self.config.profile != ServiceProfile::StatefulPeerIdle
+        {
+            return Err("Idle replacement requires the original peer-idle profile".into());
+        }
+        let current = self.ledger.idle_status();
+        if self.ledger.idle_predecessor.is_some() && current["state"] == "ready" {
+            return Ok(current);
+        }
+        let body = self.ledger.request_idle_replacement(Instant::now())?;
         self.peer_idle_requested = true;
         if let Err(error) = self.send_idle(&body).await {
             self.ledger.lost(0, error.clone());

@@ -81,6 +81,12 @@ now covers normal/force and opening/closing/closed/failed/absent/lost targets,
 including Delete-error ForceAbort, independently proved host loss and retained
 cleanup history after app exit. Missing ownership remains unproved/unknown;
 no deletion outcome authorizes replacement.
+An [explicit fresh-Idle replacement slice](MinimalFmCluster.md#explicit-fresh-idle-replacement)
+now authorizes one successor after original successful FM build, Primary
+Remove completion and normal destination Delete joined with genuine disposal.
+It preserves predecessor history, recopies real state and continues replication
+on the original node/app sessions. It grants no active membership, host-loss
+replacement, second successor or recovery.
 Broader removal branches, active membership and reconfiguration
 remain gated.
 
@@ -551,7 +557,7 @@ This does not qualify every native handler branch or complete P4/M2.
 | 1. Finish singleton lifecycle | Abort/ForceAbort reporting, closed-AddPrimary handling and remaining DeleteReplica branches, then explicitly authorized fresh-lifetime recreation. | Preserve native close/report/ACK semantics and exact original accounting. Reporting and metadata completion cannot substitute for disposal proof or relabel lost volatile data as recovered empty state. |
 | 2. Complete node-wide coordination | Bounded implementation: broader P2 multi-entity execution; NodeActivateRequest/Reply, NodeDeactivateRequest/Reply, NodeUpdateServiceRequest/Reply, ServiceTypeEnabled/Disabled and their replies, existing registration notifications and complete ReportLoad codecs/forwarding. ReplicaEndpointUpdated/Reply codecs and endpoint helper only; live publication moves to stage 5. | Preserve sequence/version checks and action-specific completion barriers. Deactivation replies follow required replica closure, not admission; ReportLoad remains best-effort without an invented per-report ACK. Keep one FT per deployed Node; qualify multiple FTs in RA model/store tests. |
 | 3. Complete ordinary-FM generation and upload | Bounded generation-handshake increment implemented: GenerationProposal/Reply and GenerationUpdate/Reject. Remaining: LFUMUpload/Reply, nonempty NodeUp/NodeUpAck reconciliation and full ReplicaUp/Reply batching/final-upload handling. | Preserve proposed/receive/send generations and per-entity commit barriers. Only the correct semantic completion advances upload/readiness; keep restart serving disabled until stage 6. |
-| 4. Build and remove remote replicas | Bounded original two-node volatile Idle creation, nonempty copy/continuing replication, FM Add/build, pending/failed/opened Primary removal and same-lifetime retry/replay are implemented. The [original-session destination Delete contract](MinimalFmCluster.md#complete-original-session-destination-delete-contract) now covers normal/force and opening/closing/closed/failed/absent/lost targets, Delete-error Abort fallback, native closed/no-registration handling and separate original cleanup proofs. Close/Drop/Abort and opened/Close/Drop host-loss reporting retain native stage/ACK distinctions. Unproved cleanup stays explicit, never successful empty recovery. Remaining: fresh replacement, active configuration/reconfiguration/removal, broader lifecycle/report profiles and native interoperability qualification. | Copy completion grants no active membership, serving or FM success; AddReplicaReply is required for FM build completion and Ready/Idle is not ActiveSecondary. Only RemoveReplicaReply clears Primary pending-remove. Destination Delete independently joins its semantic reply with original disposal, absence, cancellation, known failure or positive owned-process-loss evidence. Metadata/report ACK alone is none of those cleanup proofs. Every outcome preserves original ownership, historical Add results and no peer reuse/replacement authority. |
+| 4. Build and remove remote replicas | Bounded original two-node volatile Idle creation, nonempty copy/continuing replication, FM Add/build, pending/failed/opened Primary removal and same-lifetime retry/replay are implemented. The [original-session destination Delete contract](MinimalFmCluster.md#complete-original-session-destination-delete-contract) covers normal/force and opening/closing/closed/failed/absent/lost targets and separate original cleanup proofs. Close/Drop/Abort and host-loss reporting retain native stage/ACK distinctions. [Explicit fresh replacement](MinimalFmCluster.md#explicit-fresh-idle-replacement) now rebuilds one successor after original successful build, Primary removal and normal Delete/disposal. Remaining: broader replacement/lifecycle/report profiles, active configuration/reconfiguration/removal and native interoperability qualification. | Copy completion grants no active membership or serving; AddReplicaReply completes FM build and Ready/Idle is not ActiveSecondary. Only RemoveReplicaReply clears Primary pending-remove. Destination Delete independently joins its semantic reply with original cleanup evidence. Neither metadata/report ACK nor cleanup proof authorizes a successor: the bounded replacement requires a separate explicit FM request and destination-local disposal/drain admission. Original history and stale-incarnation fences survive replacement. |
 | 5. Implement reconfiguration | DoReconfiguration/Reply, peer GetLSN/Reply, Deactivate/Reply and Activate/Reply, ChangeConfiguration and DatalossReport. Include peer swap continuation. | Preserve native phase ordering, separate previous/current quorum obligations, catch-up/cancellation, old-primary fencing and endpoint publication. Qualify secondary replacement before primary transfer. |
 | 6. Enable durable RA restart | P5 loading/fixups, crash-window reconciliation, fresh incarnation and recovery with the original FM surviving. | Historical records cannot restore Primary authority. Prove predecessor fencing; rebuild volatile replicas from eligible survivors with valid history/quorum evidence or report data loss. |
 | 7. Add FMM ownership/rebuild | Independent FM/FMM readiness and generation domains, owner-specific uploads, GFUMTransfer and FM-service replica handling. | Supply matching FM/FMM/common-layer counterparts and required FM-service functionality. Ordinary FM acknowledgments cannot stand in for FMM; this does not authorize transparent FM restart. |
@@ -621,8 +627,8 @@ build success. Primary/FM bookkeeping becomes Ready/Idle, while the actual
 destination remains Idle/InBuild. Lost replies retry/replay the original
 request/result without another Open/build; creation failures require cleanup,
 ordinary build errors retain pending retry, and Close/removal fence late success.
-No active membership, catch-up quorum or quorum change is inferred. LFUM/restart/FMM and peer
-recreation/promotion remain gated. Explicit `Cluster::remove_idle_replica()`
+No active membership, catch-up quorum or quorum change is inferred. LFUM/restart/FMM,
+broader peer recreation and promotion remain gated. Explicit `Cluster::remove_idle_replica()`
 now abandons that opened original Idle through
 ReplicatorRemoveIdleReplica/Reply, fencing late build completion and retaining
 terminal incarnation tombstones. Failed-build retries instead use RAP's
@@ -742,7 +748,7 @@ Unproved metadata and original owner loss stay incomplete/unknown.
 The consolidated model/store and actual process/Channel matrix includes held
 cleanup, force supersession, no-runtime force, proof conflicts, commit uncertainty
 and reply replay. HostDown during Abort and failed/ForceAbort reporting outside
-explicit Delete, broader unknown/foreign identities, replacement and recovery
+explicit Delete, broader unknown/foreign identities, broader replacement and recovery
 remain separate gates. No wire schema, timer or native handler qualification changes.
 This detour does not complete stage 3 or the full stage-4 FM build/removal
 choreography.

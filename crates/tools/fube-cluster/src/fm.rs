@@ -113,6 +113,7 @@ pub struct Ledger {
     pub(crate) idle: Option<IdleBuild>,
     pub(crate) idle_removal: Option<IdleRemoval>,
     pub(crate) idle_deletion: Option<IdleDeletion>,
+    pub(crate) idle_predecessor: Option<Value>,
 }
 pub(crate) struct IdleDeletion {
     pub body: DeleteReplica,
@@ -832,6 +833,7 @@ impl Ledger {
             idle: None,
             idle_removal: None,
             idle_deletion: None,
+            idle_predecessor: None,
         }
     }
     pub fn accept(&mut self, command: Command) -> Result<Accepted> {
@@ -1433,6 +1435,7 @@ impl Ledger {
             "idle_build":self.idle_status(),
             "idle_removal":self.idle_removal_status(),
             "idle_deletion":self.idle_deletion_status(),
+            "idle_predecessor":self.idle_predecessor,
             "generation_handshake": self.generation.as_ref().map(GenerationHandshake::status),
             "operations":self.operations.iter().map(|op|
                 if op.command.action == "status" {
@@ -1470,6 +1473,79 @@ impl Ledger {
         if body.replica.version != body.service.version {
             return Err("peer packages do not share the original deployment version".into());
         }
+        self.idle = Some(IdleBuild {
+            body: body.clone(),
+            reply: None,
+            cancelled: false,
+            unknown: false,
+            started: now,
+            last: now,
+        });
+        Ok(body)
+    }
+    pub fn request_idle_replacement(&mut self, now: Instant) -> Result<AddReplica> {
+        if self.idle_predecessor.is_some() {
+            return self.request_idle(now);
+        }
+        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
+            || self.generation.is_some()
+            || self.placements[0].observed != Observed::Running
+            || self.placements.iter().any(|placement| {
+                !placement.link_alive
+                    || !placement.activated
+                    || placement.bootstrap != Bootstrap::Admitted
+                    || placement.loss_reported
+                    || placement.node_control.is_some()
+                    || placement.service_update.is_some()
+                    || placement.pending.is_some()
+            })
+            || self.idle.as_ref().is_none_or(|idle| {
+                idle.unknown || idle.reply.as_ref().is_none_or(|reply| reply.error != 0)
+            })
+            || self.idle_removal.as_ref().is_none_or(|removal| {
+                removal.unknown || removal.reply.is_none() || removal.failed_creation
+            })
+            || self.idle_deletion.as_ref().is_none_or(|deletion| {
+                deletion.unknown
+                    || deletion.target != IdleDeleteTarget::Runtime
+                    || deletion.body.deletion.0.force
+                    || deletion.host_loss.is_some()
+            })
+            || !self.idle_deletion_complete()
+            || self.placements[1].retirement.is_none()
+        {
+            return Err(
+                "fresh Idle requires original FM removal, normal Delete and verified disposal on both live original nodes".into(),
+            );
+        }
+        let (replica, incarnation) = self.placements[1].launch.idle_successor()?;
+        let mut body = self.placements[0].body()?;
+        body.replica = self.placements[1].body_for(replica, incarnation)?.replica;
+        body.replica.current_role = 2;
+        if body.replica.version != body.service.version {
+            return Err("peer packages do not share the original deployment version".into());
+        }
+        self.idle_predecessor = Some(json!({
+            "build":self.idle_status(),
+            "removal":self.idle_removal_status(),
+            "deletion":self.idle_deletion_status(),
+            "disposal":self.placements[1].retirement,
+        }));
+        let placement = &mut self.placements[1];
+        placement
+            .retired
+            .push((placement.replica, placement.incarnation));
+        placement.replica = replica;
+        placement.incarnation = incarnation;
+        placement.created = false;
+        placement.observed = Observed::Absent;
+        placement.remove_received = false;
+        placement.retirement = None;
+        placement.reusable = false;
+        placement.error = None;
+        placement.endpoint = None;
+        self.idle_removal = None;
+        self.idle_deletion = None;
         self.idle = Some(IdleBuild {
             body: body.clone(),
             reply: None,

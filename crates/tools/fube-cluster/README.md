@@ -50,7 +50,26 @@ service/data and registration remain intact; no remote deletion, active membersh
 or automatic removal after successful build is inferred. A late destination Open
 is ignored by the Primary and cannot start build; any resulting destination
 service remains owned until explicit cleanup or shutdown. Manual pre-Open,
-broader down/arbitrary-unknown cleanup and replacement remain gated.
+broader down/arbitrary-unknown cleanup and replacement outside the explicit
+fresh-Idle slice below remain gated.
+
+`Cluster::replace_idle_replica().await` explicitly authorizes **one fresh Idle**
+after the original successful FM build, matched Primary RemoveReplicaReply,
+normal non-force destination DeleteReplicaReply and independently verified
+original runtime disposal/committed Close/exact usage release. Both original
+node/app sessions must remain live. It is not automatically enabled by deletion,
+and does not admit failed/absent/host-lost predecessors or app adoption.
+The new replica ID/incarnation exceed the original IDs, with a new service/
+replicator lifetime on the same resident factory/processes. The normal native
+Add/Create/build sequence recopies nonempty Primary state and continues
+replication; poll `idle_build.ready` for semantic completion. The successor
+remains Idle/InBuild, non-serving and unconfigured.
+Repeated calls retry/observe that same successor; a second replacement is gated.
+`status()["idle_predecessor"]` retains original Add/Remove/Delete outcomes and
+disposal proof, while the ordinary Idle status fields follow the successor.
+Old messages/proofs cannot retire or complete the new lifetime. The successor
+supports explicit normal removal/deletion with its own matching proof.
+See the [source mapping and evidence limits](../../../docs/cluster/MinimalFmCluster.md#explicit-fresh-idle-replacement).
 
 `Cluster::delete_idle_replica_via_fm().await` separately authorizes native
 `DeleteReplica(force=false)` on the **original destination**,
@@ -242,7 +261,7 @@ metadata deletion and independent Primary removal/no-reuse boundaries are
 preserved. Controlled real provider/service disposal verifies actual Abort,
 lost-ACK retry and stable proof/metadata replay; model/store tests cover
 admission, both ACK lists and intent/completion/ACK commit barriers.
-HostDown during Abort, failed/ForceAbort reporting and replacement remain
+HostDown during Abort, failed/ForceAbort reporting and broader replacement remain
 gated. No new child-node control feature or native handler qualification is
 added; see the [bounded Abort guide](../../../docs/cluster/MinimalFmCluster.md#normal-opened-destination-abort-reporting).
 
