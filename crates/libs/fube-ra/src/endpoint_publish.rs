@@ -1,4 +1,4 @@
-//! Source-pinned endpoint publication helper; live reconfiguration remains gated.
+//! Source-pinned endpoint publication helper shared with the bounded planned swap.
 use super::*;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

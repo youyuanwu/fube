@@ -777,6 +777,43 @@ fn peer_contracts(input: &Path, output: &Path) {
 }
 
 fn configuration_contracts(input: &Path, output: &Path) {
+    for (name, body) in [
+        ("default-get-lsn", GetLsn::default()),
+        ("rich-get-lsn", filled::<GetLsn>(&mut 0)),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "GetLSN",
+            body,
+            get_lsn_message,
+            decode_get_lsn,
+        );
+    }
+    let c = &mut 0;
+    let replica = filled::<AddInstanceReply>(c);
+    let deactivation = filled::<ReplicaDeactivationInfo>(c);
+    for (name, body) in [
+        ("default-get-lsn-reply", GetLsnReply::default()),
+        (
+            "rich-get-lsn-reply",
+            GetLsnReply {
+                replica,
+                deactivation,
+            },
+        ),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "GetLSNReply",
+            body,
+            get_lsn_reply_message,
+            decode_get_lsn_reply,
+        );
+    }
     let c = &mut 0;
     let config = filled::<Configuration>(c);
     let force = filled::<bool>(c);
@@ -914,6 +951,8 @@ fn configuration_contracts(input: &Path, output: &Path) {
         "ActivateReply",
         "Deactivate",
         "DeactivateReply",
+        "GetLSN",
+        "GetLSNReply",
     ] {
         check(
             input,

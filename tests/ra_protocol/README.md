@@ -37,7 +37,14 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 157 inputs.
+The C++ producer independently constructs expected values and emits 163 inputs.
+Healthy planned Primary transfer adds six default/rich/action cases for
+GetLSN/Reply. GetLSN reuses ReplicaMessageBody; GetLSNReply inherits
+ReplicaReplyMessageBody and adds nested deactivation information in its derived
+scope. Native extraction now covers 83 types/251 fields and 167 bundle files;
+native executes 47 truncation rejections. All prior 157 cases and 45
+truncation rejections remain retained. Rust verifies peer actor/priority,
+generation, exact action factories and every proper body prefix.
 Healthy configured-Secondary retirement adds six default/rich/action cases for
 Deactivate/Reply. Its inherited configuration is followed by a derived scope
 containing `isForce_` and the nested deactivation information. This adds one

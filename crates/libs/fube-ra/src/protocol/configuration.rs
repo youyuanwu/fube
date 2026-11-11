@@ -145,6 +145,59 @@ impl<'de> Deserialize<'de> for Deactivate {
 }
 pub type DeactivateReply = AddInstanceReply;
 
+pub type GetLsn = AddInstance;
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GetLsnReply {
+    pub replica: AddInstanceReply,
+    pub deactivation: ReplicaDeactivationInfo,
+}
+impl Serialize for GetLsnReply {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        Inherited {
+            base: Inline(&self.replica),
+            options: Derived(Options {
+                value: &self.deactivation,
+            }),
+        }
+        .serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for GetLsnReply {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let body =
+            Inherited::<AddInstanceReply, ReplicaDeactivationInfo>::deserialize(deserializer)?;
+        Ok(Self {
+            replica: body.base.0,
+            deactivation: body.options.0.value,
+        })
+    }
+}
+pub fn get_lsn_message(body: &GetLsn, generation: &GenerationHeader) -> Result<Message> {
+    reliability_message(body, "GetLSN", RA_ACTOR, true, Some(generation))
+}
+pub fn decode_get_lsn(message: &Message) -> Result<(GetLsn, GenerationHeader)> {
+    check_factory(message, "GetLSN", &[RA_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+    ))
+}
+pub fn get_lsn_reply_message(body: &GetLsnReply, generation: &GenerationHeader) -> Result<Message> {
+    reliability_message(body, "GetLSNReply", RA_ACTOR, true, Some(generation))
+}
+pub fn decode_get_lsn_reply(message: &Message) -> Result<(GetLsnReply, GenerationHeader)> {
+    check_factory(message, "GetLSNReply", &[RA_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+    ))
+}
+
 pub fn deactivate_message(body: &Deactivate, generation: &GenerationHeader) -> Result<Message> {
     reliability_message(body, "Deactivate", RA_ACTOR, true, Some(generation))
 }

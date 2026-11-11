@@ -355,6 +355,7 @@ fn start_close_inner(
     }
     let was_creating = state.phase == Phase::Opening;
     if (matches!(state.body.replica.current_role, 2 | 3)
+        || (state.body.replica.current_role == 4 && state.swap.is_some())
         || (state.body.replica.current_role == 1
             && state
                 .reconfiguration
@@ -653,6 +654,7 @@ pub(super) fn transition(
                 peer_creation: None,
                 remote_idle: None,
                 reconfiguration: None,
+                swap: None,
                 // TryCreateFailoverUnit constructs from ID, consistency and
                 // service, NOT the incoming previous epoch/target/minimum.
                 body: Arc::new(AddInstance {

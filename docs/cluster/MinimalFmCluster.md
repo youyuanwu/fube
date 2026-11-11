@@ -1067,8 +1067,8 @@ The maintained native-stream gate adds four action contracts and twelve cases:
 
 This qualifies the frozen same-Primary admission and terminal observation path;
 the bounded healthy retirement/replacement extension is described below.
-Arbitrary configuration supersession, primary transfer, GetLSN, broader
-Deactivate, endpoint changes/publication, data loss,
+Outside the planned swap below, arbitrary configuration supersession, primary
+transfer, GetLSN, broader Deactivate, endpoint changes/publication and data loss,
 FMM, generation upload, reconnect and restart remain gated. Codec/schema
 execution and native-free process acceptance are not complete original C++
 handler traces or native FM/Federation interoperability.
@@ -1122,10 +1122,67 @@ The maintained native-stream gate now covers 157 bidirectional cases,
 
 This enables one healthy original configured-Secondary replacement, not a
 second replacement, retirement of an already-replaced Idle, concurrent/new
-reconfiguration supersession, Primary transfer, automatic failure repair,
+reconfiguration supersession, automatic failure repair,
 endpoint publication, FMM, generation upload, reconnect or durable restart.
+The separate planned-Primary-transfer increment below adds its bounded role
+handoff and endpoint publication.
 Original C++ handler traces and native FM/Federation interoperability remain
 unqualified.
+
+### Healthy planned Primary transfer
+
+After completed two-member active admission (including the supported fresh
+Secondary), `Cluster::transfer_primary()` explicitly transfers Primary from
+original node 1 to node 2. Both original admitted sessions and replicas must be
+healthy, with no pending build/removal/deletion, node/service work or generation
+upload. The request keeps the service, membership and replica incarnations,
+sets P/S and S/P and increments the configuration version by `0x100000001`
+without changing data-loss version. The FM withdraws its old endpoint while
+transfer is pending; withdrawal alone is not proof of runtime write revocation.
+
+Pinned SF source `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the flow:
+
+| Source | Preserved contract |
+|---|---|
+| `fm/FailoverUnit.cpp:878-895`; `ra/ReconfigurationState.cpp:76-119`; `ra/FailoverUnit.cpp:1754-1779` | Explicit healthy SwapPrimary starts at the old Primary in phase 0, not direct promotion or a local role setter. Real RAP configuration/catch-up revokes writes, catches up the candidate and changes the old service/replicator to Secondary. |
+| `ra/FailoverUnit.cpp:736-782,2926-2950,3497-3540` | Matching successful demotion and its commit precede peer DoReconfiguration with retained non-Max phase-0 duration. A duplicate FM request replays that continuation, never an old-Primary success reply. |
+| `ra/FailoverUnit.cpp:628-703,2204-2299`; `ra/ReconfigurationAgent.cpp:2425-2507` | Candidate phase 1 uses real local RAP UpdateEpochAndGetStatus and native peer GetLSN/Reply. GetLSNReply inherits ReplicaReplyMessageBody and adds nested deactivation information. This bounded profile requires initialized matched progress on both original members; other histories stop rather than inventing election, repair or data loss. |
+| `ra/FailoverUnit.cpp:736-818,3063-3124`; `common/FailoverConfig.h:387` | Candidate promotion/catch-up uses full two-member PC and CC. The native default PC=CC optimization skips phase-3 Deactivate; it does not reuse the S/N retirement/Close path. |
+| `ra/FailoverUnit.cpp:2703-2873,3164-3272,3376-3415,3487-3496` | Peer Activate updates the demoted member without another Open/build. Exact ActivateReply precedes final RAP EndReconfiguration and commit before the new Primary's native DoReconfigurationReply. Stable completion clears previous epoch/roles. |
+| `ra/FailoverUnit.cpp:3590-3630,4597-4624,5701-5710`; `ra/EndpointPublishState.cpp:47-145`; `common/FailoverConfig.h:486` | Original-runtime ProxyReplicaEndpointUpdated is ACKed, but only matching active promotion updates the committed endpoint. The existing helper owns the native 30-second early-publication timeout and exact FM ACK. Final reconfiguration completion publishes the new Primary address; an endpoint update/ACK alone does not complete the transfer. |
+
+Poll `configuration` for `kind=planned_primary_transfer` and `ready=true`.
+Only the exact new-Primary native reply changes readiness and places the
+numeric loopback service endpoint on node 2. Early native
+ReplicaEndpointUpdated/Reply records are retained separately in
+`configuration.endpoint_update`, without making a pending transfer ready.
+`configuration.history` preserves prior admission/retirement records.
+`nodes[].retained_work.local_replica.swap` reports the owned phase/error;
+the older `local_replica.configuration` remains historical same-Primary work.
+
+The sample retains its original service/provider instances. Promotion stops the
+old Secondary stream consumer and starts the same service's Primary listener;
+demotion consumes replication on the existing provider without a new copy.
+The old listener remains contactable but rejects writes through the real public
+partition/replicator authority checks. No engine-specific mutation or
+qualification-only execution hook supplies progress, role change or success.
+
+Model/store tests cover failed demotion, both progress results, exact native FM
+completion, retained retries, endpoint timeout/publication, definite commit
+veto/uncertainty and demotion/endpoint/final-reply commit barriers.
+Original-process tests copy nonempty state, lose/replay the final reply, verify
+old-writer rejection and new-Primary ACKs continuing on the demoted member,
+retain both original owners and one Open each, and confirm new-Primary host
+loss cannot reactivate the old writer. Native down reporting makes transfer
+observation unknown; it supplies no replacement, election or quorum fallback.
+
+This enables one explicit healthy transfer only. Reverse/second transfer,
+concurrent supersession, mismatched progress, aborted-swap recovery, loss-driven
+failover, changed membership/endpoints outside this promotion, data loss,
+FMM, reconnect and restart remain gated. Native source-stream evidence covers
+163 bidirectional cases, 83 types/251 fields, 167 bundle files and 47 actual
+native truncation rejections. Original C++ handler traces and native
+FM/Federation interoperability remain unqualified.
 
 ## Initial stateful FM control
 

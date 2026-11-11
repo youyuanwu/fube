@@ -6108,6 +6108,294 @@ async fn complete_primary_activation(executor: &Executor, config: &Configuration
 }
 
 #[tokio::test]
+async fn planned_swap_demote_commit_and_original_progress_precede_peer_continuation() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        let active = built_fm_idle(&executor).await;
+        complete_primary_activation(&executor, &active).await;
+        let before = state(&executor);
+        let mut intent = active;
+        intent.unit.previous = intent.unit.current;
+        intent.unit.current.configuration += 0x1_0000_0001;
+        for r in &mut intent.replicas.0 {
+            r.previous_role = r.current_role;
+            r.current_role = if r.current_role == 4 { 3 } else { 4 };
+        }
+        run(&executor, reconfigure(intent.clone())).await;
+        let mut demoted = configured(&effects(&executor));
+        demoted.error = -99;
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(demoted.clone())),
+        )
+        .await;
+        assert!(effects(&executor).is_empty());
+        run(
+            &executor,
+            Command::RetryConfiguration(intent.unit.id.clone()),
+        )
+        .await;
+        assert_eq!(configured(&effects(&executor)).flags, 2);
+        demoted.error = 0;
+        demoted.local.service_endpoint.clear();
+        demoted.local.first_lsn = 0;
+        demoted.local.last_lsn = 1;
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::CompleteConfiguration(Box::new(demoted.clone())))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        assert_eq!(
+            state(&executor).swap.as_ref().unwrap().stage,
+            SwapStage::Demote
+        );
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(effects(&executor).is_empty());
+            run(&executor, Command::CompleteConfiguration(Box::new(demoted))).await;
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        let forwarded = effects(&executor);
+        assert!(
+            matches!(forwarded.as_slice(), [Effect::PeerContinueSwap { body, .. }]
+            if body.phase0_duration > 0 && body.phase0_duration != i64::MAX
+                && body.configuration.replicas.0[0].service_endpoint.is_empty())
+        );
+        assert_eq!(state(&executor).runtime, before.runtime);
+        assert_eq!(state(&executor).usage, before.usage);
+        run(&executor, reconfigure(intent)).await;
+        assert_eq!(effects(&executor), forwarded);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn planned_swap_candidate_requires_both_lsn_results_endpoint_commit_and_final_barriers() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        make_peer_idle_ready(&executor).await;
+        let idle = state(&executor);
+        let mut p = (*idle.body).clone();
+        p.replica.node = peer_source();
+        p.replica.id += 1;
+        p.replica.instance += 1;
+        p.replica.replication_endpoint = "127.0.0.1:12346".into();
+        let active = secondary_configuration(&p, &idle.body.replica);
+        let history = idle.peer_creation.as_ref().unwrap().deactivation.clone();
+        run(
+            &executor,
+            Command::Activate {
+                body: Box::new(Activate {
+                    configuration: active.clone(),
+                    deactivation: history.clone(),
+                }),
+                source: peer_source(),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+        )
+        .await;
+        let completion = configured(&effects(&executor));
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(completion)),
+        )
+        .await;
+        effects(&executor);
+        let mut intent = active;
+        intent.unit.previous = intent.unit.current;
+        intent.unit.current.configuration += 0x1_0000_0001;
+        for r in &mut intent.replicas.0 {
+            r.previous_role = r.current_role;
+            r.current_role = if r.current_role == 4 { 3 } else { 4 };
+        }
+        let continue_swap = || Command::DoReconfiguration {
+            body: Box::new(DoReconfiguration {
+                configuration: intent.clone(),
+                phase0_duration: 1,
+            }),
+            source: peer_source(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        };
+        run(&executor, continue_swap()).await;
+        let actions = effects(&executor);
+        assert!(actions
+            .iter()
+            .any(|e| matches!(e, Effect::QueryReplicaStatus { .. })));
+        assert!(actions
+            .iter()
+            .any(|e| matches!(e, Effect::PeerGetLsn { .. })));
+        let local = state(&executor);
+        let mut sample = local.body.replica.clone();
+        sample.first_lsn = 0;
+        sample.last_lsn = 1;
+        run(
+            &executor,
+            Command::CompleteStatus(Box::new(ConfigurationCompletion {
+                unit: local.body.unit.clone(),
+                local: sample,
+                replicas: Default::default(),
+                flags: 0,
+                error: 0,
+            })),
+        )
+        .await;
+        assert!(!effects(&executor)
+            .iter()
+            .any(|e| matches!(e, Effect::UpdateConfiguration { .. })));
+        let mut remote = intent.replicas.0[0].clone();
+        remote.first_lsn = 0;
+        remote.last_lsn = 1;
+        run(
+            &executor,
+            Command::GetLsnReply {
+                body: Box::new(GetLsnReply {
+                    replica: AddInstanceReply {
+                        unit: intent.unit.clone(),
+                        replica: remote,
+                        error: 0,
+                    },
+                    deactivation: history,
+                }),
+                source: peer_source(),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+        )
+        .await;
+        let mut catchup = configured(&effects(&executor));
+        assert_eq!(catchup.flags, 2);
+        executor
+            .config()
+            .set_node(NodeProperty::EndpointPublishTimeoutTicks, 0);
+        let mut endpoint = (*state(&executor).body).clone();
+        endpoint.replica.service_endpoint = "127.0.0.1:23456".into();
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::ProxyEndpoint(Box::new(endpoint.clone())))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(effects(&executor).is_empty());
+            run(
+                &executor,
+                Command::ProxyEndpoint(Box::new(endpoint.clone())),
+            )
+            .await;
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        let actions = effects(&executor);
+        assert!(actions
+            .iter()
+            .any(|e| matches!(e, Effect::AcknowledgeEndpoint { .. })));
+        assert!(actions
+            .iter()
+            .any(|e| matches!(e, Effect::ReplicaEndpointUpdated(_))));
+        if unknown {
+            finish(&store, &executor).await;
+            continue;
+        }
+        run(
+            &executor,
+            Command::EndpointReply {
+                body: Box::new(AddInstanceReply {
+                    unit: endpoint.unit,
+                    replica: endpoint.replica,
+                    error: 0,
+                }),
+                source: admission().fm_source,
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+        )
+        .await;
+        assert!(effects(&executor).is_empty());
+        catchup.local.service_endpoint = "127.0.0.1:23456".into();
+        run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+        let actions = effects(&executor);
+        let activate = actions
+            .iter()
+            .find_map(|e| match e {
+                Effect::PeerActivate { body, .. } => Some((**body).clone()),
+                _ => None,
+            })
+            .unwrap();
+        let mut stable = activate.configuration.clone();
+        stable.unit.previous = Epoch::default();
+        for r in &mut stable.replicas.0 {
+            r.previous_role = 1;
+        }
+        run(
+            &executor,
+            Command::ActivateReply {
+                body: Box::new(ActivateReply {
+                    unit: stable.unit,
+                    replica: stable.replicas.0[0].clone(),
+                    error: 0,
+                }),
+                source: peer_source(),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+        )
+        .await;
+        let end = configured(&effects(&executor));
+        assert_eq!(end.flags, 1);
+        let (entered, release) = hooks.pause(false);
+        let ticket = executor
+            .submit(Command::CompleteConfiguration(Box::new(end)))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        release.send(()).unwrap();
+        ticket.wait(WAIT).await.unwrap();
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(body)] if body.unit.previous == Epoch::default() && body.replicas.0[1].service_endpoint == "127.0.0.1:23456")
+        );
+        run(&executor, continue_swap()).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::DoReconfigurationReply(_)]
+        ));
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
 async fn configured_secondary_retirement_preserves_both_quorums_and_exact_phase_commit_barriers() {
     let (store, executor, hooks) = setup(WAIT).await;
     let active = built_fm_idle(&executor).await;

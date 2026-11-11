@@ -154,6 +154,11 @@ pub struct PackageRegistration {
 }
 #[derive(Clone)]
 enum Work {
+    GetLsn(Arc<GetLsn>, NodeInstance, GenerationHeader),
+    GetLsnReply(Arc<GetLsnReply>, NodeInstance, GenerationHeader),
+    ReplicaStatus(ra::ConfigurationCompletion),
+    Endpoint(Arc<AddInstance>),
+    EndpointAck(Arc<AddInstanceReply>, NodeInstance, GenerationHeader),
     Reconfigure(Arc<DoReconfiguration>, NodeInstance, GenerationHeader),
     Deactivate(Arc<Deactivate>, NodeInstance, GenerationHeader),
     Deactivated(Arc<DeactivateReply>, NodeInstance, GenerationHeader),
@@ -1264,6 +1269,82 @@ impl Node {
             generation.clone(),
         ))
     }
+    pub fn continue_swap_from_peer(
+        &mut self,
+        body: DoReconfiguration,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+            || self.ra.peer().as_ref() != Some(source)
+            || generation.for_fm_replica
+        {
+            return Err(Error::Unsupported);
+        }
+        self.admit_configuration(&body.configuration)?;
+        self.enqueue(Work::Reconfigure(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn get_lsn_from_peer(
+        &mut self,
+        body: GetLsn,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if self.ra.peer().as_ref() != Some(source)
+            || generation.for_fm_replica
+            || self
+                .ra
+                .snapshot(body.unit.id.guid.0)
+                .committed
+                .is_none_or(|s| s.swap.is_none())
+        {
+            return Err(Error::Unsupported);
+        }
+        self.enqueue(Work::GetLsn(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn get_lsn_reply_from_peer(
+        &mut self,
+        body: GetLsnReply,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if self.ra.peer().as_ref() != Some(source)
+            || generation.for_fm_replica
+            || self
+                .ra
+                .snapshot(body.replica.unit.id.guid.0)
+                .committed
+                .is_none_or(|s| s.swap.is_none())
+        {
+            return Err(Error::Unsupported);
+        }
+        self.enqueue(Work::GetLsnReply(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn endpoint_reply_from_fm(
+        &mut self,
+        body: AddInstanceReply,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        self.admit_fm(source, generation)?;
+        self.enqueue(Work::EndpointAck(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
     pub fn reconfigure_from_fm(
         &mut self,
         body: DoReconfiguration,
@@ -1287,7 +1368,12 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+        let swapping = self
+            .ra
+            .snapshot(body.configuration.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.swap.is_some());
+        if (!swapping && self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle)
             || self.ra.peer().as_ref() != Some(source)
             || generation.for_fm_replica
         {
@@ -1343,7 +1429,12 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+        let swapping = self
+            .ra
+            .snapshot(body.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.swap.is_some());
+        if (!swapping && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary)
             || self.ra.peer().as_ref() != Some(source)
             || generation.for_fm_replica
         {
@@ -1648,6 +1739,23 @@ impl Node {
     }
     fn build(&self, work: &Work) -> ra::Command {
         match work {
+            Work::GetLsn(body, source, generation) => ra::Command::GetLsn {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::GetLsnReply(body, source, generation) => ra::Command::GetLsnReply {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::ReplicaStatus(body) => ra::Command::CompleteStatus(Box::new(body.clone())),
+            Work::Endpoint(body) => ra::Command::ProxyEndpoint(Box::new((**body).clone())),
+            Work::EndpointAck(body, source, generation) => ra::Command::EndpointReply {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
             Work::Deactivate(body, source, generation) => ra::Command::Deactivate {
                 body: Box::new((**body).clone()),
                 source: source.clone(),
@@ -2112,9 +2220,13 @@ impl Node {
                     if matches!(state.phase, ra::Phase::Opening | ra::Phase::Closing) {
                         self.retry(unit)?;
                     } else if state
-                        .reconfiguration
+                        .swap
                         .as_ref()
-                        .is_some_and(|config| config.stage != ra::ConfigurationStage::Complete)
+                        .is_some_and(|s| s.stage != ra::SwapStage::Complete)
+                        || state
+                            .reconfiguration
+                            .as_ref()
+                            .is_some_and(|config| config.stage != ra::ConfigurationStage::Complete)
                     {
                         self.enqueue(Work::RetryConfiguration(unit))?;
                     } else if state.service_description_pending {
@@ -2404,7 +2516,9 @@ impl Node {
             }
             | ra::Effect::RemoveIdle {
                 body, registration, ..
-            } => {
+            }
+            | ra::Effect::QueryReplicaStatus { body, registration }
+            | ra::Effect::AcknowledgeEndpoint { body, registration } => {
                 let Some(lease) = self.activation.host_lease() else {
                     self.effects.pop_front();
                     self.receipts.push_back(EffectReceipt {
@@ -2425,12 +2539,31 @@ impl Node {
                     }
                     ra::Effect::BuildIdle { .. } => ("ReplicatorBuildIdleReplica", 0),
                     ra::Effect::RemoveIdle { .. } => ("ReplicatorRemoveIdleReplica", 0),
+                    ra::Effect::QueryReplicaStatus { .. } => {
+                        ("ReplicatorUpdateEpochAndGetStatus", 0)
+                    }
+                    ra::Effect::AcknowledgeEndpoint { .. } => {
+                        ("ProxyReplicaEndpointUpdatedReply", 0)
+                    }
                     _ => unreachable!(),
                 };
                 let bytes = if let ra::Effect::BuildIdle { replica, .. }
                 | ra::Effect::RemoveIdle { replica, .. } = &dispatch.effect
                 {
                     rap::idle_request(body, replica)?
+                } else if matches!(
+                    dispatch.effect,
+                    ra::Effect::QueryReplicaStatus { .. } | ra::Effect::AcknowledgeEndpoint { .. }
+                ) {
+                    to_vec(&rap::Request {
+                        runtime: registration.runtime.clone(),
+                        unit: body.unit.clone(),
+                        local: body.replica.clone(),
+                        remote: ObjectArray(vec![]),
+                        service: Service::default(),
+                        flags: 0,
+                    })
+                    .map_err(|_| Error::Protocol)?
                 } else {
                     rap::request(registration, body, flags)?
                 };
@@ -2513,6 +2646,10 @@ impl Node {
             | ra::Effect::PeerActivateReply { .. }
             | ra::Effect::PeerDeactivate { .. }
             | ra::Effect::PeerDeactivateReply { .. }
+            | ra::Effect::PeerContinueSwap { .. }
+            | ra::Effect::PeerGetLsn { .. }
+            | ra::Effect::PeerGetLsnReply { .. }
+            | ra::Effect::ReplicaEndpointUpdated(_)
             | ra::Effect::PeerCreateReplica { .. }
             | ra::Effect::PeerCreateReplicaReply { .. }
             | ra::Effect::NodeActivateReply(_)
@@ -2599,6 +2736,12 @@ impl Node {
             self.held_reply = None;
             return Ok(());
         }
+        if action == "ProxyReplicaEndpointUpdated" {
+            let body: AddInstance = decode(reply.body())?;
+            self.enqueue(Work::Endpoint(Arc::new(body)))?;
+            self.held_reply = None;
+            return Ok(());
+        }
         let body: rap::Reply = decode(reply.body())?;
         let idle = matches!(
             action.as_str(),
@@ -2628,6 +2771,15 @@ impl Node {
             return Err(Error::Protocol);
         }
         let work = match reply.action().map_err(|_| Error::Protocol)?.as_str() {
+            "ReplicatorUpdateEpochAndGetStatusReply" => {
+                Work::ReplicaStatus(ra::ConfigurationCompletion {
+                    unit: body.unit,
+                    local: body.local,
+                    replicas: body.remote,
+                    flags: body.flags,
+                    error: body.error.error,
+                })
+            }
             "UpdateConfigurationReply" => Work::Configured(ra::ConfigurationCompletion {
                 unit: body.unit,
                 local: body.local,

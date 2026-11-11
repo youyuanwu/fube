@@ -345,12 +345,22 @@ int main(int argc,char** argv) {
         c=0; rich(peer_deactivated,c);
         run(mode,dir,"rich-deactivate-reply",peer_deactivated);
         reject_truncated(peer_deactivated);
+        ReplicaMessageBody get_lsn;
+        run(mode,dir,"default-get-lsn",get_lsn);
+        c=0; rich(get_lsn,c);
+        run(mode,dir,"rich-get-lsn",get_lsn);
+        reject_truncated(get_lsn);
+        GetLSNReplyMessageBody lsn_reply;
+        run(mode,dir,"default-get-lsn-reply",lsn_reply);
+        c=0; rich(lsn_reply,c);
+        run(mode,dir,"rich-get-lsn-reply",lsn_reply);
+        reject_truncated(lsn_reply);
         if(DoReconfigurationActor!=12 || DoReconfigurationReplyActor!=11 ||
-           ActivateActor!=12 || ActivateReplyActor!=12 || DeactivateActor!=12 || DeactivateReplyActor!=12 ||
+           ActivateActor!=12 || ActivateReplyActor!=12 || DeactivateActor!=12 || DeactivateReplyActor!=12 || GetLSNActor!=12 || GetLSNReplyActor!=12 ||
            !DoReconfigurationPriority || !DoReconfigurationReplyPriority ||
-           !ActivatePriority || !ActivateReplyPriority || !DeactivatePriority || !DeactivateReplyPriority)
+           !ActivatePriority || !ActivateReplyPriority || !DeactivatePriority || !DeactivateReplyPriority || !GetLSNPriority || !GetLSNReplyPriority)
             throw std::runtime_error("native configuration factory metadata mismatch");
-        for(auto name:{u"DoReconfiguration",u"DoReconfigurationReply",u"Activate",u"ActivateReply",u"Deactivate",u"DeactivateReply"}) {
+        for(auto name:{u"DoReconfiguration",u"DoReconfigurationReply",u"Activate",u"ActivateReply",u"Deactivate",u"DeactivateReply",u"GetLSN",u"GetLSNReply"}) {
             action.action_=text(name);
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);
@@ -581,7 +591,7 @@ int main(int argc,char** argv) {
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
         ++native_truncation_rejections;
-        if(native_truncation_rejections!=45)
+        if(native_truncation_rejections!=47)
             throw std::runtime_error("native truncation coverage mismatch");
         std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;

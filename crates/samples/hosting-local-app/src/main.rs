@@ -271,10 +271,9 @@ impl IStatefulServiceReplica for StatefulReplica {
     fn change_role(&self, role: ReplicaRole, _: Cancellation) -> ApiFuture<'_, String> {
         Box::pin(async move {
             if !matches!(role, ReplicaRole::IdleSecondary | ReplicaRole::None)
-                && !(role == ReplicaRole::Primary && self.resource.mode.primary)
-                && !(role == ReplicaRole::ActiveSecondary
-                    && self.native.is_some()
-                    && !self.resource.mode.primary)
+                && !(role == ReplicaRole::Primary
+                    && (self.resource.mode.primary || self.native.is_some()))
+                && !(role == ReplicaRole::ActiveSecondary && self.native.is_some())
             {
                 return Err(Error::Protocol(
                     "fixture prohibits Primary/secondary promotion",
@@ -289,7 +288,27 @@ impl IStatefulServiceReplica for StatefulReplica {
                 });
             }
             if role == ReplicaRole::Primary {
+                if let Some(mut secondary) = self.secondary.lock().unwrap().take() {
+                    secondary.join();
+                }
                 let data = self.data.lock().unwrap().clone().expect("real data owner");
+                if self.primary.lock().unwrap().is_none() {
+                    let service = PrimaryService::start(PrimaryState {
+                        native: self
+                            .native
+                            .as_ref()
+                            .expect("real native integration")
+                            .clone(),
+                        partition: self.partition.lock().unwrap().clone().expect("partition"),
+                        data: data.clone(),
+                        memory: self.memory.lock().unwrap().clone().expect("provider"),
+                    })?;
+                    marker(&format!(
+                        "LOCAL_PRIMARY listening endpoint={}",
+                        service.address
+                    ));
+                    *self.primary.lock().unwrap() = Some(service);
+                }
                 let before = data.snapshot();
                 assert_eq!(before.role, ReplicaRole::Primary);
                 assert!(!before.ready);
@@ -378,8 +397,22 @@ impl IStatefulServiceReplica for StatefulReplica {
                         partition,
                         data,
                         self.memory.lock().unwrap().clone().expect("real provider"),
+                        true,
                     )?);
                 }
+            }
+            if role == ReplicaRole::ActiveSecondary && self.secondary.lock().unwrap().is_none() {
+                let pump = SecondaryPump::start(
+                    self.native
+                        .as_ref()
+                        .expect("real native integration")
+                        .clone(),
+                    self.partition.lock().unwrap().clone().expect("partition"),
+                    self.data.lock().unwrap().clone().expect("real replicator"),
+                    self.memory.lock().unwrap().clone().expect("real provider"),
+                    false,
+                )?;
+                *self.secondary.lock().unwrap() = Some(pump);
             }
             Ok(String::new())
         })
@@ -735,10 +768,15 @@ impl SecondaryPump {
         partition: Arc<dyn IStatefulServicePartition>,
         data: Arc<RuntimeReplicator>,
         memory: Arc<MemoryProvider>,
+        copying: bool,
     ) -> Result<Self> {
         let state = data.get_state_replicator();
-        let copy = state.get_copy_stream()?;
+        let mut streams = vec![];
+        if copying {
+            streams.push((state.get_copy_stream()?, true));
+        }
         let replication = state.get_replication_stream()?;
+        streams.push((replication, false));
         let data = Arc::downgrade(&data);
         let stopped = Cancellation::default();
         let stop = stopped.clone();
@@ -762,7 +800,7 @@ impl SecondaryPump {
                         let result = async {
                         // Copy EOS and replication EOS are independent. Consuming copy
                         // first prevents application replication into a partial snapshot.
-                        for (stream, copying) in [(copy, true), (replication, false)] {
+                        for (stream, copying) in streams {
                             loop {
                                 let operation = tokio::select! {
                                     biased;
@@ -792,6 +830,14 @@ impl SecondaryPump {
                                 if let Some(data) =
                                     data.upgrade().filter(|data| !data.snapshot().closed)
                                 {
+                                    if data.snapshot().role == ReplicaRole::Primary
+                                        && native.status().is_ok_and(|status| {
+                                            status.current_role == ReplicaRole::Primary
+                                        })
+                                    {
+                                        marker("LOCAL_IDLE_DATA role_handoff");
+                                        return;
+                                    }
                                     marker(&format!("LOCAL_IDLE_DATA_ERROR {error}"));
                                     data.close(Cancellation::default())
                                         .await

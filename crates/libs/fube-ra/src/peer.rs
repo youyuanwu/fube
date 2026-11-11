@@ -22,7 +22,8 @@ impl EntityState {
         self.peer_creation.as_ref().is_some_and(|peer| {
             (self.body.replica.current_role == 2
                 || (matches!(self.body.replica.current_role, 1 | 3)
-                    && self.reconfiguration.is_some()))
+                    && self.reconfiguration.is_some())
+                || (self.body.replica.current_role == 4 && self.swap.is_some()))
                 && match self.phase {
                     Phase::Ready => self.runtime.is_some() && self.usage.is_some(),
                     Phase::Closing | Phase::Closed => peer.close_started_open || peer.host_down,

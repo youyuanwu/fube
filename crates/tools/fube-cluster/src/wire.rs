@@ -57,6 +57,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                 | "AddPrimaryReply"
                 | "AddReplicaReply"
                 | "DoReconfigurationReply"
+                | "ReplicaEndpointUpdated"
                 | "RemoveReplicaReply"
                 | "RemoveInstanceReply"
                 | "DeleteReplicaReply"
@@ -118,6 +119,7 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
                 | "DeleteReplica"
                 | "ReplicaUpReply"
                 | "ServiceTypeNotificationReply"
+                | "ReplicaEndpointUpdatedReply"
                 | "NodeActivateRequest"
                 | "NodeDeactivateRequest"
                 | "NodeUpdateServiceRequest"
@@ -194,6 +196,9 @@ fn peer_ingress(message: &Message, props: &Properties) -> fube_transport::Result
                 | "ActivateReply"
                 | "Deactivate"
                 | "DeactivateReply"
+                | "GetLSN"
+                | "GetLSNReply"
+                | "DoReconfiguration"
         )
         || message
             .headers
@@ -283,6 +288,18 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 pub fn predecode(message: &Message) -> Result<()> {
     use fube_ra::protocol::*;
     match message.properties().map_err(err)?.action.as_str() {
+        "GetLSN" => {
+            decode::<GetLsn>(&message.body)?;
+        }
+        "GetLSNReply" => {
+            decode::<GetLsnReply>(&message.body)?;
+        }
+        "ReplicaEndpointUpdated" => {
+            decode::<AddInstance>(&message.body)?;
+        }
+        "ReplicaEndpointUpdatedReply" => {
+            decode::<AddInstanceReply>(&message.body)?;
+        }
         "DoReconfiguration" => {
             decode::<DoReconfiguration>(&message.body)?;
         }

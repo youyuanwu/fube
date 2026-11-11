@@ -48,6 +48,8 @@ pub use generation::{GenerationState, GenerationUpdateOutcome};
 mod peer;
 #[path = "reconfiguration.rs"]
 mod reconfiguration;
+#[path = "swap.rs"]
+mod swap;
 pub use peer::{
     BuildCompletion, PeerCreation, RemoteBuild, RemoteIdle, RemoteRemoval, RemovalCompletion,
 };
@@ -55,6 +57,7 @@ pub use reconfiguration::{
     retired_configuration, secondary_service, ConfigurationCompletion, ConfigurationStage,
     Reconfiguration,
 };
+pub use swap::{PrimarySwap, SwapStage};
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -270,6 +273,23 @@ pub struct OpenCompletion {
     pub detail: ProxyErrorDetail,
 }
 pub enum Command {
+    GetLsn {
+        body: Box<GetLsn>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    GetLsnReply {
+        body: Box<GetLsnReply>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CompleteStatus(Box<ConfigurationCompletion>),
+    ProxyEndpoint(Box<AddInstance>),
+    EndpointReply {
+        body: Box<AddInstanceReply>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
     Deactivate {
         body: Box<Deactivate>,
         source: NodeInstance,
@@ -442,6 +462,20 @@ pub enum Command {
     },
 }
 enum Kind {
+    GetLsn {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    GetLsnReply {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CompleteStatus,
+    ProxyEndpoint,
+    EndpointReply {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
     Deactivate {
         source: NodeInstance,
         generation: GenerationHeader,
@@ -607,6 +641,7 @@ pub struct EntityState {
     pub remote_idle: Option<RemoteIdle>,
     /// Session-only phase ownership; persisted descriptions cannot restore authority.
     pub reconfiguration: Option<Reconfiguration>,
+    pub swap: Option<PrimarySwap>,
     pub phase: Phase,
     pub open_token: u64,
     /// Volatile retry bookkeeping; not a native disk record or durable outbox.
@@ -639,6 +674,27 @@ pub struct Snapshot {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    PeerContinueSwap {
+        target: NodeInstance,
+        body: Box<DoReconfiguration>,
+    },
+    PeerGetLsn {
+        target: NodeInstance,
+        body: Box<GetLsn>,
+    },
+    PeerGetLsnReply {
+        target: NodeInstance,
+        body: Box<GetLsnReply>,
+    },
+    QueryReplicaStatus {
+        body: Arc<AddInstance>,
+        registration: RuntimeRegistration,
+    },
+    AcknowledgeEndpoint {
+        body: Arc<AddInstance>,
+        registration: RuntimeRegistration,
+    },
+    ReplicaEndpointUpdated(Box<AddInstance>),
     PeerDeactivate {
         target: NodeInstance,
         body: Box<Deactivate>,
@@ -1029,6 +1085,39 @@ impl Executor {
                 Kind::AddPrimary { source, generation },
                 to_vec(&body),
             ),
+            Command::GetLsn {
+                body,
+                source,
+                generation,
+            } => (
+                body.unit.id.guid.0,
+                Kind::GetLsn { source, generation },
+                to_vec(&body),
+            ),
+            Command::GetLsnReply {
+                body,
+                source,
+                generation,
+            } => (
+                body.replica.unit.id.guid.0,
+                Kind::GetLsnReply { source, generation },
+                to_vec(&body),
+            ),
+            Command::CompleteStatus(body) => {
+                (body.unit.id.guid.0, Kind::CompleteStatus, to_vec(&body))
+            }
+            Command::ProxyEndpoint(body) => {
+                (body.unit.id.guid.0, Kind::ProxyEndpoint, to_vec(&body))
+            }
+            Command::EndpointReply {
+                body,
+                source,
+                generation,
+            } => (
+                body.unit.id.guid.0,
+                Kind::EndpointReply { source, generation },
+                to_vec(&body),
+            ),
             Command::Deactivate {
                 body,
                 source,
@@ -1274,6 +1363,7 @@ impl Executor {
             && matches!(
                 kind,
                 Kind::AddReplica { .. }
+                    | Kind::GetLsn { .. }
                     | Kind::RemoveReplica { .. }
                     | Kind::DoReconfiguration { .. }
                     | Kind::Deactivate { .. }
@@ -1732,6 +1822,9 @@ fn transition(
     peer: Option<&NodeInstance>,
 ) -> Result<Transition> {
     let decode_error = |_| Failure::Admission("invalid native command payload");
+    if swap::handles(work, state)? {
+        return swap::transition(work, state, admission, config, peer);
+    }
     match &work.kind {
         #[cfg(feature = "qualification")]
         Kind::QualificationTerminate => panic!("explicit qualification worker termination"),
@@ -1739,6 +1832,9 @@ fn transition(
         Kind::DoReconfiguration { .. }
         | Kind::Deactivate { .. }
         | Kind::DeactivateReply { .. }
+        | Kind::GetLsn { .. }
+        | Kind::GetLsnReply { .. }
+        | Kind::EndpointReply { .. }
         | Kind::Activate { .. }
         | Kind::ActivateReply { .. }
         | Kind::CompleteConfiguration
@@ -2049,6 +2145,7 @@ fn transition(
                     peer_creation,
                     remote_idle: None,
                     reconfiguration: None,
+                    swap: None,
                     phase: Phase::Opening,
                     open_token: work.id,
                     retry_attempts: 0,

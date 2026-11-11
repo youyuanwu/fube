@@ -137,6 +137,9 @@ impl Adapter {
                             | ra::Effect::PeerActivateReply { .. }
                             | ra::Effect::PeerDeactivate { .. }
                             | ra::Effect::PeerDeactivateReply { .. }
+                            | ra::Effect::PeerContinueSwap { .. }
+                            | ra::Effect::PeerGetLsn { .. }
+                            | ra::Effect::PeerGetLsnReply { .. }
                     )
                 {
                     if let ra::Effect::PeerCreateReplicaReply { body, .. } =
@@ -152,6 +155,7 @@ impl Adapter {
                         receipt.dispatch.effect,
                         ra::Effect::NodeActivateReply(_)
                             | ra::Effect::DoReconfigurationReply(_)
+                            | ra::Effect::ReplicaEndpointUpdated(_)
                             | ra::Effect::NodeDeactivateReply(_)
                             | ra::Effect::NodeUpdateServiceReply(_)
                             | ra::Effect::Reply(_)
@@ -280,6 +284,25 @@ impl Adapter {
         self.commands(node)?;
         if let (Some(link), Some(peer), Some(reply)) = (peer_link, peer, self.peer_replies.front())
         {
+            let swap_unit = match &reply.effect {
+                ra::Effect::PeerContinueSwap { body, .. } => Some(&body.configuration.unit),
+                ra::Effect::PeerGetLsn { body, .. } => Some(&body.unit),
+                ra::Effect::PeerGetLsnReply { body, .. } => Some(&body.replica.unit),
+                _ => None,
+            };
+            if let Some(unit) = swap_unit {
+                let snapshot = node.snapshot(reply.entity);
+                if snapshot.fenced
+                    || snapshot.committed.is_none_or(|s| {
+                        s.phase != ra::Phase::Ready
+                            || s.swap.is_none()
+                            || s.body.unit.current != unit.current
+                    })
+                {
+                    self.peer_replies.pop_front();
+                    return Ok(());
+                }
+            }
             if let ra::Effect::PeerDeactivateReply { body, .. } = &reply.effect {
                 let snapshot = node.snapshot(reply.entity);
                 if snapshot.fenced
@@ -333,6 +356,15 @@ impl Adapter {
                     }
                     ra::Effect::PeerDeactivateReply { target, body } if target == &peer.node => {
                         deactivate_reply_message(body, link.generation())
+                    }
+                    ra::Effect::PeerContinueSwap { target, body } if target == &peer.node => {
+                        do_reconfiguration_message(body, link.generation())
+                    }
+                    ra::Effect::PeerGetLsn { target, body } if target == &peer.node => {
+                        get_lsn_message(body, link.generation())
+                    }
+                    ra::Effect::PeerGetLsnReply { target, body } if target == &peer.node => {
+                        get_lsn_reply_message(body, link.generation())
                     }
                     _ => return Err("peer receipt does not match the original bound peer".into()),
                 }
@@ -390,12 +422,26 @@ impl Adapter {
         }
         if let Some(link) = link {
             if let Some(reply) = self.replies.front() {
+                if let ra::Effect::ReplicaEndpointUpdated(body) = &reply.effect {
+                    let snapshot = node.snapshot(reply.entity);
+                    if snapshot.fenced
+                        || snapshot.committed.is_none_or(|s| {
+                            s.phase != ra::Phase::Ready
+                                || s.body.as_ref() != body.as_ref()
+                                || s.body.replica.current_role != 4
+                                || s.swap.as_ref().is_none_or(|swap| !swap.endpoint_available)
+                        })
+                    {
+                        self.replies.pop_front();
+                        return Ok(());
+                    }
+                }
                 if let ra::Effect::DoReconfigurationReply(body) = &reply.effect {
                     let snapshot = node.snapshot(reply.entity);
                     if snapshot.fenced
                         || snapshot.committed.is_none_or(|state| {
                             state.phase != ra::Phase::Ready
-                                || !state.fm_primary
+                                || state.body.replica.current_role != 4
                                 || state.body.unit != body.unit
                                 || state.reconfiguration.as_ref().is_none_or(|config| {
                                     config.stage != ra::ConfigurationStage::Complete
@@ -446,6 +492,9 @@ impl Adapter {
                     ra::Effect::Reply(body) => add_instance_reply_message(body, Owner::Fm),
                     ra::Effect::DoReconfigurationReply(body) => {
                         do_reconfiguration_reply_message(body, Owner::Fm)
+                    }
+                    ra::Effect::ReplicaEndpointUpdated(body) => {
+                        replica_endpoint_updated_message(body, Owner::Fm)
                     }
                     ra::Effect::PrimaryReply(body) => add_primary_reply_message(body, Owner::Fm),
                     ra::Effect::AddReplicaReply(body) => add_replica_reply_message(body, Owner::Fm),
@@ -1131,6 +1180,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         "open_token":state.open_token, "usage":format!("{:?}",state.usage),
                         "fm_stage":format!("{:?}",state.fm_stage),
                         "local_deleted":state.local_deleted,
+                        "swap":state.swap.as_ref().map(|swap| serde_json::json!({"stage":format!("{:?}",swap.stage),"error":swap.error})),
                         "configuration":state.reconfiguration.as_ref().map(|config| serde_json::json!({
                             "stage":format!("{:?}", config.stage), "request":config.request, "error":config.error,
                         })),
@@ -1294,6 +1344,18 @@ fn receive_peer(
     wire::predecode(message)?;
     let peer = launch.peer.as_ref().ok_or("unbound peer ingress")?;
     let result = match message.properties().map_err(err)?.action.as_str() {
+        "DoReconfiguration" if launch.placement == 2 => {
+            let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
+            node.continue_swap_from_peer(body, &peer.node, &generation)
+        }
+        "GetLSN" => {
+            let (body, generation) = decode_get_lsn(message).map_err(err)?;
+            node.get_lsn_from_peer(body, &peer.node, &generation)
+        }
+        "GetLSNReply" => {
+            let (body, generation) = decode_get_lsn_reply(message).map_err(err)?;
+            node.get_lsn_reply_from_peer(body, &peer.node, &generation)
+        }
         "Deactivate" if launch.placement == 2 => {
             let (body, generation) = decode_deactivate(message).map_err(err)?;
             node.deactivate_replica_from_peer(body, &peer.node, &generation)
@@ -1310,20 +1372,31 @@ fn receive_peer(
             )?;
             node.deactivate_reply_from_peer(body, &peer.node, &generation)
         }
-        "Activate" if launch.placement == 2 => {
+        "Activate" => {
             let (body, generation) = decode_activate(message).map_err(err)?;
             node.activate_replica_from_peer(body, &peer.node, &generation)
         }
-        "ActivateReply" if launch.placement == 1 => {
+        "ActivateReply" => {
             let (body, generation) = decode_activate_reply(message).map_err(err)?;
-            fixed_idle_target(
-                launch,
-                &body.unit.id,
-                &body.replica,
-                &peer.node,
-                peer.replica,
-                peer.incarnation,
-            )?;
+            if launch.placement == 1 {
+                fixed_idle_target(
+                    launch,
+                    &body.unit.id,
+                    &body.replica,
+                    &peer.node,
+                    peer.replica,
+                    peer.incarnation,
+                )?;
+            } else {
+                fixed_peer_target(
+                    launch,
+                    &body.unit.id,
+                    &body.replica,
+                    &peer.node,
+                    peer.replica,
+                    peer.incarnation,
+                )?;
+            }
             node.activate_reply_from_peer(body, &peer.node, &generation)
         }
         "CreateReplica" if launch.placement == 2 => {
@@ -1652,6 +1725,11 @@ fn receive_command(
             }
             let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
             node.reconfigure_from_fm(body, &launch.fm, &generation)
+                .map_err(err)?;
+        }
+        "ReplicaEndpointUpdatedReply" => {
+            let (body, generation) = decode_replica_endpoint_updated_reply(message).map_err(err)?;
+            node.endpoint_reply_from_fm(body, &launch.fm, &generation)
                 .map_err(err)?;
         }
         "AddReplica" | "RemoveReplica" => {

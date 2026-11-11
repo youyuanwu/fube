@@ -342,6 +342,18 @@ impl Cluster {
         let action = incoming.message.properties().map_err(err)?.action;
         let generation = self.children[index].launch.generation.clone();
         match action.as_str() {
+            "ReplicaEndpointUpdated" => {
+                let (body, owner) =
+                    decode_replica_endpoint_updated(&incoming.message).map_err(err)?;
+                if owner != Owner::Fm {
+                    return Err("FMM endpoint publication is gated".into());
+                }
+                if let Some(reply) = self.ledger.endpoint_updated(index, body)? {
+                    let message =
+                        replica_endpoint_updated_reply_message(&reply, &generation).map_err(err)?;
+                    link.send(message).await?;
+                }
+            }
             "DoReconfigurationReply" => {
                 let (body, owner) =
                     decode_do_reconfiguration_reply(&incoming.message).map_err(err)?;
@@ -1001,6 +1013,19 @@ impl Cluster {
         if let Err(error) = self.send_configuration(&body).await {
             self.ledger.lost(0, error.clone());
             return Err(error);
+        }
+        Ok(self.ledger.configuration_status())
+    }
+    pub async fn transfer_primary(&mut self) -> Result<Value> {
+        if self.finished.is_some() || self.children.len() != 2 {
+            return Err("Primary transfer requires the original running cluster".into());
+        }
+        let body = self.ledger.request_primary_transfer(Instant::now())?;
+        if self.ledger.configuration_status()["ready"] != true {
+            if let Err(error) = self.send_configuration(&body).await {
+                self.ledger.lost(0, error.clone());
+                return Err(error);
+            }
         }
         Ok(self.ledger.configuration_status())
     }

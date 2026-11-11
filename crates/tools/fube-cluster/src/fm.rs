@@ -117,6 +117,8 @@ pub struct Ledger {
     pub(crate) idle_deletion: Option<IdleDeletion>,
     pub(crate) idle_predecessor: Option<Value>,
     pub(crate) configuration: Option<ActiveConfiguration>,
+    pub(crate) swap: Option<ActiveConfiguration>,
+    swap_endpoint: Option<AddInstance>,
     configuration_history: Vec<ActiveConfiguration>,
 }
 pub(crate) struct ActiveConfiguration {
@@ -526,6 +528,18 @@ impl Ledger {
         if !self.placements[index].link_alive {
             return Err("report requires the original live node session".into());
         }
+        if let Some(swap) = &self.swap {
+            let mut stable = swap.body.configuration.unit.clone();
+            stable.previous = Epoch::default();
+            if body
+                .dropped
+                .0
+                .first()
+                .is_some_and(|i| i.unit == stable && i.service == swap.body.configuration.service)
+            {
+                self.placements[index].active_unit = Some(stable);
+            }
+        }
         let peer_idle = index == 1
             && self.placements[index].launch.profile == crate::ServiceProfile::StatefulPeerIdle;
         if peer_idle
@@ -576,6 +590,9 @@ impl Ledger {
             && placement.bootstrap == Bootstrap::Admitted
             && placement.launch.profile.stateful()
         {
+            if let Some(swap) = &mut self.swap {
+                swap.unknown = true;
+            }
             if let Some(configuration) = &mut self.configuration {
                 configuration.unknown = true;
             }
@@ -898,6 +915,8 @@ impl Ledger {
             idle_deletion: None,
             idle_predecessor: None,
             configuration: None,
+            swap: None,
+            swap_endpoint: None,
             configuration_history: vec![],
         }
     }
@@ -1212,6 +1231,9 @@ impl Ledger {
         }
     }
     pub fn lost(&mut self, index: usize, error: String) {
+        if let Some(swap) = &mut self.swap {
+            swap.unknown = true;
+        }
         if let Some(configuration) = &mut self.configuration {
             configuration.unknown = true;
         }
@@ -1606,6 +1628,9 @@ impl Ledger {
         Ok(body)
     }
     pub fn request_configuration(&mut self, now: Instant) -> Result<DoReconfiguration> {
+        if self.swap.is_some() {
+            return Err("another configuration after Primary transfer is gated".into());
+        }
         let successor = self.retired_secondary()
             && self.idle_predecessor.is_some()
             && self.idle.as_ref().is_some_and(|i| {
@@ -1711,6 +1736,9 @@ impl Ledger {
                 .is_some_and(|c| c.reply.is_some())
     }
     pub fn request_secondary_retirement(&mut self, now: Instant) -> Result<DoReconfiguration> {
+        if self.swap.is_some() {
+            return Err("retirement after Primary transfer is gated".into());
+        }
         if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
             || self.generation.is_some()
             || self.idle_predecessor.is_some()
@@ -1799,6 +1827,9 @@ impl Ledger {
         Ok(body)
     }
     pub fn configuration_reply(&mut self, index: usize, body: ConfigurationReply) -> Result<()> {
+        if self.swap.is_some() {
+            return self.swap_reply(index, body);
+        }
         let Some(config) = &mut self.configuration else {
             return Ok(());
         };
@@ -1849,6 +1880,20 @@ impl Ledger {
         Ok(())
     }
     pub fn configuration_retry(&mut self, now: Instant) -> Option<DoReconfiguration> {
+        if let Some(swap) = &mut self.swap {
+            if swap.unknown
+                || swap.reply.is_some()
+                || self
+                    .placements
+                    .iter()
+                    .any(|p| !p.link_alive || p.loss_reported)
+                || !action_retry_due(swap.started, swap.last, now)
+            {
+                return None;
+            }
+            swap.last = now;
+            return Some(swap.body.clone());
+        }
         let config = self.configuration.as_mut()?;
         if config.unknown
             || config.reply.is_some()
@@ -1863,7 +1908,224 @@ impl Ledger {
         config.last = now;
         Some(config.body.clone())
     }
+    pub fn request_primary_transfer(&mut self, now: Instant) -> Result<DoReconfiguration> {
+        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
+            || self.generation.is_some()
+            || self.idle_removal.is_some()
+            || self.idle_deletion.is_some()
+            || self.placements.iter().any(|p| {
+                !p.link_alive
+                    || p.loss_reported
+                    || !p.activated
+                    || p.bootstrap != Bootstrap::Admitted
+                    || p.pending.is_some()
+                    || p.node_control.is_some()
+                    || p.service_update.is_some()
+            })
+        {
+            return Err(
+                "Primary transfer requires the two healthy original admitted sessions".into(),
+            );
+        }
+        if let Some(swap) = &mut self.swap {
+            if swap.unknown {
+                return Err("Primary transfer ownership is unknown".into());
+            }
+            swap.last = now;
+            return Ok(swap.body.clone());
+        }
+        let active = self
+            .configuration
+            .as_ref()
+            .filter(|c| c.reply.is_some() && !c.unknown && c.body.configuration.unit.target == 2)
+            .ok_or("Primary transfer requires completed two-member active membership")?;
+        if self
+            .placements
+            .iter()
+            .any(|p| p.observed != Observed::Running)
+        {
+            return Err("Primary transfer requires both members Running".into());
+        }
+        let mut body = active.body.clone();
+        let reply = active.reply.as_ref().expect("completed configuration");
+        body.configuration.unit = reply.unit.clone();
+        body.configuration.unit.previous = reply.unit.current;
+        body.configuration.unit.current.configuration = reply
+            .unit
+            .current
+            .configuration
+            .checked_add(0x1_0000_0001)
+            .ok_or("Primary epoch exhausted")?;
+        body.configuration.replicas = reply.replicas.clone();
+        for r in &mut body.configuration.replicas.0 {
+            r.previous_role = r.current_role;
+            r.current_role = if r.current_role == 4 { 3 } else { 4 };
+        }
+        body.phase0_duration = i64::MAX;
+        for p in &mut self.placements {
+            p.active_unit = Some(body.configuration.unit.clone());
+            p.ready_replica = body
+                .configuration
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.node == p.launch.node)
+                .cloned();
+            p.endpoint = None;
+        }
+        self.swap = Some(ActiveConfiguration {
+            body: body.clone(),
+            reply: None,
+            unknown: false,
+            started: now,
+            last: now,
+        });
+        Ok(body)
+    }
+    pub fn endpoint_updated(
+        &mut self,
+        index: usize,
+        body: AddInstance,
+    ) -> Result<Option<AddInstanceReply>> {
+        let Some(swap) = self
+            .swap
+            .as_ref()
+            .filter(|s| !s.unknown && s.reply.is_none())
+        else {
+            return Ok(None);
+        };
+        if index != 1
+            || self
+                .placements
+                .iter()
+                .any(|p| !p.link_alive || p.loss_reported)
+        {
+            return Ok(None);
+        }
+        let expected = swap
+            .body
+            .configuration
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.node == self.placements[1].launch.node)
+            .ok_or("missing new Primary")?;
+        let mut actual = body.replica.clone();
+        actual.service_endpoint = expected.service_endpoint.clone();
+        actual.first_lsn = expected.first_lsn;
+        actual.last_lsn = expected.last_lsn;
+        if body.unit != swap.body.configuration.unit
+            || body.service != swap.body.configuration.service
+            || actual != *expected
+        {
+            return Ok(None);
+        }
+        let endpoint: std::net::SocketAddr = body
+            .replica
+            .service_endpoint
+            .parse()
+            .map_err(|_| "invalid promoted service endpoint")?;
+        if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+            return Err("promoted endpoint must be numeric loopback".into());
+        }
+        let reply = AddInstanceReply {
+            unit: body.unit.clone(),
+            replica: body.replica.clone(),
+            error: 0,
+        };
+        self.swap_endpoint = Some(body);
+        Ok(Some(reply))
+    }
+    fn swap_reply(&mut self, index: usize, body: ConfigurationReply) -> Result<()> {
+        let Some(swap) = self
+            .swap
+            .as_mut()
+            .filter(|s| !s.unknown && s.reply.is_none())
+        else {
+            return Ok(());
+        };
+        let mut unit = swap.body.configuration.unit.clone();
+        unit.previous = Epoch::default();
+        if index != 1
+            || body.error != 0
+            || body.unit != unit
+            || body.replicas.0.len() != 2
+            || swap.body.configuration.replicas.0.iter().any(|expected| {
+                body.replicas
+                    .0
+                    .iter()
+                    .filter(|r| r.node == expected.node)
+                    .count()
+                    != 1
+            })
+            || self
+                .placements
+                .iter()
+                .any(|p| !p.link_alive || p.loss_reported)
+        {
+            return Ok(());
+        }
+        for r in &body.replicas.0 {
+            let Some(expected) = swap
+                .body
+                .configuration
+                .replicas
+                .0
+                .iter()
+                .find(|e| e.node == r.node)
+            else {
+                return Ok(());
+            };
+            let mut actual = r.clone();
+            actual.previous_role = expected.previous_role;
+            actual.first_lsn = expected.first_lsn;
+            actual.last_lsn = expected.last_lsn;
+            actual.service_endpoint = expected.service_endpoint.clone();
+            if actual != *expected || r.previous_role != 1 || r.first_lsn < 0 || r.last_lsn < 0 {
+                return Ok(());
+            }
+            if r.current_role == 4 {
+                let endpoint: std::net::SocketAddr = r
+                    .service_endpoint
+                    .parse()
+                    .map_err(|_| "invalid final Primary endpoint")?;
+                if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+                    return Err("unsupported final Primary endpoint".into());
+                }
+            } else if !r.service_endpoint.is_empty() {
+                return Err("demoted Primary retained a published service endpoint".into());
+            }
+        }
+        for p in &mut self.placements {
+            let replica = body
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.node == p.launch.node)
+                .ok_or("swap omitted placement")?
+                .clone();
+            p.endpoint = (replica.current_role == 4).then(|| replica.service_endpoint.clone());
+            p.ready_replica = Some(replica);
+            p.active_unit = Some(body.unit.clone());
+            p.observed = Observed::Running;
+        }
+        swap.reply = Some(body);
+        Ok(())
+    }
     pub fn configuration_status(&self) -> Value {
+        if let Some(swap) = &self.swap {
+            let state = if swap.unknown {
+                "unknown"
+            } else if swap.reply.is_some() {
+                "ready"
+            } else {
+                "pending"
+            };
+            return json!({"state":state,"ready":state == "ready","kind":"planned_primary_transfer",
+                "request":{"configuration":swap.body.configuration,"phase0_duration":swap.body.phase0_duration},
+                "reply":swap.reply,"endpoint_update":self.swap_endpoint,"primary_transfer":true,"from":1,"to":2,
+                "history":self.configuration_history.iter().chain(self.configuration.iter()).map(|c| json!({"request":c.body.configuration,"reply":c.reply})).collect::<Vec<_>>()});
+        }
         let Some(config) = &self.configuration else {
             return json!({"state":"absent","ready":false});
         };
@@ -1881,6 +2143,9 @@ impl Ledger {
             "history":self.configuration_history.iter().map(|c| json!({"request":c.body.configuration,"reply":c.reply})).collect::<Vec<_>>()})
     }
     pub fn request_idle_replacement(&mut self, now: Instant) -> Result<AddReplica> {
+        if self.swap.is_some() {
+            return Err("replacement after Primary transfer is gated".into());
+        }
         if self.configuration.is_some() && !self.retired_secondary() {
             return Err("configured-secondary replacement is gated".into());
         }

@@ -19,7 +19,7 @@ class StageTwoCatalogTests(unittest.TestCase):
         records = {row["action"]: row for row in rows}
         self.assertEqual(len(rows), 119)
         self.assertEqual(sum(row["boundary"] == "true" for row in rows), 66)
-        self.assertEqual(sum("selected" in row["status"] for row in rows), 43)
+        self.assertEqual(sum("selected" in row["status"] for row in rows), 45)
         for action in consumer.STAGE_TWO_ACTIONS:
             with self.subTest(action=action):
                 row = records[action]
@@ -27,8 +27,7 @@ class StageTwoCatalogTests(unittest.TestCase):
                 self.assertIn("selected-C6", row["status"])
                 self.assertIn("codec", row["status"])
                 if action.startswith("ReplicaEndpointUpdated"):
-                    self.assertIn("codec-only", row["status"])
-                    self.assertIn("deferred-stage-5", row["status"])
+                    self.assertIn("selected-C13", row["status"])
         text = (root / "docs/cluster/NativeRaProtocol.md").read_text()
         for term in ["101 inputs", "73 types/233 fields", "105 bundle files",
                      "26 native truncation", "one FT per real Node", "multi-FT",

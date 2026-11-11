@@ -42,8 +42,9 @@ application listener. The original Primary endpoint remains unchanged.
 Current two-member and previous singleton quorum obligations stay distinct:
 loss of the Secondary cannot acknowledge a fresh write from the old singleton.
 Exact original requests retry/replay without repeating Open/build/role work.
-While this configuration is owned, Idle removal/replacement, node/service
-mutations, generation upload and additional configurations remain gated; owner
+Outside the explicit retirement/replacement and planned transfer below,
+Idle removal/replacement, node/service mutations, generation upload and
+additional configurations remain gated; owner
 shutdown remains available. See the [source mapping and acceptance boundaries](../../../docs/cluster/MinimalFmCluster.md#same-primary-active-configuration-stage-5-increment).
 
 `Cluster::retire_secondary_replica().await` explicitly retires the **healthy
@@ -61,8 +62,29 @@ independent original disposal/usage-release proof before
 `configuration.history`/`idle_predecessor` preserve the predecessor results.
 Original processes, factory/runtime owners and Primary endpoint stay unchanged.
 Host loss never authorizes retirement or restores singleton quorum; second
-replacement, concurrent supersession, Primary transfer and restart stay gated.
+replacement, concurrent supersession and restart stay gated.
 See the [source mapping and evidence limits](../../../docs/cluster/MinimalFmCluster.md#healthy-configured-secondary-retirement-and-replacement).
+
+`Cluster::transfer_primary().await` explicitly transfers Primary from node 1
+to node 2 after completed healthy two-member active admission, including the
+supported replacement. Native phase-0 RAP demotion/write revocation must finish
+before peer DoReconfiguration continuation. The candidate then obtains actual
+local RAP and peer GetLSN progress, promotes/catches up, activates the demoted
+member and completes final RAP configuration and its committed FM reply.
+The native default PC=CC path skips phase-3 Deactivate; neither member reopens
+or rebuilds. Existing data and node/app/factory/runtime owners remain intact.
+Poll `configuration.kind=planned_primary_transfer` and `ready=true`.
+Only the exact new-Primary reply publishes node 2's endpoint in `nodes[1]`;
+the old endpoint is withdrawn while pending, and its retained listener rejects
+writes after real demotion. Proxy endpoint ACKs and optional native 30-second
+ReplicaEndpointUpdated/Reply publication remain distinct from final completion.
+Prior requests/replies remain in `configuration.history`; current swap
+phase/error is in `nodes[].retained_work.local_replica.swap`.
+Lost replies replay the retained continuation/completion without another Open.
+New-Primary loss yields unknown, never failback or quorum reduction. Second/
+reverse transfer, progress mismatch repair, swap abort, automatic failover,
+restart and full native handler/interoperability qualification remain gated.
+See the [source mapping and acceptance boundaries](../../../docs/cluster/MinimalFmCluster.md#healthy-planned-primary-transfer).
 
 `Cluster::remove_idle_replica_via_fm().await` lets FM cancel its original pending
 creation, retire failed creation or abandon the original opened Idle through native RemoveReplica/Reply,
@@ -481,7 +503,8 @@ the native default five-second FM scan interval. Status includes current intent,
 pending control, type status, service-update version and load receipt presence.
 Real service-description/load IPC and node-wide barriers are described in
 [stage-two coordination](../../../docs/cluster/MinimalFmCluster.md#node-wide-coordination-stage-2).
-Live endpoint publication, general multi-FT deployment and FMM remain gated.
+General endpoint publication outside the bounded planned swap, multi-FT
+deployment and FMM remain gated.
 
 The programmatic `Cluster::begin_generation_handshake()` starts the bounded
 ordinary-FM GenerationProposal/Reply and GenerationUpdate/Reject round.
