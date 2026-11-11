@@ -37,12 +37,18 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 169 inputs.
+The C++ producer independently constructs expected values and emits 172 inputs.
+Healthy three-member admission adds three-element-vector cases for
+DoReconfiguration, Activate and DoReconfigurationReply. A separately initialized
+third descriptor is appended to the rich native/Rust bodies; these are synthetic
+codec fixtures, not a native handler trace or live membership proof.
+The maintained gate covers 84 types/255 fields, 176 bundle files and 52 actual
+native truncation rejections, retaining all prior 169 LFUM cases.
 Live-session LFUM adds empty/rich/deleted-only metadata bodies, a bodyless
 correlated reply and both action headers. Native LFUMMessageBody extraction
 preserves generation/NodeDescription/FailoverUnitInfo-vector/AnyReplicaFound
 order; the request has no GenerationHeader and the reply echoes it.
-The maintained gate covers 84 types/255 fields, 173 bundle files and 49 actual
+The LFUM gate covered 84 types/255 fields, 173 bundle files and 49 actual
 native truncation rejections. All prior 163 cases and 47 rejections remain.
 The empty LFUM fixture explicitly initializes AnyReplicaFound=false; the native
 body's empty constructor does not initialize that scalar.

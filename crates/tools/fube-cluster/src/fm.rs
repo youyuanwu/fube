@@ -110,10 +110,10 @@ pub struct Operation {
     pub outcome: Value,
 }
 pub struct Ledger {
-    pub placements: [Placement; 2],
+    pub placements: Vec<Placement>,
     pub operations: Vec<Operation>,
     pub(crate) generation: Option<GenerationHandshake>,
-    pub(crate) idle: Option<IdleBuild>,
+    pub(crate) idles: Vec<IdleBuild>,
     pub(crate) idle_removal: Option<IdleRemoval>,
     pub(crate) idle_deletion: Option<IdleDeletion>,
     pub(crate) idle_predecessor: Option<Value>,
@@ -583,7 +583,8 @@ impl Ledger {
     }
 
     pub fn begin_generation(&mut self) -> Result<()> {
-        if self.configuration.is_some()
+        if self.placements.len() != 2
+            || self.configuration.is_some()
             || self.generation.is_some()
             || self.placements.iter().any(|placement| {
                 placement.bootstrap != Bootstrap::Admitted
@@ -620,8 +621,7 @@ impl Ledger {
                 self.placements[index].active_unit = Some(stable);
             }
         }
-        let peer_idle = index == 1
-            && self.placements[index].launch.profile == crate::ServiceProfile::StatefulPeerIdle;
+        let peer_idle = index != 0 && self.placements[index].launch.profile.peer_replicas();
         if peer_idle
             && !body.last
             && !body.from_fmm
@@ -657,7 +657,7 @@ impl Ledger {
                 }
             }
         }
-        let response = if peer_idle && self.idle.is_some() {
+        let response = if peer_idle && !self.idles.is_empty() {
             self.placements[index].report_known_creation(body, true)?
         } else {
             self.placements[index].report(body)?
@@ -984,13 +984,12 @@ impl Ledger {
         self.finish_idle_deletion();
         Ok(())
     }
-    pub fn new(launches: [Launch; 2]) -> Self {
-        let [one, two] = launches;
+    pub fn new(launches: impl IntoIterator<Item = Launch>) -> Self {
         Self {
-            placements: [Placement::new(one), Placement::new(two)],
+            placements: launches.into_iter().map(Placement::new).collect(),
             operations: vec![],
             generation: None,
-            idle: None,
+            idles: vec![],
             idle_removal: None,
             idle_deletion: None,
             idle_predecessor: None,
@@ -1019,7 +1018,7 @@ impl Ledger {
         if self.configuration.is_some() && !matches!(command.action.as_str(), "status" | "quit") {
             return Err("active-configuration lifecycle changes remain gated".into());
         }
-        if self.placements[0].launch.profile == crate::ServiceProfile::StatefulPeerIdle
+        if self.placements[0].launch.profile.peer_replicas()
             && (matches!(
                 command.action.as_str(),
                 "delete" | "activate" | "deactivate"
@@ -1325,7 +1324,7 @@ impl Ledger {
                 removal.unknown = true;
             }
         }
-        if let Some(idle) = &mut self.idle {
+        for idle in &mut self.idles {
             idle.unknown = true;
         }
         let placement = &mut self.placements[index];
@@ -1355,6 +1354,11 @@ impl Ledger {
         }
     }
     pub fn down(&mut self, index: usize) {
+        if self.placements[0].launch.profile == crate::ServiceProfile::StatefulThree {
+            if let Some(configuration) = &mut self.configuration {
+                configuration.unknown = true;
+            }
+        }
         if index == 1 && !self.idle_deletion_complete() {
             if let Some(deletion) = &mut self.idle_deletion {
                 deletion.unknown = true;
@@ -1365,7 +1369,7 @@ impl Ledger {
                 removal.unknown = true;
             }
         }
-        if let Some(idle) = &mut self.idle {
+        for idle in &mut self.idles {
             idle.unknown = true;
         }
         let placement = &mut self.placements[index];
@@ -1665,10 +1669,16 @@ impl Ledger {
             "unsupported":"all native families outside the selected fixed lifecycle profile"})
     }
     pub fn request_idle(&mut self, now: Instant) -> Result<AddReplica> {
+        self.request_idle_on(1, now)
+    }
+    pub fn request_idle_on(&mut self, destination: usize, now: Instant) -> Result<AddReplica> {
+        if destination == 0 || destination >= self.placements.len() {
+            return Err("unknown original Idle destination".into());
+        }
         if (self.configuration.is_some()
             && !(self.retired_secondary() && self.idle_predecessor.is_some()))
-            || self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
-            || self.placements[1].loss_reported
+            || !self.placements[0].launch.profile.peer_replicas()
+            || self.placements.iter().any(|p| p.loss_reported)
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
             || self.generation.is_some()
@@ -1678,24 +1688,27 @@ impl Ledger {
                 .iter()
                 .any(|p| !p.link_alive || !p.activated || p.bootstrap != Bootstrap::Admitted)
         {
-            return Err(
-                "Idle build requires the original admitted two-node Primary profile".into(),
-            );
+            return Err("Idle build requires the original admitted healthy peer profile".into());
         }
-        if let Some(idle) = &mut self.idle {
-            if idle.cancelled || idle.unknown || idle.reply.is_some() {
+        let target = &self.placements[destination].launch.node;
+        if let Some(idle) = self
+            .idles
+            .iter_mut()
+            .find(|i| &i.body.replica.node == target)
+        {
+            if idle.cancelled || idle.unknown || idle.reply.as_ref().is_some_and(|r| r.error != 0) {
                 return Err("original FM Idle build is no longer pending".into());
             }
             idle.last = now;
             return Ok(idle.body.clone());
         }
         let mut body = self.placements[0].body()?;
-        body.replica = self.placements[1].body()?.replica;
+        body.replica = self.placements[destination].body()?.replica;
         body.replica.current_role = 2;
         if body.replica.version != body.service.version {
             return Err("peer packages do not share the original deployment version".into());
         }
-        self.idle = Some(IdleBuild {
+        self.idles.push(IdleBuild {
             body: body.clone(),
             reply: None,
             cancelled: false,
@@ -1706,15 +1719,16 @@ impl Ledger {
         Ok(body)
     }
     pub fn request_configuration(&mut self, now: Instant) -> Result<DoReconfiguration> {
+        let count = self.placements.len() as i32;
         if self.swap.is_some() {
             return Err("another configuration after Primary transfer is gated".into());
         }
         let successor = self.retired_secondary()
             && self.idle_predecessor.is_some()
-            && self.idle.as_ref().is_some_and(|i| {
+            && self.idles.first().is_some_and(|i| {
                 i.reply.as_ref().is_some_and(|r| r.error == 0) && !i.cancelled && !i.unknown
             });
-        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
+        if !self.placements[0].launch.profile.peer_replicas()
             || self.generation.is_some()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
@@ -1729,14 +1743,14 @@ impl Ledger {
                     || p.service_update.is_some()
             })
         {
-            return Err("configuration requires the two original healthy admitted nodes".into());
+            return Err("configuration requires the original healthy admitted nodes".into());
         }
         if let Some(configuration) = &mut self.configuration {
             if configuration.unknown {
                 return Err("configuration owner is unknown".into());
             }
             if !successor {
-                if configuration.body.configuration.unit.target != 2 {
+                if configuration.body.configuration.unit.target != count {
                     return Err(
                         "retired configuration requires a fresh successfully built successor"
                             .into(),
@@ -1746,21 +1760,26 @@ impl Ledger {
                 return Ok(configuration.body.clone());
             }
         }
-        let idle = self
-            .idle
-            .as_ref()
-            .filter(|idle| !idle.cancelled && !idle.unknown)
-            .and_then(|idle| idle.reply.as_ref())
-            .filter(|reply| reply.error == 0)
-            .ok_or("configuration requires successful FM Idle build")?;
+        if self.idles.len() != self.placements.len() - 1 {
+            return Err("configuration requires every original FM Idle build".into());
+        }
         let mut primary = self.placements[0]
             .ready_replica
             .clone()
             .ok_or("missing original Primary reply")?;
-        let mut secondary = idle.replica.clone();
         primary.previous_role = 4;
-        secondary.previous_role = 2;
-        secondary.current_role = 3;
+        let mut replicas = vec![primary];
+        for idle in &self.idles {
+            let reply = idle
+                .reply
+                .as_ref()
+                .filter(|r| r.error == 0 && !idle.cancelled && !idle.unknown)
+                .ok_or("configuration requires successful FM Idle build")?;
+            let mut secondary = reply.replica.clone();
+            secondary.previous_role = 2;
+            secondary.current_role = 3;
+            replicas.push(secondary);
+        }
         let mut body = self.placements[0].body()?;
         body.unit.previous = body.unit.current;
         body.unit.current.configuration = body
@@ -1774,8 +1793,10 @@ impl Ledger {
         {
             return Err("same-Primary configuration epoch exhausted".into());
         }
-        body.unit.target = 2;
-        body.service.target = 2;
+        body.unit.target = count;
+        body.unit.minimum = if count == 3 { 2 } else { 1 };
+        body.service.target = count;
+        body.service.minimum = body.unit.minimum;
         body.service.update_version = body
             .service
             .update_version
@@ -1785,7 +1806,7 @@ impl Ledger {
             configuration: Configuration {
                 unit: body.unit,
                 service: body.service,
-                replicas: ObjectArray(vec![primary, secondary]),
+                replicas: ObjectArray(replicas),
             },
             phase0_duration: i64::MAX,
         };
@@ -2242,7 +2263,7 @@ impl Ledger {
                     || placement.service_update.is_some()
                     || placement.pending.is_some()
             })
-            || self.idle.as_ref().is_none_or(|idle| {
+            || self.idles.first().is_none_or(|idle| {
                 idle.unknown || idle.reply.as_ref().is_none_or(|reply| reply.error != 0)
             })
             || (!self.retired_secondary()
@@ -2299,18 +2320,22 @@ impl Ledger {
         placement.endpoint = None;
         self.idle_removal = None;
         self.idle_deletion = None;
-        self.idle = Some(IdleBuild {
+        self.idles = vec![IdleBuild {
             body: body.clone(),
             reply: None,
             cancelled: false,
             unknown: false,
             started: now,
             last: now,
-        });
+        }];
         Ok(body)
     }
     pub fn idle_reply(&mut self, index: usize, body: AddReplicaReply) -> Result<()> {
-        let Some(idle) = &mut self.idle else {
+        let Some(idle) = self
+            .idles
+            .iter_mut()
+            .find(|i| i.body.replica.node == body.replica.node)
+        else {
             return Ok(());
         };
         if index != 0
@@ -2319,7 +2344,7 @@ impl Ledger {
             || idle.reply.is_some()
             || self.placements[0].observed != Observed::Running
             || self.placements.iter().any(|p| !p.link_alive)
-            || self.placements[1].loss_reported
+            || self.placements.iter().any(|p| p.loss_reported)
             || body.unit != idle.body.unit
             || body.replica.node != idle.body.replica.node
             || body.replica.id != idle.body.replica.id
@@ -2340,13 +2365,18 @@ impl Ledger {
         }
         let failed = body.error != 0;
         idle.reply = Some(body);
-        if failed {
+        if failed && self.placements[0].launch.profile == crate::ServiceProfile::StatefulPeerIdle {
             self.request_idle_removal(Instant::now())?;
         }
         Ok(())
     }
     pub fn idle_retry(&mut self, index: usize, now: Instant) -> Option<AddReplica> {
-        let idle = self.idle.as_mut()?;
+        let idle = self.idles.iter_mut().find(|i| {
+            i.reply.is_none()
+                && !i.cancelled
+                && !i.unknown
+                && action_retry_due(i.started, i.last, now)
+        })?;
         if index != 0
             || self.generation.is_some()
             || idle.cancelled
@@ -2368,7 +2398,33 @@ impl Ledger {
         Some(idle.body.clone())
     }
     pub fn idle_status(&self) -> Value {
-        let Some(idle) = &self.idle else {
+        if self.placements[0].launch.profile == crate::ServiceProfile::StatefulThree {
+            let builds: Vec<_> = self.idles.iter().map(|idle| {
+                let error = idle.reply.as_ref().map(|r| r.error);
+                let state = if idle.unknown { "unknown" }
+                    else if idle.cancelled { "cancelled" }
+                    else if error == Some(0) { "ready" }
+                    else if error.is_some() { "failed" } else { "pending" };
+                json!({"state":state,"ready":state == "ready","request":idle.body,"reply":idle.reply,
+                    "to_be_dropped":error.is_some_and(|e| e != 0),
+                    "cleanup_required":error.is_some_and(|e| e != 0)})
+            }).collect();
+            let ready = builds.len() == 2 && builds.iter().all(|b| b["ready"] == true);
+            let state = if builds.iter().any(|b| b["state"] == "unknown") {
+                "unknown"
+            } else if builds.iter().any(|b| b["state"] == "failed") {
+                "failed"
+            } else if ready {
+                "ready"
+            } else if builds.is_empty() {
+                "absent"
+            } else {
+                "pending"
+            };
+            return json!({"state":state,
+                "ready":ready,"serving":false,"builds":builds});
+        }
+        let Some(idle) = self.idles.first() else {
             return json!({"state":"absent","ready":false});
         };
         let error = idle.reply.as_ref().map(|reply| reply.error);
@@ -2417,8 +2473,8 @@ impl Ledger {
             return Ok(removal.body.clone());
         }
         if self
-            .idle
-            .as_ref()
+            .idles
+            .first()
             .is_some_and(|idle| idle.cancelled || idle.unknown)
         {
             return Err("cancelled or unknown Idle cleanup is gated".into());
@@ -2430,7 +2486,7 @@ impl Ledger {
             return Err("peer packages do not share the original deployment version".into());
         }
         let mut failed_creation = false;
-        if let Some(idle) = &mut self.idle {
+        if let Some(idle) = self.idles.first_mut() {
             body = idle.body.clone();
             if let Some(reply) = &idle.reply {
                 failed_creation = reply.error != 0;
@@ -2550,11 +2606,11 @@ impl Ledger {
                 }))
     }
     pub fn idle_absence_allowed(&self) -> bool {
-        matches!((&self.idle, &self.idle_removal), (Some(idle), Some(removal))
+        matches!((self.idles.first(), &self.idle_removal), (Some(idle), Some(removal))
             if idle.reply.is_none() && !idle.unknown && !removal.unknown && idle.body == removal.body)
     }
     pub fn idle_failed_creation_error(&self) -> Option<i64> {
-        let (Some(idle), Some(removal)) = (&self.idle, &self.idle_removal) else {
+        let (Some(idle), Some(removal)) = (self.idles.first(), &self.idle_removal) else {
             return None;
         };
         (!idle.unknown && !removal.unknown && removal.failed_creation && idle.body == removal.body)
@@ -2808,8 +2864,8 @@ impl Ledger {
             && placement.launch.profile == crate::ServiceProfile::StatefulPeerIdle
             && placement.loss_reported
         {
-            self.idle
-                .as_ref()
+            self.idles
+                .first()
                 .ok_or("missing original Idle creation")?
                 .body
                 .clone()

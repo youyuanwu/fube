@@ -17,6 +17,7 @@ pub struct Reconfiguration {
     pub stage: ConfigurationStage,
     pub error: i64,
     pub history: Vec<Configuration>,
+    pub activated: Vec<NodeInstance>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigurationCompletion {
@@ -34,7 +35,12 @@ pub fn secondary_service(old: &Service, new: &Service) -> bool {
         return false;
     };
     expected.update_version = version;
-    matches!(old.target, 1 | 2) && old.minimum == 1 && *new == expected
+    if matches!(old.target, 1 | 2) && old.minimum == 1 && *new == expected {
+        return true;
+    }
+    expected.target = 3;
+    expected.minimum = 2;
+    old.target == 1 && old.minimum == 1 && *new == expected
 }
 pub fn retired_configuration(state: &EntityState) -> bool {
     state.reconfiguration.as_ref().is_some_and(|config| {
@@ -58,7 +64,8 @@ fn local<'a>(body: &'a Configuration, node: &NodeInstance) -> Result<&'a Replica
 }
 fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Result<()> {
     let old_epoch = old.body.unit.current;
-    if body.replicas.0.len() != 2
+    let three = body.unit.target == 3 && old.body.service.target == 1;
+    if body.replicas.0.len() != if three { 3 } else { 2 }
         || body.unit.id != old.body.unit.id
         || body.unit.consistency != old.body.unit.consistency
         || body.unit.previous != old_epoch
@@ -70,33 +77,33 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                 .ok_or(Failure::Capacity)?
         || body.unit.current.configuration & !0xffff_ffff != old_epoch.configuration & !0xffff_ffff
         || body.unit.target != body.service.target
-        || body.unit.minimum != 1
+        || body.unit.minimum != if three { 2 } else { 1 }
+        || body.unit.minimum != body.service.minimum
         || !secondary_service(&old.body.service, &body.service)
     {
         return Err(Failure::Unsupported(
-            "only bounded same-Primary 1-to-2 or 2-to-1 configuration is enabled",
+            "only bounded same-Primary 1-to-2, 1-to-3 or 2-to-1 configuration is enabled",
         ));
     }
     let p = local(body, primary)?;
-    let s = body
-        .replicas
-        .0
-        .iter()
-        .find(|r| r.node != *primary)
-        .ok_or(Failure::Admission("missing Secondary"))?;
     if p.current_role != 4
         || p.previous_role != 4
-        || (body.unit.target == 2 && (s.current_role != 3 || s.previous_role != 2))
-        || (body.unit.target == 1 && (s.current_role != 1 || s.previous_role != 3))
-        || p.id == s.id
-        || p.node.id == s.node.id
-        || body.replicas.0.iter().any(|r| {
+        || body.replicas.0.iter().enumerate().any(|(i, r)| {
             !r.up
                 || r.state != 2
                 || r.id < 0
                 || r.instance < 0
                 || r.version != body.service.version
                 || r.replication_endpoint.is_empty()
+                || body.replicas.0[..i]
+                    .iter()
+                    .any(|old| old.id == r.id || old.node.id == r.node.id)
+                || (r.node != *primary
+                    && if body.unit.target >= 2 {
+                        r.current_role != 3 || r.previous_role != 2
+                    } else {
+                        r.current_role != 1 || r.previous_role != 3
+                    })
         })
     {
         return Err(Failure::Unsupported(
@@ -181,13 +188,9 @@ pub(super) fn deactivate_reply(state: &EntityState) -> Effect {
         }),
     }
 }
-fn pending_effect(state: &EntityState) -> Effect {
-    match state
-        .reconfiguration
-        .as_ref()
-        .expect("owned configuration")
-        .stage
-    {
+fn pending_effects(state: &EntityState) -> Vec<Effect> {
+    let config = state.reconfiguration.as_ref().expect("owned configuration");
+    let effect = match config.stage {
         ConfigurationStage::Catchup => configuration_effect(state, 2),
         ConfigurationStage::End => configuration_effect(state, 1),
         ConfigurationStage::Secondary => configuration_effect(state, 0),
@@ -199,7 +202,6 @@ fn pending_effect(state: &EntityState) -> Effect {
             }
         }
         ConfigurationStage::Deactivate => {
-            let config = state.reconfiguration.as_ref().expect("owned configuration");
             let target = config
                 .request
                 .replicas
@@ -218,25 +220,27 @@ fn pending_effect(state: &EntityState) -> Effect {
             }
         }
         ConfigurationStage::Activate => {
-            let config = state.reconfiguration.as_ref().expect("owned configuration");
-            let target = config
+            let (epoch, catchup_lsn) = state.primary_deactivation.expect("Primary deactivation");
+            return config
                 .request
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 3)
-                .expect("Secondary");
-            let (epoch, catchup_lsn) = state.primary_deactivation.expect("Primary deactivation");
-            Effect::PeerActivate {
-                target: target.node.clone(),
-                body: Box::new(Activate {
-                    configuration: config.request.clone(),
-                    deactivation: ReplicaDeactivationInfo { epoch, catchup_lsn },
-                }),
-            }
+                .filter(|target| {
+                    target.current_role == 3 && !config.activated.contains(&target.node)
+                })
+                .map(|target| Effect::PeerActivate {
+                    target: target.node.clone(),
+                    body: Box::new(Activate {
+                        configuration: config.request.clone(),
+                        deactivation: ReplicaDeactivationInfo { epoch, catchup_lsn },
+                    }),
+                })
+                .collect();
         }
         ConfigurationStage::Complete => reply(state),
-    }
+    };
+    vec![effect]
 }
 fn admitted(
     source: &NodeInstance,
@@ -261,6 +265,7 @@ pub(super) fn transition(
     work: &Submission,
     current: Option<&EntityState>,
     admission: &Admission,
+    peers: &[NodeInstance],
     peer: Option<&NodeInstance>,
 ) -> Result<Transition> {
     let Some(current) = current else {
@@ -300,7 +305,7 @@ pub(super) fn transition(
                 } else {
                     return Ok(Transition {
                         update: Update::None,
-                        effects: vec![pending_effect(current)],
+                        effects: pending_effects(current),
                         disposition: Disposition::Applied,
                     });
                 }
@@ -309,54 +314,69 @@ pub(super) fn transition(
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
             }
             shape(&body.configuration, current, &admission.local_node)?;
-            let remote = current
-                .remote_idle
-                .as_ref()
-                .filter(|remote| remote.ready && remote.removal.is_none())
-                .ok_or(Failure::Unsupported(
-                    "configuration requires a successfully built FM Idle",
-                ))?;
-            let opened = remote
-                .reply
-                .as_ref()
-                .ok_or(Failure::Unsupported("missing peer Open"))?;
-            let secondary = local(&body.configuration, &remote.target)?;
-            let expected_remote = if body.configuration.unit.target == 1 {
-                current
-                    .reconfiguration
-                    .as_ref()
-                    .filter(|c| {
-                        c.stage == ConfigurationStage::Complete && c.request.unit.target == 2
-                    })
-                    .and_then(|c| {
-                        c.request
-                            .replicas
-                            .0
-                            .iter()
-                            .find(|r| r.node == remote.target)
-                    })
-                    .ok_or(Failure::Unsupported(
-                        "retirement requires completed active membership",
-                    ))?
-            } else {
-                &opened.replica
-            };
-            if peer != Some(&remote.target)
-                || remote.fm_request.is_none()
-                || secondary.id != expected_remote.id
-                || secondary.instance != expected_remote.instance
-                || secondary.replication_endpoint != expected_remote.replication_endpoint
-                || secondary.service_endpoint != expected_remote.service_endpoint
-                || local(&body.configuration, &admission.local_node)?.id != current.body.replica.id
-                || local(&body.configuration, &admission.local_node)?.instance
-                    != current.body.replica.instance
-                || local(&body.configuration, &admission.local_node)?.replication_endpoint
-                    != current.body.replica.replication_endpoint
-                || local(&body.configuration, &admission.local_node)?.service_endpoint
-                    != current.body.replica.service_endpoint
+            if body.configuration.unit.target == 3
+                && (peers.len() != 2
+                    || current.reconfiguration.is_some()
+                    || current.remote_idles.len() != 2)
             {
+                return Err(Failure::Unsupported(
+                    "three-member admission requires both original built Idles",
+                ));
+            }
+            for remote in &current.remote_idles {
+                if !remote.ready || remote.removal.is_some() {
+                    return Err(Failure::Unsupported(
+                        "configuration requires a successfully built FM Idle",
+                    ));
+                }
+                let opened = remote
+                    .reply
+                    .as_ref()
+                    .ok_or(Failure::Unsupported("missing peer Open"))?;
+                let secondary = local(&body.configuration, &remote.target)?;
+                let expected_remote = if body.configuration.unit.target == 1 {
+                    current
+                        .reconfiguration
+                        .as_ref()
+                        .filter(|c| {
+                            c.stage == ConfigurationStage::Complete && c.request.unit.target == 2
+                        })
+                        .and_then(|c| {
+                            c.request
+                                .replicas
+                                .0
+                                .iter()
+                                .find(|r| r.node == remote.target)
+                        })
+                        .ok_or(Failure::Unsupported(
+                            "retirement requires completed active membership",
+                        ))?
+                } else {
+                    &opened.replica
+                };
+                if !peers.contains(&remote.target)
+                    || remote.fm_request.is_none()
+                    || secondary.id != expected_remote.id
+                    || secondary.instance != expected_remote.instance
+                    || secondary.replication_endpoint != expected_remote.replication_endpoint
+                    || secondary.service_endpoint != expected_remote.service_endpoint
+                    || local(&body.configuration, &admission.local_node)?.id
+                        != current.body.replica.id
+                    || local(&body.configuration, &admission.local_node)?.instance
+                        != current.body.replica.instance
+                    || local(&body.configuration, &admission.local_node)?.replication_endpoint
+                        != current.body.replica.replication_endpoint
+                    || local(&body.configuration, &admission.local_node)?.service_endpoint
+                        != current.body.replica.service_endpoint
+                {
+                    return Err(Failure::Admission(
+                        "configuration changed original replica ownership",
+                    ));
+                }
+            }
+            if current.remote_idles.len() != body.configuration.replicas.0.len() - 1 {
                 return Err(Failure::Admission(
-                    "configuration changed original replica ownership",
+                    "configuration omitted a remote build owner",
                 ));
             }
             let mut state = current.clone();
@@ -372,8 +392,9 @@ pub(super) fn transition(
                     history.push(c.request.clone());
                     history
                 }),
+                activated: vec![],
             });
-            effects.push(pending_effect(&state));
+            effects.extend(pending_effects(&state));
             Ok(lifecycle::changed(state, effects, true))
         }
         Kind::Activate { source, generation } => {
@@ -412,7 +433,7 @@ pub(super) fn transition(
                 }
                 return Ok(Transition {
                     update: Update::None,
-                    effects: vec![pending_effect(current)],
+                    effects: pending_effects(current),
                     disposition: Disposition::Applied,
                 });
             }
@@ -438,8 +459,9 @@ pub(super) fn transition(
                 stage: ConfigurationStage::Secondary,
                 error: 0,
                 history: vec![],
+                activated: vec![],
             });
-            effects.push(pending_effect(&state));
+            effects.extend(pending_effects(&state));
             Ok(lifecycle::changed(state, effects, true))
         }
         Kind::Deactivate { source, generation } => {
@@ -534,6 +556,7 @@ pub(super) fn transition(
                 stage: ConfigurationStage::Retiring,
                 error: 0,
                 history: vec![prior.request.clone()],
+                activated: vec![],
             });
             lifecycle::start_close(&mut state, CloseMode::Deactivate, work.id, &mut effects);
             Ok(lifecycle::changed(state, effects, true))
@@ -580,7 +603,7 @@ pub(super) fn transition(
                 .stage = ConfigurationStage::End;
             Ok(lifecycle::changed(
                 state.clone(),
-                vec![pending_effect(&state)],
+                pending_effects(&state),
                 true,
             ))
         }
@@ -610,14 +633,24 @@ pub(super) fn transition(
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             }
             let mut state = current.clone();
-            state
-                .reconfiguration
-                .as_mut()
-                .expect("owned configuration")
-                .stage = ConfigurationStage::End;
+            let config = state.reconfiguration.as_mut().expect("owned configuration");
+            if config.activated.contains(source) {
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
+            }
+            config.activated.push(source.clone());
+            if config
+                .request
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.current_role == 3)
+                .all(|r| config.activated.contains(&r.node))
+            {
+                config.stage = ConfigurationStage::End;
+            }
             Ok(lifecycle::changed(
                 state.clone(),
-                vec![pending_effect(&state)],
+                pending_effects(&state),
                 true,
             ))
         }
@@ -666,7 +699,7 @@ pub(super) fn transition(
                 let stable = stable(&config.request);
                 apply_body(&mut state, &stable, &admission.local_node)?;
                 if state.fm_primary && config.request.unit.target == 1 {
-                    state.remote_idle = None;
+                    state.remote_idles.clear();
                 }
                 state
                     .reconfiguration
@@ -676,7 +709,7 @@ pub(super) fn transition(
             }
             Ok(lifecycle::changed(
                 state.clone(),
-                vec![pending_effect(&state)],
+                pending_effects(&state),
                 true,
             ))
         }
@@ -688,7 +721,7 @@ pub(super) fn transition(
             {
                 Ok(Transition {
                     update: Update::None,
-                    effects: vec![pending_effect(current)],
+                    effects: pending_effects(current),
                     disposition: Disposition::Applied,
                 })
             } else {

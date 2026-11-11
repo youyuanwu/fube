@@ -45,6 +45,28 @@ enum SemanticAck {
     Notification(ServiceTypeNotification),
     Report(ReplicaUp),
 }
+struct PeerConnection {
+    link: Option<Link>,
+    incoming: Option<
+        fube_transport::channel::IncomingMessage<fube_transport::native_channel::GatewayTarget>,
+    >,
+    dialed: bool,
+}
+
+fn peer_target(effect: &ra::Effect) -> Option<&NodeInstance> {
+    match effect {
+        ra::Effect::PeerCreateReplica { target, .. }
+        | ra::Effect::PeerCreateReplicaReply { target, .. }
+        | ra::Effect::PeerActivate { target, .. }
+        | ra::Effect::PeerActivateReply { target, .. }
+        | ra::Effect::PeerDeactivate { target, .. }
+        | ra::Effect::PeerDeactivateReply { target, .. }
+        | ra::Effect::PeerContinueSwap { target, .. }
+        | ra::Effect::PeerGetLsn { target, .. }
+        | ra::Effect::PeerGetLsnReply { target, .. } => Some(target),
+        _ => None,
+    }
+}
 const REPORT_RETRY: Duration = Duration::from_secs(15);
 const STATEFUL_REPORT_RETRY: Duration = Duration::from_secs(30);
 
@@ -464,8 +486,7 @@ impl Adapter {
                             state.phase != ra::Phase::Ready
                                 || !state.fm_primary
                                 || state
-                                    .remote_idle
-                                    .as_ref()
+                                    .remote_idle(&body.replica.node)
                                     .and_then(|remote| {
                                         if removing {
                                             remote.remove_reply()
@@ -774,7 +795,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
     let address = listener.local_addr().map_err(err)?;
-    let mut peer_listener = if launch.peer.is_some() {
+    let mut peer_listener = if !launch.peers.is_empty() {
         Some(TcpListener::bind("127.0.0.1:0").await.map_err(err)?)
     } else {
         None
@@ -858,16 +879,15 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     // bootstrap exchanges completed for this original session.
     private_dir(&launch.directory.join("hosting"))?;
     let mut options = Options::new(launch.directory.join("hosting"));
-    if launch.profile == ServiceProfile::StatefulPeerIdle {
+    if launch.profile.peer_replicas() {
         options.service_package_version_instance = Some(1);
     }
     if launch.profile.stateful() {
-        options.profile =
-            if launch.profile == ServiceProfile::StatefulPeerIdle && launch.placement == 2 {
-                fube_hosting::local::Profile::VolatileStatefulLifecycle
-            } else {
-                fube_hosting::local::Profile::VolatileStatefulFmPrimary
-            };
+        options.profile = if launch.profile.peer_replicas() && launch.placement != 1 {
+            fube_hosting::local::Profile::VolatileStatefulLifecycle
+        } else {
+            fube_hosting::local::Profile::VolatileStatefulFmPrimary
+        };
     }
     options.node = Some(NodeContext {
         id: node_hex(&launch.node),
@@ -907,13 +927,14 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         },
     )
     .map_err(err)?;
-    if let Some(peer) = &launch.peer {
-        node.bind_peer(peer.node.clone()).map_err(err)?;
+    if !launch.peers.is_empty() {
+        node.bind_peers(launch.peers.iter().map(|p| p.node.clone()).collect())
+            .map_err(err)?;
     }
     node.apply_fresh_node_up_ack(&ack, &generation)
         .map_err(err)?;
     let mut adapter = Adapter::default();
-    let arguments = if launch.profile == ServiceProfile::StatefulPeerIdle && launch.placement == 2 {
+    let arguments = if launch.profile.peer_replicas() && launch.placement != 1 {
         vec![(
             "Arguments".into(),
             "--stateful-lifecycle --data-replicator".into(),
@@ -936,9 +957,15 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         started
     };
     let mut link = Some(link);
-    let mut peer_link = None;
-    let mut peer_dialed = false;
-    let mut peer_incoming = None;
+    let mut connections: Vec<_> = launch
+        .peers
+        .iter()
+        .map(|_| PeerConnection {
+            link: None,
+            incoming: None,
+            dialed: false,
+        })
+        .collect();
     let mut failure = startup.err();
     let mut next_observation = Instant::now();
     let mut published_retirement = None;
@@ -992,19 +1019,32 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             let command = std::str::from_utf8(&line).map_err(err);
                             let command = command.as_ref().map(|line| line.split_whitespace().collect::<Vec<_>>());
                             match command {
-                                Ok(parts) if parts.len() == 4 && parts[0] == "peer"
+                                Ok(parts) if matches!(parts.len(), 4 | 5) && parts[0] == "peer"
                                     && parts[1] == launch.session && parts[2] == launch.capability
-                                    && launch.placement == 1 && launch.peer.is_some() && !peer_dialed => {
-                                    peer_dialed = true;
+                                    && launch.placement == 1 && !launch.peers.is_empty() => {
+                                    let index = if parts.len() == 5 {
+                                        match parts[3].parse::<usize>() {
+                                            Ok(index) => index,
+                                            Err(error) => {
+                                                failure = Some(format!("invalid original peer index: {error}"));
+                                                break;
+                                            }
+                                        }
+                                    } else { 0 };
+                                    let Some(connection) = connections.get_mut(index).filter(|c| !c.dialed) else {
+                                        failure = Some("invalid or already dialed original peer".into());
+                                        break;
+                                    };
+                                    connection.dialed = true;
                                     peer_listener.take();
-                                    match dial_peer(launch, parts[3]).await {
-                                        Ok(link) => peer_link = Some(link),
+                                    match dial_peer_to(launch, &launch.peers[index], parts[parts.len() - 1]).await {
+                                        Ok(link) => connection.link = Some(link),
                                         Err(error) => adapter.peer_error = Some(error),
                                     }
                                 }
                                 Ok(parts) if parts.len() == 3 && matches!(parts[0], "create-idle" | "build-idle" | "remove-idle")
                                     && parts[1] == launch.session && parts[2] == launch.capability
-                                    && launch.placement == 1 && launch.peer.is_some() => {
+                                    && launch.placement == 1 && !launch.peers.is_empty() => {
                                     let submitted = if adapter.peer_commands.len() == 32 {
                                         Err("peer command receipt capacity".into())
                                     } else {
@@ -1032,13 +1072,13 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(2)) => {},
             }
-            if launch.placement == 2 {
+            if launch.placement != 1 {
                 if let Some(listener) = &peer_listener {
                     match tokio::time::timeout(Duration::from_millis(1), listener.accept()).await {
                         Ok(Ok((stream, _))) => {
                             peer_listener.take();
                             match accept_peer(launch, stream).await {
-                                Ok(link) => peer_link = Some(link),
+                                Ok(link) => connections[0].link = Some(link),
                                 Err(error) => adapter.peer_error = Some(error),
                             }
                         }
@@ -1104,12 +1144,19 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     let _ = old.close().await;
                 }
             }
+            adapter.capture(&mut node);
+            let selected_peer = adapter
+                .peer_replies
+                .front()
+                .and_then(|reply| peer_target(&reply.effect))
+                .and_then(|target| launch.peers.iter().position(|peer| &peer.node == target));
+            let selected_link = selected_peer.and_then(|index| connections[index].link.as_ref());
             if let Err(error) = adapter
                 .advance_with_peer(
                     &mut node,
                     link.as_ref(),
-                    peer_link.as_ref(),
-                    launch.peer.as_ref(),
+                    selected_link,
+                    selected_peer.map(|index| &launch.peers[index]),
                 )
                 .await
             {
@@ -1118,36 +1165,38 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     let _ = old.close().await;
                 }
             }
-            if let Some(current) = &peer_link {
-                if peer_incoming.is_none() && adapter.peer_commands.len() < 32 {
-                    match current
-                        .receive(Instant::now() + Duration::from_millis(1))
-                        .await
-                    {
-                        Ok(incoming) => peer_incoming = incoming,
-                        Err(error) => adapter.peer_error = Some(error),
+            for (peer, connection) in launch.peers.iter().zip(&mut connections) {
+                if let Some(current) = &connection.link {
+                    if connection.incoming.is_none() && adapter.peer_commands.len() < 32 {
+                        match current
+                            .receive(Instant::now() + Duration::from_millis(1))
+                            .await
+                        {
+                            Ok(incoming) => connection.incoming = incoming,
+                            Err(error) => adapter.peer_error = Some(error),
+                        }
                     }
-                }
-                if let Some(incoming) = &mut peer_incoming {
-                    match receive_peer(launch, &mut node, &incoming.message) {
-                        Ok(Some(id)) => {
-                            adapter.peer_commands.push(id);
-                            if let Some(handoff) = incoming.handoff.as_mut() {
-                                handoff.acknowledge();
+                    if let Some(incoming) = &mut connection.incoming {
+                        match receive_peer_from(launch, peer, &mut node, &incoming.message) {
+                            Ok(Some(id)) => {
+                                adapter.peer_commands.push(id);
+                                if let Some(handoff) = incoming.handoff.as_mut() {
+                                    handoff.acknowledge();
+                                }
+                                connection.incoming = None;
                             }
-                            peer_incoming = None;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            adapter.peer_error = Some(error);
-                            peer_incoming = None;
-                            current.channel.dispose();
+                            Ok(None) => {}
+                            Err(error) => {
+                                adapter.peer_error = Some(error);
+                                connection.incoming = None;
+                                current.channel.dispose();
+                            }
                         }
                     }
-                }
-                if adapter.peer_error.is_some() {
-                    if let Some(old) = peer_link.take() {
-                        let _ = old.close().await;
+                    if adapter.peer_error.is_some() {
+                        if let Some(old) = connection.link.take() {
+                            let _ = old.close().await;
+                        }
                     }
                 }
             }
@@ -1281,7 +1330,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 });
                 let remote_idle =
                     state
-                        .and_then(|state| state.remote_idle.as_ref())
+                        .and_then(|state| state.remote_idles.first())
                         .map(|remote| {
                             serde_json::json!({
                                 "replica":remote.body.replica.0.replica,
@@ -1315,7 +1364,12 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     "semantic_pending":adapter.semantic_pending(),
                     "staged_status":format!("{:?}", node.pending_status()),
                     "error":adapter.error, "link_alive":link.is_some(),
-                    "peer_link_alive":peer_link.is_some(), "peer_error":adapter.peer_error,
+                    "peer_link_alive":!connections.is_empty() && connections.iter().all(|c| c.link.is_some()), "peer_error":adapter.peer_error,
+                    "remote_idles":state.map(|s| s.remote_idles.iter().map(|r| serde_json::json!({
+                        "replica":r.body.replica.0.replica, "reply":r.reply,
+                        "ready":r.ready && r.removal.is_none(),
+                        "build":r.build.as_ref().map(|b| serde_json::json!({"result":b.result,"detail":b.detail})),
+                    })).collect::<Vec<_>>()),
                     "peer_command_error":adapter.peer_command_error,
                     "peer_idle":remote_idle, "local_replica":local_replica,
                     "app_observation":{
@@ -1334,7 +1388,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     "generations": {
                         "proposed":generations.proposed, "receive":generations.receive,
                         "send":generations.send, "upload_pending":generations.upload_pending,
-                        "upload_supported":launch.profile != ServiceProfile::StatefulPeerIdle,
+                        "upload_supported":!launch.profile.peer_replicas(),
                     },
                 });
                 if let Err(error) =
@@ -1351,8 +1405,10 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     if let Some(link) = link.take() {
         let _ = link.close().await;
     }
-    if let Some(link) = peer_link.take() {
-        let _ = link.close().await;
+    for connection in &mut connections {
+        if let Some(link) = connection.link.take() {
+            let _ = link.close().await;
+        }
     }
     let receipt = cleanup(launch, &mut node, &store, &mut adapter).await?;
     write_json(&launch.directory.join("cleanup.json"), &receipt)?;
@@ -1362,7 +1418,16 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn dial_peer(launch: &Launch, address: &str) -> Result<Link> {
+    dial_peer_to(
+        launch,
+        launch.peers.first().ok_or("no original peer binding")?,
+        address,
+    )
+    .await
+}
+async fn dial_peer_to(launch: &Launch, peer: &Peer, address: &str) -> Result<Link> {
     let address: std::net::SocketAddr = address.parse().map_err(err)?;
     if !address.ip().is_loopback() || address.port() == 0 {
         return Err("peer requires original numeric loopback listener".into());
@@ -1376,7 +1441,12 @@ async fn dial_peer(launch: &Launch, address: &str) -> Result<Link> {
     .connect_until(wire::deadline())
     .await
     .map_err(err)?;
-    peer_link(launch, channel)
+    Link::new(
+        channel,
+        launch.node.clone(),
+        peer.node.clone(),
+        launch.generation.clone(),
+    )
 }
 
 async fn accept_peer(launch: &Launch, stream: tokio::net::TcpStream) -> Result<Link> {
@@ -1396,8 +1466,8 @@ fn peer_link(launch: &Launch, channel: fube_transport::Channel) -> Result<Link> 
         channel,
         launch.node.clone(),
         launch
-            .peer
-            .as_ref()
+            .peers
+            .first()
             .ok_or("no original peer binding")?
             .node
             .clone(),
@@ -1406,7 +1476,7 @@ fn peer_link(launch: &Launch, channel: fube_transport::Channel) -> Result<Link> 
 }
 
 fn create_idle(launch: &Launch, node: &mut Node) -> Result<u64> {
-    let peer = launch.peer.as_ref().ok_or("no original peer binding")?;
+    let peer = launch.peers.first().ok_or("no original peer binding")?;
     let package_version = actual_profile(node)?.version;
     node.create_idle_on_peer(Replica {
         node: peer.node.clone(),
@@ -1422,13 +1492,26 @@ fn create_idle(launch: &Launch, node: &mut Node) -> Result<u64> {
     .map_err(err)
 }
 
+#[cfg(test)]
 fn receive_peer(
     launch: &Launch,
     node: &mut Node,
     message: &fube_transport::message::Message,
 ) -> Result<Option<u64>> {
+    receive_peer_from(
+        launch,
+        launch.peers.first().ok_or("unbound peer ingress")?,
+        node,
+        message,
+    )
+}
+fn receive_peer_from(
+    launch: &Launch,
+    peer: &Peer,
+    node: &mut Node,
+    message: &fube_transport::message::Message,
+) -> Result<Option<u64>> {
     wire::predecode(message)?;
-    let peer = launch.peer.as_ref().ok_or("unbound peer ingress")?;
     let result = match message.properties().map_err(err)?.action.as_str() {
         "DoReconfiguration" if launch.placement == 2 => {
             let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
@@ -1485,7 +1568,7 @@ fn receive_peer(
             }
             node.activate_reply_from_peer(body, &peer.node, &generation)
         }
-        "CreateReplica" if launch.placement == 2 => {
+        "CreateReplica" if launch.placement != 1 => {
             let (body, generation) = decode_create_replica(message).map_err(err)?;
             fixed_idle_target(
                 launch,
@@ -1806,7 +1889,7 @@ fn receive_command(
                 .map_err(err)?;
         }
         "DoReconfiguration" => {
-            if launch.profile != ServiceProfile::StatefulPeerIdle || launch.placement != 1 {
+            if !launch.profile.peer_replicas() || launch.placement != 1 {
                 return Err("DoReconfiguration requires the original coordinating Primary".into());
             }
             let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
@@ -1827,8 +1910,9 @@ fn receive_command(
             }
             .map_err(err)?;
             let peer = launch
-                .peer
-                .as_ref()
+                .peers
+                .iter()
+                .find(|peer| peer.node == body.replica.node)
                 .filter(|_| launch.placement == 1)
                 .ok_or("replica control requires the original coordinating Primary")?;
             fixed_idle_target(
@@ -3879,7 +3963,7 @@ pub(crate) mod report_tests {
             },
         )
         .map_err(err)?;
-        if let Some(peer) = &launch.peer {
+        if let Some(peer) = launch.peers.first() {
             node.bind_peer(peer.node.clone()).map_err(err)?;
         }
         Ok((node, store))
@@ -3894,7 +3978,7 @@ pub(crate) mod report_tests {
     ) -> Result<()> {
         node.drive().map_err(err)?;
         adapter
-            .advance_with_peer(node, fm, Some(peer), launch.peer.as_ref())
+            .advance_with_peer(node, fm, Some(peer), launch.peers.first())
             .await?;
         if let Some(mut incoming) = peer
             .receive(Instant::now() + Duration::from_millis(1))
@@ -5008,7 +5092,7 @@ pub(crate) mod report_tests {
                             return Err("late Create opened/acquired/disposed a never-created destination".into());
                         }
                         let primary = source.snapshot(entity).committed.ok_or("Primary disappeared")?;
-                        if primary.remote_idle.as_ref().is_none_or(|remote| remote.build.is_some() || remote.ready || remote.reply.is_some()) {
+                        if primary.remote_idles.first().is_none_or(|remote| remote.build.is_some() || remote.ready || remote.reply.is_some()) {
                             return Err("late Create resurrected the cancelled source build".into());
                         }
                         ledger.idle_removal_reply(0, traffic.idle_removals[1].clone())?;
@@ -5081,8 +5165,7 @@ pub(crate) mod report_tests {
                     .committed
                     .ok_or("Primary disappeared")?;
                 let remote = current
-                    .remote_idle
-                    .as_ref()
+                    .remote_idles.first()
                     .ok_or("cancellation tombstone disappeared")?;
                 if remote.reply.as_ref().map(|reply| reply.error)
                     != failed.then_some(ra::RA_NOT_READY)
@@ -5299,7 +5382,7 @@ pub(crate) mod report_tests {
                             || target.activation().logs().iter().filter(|line| line.contains("LOCAL_CALLBACK abort")).count() != usize::from(opening)
                             || target.activation().logs().iter().filter(|line| line.contains("LOCAL_DATA_PROVIDER acquired")).count() != 1
                             || !target_traffic.reports.is_empty()
-                            || source.snapshot(entity).committed.is_none_or(|state| state.remote_idle.as_ref().is_none_or(|remote| remote.build.is_some() || remote.ready))
+                            || source.snapshot(entity).committed.is_none_or(|state| state.remote_idles.first().is_none_or(|remote| remote.build.is_some() || remote.ready))
                         {
                             return Err("late peer/build traffic resurrected or reacquired the deleted Idle".into());
                         }
@@ -5416,7 +5499,7 @@ pub(crate) mod report_tests {
                     peer_step(&launches[0], &mut source, &mut source_adapter, &source_link, Some(&fm_link)).await?;
                     peer_step(&launches[1], &mut target, &mut target_adapter, &target_link, None).await?;
                     if source.snapshot(entity).committed.as_ref()
-                        .and_then(|state| state.remote_idle.as_ref())
+                        .and_then(|state| state.remote_idles.first())
                         .is_some_and(|remote| remote.reply.is_some())
                     {
                         break;
@@ -5428,7 +5511,7 @@ pub(crate) mod report_tests {
                 }
                 let original = target.snapshot(entity).committed.ok_or("missing Idle")?;
                 let request = source.snapshot(entity).committed.ok_or("missing Primary")?
-                    .remote_idle.as_ref().ok_or("missing remote request")?.body.clone();
+                    .remote_idles.first().ok_or("missing remote request")?.body.clone();
                 let mut stale_epoch = (*request).clone();
                 stale_epoch.replica.0.unit.current.configuration -= 1;
                 for request in [&stale_epoch, request.as_ref()] {

@@ -319,15 +319,27 @@ int main(int argc,char** argv) {
         c=0; rich(reconfig,c);
         run(mode,dir,"rich-do-reconfiguration",reconfig);
         reject_truncated(reconfig);
+        ReplicaDescription third;
+        int third_counter=5000;
+        rich(third,third_counter);
+        reconfig.replicas_.push_back(third);
+        run(mode,dir,"three-do-reconfiguration",reconfig);
+        reject_truncated(reconfig);
         ConfigurationReplyMessageBody configured;
         run(mode,dir,"default-do-reconfiguration-reply",configured);
         c=0; rich(configured,c);
         run(mode,dir,"rich-do-reconfiguration-reply",configured);
         reject_truncated(configured);
+        configured.replicas_.push_back(third);
+        run(mode,dir,"three-do-reconfiguration-reply",configured);
+        reject_truncated(configured);
         ActivateMessageBody peer_activate;
         run(mode,dir,"default-activate",peer_activate);
         c=0; rich(peer_activate,c);
         run(mode,dir,"rich-activate",peer_activate);
+        reject_truncated(peer_activate);
+        peer_activate.replicas_.push_back(third);
+        run(mode,dir,"three-activate",peer_activate);
         reject_truncated(peer_activate);
         ReplicaReplyMessageBody peer_activated;
         run(mode,dir,"default-activate-reply",peer_activated);
@@ -604,7 +616,7 @@ int main(int argc,char** argv) {
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
         ++native_truncation_rejections;
-        if(native_truncation_rejections!=49)
+        if(native_truncation_rejections!=52)
             throw std::runtime_error("native truncation coverage mismatch");
         std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;

@@ -868,12 +868,21 @@ fn configuration_contracts(input: &Path, output: &Path) {
     let c = &mut 0;
     let config = filled::<Configuration>(c);
     let duration = filled::<i64>(c);
+    let mut three = config.clone();
+    three.replicas.0.push(filled::<Replica>(&mut 5000));
     for (name, body) in [
         ("default-do-reconfiguration", DoReconfiguration::default()),
         (
             "rich-do-reconfiguration",
             DoReconfiguration {
                 configuration: config,
+                phase0_duration: duration,
+            },
+        ),
+        (
+            "three-do-reconfiguration",
+            DoReconfiguration {
+                configuration: three,
                 phase0_duration: duration,
             },
         ),
@@ -891,12 +900,21 @@ fn configuration_contracts(input: &Path, output: &Path) {
     let c = &mut 0;
     let config = filled::<Configuration>(c);
     let deactivation = filled::<ReplicaDeactivationInfo>(c);
+    let mut three = config.clone();
+    three.replicas.0.push(filled::<Replica>(&mut 5000));
     for (name, body) in [
         ("default-activate", Activate::default()),
         (
             "rich-activate",
             Activate {
                 configuration: config,
+                deactivation: deactivation.clone(),
+            },
+        ),
+        (
+            "three-activate",
+            Activate {
+                configuration: three,
                 deactivation,
             },
         ),
@@ -911,6 +929,8 @@ fn configuration_contracts(input: &Path, output: &Path) {
             decode_activate,
         );
     }
+    let mut three = filled::<ConfigurationReply>(&mut 0);
+    three.replicas.0.push(filled::<Replica>(&mut 5000));
     for (name, body) in [
         ("default-activate-reply", ActivateReply::default()),
         ("rich-activate-reply", filled::<ActivateReply>(&mut 0)),
@@ -934,6 +954,7 @@ fn configuration_contracts(input: &Path, output: &Path) {
             "rich-do-reconfiguration-reply",
             filled::<ConfigurationReply>(&mut 0),
         ),
+        ("three-do-reconfiguration-reply", three),
     ] {
         check(input, output, name, body.clone());
         for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {

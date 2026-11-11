@@ -20,16 +20,29 @@ pub enum ServiceProfile {
     Stateless,
     StatefulSingleton,
     StatefulPeerIdle,
+    StatefulThree,
 }
 impl ServiceProfile {
     pub fn service(self) -> &'static str {
         match self {
             Self::Stateless => SERVICE,
-            Self::StatefulSingleton | Self::StatefulPeerIdle => "fabric:/Cluster/Singleton",
+            Self::StatefulSingleton | Self::StatefulPeerIdle | Self::StatefulThree => {
+                "fabric:/Cluster/Singleton"
+            }
         }
     }
     pub fn stateful(self) -> bool {
         self != Self::Stateless
+    }
+    pub fn peer_replicas(self) -> bool {
+        matches!(self, Self::StatefulPeerIdle | Self::StatefulThree)
+    }
+    pub fn node_count(self) -> usize {
+        if self == Self::StatefulThree {
+            3
+        } else {
+            2
+        }
     }
 }
 
@@ -194,11 +207,14 @@ pub struct Launch {
     pub replica: i64,
     pub incarnation: i64,
     #[serde(default)]
-    pub peer: Option<Peer>,
+    pub peers: Vec<Peer>,
 }
 impl Launch {
     pub fn idle_successor(&self) -> Result<(i64, i64)> {
-        let peer = self.peer.as_ref().ok_or("missing original peer")?;
+        if self.profile != ServiceProfile::StatefulPeerIdle {
+            return Err("replacement outside the original two-node profile is gated".into());
+        }
+        let peer = self.peers.first().ok_or("missing original peer")?;
         let destination_instance = if self.placement == 2 {
             self.incarnation
         } else {
@@ -217,7 +233,7 @@ impl Launch {
         format!("node{}", self.placement)
     }
     pub fn validate(&self) -> Result<()> {
-        if !(1..=2).contains(&self.placement)
+        if !(1..=self.profile.node_count()).contains(&usize::from(self.placement))
             || self.node.id == self.fm.id
             || self.node.instance == 0
             || self.fm.instance == 0
@@ -240,22 +256,38 @@ impl Launch {
         ] {
             uuid::Uuid::parse_str(id).map_err(err)?;
         }
-        match (&self.peer, self.profile) {
-            (Some(peer), ServiceProfile::StatefulPeerIdle)
-                if peer.node != self.node
-                    && peer.node.id != self.fm.id
-                    && peer.node.id != self.node.id
-                    && peer.node.instance > 0
-                    && peer.session != self.session
-                    && peer.partition == self.partition
-                    && peer.replica >= 0
-                    && peer.replica != self.replica
-                    && peer.incarnation > 0 =>
+        let expected = if self.profile.peer_replicas() {
+            if self.placement == 1 {
+                self.profile.node_count() - 1
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+        if self.peers.len() != expected {
+            return Err("invalid original peer count".into());
+        }
+        for (i, peer) in self.peers.iter().enumerate() {
+            if peer.node != self.node
+                && peer.node.id != self.fm.id
+                && peer.node.id != self.node.id
+                && peer.node.instance > 0
+                && peer.session != self.session
+                && peer.partition == self.partition
+                && peer.replica >= 0
+                && peer.replica != self.replica
+                && peer.incarnation > 0
+                && self.peers[..i].iter().all(|other| {
+                    other.node.id != peer.node.id
+                        && other.replica != peer.replica
+                        && other.session != peer.session
+                })
             {
                 uuid::Uuid::parse_str(&peer.session).map_err(err)?;
+            } else {
+                return Err("invalid original peer binding".into());
             }
-            (None, ServiceProfile::Stateless | ServiceProfile::StatefulSingleton) => {}
-            _ => return Err("invalid original peer binding".into()),
         }
         Ok(())
     }
@@ -320,7 +352,9 @@ pub fn fixed_type() -> ServiceType {
 pub fn fixed_type_for(profile: ServiceProfile) -> ServiceType {
     let (application, package, name) = match profile {
         ServiceProfile::Stateless => ("ClusterStatelessApp", "ClusterService", TYPE),
-        ServiceProfile::StatefulSingleton | ServiceProfile::StatefulPeerIdle => (
+        ServiceProfile::StatefulSingleton
+        | ServiceProfile::StatefulPeerIdle
+        | ServiceProfile::StatefulThree => (
             "HostingLocalStatefulApp",
             "LocalService",
             "LocalStatefulType",
@@ -423,7 +457,7 @@ impl PreOpenCancellationReceipt {
     pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
         if launch.profile != ServiceProfile::StatefulPeerIdle
             || launch.placement != 2
-            || launch.peer.is_none()
+            || launch.peers.is_empty()
             || self.deployment != launch.deployment
             || self.session != launch.session
             || self.node != launch.node
@@ -467,7 +501,7 @@ impl FailedRegistrationReceipt {
         let failure = &self.deletion.failure;
         if launch.profile != ServiceProfile::StatefulPeerIdle
             || launch.placement != 2
-            || launch.peer.is_none()
+            || launch.peers.is_empty()
             || self.deployment != launch.deployment
             || self.session != launch.session
             || self.node != launch.node
@@ -522,7 +556,7 @@ impl FailedOpenReceipt {
         original.replica.current_role = 2;
         if launch.profile != ServiceProfile::StatefulPeerIdle
             || launch.placement != 2
-            || launch.peer.is_none()
+            || launch.peers.is_empty()
             || self.deployment != launch.deployment
             || self.session != launch.session
             || self.node != launch.node
@@ -577,7 +611,7 @@ impl AbsenceReceipt {
     pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
         if launch.profile != ServiceProfile::StatefulPeerIdle
             || launch.placement != 2
-            || launch.peer.is_none()
+            || launch.peers.is_empty()
             || self.deployment != launch.deployment
             || self.session != launch.session
             || self.node != launch.node

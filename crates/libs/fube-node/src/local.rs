@@ -330,7 +330,7 @@ fn pre_open_cancelled(state: &ra::EntityState, creation: u64) -> bool {
         && state.runtime.is_none()
         && state.usage.is_none()
         && state.peer_creation.is_some()
-        && state.remote_idle.is_none()
+        && state.remote_idles.is_empty()
         && state.fm_stage == ra::FmStage::None
 }
 fn never_created(state: &ra::EntityState) -> bool {
@@ -342,7 +342,7 @@ fn never_created(state: &ra::EntityState) -> bool {
         && state.runtime.is_none()
         && state.usage.is_none()
         && state.peer_creation.is_none()
-        && state.remote_idle.is_none()
+        && state.remote_idles.is_empty()
         && state.registration_lookups.is_empty()
         && state.fm_stage == ra::FmStage::None
 }
@@ -752,11 +752,14 @@ impl Node {
     pub fn bind_peer(&self, source: NodeInstance) -> Result<()> {
         Ok(self.ra.bind_peer(source)?)
     }
+    pub fn bind_peers(&self, sources: Vec<NodeInstance>) -> Result<()> {
+        Ok(self.ra.bind_peers(sources)?)
+    }
     pub fn create_idle_on_peer(&mut self, replica: Replica) -> Result<u64> {
         if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
             || !self.live.load(Ordering::SeqCst)
             || self.ra.generation_state().upload_pending
-            || self.ra.peer().as_ref() != Some(&replica.node)
+            || !self.ra.is_peer(&replica.node)
         {
             return Err(Error::Unsupported);
         }
@@ -824,7 +827,7 @@ impl Node {
                 && state.body.unit == base.unit
         });
         if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
-            || self.ra.peer().as_ref() != Some(source)
+            || !self.ra.is_peer(source)
             || generation.for_fm_replica
             || (!self.live.load(Ordering::SeqCst) && !retired_original)
             || !self.ra.consumer_lifetime().is_accepting()
@@ -902,7 +905,7 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
-            || self.ra.peer().as_ref() != Some(source)
+            || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
             return Err(Error::Unsupported);
@@ -1288,7 +1291,7 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
-            || self.ra.peer().as_ref() != Some(source)
+            || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
             return Err(Error::Unsupported);
@@ -1306,7 +1309,7 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if self.ra.peer().as_ref() != Some(source)
+        if !self.ra.is_peer(source)
             || generation.for_fm_replica
             || self
                 .ra
@@ -1328,7 +1331,7 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if self.ra.peer().as_ref() != Some(source)
+        if !self.ra.is_peer(source)
             || generation.for_fm_replica
             || self
                 .ra
@@ -1386,7 +1389,7 @@ impl Node {
             .committed
             .is_some_and(|s| s.swap.is_some());
         if (!swapping && self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle)
-            || self.ra.peer().as_ref() != Some(source)
+            || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
             return Err(Error::Unsupported);
@@ -1405,7 +1408,7 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
-            || self.ra.peer().as_ref() != Some(source)
+            || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
             return Err(Error::Unsupported);
@@ -1424,7 +1427,7 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
-            || self.ra.peer().as_ref() != Some(source)
+            || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
             return Err(Error::Unsupported);
@@ -1447,7 +1450,7 @@ impl Node {
             .committed
             .is_some_and(|s| s.swap.is_some());
         if (!swapping && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary)
-            || self.ra.peer().as_ref() != Some(source)
+            || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
             return Err(Error::Unsupported);
@@ -1462,7 +1465,7 @@ impl Node {
         if !self.live.load(Ordering::SeqCst)
             || self.ra.generation_state().upload_pending
             || !self.ra.consumer_lifetime().is_accepting()
-            || body.replicas.0.len() != 2
+            || !matches!(body.replicas.0.len(), 2 | 3)
             || to_vec(body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
         {
             return Err(Error::Unsupported);
@@ -1505,7 +1508,7 @@ impl Node {
         if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
             || !self.live.load(Ordering::SeqCst)
             || self.ra.generation_state().upload_pending
-            || self.ra.peer().as_ref() != Some(&body.replica.node)
+            || !self.ra.is_peer(&body.replica.node)
             || self
                 .ra
                 .snapshot(body.unit.id.guid.0)
@@ -2769,7 +2772,7 @@ impl Node {
         );
         let configuration = action == "UpdateConfigurationReply";
         if (idle && (body.remote.0.len() != 1 || body.flags != 0))
-            || (configuration && (body.remote.0.len() != 2 || body.flags & !3 != 0))
+            || (configuration && (!matches!(body.remote.0.len(), 2 | 3) || body.flags & !3 != 0))
             || (!idle && !configuration && (!body.remote.0.is_empty() || body.flags & !12 != 0))
         {
             return Err(Error::Protocol);

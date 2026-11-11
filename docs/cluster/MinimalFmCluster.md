@@ -3,6 +3,9 @@
 **Profile:** one foreground in-memory FM, two separate RA+Hosting processes,
 and one fixed stateless application profile. Explicit placement only; no
 automatic recovery, reconnect, failover or native FM/Federation parity.
+An opt-in [healthy three-replica profile](#healthy-three-replica-service) runs
+three original RA+Hosting processes for one volatile partition at target/minimum
+3/2. The default and existing two-node profiles are unchanged.
 
 The explicit `--stateful-singleton` variant now enables fresh FM-authorized
 volatile 1/1 Primary creation, using the separate `hosting-local-app` package.
@@ -221,6 +224,60 @@ Native-stream/schema-adapter evidence adds six cases:
 native truncation rejections. Full C++ handler traces/interoperability,
 nonempty NodeUp reconciliation, full ReplicaUp batching/final upload, peer
 configuration upload, FM/FMM rebuild and durable restart remain unqualified.
+
+## Healthy three-replica service
+
+`ServiceProfile::StatefulThree` (`--stateful-three` for startup) extends the
+native-free harness to three original nodes and one volatile partition.
+Only node1 receives AddPrimary. After it is ready, the public
+`Cluster::add_idle_replica_on(2)` and `add_idle_replica_on(3)` APIs independently
+authorize the two original destinations. Either build order is supported.
+Each native AddReplica drives its exact CreateReplica/Reply, RAP Build and
+AddReplicaReply, with separately retained retry/error/identity state.
+`idle_build.builds` exposes those semantic FM outcomes; aggregate `ready`
+requires both successful replies, not node observations or completed socket writes.
+
+After both builds, `activate_idle_replica()` sends one healthy same-Primary
+1-to-3 configuration with target/minimum 3/2. Previous membership contains only
+the Primary; current membership contains that same Primary and both Secondaries.
+The existing runtime projects those quorum obligations separately. RAP catch-up
+precedes peer activation; each exact ActivateReply commits independently.
+Only after both replies may RA send EndReconfiguration. Its matching successful
+RAP completion and commit precede DoReconfigurationReply and FM readiness.
+Retries retain the original bodies and resend only pending activation work;
+neither peer's result can complete the other's build or activation.
+
+Pinned SF revision `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` supplies the flow:
+
+| Source | Preserved responsibility |
+|---|---|
+| `ra/ReconfigurationAgent.cpp:1995-2040` | Per-replica Add/build ownership, identity checks and CreateReplica dispatch without changing the current configuration epoch. |
+| `ra/FailoverUnit.cpp:2703-2873` | Phase-4 per-remote activation stages; all up/Ready members must activate before EndReconfiguration can grant writes. |
+| `ra/FailoverUnit.cpp:4192-4220` | Each Activate carries the complete configuration, not a local-only role setter. |
+| `ra/FailoverUnit.cpp:3164-3272,3487-3496` | Final RAP completion and committed stable configuration before FM completion. |
+
+Model/store tests cover interleaved target ownership, stale completions, a
+failed/retried build, missing/duplicate activation ACKs, and held, failed or
+unknown ACK commits. Original-process tests copy nonempty data to both nodes,
+replay lost AddReplicaReply/final DoReconfigurationReply without another Open,
+continue replication to both and preserve original app/runtime ownership.
+Losing one Secondary still permits Primary-plus-survivor writes at quorum two;
+losing both cannot acknowledge a new write using the old singleton vote.
+These loss checks do not elect, shrink membership or authorize replacement.
+All three original node/app owners supply independent cleanup proof.
+
+The same native schema codecs now have three additional three-element-vector
+cases for DoReconfiguration, Activate and DoReconfigurationReply: 172
+bidirectional cases, 84 types/255 fields, 176 bundle files and 52 actual native
+truncation rejections. These are native-stream/schema-adapter and native-free
+process results, not full original-handler or FM/Federation interoperability.
+Three-member transfer, retirement/replacement, superseding configurations,
+generation/peer inventories, failover, data loss, reconnect and restart remain
+explicitly gated. A failed native build remains failed/to-be-dropped with
+cleanup required; this profile does not invent successful repair or replacement.
+Original-owner shutdown still disposes all owned resources.
+Stdin retains its existing create/status/quit interface;
+the public Cluster APIs authorize build and configuration.
 
 ## Peer-created Idle replica (stage-4 increment)
 

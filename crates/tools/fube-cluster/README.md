@@ -1,6 +1,6 @@
 # Bounded native-free FM cluster
 
-This tool owns one in-memory FM and exactly two child processes running the
+This tool owns one in-memory FM and, by default, two child processes running the
 existing local RA/Hosting/runtime. It supports only the fixed
 `ClusterStatelessApp/ClusterService/Code/ClusterStatelessType` package. This is
 not native Federation interoperability, full M1, recovery, failover or a general
@@ -10,6 +10,25 @@ An explicit `--stateful-singleton` variant admits the existing
 `hosting-local-app` volatile package and one fresh 1/1 Primary lifetime per node.
 The two nodes host independent singleton partitions, not two replicas or an HA
 configuration. Stateless remains the default.
+
+`--stateful-three` / `ServiceProfile::StatefulThree` is a separate, fixed
+three-node volatile profile. Create only the original node1 Primary. Then call
+`Cluster::add_idle_replica_on(2)` and `add_idle_replica_on(3)` in either order.
+Drive until `status()["idle_build"]["ready"]` is true; each entry in `builds`
+retains its own native AddReplica request/reply and retry ownership.
+`Cluster::activate_idle_replica()` then admits both built Idles in one healthy
+1-to-3 DoReconfiguration, with target/minimum 3/2. Poll `configuration.ready`.
+The APIs, not additional stdin commands, own build/configuration admission.
+
+Both exact peer Activate replies and the final RAP EndReconfiguration must
+complete before the FM configuration is ready. Both destinations copy actual
+nonempty data and remain non-writers. A fresh write needs the Primary plus one
+Secondary, not both; missing members never restore the historical singleton
+quorum. Source-bound process tests also lose/replay build and final configuration
+replies, preserve all original owners/one Open each and verify independent
+three-child cleanup. Primary transfer, replacement/retirement, generation
+upload, failover, data loss and restart remain gated for this profile.
+See [source mapping and limits](../../../docs/cluster/MinimalFmCluster.md#healthy-three-replica-service).
 
 `--stateful-peer-idle` is a separate fresh-start, fixed-generation opt-in:
 node1 alone receives FM AddPrimary; node2 is the bound remote volatile Idle

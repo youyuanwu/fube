@@ -55,8 +55,11 @@ independent cases for the inherited force/deactivation body, dropped reply and
 literal action headers. Healthy planned transfer adds GetLSN/Reply and six
 independent cases, preserving the reply's inherited base and deactivation scope.
 Live-session LFUM adds its full metadata body and correlated bodyless reply.
-The maintained source-stream oracle now has 169 inputs, 84 types/255 fields,
-173 bundle files and 49 native truncation rejections, retaining the preceding
+Healthy three-member admission adds three-element configuration vectors for
+DoReconfiguration, Activate and DoReconfigurationReply without new schemas.
+The maintained source-stream oracle now has 172 inputs, 84 types/255 fields,
+176 bundle files and 52 native truncation rejections, retaining the preceding
+169-case LFUM gate and the
 163-case planned-transfer gate. The preceding retirement
 gate's 157 inputs, 82 types/250 fields, 161 bundle files and 45 rejections remain
 preserved.
@@ -74,7 +77,7 @@ rejections remain preserved. The preceding generation gate's 116 inputs, 75 type
 The preceding stage-two gate's 101 inputs, 73 types/233 fields,
 105 bundle files and 26 native truncation rejections remain preserved, including
 all prior 58 inputs (and the original 36). The current gate executes
-47 native truncation rejections and Rust proper-prefix rejection for every new
+52 native truncation rejections and Rust proper-prefix rejection for every new
 nonempty root fixture. A bodyless proposal is exactly zero bytes.
 It is not deployed native
 FM/Federation evidence; see the [oracle disclosure](../../tests/ra_protocol/README.md).

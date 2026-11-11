@@ -72,7 +72,7 @@ fn configuration(state: Option<&EntityState>) -> Result<Option<FailoverUnitInfo>
     };
     // The deployed upload profile excludes peer topology/reconfiguration. Do
     // not silently omit remote replicas or invent intermediate configuration.
-    if state.remote_idle.is_some()
+    if !state.remote_idles.is_empty()
         || state.peer_creation.is_some()
         || state.reconfiguration.is_some()
         || state.swap.is_some()

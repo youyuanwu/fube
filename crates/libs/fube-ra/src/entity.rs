@@ -641,7 +641,7 @@ pub struct EntityState {
     /// Session-only original peer responsibility; never restored by metadata.
     pub peer_creation: Option<PeerCreation>,
     /// Session-only remote Open/build observations, never active membership.
-    pub remote_idle: Option<RemoteIdle>,
+    pub remote_idles: Vec<RemoteIdle>,
     /// Session-only phase ownership; persisted descriptions cannot restore authority.
     pub reconfiguration: Option<Reconfiguration>,
     pub swap: Option<PrimarySwap>,
@@ -870,7 +870,7 @@ pub struct Statistics {
 }
 #[derive(Default)]
 struct View {
-    peer: Option<NodeInstance>,
+    peers: Vec<NodeInstance>,
     generations: GenerationState,
     generations_touched: bool,
     lfum: Option<generation::LfumSnapshot>,
@@ -1833,10 +1833,14 @@ fn transition(
     state: Option<&EntityState>,
     admission: &Admission,
     config: &NativeConfig,
-    peer: Option<&NodeInstance>,
+    peers: &[NodeInstance],
 ) -> Result<Transition> {
     let decode_error = |_| Failure::Admission("invalid native command payload");
+    let peer = peer::selected_peer(work, peers)?;
     if swap::handles(work, state)? {
+        if peers.len() != 1 {
+            return Err(Failure::Unsupported("multi-peer Primary transfer is gated"));
+        }
         return swap::transition(work, state, admission, config, peer);
     }
     match &work.kind {
@@ -1853,7 +1857,9 @@ fn transition(
         | Kind::Activate { .. }
         | Kind::ActivateReply { .. }
         | Kind::CompleteConfiguration
-        | Kind::RetryConfiguration => reconfiguration::transition(work, state, admission, peer),
+        | Kind::RetryConfiguration => {
+            reconfiguration::transition(work, state, admission, peers, peer)
+        }
         Kind::AddReplica { source, generation } => {
             peer::add_from_fm(work, state, source, generation, admission, peer)
         }
@@ -2158,7 +2164,7 @@ fn transition(
                     fm_primary,
                     primary_deactivation: fm_primary.then_some((body.unit.current, 0)),
                     peer_creation,
-                    remote_idle: None,
+                    remote_idles: vec![],
                     reconfiguration: None,
                     swap: None,
                     phase: Phase::Opening,
@@ -2475,7 +2481,7 @@ async fn entity_worker(
                     committed.as_deref(),
                     &effective_admission,
                     &shared.config,
-                    view.peer.as_ref(),
+                    &view.peers,
                 )
             }
         } else {
@@ -2776,7 +2782,7 @@ mod tests {
             reserved_effects: 2,
             result,
         };
-        let Update::Durable(mut state) = transition(&work, None, &admission, &config, None)
+        let Update::Durable(mut state) = transition(&work, None, &admission, &config, &[])
             .unwrap()
             .update
         else {
@@ -2793,7 +2799,7 @@ mod tests {
             for upgrading in [false, true] {
                 admission.node_activated = false;
                 admission.fabric_upgrading = upgrading;
-                let result = transition(&work, Some(&state), &admission, &config, None).unwrap();
+                let result = transition(&work, Some(&state), &admission, &config, &[]).unwrap();
                 assert_eq!(result.disposition, Disposition::IgnoredPending);
                 assert!(matches!(result.update, Update::None));
                 assert!(result.effects.is_empty());

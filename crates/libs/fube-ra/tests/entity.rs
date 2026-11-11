@@ -4211,7 +4211,7 @@ async fn fm_delete_before_peer_create_retains_native_absent_tombstone_without_op
             && absent.usage.is_none()
             && absent.registration_lookups.is_empty()
     );
-    assert!(absent.peer_creation.is_none() && absent.remote_idle.is_none());
+    assert!(absent.peer_creation.is_none() && absent.remote_idles.is_empty());
     assert!(
         matches!(effects(&executor).as_slice(), [Effect::DeleteReplicaReply(reply)] if **reply == expected)
     );
@@ -5378,16 +5378,16 @@ async fn primary_peer_open_observation_never_builds_or_changes_quorum_and_close_
     stale.replica.instance -= 1;
     assert_eq!(run(&executor, ack(stale)).await, Disposition::IgnoredStale);
     assert!(state(&executor)
-        .remote_idle
-        .as_ref()
+        .remote_idles
+        .first()
         .unwrap()
         .reply
         .is_none());
     run(&executor, ack(reply.clone())).await;
     assert_eq!(
         state(&executor)
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .reply
             .as_ref(),
@@ -5412,7 +5412,7 @@ async fn primary_peer_open_observation_never_builds_or_changes_quorum_and_close_
     )
     .await;
     executor.take_effects();
-    assert!(state(&executor).remote_idle.is_none());
+    assert!(state(&executor).remote_idles.is_empty());
     assert_eq!(run(&executor, ack(reply)).await, Disposition::IgnoredStale);
     assert!(executor.take_effects().is_empty());
     finish(&store, &executor).await;
@@ -5489,8 +5489,8 @@ async fn peer_build_is_explicit_correlated_and_never_grants_membership() {
     );
     assert_eq!(
         state(&executor)
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .build
             .as_ref()
@@ -5536,8 +5536,8 @@ async fn peer_build_is_explicit_correlated_and_never_grants_membership() {
     }
     assert_eq!(
         state(&executor)
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .build
             .as_ref()
@@ -5551,8 +5551,8 @@ async fn peer_build_is_explicit_correlated_and_never_grants_membership() {
     let after = state(&executor);
     assert_eq!(
         after
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .build
             .as_ref()
@@ -5563,8 +5563,8 @@ async fn peer_build_is_explicit_correlated_and_never_grants_membership() {
     assert_eq!(after.body, primary.body);
     assert_eq!(
         after
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .reply
             .as_ref()
@@ -5606,7 +5606,7 @@ async fn peer_build_errors_retry_the_original_rap_obligation_and_close_fences_la
         if error != 0 {
             run(&executor, Command::CompleteBuild(Box::new(event.clone()))).await;
             let after = state(&executor);
-            let build = after.remote_idle.as_ref().unwrap().build.as_ref().unwrap();
+            let build = after.remote_idles.first().unwrap().build.as_ref().unwrap();
             assert_eq!(build.result, Some(error));
             assert_eq!(build.detail, event.detail);
             run(
@@ -5617,8 +5617,8 @@ async fn peer_build_errors_retry_the_original_rap_obligation_and_close_fences_la
             assert_eq!(effects(&executor), first);
             assert_eq!(
                 state(&executor)
-                    .remote_idle
-                    .as_ref()
+                    .remote_idles
+                    .first()
                     .unwrap()
                     .build
                     .as_ref()
@@ -5633,8 +5633,8 @@ async fn peer_build_errors_retry_the_original_rap_obligation_and_close_fences_la
             run(&executor, Command::CompleteBuild(Box::new(success))).await;
             assert_eq!(
                 state(&executor)
-                    .remote_idle
-                    .as_ref()
+                    .remote_idles
+                    .first()
                     .unwrap()
                     .build
                     .as_ref()
@@ -5658,7 +5658,7 @@ async fn peer_build_errors_retry_the_original_rap_obligation_and_close_fences_la
             run(&executor, Command::CompleteBuild(Box::new(late))).await,
             Disposition::IgnoredStale
         );
-        assert!(state(&executor).remote_idle.is_none());
+        assert!(state(&executor).remote_idles.is_empty());
         assert!(effects(&executor).is_empty());
         finish(&store, &executor).await;
     }
@@ -5708,8 +5708,8 @@ async fn peer_idle_removal_is_terminal_for_unbuilt_pending_successful_and_failed
         assert_eq!(state(&executor).body, primary.body);
         assert_eq!(
             state(&executor)
-                .remote_idle
-                .as_ref()
+                .remote_idles
+                .first()
                 .unwrap()
                 .removal
                 .as_ref()
@@ -5768,8 +5768,8 @@ async fn peer_idle_removal_is_terminal_for_unbuilt_pending_successful_and_failed
         .await;
         let after = state(&executor);
         let removal = after
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .removal
             .as_ref()
@@ -5786,8 +5786,8 @@ async fn peer_idle_removal_is_terminal_for_unbuilt_pending_successful_and_failed
         let after = state(&executor);
         assert_eq!(
             after
-                .remote_idle
-                .as_ref()
+                .remote_idles
+                .first()
                 .unwrap()
                 .removal
                 .as_ref()
@@ -5796,7 +5796,7 @@ async fn peer_idle_removal_is_terminal_for_unbuilt_pending_successful_and_failed
             Some(0)
         );
         assert_eq!(
-            after.remote_idle.as_ref().unwrap().reply,
+            after.remote_idles.first().unwrap().reply,
             Some(remote.clone())
         );
         assert_eq!(after.body, primary.body);
@@ -5838,7 +5838,7 @@ async fn peer_idle_removal_is_terminal_for_unbuilt_pending_successful_and_failed
             run(&executor, Command::CompleteRemoval(Box::new(removed))).await,
             Disposition::IgnoredStale,
         );
-        assert!(state(&executor).remote_idle.is_none());
+        assert!(state(&executor).remote_idles.is_empty());
         finish(&store, &executor).await;
     }
 }
@@ -5872,7 +5872,7 @@ async fn primary_close_fences_pending_idle_removal_without_claiming_remote_dispo
     .await;
     let closing = state(&executor);
     assert_eq!(closing.phase, Phase::Closing);
-    assert!(closing.remote_idle.is_none());
+    assert!(closing.remote_idles.is_empty());
     effects(&executor);
     assert_eq!(
         run(&executor, Command::CompleteRemoval(Box::new(completion))).await,
@@ -5994,6 +5994,255 @@ async fn built_fm_idle(executor: &Executor) -> Configuration {
     .await;
     effects(executor);
     secondary_configuration(&primary.body, &opened.replica)
+}
+
+async fn built_three_idles(executor: &Executor) -> Configuration {
+    let mut second = peer_source();
+    second.id = [7; 16];
+    executor
+        .bind_peers(vec![peer_source(), second.clone()])
+        .unwrap();
+    make_ready(executor, &primary_body()).await;
+    let original = state(executor);
+    let first = fm_idle_request(&original);
+    let mut other = first.clone();
+    other.replica.node = second;
+    other.replica.id += 1;
+    other.replica.instance += 1;
+    for request in [&first, &other] {
+        run(executor, fm_add_idle(request.clone())).await;
+        effects(executor);
+    }
+    let mut opened = vec![];
+    for (i, request) in [other, first].into_iter().enumerate() {
+        let mut reply = CreateReplicaReply {
+            unit: request.unit,
+            replica: request.replica,
+            error: 0,
+        };
+        reply.replica.replication_endpoint = format!("127.0.0.1:{}", 12346 + i);
+        run(
+            executor,
+            Command::CreateReplicaReply {
+                source: reply.replica.node.clone(),
+                body: Box::new(reply.clone()),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+        )
+        .await;
+        assert!(
+            matches!(effects(executor).as_slice(), [Effect::BuildIdle { replica, .. }] if **replica == reply.replica)
+        );
+        opened.push(reply.replica);
+    }
+    for (i, remote) in opened.iter().enumerate() {
+        let mut completion = BuildCompletion {
+            unit: original.body.unit.clone(),
+            local: original.body.replica.clone(),
+            remote: remote.clone(),
+            error: 0,
+            detail: ProxyErrorDetail::default(),
+        };
+        if i == 0 {
+            completion.remote.instance -= 1;
+            assert_eq!(
+                run(
+                    executor,
+                    Command::CompleteBuild(Box::new(completion.clone()))
+                )
+                .await,
+                Disposition::IgnoredStale
+            );
+            assert!(effects(executor).is_empty());
+            completion.remote = remote.clone();
+            completion.error = -991;
+            run(
+                executor,
+                Command::CompleteBuild(Box::new(completion.clone())),
+            )
+            .await;
+            assert!(effects(executor).is_empty());
+            let request = state(executor)
+                .remote_idle(&remote.node)
+                .unwrap()
+                .fm_request
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .clone();
+            run(executor, fm_add_idle(request)).await;
+            assert!(
+                matches!(effects(executor).as_slice(), [Effect::BuildIdle { replica, .. }] if **replica == *remote)
+            );
+            completion.error = 0;
+        }
+        run(executor, Command::CompleteBuild(Box::new(completion))).await;
+        assert!(
+            matches!(effects(executor).as_slice(), [Effect::AddReplicaReply(reply)] if reply.replica.node == remote.node)
+        );
+        assert_eq!(
+            state(executor)
+                .remote_idles
+                .iter()
+                .filter(|r| r.ready)
+                .count(),
+            i + 1
+        );
+    }
+    let mut config = secondary_configuration(&original.body, &opened[0]);
+    config.unit.target = 3;
+    config.unit.minimum = 2;
+    config.service.target = 3;
+    config.service.minimum = 2;
+    let mut secondary = opened[1].clone();
+    secondary.previous_role = 2;
+    secondary.current_role = 3;
+    secondary.state = 2;
+    config.replicas.0.push(secondary);
+    config
+}
+
+#[tokio::test]
+async fn three_replica_activation_waits_for_each_exact_peer_and_its_commit() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        let config = built_three_idles(&executor).await;
+        let original = state(&executor);
+        run(&executor, reconfigure(config.clone())).await;
+        let catchup = configured(&effects(&executor));
+        assert_eq!(
+            catchup
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.previous_role >= 3)
+                .count(),
+            1
+        );
+        assert_eq!(
+            catchup
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.current_role >= 3)
+                .count(),
+            3
+        );
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(catchup.clone())),
+        )
+        .await;
+        let actions = effects(&executor);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|e| matches!(e, Effect::PeerActivate { .. }))
+                .count(),
+            2
+        );
+        let mut unit = config.unit.clone();
+        unit.previous = Epoch::default();
+        let ack = |index: usize| {
+            let mut replica = config.replicas.0[index].clone();
+            replica.previous_role = 1;
+            Command::ActivateReply {
+                source: replica.node.clone(),
+                body: Box::new(ActivateReply {
+                    unit: unit.clone(),
+                    replica,
+                    error: 0,
+                }),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            }
+        };
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor.submit(ack(1)).unwrap();
+        entered.await.unwrap();
+        assert!(state(&executor)
+            .reconfiguration
+            .as_ref()
+            .unwrap()
+            .activated
+            .is_empty());
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot(config.unit.id.guid.0).fenced);
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(effects(&executor).is_empty());
+            assert!(state(&executor)
+                .reconfiguration
+                .as_ref()
+                .unwrap()
+                .activated
+                .is_empty());
+            finish(&store, &executor).await;
+            continue;
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::PeerActivate { target, .. }] if *target == config.replicas.0[2].node)
+        );
+        if unknown {
+            assert_eq!(
+                state(&executor).reconfiguration.as_ref().unwrap().stage,
+                ConfigurationStage::Activate
+            );
+            assert_eq!(
+                state(&executor)
+                    .reconfiguration
+                    .as_ref()
+                    .unwrap()
+                    .activated
+                    .len(),
+                1
+            );
+            finish(&store, &executor).await;
+            continue;
+        }
+        assert_eq!(run(&executor, ack(1)).await, Disposition::IgnoredStale);
+        assert!(effects(&executor).is_empty());
+        let mut early = catchup;
+        early.flags = 1;
+        assert_eq!(
+            run(&executor, Command::CompleteConfiguration(Box::new(early))).await,
+            Disposition::IgnoredStale
+        );
+        run(
+            &executor,
+            Command::RetryConfiguration(config.unit.id.clone()),
+        )
+        .await;
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::PeerActivate { target, .. }] if *target == config.replicas.0[2].node)
+        );
+        run(&executor, ack(2)).await;
+        let end = configured(&effects(&executor));
+        assert_eq!(end.flags, 1);
+        run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(reply)] if reply.replicas.0.len() == 3)
+        );
+        assert_eq!(state(&executor).runtime, original.runtime);
+        assert_eq!(state(&executor).remote_idles.len(), 2);
+        finish(&store, &executor).await;
+    }
 }
 
 #[tokio::test]
@@ -6692,14 +6941,14 @@ async fn configured_secondary_retirement_preserves_both_quorums_and_exact_phase_
         .unwrap();
     entered.await.unwrap();
     assert!(effects(&executor).is_empty());
-    assert!(state(&executor).remote_idle.is_some());
+    assert!(!state(&executor).remote_idles.is_empty());
     release.send(()).unwrap();
     ticket.wait(WAIT).await.unwrap();
     let reply = effects(&executor);
     assert!(
         matches!(reply.as_slice(), [Effect::DoReconfigurationReply(body)] if body.replicas.0.len() == 1 && body.unit.previous == Epoch::default())
     );
-    assert!(state(&executor).remote_idle.is_none());
+    assert!(state(&executor).remote_idles.is_empty());
     run(&executor, reconfigure(retirement)).await;
     assert_eq!(effects(&executor), reply);
     assert_eq!(
@@ -6974,7 +7223,7 @@ async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_seman
             .wait(WAIT)
             .await
             .is_err());
-        assert!(state(&executor).remote_idle.is_none());
+        assert!(state(&executor).remote_idles.is_empty());
         run(&executor, fm_add_idle(request.clone())).await;
         effects(&executor);
         let mut opened = CreateReplicaReply {
@@ -7047,10 +7296,10 @@ async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_seman
                 if body == &primary.body && **replica == dropped
                     && Some(registration) == primary.runtime.as_ref())
         );
-        assert!(!state(&executor).remote_idle.as_ref().unwrap().ready);
+        assert!(!state(&executor).remote_idles.first().unwrap().ready);
         assert!(state(&executor)
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .add_reply()
             .is_none());
@@ -7066,8 +7315,8 @@ async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_seman
             .is_err());
         assert_eq!(
             state(&executor)
-                .remote_idle
-                .as_ref()
+                .remote_idles
+                .first()
                 .unwrap()
                 .removal
                 .as_ref()
@@ -7110,8 +7359,8 @@ async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_seman
         assert!(effects(&executor).is_empty());
         assert_eq!(
             state(&executor)
-                .remote_idle
-                .as_ref()
+                .remote_idles
+                .first()
                 .unwrap()
                 .removal
                 .as_ref()
@@ -7226,7 +7475,7 @@ async fn fm_remove_in_create_echoes_request_without_rap_and_fences_late_open_and
     })];
     assert_eq!(effects(&executor), reply);
     let cancelled = state(&executor);
-    let remote = cancelled.remote_idle.as_ref().unwrap();
+    let remote = cancelled.remote_idles.first().unwrap();
     assert!(remote.reply.is_none() && remote.build.is_none() && !remote.ready);
     assert!(remote.add_reply().is_none());
     let removal = remote.removal.as_ref().unwrap();
@@ -7270,7 +7519,7 @@ async fn fm_remove_in_create_echoes_request_without_rap_and_fences_late_open_and
         .wait(WAIT)
         .await
         .is_err());
-    assert_eq!(state(&executor).remote_idle, cancelled.remote_idle);
+    assert_eq!(state(&executor).remote_idles, cancelled.remote_idles);
     assert!(effects(&executor).is_empty());
     run(
         &executor,
@@ -7293,7 +7542,7 @@ async fn fm_remove_in_create_echoes_request_without_rap_and_fences_late_open_and
 async fn fm_remove_unbuilt_idle_keeps_original_lifetime_and_close_fences_pending_reply() {
     let (store, executor, opened) = opened_peer_primary().await;
     let primary = state(&executor);
-    let request = primary.remote_idle.as_ref().unwrap().body.replica.0.clone();
+    let request = primary.remote_idles.first().unwrap().body.replica.0.clone();
     run(&executor, fm_remove_idle(request.clone())).await;
     assert!(matches!(
         &effects(&executor)[..],
@@ -7343,7 +7592,7 @@ async fn fm_add_idle_retries_creation_build_and_ready_reply_without_granting_mem
         if target == &peer_source() && body.replica.0 == request)
     );
     let creating = state(&executor);
-    let remote = creating.remote_idle.as_ref().unwrap();
+    let remote = creating.remote_idles.first().unwrap();
     assert_eq!(remote.fm_request.as_deref(), Some(&request));
     assert!(remote.reply.is_none() && remote.build.is_none() && !remote.ready);
     run(&executor, fm_add_idle(request.clone())).await;
@@ -7382,7 +7631,7 @@ async fn fm_add_idle_retries_creation_build_and_ready_reply_without_granting_mem
     )
     .await;
     assert!(effects(&executor).is_empty()); // Native build errors do not finish FM AddReplica.
-    assert!(!state(&executor).remote_idle.as_ref().unwrap().ready);
+    assert!(!state(&executor).remote_idles.first().unwrap().ready);
     run(&executor, fm_add_idle(request.clone())).await;
     assert_eq!(effects(&executor), build);
     completion.error = 0;
@@ -7397,9 +7646,9 @@ async fn fm_add_idle_retries_creation_build_and_ready_reply_without_granting_mem
     let reply = vec![Effect::AddReplicaReply(ready)];
     assert_eq!(effects(&executor), reply);
     let built = state(&executor);
-    assert!(built.remote_idle.as_ref().unwrap().ready);
+    assert!(built.remote_idles.first().unwrap().ready);
     assert_eq!(
-        built.remote_idle.as_ref().unwrap().reply.as_ref(),
+        built.remote_idles.first().unwrap().reply.as_ref(),
         Some(&opened)
     );
     assert_eq!(built.body, primary.body);
@@ -7426,8 +7675,8 @@ async fn fm_add_idle_retries_creation_build_and_ready_reply_without_granting_mem
         Disposition::IgnoredStale
     );
     assert!(state(&executor)
-        .remote_idle
-        .as_ref()
+        .remote_idles
+        .first()
         .unwrap()
         .add_reply()
         .is_none());
@@ -7471,7 +7720,7 @@ async fn fm_add_idle_admission_open_failure_and_close_never_fabricate_ready() {
         ] {
             assert!(executor.submit(command).unwrap().wait(WAIT).await.is_err());
         }
-        assert!(state(&executor).remote_idle.is_none());
+        assert!(state(&executor).remote_idles.is_empty());
         assert!(effects(&executor).is_empty());
         run(&executor, fm_add_idle(request.clone())).await;
         effects(&executor);
@@ -7509,16 +7758,16 @@ async fn fm_add_idle_admission_open_failure_and_close_never_fabricate_ready() {
                 run(&executor, fm_add_idle(request)).await,
                 Disposition::IgnoredStale
             );
-            assert!(state(&executor).remote_idle.is_none());
+            assert!(state(&executor).remote_idles.is_empty());
         } else {
             run(&executor, peer_opened(reply.clone())).await;
             assert_eq!(effects(&executor), [Effect::AddReplicaReply(reply.clone())]);
             run(&executor, fm_add_idle(request.clone())).await;
             assert_eq!(effects(&executor), [Effect::AddReplicaReply(reply)]);
-            assert!(!state(&executor).remote_idle.as_ref().unwrap().ready);
+            assert!(!state(&executor).remote_idles.first().unwrap().ready);
             assert!(state(&executor)
-                .remote_idle
-                .as_ref()
+                .remote_idles
+                .first()
                 .unwrap()
                 .removal
                 .is_none());
@@ -7565,7 +7814,7 @@ async fn failed_peer_creation_is_retired_by_original_fm_removal_without_rap_or_r
         [Effect::AddReplicaReply(failed.clone())]
     );
     let aborted = state(&executor);
-    let remote = aborted.remote_idle.as_ref().unwrap();
+    let remote = aborted.remote_idles.first().unwrap();
     assert!(remote.creation_failed() && remote.build.is_none() && !remote.ready);
     assert_eq!(aborted.body, primary.body);
     assert_eq!(aborted.runtime, primary.runtime);
@@ -7615,7 +7864,7 @@ async fn failed_peer_creation_is_retired_by_original_fm_removal_without_rap_or_r
     })];
     assert_eq!(effects(&executor), reply);
     let retired = state(&executor);
-    let remote = retired.remote_idle.as_ref().unwrap();
+    let remote = retired.remote_idles.first().unwrap();
     assert!(remote.creation_failed() && remote.build.is_none() && !remote.ready);
     assert_eq!(remote.reply.as_ref(), Some(&failed));
     assert_eq!(remote.removal.as_ref().unwrap().result, Some(0));
@@ -7645,7 +7894,7 @@ async fn failed_peer_creation_is_retired_by_original_fm_removal_without_rap_or_r
         .await
         .is_err());
     assert!(effects(&executor).is_empty());
-    assert_eq!(state(&executor).remote_idle, retired.remote_idle);
+    assert_eq!(state(&executor).remote_idles, retired.remote_idles);
     run(
         &executor,
         Command::CloseLocal {

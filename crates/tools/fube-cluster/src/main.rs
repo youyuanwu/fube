@@ -16,14 +16,18 @@ struct Arguments {
     app: Option<PathBuf>,
 
     /// Run one volatile stateful Primary.
-    #[arg(long, conflicts_with = "stateful_peer_idle")]
+    #[arg(long, conflicts_with_all = ["stateful_peer_idle", "stateful_three"])]
     stateful_singleton: bool,
 
     /// Run a Primary and a peer-created Idle replica.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "stateful_three")]
     stateful_peer_idle: bool,
 
-    #[arg(long, hide = true, conflicts_with_all = ["root", "app", "stateful_singleton", "stateful_peer_idle"])]
+    /// Run the opt-in three-node volatile replica profile.
+    #[arg(long)]
+    stateful_three: bool,
+
+    #[arg(long, hide = true, conflicts_with_all = ["root", "app", "stateful_singleton", "stateful_peer_idle", "stateful_three"])]
     internal_node: Option<PathBuf>,
 }
 
@@ -152,7 +156,9 @@ async fn run(arguments: Arguments) -> Result<bool> {
         fube_cluster::internal_node(&path).await?;
         return Ok(true);
     }
-    let profile = if arguments.stateful_singleton {
+    let profile = if arguments.stateful_three {
+        ServiceProfile::StatefulThree
+    } else if arguments.stateful_singleton {
         ServiceProfile::StatefulSingleton
     } else if arguments.stateful_peer_idle {
         ServiceProfile::StatefulPeerIdle

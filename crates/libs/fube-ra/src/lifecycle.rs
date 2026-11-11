@@ -389,7 +389,7 @@ fn start_close_inner(
         mark_deleted(state);
     }
     state.phase = Phase::Closing;
-    state.remote_idle = None;
+    state.remote_idles.clear();
     state.service_description_pending = false;
     state.close_mode = Some(mode);
     state.close_token = token;
@@ -652,7 +652,7 @@ pub(super) fn transition(
                 fm_primary: stateful,
                 primary_deactivation: stateful.then_some((Epoch::default(), -2)),
                 peer_creation: None,
-                remote_idle: None,
+                remote_idles: vec![],
                 reconfiguration: None,
                 swap: None,
                 // TryCreateFailoverUnit constructs from ID, consistency and
