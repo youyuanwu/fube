@@ -185,6 +185,9 @@ impl Executor {
     pub fn is_peer(&self, source: &NodeInstance) -> bool {
         lock(&self.shared.view).peers.contains(source)
     }
+    pub fn peer_count(&self) -> usize {
+        lock(&self.shared.view).peers.len()
+    }
 }
 
 pub(super) fn selected_peer<'a>(

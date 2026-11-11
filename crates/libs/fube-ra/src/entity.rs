@@ -57,7 +57,7 @@ pub use reconfiguration::{
     retired_configuration, secondary_service, ConfigurationCompletion, ConfigurationStage,
     Reconfiguration,
 };
-pub use swap::{PrimarySwap, SwapStage};
+pub use swap::{PrimarySwap, ProgressQuery, SwapStage};
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -645,6 +645,7 @@ pub struct EntityState {
     /// Session-only phase ownership; persisted descriptions cannot restore authority.
     pub reconfiguration: Option<Reconfiguration>,
     pub swap: Option<PrimarySwap>,
+    pub progress_query: Option<ProgressQuery>,
     pub phase: Phase,
     pub open_token: u64,
     /// Volatile retry bookkeeping; not a native disk record or durable outbox.
@@ -1838,10 +1839,7 @@ fn transition(
     let decode_error = |_| Failure::Admission("invalid native command payload");
     let peer = peer::selected_peer(work, peers)?;
     if swap::handles(work, state)? {
-        if peers.len() != 1 {
-            return Err(Failure::Unsupported("multi-peer Primary transfer is gated"));
-        }
-        return swap::transition(work, state, admission, config, peer);
+        return swap::transition(work, state, admission, config, peers);
     }
     match &work.kind {
         Kind::GetLfum { .. } => Ok(Transition::ignored(Disposition::Applied)),
@@ -2167,6 +2165,7 @@ fn transition(
                     remote_idles: vec![],
                     reconfiguration: None,
                     swap: None,
+                    progress_query: None,
                     phase: Phase::Opening,
                     open_token: work.id,
                     retry_attempts: 0,

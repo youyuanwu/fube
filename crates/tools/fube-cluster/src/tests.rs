@@ -288,7 +288,7 @@ fn three_replica_ledger() -> Ledger {
     }).collect();
     for (i, launch) in launches.iter_mut().enumerate() {
         launch.profile = ServiceProfile::StatefulThree;
-        launch.peers = if i == 0 { peers[1..].to_vec() } else { vec![peers[0].clone()] };
+        launch.peers = peers.iter().enumerate().filter(|(index, _)| *index != i).map(|(_, p)| p.clone()).collect();
         launch.validate().unwrap();
     }
     let mut ledger = Ledger::new(launches);
@@ -302,6 +302,82 @@ fn three_replica_ledger() -> Ledger {
     ledger.accept(command("primary", "create", Some(1))).unwrap();
     ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
     ledger
+}
+
+fn configured_three_ledger() -> Ledger {
+    let mut ledger = three_replica_ledger();
+    for destination in 1..3 {
+        let body = ledger.request_idle_on(destination, Instant::now()).unwrap();
+        let mut replica = body.replica;
+        replica.state = 2;
+        replica.replication_endpoint = format!("127.0.0.1:{}", 12346 + destination);
+        ledger.idle_reply(0, AddReplicaReply { unit: body.unit, replica, error: 0 }).unwrap();
+    }
+    let body = ledger.request_configuration(Instant::now()).unwrap();
+    let mut reply = ConfigurationReply {
+        unit: body.configuration.unit, replicas: body.configuration.replicas, error: 0,
+    };
+    reply.unit.previous = Epoch::default();
+    for r in &mut reply.replicas.0 { r.previous_role = 1; }
+    ledger.configuration_reply(0, reply).unwrap();
+    ledger
+}
+
+#[test]
+fn primary_failover_requires_matched_loss_and_both_survivors_and_ignores_old_loss_replay() {
+    let mut disconnected = configured_three_ledger();
+    disconnected.lost(0, "FM channel disconnected without a replica report".into());
+    assert!(disconnected.start_primary_failover(Instant::now()).unwrap().is_none());
+    assert!(!disconnected.placements[0].loss_reported);
+    for survivor in [1, 2] {
+        let mut missing = configured_three_ledger();
+        missing.lost(survivor, "survivor original session lost".into());
+        let loss = stateful_loss_report(&missing.placements[0]);
+        missing.report(0, &loss).unwrap();
+        assert!(missing.start_primary_failover(Instant::now()).unwrap().is_none());
+    }
+    let mut ledger = configured_three_ledger();
+    let loss = stateful_loss_report(&ledger.placements[0]);
+    let mut stale = loss.clone();
+    stale.dropped.0[0].replicas.0[0].description.instance -= 1;
+    assert!(ledger.report(0, &stale).is_err());
+    assert!(ledger.start_primary_failover(Instant::now()).unwrap().is_none());
+    ledger.report(0, &loss).unwrap();
+    let body = ledger.start_primary_failover(Instant::now()).unwrap().unwrap();
+    assert_eq!(body.configuration.unit.previous.data_loss, body.configuration.unit.current.data_loss);
+    assert_eq!(body.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), 3);
+    assert_eq!(body.configuration.replicas.0.iter().filter(|r| r.current_role >= 3).count(), 2);
+    ledger.report(0, &loss).unwrap();
+    assert_eq!(ledger.configuration_status()["state"], "pending");
+    assert_eq!(ledger.configuration_retry(Instant::now() + Duration::from_secs(11)), Some(body.clone()));
+    assert!(ledger.start_primary_failover(Instant::now()).unwrap().is_none());
+    let mut reply = ConfigurationReply {
+        unit: body.configuration.unit.clone(), replicas: body.configuration.replicas.clone(), error: 0,
+    };
+    reply.unit.previous = Epoch::default();
+    reply.replicas.0.retain(|r| r.current_role >= 3);
+    for r in &mut reply.replicas.0 {
+        r.previous_role = 1;
+        r.first_lsn = 1;
+        r.last_lsn = 8;
+        if r.current_role == 4 { r.service_endpoint = "127.0.0.1:12349".into(); }
+    }
+    let mut partial = reply.clone();
+    partial.replicas.0.pop();
+    ledger.configuration_reply(1, partial).unwrap();
+    assert_eq!(ledger.configuration_status()["ready"], false);
+    ledger.configuration_reply(0, reply.clone()).unwrap();
+    assert_eq!(ledger.configuration_status()["ready"], false);
+    ledger.configuration_reply(1, reply).unwrap();
+    assert_eq!(ledger.configuration_status()["ready"], true);
+    assert_eq!(ledger.placements[1].endpoint.as_deref(), Some("127.0.0.1:12349"));
+    assert!(ledger.placements[0].endpoint.is_none());
+    ledger.report(0, &loss).unwrap();
+    assert_eq!(ledger.configuration_status()["ready"], true);
+    assert_eq!(ledger.placements[1].endpoint.as_deref(), Some("127.0.0.1:12349"));
+    ledger.lost(2, "last original Secondary lost".into());
+    assert_eq!(ledger.configuration_status()["state"], "unknown");
+    assert!(ledger.configuration_retry(Instant::now() + Duration::from_secs(30)).is_none());
 }
 
 #[test]
@@ -1550,6 +1626,7 @@ async fn hold_peer_loss_frame(
                 cluster.receive_message(index, incoming).await?;
             }
         }
+        cluster.start_failover().await;
         if Instant::now() >= end { return Err(format!("held {action} deadline: {}", cluster.status())); }
     }
 }
@@ -2890,6 +2967,104 @@ async fn fm_deletes_original_built_idle_destination_without_replacing_or_stoppin
 }
 
 #[tokio::test]
+async fn three_replica_primary_failover_preserves_data_and_never_promotes_without_survivors() {
+    for missing_survivor in [false, true] {
+        let fixture = Fixture::new("primary-failover");
+        let mut config = fixture.config();
+        config.profile = ServiceProfile::StatefulThree;
+        config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+        let mut cluster = Cluster::new(config).unwrap();
+        if let Err(error) = cluster.start().await {
+            let cleanup = cluster.shutdown().await;
+            panic!("failover startup: {error}; cleanup={cleanup}");
+        }
+        let result = peer_idle_catch(async {
+            cluster.execute(command("primary", "create", Some(1))).await?;
+            until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
+            let old_endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+            until(&mut cluster, |_| data_contact(&old_endpoint, b"read\n").starts_with("OK ")).await;
+            assert!(data_contact(&old_endpoint, b"write\n").contains("committed=1"));
+            cluster.add_idle_replica_on(2).await?;
+            cluster.add_idle_replica_on(3).await?;
+            until(&mut cluster, |c| c.ledger.idle_status()["ready"] == true).await;
+            cluster.activate_idle_replica().await?;
+            until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+            let owners = cluster.status()["nodes"].as_array().unwrap().iter()
+                .map(|n| (n["node_pid"].clone(), n["app_pid"].clone(), n["runtime_root"].clone())).collect::<Vec<_>>();
+            if missing_survivor {
+                let pid = cluster.ledger.placements[2].profile.as_ref().unwrap().app_pid;
+                assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+                until(&mut cluster, |c| c.ledger.placements[2].observed == Observed::Unknown).await;
+            }
+            let pid = cluster.ledger.placements[0].profile.as_ref().unwrap().app_pid;
+            assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+            if missing_survivor {
+                until(&mut cluster, |c| c.ledger.placements[0].loss_reported).await;
+                for _ in 0..20 { cluster.drive().await; }
+                assert!(cluster.ledger.swap.is_none());
+                assert_eq!(cluster.ledger.configuration_status()["state"], "unknown");
+                assert!(cluster.ledger.placements.iter().all(|p| p.endpoint.is_none()));
+                assert_eq!(cluster.status()["nodes"][1]["retained_work"]["local_replica"]["replica"]["current_role"], 3);
+                return Ok(());
+            }
+            let lost = hold_peer_loss_frame(&mut cluster, 1, "DoReconfigurationReply", Duration::from_secs(20)).await?;
+            let (reply, owner) = decode_do_reconfiguration_reply(&lost).map_err(err)?;
+            assert_eq!(owner, Owner::Fm);
+            assert!(cluster.ledger.placements[0].loss_reported);
+            assert_eq!(cluster.ledger.configuration_status()["kind"], "primary_failover");
+            assert_eq!(cluster.ledger.configuration_status()["ready"], false);
+            assert!(cluster.ledger.placements.iter().all(|p| p.endpoint.is_none()));
+            let request = cluster.ledger.swap.as_ref().unwrap().body.clone();
+            assert_eq!(request.configuration.unit.previous.data_loss, request.configuration.unit.current.data_loss);
+            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), 3);
+            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role >= 3).count(), 2);
+            assert!(request.configuration.replicas.0.iter().any(|r| r.previous_role == 4 && r.current_role == 1 && !r.up && r.state == 3));
+            let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11))
+                .ok_or("missing native failover retry")?;
+            assert_eq!(retry, request);
+            cluster.send_configuration(&retry).await?;
+            until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+            assert_eq!(cluster.ledger.swap.as_ref().unwrap().reply.as_ref(), Some(&reply));
+            let endpoint = cluster.ledger.placements[1].endpoint.clone().ok_or("missing promoted endpoint")?;
+            assert_ne!(endpoint, old_endpoint);
+            assert!(TcpStream::connect_timeout(&old_endpoint.parse().map_err(err)?, Duration::from_millis(250)).is_err());
+            assert!(data_contact(&endpoint, b"read\n").contains("committed=1 value=acknowledged"));
+            let written = data_contact(&endpoint, b"write-more\n");
+            assert!(written.contains("committed=2 value=continued"), "{written}");
+            until(&mut cluster, |c| c.status()["nodes"][2]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 2).await;
+            let status = cluster.status();
+            for i in 1..3 {
+                assert_eq!(owners[i], (status["nodes"][i]["node_pid"].clone(), status["nodes"][i]["app_pid"].clone(), status["nodes"][i]["runtime_root"].clone()));
+                assert_eq!(status["nodes"][i]["retained_work"]["app_observation"]["opens"], 1);
+                assert_eq!(status["nodes"][i]["retained_work"]["peer_command_error"], Value::Null);
+                assert_eq!(status["nodes"][i]["retained_work"]["peer_error"], Value::Null);
+            }
+            assert_eq!(status["nodes"][2]["retained_work"]["app_observation"]["idle_data"]["provider"]["data_loss_calls"], 0);
+            let pid = cluster.ledger.placements[2].profile.as_ref().unwrap().app_pid;
+            assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+            until(&mut cluster, |c| c.ledger.configuration_status()["state"] == "unknown").await;
+            let mut pending = TcpStream::connect(&endpoint).map_err(err)?;
+            pending.set_read_timeout(Some(Duration::from_millis(250))).map_err(err)?;
+            pending.write_all(b"write-final\n").map_err(err)?;
+            until(&mut cluster, |c| c.status()["nodes"][1]["retained_work"]["app_observation"]["primary_last_admitted"] == 3).await;
+            let mut bytes = [0; 1024];
+            assert!(matches!(pending.read(&mut bytes), Err(ref e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+                "failover must not shrink quorum after losing the last Secondary");
+            assert_eq!(cluster.status()["nodes"][1]["retained_work"]["app_observation"]["primary_last_acknowledged"], 2);
+            assert!(cluster.ledger.placements[0].endpoint.is_none());
+            Ok::<(), String>(())
+        }).await;
+        if !matches!(&result, Ok(Ok(()))) {
+            eprintln!("FAILOVER_STATUS {}", cluster.status());
+            for child in &cluster.children { eprintln!("FAILOVER_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+        }
+        let cleanup = cluster.shutdown().await;
+        assert_eq!(cleanup["clean"], true, "{cleanup}");
+        result.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn three_replica_service_copies_each_peer_replays_replies_and_preserves_majority() {
     for lose_majority in [false, true] {
     let fixture = Fixture::new("three-replica-service");
@@ -3698,6 +3873,7 @@ fn private_launch_metadata_roundtrip_does_not_use_native_byte_array_json_visitor
         pid: 555,
         address: "127.0.0.1:23456".parse().unwrap(),
         peer_address: None,
+        peer_addresses: vec![],
         profile: Some(profile(&decoded)),
     };
     let bytes = serde_json::to_vec(&metadata).unwrap();

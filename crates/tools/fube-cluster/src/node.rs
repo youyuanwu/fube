@@ -319,7 +319,7 @@ impl Adapter {
                 if snapshot.fenced
                     || snapshot.committed.is_none_or(|s| {
                         s.phase != ra::Phase::Ready
-                            || s.swap.is_none()
+                            || (s.swap.is_none() && s.progress_query.is_none())
                             || s.body.unit.current != unit.current
                     })
                 {
@@ -331,14 +331,19 @@ impl Adapter {
                 let snapshot = node.snapshot(reply.entity);
                 if snapshot.fenced
                     || snapshot.committed.is_none_or(|state| {
-                        state.phase != ra::Phase::Closed
+                        let survivor_ack = state.phase == ra::Phase::Ready
+                            && state.swap.as_ref().is_some_and(|s| {
+                                s.failover && s.stage == ra::SwapStage::Deactivated
+                            });
+                        (!survivor_ack && state.phase != ra::Phase::Closed)
                             || state.body.unit != body.unit
                             || state.body.replica.id != body.replica.id
                             || state.body.replica.instance != body.replica.instance
-                            || state
-                                .peer_creation
-                                .as_ref()
-                                .is_none_or(|p| !p.close_completed || p.host_down)
+                            || (!survivor_ack
+                                && state
+                                    .peer_creation
+                                    .as_ref()
+                                    .is_none_or(|p| !p.close_completed || p.host_down))
                     })
                 {
                     self.peer_replies.pop_front();
@@ -352,9 +357,14 @@ impl Adapter {
                         state.phase != ra::Phase::Ready
                             || state.body.unit != body.unit
                             || state.body.replica != body.replica
-                            || state.reconfiguration.as_ref().is_none_or(|config| {
-                                config.stage != ra::ConfigurationStage::Complete
-                            })
+                            || state.swap.as_ref().map_or_else(
+                                || {
+                                    state.reconfiguration.as_ref().is_none_or(|config| {
+                                        config.stage != ra::ConfigurationStage::Complete
+                                    })
+                                },
+                                |swap| swap.stage != ra::SwapStage::Complete,
+                            )
                     })
                 {
                     self.peer_replies.pop_front();
@@ -795,16 +805,14 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
     let address = listener.local_addr().map_err(err)?;
-    let mut peer_listener = if !launch.peers.is_empty() {
-        Some(TcpListener::bind("127.0.0.1:0").await.map_err(err)?)
-    } else {
-        None
-    };
-    let peer_address = peer_listener
-        .as_ref()
-        .map(TcpListener::local_addr)
-        .transpose()
-        .map_err(err)?;
+    let mut peer_listeners = vec![];
+    let mut peer_addresses = vec![];
+    for _ in &launch.peers {
+        let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
+        peer_addresses.push(listener.local_addr().map_err(err)?);
+        peer_listeners.push(Some(listener));
+    }
+    let peer_address = peer_addresses.first().copied();
     let mut metadata = Metadata {
         deployment: launch.deployment.clone(),
         session: launch.session.clone(),
@@ -812,6 +820,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         pid: std::process::id(),
         address,
         peer_address,
+        peer_addresses,
         profile: None,
     };
     write_json(&launch.directory.join("listener.json"), &metadata)?;
@@ -1021,7 +1030,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             match command {
                                 Ok(parts) if matches!(parts.len(), 4 | 5) && parts[0] == "peer"
                                     && parts[1] == launch.session && parts[2] == launch.capability
-                                    && launch.placement == 1 && !launch.peers.is_empty() => {
+                                    && (launch.placement == 1 || launch.profile == ServiceProfile::StatefulThree) && !launch.peers.is_empty() => {
                                     let index = if parts.len() == 5 {
                                         match parts[3].parse::<usize>() {
                                             Ok(index) => index,
@@ -1036,7 +1045,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                                         break;
                                     };
                                     connection.dialed = true;
-                                    peer_listener.take();
+                                    peer_listeners[index].take();
                                     match dial_peer_to(launch, &launch.peers[index], parts[parts.len() - 1]).await {
                                         Ok(link) => connection.link = Some(link),
                                         Err(error) => adapter.peer_error = Some(error),
@@ -1072,19 +1081,19 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(2)) => {},
             }
-            if launch.placement != 1 {
-                if let Some(listener) = &peer_listener {
+            for (index, listener_slot) in peer_listeners.iter_mut().enumerate() {
+                if let Some(listener) = listener_slot {
                     match tokio::time::timeout(Duration::from_millis(1), listener.accept()).await {
                         Ok(Ok((stream, _))) => {
-                            peer_listener.take();
-                            match accept_peer(launch, stream).await {
-                                Ok(link) => connections[0].link = Some(link),
+                            listener_slot.take();
+                            match accept_peer_from(launch, &launch.peers[index], stream).await {
+                                Ok(link) => connections[index].link = Some(link),
                                 Err(error) => adapter.peer_error = Some(error),
                             }
                         }
                         Ok(Err(error)) => {
                             adapter.peer_error = Some(err(error));
-                            peer_listener.take();
+                            listener_slot.take();
                         }
                         Err(_) => {}
                     }
@@ -1315,6 +1324,10 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         "fm_stage":format!("{:?}",state.fm_stage),
                         "local_deleted":state.local_deleted,
                         "swap":state.swap.as_ref().map(|swap| serde_json::json!({"stage":format!("{:?}",swap.stage),"error":swap.error})),
+                        "progress_query":state.progress_query.as_ref().map(|query| serde_json::json!({
+                            "source":query.source,"epoch":query.request.unit.current,
+                            "pending":query.reply.is_none(),"error":query.error,
+                        })),
                         "configuration":state.reconfiguration.as_ref().map(|config| serde_json::json!({
                             "stage":format!("{:?}", config.stage), "request":config.request, "error":config.error,
                         })),
@@ -1449,7 +1462,20 @@ async fn dial_peer_to(launch: &Launch, peer: &Peer, address: &str) -> Result<Lin
     )
 }
 
+#[cfg(test)]
 async fn accept_peer(launch: &Launch, stream: tokio::net::TcpStream) -> Result<Link> {
+    accept_peer_from(
+        launch,
+        launch.peers.first().ok_or("no original peer binding")?,
+        stream,
+    )
+    .await
+}
+async fn accept_peer_from(
+    launch: &Launch,
+    peer: &Peer,
+    stream: tokio::net::TcpStream,
+) -> Result<Link> {
     let channel = fube_transport::accept_unsecured_loopback(
         stream,
         wire::peer_composition().map_err(err)?,
@@ -1458,19 +1484,10 @@ async fn accept_peer(launch: &Launch, stream: tokio::net::TcpStream) -> Result<L
     )
     .await
     .map_err(err)?;
-    peer_link(launch, channel)
-}
-
-fn peer_link(launch: &Launch, channel: fube_transport::Channel) -> Result<Link> {
     Link::new(
         channel,
         launch.node.clone(),
-        launch
-            .peers
-            .first()
-            .ok_or("no original peer binding")?
-            .node
-            .clone(),
+        peer.node.clone(),
         launch.generation.clone(),
     )
 }
@@ -1525,11 +1542,15 @@ fn receive_peer_from(
             let (body, generation) = decode_get_lsn_reply(message).map_err(err)?;
             node.get_lsn_reply_from_peer(body, &peer.node, &generation)
         }
-        "Deactivate" if launch.placement == 2 => {
+        "Deactivate"
+            if launch.placement == 2 || launch.profile == ServiceProfile::StatefulThree =>
+        {
             let (body, generation) = decode_deactivate(message).map_err(err)?;
             node.deactivate_replica_from_peer(body, &peer.node, &generation)
         }
-        "DeactivateReply" if launch.placement == 1 => {
+        "DeactivateReply"
+            if launch.placement == 1 || launch.profile == ServiceProfile::StatefulThree =>
+        {
             let (body, generation) = decode_deactivate_reply(message).map_err(err)?;
             fixed_idle_target(
                 launch,
@@ -1889,7 +1910,9 @@ fn receive_command(
                 .map_err(err)?;
         }
         "DoReconfiguration" => {
-            if !launch.profile.peer_replicas() || launch.placement != 1 {
+            if !launch.profile.peer_replicas()
+                || (launch.placement != 1 && launch.profile != ServiceProfile::StatefulThree)
+            {
                 return Err("DoReconfiguration requires the original coordinating Primary".into());
             }
             let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;

@@ -390,6 +390,7 @@ fn start_close_inner(
     }
     state.phase = Phase::Closing;
     state.remote_idles.clear();
+    state.progress_query = None;
     state.service_description_pending = false;
     state.close_mode = Some(mode);
     state.close_token = token;
@@ -655,6 +656,7 @@ pub(super) fn transition(
                 remote_idles: vec![],
                 reconfiguration: None,
                 swap: None,
+                progress_query: None,
                 // TryCreateFailoverUnit constructs from ID, consistency and
                 // service, NOT the incoming previous epoch/target/minimum.
                 body: Arc::new(AddInstance {

@@ -257,7 +257,7 @@ impl Launch {
             uuid::Uuid::parse_str(id).map_err(err)?;
         }
         let expected = if self.profile.peer_replicas() {
-            if self.placement == 1 {
+            if self.placement == 1 || self.profile == ServiceProfile::StatefulThree {
                 self.profile.node_count() - 1
             } else {
                 1
@@ -304,6 +304,8 @@ pub struct Metadata {
     pub address: SocketAddr,
     #[serde(default)]
     pub peer_address: Option<SocketAddr>,
+    #[serde(default)]
+    pub peer_addresses: Vec<SocketAddr>,
     pub profile: Option<ActualProfile>,
 }
 

@@ -352,6 +352,10 @@ int main(int argc,char** argv) {
         c=0; rich(peer_deactivate,c);
         run(mode,dir,"rich-deactivate",peer_deactivate);
         reject_truncated(peer_deactivate);
+        peer_deactivate.replicas_.push_back(third);
+        peer_deactivate.isForce_=false;
+        run(mode,dir,"three-deactivate",peer_deactivate);
+        reject_truncated(peer_deactivate);
         ReplicaReplyMessageBody peer_deactivated;
         run(mode,dir,"default-deactivate-reply",peer_deactivated);
         c=0; rich(peer_deactivated,c);
@@ -616,7 +620,7 @@ int main(int argc,char** argv) {
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
         ++native_truncation_rejections;
-        if(native_truncation_rejections!=52)
+        if(native_truncation_rejections!=53)
             throw std::runtime_error("native truncation coverage mismatch");
         std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;

@@ -1315,7 +1315,9 @@ impl Node {
                 .ra
                 .snapshot(body.unit.id.guid.0)
                 .committed
-                .is_none_or(|s| s.swap.is_none())
+                .is_none_or(|s| {
+                    s.swap.is_none() && !self.three_member_configuration(body.unit.id.guid.0)
+                })
         {
             return Err(Error::Unsupported);
         }
@@ -1367,7 +1369,10 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         self.admit_fm(source, generation)?;
-        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            && !(self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
+                && self.three_member_configuration(body.configuration.unit.id.guid.0))
+        {
             return Err(Error::Unsupported);
         }
         self.admit_configuration(&body.configuration)?;
@@ -1426,7 +1431,8 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+        if (self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            && !self.three_member_configuration(body.unit.id.guid.0))
             || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
@@ -1484,6 +1490,15 @@ impl Node {
             return Err(Error::Unsupported);
         }
         Ok(())
+    }
+    fn three_member_configuration(&self, entity: ra::EntityId) -> bool {
+        self.ra.peer_count() == 2
+            && self.ra.snapshot(entity).committed.is_some_and(|s| {
+                s.phase == ra::Phase::Ready
+                    && s.reconfiguration.as_ref().is_some_and(|c| {
+                        c.stage == ra::ConfigurationStage::Complete && c.request.unit.target == 3
+                    })
+            })
     }
     pub fn remove_replica_from_fm(
         &mut self,

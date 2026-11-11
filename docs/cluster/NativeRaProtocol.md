@@ -37,6 +37,9 @@ The FM accounting is 39 selected/19 remaining of 58; peer accounting is
 DoReconfiguration's peer-swap direction now has bounded healthy-transfer
 execution; broader failover, abort, closed/unknown and interoperability branches
 remain gated.
+The [three-member Primary app-host failover](MinimalFmCluster.md#three-replica-primary-app-host-failover)
+also reuses FM DoReconfiguration/Reply, GetLSN/Reply and Deactivate/Activate pairs
+with real RAP completion, without enabling data-loss or node/FM restart paths.
 The bounded entity seam alone does not implement Hosting or authorize serving.
 The implementation mapping below supplies actual Rust mappings and evidence
 as each phase lands. A native test anchor is a reference to existing source, not a
@@ -57,8 +60,10 @@ independent cases, preserving the reply's inherited base and deactivation scope.
 Live-session LFUM adds its full metadata body and correlated bodyless reply.
 Healthy three-member admission adds three-element configuration vectors for
 DoReconfiguration, Activate and DoReconfigurationReply without new schemas.
-The maintained source-stream oracle now has 172 inputs, 84 types/255 fields,
-176 bundle files and 52 native truncation rejections, retaining the preceding
+Bounded Primary failover adds a three-element non-force Deactivate vector.
+The maintained source-stream oracle now has 173 inputs, 84 types/255 fields,
+177 bundle files and 53 native truncation rejections, retaining the preceding
+172-case healthy three-member gate, the
 169-case LFUM gate and the
 163-case planned-transfer gate. The preceding retirement
 gate's 157 inputs, 82 types/250 fields, 161 bundle files and 45 rejections remain
@@ -77,7 +82,7 @@ rejections remain preserved. The preceding generation gate's 116 inputs, 75 type
 The preceding stage-two gate's 101 inputs, 73 types/233 fields,
 105 bundle files and 26 native truncation rejections remain preserved, including
 all prior 58 inputs (and the original 36). The current gate executes
-52 native truncation rejections and Rust proper-prefix rejection for every new
+53 native truncation rejections and Rust proper-prefix rejection for every new
 nonempty root fixture. A bodyless proposal is exactly zero bytes.
 It is not deployed native
 FM/Federation evidence; see the [oracle disclosure](../../tests/ra_protocol/README.md).

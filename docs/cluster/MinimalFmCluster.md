@@ -271,13 +271,85 @@ cases for DoReconfiguration, Activate and DoReconfigurationReply: 172
 bidirectional cases, 84 types/255 fields, 176 bundle files and 52 actual native
 truncation rejections. These are native-stream/schema-adapter and native-free
 process results, not full original-handler or FM/Federation interoperability.
-Three-member transfer, retirement/replacement, superseding configurations,
-generation/peer inventories, failover, data loss, reconnect and restart remain
+Three-member planned transfer, retirement/replacement, superseding configurations,
+generation/peer inventories, node/FM-loss failover, data loss, reconnect and restart remain
 explicitly gated. A failed native build remains failed/to-be-dropped with
 cleanup required; this profile does not invent successful repair or replacement.
 Original-owner shutdown still disposes all owned resources.
 Stdin retains its existing create/status/quit interface;
 the public Cluster APIs authorize build and configuration.
+
+### Three-replica Primary app-host failover
+
+The completed original 3/2 profile now supports one loss-driven Primary failover
+without changing the data-loss epoch. Its **original Primary app host** must
+actually exit while the original Node/RA and both configured Secondaries remain
+available. RA's committed canonical dropped ReplicaUp report is reconciled
+against the exact original FM ownership before FM starts reconfiguration.
+A broken FM link, diagnostic observation, cleanup sidecar or historical Ready
+label cannot supply that loss report. The normal processed ReplicaUp ACK and
+closed metadata Delete remain separate from disposal or replacement.
+
+FM selects original node2 as the bounded candidate and increments the Primary
+configuration epoch. PC contains all three original members; the old Primary is
+Dropped/down and removed from CC. CC contains node2 Primary and node3 Secondary.
+Desired target/minimum remains 3/2. All original peers are bound before entity
+work; each peer has its own original listener/Channel, so the two survivors
+exchange native reliability traffic directly without reconnect/adoption.
+
+The candidate starts phase 1, **not** healthy-swap phase-0 demotion of a dead
+writer. It obtains real local and peer RAP UpdateEpochAndGetStatus/GetLSN
+results. The peer commits its new epoch before querying RAP and returns its
+actual progress/deactivation history, never a descriptor/default LSN. This
+profile requires both survivors' initialized, matching tails and compatible
+original history. Missing progress, incompatible history, a changed data-loss
+epoch or catch-up progress inconsistent with phase 1 cannot grant promotion.
+ChangeConfiguration, broader history repair and DatalossReport remain gated.
+
+Real promotion/catch-up retains separate PC/CC quorum obligations. Because PC
+and CC differ, phase 3 cannot use the equal-membership skip optimization:
+node3 receives S/S Deactivate, commits the configuration and new deactivation
+boundary, and returns the native fresh identity-only DeactivateReply. This is
+**metadata deactivation**, not service Close, runtime disposal or proof that
+the Secondary was dropped. Its actual service/replicator stays resident.
+The candidate then sends Activate, waits for node3's real RAP configuration
+completion and committed ActivateReply, and finishes RAP EndReconfiguration.
+Only the final matching DoReconfigurationReply publishes the promoted endpoint.
+An endpoint notification/ACK does not complete failover.
+
+Pinned SF revision `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines these decisions:
+
+| Source | Preserved responsibility |
+|---|---|
+| `fm/ReconfigurationTask.cpp:175-355`; `fm/FailoverUnit.cpp:878-895,1087-1105` | Available-member candidate admission, retain PC, increment Primary epoch and remove the down old Primary from CC without manufacturing singleton quorum. |
+| `ra/ReconfigurationState.cpp:76-119`; `ra/FailoverUnit.cpp:2204-2299,3013-3055` | Failover starts GetLSN; obtain local/remote progress and both configuration read-quorum evidence before selecting an eligible Primary. |
+| `ra/FailoverUnit.cpp:624-703,1993-2157` | GetLSN epoch commit, real RAP status, deactivation-history filtering and progress/catch-up-capability eligibility. |
+| `ra/FailoverUnit.cpp:736-818,2596-2637,3091-3124` | Actual catch-up result establishes the new boundary; unequal PC/CC requires phase-3 deactivation. |
+| `ra/ReconfigurationAgent.cpp:2590-2682`; `ra/FailoverUnit.cpp:929-958` | S/S Deactivate commits metadata/history and replies without RAP Close; S/N retirement is a different branch. |
+| `ra/FailoverUnit.cpp:2703-2873,3164-3272,3487-3496` | Peer activation, final RAP completion and committed stable configuration before FM completion/publication. |
+
+Model/store tests hold candidate admission, progress-query/deactivation and
+final completion commits; reject false progress/history, stale identities,
+missing/partial replies and unsupported data-loss changes. Definite/unknown
+S/S deactivation commits emit no early reply or invented Close. FM models reject
+channel-loss-only promotion and insufficient survivors, retain the native
+10/60-second retry and ignore repeated old loss reports after completion.
+Original-process acceptance kills the actual original Primary app host,
+retains nonempty data, loses/replays the final reply, checks the old listener
+is gone, and verifies new-Primary writes replicated on the original node3
+provider. Both survivors retain one Open and their original app/runtime owners.
+Insufficient survivors prevent failover; loss of the remaining Secondary after
+promotion cannot acknowledge a new admitted write or restore the old writer.
+All original cleanup owners remain independently verified.
+
+After completion, `configuration.kind=primary_failover`, `ready=true` means the
+two surviving configured members have completed this flow, not that a replacement
+third replica exists. Rebuild, repeat/aborted failover, whole-node/FM loss,
+restart/reconnect, arbitrary candidates and mismatched-history recovery remain
+unsupported. Native-stream evidence adds one three-element non-force Deactivate
+case: 173 bidirectional cases, 84 types/255 fields, 177 bundle files and 53 native
+truncation rejections. Neither these source-derived models/processes nor the
+schema adapter execute complete original C++ handlers or native Federation/FM.
 
 ## Peer-created Idle replica (stage-4 increment)
 

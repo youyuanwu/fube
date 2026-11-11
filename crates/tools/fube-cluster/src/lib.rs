@@ -113,7 +113,15 @@ impl Cluster {
                 let peers = launches
                     .iter()
                     .enumerate()
-                    .filter(|(other, _)| if index == 0 { *other != 0 } else { *other == 0 })
+                    .filter(|(other, _)| {
+                        if config.profile == ServiceProfile::StatefulThree {
+                            *other != index
+                        } else if index == 0 {
+                            *other != 0
+                        } else {
+                            *other == 0
+                        }
+                    })
                     .map(|(_, remote)| Peer {
                         node: remote.node.clone(),
                         session: remote.session.clone(),
@@ -143,27 +151,47 @@ impl Cluster {
             self.spawn(index).await?;
         }
         if self.config.profile.peer_replicas() {
-            for index in 1..self.children.len() {
-                let address = self.children[index]
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.peer_address)
-                    .ok_or("missing original node2 peer listener")?;
-                let child = &mut self.children[0];
-                child
-                    .process
-                    .as_mut()
-                    .ok_or("missing original Primary owner")?
-                    .command(
-                        format!(
-                            "peer {} {} {} {address}\n",
-                            child.launch.session,
-                            child.launch.capability,
-                            index - 1
+            for source in 0..self.children.len() {
+                for index in source + 1..self.children.len() {
+                    if !self.config.profile.peer_replicas()
+                        || (source != 0 && self.config.profile != ServiceProfile::StatefulThree)
+                    {
+                        continue;
+                    }
+                    let source_node = &self.children[source].launch.node;
+                    let incoming_slot = self.children[index]
+                        .launch
+                        .peers
+                        .iter()
+                        .position(|p| &p.node == source_node)
+                        .ok_or("missing original incoming mesh binding")?;
+                    let address = self.children[index]
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.peer_addresses.get(incoming_slot))
+                        .copied()
+                        .ok_or("missing original peer-specific listener")?;
+                    let target = &self.children[index].launch.node;
+                    let peer_index = self.children[source]
+                        .launch
+                        .peers
+                        .iter()
+                        .position(|p| &p.node == target)
+                        .ok_or("missing original mesh peer")?;
+                    let child = &mut self.children[source];
+                    child
+                        .process
+                        .as_mut()
+                        .ok_or("missing original Primary owner")?
+                        .command(
+                            format!(
+                                "peer {} {} {} {address}\n",
+                                child.launch.session, child.launch.capability, peer_index
+                            )
+                            .as_bytes(),
                         )
-                        .as_bytes(),
-                    )
-                    .map_err(err)?;
+                        .map_err(err)?;
+                }
             }
         }
         Ok(())
@@ -327,8 +355,19 @@ impl Cluster {
             || metadata
                 .peer_address
                 .is_some_and(|address| !address.ip().is_loopback() || address.port() == 0)
+            || metadata.peer_addresses.len() != owner.launch.peers.len()
+            || metadata.peer_address != metadata.peer_addresses.first().copied()
+            || metadata
+                .peer_addresses
+                .iter()
+                .enumerate()
+                .any(|(i, address)| {
+                    !address.ip().is_loopback()
+                        || address.port() == 0
+                        || metadata.peer_addresses[..i].contains(address)
+                })
             || owner.metadata.as_ref().is_some_and(|prior| {
-                prior.address != metadata.address || prior.peer_address != metadata.peer_address
+                prior.address != metadata.address || prior.peer_addresses != metadata.peer_addresses
             })
         {
             return Err(
@@ -619,7 +658,7 @@ impl Cluster {
                 Err(error) => Err(error),
             };
             let result = match result {
-                Ok(()) if index == 0 => {
+                Ok(()) if index == usize::from(self.ledger.primary_failover()) => {
                     if let Some(body) = self.ledger.configuration_retry(Instant::now()) {
                         self.send_configuration(&body).await
                     } else {
@@ -634,6 +673,17 @@ impl Cluster {
                     link.channel.dispose();
                 }
             }
+        }
+        self.start_failover().await;
+    }
+    async fn start_failover(&mut self) {
+        let failover = match self.ledger.start_primary_failover(Instant::now()) {
+            Ok(Some(body)) => self.send_configuration(&body).await,
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = failover {
+            self.ledger.lost(1, error);
         }
     }
     /// Begin one live-session ordinary-FM inventory reconciliation. New
@@ -1106,7 +1156,15 @@ impl Cluster {
     async fn send_configuration(&self, body: &DoReconfiguration) -> Result<()> {
         let child = self
             .children
-            .first()
+            .get(usize::from(
+                body.configuration.replicas.0.len() == 3
+                    && body
+                        .configuration
+                        .replicas
+                        .0
+                        .iter()
+                        .any(|r| r.previous_role == 4 && !r.up && r.current_role == 1),
+            ))
             .ok_or("missing original Primary owner")?;
         child
             .link

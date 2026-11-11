@@ -830,6 +830,8 @@ fn configuration_contracts(input: &Path, output: &Path) {
     let config = filled::<Configuration>(c);
     let force = filled::<bool>(c);
     let deactivation = filled::<ReplicaDeactivationInfo>(c);
+    let mut three = config.clone();
+    three.replicas.0.push(filled::<Replica>(&mut 5000));
     for (name, body) in [
         ("default-deactivate", Deactivate::default()),
         (
@@ -837,6 +839,14 @@ fn configuration_contracts(input: &Path, output: &Path) {
             Deactivate {
                 configuration: config,
                 force,
+                deactivation: deactivation.clone(),
+            },
+        ),
+        (
+            "three-deactivate",
+            Deactivate {
+                configuration: three,
+                force: false,
                 deactivation,
             },
         ),

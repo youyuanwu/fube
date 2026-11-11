@@ -26,9 +26,30 @@ nonempty data and remain non-writers. A fresh write needs the Primary plus one
 Secondary, not both; missing members never restore the historical singleton
 quorum. Source-bound process tests also lose/replay build and final configuration
 replies, preserve all original owners/one Open each and verify independent
-three-child cleanup. Primary transfer, replacement/retirement, generation
-upload, failover, data loss and restart remain gated for this profile.
+three-child cleanup. The bounded Primary app-host failover below is now supported;
+planned transfer, replacement/retirement, generation upload, data loss and
+restart remain gated for this profile.
 See [source mapping and limits](../../../docs/cluster/MinimalFmCluster.md#healthy-three-replica-service).
+
+Once that original 3/2 configuration is complete, a matching native terminal
+report for node1's Primary automatically starts one no-data-loss failover to
+node2, provided both original Secondaries remain available. FM-link loss alone
+cannot authorize it. Original per-peer listeners/Channels connect the surviving
+RAs directly; no new process/runtime/service Open or replica build is substituted.
+Actual local/remote GetLSN must return matched initialized progress and compatible
+history before promotion/catch-up. Native S/S Deactivate is metadata-only, not
+Close or disposal; its committed reply precedes Activate and final RAP/FM
+completion. Poll `configuration.kind=primary_failover` and `configuration.ready`.
+Only the exact new-Primary completion publishes its service endpoint.
+
+The resulting current membership is node2 Primary plus node3 Secondary, still
+with desired target/minimum 3/2 and write quorum two. Original nonempty data
+continues on those owners. There is no automatic replacement of node1 or quorum
+fallback if another member is lost. Lost final replies replay without another
+promotion/Open; repeated old-Primary loss reports cannot undo the new endpoint.
+This qualifies original Primary **app-host** loss with its RA/Node alive, not
+node/FM process failover, restart, mismatched-history repair, a second failover
+or data-loss recovery. See [the SF flow and evidence](../../../docs/cluster/MinimalFmCluster.md#three-replica-primary-app-host-failover).
 
 `--stateful-peer-idle` is a separate fresh-start, fixed-generation opt-in:
 node1 alone receives FM AddPrimary; node2 is the bound remote volatile Idle

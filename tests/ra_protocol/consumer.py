@@ -98,7 +98,7 @@ CONFIGURATION_CASES = {
     f"{profile}-{root}" for profile in ["default", "rich"]
     for root in ["do-reconfiguration", "do-reconfiguration-reply", "activate", "activate-reply", "deactivate", "deactivate-reply", "get-lsn", "get-lsn-reply"]
 } | {f"action-{action}" for action in CONFIGURATION_FACTORIES} | {
-    "three-do-reconfiguration", "three-do-reconfiguration-reply", "three-activate",
+    "three-do-reconfiguration", "three-do-reconfiguration-reply", "three-activate", "three-deactivate",
 }
 CASES |= CONFIGURATION_CASES
 SCHEMA_TYPES = 84
