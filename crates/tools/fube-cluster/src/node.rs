@@ -1654,7 +1654,8 @@ fn receive_peer_from(
     message: &fube_transport::message::Message,
 ) -> Result<Option<u64>> {
     wire::predecode(message)?;
-    let result = match message.properties().map_err(err)?.action.as_str() {
+    let action = message.properties().map_err(err)?.action;
+    let result = match action.as_str() {
         "DoReconfiguration" if launch.placement == 2 => {
             let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
             node.continue_swap_from_peer(body, &peer.node, &generation)
@@ -1731,6 +1732,7 @@ fn receive_peer_from(
     match result {
         Ok(id) => Ok(Some(id)),
         Err(fube_node::local::Error::Capacity) => Ok(None),
+        Err(fube_node::local::Error::Busy) if action == "CreateReplica" => Ok(None),
         Err(error) => Err(err(error)),
     }
 }
@@ -5554,6 +5556,27 @@ pub(crate) mod report_tests {
                             || target.retained_usage() != 0 || target.replica_absence().is_some()
                         {
                             return Err("destination Delete completed Primary removal or authorized replacement".into());
+                        }
+                        if !opening && !after_host_exit {
+                            let mut fresh = create.clone();
+                            let (id, instance) = launches[1].idle_successor()?;
+                            fresh.replica.0.replica.id = id;
+                            fresh.replica.0.replica.instance = instance;
+                            let message = create_replica_message(&fresh, &launches[0].generation).map_err(err)?;
+                            receive_command(&launches[1], &mut target,
+                                &delete_replica_message(&deleting, &launches[1].generation).map_err(err)?)?;
+                            let pending = target.pending_commands();
+                            let before = target.snapshot(entity).committed.ok_or("missing closed owner before busy Create")?;
+                            // Queued old-owner work must backpressure a fresh Create, not close the peer.
+                            for _ in 0..2 {
+                                if receive_peer(&launches[1], &mut target, &message)?.is_some()
+                                    || target.pending_commands() != pending
+                                    || target.snapshot(entity).committed.is_none_or(|state|
+                                        state.body != before.body || !state.local_deleted)
+                                {
+                                    return Err("busy Create changed the closed owner or consumed admission".into());
+                                }
+                            }
                         }
                         source_link.send(create_replica_message(&create, &launches[0].generation).map_err(err)?).await?;
                         fm.send(add_replica_message(&request, &launches[0].generation).map_err(err)?).await?;

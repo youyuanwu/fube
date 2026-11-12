@@ -1206,9 +1206,9 @@ async fn stateful_idle_open_close_replay_and_actual_disposal_preserve_nonprimary
         let mut persisted = b.clone();
         persisted.service.persisted = true;
         assert!(node.open_stateful(persisted).is_err());
-        let mut larger = b.clone();
-        larger.service.target = 3;
-        assert!(node.open_stateful(larger).is_err());
+        let mut oversized = b.clone();
+        oversized.service.target = ra::MAX_CONFIGURATION_REPLICAS as i32 + 1;
+        assert!(node.open_stateful(oversized).is_err());
         assert_eq!(node.retained_usage(), 0);
         node.open_stateful(b.clone()).unwrap();
         let effects = until(&mut node, |n| {
