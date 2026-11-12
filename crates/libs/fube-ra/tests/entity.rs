@@ -7590,6 +7590,427 @@ async fn failover_survivor_get_lsn_and_ss_deactivate_wait_for_their_own_commits(
 }
 
 #[tokio::test]
+async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit() {
+    for (target, minimum) in [(5, 3), (64, 32)] {
+        for stage in 0..4 {
+            let (store, executor, hooks) = setup(WAIT).await;
+            active_configured_survivor(&executor, target, minimum).await;
+            let original = state(&executor);
+            let mut removal = original.reconfiguration.as_ref().unwrap().request.clone();
+            removal.unit.previous = removal.unit.current;
+            removal.unit.current.configuration += 1;
+            for r in &mut removal.replicas.0 {
+                r.previous_role = r.current_role;
+            }
+            let lost = removal.replicas.0.last_mut().unwrap();
+            lost.current_role = 1;
+            lost.up = false;
+            lost.state = 3;
+            let history = original
+                .peer_creation
+                .as_ref()
+                .unwrap()
+                .deactivation
+                .clone();
+            let old_deactivate = || Command::Deactivate {
+                source: peer_source(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(Deactivate {
+                    configuration: removal.clone(),
+                    force: false,
+                    deactivation: history.clone(),
+                }),
+            };
+            let old_activate = || Command::Activate {
+                source: peer_source(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(Activate {
+                    configuration: removal.clone(),
+                    deactivation: history.clone(),
+                }),
+            };
+            let mut old_completion = None;
+            if stage > 0 {
+                run(&executor, old_deactivate()).await;
+                effects(&executor);
+            }
+            if stage > 1 {
+                run(&executor, old_activate()).await;
+                old_completion = Some(configured(&effects(&executor)));
+            }
+            if stage > 2 {
+                run(
+                    &executor,
+                    Command::CompleteConfiguration(Box::new(old_completion.clone().unwrap())),
+                )
+                .await;
+                effects(&executor);
+            }
+            let mut intent = removal.clone();
+            intent.unit.current.configuration += 0x1_0000_0001;
+            for r in &mut intent.replicas.0 {
+                if r.current_role == 4 {
+                    r.current_role = 3;
+                    r.up = false;
+                    r.state = 3;
+                } else if r.node == admission().local_node {
+                    r.current_role = 4;
+                }
+                r.first_lsn = -1;
+                r.last_lsn = -1;
+            }
+            for invalid in 0..5 {
+                let mut bad = intent.clone();
+                match invalid {
+                    0 => bad.unit.previous = removal.unit.current,
+                    1 => bad.replicas.0[0].current_role = 1,
+                    2 => bad.replicas.0[2].previous_role = 1,
+                    3 => bad.replicas.0[2].instance += 1,
+                    _ => bad.service.minimum -= 1,
+                }
+                assert!(executor
+                    .submit(reconfigure(bad))
+                    .unwrap()
+                    .wait(WAIT)
+                    .await
+                    .is_err());
+                assert!(effects(&executor).is_empty());
+            }
+            let before = state(&executor);
+            let (entered, release) = hooks.pause(true);
+            let ticket = executor.submit(reconfigure(intent.clone())).unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            release.send(()).unwrap();
+            assert!(matches!(ticket.wait(WAIT).await, Err(Failure::Store(_))));
+            assert_eq!(state(&executor).body, before.body);
+            assert!(effects(&executor).is_empty());
+            run(&executor, reconfigure(intent.clone())).await;
+            let progress = status_completion(&effects(&executor));
+            for command in [old_deactivate(), old_activate()]
+                .into_iter()
+                .chain(old_completion.map(|c| Command::CompleteConfiguration(Box::new(c))))
+            {
+                assert_eq!(run(&executor, command).await, Disposition::IgnoredStale);
+                assert!(effects(&executor).is_empty());
+            }
+            run(&executor, Command::CompleteStatus(Box::new(progress))).await;
+            let mut actions = effects(&executor);
+            for remote in intent
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.up && r.current_role == 3)
+            {
+                run(
+                    &executor,
+                    failover_progress(&intent, remote, history.clone(), 7),
+                )
+                .await;
+                actions = effects(&executor);
+                if target == 5
+                    && state(&executor)
+                        .swap
+                        .as_ref()
+                        .unwrap()
+                        .remote_progress
+                        .len()
+                        == 1
+                {
+                    executor
+                        .config()
+                        .set_node(NodeProperty::RemoteReplicaProgressQueryWaitTicks, 0);
+                    run(
+                        &executor,
+                        Command::RetryConfiguration(intent.unit.id.clone()),
+                    )
+                    .await;
+                    actions = effects(&executor);
+                    assert_eq!(
+                        state(&executor).swap.as_ref().unwrap().stage,
+                        SwapStage::GetLsn
+                    );
+                    assert!(!actions
+                        .iter()
+                        .any(|e| matches!(e, Effect::UpdateConfiguration { .. })));
+                }
+            }
+            let mut catchup = configured(&actions);
+            assert_eq!(catchup.unit.previous, removal.unit.previous);
+            assert_eq!(
+                catchup
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|r| r.previous_role >= 3)
+                    .count(),
+                target as usize
+            );
+            assert_eq!(
+                catchup
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|r| r.current_role >= 3)
+                    .count(),
+                target as usize - 1
+            );
+            catchup.local.service_endpoint = "127.0.0.1:12349".into();
+            run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+            effects(&executor);
+            for remote in intent
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.up && r.current_role == 3)
+            {
+                let (entered, release) = hooks.pause(false);
+                let ticket = executor
+                    .submit(Command::DeactivateReply {
+                        source: remote.node.clone(),
+                        generation: generation_header(admission().generation.generation),
+                        body: Box::new(DeactivateReply {
+                            unit: intent.unit.clone(),
+                            replica: Replica {
+                                node: remote.node.clone(),
+                                id: remote.id,
+                                instance: remote.instance,
+                                up: false,
+                                state: 3,
+                                ..Replica::default()
+                            },
+                            error: 0,
+                        }),
+                    })
+                    .unwrap();
+                entered.await.unwrap();
+                assert!(effects(&executor).is_empty());
+                release.send(()).unwrap();
+                ticket.wait(WAIT).await.unwrap();
+                effects(&executor);
+            }
+            let mut actions = vec![];
+            for remote in intent
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.up && r.current_role == 3)
+            {
+                let mut unit = intent.unit.clone();
+                unit.previous = Epoch::default();
+                let mut replica = remote.clone();
+                replica.previous_role = 1;
+                replica.first_lsn = 1;
+                replica.last_lsn = 7;
+                run(
+                    &executor,
+                    Command::ActivateReply {
+                        source: remote.node.clone(),
+                        generation: generation_header(admission().generation.generation),
+                        body: Box::new(ActivateReply {
+                            unit,
+                            replica,
+                            error: 0,
+                        }),
+                    },
+                )
+                .await;
+                actions = effects(&executor);
+            }
+            let end = configured(&actions);
+            assert_eq!(end.flags, 1);
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor
+                .submit(Command::CompleteConfiguration(Box::new(end)))
+                .unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            assert!(
+                matches!(effects(&executor).as_slice(),[Effect::DoReconfigurationReply(r)]
+                if r.replicas.0.len() == target as usize-1 && r.replicas.0.iter().filter(|r| r.up).count() == target as usize-2)
+            );
+            assert_eq!(state(&executor).runtime, original.runtime);
+            assert_eq!(state(&executor).usage, original.usage);
+            assert_eq!(state(&executor).body.service, original.body.service);
+            finish(&store, &executor).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn removal_survivor_queries_retained_history_and_fences_old_activation() {
+    for stage in 0..4 {
+        let (store, executor, _) = setup(WAIT).await;
+        active_configured_survivor(&executor, 5, 3).await;
+        let original = state(&executor);
+        let history = original
+            .peer_creation
+            .as_ref()
+            .unwrap()
+            .deactivation
+            .clone();
+        let mut removal = original.reconfiguration.as_ref().unwrap().request.clone();
+        removal.unit.previous = removal.unit.current;
+        removal.unit.current.configuration += 1;
+        for r in &mut removal.replicas.0 {
+            r.previous_role = r.current_role;
+        }
+        let lost = removal.replicas.0.last_mut().unwrap();
+        lost.current_role = 1;
+        lost.up = false;
+        lost.state = 3;
+        let old_deactivate = || Command::Deactivate {
+            source: peer_source(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(Deactivate {
+                configuration: removal.clone(),
+                force: false,
+                deactivation: history.clone(),
+            }),
+        };
+        let old_activate = || Command::Activate {
+            source: peer_source(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(Activate {
+                configuration: removal.clone(),
+                deactivation: history.clone(),
+            }),
+        };
+        let mut old_completion = None;
+        if stage > 0 {
+            run(&executor, old_deactivate()).await;
+            effects(&executor);
+        }
+        if stage > 1 {
+            run(&executor, old_activate()).await;
+            old_completion = Some(configured(&effects(&executor)));
+        }
+        if stage > 2 {
+            run(
+                &executor,
+                Command::CompleteConfiguration(Box::new(old_completion.clone().unwrap())),
+            )
+            .await;
+            effects(&executor);
+        }
+        let candidate = removal.replicas.0[2].node.clone();
+        let mut intent = removal.clone();
+        intent.unit.current.configuration += 0x1_0000_0001;
+        for r in &mut intent.replicas.0 {
+            if r.current_role == 4 {
+                r.current_role = 3;
+                r.up = false;
+                r.state = 3;
+            } else if r.node == candidate {
+                r.current_role = 4;
+            }
+            r.first_lsn = -1;
+            r.last_lsn = -1;
+        }
+        run(
+            &executor,
+            Command::GetLsn {
+                source: candidate.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(AddInstance {
+                    unit: intent.unit.clone(),
+                    service: intent.service.clone(),
+                    replica: Replica {
+                        node: original.body.replica.node.clone(),
+                        id: original.body.replica.id,
+                        instance: original.body.replica.instance,
+                        ..Replica::default()
+                    },
+                }),
+            },
+        )
+        .await;
+        let completion = status_completion(&effects(&executor));
+        for command in [old_deactivate(), old_activate()]
+            .into_iter()
+            .chain(old_completion.map(|c| Command::CompleteConfiguration(Box::new(c))))
+        {
+            assert_eq!(run(&executor, command).await, Disposition::IgnoredStale);
+            assert!(effects(&executor).is_empty());
+        }
+        run(&executor, Command::CompleteStatus(Box::new(completion))).await;
+        assert!(
+            matches!(effects(&executor).as_slice(),[Effect::PeerGetLsnReply { body,.. }] if body.deactivation==history)
+        );
+        let next_history = ReplicaDeactivationInfo {
+            epoch: intent.unit.current,
+            catchup_lsn: 8,
+        };
+        let mut future = intent.clone();
+        future.unit.current.configuration += 0x1_0000_0001;
+        assert!(executor
+            .submit(Command::Deactivate {
+                source: candidate.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(Deactivate {
+                    deactivation: ReplicaDeactivationInfo {
+                        epoch: future.unit.current,
+                        catchup_lsn: 8
+                    },
+                    configuration: future,
+                    force: false,
+                }),
+            })
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .is_err());
+        assert!(effects(&executor).is_empty());
+        run(
+            &executor,
+            Command::Deactivate {
+                source: candidate.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(Deactivate {
+                    configuration: intent.clone(),
+                    force: false,
+                    deactivation: next_history.clone(),
+                }),
+            },
+        )
+        .await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::PeerDeactivateReply { .. }]
+        ));
+        run(
+            &executor,
+            Command::Activate {
+                source: candidate,
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(Activate {
+                    configuration: intent,
+                    deactivation: next_history,
+                }),
+            },
+        )
+        .await;
+        let mut completion = configured(&effects(&executor));
+        completion.local.first_lsn = 1;
+        completion.local.last_lsn = 8;
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(completion)),
+        )
+        .await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::PeerActivateReply { .. }]
+        ));
+        assert_eq!(state(&executor).runtime, original.runtime);
+        assert_eq!(state(&executor).usage, original.usage);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
 async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_commit() {
     for (target, minimum, veto) in [
         (4, 2, false),

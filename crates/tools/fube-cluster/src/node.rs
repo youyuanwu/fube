@@ -508,9 +508,18 @@ impl Adapter {
                             state.phase != ra::Phase::Ready
                                 || state.body.replica.current_role != 4
                                 || state.body.unit != body.unit
-                                || state.reconfiguration.as_ref().is_none_or(|config| {
-                                    config.stage != ra::ConfigurationStage::Complete
-                                })
+                                || if state.reconfiguration.as_ref().is_some_and(|config| {
+                                    config.request.unit.current == body.unit.current
+                                }) {
+                                    state.reconfiguration.as_ref().is_none_or(|config| {
+                                        config.stage != ra::ConfigurationStage::Complete
+                                    })
+                                } else {
+                                    state.swap.as_ref().is_none_or(|swap| {
+                                        swap.stage != ra::SwapStage::Complete
+                                            || swap.body.unit != body.unit
+                                    })
+                                }
                         })
                     {
                         self.replies.pop_front();

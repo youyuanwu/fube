@@ -65,14 +65,22 @@ SF does not remove a down Secondary at minimum without a ready spare. This
 original-node-only topology therefore rejects repair when minimum equals target;
 it never lowers minimum or invents a spare placement. Multiple losses also
 reject a new repair. A further loss during repair makes it unknown and blocks
-host replacement/completion. Data-plane writes still require their actual quorum.
+host replacement/completion. Before any replacement starts, a matched Primary
+app-host loss during pending Secondary removal can instead supersede removal:
+it retains the original PC and CC set (including the failed Primary as down S),
+checks both read quorums and completes normal GetLSN/history/catch-up and
+survivor phase commits. `repair.state` becomes `superseded`, not ready; the new
+Primary can serve, but repair of the two lost members remains gated.
+FM-link loss and interruption during copy/readmission do not authorize this
+bounded exception. Data-plane writes still require their actual quorum.
 
 The configured profile still rejects resize, planned transfer and healthy
 Secondary retirement. Host replacement is explicit, never automatic.
 Insufficient read quorum blocks failover without declaring data loss. Additional
-loss during an in-flight transition makes its ownership unknown, not successful.
+loss during an in-flight transition makes its ownership unknown, not successful,
+except for the bounded pre-replacement Primary-loss supersession above.
 Another configured failover requires completed repair; multi-loss repair,
-interrupted/superseding recovery and whole-node/FM restart remain unsupported.
+broader interrupted/superseding recovery and whole-node/FM restart remain unsupported.
 The named profiles below remain
 separate qualification paths, including their historical size transitions and
 repeated failover/repair.

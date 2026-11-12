@@ -50,7 +50,7 @@ pub fn retired_configuration(state: &EntityState) -> bool {
         config.stage == ConfigurationStage::Complete && config.request.unit.target == 1
     })
 }
-fn secondary_removal(body: &Configuration) -> bool {
+pub(super) fn secondary_removal(body: &Configuration) -> bool {
     body.replicas
         .0
         .iter()
@@ -61,6 +61,16 @@ fn secondary_removal(body: &Configuration) -> bool {
 pub fn completed_secondary_removal(state: &EntityState) -> bool {
     state.reconfiguration.as_ref().is_some_and(|c| {
         c.secondary_loss && c.stage == ConfigurationStage::Complete && secondary_removal(&c.request)
+    })
+}
+pub fn secondary_removal_in_progress(state: &EntityState) -> bool {
+    state.reconfiguration.as_ref().is_some_and(|c| {
+        c.secondary_loss
+            && secondary_removal(&c.request)
+            && matches!(
+                c.stage,
+                ConfigurationStage::Deactivated | ConfigurationStage::Secondary
+            )
     })
 }
 fn secondary_transition(body: &Configuration, old: &EntityState) -> bool {

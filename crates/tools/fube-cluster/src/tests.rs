@@ -425,6 +425,81 @@ fn configured_failover_redirects_only_exact_native_progress_and_replays_legacy_r
 }
 
 #[test]
+fn primary_loss_supersedes_only_unreplaced_secondary_removal_and_preserves_pc_cc() {
+    for (target, minimum) in [(3,2),(4,2),(5,3),(64,32)] {
+        for blocked in 0..6 {
+            let mut ledger = configured_ledger(target,minimum);
+            let original = ledger.placements[1].body().unwrap();
+            ledger.report(1,&stateful_loss_report(&ledger.placements[1])).unwrap();
+            ledger.reply(1,AddInstanceReply {
+                unit:original.unit,replica:dropped_replica(&original.replica),error:0,
+            },true).unwrap();
+            let removal = ledger.begin_secondary_repair(1,Instant::now()).unwrap().unwrap();
+            let mut late = ConfigurationReply {
+                unit:removal.configuration.unit.clone(),replicas:removal.configuration.replicas.clone(),error:0,
+            };
+            late.unit.previous = Epoch::default();
+            late.replicas.0.retain(|r| r.current_role >= 3);
+            for r in &mut late.replicas.0 { r.previous_role = 1; }
+            match blocked {
+                1 => ledger.repair.as_mut().unwrap().host_requested = true,
+                2 => ledger.configuration_reply(0,late.clone()).unwrap(),
+                3 => ledger.lost(0,"FM link lost, not app-host loss".into()),
+                4 => { ledger.report(2,&stateful_loss_report(&ledger.placements[2])).unwrap(); },
+                _ => {}
+            }
+            if blocked != 3 {
+                ledger.report(0,&stateful_loss_report(&ledger.placements[0])).unwrap();
+            }
+            if blocked == 5 {
+                ledger.placements[2].activated = false;
+            }
+            let intent = ledger.start_primary_failover(Instant::now()).unwrap();
+            if blocked != 0 || target == 3 {
+                assert!(intent.is_none(),"unexpected supersession {target}/{minimum} case={blocked}");
+                assert!(ledger.repair.as_ref().unwrap().profile.is_none());
+                continue;
+            }
+            let intent = intent.unwrap();
+            assert!(ledger.repair.is_none());
+            assert!(ledger.repair_history.last().unwrap().unknown);
+            assert_eq!(ledger.repair_status()["state"],"superseded");
+            assert_eq!(ledger.repair_status()["ready"],false);
+            assert_eq!(ledger.primary_index(),2);
+            assert_eq!(ledger.failed_primary_index(),Some(0));
+            assert_eq!(intent.configuration.unit.previous,removal.configuration.unit.previous);
+            assert_eq!(intent.configuration.unit.current.configuration,removal.configuration.unit.current.configuration+0x1_0000_0001);
+            assert_eq!(intent.configuration.service,removal.configuration.service);
+            for expected in &removal.configuration.replicas.0 {
+                let actual = intent.configuration.replicas.0.iter().find(|r| r.node == expected.node).unwrap();
+                assert_eq!(actual.previous_role,expected.previous_role);
+                assert_eq!(actual.current_role >= 3,expected.current_role >= 3);
+                assert_eq!((actual.id,actual.instance),(expected.id,expected.instance));
+            }
+            let before = ledger.status();
+            ledger.configuration_reply(0,late).unwrap();
+            assert_eq!(ledger.status(),before);
+            assert!(ledger.start_primary_failover(Instant::now()).unwrap().is_none());
+            assert_eq!(ledger.configuration_retry(Instant::now()+Duration::from_secs(11)),Some(intent.clone()));
+            let mut reply = ConfigurationReply {
+                unit:intent.configuration.unit,replicas:intent.configuration.replicas,error:0,
+            };
+            reply.unit.previous = Epoch::default();
+            reply.replicas.0.retain(|r| r.current_role >= 3);
+            for r in &mut reply.replicas.0 {
+                r.previous_role = 1;
+                if r.up { r.first_lsn=1; r.last_lsn=8; r.service_endpoint.clear(); }
+                if r.current_role == 4 { r.service_endpoint="127.0.0.1:12349".into(); }
+            }
+            ledger.configuration_reply(2,reply).unwrap();
+            assert_eq!(ledger.configuration_status()["ready"],true);
+            assert!(ledger.begin_primary_repair(Instant::now()).is_err());
+            assert!(ledger.begin_secondary_repair(1,Instant::now()).is_err());
+        }
+    }
+}
+
+#[test]
 fn secondary_repair_requires_exact_loss_minimum_and_completed_removal_before_host_admission() {
     for (target,minimum) in [(2,1),(4,2),(4,3),(4,4),(5,3),(64,32)] {
         let mut ledger = configured_ledger(target,minimum);
@@ -3543,6 +3618,120 @@ async fn configured_candidate_redirection_routes_new_epoch_and_rejects_deprecate
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
     result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn primary_loss_during_secondary_removal_recovers_data_without_replacement_or_quorum_reduction() {
+    for (target, minimum, checkpoint) in [(5,3,0),(5,3,1),(5,3,2),(3,2,2)] {
+        let fixture=Fixture::new("removal-primary-loss");
+        let mut config=fixture.config();
+        config.profile=ServiceProfile::Stateful { target,minimum };
+        config.app=support::binary("hosting-local-app","FUBE_CLUSTER_STATEFUL_APP");
+        let mut cluster=Cluster::new(config).unwrap();
+        if let Err(error)=cluster.start().await {
+            let cleanup=cluster.shutdown().await;
+            panic!("removal supersession startup: {error}; cleanup={cleanup}");
+        }
+        let mut stopped_node=None;
+        let result=peer_idle_catch(async {
+            cluster.execute(command("primary","create",Some(1))).await?;
+            until(&mut cluster,|c| c.ledger.result("primary")["state"]=="complete").await;
+            let endpoint=cluster.ledger.placements[0].endpoint.clone().unwrap();
+            until(&mut cluster,|_| data_contact(&endpoint,b"read\n").starts_with("OK ")).await;
+            assert!(data_contact(&endpoint,b"write\n").contains("committed=1 value=acknowledged"));
+            until(&mut cluster,|c| (1..target as usize).all(|i|
+                c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"]==1)).await;
+            let service=cluster.ledger.placements[0].body()?.service;
+            let node_pids=cluster.status()["nodes"].as_array().unwrap().iter().map(|n| n["node_pid"].clone()).collect::<Vec<_>>();
+            let profiles=cluster.ledger.placements.iter().map(|p| p.profile.clone().unwrap()).collect::<Vec<_>>();
+            let old_secondary=cluster.ledger.placements[1].body()?;
+            assert!(std::process::Command::new("kill").args(["-KILL",&profiles[1].app_pid.to_string()]).status().map_err(err)?.success());
+            until(&mut cluster,|c| c.ledger.placements[1].loss_reported
+                && c.ledger.placements[1].status()["native_replica_deleted"]==true).await;
+            let removal=cluster.ledger.begin_secondary_repair(1,Instant::now())?.ok_or("missing removal")?;
+            let held=if checkpoint==2 {
+                cluster.send_configuration(&removal).await?;
+                Some(hold_peer_loss_frame(&mut cluster,0,"DoReconfigurationReply",Duration::from_secs(30)).await?)
+            } else {
+                if checkpoint==1 {
+                    let pid=cluster.children[4].process.as_ref().unwrap().pid();
+                    assert!(std::process::Command::new("kill").args(["-STOP",&pid.to_string()]).status().map_err(err)?.success());
+                    stopped_node=Some(pid);
+                    cluster.send_configuration(&removal).await?;
+                    until(&mut cluster,|c| c.status()["nodes"][0]["retained_work"]["local_replica"]["configuration"]["stage"]=="Deactivate"
+                        && c.status()["nodes"][2]["retained_work"]["local_replica"]["configuration"]["stage"]=="Deactivated").await;
+                }
+                None
+            };
+            assert!(!cluster.ledger.repair.as_ref().unwrap().host_requested);
+            assert!(std::process::Command::new("kill").args(["-KILL",&profiles[0].app_pid.to_string()]).status().map_err(err)?.success());
+            if let Some(pid)=stopped_node.take() {
+                assert!(std::process::Command::new("kill").args(["-CONT",&pid.to_string()]).status().map_err(err)?.success());
+            }
+            until(&mut cluster,|c| c.ledger.placements[0].loss_reported
+                && c.ledger.placements[0].status()["native_replica_deleted"]==true).await;
+            if target==3 {
+                assert!(cluster.ledger.swap.is_none());
+                assert_eq!(cluster.ledger.configuration_status()["state"],"unknown");
+                assert!(cluster.ledger.start_primary_failover(Instant::now())?.is_none());
+                if let Some(held)=held {
+                    cluster.ledger.configuration_reply(0,decode_do_reconfiguration_reply(&held).map_err(err)?.0)?;
+                }
+                for _ in 0..30 { cluster.drive().await; }
+                assert!(cluster.ledger.swap.is_none());
+                assert!(!cluster.ledger.repair.as_ref().unwrap().host_requested);
+                assert!(cluster.ledger.placements[2].endpoint.is_none());
+                assert_eq!(cluster.status()["nodes"][2]["retained_work"]["local_replica"]["replica"]["current_role"],3);
+            } else {
+                until(&mut cluster,|c| c.ledger.configuration_status()["ready"]==true
+                    && c.ledger.failed_primary_index()==Some(0)).await;
+                let intent=cluster.ledger.swap.as_ref().unwrap().body.clone();
+                assert_eq!(cluster.ledger.primary_index(),2);
+                assert_eq!(intent.configuration.unit.previous,removal.configuration.unit.previous);
+                assert_eq!(intent.configuration.unit.current.configuration,removal.configuration.unit.current.configuration+0x1_0000_0001);
+                assert_eq!(intent.configuration.service,service);
+                assert_eq!(intent.configuration.replicas.0.iter().filter(|r| r.previous_role>=3).count(),5);
+                assert_eq!(intent.configuration.replicas.0.iter().filter(|r| r.current_role>=3).count(),4);
+                assert_eq!(intent.configuration.replicas.0.iter().filter(|r| r.up).count(),3);
+                assert!(cluster.ledger.repair.is_none());
+                assert!(!cluster.ledger.repair_history.last().unwrap().host_requested);
+                let endpoint=cluster.ledger.placements[2].endpoint.clone().ok_or("missing superseding Primary endpoint")?;
+                assert!(data_contact(&endpoint,b"read\n").contains("committed=1 value=acknowledged"));
+                if let Some(held)=held {
+                    cluster.ledger.configuration_reply(0,decode_do_reconfiguration_reply(&held).map_err(err)?.0)?;
+                }
+                cluster.send_configuration(&removal).await?;
+                cluster.send_configuration(&intent).await?;
+                for _ in 0..30 { cluster.drive().await; }
+                assert_eq!(cluster.ledger.configuration_status()["ready"],true);
+                assert!(cluster.ledger.repair.is_none());
+                assert!(cluster.repair_primary_replica().await.is_err());
+                assert!(cluster.repair_secondary_replica(2).await.is_err());
+                assert!(data_contact(&endpoint,b"write-more\n").contains("committed=2 value=continued"));
+                until(&mut cluster,|c| (3..target as usize).all(|i|
+                    c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"]==2)).await;
+            }
+            assert!(!cluster.children[1].launch.host_replacement_path(old_secondary.replica.id,old_secondary.replica.instance).exists());
+            for (i,p) in profiles.iter().enumerate() {
+                assert_eq!(cluster.ledger.placements[i].profile.as_ref(),Some(p));
+                assert_eq!(cluster.ledger.placements[i].body()?.service,service);
+                assert_eq!(&cluster.status()["nodes"][i]["node_pid"],&node_pids[i]);
+                if i>=2 { assert_eq!(cluster.status()["nodes"][i]["retained_work"]["app_observation"]["opens"],1); }
+            }
+            assert!(cluster.ledger.placements.iter().all(|p| p.link_alive));
+            Ok::<(),String>(())
+        }).await;
+        if let Some(pid)=stopped_node {
+            assert!(std::process::Command::new("kill").args(["-CONT",&pid.to_string()]).status().unwrap().success());
+        }
+        if !matches!(&result,Ok(Ok(()))) {
+            eprintln!("REMOVAL_SUPERSESSION_STATUS {}",cluster.status());
+            for child in &cluster.children { eprintln!("REMOVAL_SUPERSESSION_LOG {:?}",bounded_logs(child.process.as_ref().unwrap())); }
+        }
+        let cleanup=cluster.shutdown().await;
+        assert_eq!(cleanup["clean"],true,"{cleanup}");
+        result.unwrap().unwrap();
+    }
 }
 
 #[tokio::test]

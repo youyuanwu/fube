@@ -51,20 +51,42 @@ fn deactivation(state: &EntityState) -> Result<ReplicaDeactivationInfo> {
         .ok_or(Failure::Admission("missing original replica history"))
 }
 
-fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
-    let active = state
+fn failover_membership(state: &EntityState) -> Result<&Reconfiguration> {
+    state
         .reconfiguration
         .as_ref()
-        .filter(|c| c.stage == ConfigurationStage::Complete && c.request.replicas.0.len() >= 2)
+        .filter(|c| {
+            c.request.replicas.0.len() >= 2
+                && (c.stage == ConfigurationStage::Complete
+                    || reconfiguration::secondary_removal_in_progress(state))
+        })
         .ok_or(Failure::Unsupported(
-            "failover requires completed current membership",
-        ))?;
+            "failover requires completed membership or exact Secondary removal",
+        ))
+}
+
+fn failover_epoch(unit: &FailoverUnit, active: &Reconfiguration, interrupted: bool) -> bool {
+    let old = &active.request.unit;
+    let removal = active.secondary_loss && reconfiguration::secondary_removal(&active.request);
+    unit.previous == if removal { old.previous } else { old.current }
+        && unit.current.data_loss == old.current.data_loss
+        && unit
+            .current
+            .configuration
+            .checked_sub(old.current.configuration)
+            .and_then(|d| d.checked_sub(i64::from(interrupted && !removal)))
+            .is_some_and(|d| d > 0 && d % 0x1_0000_0001 == 0)
+}
+
+fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
+    let active = failover_membership(state)?;
     let old = &active.request;
-    let delta = body
-        .unit
-        .current
-        .configuration
-        .checked_sub(old.unit.current.configuration);
+    let interrupted = body
+        .replicas
+        .0
+        .iter()
+        .any(|r| r.previous_role == 4 && r.current_role == 3 && !r.up && r.state == 3);
+    let removal = active.secondary_loss && reconfiguration::secondary_removal(old);
     if body.replicas.0.len() != old.replicas.0.len()
         || body.service != old.service
         || !valid_stateful_sizes(&body.service)
@@ -72,9 +94,27 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
         || body.unit.minimum != old.unit.minimum
         || body.unit.id != old.unit.id
         || body.unit.consistency != old.unit.consistency
-        || body.unit.previous != old.unit.current
-        || body.unit.current.data_loss != old.unit.current.data_loss
-        || delta.is_none_or(|d| d <= 0 || d % 0x1_0000_0001 != 0)
+        || !failover_epoch(&body.unit, active, interrupted)
+        || (removal && !interrupted)
+        || (interrupted
+            && (body.replicas.0.len() != body.service.target as usize
+                || !reconfiguration::secondary_removal(body)
+                || body
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|r| r.previous_role >= 3)
+                    .count()
+                    != body.replicas.0.len()
+                || body
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|r| r.current_role >= 3)
+                    .count()
+                    != body.replicas.0.len() - 1
+                || body.replicas.0.iter().filter(|r| !r.up).count() != 2
+                || body.service.minimum >= body.service.target))
     {
         return Err(Failure::Unsupported(
             "only unchanged-service no-data-loss Primary failover is enabled",
@@ -89,12 +129,25 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
         normalized.up = expected.up;
         normalized.state = expected.state;
         if !same_replica(&normalized, expected)
-            || r.previous_role != expected.current_role
+            || r.previous_role
+                != if removal {
+                    expected.previous_role
+                } else {
+                    expected.current_role
+                }
             || body.replicas.0[..i]
                 .iter()
                 .any(|other| other.node.id == r.node.id || other.id == r.id)
             || if expected.current_role == 4 {
+                r.up || r.state != 3 || r.current_role != if interrupted { 3 } else { 1 }
+            } else if removal && expected.current_role == 1 {
                 r.up || r.state != 3 || r.current_role != 1
+            } else if interrupted {
+                if r.up {
+                    r.state != 2 || !matches!(r.current_role, 3 | 4)
+                } else {
+                    removal || r.state != 3 || r.current_role != 1
+                }
             } else {
                 if r.up {
                     r.state != 2 || !matches!(r.current_role, 3 | 4)
@@ -151,15 +204,7 @@ fn progress_query(
             {
                 return Ok(None);
             }
-            let active = current
-                .reconfiguration
-                .as_ref()
-                .filter(|c| {
-                    c.stage == ConfigurationStage::Complete && c.request.replicas.0.len() >= 2
-                })
-                .ok_or(Failure::Unsupported(
-                    "progress query requires completed active membership",
-                ))?;
+            let active = failover_membership(current)?;
             if request.unit.current.older_than(current.body.unit.current) {
                 return Ok(Some(Transition::ignored(Disposition::IgnoredStale)));
             }
@@ -173,14 +218,10 @@ fn progress_query(
                 || request.unit.consistency != active.request.unit.consistency
                 || request.unit.target != active.request.unit.target
                 || request.unit.minimum != active.request.unit.minimum
-                || request.unit.previous != active.request.unit.current
-                || request.unit.current.data_loss != active.request.unit.current.data_loss
-                || request
-                    .unit
-                    .current
-                    .configuration
-                    .checked_sub(active.request.unit.current.configuration)
-                    .is_none_or(|d| d <= 0 || d % 0x1_0000_0001 != 0)
+                || !(failover_epoch(&request.unit, active, false)
+                    || (active.request.replicas.0.len() == active.request.service.target as usize
+                        && active.request.service.minimum < active.request.service.target
+                        && failover_epoch(&request.unit, active, true)))
             {
                 return Err(Failure::Unsupported(
                     "not the exact original survivor progress query",
@@ -276,8 +317,17 @@ fn progress_query(
             let body: Deactivate = from_slice(&work.bytes)
                 .map_err(|_| Failure::Admission("invalid survivor Deactivate"))?;
             let query = current.progress_query.as_ref().expect("query");
+            if body
+                .configuration
+                .unit
+                .current
+                .older_than(query.request.unit.current)
+            {
+                return Ok(Some(Transition::ignored(Disposition::IgnoredStale)));
+            }
             validate_failover(&body.configuration, current)?;
             if body.force
+                || body.configuration.unit != query.request.unit
                 || *source != query.source
                 || query.reply.is_none()
                 || replica(&body.configuration, source)?.current_role != 4
@@ -959,7 +1009,7 @@ pub(super) fn transition(
                 .replicas
                 .0
                 .iter()
-                .any(|r| r.previous_role == 4 && r.current_role == 1 && !r.up);
+                .any(|r| r.previous_role == 4 && matches!(r.current_role, 1 | 3) && !r.up);
             if failover {
                 validate_failover(&body.configuration, current)?;
             } else {

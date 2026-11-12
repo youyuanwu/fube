@@ -133,6 +133,7 @@ pub(crate) struct ReplicaRepair {
     pub configuration: Option<ActiveConfiguration>,
     pub removal: Option<ActiveConfiguration>,
     pub host_requested: bool,
+    superseded_by: Option<Epoch>,
     pub(crate) unknown: bool,
 }
 pub(crate) struct ActiveConfiguration {
@@ -534,7 +535,7 @@ impl Ledger {
                 .replicas
                 .0
                 .iter()
-                .any(|r| r.previous_role == 4 && r.current_role == 1 && !r.up)
+                .any(|r| r.previous_role == 4 && matches!(r.current_role, 1 | 3) && !r.up)
         })
     }
 
@@ -570,6 +571,10 @@ impl Ledger {
     }
 
     pub fn start_primary_failover(&mut self, now: Instant) -> Result<Option<DoReconfiguration>> {
+        if let Some(body) = self.secondary_removal_failover()? {
+            self.install_primary_failover(body.clone(), now);
+            return Ok(Some(body));
+        }
         let configured = self.placements[0]
             .launch
             .profile
@@ -717,21 +722,117 @@ impl Ledger {
             }
         }
         body.phase0_duration = i64::MAX;
-        for (i, p) in self.placements.iter_mut().enumerate() {
-            if i == lost || (configured && !available(p)) {
-                continue;
+        self.install_primary_failover(body.clone(), now);
+        Ok(Some(body))
+    }
+
+    fn secondary_removal_failover(&self) -> Result<Option<DoReconfiguration>> {
+        let Some(repair) = self.repair.as_ref().filter(|r| {
+            !r.host_requested
+                && r.profile.is_none()
+                && r.configuration.is_none()
+                && r.build.reply.is_none()
+        }) else {
+            return Ok(None);
+        };
+        let Some(removal) = repair.removal.as_ref().filter(|c| c.reply.is_none()) else {
+            return Ok(None);
+        };
+        let configuration = &removal.body.configuration;
+        let Some(primary) = configuration
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.previous_role == 4 && r.current_role == 4)
+        else {
+            return Ok(None);
+        };
+        if self.generation.is_some()
+            || self.idle_removal.is_some()
+            || self.idle_deletion.is_some()
+            || self.placements.iter().any(|p| {
+                !p.link_alive
+                    || !p.activated
+                    || p.bootstrap != Bootstrap::Admitted
+                    || p.pending.is_some()
+                    || p.node_control.is_some()
+                    || p.service_update.is_some()
+                    || if p.launch.node == primary.node
+                        || p.launch.node == repair.predecessor.replica.node
+                    {
+                        !p.loss_reported
+                    } else {
+                        p.loss_reported || p.observed != Observed::Running
+                    }
+            })
+        {
+            return Ok(None);
+        }
+        let available = |r: &&Replica| r.up && r.node != primary.node;
+        for previous in [true, false] {
+            let members: Vec<_> = configuration
+                .replicas
+                .0
+                .iter()
+                .filter(|r| {
+                    if previous {
+                        r.previous_role >= 3
+                    } else {
+                        r.current_role >= 3
+                    }
+                })
+                .collect();
+            if members.iter().copied().filter(available).count() < members.len().div_ceil(2) {
+                return Ok(None);
             }
-            p.active_unit = Some(body.configuration.unit.clone());
-            p.ready_replica = body
+        }
+        let candidate = configuration
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.up && r.current_role == 3)
+            .ok_or("missing surviving Secondary during removal")?;
+        let mut body = removal.body.clone();
+        body.configuration.unit.current.configuration = configuration
+            .unit
+            .current
+            .configuration
+            .checked_add(0x1_0000_0001)
+            .ok_or("interrupted Secondary removal epoch exhausted")?;
+        // SF preserves PC and the CC set during an in-flight Primary change.
+        for r in &mut body.configuration.replicas.0 {
+            if r.node == primary.node {
+                r.current_role = 3;
+                r.up = false;
+                r.state = 3;
+            } else if r.node == candidate.node {
+                r.current_role = 4;
+            }
+            r.first_lsn = -1;
+            r.last_lsn = -1;
+        }
+        Ok(Some(body))
+    }
+
+    fn install_primary_failover(&mut self, body: DoReconfiguration, now: Instant) {
+        for p in &mut self.placements {
+            let Some(replica) = body
                 .configuration
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.node == p.launch.node)
-                .cloned();
+                .find(|r| r.node == p.launch.node && r.up && r.current_role >= 3)
+            else {
+                continue;
+            };
+            p.active_unit = Some(body.configuration.unit.clone());
+            p.ready_replica = Some(replica.clone());
             p.endpoint = None;
         }
-        if let Some(repair) = self.repair.take() {
+        if let Some(mut repair) = self.repair.take() {
+            if repair.removal.as_ref().is_some_and(|c| c.reply.is_none()) {
+                repair.superseded_by = Some(body.configuration.unit.current);
+            }
             self.repair_history.push(repair);
         }
         self.candidate_changes.clear();
@@ -743,7 +844,6 @@ impl Ledger {
             started: now,
             last: now,
         });
-        Ok(Some(body))
     }
 
     pub fn change_configuration(
@@ -2137,7 +2237,10 @@ impl Ledger {
             .and_then(|s| {
                 self.placements.iter().position(|p| {
                     s.body.configuration.replicas.0.iter().any(|r| {
-                        r.node == p.launch.node && r.previous_role == 4 && r.current_role == 1
+                        r.node == p.launch.node
+                            && r.previous_role == 4
+                            && matches!(r.current_role, 1 | 3)
+                            && !r.up
                     })
                 })
             })
@@ -2354,6 +2457,7 @@ impl Ledger {
             configuration: None,
             removal,
             host_requested: false,
+            superseded_by: None,
             unknown: false,
         })
     }
@@ -2538,10 +2642,16 @@ impl Ledger {
     }
 
     pub fn repair_status(&self) -> Value {
-        let Some(r) = &self.repair else {
+        let Some(r) = self.repair.as_ref().or_else(|| {
+            self.repair_history
+                .last()
+                .filter(|r| r.superseded_by.is_some())
+        }) else {
             return json!({"state":"absent","ready":false});
         };
-        let state = if r.unknown {
+        let state = if r.superseded_by.is_some() {
+            "superseded"
+        } else if r.unknown {
             "unknown"
         } else if r.configuration.as_ref().is_some_and(|c| c.reply.is_some()) {
             "ready"
@@ -2551,6 +2661,7 @@ impl Ledger {
             "pending"
         };
         json!({"state":state,"ready":state == "ready","predecessor":r.predecessor,
+            "superseded_by":r.superseded_by,
             "kind":if r.removal.is_some() {"secondary"} else {"primary"},
             "removed":r.removal.as_ref().is_some_and(|c| c.reply.is_some()),
             "old_profile":r.old_profile,"profile":r.profile,"request":r.build.body,"build_reply":r.build.reply,

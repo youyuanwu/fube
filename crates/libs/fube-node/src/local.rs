@@ -1635,7 +1635,8 @@ impl Node {
             && self.ra.snapshot(entity).committed.is_some_and(|s| {
                 s.phase == ra::Phase::Ready
                     && s.reconfiguration.as_ref().is_some_and(|c| {
-                        c.stage == ra::ConfigurationStage::Complete
+                        (c.stage == ra::ConfigurationStage::Complete
+                            || ra::secondary_removal_in_progress(&s))
                             && c.request.replicas.0.len() >= 2
                             && ra::valid_stateful_sizes(&c.request.service)
                     })
@@ -2416,10 +2417,10 @@ impl Node {
                         .swap
                         .as_ref()
                         .is_some_and(|s| s.stage != ra::SwapStage::Complete)
-                        || state
-                            .reconfiguration
-                            .as_ref()
-                            .is_some_and(|config| config.stage != ra::ConfigurationStage::Complete)
+                        || state.reconfiguration.as_ref().is_some_and(|config| {
+                            config.request.unit.current == state.body.unit.current
+                                && config.stage != ra::ConfigurationStage::Complete
+                        })
                     {
                         self.enqueue(Work::RetryConfiguration(unit))?;
                     } else if state.service_description_pending {

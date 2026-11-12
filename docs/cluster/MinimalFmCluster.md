@@ -263,8 +263,10 @@ The current repair and retained predecessor histories fence late reports,
 Delete traffic and stale configuration/build replies across repeated cycles.
 
 A new loss during removal or admission makes repair unknown. A late successful
-reply cannot advance it, start an unproved replacement or trigger overlapping
-Primary failover. Known in-flight report epochs remain admitted as terminal loss,
+reply cannot advance it or start an unproved replacement. The bounded
+[Primary-loss supersession](#primary-loss-during-secondary-removal) below can
+replace removal before host replacement; other overlapping recovery stays gated.
+Known in-flight report epochs remain admitted as terminal loss,
 not relabeled as an FM-link failure. Existing data-plane quorum/access checks
 remain independent of this uncertain control-plane result.
 
@@ -289,8 +291,60 @@ No new native schema/action is introduced: the source-stream gate remains
 179 cases/55 native truncation rejections. This is source-derived model/process
 and native-stream/schema-adapter evidence, not full original C++ handler or
 Federation interoperability. Multi-loss repair, spare-node placement, automatic
-restart, interrupted-transition recovery, resize and node/FM restart remain
+restart, broader interrupted-transition recovery, resize and node/FM restart remain
 deferred. The 64 bound is model/resource qualification, not 64-process testing.
+
+## Primary loss during Secondary removal
+
+If the current Primary app host is lost while an explicit Secondary removal
+still awaits its final FM reply, `drive()` can supersede that removal with
+no-data-loss Primary failover. The original Secondary loss/deletion must already
+be processed, no replacement host may have been requested/admitted, and every
+other original Node/RA session and surviving app host must remain live.
+FM-link loss, another Secondary loss, completed removal, and interrupted
+copy/readmission do not authorize this path.
+
+SF distinguishes this from failover out of stable membership. It preserves
+the removal's original PC epoch/roles and CC member set, increments the
+current epoch by `0x1_0000_0001`, and swaps the failed P/P to a down P/S
+while promoting one live S/P. The previously removed S/N stays out of CC;
+the failed Primary is not also removed from CC. Target/minimum, service
+version and data-loss epoch remain unchanged. FM checks separate PC/CC read
+quorums, then RA independently obtains real per-member progress/history and
+uses the existing history-first selection, catch-up, per-survivor
+Deactivate/Activate and final RAP/FM completion before publishing readiness.
+
+Survivors may not yet have received removal, may be deactivated, may have a
+pending RAP activation, or may have completed locally without FM receiving
+the final reply. Each admits only the matching newer failover/query epochs
+and exact retained owners. Secondary-only history is retained until the new
+Primary catch-up establishes its own deactivation boundary. Old peer messages,
+RAP completions, removal replies and retries cannot finish the new transition
+or start the old replacement. `repair.state` becomes `superseded` with
+`superseded_by` naming the failover epoch; `repair.ready` remains false.
+Supersession restores a serving Primary, not target redundancy. Repair of
+the two lost members remains gated.
+
+| Pinned SF source | Supersession responsibility |
+|---|---|
+| `fm/ReconfigurationTask.cpp:40-48,225-259,320-352` | Reconfigure a lost Primary during an existing transition; retain PC and the CC set, independently checking their read quorums. |
+| `ra/FailoverUnit.cpp:624-672,1737-1751` | Accept newer GetLSN epochs, query the replicator's real status and retain the incoming PC when starting failover. |
+| `ra/FailoverUnit.cpp:1929-2202,2878-2926,2968-3055` | Select using retained history/progress and preserve separate PC/CC quorum obligations. |
+
+RA models cover the four survivor states above at 5/3 and 64/32, commit
+holds/veto, stale completions, exact query epochs, and a CC read quorum that
+cannot substitute for the larger PC read quorum. FM models additionally cover
+4/2, absent quorum at 3/2, FM-link loss, another Secondary loss, host-request
+and completed-removal fences. Real-process 5/3 cases lose removal delivery,
+interrupt phase 3 with deactivated survivors, and hold the final FM reply.
+All retain nonempty data, acknowledge a later write, preserve surviving
+app/runtime/Node ownership and single Open, reject stale replies, avoid
+replacement and independently join shutdown cleanup. A 3/2 process case
+cannot promote its lone survivor, even after the late removal reply arrives.
+These are source-derived model/process results, not native handler or
+Federation interoperability evidence. No native schema/action is added;
+general interrupted recovery, multi-loss repair, resize and node/FM restart
+remain deferred.
 
 ## Run
 

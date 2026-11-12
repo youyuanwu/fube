@@ -86,6 +86,10 @@ The [Secondary-loss repair extension](MinimalFmCluster.md#standalone-secondary-a
 also reuses those contracts: same-Primary removal obeys minimum, required live
 phase-3/4 commits precede fresh-owner copy/readmission, and retained deactivation
 history supports later Primary failover without inventing a new wire exchange.
+The [pre-replacement Primary-loss supersession](MinimalFmCluster.md#primary-loss-during-secondary-removal)
+also reuses those exchanges, preserving the interrupted PC and CC member set,
+including the failed P/S, with exact newer-epoch queries and stale-reply fencing.
+It adds no schema/action and does not qualify general interrupted recovery.
 The maintained source-stream oracle now has 179 inputs, 85 types/257 fields,
 183 bundle files and 55 native truncation rejections, retaining the preceding
 173-case failover gate and its 84 types/255 fields, 177 bundle files and
