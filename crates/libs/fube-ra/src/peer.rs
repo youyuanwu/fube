@@ -24,19 +24,42 @@ pub(super) fn lost_replica_replacement(
                     .iter()
                     .any(|r| r.node == old.body.replica.node && r.current_role == 3)
         });
-    (old.fm_primary || secondary)
+    let promoted = reconfiguration::replica_replacement_metadata(old)
+        && old.reconfiguration.as_ref().is_some_and(|c| {
+            c.request
+                .replicas
+                .0
+                .iter()
+                .any(|r| r.node == *source && r.current_role == 3)
+        })
+        && old.body.unit.current.older_than(history.epoch)
+        && old.body.unit.current.data_loss == history.epoch.data_loss
+        && history.epoch.configuration & !0xffff_ffff
+            == body.unit.current.configuration & !0xffff_ffff
+        && !body.unit.current.older_than(history.epoch)
+        && old.body.unit.current.configuration & !0xffff_ffff
+            < history.epoch.configuration & !0xffff_ffff;
+    (old.fm_primary
+        || secondary
+        || (promoted
+            && old.peer_host_loss()
+            && old
+                .peer_creation
+                .as_ref()
+                .is_some_and(|p| p.delete_operation != 0)))
         && old.phase == Phase::Closed
         && old.local_deleted
         && old.cleanup_pending
         && old.fm_stage == FmStage::None
-        && (secondary || old.primary_deactivation == Some((Epoch::default(), -2)))
+        && (secondary
+            || !old.fm_primary
+            || old.primary_deactivation == Some((Epoch::default(), -2)))
         && old.runtime.is_none()
         && old.usage.is_none()
         && old.registration_lookups.is_empty()
+        && reconfiguration::replica_replacement_metadata(old)
         && old.reconfiguration.as_ref().is_some_and(|c| {
-            c.stage == ConfigurationStage::Complete
-                && valid_stateful_sizes(&c.request.service)
-                && c.request.unit.target >= 2
+            c.request.unit.target >= 2
                 && c.request
                     .replicas
                     .0
@@ -59,13 +82,21 @@ pub(super) fn lost_replica_replacement(
             .configuration
             .checked_sub(old.body.unit.current.configuration)
             .is_some_and(|delta| {
-                if secondary {
+                if promoted {
+                    delta > 0
+                } else if secondary {
                     delta == 1
                 } else {
                     delta > 0 && delta % 0x1_0000_0001 == 0
                 }
             })
-        && (if secondary {
+        && (if promoted {
+            !history.epoch.older_than(
+                old.peer_creation
+                    .as_ref()
+                    .map_or(Epoch::default(), |p| p.deactivation.epoch),
+            )
+        } else if secondary {
             history.epoch.data_loss == body.unit.current.data_loss
                 && history.epoch.configuration & !0xffff_ffff
                     == body.unit.current.configuration & !0xffff_ffff
@@ -379,20 +410,26 @@ fn create_remote(
     let repair = (completed_primary_failover(current)
         || reconfiguration::completed_secondary_removal(current))
         && current.body.replica.current_role == 4
-        && (if reconfiguration::completed_secondary_removal(current) {
-            current.reconfiguration.as_ref().map(|c| &c.request)
-        } else {
-            current.swap.as_ref().map(|s| &s.intent)
+        && reconfiguration::completed_configuration(current).is_some_and(|c| {
+            !c.replicas
+                .0
+                .iter()
+                .any(|r| r.node == target.node && r.current_role >= 3)
         })
-        .is_some_and(|body| {
-            body.replicas.0.iter().any(|r| {
-                r.node == target.node
-                    && !r.up
-                    && r.current_role == 1
-                    && target.id > r.id
-                    && target.instance > r.instance
-            })
-        });
+        && current
+            .reconfiguration
+            .iter()
+            .map(|c| &c.request)
+            .chain(current.swap.iter().map(|s| &s.intent))
+            .any(|body| {
+                body.replicas.0.iter().any(|r| {
+                    r.node == target.node
+                        && !r.up
+                        && matches!(r.current_role, 1 | 3)
+                        && target.id > r.id
+                        && target.instance > r.instance
+                })
+            });
     if current.reconfiguration.is_some() && !retired_configuration(current) && !repair {
         return Err(Failure::Unsupported(
             "active-configuration replica changes are gated",

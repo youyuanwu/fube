@@ -322,8 +322,9 @@ Primary catch-up establishes its own deactivation boundary. Old peer messages,
 RAP completions, removal replies and retries cannot finish the new transition
 or start the old replacement. `repair.state` becomes `superseded` with
 `superseded_by` naming the failover epoch; `repair.ready` remains false.
-Supersession restores a serving Primary, not target redundancy. Repair of
-the two lost members remains gated.
+Supersession restores a serving Primary, not target redundancy. The explicit
+[sequential restoration](#sequential-restoration-after-supersession) below can
+then repair the two retained predecessor placements.
 
 | Pinned SF source | Supersession responsibility |
 |---|---|
@@ -343,8 +344,63 @@ replacement and independently join shutdown cleanup. A 3/2 process case
 cannot promote its lone survivor, even after the late removal reply arrives.
 These are source-derived model/process results, not native handler or
 Federation interoperability evidence. No native schema/action is added;
-general interrupted recovery, multi-loss repair, resize and node/FM restart
+general interrupted recovery, general multi-loss repair, resize and node/FM restart
 remain deferred.
+
+## Sequential restoration after supersession
+
+After completed Primary-loss supersession, the two exact processed predecessor
+losses can be repaired explicitly, one at a time, on their original live
+Node/RA sessions. `repair_secondary_replica(node)` first selects the old Primary,
+now a down CC Secondary, then the previously removed Secondary. It rejects the
+opposite order while a down member remains in CC and rejects concurrent repair.
+It is not a general multiple-loss placement/recovery API.
+
+For the qualified 5/3 case, CC starts with four members, three live. Native
+same-Primary removal drops the failed old Primary to reach three; fresh-host
+copy and committed I/S admission restore four live members. Only after that
+cycle completes can the already-removed placement be rebuilt and admitted,
+restoring five live members. Target five, minimum three, service version and
+the new Primary/data-loss epochs never change. Removing a down CC member at
+minimum is still blocked without a Ready spare; in particular this ordered,
+original-placement-only repair does not restore a superseded 4/3 configuration.
+
+Every replacement retains predecessor exit/reaping/group/root cleanup,
+report/lookup/usage drainage, a fresh Hosting gate/runtime and newer replica
+identity. Closed Primary metadata from an interrupted removal is eligible only
+with its exact terminal loss/deletion and a newer Primary's history; an old
+in-flight stage is not converted into successful completion. CreateReplica,
+RAP BuildIdleReplica and real copy remain the sole construction path.
+
+Admission grows actual membership by one, not directly to target. It preserves
+every surviving owner and the completed configuration as PC. Secondary-only
+removal/admission retain the serving Primary's deactivation history.
+`repair.ready` means the selected placement completed its cycle;
+`repair.target_restored` becomes true only at full target, and
+`repair.remaining_lost` lists the remaining one-based placements. Final replies
+cannot relabel an unrepaired placement Running. The serving Primary keeps its
+endpoint/runtime and original survivors are neither reopened nor moved.
+Another loss, including loss of a newly built incarnation, fences restoration
+as unknown; late replies cannot resume it or authorize overlapping failover.
+
+This follows pinned `fm/ReconfigurationTask.cpp:354-412` (minimum/Ready-Idle
+accounting and one-member admission), `fm/Replica.cpp:555-585` (new identities),
+`ra/ReconfigurationAgent.cpp:2244-2324` (newer CreateReplica from closed metadata)
+and `ra/FailoverUnit.cpp:736-810,2596-2646,3091-3248` (same-Primary history and
+per-live-survivor phase obligations). RA models restore partial/full membership
+at 5/3 and 64/32 across all four preceding survivor stages, with commit holds and
+exact-owner/history rejection. FM models additionally cover 4/2, 4/3 minimum
+blocking, unprocessed deletion, wrong order, concurrent calls and another loss
+before/during/after each repair phase.
+
+Real 5/3 processes restore both placements after a held final removal reply and
+after a deterministic phase-3 interruption. They lose/retry removal, build and
+admission replies, copy nonempty data, fence predecessor traffic, retain
+surviving owners and single Open, acknowledge continued writes, then fail over
+to a rebuilt replica and repair that later Primary loss. Shutdown independently
+joins cleanup. Native-stream qualification remains 179 cases; this is not
+native C++ handler/Federation interoperability, generic interrupted-copy recovery,
+automatic restart, resize or durable/node/FM recovery.
 
 ## Run
 

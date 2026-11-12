@@ -55,8 +55,8 @@ pub use peer::{
     RemoteRemoval, RemovalCompletion,
 };
 pub use reconfiguration::{
-    retired_configuration, secondary_removal_in_progress, secondary_service,
-    ConfigurationCompletion, ConfigurationStage, Reconfiguration,
+    replica_replacement_metadata, retired_configuration, secondary_removal_in_progress,
+    secondary_service, ConfigurationCompletion, ConfigurationStage, Reconfiguration,
 };
 pub use swap::{PrimarySwap, ProgressQuery, SwapStage};
 

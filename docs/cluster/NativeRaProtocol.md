@@ -90,6 +90,10 @@ The [pre-replacement Primary-loss supersession](MinimalFmCluster.md#primary-loss
 also reuses those exchanges, preserving the interrupted PC and CC member set,
 including the failed P/S, with exact newer-epoch queries and stale-reply fencing.
 It adds no schema/action and does not qualify general interrupted recovery.
+The [sequential restoration extension](MinimalFmCluster.md#sequential-restoration-after-supersession)
+also reuses normal removal, fresh CreateReplica/copy and one-member admission
+at unchanged target/minimum. Partial membership, closed predecessor history
+and per-cycle completion do not introduce a wire schema or private runtime seam.
 The maintained source-stream oracle now has 179 inputs, 85 types/257 fields,
 183 bundle files and 55 native truncation rejections, retaining the preceding
 173-case failover gate and its 84 types/255 fields, 177 bundle files and

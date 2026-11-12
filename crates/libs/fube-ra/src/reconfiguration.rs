@@ -73,13 +73,56 @@ pub fn secondary_removal_in_progress(state: &EntityState) -> bool {
             )
     })
 }
+pub fn replica_replacement_metadata(state: &EntityState) -> bool {
+    state.reconfiguration.as_ref().is_some_and(|c| {
+        valid_stateful_sizes(&c.request.service)
+            && c.request.unit.target >= 2
+            && (c.stage == ConfigurationStage::Complete
+                || (state.fm_primary
+                    && c.secondary_loss
+                    && secondary_removal(&c.request)
+                    && c.request.replicas.0.iter().any(|r| {
+                        r.node == state.body.replica.node
+                            && r.previous_role == 4
+                            && r.current_role == 4
+                    })))
+    })
+}
+pub(super) fn completed_configuration(state: &EntityState) -> Option<&Configuration> {
+    let configuration = state
+        .reconfiguration
+        .as_ref()
+        .filter(|c| c.stage == ConfigurationStage::Complete);
+    let swap = state
+        .swap
+        .as_ref()
+        .filter(|s| s.stage == SwapStage::Complete);
+    match (configuration, swap) {
+        (Some(c), Some(s)) if c.request.unit.current.older_than(s.body.unit.current) => {
+            Some(&s.body)
+        }
+        (Some(c), _) => Some(&c.request),
+        (None, Some(s)) => Some(&s.body),
+        _ => None,
+    }
+}
 fn secondary_transition(body: &Configuration, old: &EntityState) -> bool {
     secondary_removal(body)
         || completed_secondary_removal(old)
-        || old
-            .reconfiguration
-            .as_ref()
-            .is_some_and(|c| c.secondary_loss && c.request == *body)
+        || old.reconfiguration.as_ref().is_some_and(|c| {
+            c.secondary_loss
+                && (c.request == *body
+                    || (c.stage == ConfigurationStage::Complete
+                        && c.request.unit.current == old.body.unit.current
+                        && body.service == old.body.service
+                        && c.request
+                            .replicas
+                            .0
+                            .iter()
+                            .filter(|r| r.current_role >= 3)
+                            .count()
+                            < body.service.target as usize))
+        })
         || (body.service == old.body.service
             && old.body.replica.current_role == 2
             && old.peer_creation.as_ref().is_some_and(|p| {
@@ -120,15 +163,10 @@ fn initial_configuration(body: &Configuration, old: &EntityState) -> bool {
 fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Result<()> {
     let old_epoch = old.body.unit.current;
     if secondary_removal(body) {
-        let prior = old
-            .reconfiguration
-            .as_ref()
-            .filter(|c| c.stage == ConfigurationStage::Complete)
-            .ok_or(Failure::Unsupported(
-                "Secondary removal requires completed membership",
-            ))?;
+        let prior = completed_configuration(old).ok_or(Failure::Unsupported(
+            "Secondary removal requires completed membership",
+        ))?;
         let members: Vec<_> = prior
-            .request
             .replicas
             .0
             .iter()
@@ -146,9 +184,9 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
             || body.unit.current.configuration & !0xffff_ffff
                 != old_epoch.configuration & !0xffff_ffff
             || body.replicas.0.len() != members.len()
-            || members.len() != body.service.target as usize
+            || members.len() > body.service.target as usize
             || members.len() <= body.service.minimum as usize
-            || local(&prior.request, primary)?.current_role != 4
+            || local(prior, primary)?.current_role != 4
         {
             return Err(Failure::Unsupported(
                 "Secondary removal must preserve sizes, Primary and minimum",
@@ -190,11 +228,15 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
         && valid_stateful_sizes(&body.service)
         && body.unit.target >= 2
         && body.service == old.body.service;
+    let prior = completed_configuration(old);
+    let repair_count = prior.map_or(body.replicas.0.len(), |c| {
+        c.replicas.0.iter().filter(|r| r.current_role >= 3).count() + 1
+    });
     let three = body.unit.target == 3 && old.body.service.target == 1;
     if (!initial
         && body.replicas.0.len()
             != if repair {
-                body.service.target as usize
+                repair_count
             } else if three {
                 3
             } else {
@@ -211,6 +253,9 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                 .ok_or(Failure::Capacity)?
         || body.unit.current.configuration & !0xffff_ffff != old_epoch.configuration & !0xffff_ffff
         || body.unit.target != body.service.target
+        || (repair
+            && (body.replicas.0.len() > body.service.target as usize
+                || body.replicas.0.len() < body.service.minimum as usize))
         || (!initial && !repair && body.unit.minimum != if three { 2 } else { 1 })
         || body.unit.minimum != body.service.minimum
         || (!initial && !repair && !secondary_service(&old.body.service, &body.service))
@@ -265,12 +310,7 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                 "repair must retain P/P and every S/S and admit one I/S",
             ));
         }
-        if completed_secondary_removal(old) {
-            let prior = &old
-                .reconfiguration
-                .as_ref()
-                .expect("completed removal")
-                .request;
+        if let Some(prior) = prior {
             for expected in prior.replicas.0.iter().filter(|r| r.current_role >= 3) {
                 let mut actual = local(body, &expected.node)?.clone();
                 if actual.previous_role != expected.current_role {
@@ -287,45 +327,14 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                     ));
                 }
             }
-            let lost = prior
-                .replicas
-                .0
-                .iter()
-                .find(|r| r.current_role == 1)
-                .expect("removed Secondary");
-            let fresh = local(body, &lost.node)?;
-            if fresh.previous_role != 2 || fresh.id <= lost.id || fresh.instance <= lost.instance {
-                return Err(Failure::Admission(
-                    "Secondary repair requires a fresh incarnation",
-                ));
-            }
-        } else if let Some(swap) = old
-            .swap
-            .as_ref()
-            .filter(|_| completed_primary_failover(old))
-        {
-            if old
-                .reconfiguration
-                .as_ref()
-                .is_some_and(|c| swap.body.unit.current.older_than(c.request.unit.current))
-            {
-                return Err(Failure::Unsupported(
-                    "a second post-failover repair is gated",
-                ));
-            }
-            for expected in &swap.body.replicas.0 {
-                let mut actual = local(body, &expected.node)?.clone();
-                if actual.previous_role != expected.current_role {
+            if let Some(lost) = prior.replicas.0.iter().find(|r| r.current_role == 1) {
+                let fresh = local(body, &lost.node)?;
+                if fresh.previous_role != 2
+                    || fresh.id <= lost.id
+                    || fresh.instance <= lost.instance
+                {
                     return Err(Failure::Admission(
-                        "repair changed the surviving previous configuration",
-                    ));
-                }
-                actual.previous_role = expected.previous_role;
-                actual.first_lsn = expected.first_lsn;
-                actual.last_lsn = expected.last_lsn;
-                if actual != *expected {
-                    return Err(Failure::Admission(
-                        "repair changed a surviving replica owner",
+                        "Secondary repair requires a fresh incarnation",
                     ));
                 }
             }
@@ -523,7 +532,11 @@ pub(super) fn transition(
                     {
                         return Ok(Transition::ignored(Disposition::IgnoredStale));
                     }
-                    if config.stage != ConfigurationStage::Complete
+                    if (config.stage != ConfigurationStage::Complete
+                        && !current.swap.as_ref().is_some_and(|s| {
+                            s.stage == SwapStage::Complete
+                                && config.request.unit.current.older_than(s.body.unit.current)
+                        }))
                         || (!secondary_loss && config.history.len() >= 2)
                         || (body.configuration.unit.target == 1 && !config.history.is_empty())
                     {
@@ -875,9 +888,22 @@ pub(super) fn transition(
                     || (!secondary_loss
                         && body.deactivation.epoch != body.configuration.unit.current)
                     || (secondary_loss
-                        && current.peer_creation.as_ref().is_none_or(|p| {
-                            p.source != *source || p.deactivation != body.deactivation
-                        }))
+                        && (completed_configuration(current).is_none_or(|c| {
+                            !c.replicas
+                                .0
+                                .iter()
+                                .any(|r| r.node == *source && r.current_role == 4)
+                        }) || current.primary_deactivation.map_or_else(
+                            || {
+                                current
+                                    .peer_creation
+                                    .as_ref()
+                                    .is_none_or(|p| p.deactivation != body.deactivation)
+                            },
+                            |(epoch, catchup_lsn)| {
+                                body.deactivation != ReplicaDeactivationInfo { epoch, catchup_lsn }
+                            },
+                        )))
                     || current
                         .peer_creation
                         .as_ref()

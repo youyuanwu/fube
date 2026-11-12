@@ -520,11 +520,7 @@ impl Node {
             || state.runtime.is_some()
             || state.usage.is_some()
             || !state.registration_lookups.is_empty()
-            || !state.reconfiguration.as_ref().is_some_and(|c| {
-                c.stage == ra::ConfigurationStage::Complete
-                    && ra::valid_stateful_sizes(&c.request.service)
-                    && c.request.unit.target >= 2
-            })
+            || !ra::replica_replacement_metadata(&state)
             || self
                 .activation
                 .process_status()
