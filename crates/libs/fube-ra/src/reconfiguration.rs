@@ -18,6 +18,7 @@ pub struct Reconfiguration {
     pub stage: ConfigurationStage,
     pub error: i64,
     pub history: Vec<Configuration>,
+    pub deactivated: Vec<NodeInstance>,
     pub activated: Vec<NodeInstance>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,12 +81,19 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
     let old_epoch = old.body.unit.current;
     let initial = initial_configuration(body, old);
     let repair = !initial
-        && body.unit.target == 3
-        && old.body.service.target == 3
-        && old.body.service.minimum == 2
+        && valid_stateful_sizes(&body.service)
+        && body.unit.target >= 2
         && body.service == old.body.service;
     let three = body.unit.target == 3 && old.body.service.target == 1;
-    if (!initial && body.replicas.0.len() != if three || repair { 3 } else { 2 })
+    if (!initial
+        && body.replicas.0.len()
+            != if repair {
+                body.service.target as usize
+            } else if three {
+                3
+            } else {
+                2
+            })
         || body.unit.id != old.body.unit.id
         || body.unit.consistency != old.body.unit.consistency
         || body.unit.previous != old_epoch
@@ -97,12 +105,12 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                 .ok_or(Failure::Capacity)?
         || body.unit.current.configuration & !0xffff_ffff != old_epoch.configuration & !0xffff_ffff
         || body.unit.target != body.service.target
-        || (!initial && body.unit.minimum != if three || repair { 2 } else { 1 })
+        || (!initial && !repair && body.unit.minimum != if three { 2 } else { 1 })
         || body.unit.minimum != body.service.minimum
         || (!initial && !repair && !secondary_service(&old.body.service, &body.service))
     {
         return Err(Failure::Unsupported(
-            "only initial configured admission or qualified legacy same-Primary configuration is enabled",
+            "only initial configured admission, unchanged-size repair or qualified legacy configuration is enabled",
         ));
     }
     let p = local(body, primary)?;
@@ -145,10 +153,10 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                 .iter()
                 .filter(|r| r.previous_role == 3)
                 .count()
-                != 1
+                != body.replicas.0.len() - 2
         {
             return Err(Failure::Admission(
-                "repair must retain P/P and S/S and admit one I/S",
+                "repair must retain P/P and every S/S and admit one I/S",
             ));
         }
         if let Some(swap) = old
@@ -280,22 +288,22 @@ fn pending_effects(state: &EntityState) -> Vec<Effect> {
         }
         ConfigurationStage::Deactivated => deactivate_reply(state),
         ConfigurationStage::Deactivate => {
-            let target = config
+            let (epoch, catchup_lsn) = state.primary_deactivation.expect("Primary deactivation");
+            return config
                 .request
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.previous_role == 3)
-                .expect("retiring Secondary");
-            let (epoch, catchup_lsn) = state.primary_deactivation.expect("Primary deactivation");
-            Effect::PeerDeactivate {
-                target: target.node.clone(),
-                body: Box::new(Deactivate {
-                    configuration: config.request.clone(),
-                    force: false,
-                    deactivation: ReplicaDeactivationInfo { epoch, catchup_lsn },
-                }),
-            }
+                .filter(|r| r.previous_role == 3 && !config.deactivated.contains(&r.node))
+                .map(|target| Effect::PeerDeactivate {
+                    target: target.node.clone(),
+                    body: Box::new(Deactivate {
+                        configuration: config.request.clone(),
+                        force: false,
+                        deactivation: ReplicaDeactivationInfo { epoch, catchup_lsn },
+                    }),
+                })
+                .collect();
         }
         ConfigurationStage::Activate => {
             let (epoch, catchup_lsn) = state.primary_deactivation.expect("Primary deactivation");
@@ -395,12 +403,21 @@ pub(super) fn transition(
             let initial = initial_configuration(&body.configuration, current);
             let repair = completed_primary_failover(current)
                 && body.configuration.service == current.body.service
-                && body.configuration.unit.target == 3;
+                && valid_stateful_sizes(&body.configuration.service);
+            if repair
+                && (peers.len() + 1 < body.configuration.replicas.0.len()
+                    || current.remote_idles.len() != 1)
+            {
+                return Err(Failure::Unsupported(
+                    "repair requires exactly one freshly built Idle and every surviving peer",
+                ));
+            }
             if !initial
+                && !repair
                 && body.configuration.unit.target == 3
                 && (peers.len() != 2
-                    || (!repair && current.reconfiguration.is_some())
-                    || current.remote_idles.len() != if repair { 1 } else { 2 })
+                    || current.reconfiguration.is_some()
+                    || current.remote_idles.len() != 2)
             {
                 return Err(Failure::Unsupported(
                     "three-member admission requires both original built Idles",
@@ -475,6 +492,7 @@ pub(super) fn transition(
                     history.push(c.request.clone());
                     history
                 }),
+                deactivated: vec![],
                 activated: vec![],
             });
             effects.extend(pending_effects(&state));
@@ -491,11 +509,9 @@ pub(super) fn transition(
             }
             let body: Activate =
                 from_slice(&work.bytes).map_err(|_| Failure::Admission("invalid Activate"))?;
-            let initial = initial_configuration(&body.configuration, current);
-            let repair = !initial
-                && body.configuration.unit.target == 3
+            let repair = body.configuration.unit.target >= 2
+                && valid_stateful_sizes(&body.configuration.service)
                 && body.configuration.service == current.body.service
-                && current.body.service.target == 3
                 && (completed_primary_failover(current) || current.body.replica.current_role == 2)
                 && body.deactivation.epoch == body.configuration.unit.current
                 && body.deactivation.catchup_lsn >= 0;
@@ -594,6 +610,7 @@ pub(super) fn transition(
                 stage: ConfigurationStage::Secondary,
                 error: 0,
                 history: vec![],
+                deactivated: vec![],
                 activated: vec![],
             });
             effects.extend(pending_effects(&state));
@@ -611,7 +628,7 @@ pub(super) fn transition(
             let body: Deactivate =
                 from_slice(&work.bytes).map_err(|_| Failure::Admission("invalid Deactivate"))?;
             if completed_primary_failover(current)
-                && body.configuration.unit.target == 3
+                && valid_stateful_sizes(&body.configuration.service)
                 && body.configuration.service == current.body.service
                 && body.configuration.unit.current.data_loss == current.body.unit.current.data_loss
                 && body.configuration.unit.current.configuration & !0xffff_ffff
@@ -685,6 +702,7 @@ pub(super) fn transition(
                     stage: ConfigurationStage::Deactivated,
                     error: 0,
                     history: vec![],
+                    deactivated: vec![],
                     activated: vec![],
                 });
                 let reply = deactivate_reply(&state);
@@ -771,6 +789,7 @@ pub(super) fn transition(
                 stage: ConfigurationStage::Retiring,
                 error: 0,
                 history: vec![prior.request.clone()],
+                deactivated: vec![],
                 activated: vec![],
             });
             lifecycle::start_close(&mut state, CloseMode::Deactivate, work.id, &mut effects);
@@ -807,19 +826,28 @@ pub(super) fn transition(
                 || body.unit != config.request.unit
                 || body.replica != expected
                 || body.error != 0
+                || target.previous_role != 3
+                || config.deactivated.contains(source)
             {
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             }
             let mut state = current.clone();
-            state
-                .reconfiguration
-                .as_mut()
-                .expect("owned configuration")
-                .stage = if config.request.unit.target == 3 {
-                ConfigurationStage::Activate
-            } else {
-                ConfigurationStage::End
-            };
+            let config = state.reconfiguration.as_mut().expect("owned configuration");
+            config.deactivated.push(source.clone());
+            if config
+                .request
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.previous_role == 3)
+                .all(|r| config.deactivated.contains(&r.node))
+            {
+                config.stage = if config.request.unit.target == 1 {
+                    ConfigurationStage::End
+                } else {
+                    ConfigurationStage::Activate
+                };
+            }
             Ok(lifecycle::changed(
                 state.clone(),
                 pending_effects(&state),
@@ -905,7 +933,8 @@ pub(super) fn transition(
                 return Ok(lifecycle::changed(state, vec![], false));
             }
             if config.stage == ConfigurationStage::Catchup {
-                if completed_primary_failover(current) && config.request.unit.target == 3 {
+                let repair = completed_primary_failover(current);
+                if repair {
                     if body.local.last_lsn < 0 {
                         return Err(Failure::Admission(
                             "repair catch-up requires actual initialized progress",
@@ -918,7 +947,13 @@ pub(super) fn transition(
                     .as_mut()
                     .expect("owned configuration")
                     .stage = if config.request.unit.target == 1
-                    || (completed_primary_failover(current) && config.request.unit.target == 3)
+                    || (repair
+                        && config
+                            .request
+                            .replicas
+                            .0
+                            .iter()
+                            .any(|r| r.previous_role == 3))
                 {
                     ConfigurationStage::Deactivate
                 } else {

@@ -511,7 +511,9 @@ impl Node {
             || state.usage.is_some()
             || !state.registration_lookups.is_empty()
             || !state.reconfiguration.as_ref().is_some_and(|c| {
-                c.stage == ra::ConfigurationStage::Complete && c.request.unit.target == 3
+                c.stage == ra::ConfigurationStage::Complete
+                    && ra::valid_stateful_sizes(&c.request.service)
+                    && c.request.unit.target >= 2
             })
             || self
                 .activation
@@ -1577,7 +1579,7 @@ impl Node {
             .is_some_and(|s| s.swap.is_some());
         if (!swapping
             && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
-            && !self.three_member_configuration(body.unit.id.guid.0))
+            && !self.active_stateful_configuration(body.unit.id.guid.0))
             || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
@@ -1612,15 +1614,6 @@ impl Node {
             return Err(Error::Unsupported);
         }
         Ok(())
-    }
-    fn three_member_configuration(&self, entity: ra::EntityId) -> bool {
-        self.ra.peer_count() == 2
-            && self.ra.snapshot(entity).committed.is_some_and(|s| {
-                s.phase == ra::Phase::Ready
-                    && s.reconfiguration.as_ref().is_some_and(|c| {
-                        c.stage == ra::ConfigurationStage::Complete && c.request.unit.target == 3
-                    })
-            })
     }
     fn active_stateful_configuration(&self, entity: ra::EntityId) -> bool {
         self.ra.peer_count() >= 1
@@ -1700,8 +1693,10 @@ impl Node {
             || (self.host_predecessors.is_empty()
                 && ((stateful && !ra::valid_stateful_sizes(&body.service))
                     || (!stateful && (body.service.target != 1 || body.service.minimum != 1))))
-            || (!self.host_predecessors.is_empty()
-                && (body.service.target != 3 || body.service.minimum != 2))
+            || self
+                .host_predecessors
+                .last()
+                .is_some_and(|old| !stateful || body.service != old.service)
             || body.unit.consistency.kind != 1
             || !body.unit.consistency.name.is_empty()
             || body.unit.consistency.low != 0

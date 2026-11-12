@@ -728,6 +728,7 @@ impl Ledger {
         if let Some(repair) = self.repair.take() {
             self.repair_history.push(repair);
         }
+        self.candidate_changes.clear();
         self.swap_endpoint = None;
         self.swap = Some(ActiveConfiguration {
             body: body.clone(),
@@ -2134,10 +2135,8 @@ impl Ledger {
     }
 
     pub fn begin_primary_repair(&mut self, now: Instant) -> Result<bool> {
-        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulThree {
-            return Err(
-                "Primary repair remains qualified only for the named three-member profile".into(),
-            );
+        if !self.placements[0].launch.profile.mesh_peers() {
+            return Err("Primary repair requires a configured replica-set profile".into());
         }
         if self.repair.is_some() {
             return Ok(false);
@@ -2146,7 +2145,7 @@ impl Ledger {
             .swap
             .as_ref()
             .filter(|s| self.primary_failover() && !s.unknown && s.reply.is_some())
-            .ok_or("repair requires completed three-member Primary failover")?;
+            .ok_or("repair requires completed Primary failover")?;
         let destination = self
             .failed_primary_index()
             .ok_or("missing failed Primary placement")?;
@@ -2168,10 +2167,19 @@ impl Ledger {
             })
         {
             return Err(
-                "repair requires processed old loss/deletion and both live survivors".into(),
+                "repair requires processed old loss/deletion and every live survivor".into(),
             );
         }
         let reply = swap.reply.as_ref().expect("completed failover");
+        if reply.replicas.0.len() + 1 != self.placements.len()
+            || reply
+                .replicas
+                .0
+                .iter()
+                .any(|r| !r.up || r.state != 2 || !matches!(r.current_role, 3 | 4))
+        {
+            return Err("repair requires exactly one missing configured member".into());
+        }
         let next = self
             .placements
             .iter()

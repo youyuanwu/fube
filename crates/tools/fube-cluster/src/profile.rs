@@ -381,7 +381,7 @@ pub struct HostReplacementReceipt {
 impl HostReplacementReceipt {
     pub fn validate(&self, launch: &Launch, old: &ActualProfile, node_pid: u32) -> Result<()> {
         self.profile.validate(launch)?;
-        if launch.profile != ServiceProfile::StatefulThree
+        if !launch.profile.mesh_peers()
             || self.deployment != launch.deployment
             || self.session != launch.session
             || self.node_pid != node_pid

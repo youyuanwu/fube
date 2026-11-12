@@ -75,7 +75,7 @@ path could accept is rejected by the immutable profile's actual ingress.
 This initial slice deliberately waits for all original build destinations and
 admits them together. The failover extension below adds loss-driven promotion.
 Incremental/partial admission, resize, generic planned transfer,
-replacement/repair, whole-node/FM restart and persisted recovery remain
+standalone Secondary replacement, whole-node/FM restart and persisted recovery remain
 unsupported for this new profile. The older named profiles remain separate
 qualification fixtures with their existing behavior; their bounded lifecycle
 support is not implicitly enabled for arbitrary configured sizes.
@@ -83,7 +83,7 @@ support is not implicitly enabled for arbitrary configured sizes.
 ## Immutable configured Primary failover
 
 After completed initial admission, a matched native terminal report for the
-Primary's app-host can start one no-data-loss failover for the configured
+Primary's app-host can start no-data-loss failover for the configured
 profile. The original FM, Nodes/RAs, stores and peer Channels remain owned.
 FM-link disappearance is not proof of Primary failure. No new service Open,
 host adoption, private data-engine access or size update is substituted for
@@ -152,10 +152,72 @@ selection. RA models cover unequal/older-history progress, catch-up capability,
 redirection/rejoining, read-quorum blocking, expiry and every survivor commit,
 including 64/32. The 64 bound is not 64-process qualification.
 
-This adds no resize, automatic placement/restart, generic repair, whole-node/FM
-recovery, data-loss exchange or persisted recovery. Repeated configured-profile
-failover and losses/supersession during a transition remain gated; repeated
-failover after explicit repair remains qualified on the named 3/2 profile.
+This adds no resize, automatic placement/restart, whole-node/FM recovery,
+data-loss exchange or persisted recovery. Another configured-profile failover
+requires the explicit repair below; losses/supersession during a transition
+remain gated.
+
+## Immutable configured Primary repair
+
+`Cluster::repair_primary_replica()` now extends the existing named-profile
+repair path to immutable configured sizes. After completed no-data-loss failover,
+the failed Primary's native loss/deletion must be processed, all original Node/RA
+sessions must remain connected and every other member must still be running.
+Only one missing member is admitted; failover with additional unavailable
+Secondaries does not authorize partial or multi-loss repair.
+
+The same physical predecessor boundary described in
+[third-replica repair](#post-failover-third-replica-repair) is retained: exact
+Closed/deleted RA ownership, original process exit/reaping/group drainage,
+report/command/lookup/acquisition drainage and old Hosting-root removal precede
+a new host gate, app process and runtime registration. FM validates the original
+Node's exact replacement receipt and independently observes old PID/root
+absence. The successor receives a replica ID/incarnation above every retained
+identity. A redirected Primary epoch is accepted without weakening partition,
+source, service, data-loss epoch or newer-incarnation fences.
+
+The current Primary owns native AddReplica/CreateReplica and real RAP
+Open/BuildIdleReplica, copying nonempty state into the fresh volatile Idle.
+Target/minimum and service update version remain unchanged. After semantic
+Ready/Idle completion, same-Primary DoReconfiguration retains every survivor
+in PC and admits exactly one fresh I/S to CC. Each required S/S Deactivate
+reply commits independently before activation; retries address only outstanding
+members. A 2/1 repair has no remote PC Secondary to deactivate. Every CC
+Secondary's Activate reply and final RAP EndReconfiguration/RA commit precede
+FM repair completion. Poll `repair.ready`, not `host_ready` or `built`.
+
+Completed repair authorizes another matched current-Primary failover using the
+latest membership/history. Candidate-redirection retention is scoped to the
+current failover round, so stale reports cannot consume a later round's budget
+or replay its legacy reply. Existing predecessor reports, Delete requests/replies,
+configuration requests and replacement controls remain fenced across cycles.
+Resize and automatic placement/restart remain deferred.
+
+| Pinned SF source | Configured repair responsibility |
+|---|---|
+| `fm/FailoverUnit.cpp:718-739`; `fm/Replica.cpp:555-585` | Reuse a dropped placement with a fresh identity and reset build metadata, independently of target/minimum. |
+| `ra/ReconfigurationAgent.cpp:2244-2324` | A closed local lifetime creates a fresh Idle only for a newer incarnation; it does not recover the lost volatile runtime. |
+| `ra/FailoverUnit.cpp:3091-3248` | Distinct PC/CC obligations and per-member phase-3/4 completion; skip no required survivor or commit. |
+| `ra/ReconfigurationAgent.cpp:2626-2644,2766-2775` | Refresh committed deactivation history for subsequent failover rounds. |
+
+RA and FM models cover configured repair through 64/32, preserving sizes and
+rejecting changed owners, resize, stale/partial replies and survivor loss.
+RA holds each admission, Deactivate, Activate and final completion commit.
+Real-process acceptance runs three failover/repair cycles at 2/1, 4/2, 4/4 and
+5/3, promoting a rebuilt replica and replacing one placement twice. It covers
+nonempty recopy/continuing writes, lost build/final replies, old traffic,
+unchanged original Node/survivor owners and quorum blocking after repair.
+A 4/3 interrupted-second-repair case independently joins cleanup before FM
+admits the new host. The native-input-injected candidate-routing test also
+repairs after redirection and fails over to the rebuilt replica; it remains
+routing/repair evidence, not live differing-history selection qualification.
+
+This reuses existing wire contracts and adds no schema/action. The maintained
+native-stream gate remains 179 cases/55 native truncation rejections, not full
+native C++ handler/Federation interoperability. Sixty-four is a model/resource
+bound, not 64-process qualification. Multi-loss or interrupted transition recovery,
+standalone Secondary repair, node/FM restart, data-loss exchange and persisted
+recovery remain unsupported.
 
 ## Run
 

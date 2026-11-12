@@ -17,7 +17,8 @@ pub(super) fn lost_primary_replacement(
         && old.registration_lookups.is_empty()
         && old.reconfiguration.as_ref().is_some_and(|c| {
             c.stage == ConfigurationStage::Complete
-                && c.request.unit.target == 3
+                && valid_stateful_sizes(&c.request.service)
+                && c.request.unit.target >= 2
                 && c.request
                     .replicas
                     .0
@@ -30,17 +31,16 @@ pub(super) fn lost_primary_replacement(
         && body.replica.instance > old.body.replica.instance
         && body.unit.id == old.body.unit.id
         && body.unit.consistency == old.body.unit.consistency
-        && body.unit.target == 3
-        && body.unit.minimum == 2
+        && body.unit.target == old.body.unit.target
+        && body.unit.minimum == old.body.unit.minimum
         && body.unit.previous == Epoch::default()
         && body.unit.current.data_loss == old.body.unit.current.data_loss
-        && Some(body.unit.current.configuration)
-            == old
-                .body
-                .unit
-                .current
-                .configuration
-                .checked_add(0x1_0000_0001)
+        && body
+            .unit
+            .current
+            .configuration
+            .checked_sub(old.body.unit.current.configuration)
+            .is_some_and(|delta| delta > 0 && delta % 0x1_0000_0001 == 0)
         && history.epoch == body.unit.current
         && history.catchup_lsn >= 0
 }

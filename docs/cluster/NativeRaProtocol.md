@@ -78,6 +78,10 @@ The [configured failover extension](MinimalFmCluster.md#immutable-configured-pri
 adds ChangeConfiguration candidate reporting and explicit rejection of its
 deprecated legacy reply, never a reply-driven RA progress gate. Per-member
 GetLSN/history and Deactivate/Activate accounting now cover immutable sizes.
+The [configured repair extension](MinimalFmCluster.md#immutable-configured-primary-repair)
+reuses existing fresh-incarnation creation/copy and same-Primary configuration
+contracts, with per-survivor Deactivate/Activate commits and repeated-cycle
+epoch/identity fencing. It introduces no native schema or action.
 The maintained source-stream oracle now has 179 inputs, 85 types/257 fields,
 183 bundle files and 55 native truncation rejections, retaining the preceding
 173-case failover gate and its 84 types/255 fields, 177 bundle files and

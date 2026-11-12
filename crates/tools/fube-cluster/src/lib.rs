@@ -743,8 +743,11 @@ impl Cluster {
     }
     /// Restore one lost volatile Primary as a fresh Secondary on its original live Node.
     pub async fn repair_primary_replica(&mut self) -> Result<Value> {
-        if self.finished.is_some() || self.children.len() != 3 {
-            return Err("Primary repair requires the original running three-node cluster".into());
+        if self.finished.is_some()
+            || !self.config.profile.mesh_peers()
+            || self.children.len() != self.config.profile.node_count()
+        {
+            return Err("Primary repair requires the original running configured cluster".into());
         }
         if self.ledger.begin_primary_repair(Instant::now())? {
             let destination = self

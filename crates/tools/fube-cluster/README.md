@@ -34,8 +34,8 @@ or the retained create result, not registration or transport completion.
 Status exposes `replica_set: { target, minimum, immutable: true }`.
 For N = 1 the normal AddPrimary completion settles creation.
 
-After completed initial membership, a matched Primary app-host loss can start
-one no-data-loss failover on the original live Node/RA sessions. Available
+After completed initial membership or explicit repair, a matched Primary app-host
+loss can start no-data-loss failover on the original live Node/RA sessions. Available
 Secondaries need not all have identical progress. RA collects per-member
 GetLSN/history, checks separate PC/CC read quorums, selects using deactivation
 history before LSN and can redirect the FM candidate with ChangeConfiguration.
@@ -44,16 +44,27 @@ precede endpoint publication. FM-link loss alone cannot authorize promotion.
 Configured sizes and service version remain unchanged; current membership may
 shrink, respecting minimum when removing additional down Secondaries.
 
-The configured profile still rejects resize, planned transfer, Secondary
-retirement/replacement and Primary repair. It does not restart applications.
+After completed failover and processed predecessor deletion,
+`Cluster::repair_primary_replica().await` explicitly restores one missing member
+at the unchanged target/minimum. All other members must remain live. Continue
+`drive()` and poll `repair.ready`: fresh host ownership and Ready/Idle copy
+completion alone are not active membership. Physical predecessor cleanup gates
+a fresh host/incarnation; native creation, copy, every surviving S/S Deactivate
+and Secondary Activate commit precede final RAP/FM completion. The same live
+Node/RA/store/peer Channels support repeated failover/repair cycles.
+
+The configured profile still rejects resize, planned transfer and standalone
+Secondary retirement/replacement. Host replacement is explicit, never automatic.
 Insufficient read quorum blocks failover without declaring data loss. Additional
 loss during an in-flight transition makes its ownership unknown, not successful.
-Repeated configured-profile failover, interrupted/superseding reconfiguration
-and whole-node/FM restart remain unsupported. The named profiles below remain
+Another configured failover requires completed repair; multi-loss repair,
+interrupted/superseding recovery and whole-node/FM restart remain unsupported.
+The named profiles below remain
 separate qualification paths, including their historical size transitions and
 repeated failover/repair.
 See [native mapping and acceptance](../../../docs/cluster/MinimalFmCluster.md#immutable-configured-initial-membership).
 See [configured failover evidence and limits](../../../docs/cluster/MinimalFmCluster.md#immutable-configured-primary-failover).
+See [configured repair evidence and limits](../../../docs/cluster/MinimalFmCluster.md#immutable-configured-primary-repair).
 
 `--stateful-three` / `ServiceProfile::StatefulThree` is a separate, fixed
 three-node volatile profile. Create only the original node1 Primary. Then call

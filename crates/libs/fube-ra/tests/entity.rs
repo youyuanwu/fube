@@ -6651,8 +6651,8 @@ fn failover_progress(
 }
 
 #[tokio::test]
-async fn configured_failover_tracks_every_survivor_and_commit_with_unequal_progress() {
-    for (target, minimum) in [(2, 1), (4, 2), (4, 3), (5, 3), (64, 32)] {
+async fn configured_failover_and_repair_track_every_survivor_and_commit_with_unequal_progress() {
+    for (target, minimum) in [(2, 1), (4, 2), (4, 3), (4, 4), (5, 3), (64, 32)] {
         let (store, executor, hooks) = setup(WAIT).await;
         active_configured_survivor(&executor, target, minimum).await;
         let original = state(&executor);
@@ -6765,6 +6765,221 @@ async fn configured_failover_tracks_every_survivor_and_commit_with_unequal_progr
         );
         assert_eq!(state(&executor).body.service, original.body.service);
         assert_eq!(state(&executor).runtime, original.runtime);
+        let promoted = state(&executor);
+        let mut fresh = intent
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.current_role == 1)
+            .unwrap()
+            .clone();
+        fresh.id += 1000;
+        fresh.instance += 1000;
+        fresh.previous_role = 1;
+        fresh.current_role = 2;
+        fresh.state = 1;
+        fresh.up = true;
+        fresh.service_endpoint.clear();
+        fresh.replication_endpoint.clear();
+        let build = AddReplica {
+            unit: promoted.body.unit.clone(),
+            service: promoted.body.service.clone(),
+            replica: fresh.clone(),
+        };
+        run(&executor, fm_add_idle(build.clone())).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::PeerCreateReplica { .. }]
+        ));
+        fresh.replication_endpoint = "127.0.0.1:12350".into();
+        run(
+            &executor,
+            Command::CreateReplicaReply {
+                source: fresh.node.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(CreateReplicaReply {
+                    unit: build.unit.clone(),
+                    replica: fresh.clone(),
+                    error: 0,
+                }),
+            },
+        )
+        .await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::BuildIdle { .. }]
+        ));
+        run(
+            &executor,
+            Command::CompleteBuild(Box::new(BuildCompletion {
+                unit: build.unit,
+                local: promoted.body.replica.clone(),
+                remote: fresh.clone(),
+                error: 0,
+                detail: ProxyErrorDetail::default(),
+            })),
+        )
+        .await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::AddReplicaReply(_)]
+        ));
+        let mut repair = promoted.swap.as_ref().unwrap().body.clone();
+        repair.unit.previous = repair.unit.current;
+        repair.unit.current.configuration += 1;
+        for r in &mut repair.replicas.0 {
+            r.previous_role = r.current_role;
+        }
+        fresh.previous_role = 2;
+        fresh.current_role = 3;
+        fresh.state = 2;
+        repair.replicas.0.push(fresh.clone());
+        for kind in 0..3 {
+            let mut bad = repair.clone();
+            match kind {
+                0 => bad.replicas.0[0].instance += 1,
+                1 => bad.service.minimum = if minimum == 1 { 2 } else { 1 },
+                _ => bad.replicas.0.truncate(target as usize - 1),
+            }
+            assert!(executor
+                .submit(reconfigure(bad))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+            assert!(effects(&executor).is_empty());
+        }
+        let (entered, release) = hooks.pause(false);
+        let ticket = executor.submit(reconfigure(repair.clone())).unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        release.send(()).unwrap();
+        ticket.wait(WAIT).await.unwrap();
+        let catchup = configured(&effects(&executor));
+        assert_eq!(catchup.flags, 2);
+        assert_eq!(
+            catchup
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.previous_role >= 3)
+                .count(),
+            target as usize - 1
+        );
+        run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+        let mut actions = effects(&executor);
+        for remote in repair.replicas.0.iter().filter(|r| r.previous_role == 3) {
+            assert!(!actions
+                .iter()
+                .any(|e| matches!(e, Effect::PeerActivate { .. })));
+            let ack = || Command::DeactivateReply {
+                source: remote.node.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(DeactivateReply {
+                    unit: repair.unit.clone(),
+                    replica: Replica {
+                        node: remote.node.clone(),
+                        id: remote.id,
+                        instance: remote.instance,
+                        up: false,
+                        state: 3,
+                        ..Replica::default()
+                    },
+                    error: 0,
+                }),
+            };
+            let before = state(&executor)
+                .reconfiguration
+                .as_ref()
+                .unwrap()
+                .deactivated
+                .len();
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor.submit(ack()).unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            assert_eq!(
+                state(&executor)
+                    .reconfiguration
+                    .as_ref()
+                    .unwrap()
+                    .deactivated
+                    .len(),
+                before
+            );
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            actions = effects(&executor);
+            assert!(!actions.iter().any(
+                |e| matches!(e, Effect::PeerDeactivate { target, .. } if *target == remote.node)
+            ));
+            assert_eq!(run(&executor, ack()).await, Disposition::IgnoredStale);
+            assert!(effects(&executor).is_empty());
+        }
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|e| matches!(e, Effect::PeerActivate { .. }))
+                .count(),
+            target as usize - 1
+        );
+        for remote in repair.replicas.0.iter().filter(|r| r.current_role == 3) {
+            let mut unit = repair.unit.clone();
+            unit.previous = Epoch::default();
+            let mut replica = remote.clone();
+            replica.previous_role = 1;
+            let before = state(&executor)
+                .reconfiguration
+                .as_ref()
+                .unwrap()
+                .activated
+                .len();
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor
+                .submit(Command::ActivateReply {
+                    source: remote.node.clone(),
+                    generation: generation_header(admission().generation.generation),
+                    body: Box::new(ActivateReply {
+                        unit,
+                        replica,
+                        error: 0,
+                    }),
+                })
+                .unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            assert_eq!(
+                state(&executor)
+                    .reconfiguration
+                    .as_ref()
+                    .unwrap()
+                    .activated
+                    .len(),
+                before
+            );
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            actions = effects(&executor);
+        }
+        let end = configured(&actions);
+        assert_eq!(end.flags, 1);
+        let (entered, release) = hooks.pause(false);
+        let ticket = executor
+            .submit(Command::CompleteConfiguration(Box::new(end)))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        release.send(()).unwrap();
+        ticket.wait(WAIT).await.unwrap();
+        let completed = effects(&executor);
+        assert!(
+            matches!(completed.as_slice(), [Effect::DoReconfigurationReply(r)]
+            if r.replicas.0.len() == target as usize)
+        );
+        assert_eq!(state(&executor).body.service, original.body.service);
+        assert_eq!(state(&executor).runtime, original.runtime);
+        run(&executor, reconfigure(repair)).await;
+        assert_eq!(effects(&executor), completed);
         finish(&store, &executor).await;
     }
 }

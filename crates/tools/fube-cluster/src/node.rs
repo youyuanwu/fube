@@ -1081,7 +1081,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             match command {
                                 Ok(parts) if parts.len() == 5 && parts[0] == "replace-host"
                                     && parts[1] == launch.session && parts[2] == launch.capability
-                                    && launch.profile == ServiceProfile::StatefulThree => {
+                                    && launch.profile.mesh_peers() => {
                                     let identity = parts[3].parse::<i64>().and_then(|id| {
                                         parts[4].parse::<i64>().map(|instance| (id, instance))
                                     });
@@ -1692,9 +1692,7 @@ fn receive_peer_from(
             )?;
             node.activate_reply_from_peer(body, &peer.node, &generation)
         }
-        "CreateReplica"
-            if launch.placement != 1 || launch.profile == ServiceProfile::StatefulThree =>
-        {
+        "CreateReplica" if launch.placement != 1 || launch.profile.mesh_peers() => {
             let (body, generation) = decode_create_replica(message).map_err(err)?;
             launch.check_service_sizes(&body.replica.0.unit, &body.replica.0.service)?;
             fixed_idle_target(
@@ -1707,9 +1705,7 @@ fn receive_peer_from(
             )?;
             node.create_replica_from_peer(body, &peer.node, &generation)
         }
-        "CreateReplicaReply"
-            if launch.placement == 1 || launch.profile == ServiceProfile::StatefulThree =>
-        {
+        "CreateReplicaReply" if launch.placement == 1 || launch.profile.mesh_peers() => {
             let (body, generation) = decode_create_replica_reply(message).map_err(err)?;
             fixed_idle_target(
                 launch,
@@ -1761,10 +1757,7 @@ fn fixed_idle_target(
 ) -> Result<()> {
     let expected = if (replica.id, replica.instance) == (id, instance) {
         (id, instance)
-    } else if launch.profile == ServiceProfile::StatefulThree
-        && replica.id > id
-        && replica.instance > instance
-    {
+    } else if launch.profile.mesh_peers() && replica.id > id && replica.instance > instance {
         // The live RA validates the exact current or freshly admitted incarnation.
         (replica.id, replica.instance)
     } else {
@@ -2100,9 +2093,7 @@ fn receive_command(
                 .peers
                 .iter()
                 .find(|peer| peer.node == body.replica.node)
-                .filter(|_| {
-                    launch.placement == 1 || launch.profile == ServiceProfile::StatefulThree
-                })
+                .filter(|_| launch.placement == 1 || launch.profile.mesh_peers())
                 .ok_or("replica control requires the original coordinating Primary")?;
             fixed_idle_target(
                 launch,
