@@ -1982,7 +1982,11 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
             assert_eq!(provider.snapshot().values, providers[0].snapshot().values);
         }
         let target = (new_primary + 1) % 3;
-        let expected = engines[target].snapshot().observed_primary;
+        let mut primary = engines[new_primary].endpoint();
+        primary.transport_id = None;
+        let expected = Some(primary.to_string());
+        // Catch-up ACKs can precede the secondary's native-view snapshot publication.
+        until(|| engines[target].snapshot().observed_primary == expected).await;
         // Epoch-less RequestAck from the old primary is never a rebind.
         engines[old_primary]
             .transport

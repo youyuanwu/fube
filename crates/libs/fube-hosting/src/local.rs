@@ -447,6 +447,14 @@ impl Activation {
     pub fn process_status(&self) -> Option<ProcessStatus> {
         self.process.as_ref().map(OwnedApp::status)
     }
+    /// Observe the original owned child even after registration/session failure.
+    pub fn observe_process_exit(&mut self) -> LocalResult<Option<std::process::ExitStatus>> {
+        self.process
+            .as_mut()
+            .ok_or(LocalError::NotStarted)?
+            .observed_exit()
+            .map_err(|error| LocalError::Mechanics(error.to_string()))
+    }
     pub fn cleanup_status(&self) -> CleanupStatus {
         self.cleanup
     }

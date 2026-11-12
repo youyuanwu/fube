@@ -521,14 +521,13 @@ impl Node {
             || state.usage.is_some()
             || !state.registration_lookups.is_empty()
             || !ra::replica_replacement_metadata(&state)
-            || self
-                .activation
-                .process_status()
-                .is_none_or(|p| !p.exit_observed)
             || self.last_error.is_some()
             || self.rejected_reply.is_some()
         {
             return Err(Error::Unsupported);
+        }
+        if self.activation.observe_process_exit()?.is_none() {
+            return Ok(false);
         }
         self.stop_admission();
         let cleaned = match self.activation.terminate() {
