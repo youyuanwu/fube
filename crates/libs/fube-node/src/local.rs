@@ -406,6 +406,7 @@ pub struct Node {
     failed_registration: Option<FailedRegistrationDeletion>,
     open_failure: Option<OpenFailureWitness>,
     failed_open: Option<FailedOpenDeletion>,
+    host_predecessor: Option<Arc<AddInstance>>,
     #[cfg(feature = "qualification")]
     hold_replies: bool,
 }
@@ -470,6 +471,7 @@ impl Node {
             failed_registration: None,
             open_failure: None,
             failed_open: None,
+            host_predecessor: None,
             #[cfg(feature = "qualification")]
             hold_replies: false,
         })
@@ -488,6 +490,89 @@ impl Node {
     }
     pub fn activation(&self) -> &Activation {
         &self.activation
+    }
+    /// Retire the physically lost volatile Primary owner without replacing RA.
+    pub fn retire_lost_primary_host(&mut self) -> Result<bool> {
+        let selected = self.selected.as_ref().ok_or(Error::Unsupported)?;
+        let snapshot = self.ra.snapshot(selected.unit.id.guid.0);
+        let state = snapshot.committed.ok_or(Error::Busy)?;
+        if self.host_predecessor.is_some()
+            || self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            || snapshot.fenced
+            || !state.fm_primary
+            || state.phase != ra::Phase::Closed
+            || !state.local_deleted
+            || !state.cleanup_pending
+            || state.fm_stage != ra::FmStage::None
+            || state.primary_deactivation != Some((Epoch::default(), -2))
+            || state.runtime.is_some()
+            || state.usage.is_some()
+            || !state.registration_lookups.is_empty()
+            || !state.reconfiguration.as_ref().is_some_and(|c| {
+                c.stage == ra::ConfigurationStage::Complete && c.request.unit.target == 3
+            })
+            || self
+                .activation
+                .process_status()
+                .is_none_or(|p| !p.exit_observed)
+            || self.last_error.is_some()
+            || self.rejected_reply.is_some()
+        {
+            return Err(Error::Unsupported);
+        }
+        self.stop_admission();
+        let cleaned = match self.activation.terminate() {
+            Ok(cleaned) => cleaned,
+            Err(h::local::LocalError::Busy) => false,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(cleaned && self.quiescent() && self.commands.is_empty() && self.receipts.is_empty())
+    }
+
+    /// Install a new, unstarted host only after exact old-owner physical cleanup.
+    pub fn replace_lost_primary_host(&mut self, mut activation: Activation) -> Result<()> {
+        if !self.retire_lost_primary_host()?
+            || !self.activation.producers_stopped()
+            || !self.activation.deliveries_drained()
+            || !self.activation.cleanup_status().directory_released
+            || self
+                .activation
+                .process_status()
+                .is_none_or(|p| !p.reaped || !p.group_drained)
+            || activation.identity().is_some()
+            || activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+        {
+            return Err(Error::Busy);
+        }
+        // Never revive the gate retained by the old IPC session.
+        let live = Arc::new(AtomicBool::new(true));
+        activation.bind_consumer(Arc::new(Gate {
+            live: live.clone(),
+            ra: self.ra.consumer_lifetime(),
+        }))?;
+        let entity = self
+            .selected
+            .as_ref()
+            .ok_or(Error::Unsupported)?
+            .unit
+            .id
+            .guid
+            .0;
+        self.host_predecessor = Some(
+            self.ra
+                .snapshot(entity)
+                .committed
+                .ok_or(Error::Busy)?
+                .body
+                .clone(),
+        );
+        self.activation = activation;
+        self.live = live;
+        self.route = None;
+        self.held_reply = None;
+        self.selected = None;
+        self.package_registration.registered = false;
+        Ok(())
     }
     pub fn snapshot(&self, unit: ra::EntityId) -> ra::Snapshot {
         self.ra.snapshot(unit)
@@ -624,7 +709,19 @@ impl Node {
                 let closed = current
                     .as_ref()
                     .is_some_and(|state| state.phase == ra::Phase::Closed);
-                if peer_work {
+                let stale_host = self.host_predecessor.as_ref().is_some_and(|old| {
+                    incoming.unit == old.unit
+                        && incoming.service == old.service
+                        && incoming.replica.node == old.replica.node
+                        && incoming.replica.id == old.replica.id
+                        && incoming.replica.instance == old.replica.instance
+                        && current.as_ref().is_some_and(|s| {
+                            incoming.replica.id < s.body.replica.id
+                                && incoming.replica.instance < s.body.replica.instance
+                                && incoming.unit.current.older_than(s.body.unit.current)
+                        })
+                });
+                if peer_work && !stale_host {
                     let eligible = match &current {
                         None => self.selected.is_none() || self.pending.iter().any(|pending| {
                             matches!(&pending.work, Work::Fm(FmWork::DeleteReplica(original, ..))
@@ -860,7 +957,7 @@ impl Node {
                     .process_status()
                     .is_none_or(|process| process.exit_observed)
                 || (!admitted_retry
-                    && (self.instance_disposal().is_none()
+                    && ((self.host_predecessor.is_none() && self.instance_disposal().is_none())
                         || !self.quiescent()
                         || !self.commands.is_empty()
                         || self
@@ -904,7 +1001,16 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+        if (self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            && !self
+                .ra
+                .snapshot(body.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| {
+                    s.fm_primary
+                        && s.body.replica.current_role == 4
+                        && ra::completed_primary_failover(&s)
+                }))
             || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
@@ -1432,7 +1538,16 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         if (self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
-            && !self.three_member_configuration(body.unit.id.guid.0))
+            && !self.three_member_configuration(body.unit.id.guid.0)
+            && !self
+                .ra
+                .snapshot(body.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| {
+                    s.fm_primary
+                        && s.body.replica.current_role == 4
+                        && ra::completed_primary_failover(&s)
+                }))
             || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
@@ -1520,7 +1635,16 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<()> {
         self.admit_fm(source, generation)?;
-        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+        if (self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            && !self
+                .ra
+                .snapshot(body.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| {
+                    s.fm_primary
+                        && s.body.replica.current_role == 4
+                        && ra::completed_primary_failover(&s)
+                }))
             || !self.live.load(Ordering::SeqCst)
             || self.ra.generation_state().upload_pending
             || !self.ra.is_peer(&body.replica.node)
@@ -1555,8 +1679,10 @@ impl Node {
             || body.service.activation_mode != 0
             || !body.service.scaling.0.is_empty()
             || body.service.partitions != 1
-            || body.service.target != 1
-            || body.service.minimum != 1
+            || (self.host_predecessor.is_none()
+                && (body.service.target != 1 || body.service.minimum != 1))
+            || (self.host_predecessor.is_some()
+                && (body.service.target != 3 || body.service.minimum != 2))
             || body.unit.consistency.kind != 1
             || !body.unit.consistency.name.is_empty()
             || body.unit.consistency.low != 0

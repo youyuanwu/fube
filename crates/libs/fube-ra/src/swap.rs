@@ -310,6 +310,47 @@ fn elapsed(swap: &PrimarySwap) -> i64 {
 }
 
 pub(super) fn handles(work: &Submission, state: Option<&EntityState>) -> Result<bool> {
+    if state.is_some_and(completed_primary_failover) {
+        let s = state.expect("completed failover");
+        let epoch = s.swap.as_ref().expect("swap").body.unit.current;
+        let newer = match work.kind {
+            Kind::DoReconfiguration { .. } => {
+                from_slice::<DoReconfiguration>(&work.bytes)
+                    .map_err(|_| Failure::Admission("invalid repair configuration"))?
+                    .configuration
+                    .unit
+                    .current
+            }
+            Kind::Activate { .. } => {
+                from_slice::<Activate>(&work.bytes)
+                    .map_err(|_| Failure::Admission("invalid repair activation"))?
+                    .configuration
+                    .unit
+                    .current
+            }
+            Kind::Deactivate { .. } => {
+                from_slice::<Deactivate>(&work.bytes)
+                    .map_err(|_| Failure::Admission("invalid repair deactivation"))?
+                    .configuration
+                    .unit
+                    .current
+            }
+            Kind::ActivateReply { .. }
+            | Kind::DeactivateReply { .. }
+            | Kind::CompleteConfiguration
+            | Kind::RetryConfiguration => s
+                .reconfiguration
+                .as_ref()
+                .map_or(epoch, |c| c.request.unit.current),
+            _ => epoch,
+        };
+        if epoch.older_than(newer)
+            && epoch.data_loss == newer.data_loss
+            && epoch.configuration & !0xffff_ffff == newer.configuration & !0xffff_ffff
+        {
+            return Ok(false);
+        }
+    }
     Ok(match &work.kind {
         Kind::GetLsn { .. }
         | Kind::GetLsnReply { .. }
@@ -987,6 +1028,14 @@ pub(super) fn transition(
                 }
             }
             apply(&mut state, &admission.local_node)?;
+            if state
+                .swap
+                .as_ref()
+                .is_some_and(|s| s.failover && s.stage == SwapStage::Complete)
+                && state.body.replica.current_role == 4
+            {
+                state.fm_primary = true;
+            }
         }
         Kind::Activate {
             source,

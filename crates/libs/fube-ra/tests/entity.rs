@@ -6394,11 +6394,162 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
     );
     assert_eq!(state(&executor).runtime, original.runtime);
     assert_eq!(state(&executor).usage, original.usage);
-    run(&executor, reconfigure(intent)).await;
+    run(&executor, reconfigure(intent.clone())).await;
     assert!(matches!(
         effects(&executor).as_slice(),
         [Effect::DoReconfigurationReply(_)]
     ));
+    let promoted = state(&executor);
+    let mut target = intent.replicas.0[0].clone();
+    target.id += 100;
+    target.instance += 100;
+    target.previous_role = 1;
+    target.current_role = 2;
+    target.state = 1;
+    target.up = true;
+    target.service_endpoint.clear();
+    target.replication_endpoint.clear();
+    let build = AddReplica {
+        unit: promoted.body.unit.clone(),
+        service: promoted.body.service.clone(),
+        replica: target.clone(),
+    };
+    run(&executor, fm_add_idle(build.clone())).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerCreateReplica { body, .. }]
+        if body.deactivation.epoch == promoted.body.unit.current && body.deactivation.catchup_lsn == 8)
+    );
+    target.replication_endpoint = "127.0.0.1:12350".into();
+    run(
+        &executor,
+        Command::CreateReplicaReply {
+            body: Box::new(CreateReplicaReply {
+                unit: build.unit.clone(),
+                replica: target.clone(),
+                error: 0,
+            }),
+            source: peer_source(),
+            generation: generation_header(admission().generation.generation),
+        },
+    )
+    .await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::BuildIdle { .. }]
+    ));
+    run(
+        &executor,
+        Command::CompleteBuild(Box::new(BuildCompletion {
+            unit: build.unit,
+            local: promoted.body.replica.clone(),
+            remote: target.clone(),
+            error: 0,
+            detail: ProxyErrorDetail::default(),
+        })),
+    )
+    .await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::AddReplicaReply(_)]
+    ));
+    let mut repair = promoted.swap.as_ref().unwrap().body.clone();
+    repair.unit.previous = repair.unit.current;
+    repair.unit.current.configuration += 1;
+    for r in &mut repair.replicas.0 {
+        r.previous_role = r.current_role;
+    }
+    target.state = 2;
+    target.previous_role = 2;
+    target.current_role = 3;
+    repair.replicas.0.push(target);
+    let (entered, release) = hooks.pause(false);
+    let work = executor.submit(reconfigure(repair.clone())).unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    release.send(()).unwrap();
+    work.wait(WAIT).await.unwrap();
+    let catchup = configured(&effects(&executor));
+    assert_eq!(catchup.flags, 2);
+    run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerDeactivate { target, .. }] if *target == survivor_peer())
+    );
+    let survivor = repair
+        .replicas
+        .0
+        .iter()
+        .find(|r| r.node == survivor_peer())
+        .unwrap();
+    let (entered, release) = hooks.pause(false);
+    let ack = executor
+        .submit(Command::DeactivateReply {
+            source: survivor_peer(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(DeactivateReply {
+                unit: repair.unit.clone(),
+                replica: Replica {
+                    node: survivor_peer(),
+                    id: survivor.id,
+                    instance: survivor.instance,
+                    up: false,
+                    state: 3,
+                    ..Replica::default()
+                },
+                error: 0,
+            }),
+        })
+        .unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    assert_eq!(
+        state(&executor).reconfiguration.as_ref().unwrap().stage,
+        ConfigurationStage::Deactivate
+    );
+    release.send(()).unwrap();
+    ack.wait(WAIT).await.unwrap();
+    assert_eq!(
+        effects(&executor)
+            .iter()
+            .filter(|e| matches!(e, Effect::PeerActivate { .. }))
+            .count(),
+        2
+    );
+    for remote in repair.replicas.0.iter().filter(|r| r.current_role == 3) {
+        let mut unit = repair.unit.clone();
+        unit.previous = Epoch::default();
+        let mut replica = remote.clone();
+        replica.previous_role = 1;
+        run(
+            &executor,
+            Command::ActivateReply {
+                body: Box::new(ActivateReply {
+                    unit,
+                    replica,
+                    error: 0,
+                }),
+                source: remote.node.clone(),
+                generation: generation_header(admission().generation.generation),
+            },
+        )
+        .await;
+    }
+    let end = configured(&effects(&executor));
+    assert_eq!(end.flags, 1);
+    let (entered, release) = hooks.pause(false);
+    let final_reply = executor
+        .submit(Command::CompleteConfiguration(Box::new(end)))
+        .unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    release.send(()).unwrap();
+    final_reply.wait(WAIT).await.unwrap();
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(reply)] if reply.replicas.0.len() == 3)
+    );
+    assert_eq!(state(&executor).runtime, original.runtime);
+    assert_eq!(state(&executor).usage, original.usage);
+    run(&executor, reconfigure(intent)).await;
+    assert!(effects(&executor).is_empty());
     finish(&store, &executor).await;
 }
 
@@ -6498,6 +6649,79 @@ async fn failover_survivor_get_lsn_and_ss_deactivate_wait_for_their_own_commits(
             if !unknown {
                 run(&executor, command()).await;
                 assert_eq!(effects(&executor), ack);
+                run(
+                    &executor,
+                    Command::Activate {
+                        body: Box::new(Activate {
+                            configuration: config.clone(),
+                            deactivation: body.deactivation.clone(),
+                        }),
+                        source: survivor_peer(),
+                        generation: generation_header(admission().generation.generation),
+                    },
+                )
+                .await;
+                let completion = configured(&effects(&executor));
+                run(
+                    &executor,
+                    Command::CompleteConfiguration(Box::new(completion)),
+                )
+                .await;
+                effects(&executor);
+                let stable = state(&executor);
+                let mut repair = stable.swap.as_ref().unwrap().body.clone();
+                repair.unit.previous = repair.unit.current;
+                repair.unit.current.configuration += 1;
+                for r in &mut repair.replicas.0 {
+                    r.previous_role = r.current_role;
+                }
+                let mut fresh = config
+                    .replicas
+                    .0
+                    .iter()
+                    .find(|r| r.current_role == 1)
+                    .unwrap()
+                    .clone();
+                fresh.id += 100;
+                fresh.instance += 100;
+                fresh.previous_role = 2;
+                fresh.current_role = 3;
+                fresh.state = 2;
+                fresh.up = true;
+                fresh.service_endpoint.clear();
+                fresh.replication_endpoint = "127.0.0.1:12350".into();
+                repair.replicas.0.push(fresh);
+                let deactivate = || Command::Deactivate {
+                    body: Box::new(Deactivate {
+                        configuration: repair.clone(),
+                        force: false,
+                        deactivation: ReplicaDeactivationInfo {
+                            epoch: repair.unit.current,
+                            catchup_lsn: 8,
+                        },
+                    }),
+                    source: survivor_peer(),
+                    generation: generation_header(admission().generation.generation),
+                };
+                let (entered, release) = hooks.pause(false);
+                let work = executor.submit(deactivate()).unwrap();
+                entered.await.unwrap();
+                assert!(effects(&executor).is_empty());
+                assert_eq!(state(&executor).body.unit, stable.body.unit);
+                release.send(()).unwrap();
+                work.wait(WAIT).await.unwrap();
+                assert!(matches!(
+                    effects(&executor).as_slice(),
+                    [Effect::PeerDeactivateReply { .. }]
+                ));
+                assert_eq!(state(&executor).phase, Phase::Ready);
+                assert_eq!(state(&executor).runtime, original.runtime);
+                assert_eq!(state(&executor).usage, original.usage);
+                run(&executor, deactivate()).await;
+                assert!(matches!(
+                    effects(&executor).as_slice(),
+                    [Effect::PeerDeactivateReply { .. }]
+                ));
             }
         }
         finish(&store, &executor).await;

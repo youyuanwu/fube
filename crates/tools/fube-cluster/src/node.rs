@@ -331,10 +331,13 @@ impl Adapter {
                 let snapshot = node.snapshot(reply.entity);
                 if snapshot.fenced
                     || snapshot.committed.is_none_or(|state| {
-                        let survivor_ack = state.phase == ra::Phase::Ready
-                            && state.swap.as_ref().is_some_and(|s| {
-                                s.failover && s.stage == ra::SwapStage::Deactivated
-                            });
+                        let survivor_ack =
+                            state.phase == ra::Phase::Ready
+                                && (state.reconfiguration.as_ref().is_some_and(|c| {
+                                    c.stage == ra::ConfigurationStage::Deactivated
+                                }) || state.swap.as_ref().is_some_and(|s| {
+                                    s.failover && s.stage == ra::SwapStage::Deactivated
+                                }));
                         (!survivor_ack && state.phase != ra::Phase::Closed)
                             || state.body.unit != body.unit
                             || state.body.replica.id != body.replica.id
@@ -357,14 +360,20 @@ impl Adapter {
                         state.phase != ra::Phase::Ready
                             || state.body.unit != body.unit
                             || state.body.replica != body.replica
-                            || state.swap.as_ref().map_or_else(
-                                || {
-                                    state.reconfiguration.as_ref().is_none_or(|config| {
-                                        config.stage != ra::ConfigurationStage::Complete
-                                    })
-                                },
-                                |swap| swap.stage != ra::SwapStage::Complete,
-                            )
+                            || if state
+                                .reconfiguration
+                                .as_ref()
+                                .is_some_and(|c| c.request.unit.current == body.unit.current)
+                            {
+                                state.reconfiguration.as_ref().is_none_or(|config| {
+                                    config.stage != ra::ConfigurationStage::Complete
+                                })
+                            } else {
+                                state
+                                    .swap
+                                    .as_ref()
+                                    .is_none_or(|swap| swap.stage != ra::SwapStage::Complete)
+                            }
                     })
                 {
                     self.peer_replies.pop_front();
@@ -983,6 +992,8 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut published_failed_registration = None;
     let mut published_failed_open = None;
     let mut published_host_loss = false;
+    let mut repair_requested = false;
+    let mut repaired_host = false;
     type UploadRequest =
         Pin<Box<dyn Future<Output = Result<Option<fube_transport::message::Message>>> + Send>>;
     let mut upload_request: Option<UploadRequest> = None;
@@ -1028,6 +1039,12 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             let command = std::str::from_utf8(&line).map_err(err);
                             let command = command.as_ref().map(|line| line.split_whitespace().collect::<Vec<_>>());
                             match command {
+                                Ok(parts) if parts.len() == 3 && parts[0] == "replace-host"
+                                    && parts[1] == launch.session && parts[2] == launch.capability
+                                    && launch.profile == ServiceProfile::StatefulThree && launch.placement == 1
+                                    && !repair_requested => {
+                                    repair_requested = true;
+                                }
                                 Ok(parts) if matches!(parts.len(), 4 | 5) && parts[0] == "peer"
                                     && parts[1] == launch.session && parts[2] == launch.capability
                                     && (launch.placement == 1 || launch.profile == ServiceProfile::StatefulThree) && !launch.peers.is_empty() => {
@@ -1249,9 +1266,11 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 }
             }
             if link.is_some() && adapter.error.is_none() && adapter.replica_drained(&node) {
-                if let Err(error) = publish_host_loss(launch, &node, &mut published_host_loss) {
-                    failure = Some(error);
-                    break;
+                if launch.profile == ServiceProfile::StatefulPeerIdle {
+                    if let Err(error) = publish_host_loss(launch, &node, &mut published_host_loss) {
+                        failure = Some(error);
+                        break;
+                    }
                 }
                 if let Err(error) = publish_absence(launch, &node, &mut published_absence) {
                     failure = Some(error);
@@ -1306,6 +1325,31 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             break;
                         }
                         published_retirement = Some(lifetime);
+                    }
+                }
+            }
+            if repair_requested && !repaired_host && adapter.replica_drained(&node) {
+                match node.retire_lost_primary_host() {
+                    Ok(true) => match replace_primary_host(launch, &mut node) {
+                        Ok(receipt) => {
+                            metadata.profile = Some(receipt.profile.clone());
+                            if let Err(error) =
+                                write_json(&launch.directory.join("repaired-host.json"), &receipt)
+                            {
+                                failure = Some(error);
+                                break;
+                            }
+                            repaired_host = true;
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    },
+                    Ok(false) => {}
+                    Err(error) => {
+                        failure = Some(err(error));
+                        break;
                     }
                 }
             }
@@ -1568,28 +1612,19 @@ fn receive_peer_from(
         }
         "ActivateReply" => {
             let (body, generation) = decode_activate_reply(message).map_err(err)?;
-            if launch.placement == 1 {
-                fixed_idle_target(
-                    launch,
-                    &body.unit.id,
-                    &body.replica,
-                    &peer.node,
-                    peer.replica,
-                    peer.incarnation,
-                )?;
-            } else {
-                fixed_peer_target(
-                    launch,
-                    &body.unit.id,
-                    &body.replica,
-                    &peer.node,
-                    peer.replica,
-                    peer.incarnation,
-                )?;
-            }
+            fixed_idle_target(
+                launch,
+                &body.unit.id,
+                &body.replica,
+                &peer.node,
+                peer.replica,
+                peer.incarnation,
+            )?;
             node.activate_reply_from_peer(body, &peer.node, &generation)
         }
-        "CreateReplica" if launch.placement != 1 => {
+        "CreateReplica"
+            if launch.placement != 1 || launch.profile == ServiceProfile::StatefulThree =>
+        {
             let (body, generation) = decode_create_replica(message).map_err(err)?;
             fixed_idle_target(
                 launch,
@@ -1601,7 +1636,9 @@ fn receive_peer_from(
             )?;
             node.create_replica_from_peer(body, &peer.node, &generation)
         }
-        "CreateReplicaReply" if launch.placement == 1 => {
+        "CreateReplicaReply"
+            if launch.placement == 1 || launch.profile == ServiceProfile::StatefulThree =>
+        {
             let (body, generation) = decode_create_replica_reply(message).map_err(err)?;
             fixed_idle_target(
                 launch,
@@ -1654,11 +1691,60 @@ fn fixed_idle_target(
     let expected = if (replica.id, replica.instance) == (id, instance) {
         (id, instance)
     } else {
-        launch.idle_successor()?
+        if launch.profile == ServiceProfile::StatefulThree {
+            launch.primary_successor()?
+        } else {
+            launch.idle_successor()?
+        }
     };
     fixed_peer_target(launch, partition, replica, node, expected.0, expected.1)
 }
 
+fn replace_primary_host(launch: &Launch, node: &mut Node) -> Result<HostReplacementReceipt> {
+    let predecessor = actual_profile(node)?;
+    let old_host = node
+        .activation()
+        .identity()
+        .ok_or("missing retired host identity")?
+        .host_id
+        .clone();
+    let mut options = Options::new(launch.directory.join("hosting"));
+    options.profile = fube_hosting::local::Profile::VolatileStatefulLifecycle;
+    options.service_package_version_instance = Some(1);
+    options.node = Some(NodeContext {
+        id: node_hex(&launch.node),
+        instance: launch.node.instance,
+        name: launch.name(),
+    });
+    node.replace_lost_primary_host(Activation::new(options).map_err(err)?)
+        .map_err(err)?;
+    node.start(
+        &launch.package,
+        APPLICATION,
+        &[(
+            "Arguments".into(),
+            "--stateful-lifecycle --data-replicator".into(),
+        )],
+    )
+    .map_err(err)?;
+    let profile = actual_profile(node)?;
+    profile.validate(launch)?;
+    let new_host = node
+        .activation()
+        .identity()
+        .ok_or("missing replacement host identity")?
+        .host_id
+        .clone();
+    Ok(HostReplacementReceipt {
+        deployment: launch.deployment.clone(),
+        session: launch.session.clone(),
+        node_pid: std::process::id(),
+        predecessor,
+        profile,
+        old_host,
+        new_host,
+    })
+}
 fn publish_host_loss(launch: &Launch, node: &Node, published: &mut bool) -> Result<()> {
     if *published {
         return Ok(());
@@ -1936,7 +2022,9 @@ fn receive_command(
                 .peers
                 .iter()
                 .find(|peer| peer.node == body.replica.node)
-                .filter(|_| launch.placement == 1)
+                .filter(|_| {
+                    launch.placement == 1 || launch.profile == ServiceProfile::StatefulThree
+                })
                 .ok_or("replica control requires the original coordinating Primary")?;
             fixed_idle_target(
                 launch,

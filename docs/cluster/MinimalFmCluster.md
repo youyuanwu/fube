@@ -344,12 +344,79 @@ All original cleanup owners remain independently verified.
 
 After completion, `configuration.kind=primary_failover`, `ready=true` means the
 two surviving configured members have completed this flow, not that a replacement
-third replica exists. Rebuild, repeat/aborted failover, whole-node/FM loss,
+third replica exists. The explicit rebuild below is separate. Repeat/aborted failover, whole-node/FM loss,
 restart/reconnect, arbitrary candidates and mismatched-history recovery remain
 unsupported. Native-stream evidence adds one three-element non-force Deactivate
 case: 173 bidirectional cases, 84 types/255 fields, 177 bundle files and 53 native
 truncation rejections. Neither these source-derived models/processes nor the
 schema adapter execute complete original C++ handlers or native Federation/FM.
+
+### Post-failover third-replica repair
+
+`Cluster::repair_primary_replica()` explicitly restores one third replica after
+the above completed failover and old Primary's processed loss/metadata deletion.
+`drive()` owns subsequent build and configuration work. Poll `repair.ready`;
+`host_ready` means only fresh host ownership, and `built` means only successful
+native AddReplicaReply. Neither authorizes active membership. The earlier
+`configuration.ready` may still describe the two surviving failover members
+until the separately owned repair configuration starts.
+
+Original node1's Node/RA, in-memory store, generation and peer Channels remain
+alive. Node independently requires actual original app-process exit, committed
+Closed/deleted metadata, drained reporting/commands/lookups and exact acquisition
+release. It explicitly reaps/drains the original process owner and terminates
+its Hosting activation before replacing it. The original host gate remains
+revoked; a new gate, host identity, app process, Hosting root and runtime
+registration are created. The launcher checks the exact original-node receipt
+and independent old PID/root absence. A loss-report ACK, dropped metadata or
+FM disconnect alone cannot supply this physical ownership boundary.
+
+FM allocates a strictly newer replica ID/incarnation above the original identities.
+New node2 Primary owns native AddReplica, peer CreateReplica/Reply, real RAP
+Open/BuildIdleReplica and AddReplicaReply. Node1's fresh volatile application
+starts empty and recopies nonempty state from node2; no old runtime/data lifetime
+is adopted and no persisted Existing Open is substituted. Copy completion is
+Ready/Idle, not ActiveSecondary. Both original survivors retain their runtime
+and acquisitions without another Open.
+
+After successful build, unchanged-Primary DoReconfiguration retains the two
+survivors as PC and adds the fresh I/S to CC. Desired target/minimum remains
+3/2, service update version is unchanged and only the configuration counter
+advances; no data-loss epoch is introduced. Actual RAP catch-up establishes the
+new deactivation boundary. Since PC differs from CC, node3's S/S metadata
+Deactivate and its committed identity-only reply precede activation. No RAP
+Close or disposal is involved in this S/S exchange. Both Secondary Activate
+replies commit independently before final RAP EndReconfiguration and the
+matching native DoReconfigurationReply complete repair.
+
+| Pinned SF source | Preserved responsibility |
+|---|---|
+| `fm/FailoverUnit.cpp:718-739`; `fm/Replica.cpp:555-585` | Reuse a dropped placement only with a new replica identity/incarnation and reset build/endpoint metadata. The fixed profile uses a deterministic monotonic allocator, not native wall-clock allocation. |
+| `ra/FailoverUnit.cpp:5487-5523`; `ra/ReconfigurationAgent.cpp:2244-2324` | A lost volatile replica is dropped, not recovered from local state. A newer incarnation creates a fresh local Idle after the old lifetime is closed. |
+| `ra/ReconfigurationAgent.cpp:1855-2038`; `ra/FailoverUnit.cpp:315-363` | The current Primary owns peer creation, real build and native semantic completion; unchanged current epoch during Idle build. |
+| `ra/FailoverUnit.cpp:736-818,2596-2637,3091-3124` | Real catch-up and separate PC/CC obligations; the native phase-3 skip currently requires equal memberships. |
+| `ra/ReconfigurationAgent.cpp:2590-2682`; `ra/FailoverUnit.cpp:929-958,2703-2873,3164-3272` | S/S Deactivate changes metadata/history without Close, followed by activation and final runtime/RA/FM completion. |
+
+Store/model tests hold repair admission, deactivation/activation and final
+completion commits, reject missing loss/deletion, reused/foreign host lineage,
+wrong-source/stale/partial replies and survivor loss, and retain frozen retries.
+Real three-node process acceptance builds nonempty state, kills the original
+Primary app, promotes node2, writes more data, replaces node1's host and recopies,
+loses/replays final completion and verifies new replica ownership. Old reports,
+Delete replies and native Delete requests cannot affect the successor. Losing
+node3 after repair still permits acknowledged writes on node2 plus rebuilt
+node1; losing both Secondaries blocks acknowledgment rather than restoring
+singleton quorum. Interrupted repair shutdown verifies both app-owner cleanups.
+
+This is one explicit repair in the original live three-node session, not an
+automatic placement policy, whole-node/FM failure, arbitrary app restart,
+reconnect, a second failover/repair, history repair or data-loss recovery.
+Survivor loss during repair leaves it unknown; it never manufactures a successful
+build or reduces quorum. Existing native message schemas/factories are reused,
+including the three-element Deactivate fixture: the maintained codec gate remains
+173 cases/53 native truncation rejections. These are native-source-derived
+store/process and native-stream/schema-adapter results, not full original C++
+handler execution or deployed FM/Federation interoperability.
 
 ## Peer-created Idle replica (stage-4 increment)
 

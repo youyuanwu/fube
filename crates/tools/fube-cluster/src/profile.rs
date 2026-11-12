@@ -210,6 +210,20 @@ pub struct Launch {
     pub peers: Vec<Peer>,
 }
 impl Launch {
+    pub fn primary_successor(&self) -> Result<(i64, i64)> {
+        if self.profile != ServiceProfile::StatefulThree {
+            return Err("Primary repair requires the original three-node profile".into());
+        }
+        let next = self
+            .peers
+            .iter()
+            .fold(self.replica.max(self.incarnation), |n, p| {
+                n.max(p.replica).max(p.incarnation)
+            })
+            .checked_add(1)
+            .ok_or("repair identity exhausted")?;
+        Ok((next, next))
+    }
     pub fn idle_successor(&self) -> Result<(i64, i64)> {
         if self.profile != ServiceProfile::StatefulPeerIdle {
             return Err("replacement outside the original two-node profile is gated".into());
@@ -309,7 +323,7 @@ pub struct Metadata {
     pub profile: Option<ActualProfile>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActualProfile {
     pub service: String,
@@ -318,6 +332,41 @@ pub struct ActualProfile {
     pub code_package: String,
     pub app_pid: u32,
     pub runtime_root: PathBuf,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostReplacementReceipt {
+    pub deployment: String,
+    pub session: String,
+    pub node_pid: u32,
+    pub predecessor: ActualProfile,
+    pub profile: ActualProfile,
+    pub old_host: String,
+    pub new_host: String,
+}
+impl HostReplacementReceipt {
+    pub fn validate(&self, launch: &Launch, old: &ActualProfile, node_pid: u32) -> Result<()> {
+        self.profile.validate(launch)?;
+        if launch.profile != ServiceProfile::StatefulThree
+            || launch.placement != 1
+            || self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node_pid != node_pid
+            || self.old_host == self.new_host
+            || &self.predecessor != old
+            || self.profile.app_pid == old.app_pid
+            || self.profile.runtime_root == old.runtime_root
+            || self.profile.service != old.service
+            || self.profile.service_type != old.service_type
+            || self.profile.version != old.version
+            || self.profile.code_package != old.code_package
+        {
+            return Err("replacement host does not match the owned repair lineage".into());
+        }
+        uuid::Uuid::parse_str(&self.old_host).map_err(err)?;
+        uuid::Uuid::parse_str(&self.new_host).map_err(err)?;
+        Ok(())
+    }
 }
 impl ActualProfile {
     pub fn validate(&self, launch: &Launch) -> Result<()> {

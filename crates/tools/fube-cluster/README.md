@@ -26,9 +26,9 @@ nonempty data and remain non-writers. A fresh write needs the Primary plus one
 Secondary, not both; missing members never restore the historical singleton
 quorum. Source-bound process tests also lose/replay build and final configuration
 replies, preserve all original owners/one Open each and verify independent
-three-child cleanup. The bounded Primary app-host failover below is now supported;
-planned transfer, replacement/retirement, generation upload, data loss and
-restart remain gated for this profile.
+three-child cleanup. The bounded Primary app-host failover and explicit repair
+below are supported; planned transfer, general replacement/retirement,
+generation upload, data loss and node/runtime adoption remain gated for this profile.
 See [source mapping and limits](../../../docs/cluster/MinimalFmCluster.md#healthy-three-replica-service).
 
 Once that original 3/2 configuration is complete, a matching native terminal
@@ -50,6 +50,29 @@ promotion/Open; repeated old-Primary loss reports cannot undo the new endpoint.
 This qualifies original Primary **app-host** loss with its RA/Node alive, not
 node/FM process failover, restart, mismatched-history repair, a second failover
 or data-loss recovery. See [the SF flow and evidence](../../../docs/cluster/MinimalFmCluster.md#three-replica-primary-app-host-failover).
+
+After completed failover and the old Primary's processed native loss/deletion,
+`Cluster::repair_primary_replica().await` explicitly starts one repair on node1.
+Continue `drive()` and poll `status()["repair"]["ready"]`. The original Node/RA,
+store and peer Channels remain owned; the original dead app must be reaped,
+its process group drained, acquisitions released and Hosting directory removed
+before a new app host, registration and runtime can be installed. The old IPC
+gate is never revived. This is fresh volatile creation/copy, not persisted Open,
+runtime adoption or reuse of the lost replica's data/identity.
+
+The new Primary owns native AddReplica -> CreateReplica/Reply -> RAP build ->
+AddReplicaReply for a strictly newer node1 replica ID/incarnation. Actual
+nonempty copy precedes same-Primary reconfiguration from two to three current
+members. Desired target/minimum stays 3/2; service version and data-loss epoch
+do not change. Actual catch-up, committed S/S metadata Deactivate, both Activate
+replies and final RAP/FM completion restore 1P+2S. Lost replies replay the same
+operation. The new Primary and surviving Secondary never reopen; old reports
+and Delete traffic cannot retire the fresh owner. After repair one Secondary
+can be lost while writes continue; losing both still prevents acknowledgments.
+Shutdown verifies old and new app cleanup even if repair is interrupted before
+FM admits the new host. This is one explicit original-Primary app-host repair,
+not automatic placement, a second repair/failover or whole-node/FM restart.
+See [source mapping and qualification](../../../docs/cluster/MinimalFmCluster.md#post-failover-third-replica-repair).
 
 `--stateful-peer-idle` is a separate fresh-start, fixed-generation opt-in:
 node1 alone receives FM AddPrimary; node2 is the bound remote volatile Idle

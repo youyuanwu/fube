@@ -1,5 +1,57 @@
 use super::*;
 
+pub(super) fn lost_primary_replacement(
+    old: &EntityState,
+    body: &AddInstance,
+    source: &NodeInstance,
+    history: &ReplicaDeactivationInfo,
+) -> bool {
+    old.fm_primary
+        && old.phase == Phase::Closed
+        && old.local_deleted
+        && old.cleanup_pending
+        && old.fm_stage == FmStage::None
+        && old.primary_deactivation == Some((Epoch::default(), -2))
+        && old.runtime.is_none()
+        && old.usage.is_none()
+        && old.registration_lookups.is_empty()
+        && old.reconfiguration.as_ref().is_some_and(|c| {
+            c.stage == ConfigurationStage::Complete
+                && c.request.unit.target == 3
+                && c.request
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == *source && r.current_role == 3)
+        })
+        && body.service == old.body.service
+        && body.replica.node == old.body.replica.node
+        && body.replica.id > old.body.replica.id
+        && body.replica.instance > old.body.replica.instance
+        && body.unit.id == old.body.unit.id
+        && body.unit.consistency == old.body.unit.consistency
+        && body.unit.target == 3
+        && body.unit.minimum == 2
+        && body.unit.previous == Epoch::default()
+        && body.unit.current.data_loss == old.body.unit.current.data_loss
+        && Some(body.unit.current.configuration)
+            == old
+                .body
+                .unit
+                .current
+                .configuration
+                .checked_add(0x1_0000_0001)
+        && history.epoch == body.unit.current
+        && history.catchup_lsn >= 0
+}
+
+pub fn completed_primary_failover(state: &EntityState) -> bool {
+    state
+        .swap
+        .as_ref()
+        .is_some_and(|s| s.failover && s.stage == SwapStage::Complete)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerCreation {
     pub source: NodeInstance,
@@ -294,7 +346,18 @@ fn create_remote(
     let current = current.ok_or(Failure::Admission(
         "remote creation needs an existing Primary",
     ))?;
-    if current.reconfiguration.is_some() && !retired_configuration(current) {
+    let repair = completed_primary_failover(current)
+        && current.body.replica.current_role == 4
+        && current.swap.as_ref().is_some_and(|s| {
+            s.intent.replicas.0.iter().any(|r| {
+                r.node == target.node
+                    && !r.up
+                    && r.current_role == 1
+                    && target.id > r.id
+                    && target.instance > r.instance
+            })
+        });
+    if current.reconfiguration.is_some() && !retired_configuration(current) && !repair {
         return Err(Failure::Unsupported(
             "active-configuration replica changes are gated",
         ));
@@ -325,7 +388,7 @@ fn create_remote(
     ))?;
     if current.phase != Phase::Ready
         || !current.fm_primary
-        || current.peer_creation.is_some()
+        || (current.peer_creation.is_some() && !repair)
         || current.body.replica.current_role != 4
         || current.body.replica.state != 2
         || current.runtime.is_none()
@@ -342,7 +405,9 @@ fn create_remote(
         || target.version != current.body.service.version
         || !target.service_endpoint.is_empty()
         || !target.replication_endpoint.is_empty()
-        || (deactivation != (current.body.unit.current, 0) && !retired_configuration(current))
+        || (deactivation != (current.body.unit.current, 0)
+            && !retired_configuration(current)
+            && !repair)
     {
         return Err(Failure::Unsupported(
             "not the admitted fresh remote Idle profile",
@@ -627,7 +692,7 @@ pub(super) fn start_build(
     if current.phase != Phase::Ready
         || !current.fm_primary
         || current.body.replica.current_role != 4
-        || current.peer_creation.is_some()
+        || (current.peer_creation.is_some() && !completed_primary_failover(current))
         || peer != Some(&remote.target)
     {
         return Err(Failure::Unsupported(

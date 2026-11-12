@@ -5,6 +5,7 @@ use fube_transport::serialization::serde::ObjectArray;
 pub enum ConfigurationStage {
     Catchup,
     Deactivate,
+    Deactivated,
     Retiring,
     Activate,
     End,
@@ -64,8 +65,12 @@ fn local<'a>(body: &'a Configuration, node: &NodeInstance) -> Result<&'a Replica
 }
 fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Result<()> {
     let old_epoch = old.body.unit.current;
+    let repair = body.unit.target == 3
+        && old.body.service.target == 3
+        && old.body.service.minimum == 2
+        && body.service == old.body.service;
     let three = body.unit.target == 3 && old.body.service.target == 1;
-    if body.replicas.0.len() != if three { 3 } else { 2 }
+    if body.replicas.0.len() != if three || repair { 3 } else { 2 }
         || body.unit.id != old.body.unit.id
         || body.unit.consistency != old.body.unit.consistency
         || body.unit.previous != old_epoch
@@ -77,9 +82,9 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                 .ok_or(Failure::Capacity)?
         || body.unit.current.configuration & !0xffff_ffff != old_epoch.configuration & !0xffff_ffff
         || body.unit.target != body.service.target
-        || body.unit.minimum != if three { 2 } else { 1 }
+        || body.unit.minimum != if three || repair { 2 } else { 1 }
         || body.unit.minimum != body.service.minimum
-        || !secondary_service(&old.body.service, &body.service)
+        || (!repair && !secondary_service(&old.body.service, &body.service))
     {
         return Err(Failure::Unsupported(
             "only bounded same-Primary 1-to-2, 1-to-3 or 2-to-1 configuration is enabled",
@@ -100,7 +105,8 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                     .any(|old| old.id == r.id || old.node.id == r.node.id)
                 || (r.node != *primary
                     && if body.unit.target >= 2 {
-                        r.current_role != 3 || r.previous_role != 2
+                        r.current_role != 3
+                            || !(r.previous_role == 2 || (repair && r.previous_role == 3))
                     } else {
                         r.current_role != 1 || r.previous_role != 3
                     })
@@ -109,6 +115,62 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
         return Err(Failure::Unsupported(
             "not the exact ready P/P and I/S configuration",
         ));
+    }
+    if repair {
+        if body
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.previous_role == 2)
+            .count()
+            != 1
+            || body
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.previous_role == 3)
+                .count()
+                != 1
+        {
+            return Err(Failure::Admission(
+                "repair must retain P/P and S/S and admit one I/S",
+            ));
+        }
+        if let Some(swap) = old
+            .swap
+            .as_ref()
+            .filter(|_| completed_primary_failover(old))
+        {
+            if old
+                .reconfiguration
+                .as_ref()
+                .is_some_and(|c| swap.body.unit.current.older_than(c.request.unit.current))
+            {
+                return Err(Failure::Unsupported(
+                    "a second post-failover repair is gated",
+                ));
+            }
+            for expected in &swap.body.replicas.0 {
+                let mut actual = local(body, &expected.node)?.clone();
+                if actual.previous_role != expected.current_role {
+                    return Err(Failure::Admission(
+                        "repair changed the surviving previous configuration",
+                    ));
+                }
+                actual.previous_role = expected.previous_role;
+                actual.first_lsn = expected.first_lsn;
+                actual.last_lsn = expected.last_lsn;
+                if actual != *expected {
+                    return Err(Failure::Admission(
+                        "repair changed a surviving replica owner",
+                    ));
+                }
+            }
+        } else if old.body.replica.current_role != 2 {
+            return Err(Failure::Unsupported(
+                "repair requires completed failover or fresh Idle",
+            ));
+        }
     }
     Ok(())
 }
@@ -201,6 +263,7 @@ fn pending_effects(state: &EntityState) -> Vec<Effect> {
                 unreachable!("retiring Close uses the lifecycle retry owner")
             }
         }
+        ConfigurationStage::Deactivated => deactivate_reply(state),
         ConfigurationStage::Deactivate => {
             let target = config
                 .request
@@ -314,10 +377,13 @@ pub(super) fn transition(
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
             }
             shape(&body.configuration, current, &admission.local_node)?;
+            let repair = completed_primary_failover(current)
+                && body.configuration.service == current.body.service
+                && body.configuration.unit.target == 3;
             if body.configuration.unit.target == 3
                 && (peers.len() != 2
-                    || current.reconfiguration.is_some()
-                    || current.remote_idles.len() != 2)
+                    || (!repair && current.reconfiguration.is_some())
+                    || current.remote_idles.len() != if repair { 1 } else { 2 })
             {
                 return Err(Failure::Unsupported(
                     "three-member admission requires both original built Idles",
@@ -374,7 +440,7 @@ pub(super) fn transition(
                     ));
                 }
             }
-            if current.remote_idles.len() != body.configuration.replicas.0.len() - 1 {
+            if !repair && current.remote_idles.len() != body.configuration.replicas.0.len() - 1 {
                 return Err(Failure::Admission(
                     "configuration omitted a remote build owner",
                 ));
@@ -408,15 +474,30 @@ pub(super) fn transition(
             }
             let body: Activate =
                 from_slice(&work.bytes).map_err(|_| Failure::Admission("invalid Activate"))?;
+            let repair = body.configuration.unit.target == 3
+                && body.configuration.service == current.body.service
+                && current.body.service.target == 3
+                && (completed_primary_failover(current) || current.body.replica.current_role == 2)
+                && body.deactivation.epoch == body.configuration.unit.current
+                && body.deactivation.catchup_lsn >= 0;
             if current.fm_primary
-                || current.peer_creation.as_ref().is_none_or(|origin| {
-                    &origin.source != source || origin.deactivation != body.deactivation
-                })
+                || (!repair
+                    && current.peer_creation.as_ref().is_none_or(|origin| {
+                        &origin.source != source || origin.deactivation != body.deactivation
+                    }))
             {
                 return Err(Failure::Unsupported(
                     "Activate requires the original built Idle source",
                 ));
             }
+            let deactivated = current.reconfiguration.as_ref().is_some_and(|c| {
+                c.stage == ConfigurationStage::Deactivated
+                    && c.request == body.configuration
+                    && current
+                        .peer_creation
+                        .as_ref()
+                        .is_some_and(|p| p.source == *source && p.deactivation == body.deactivation)
+            });
             if let Some(config) = &current.reconfiguration {
                 if config.request != body.configuration {
                     if body
@@ -427,22 +508,27 @@ pub(super) fn transition(
                     {
                         return Ok(Transition::ignored(Disposition::IgnoredStale));
                     }
-                    return Err(Failure::Unsupported(
-                        "secondary configuration supersession is gated",
-                    ));
+                    if !repair || config.stage != ConfigurationStage::Complete {
+                        return Err(Failure::Unsupported(
+                            "secondary configuration supersession is gated",
+                        ));
+                    }
+                } else if !deactivated {
+                    return Ok(Transition {
+                        update: Update::None,
+                        effects: pending_effects(current),
+                        disposition: Disposition::Applied,
+                    });
                 }
-                return Ok(Transition {
-                    update: Update::None,
-                    effects: pending_effects(current),
-                    disposition: Disposition::Applied,
-                });
             }
             if !admission.owner_ready || !admission.node_open || !admission.node_activated {
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
             }
-            shape(&body.configuration, current, source)?;
+            if !deactivated {
+                shape(&body.configuration, current, source)?;
+            }
             let expected = local(&body.configuration, &admission.local_node)?;
-            if current.body.replica.current_role != 2
+            if (!repair && current.body.replica.current_role != 2)
                 || expected.id != current.body.replica.id
                 || expected.instance != current.body.replica.instance
                 || expected.replication_endpoint != current.body.replica.replication_endpoint
@@ -451,6 +537,34 @@ pub(super) fn transition(
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             }
             let mut state = current.clone();
+            if repair {
+                if !peers.contains(source)
+                    || local(&body.configuration, source)?.current_role != 4
+                    || (!completed_primary_failover(current)
+                        && current
+                            .peer_creation
+                            .as_ref()
+                            .is_none_or(|p| p.source != *source))
+                    || (completed_primary_failover(current)
+                        && current.swap.as_ref().is_none_or(|s| {
+                            !s.body
+                                .replicas
+                                .0
+                                .iter()
+                                .any(|r| r.node == *source && r.current_role == 4)
+                        }))
+                {
+                    return Err(Failure::Admission(
+                        "repair Activate requires the surviving Primary",
+                    ));
+                }
+                let origin = state
+                    .peer_creation
+                    .as_mut()
+                    .ok_or(Failure::Admission("missing peer origin"))?;
+                origin.source = source.clone();
+                origin.deactivation = body.deactivation.clone();
+            }
             let mut effects = vec![];
             description::update(&mut state, &body.configuration.service, &mut effects);
             apply_body(&mut state, &body.configuration, &admission.local_node)?;
@@ -475,6 +589,84 @@ pub(super) fn transition(
             }
             let body: Deactivate =
                 from_slice(&work.bytes).map_err(|_| Failure::Admission("invalid Deactivate"))?;
+            if completed_primary_failover(current)
+                && body.configuration.unit.target == 3
+                && body.configuration.service == current.body.service
+                && body.configuration.unit.current.data_loss == current.body.unit.current.data_loss
+                && body.configuration.unit.current.configuration & !0xffff_ffff
+                    == current.body.unit.current.configuration & !0xffff_ffff
+            {
+                if current.reconfiguration.as_ref().is_some_and(|c| {
+                    c.stage == ConfigurationStage::Deactivated && c.request == body.configuration
+                }) && !body.force
+                    && current
+                        .peer_creation
+                        .as_ref()
+                        .is_some_and(|p| p.source == *source && p.deactivation == body.deactivation)
+                {
+                    return Ok(Transition {
+                        update: Update::None,
+                        effects: vec![deactivate_reply(current)],
+                        disposition: Disposition::Applied,
+                    });
+                }
+                if current.reconfiguration.as_ref().is_some_and(|c| {
+                    c.request == body.configuration
+                        && matches!(
+                            c.stage,
+                            ConfigurationStage::Secondary | ConfigurationStage::Complete
+                        )
+                }) {
+                    return Ok(Transition::ignored(Disposition::IgnoredStale));
+                }
+                if current.phase != Phase::Ready
+                    || current.runtime.is_none()
+                    || !admission.owner_ready
+                    || !admission.node_open
+                    || !admission.node_activated
+                {
+                    return Ok(Transition::ignored(Disposition::IgnoredNotReady));
+                }
+                shape(&body.configuration, current, source)?;
+                let expected = local(&body.configuration, &admission.local_node)?;
+                if body.force
+                    || current.fm_primary
+                    || expected.previous_role != 3
+                    || expected.current_role != 3
+                    || expected.id != current.body.replica.id
+                    || expected.instance != current.body.replica.instance
+                    || body.deactivation.epoch != body.configuration.unit.current
+                    || current
+                        .peer_creation
+                        .as_ref()
+                        .is_none_or(|p| body.deactivation.catchup_lsn < p.deactivation.catchup_lsn)
+                    || current.swap.as_ref().is_none_or(|s| {
+                        !s.body
+                            .replicas
+                            .0
+                            .iter()
+                            .any(|r| r.node == *source && r.current_role == 4)
+                    })
+                {
+                    return Err(Failure::Admission(
+                        "repair Deactivate requires the exact surviving S/S and history",
+                    ));
+                }
+                let mut state = current.clone();
+                let origin = state.peer_creation.as_mut().expect("surviving peer");
+                origin.source = source.clone();
+                origin.deactivation = body.deactivation;
+                apply_body(&mut state, &body.configuration, &admission.local_node)?;
+                state.reconfiguration = Some(Reconfiguration {
+                    request: body.configuration,
+                    stage: ConfigurationStage::Deactivated,
+                    error: 0,
+                    history: vec![],
+                    activated: vec![],
+                });
+                let reply = deactivate_reply(&state);
+                return Ok(lifecycle::changed(state, vec![reply], true));
+            }
             if body
                 .configuration
                 .unit
@@ -600,7 +792,11 @@ pub(super) fn transition(
                 .reconfiguration
                 .as_mut()
                 .expect("owned configuration")
-                .stage = ConfigurationStage::End;
+                .stage = if config.request.unit.target == 3 {
+                ConfigurationStage::Activate
+            } else {
+                ConfigurationStage::End
+            };
             Ok(lifecycle::changed(
                 state.clone(),
                 pending_effects(&state),
@@ -686,11 +882,21 @@ pub(super) fn transition(
                 return Ok(lifecycle::changed(state, vec![], false));
             }
             if config.stage == ConfigurationStage::Catchup {
+                if completed_primary_failover(current) && config.request.unit.target == 3 {
+                    if body.local.last_lsn < 0 {
+                        return Err(Failure::Admission(
+                            "repair catch-up requires actual initialized progress",
+                        ));
+                    }
+                    state.primary_deactivation = Some((body.unit.current, body.local.last_lsn));
+                }
                 state
                     .reconfiguration
                     .as_mut()
                     .expect("owned configuration")
-                    .stage = if config.request.unit.target == 1 {
+                    .stage = if config.request.unit.target == 1
+                    || (completed_primary_failover(current) && config.request.unit.target == 3)
+                {
                     ConfigurationStage::Deactivate
                 } else {
                     ConfigurationStage::Activate

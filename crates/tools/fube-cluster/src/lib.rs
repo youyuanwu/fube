@@ -675,6 +675,81 @@ impl Cluster {
             }
         }
         self.start_failover().await;
+        if let Err(error) = self.advance_repair().await {
+            self.ledger.lost(0, error);
+        }
+    }
+    /// Restore one lost volatile Primary as a fresh Secondary on its original live Node.
+    pub async fn repair_primary_replica(&mut self) -> Result<Value> {
+        if self.finished.is_some() || self.children.len() != 3 {
+            return Err("Primary repair requires the original running three-node cluster".into());
+        }
+        if self.ledger.begin_primary_repair(Instant::now())? {
+            let child = &mut self.children[0];
+            let result = child
+                .process
+                .as_mut()
+                .ok_or("missing original Node owner")?
+                .command(
+                    format!(
+                        "replace-host {} {}\n",
+                        child.launch.session, child.launch.capability
+                    )
+                    .as_bytes(),
+                )
+                .map_err(err);
+            if let Err(error) = result {
+                self.ledger.lost(0, error.clone());
+                return Err(error);
+            }
+        }
+        Ok(self.ledger.repair_status())
+    }
+
+    async fn advance_repair(&mut self) -> Result<()> {
+        if self
+            .ledger
+            .repair
+            .as_ref()
+            .is_some_and(|r| r.profile.is_none())
+        {
+            let path = self.children[0].launch.directory.join("repaired-host.json");
+            if path.try_exists().map_err(err)? {
+                let receipt: HostReplacementReceipt = read_json(&path)?;
+                if receipt.predecessor.runtime_root.exists()
+                    || Path::new(&format!("/proc/{}", receipt.predecessor.app_pid)).exists()
+                    || !receipt.profile.runtime_root.exists()
+                    || !Path::new(&format!("/proc/{}", receipt.profile.app_pid)).exists()
+                {
+                    return Err("physical host replacement is not independently observable".into());
+                }
+                let pid = self.children[0]
+                    .process
+                    .as_ref()
+                    .ok_or("missing original Node")?
+                    .pid();
+                if self.ledger.repaired_host(&receipt, pid)? {
+                    self.children[0]
+                        .metadata
+                        .as_mut()
+                        .ok_or("missing node metadata")?
+                        .profile = Some(receipt.profile);
+                    let body = self
+                        .ledger
+                        .repair
+                        .as_ref()
+                        .expect("repair")
+                        .build
+                        .body
+                        .clone();
+                    self.send_idle(&body).await?;
+                }
+            }
+        }
+        if let Some(body) = self.ledger.start_repair_configuration(Instant::now())? {
+            self.send_configuration(&body).await?;
+        }
+        Ok(())
     }
     async fn start_failover(&mut self) {
         let failover = match self.ledger.start_primary_failover(Instant::now()) {
@@ -790,7 +865,7 @@ impl Cluster {
     async fn send_idle(&self, body: &AddReplica) -> Result<()> {
         let child = self
             .children
-            .first()
+            .get(self.ledger.primary_index())
             .ok_or("missing original Primary owner")?;
         child
             .link
@@ -1156,15 +1231,7 @@ impl Cluster {
     async fn send_configuration(&self, body: &DoReconfiguration) -> Result<()> {
         let child = self
             .children
-            .get(usize::from(
-                body.configuration.replicas.0.len() == 3
-                    && body
-                        .configuration
-                        .replicas
-                        .0
-                        .iter()
-                        .any(|r| r.previous_role == 4 && !r.up && r.current_role == 1),
-            ))
+            .get(self.ledger.primary_index())
             .ok_or("missing original Primary owner")?;
         child
             .link
@@ -1488,6 +1555,38 @@ impl Cluster {
             let cleanup = process.cleanup();
             let physical = process.status();
             let receipt = read_json::<CleanupReceipt>(&child.launch.directory.join("cleanup.json"));
+            if let Some(repair) = self
+                .ledger
+                .repair
+                .as_ref()
+                .filter(|_| child.launch.placement == 1)
+            {
+                let path = child.launch.directory.join("repaired-host.json");
+                if path.exists() {
+                    let replacement = read_json::<HostReplacementReceipt>(&path).and_then(|r| {
+                        r.validate(&child.launch, &repair.old_profile, process.pid())?;
+                        if r.predecessor.runtime_root.exists()
+                            || Path::new(&format!("/proc/{}", r.predecessor.app_pid)).exists()
+                        {
+                            return Err(
+                                "predecessor host physical cleanup remains unresolved".into()
+                            );
+                        }
+                        Ok(r)
+                    });
+                    match replacement {
+                        Ok(r) => {
+                            if let Some(metadata) = &mut child.metadata {
+                                metadata.profile = Some(r.profile);
+                            }
+                        }
+                        Err(error) => {
+                            complete = false;
+                            item["host_replacement_error"] = json!(error);
+                        }
+                    }
+                }
+            }
             let valid = receipt.as_ref().is_ok_and(|receipt| {
                 receipt.deployment == child.launch.deployment
                     && receipt.session == child.launch.session

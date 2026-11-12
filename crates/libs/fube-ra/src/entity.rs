@@ -51,7 +51,8 @@ mod reconfiguration;
 #[path = "swap.rs"]
 mod swap;
 pub use peer::{
-    BuildCompletion, PeerCreation, RemoteBuild, RemoteIdle, RemoteRemoval, RemovalCompletion,
+    completed_primary_failover, BuildCompletion, PeerCreation, RemoteBuild, RemoteIdle,
+    RemoteRemoval, RemovalCompletion,
 };
 pub use reconfiguration::{
     retired_configuration, secondary_service, ConfigurationCompletion, ConfigurationStage,
@@ -1877,6 +1878,7 @@ fn transition(
         | Kind::OpenLocalStateful
         | Kind::OpenLocalPrimary => {
             let body: AddInstance = from_slice(&work.bytes).map_err(decode_error)?;
+            let mut three_peer = false;
             let peer_creation = match &work.kind {
                 Kind::CreateReplica {
                     source,
@@ -1901,7 +1903,25 @@ fn transition(
                                 .is_some_and(|p| p.deactivation == *deactivation)
                             && s.body.unit.current == body.unit.current
                     });
+                    let lost_primary = state.is_some_and(|s| {
+                        peer::lost_primary_replacement(s, &body, source, deactivation)
+                    });
+                    let retained_peer = state.is_some_and(|s| {
+                        matches!(s.phase, Phase::Opening | Phase::Ready)
+                            && s.peer_creation.as_ref().is_some_and(|p| {
+                                p.source == *source && p.deactivation == *deactivation
+                            })
+                            && body.unit == s.body.unit
+                            && body.service == s.body.service
+                            && body.replica.node == s.body.replica.node
+                            && body.replica.id == s.body.replica.id
+                            && body.replica.instance == s.body.replica.instance
+                            && body.replica.current_role == 2
+                    });
+                    three_peer = peers.len() == 2 && (lost_primary || retained_peer);
                     if !retired_peer
+                        && !lost_primary
+                        && !retained_peer
                         && (deactivation.epoch != body.unit.current
                             || deactivation.catchup_lsn != 0)
                     {
@@ -1973,8 +1993,13 @@ fn transition(
             if local_stateful
                 && (body.replica.previous_role != 1
                     || body.service.partitions != 1
-                    || body.service.target != 1
-                    || body.service.minimum != 1
+                    || ((body.service.target != 1 || body.service.minimum != 1)
+                        && !(three_peer
+                            && peer_creation.is_some()
+                            && body.service.target == 3
+                            && body.service.minimum == 2
+                            && body.unit.target == 3
+                            && body.unit.minimum == 2))
                     || body.service.activation_mode != 0
                     || !body.service.scaling.0.is_empty()
                     || body.unit.consistency.kind != 1
@@ -2032,7 +2057,14 @@ fn transition(
                             disposition: Disposition::Applied,
                         });
                     }
-                    replacing_peer = current.local_deleted
+                    replacing_peer = peer_creation.as_ref().is_some_and(|origin| {
+                        peer::lost_primary_replacement(
+                            current,
+                            &body,
+                            &origin.source,
+                            &origin.deactivation,
+                        )
+                    }) || (current.local_deleted
                         && current.fm_stage == FmStage::None
                         && current.close_token != 0
                         && current.runtime.is_none()
@@ -2047,15 +2079,16 @@ fn transition(
                         && body.replica.id > current.body.replica.id
                         && body.replica.instance > current.body.replica.instance
                         && body.unit.current == current.body.unit.current
-                        && service == current.body.service;
+                        && service == current.body.service);
                     if !replacing_peer {
                         return Err(Failure::Unsupported(
                             "peer recreation requires a deleted original runtime lifetime",
                         ));
                     }
                 }
-                if current.peer_creation.as_ref().map(|origin| &origin.source)
-                    != peer_creation.as_ref().map(|origin| &origin.source)
+                if !replacing_peer
+                    && current.peer_creation.as_ref().map(|origin| &origin.source)
+                        != peer_creation.as_ref().map(|origin| &origin.source)
                 {
                     return Err(Failure::Unsupported(
                         "cannot change original peer creation authority",
@@ -2066,7 +2099,7 @@ fn transition(
                         "cannot change entity lifecycle profile",
                     ));
                 }
-                if current.fm_primary != fm_primary {
+                if !replacing_peer && current.fm_primary != fm_primary {
                     return Err(Failure::Unsupported(
                         "cannot change original reply authority",
                     ));
