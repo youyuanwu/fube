@@ -71,14 +71,20 @@ it retains the original PC and CC set (including the failed Primary as down S),
 checks both read quorums and completes normal GetLSN/history/catch-up and
 survivor phase commits. `repair.state` becomes `superseded`, not ready; the new
 Primary can serve. After completed supersession, explicitly restore the two known
-losses with `repair_secondary_replica(node)`: repair the down CC Secondary (old
-Primary) first, then the previously removed placement. Each fresh-host/copy/
-admission cycle must finish before the next starts. `repair.ready` is per-cycle;
+losses with `repair_secondary_replica(node)`: above minimum, repair the down CC
+Secondary (old Primary) first, then the previously removed placement. At minimum,
+rebuild the already-removed placement first: a fresh Ready Idle permits combined
+down-Secondary removal and Idle admission without shrinking CC below minimum.
+Then rebuild the old Primary's placement to restore target. For superseded 4/3,
+call `repair_secondary_replica(2)`, wait for `repair.ready`, then call
+`repair_secondary_replica(1)`. Each fresh-host/copy/admission cycle must finish
+before the next starts. `repair.ready` is per-cycle;
 `repair.target_restored` identifies full target and `repair.remaining_lost`
 lists the remaining placements. CC removal still obeys minimum/Ready-Idle
 accounting, and another loss fences restoration rather than enabling recovery.
 FM-link loss and interruption during copy/readmission do not authorize this
-bounded exception. Data-plane writes still require their actual quorum.
+bounded exception. Minimum counts configured CC members, not Ready survivors;
+data-plane writes still require their actual quorum.
 
 The configured profile still rejects resize, planned transfer and healthy
 Secondary retirement. Host replacement is explicit, never automatic.

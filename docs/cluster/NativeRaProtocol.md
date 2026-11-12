@@ -94,6 +94,9 @@ The [sequential restoration extension](MinimalFmCluster.md#sequential-restoratio
 also reuses normal removal, fresh CreateReplica/copy and one-member admission
 at unchanged target/minimum. Partial membership, closed predecessor history
 and per-cycle completion do not introduce a wire schema or private runtime seam.
+Its Ready-Idle-first path combines down-Secondary removal with copied Idle
+admission at minimum, reusing the same configuration vectors and final reply
+contract; it adds no native action or schema.
 The maintained source-stream oracle now has 179 inputs, 85 types/257 fields,
 183 bundle files and 55 native truncation rejections, retaining the preceding
 173-case failover gate and its 84 types/255 fields, 177 bundle files and

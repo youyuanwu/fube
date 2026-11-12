@@ -163,14 +163,30 @@ fn initial_configuration(body: &Configuration, old: &EntityState) -> bool {
 fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Result<()> {
     let old_epoch = old.body.unit.current;
     if secondary_removal(body) {
-        let prior = completed_configuration(old).ok_or(Failure::Unsupported(
-            "Secondary removal requires completed membership",
-        ))?;
-        let members: Vec<_> = prior
+        let fresh = body
             .replicas
             .0
             .iter()
-            .filter(|r| r.current_role >= 3)
+            .filter(|r| r.previous_role == 2 && r.current_role == 3)
+            .count();
+        let prior = completed_configuration(old);
+        if prior.is_none() && !(fresh == 1 && old.body.replica.current_role == 2) {
+            return Err(Failure::Unsupported(
+                "Secondary removal requires completed membership or the fresh Idle",
+            ));
+        }
+        let members: Vec<_> = prior
+            .unwrap_or(body)
+            .replicas
+            .0
+            .iter()
+            .filter(|r| {
+                if prior.is_some() {
+                    r.current_role >= 3
+                } else {
+                    r.previous_role >= 3
+                }
+            })
             .collect();
         if body.service != old.body.service
             || !valid_stateful_sizes(&body.service)
@@ -183,14 +199,40 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
             || Some(body.unit.current.configuration) != old_epoch.configuration.checked_add(1)
             || body.unit.current.configuration & !0xffff_ffff
                 != old_epoch.configuration & !0xffff_ffff
-            || body.replicas.0.len() != members.len()
+            || fresh > 1
+            || body.replicas.0.len() != members.len() + fresh
             || members.len() > body.service.target as usize
-            || members.len() <= body.service.minimum as usize
-            || local(prior, primary)?.current_role != 4
+            || members.len() + fresh <= body.service.minimum as usize
+            || members.len() + fresh - 1 > body.service.target as usize
+            || local(body, primary)?.previous_role != 4
+            || local(body, primary)?.current_role != 4
+            || body.replicas.0.iter().enumerate().any(|(i, r)| {
+                r.id < 0
+                    || r.instance < 0
+                    || r.version != body.service.version
+                    || (r.current_role == 4 && r.node != *primary)
+                    || body.replicas.0[..i]
+                        .iter()
+                        .any(|old| old.node.id == r.node.id || old.id == r.id)
+                    || if r.current_role == 1 {
+                        r.previous_role != 3 || r.up || r.state != 3
+                    } else {
+                        !r.up
+                            || r.state != 2
+                            || r.replication_endpoint.is_empty()
+                            || !matches!(
+                                (r.previous_role, r.current_role),
+                                (4, 4) | (3, 3) | (2, 3)
+                            )
+                    }
+            })
         {
             return Err(Failure::Unsupported(
                 "Secondary removal must preserve sizes, Primary and minimum",
             ));
+        }
+        if prior.is_none() {
+            return Ok(());
         }
         for expected in members {
             let actual = local(body, &expected.node)?;
@@ -563,7 +605,13 @@ pub(super) fn transition(
                         "Secondary repair changed the Primary owner",
                     ));
                 }
-                if !secondary_removal(&body.configuration) {
+                if body
+                    .configuration
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.previous_role == 2 && r.current_role == 3)
+                {
                     let fresh: Vec<_> = current
                         .remote_idles
                         .iter()

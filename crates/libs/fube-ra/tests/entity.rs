@@ -7679,7 +7679,7 @@ async fn finish_same_primary_restoration(executor: &Executor, hooks: &Hooks, bod
 
 #[tokio::test]
 async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit() {
-    for (target, minimum) in [(5, 3), (64, 32)] {
+    for (target, minimum) in [(4, 3), (5, 3), (64, 32), (64, 63)] {
         for stage in 0..4 {
             let (store, executor, hooks) = setup(WAIT).await;
             active_configured_survivor(&executor, target, minimum).await;
@@ -7932,11 +7932,19 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
                     r.current_role = 1;
                 }
             }
-            finish_same_primary_restoration(&executor, &hooks, removal.clone()).await;
-            for lost in [
+            let ready_idle_first = target - 1 == minimum;
+            if !ready_idle_first {
+                finish_same_primary_restoration(&executor, &hooks, removal.clone()).await;
+                active = removal.clone();
+            }
+            let mut losses = [
                 intent.replicas.0[0].clone(),
                 intent.replicas.0.last().unwrap().clone(),
-            ] {
+            ];
+            if ready_idle_first {
+                losses.reverse();
+            }
+            for lost in losses {
                 let ready = state(&executor);
                 let mut fresh = lost;
                 fresh.id += 1000;
@@ -7992,17 +8000,14 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
                     effects(&executor).as_slice(),
                     [Effect::AddReplicaReply(_)]
                 ));
-                active = state(&executor)
-                    .reconfiguration
-                    .as_ref()
-                    .unwrap()
-                    .request
-                    .clone();
                 active.replicas.0.retain(|r| r.current_role >= 3);
                 active.unit.previous = active.unit.current;
                 active.unit.current.configuration += 1;
                 for r in &mut active.replicas.0 {
                     r.previous_role = r.current_role;
+                    if !r.up {
+                        r.current_role = 1;
+                    }
                 }
                 fresh.previous_role = 2;
                 fresh.current_role = 3;
@@ -8017,9 +8022,39 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
                     .await
                     .is_err());
                 assert!(effects(&executor).is_empty());
+                if ready_idle_first && active.replicas.0.iter().any(|r| !r.up) {
+                    for invalid in 0..6 {
+                        let mut bad = active.clone();
+                        match invalid {
+                            0 => bad.service.minimum -= 1,
+                            1 => bad.replicas.0.iter_mut().find(|r| !r.up).unwrap().instance += 1,
+                            2 => bad.replicas.0.last_mut().unwrap().instance += 1,
+                            3 => bad.replicas.0.last_mut().unwrap().up = false,
+                            4 => {
+                                bad.replicas.0.pop();
+                            }
+                            _ => bad.unit.current.configuration += 1,
+                        }
+                        assert!(executor
+                            .submit(reconfigure(bad))
+                            .unwrap()
+                            .wait(WAIT)
+                            .await
+                            .is_err());
+                        assert!(effects(&executor).is_empty());
+                    }
+                }
                 finish_same_primary_restoration(&executor, &hooks, active.clone()).await;
                 assert_eq!(
-                    run(&executor, reconfigure(removal.clone())).await,
+                    run(
+                        &executor,
+                        reconfigure(if ready_idle_first {
+                            original.reconfiguration.as_ref().unwrap().request.clone()
+                        } else {
+                            removal.clone()
+                        }),
+                    )
+                    .await,
                     Disposition::IgnoredStale
                 );
                 assert!(effects(&executor).is_empty());

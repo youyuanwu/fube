@@ -351,19 +351,36 @@ remain deferred.
 
 After completed Primary-loss supersession, the two exact processed predecessor
 losses can be repaired explicitly, one at a time, on their original live
-Node/RA sessions. `repair_secondary_replica(node)` first selects the old Primary,
-now a down CC Secondary, then the previously removed Secondary. It rejects the
-opposite order while a down member remains in CC and rejects concurrent repair.
-It is not a general multiple-loss placement/recovery API.
+Node/RA sessions. Above minimum, `repair_secondary_replica(node)` first selects
+the old Primary, now a down CC Secondary, then the previously removed Secondary.
+At minimum, select the already-removed placement first to build a Ready Idle.
+The opposite order and concurrent repair are rejected. This is not a general
+multiple-loss placement/recovery API.
 
 For the qualified 5/3 case, CC starts with four members, three live. Native
 same-Primary removal drops the failed old Primary to reach three; fresh-host
 copy and committed I/S admission restore four live members. Only after that
 cycle completes can the already-removed placement be rebuilt and admitted,
 restoring five live members. Target five, minimum three, service version and
-the new Primary/data-loss epochs never change. Removing a down CC member at
-minimum is still blocked without a Ready spare; in particular this ordered,
-original-placement-only repair does not restore a superseded 4/3 configuration.
+the new Primary/data-loss epochs never change.
+
+For 4/3, completed supersession instead leaves three CC members, two live.
+`repair_secondary_replica(2)` rebuilds the already-removed Secondary with a
+fresh host and real copy while CC stays unchanged. Only its matching successful
+AddReplicaReply authorizes a same-Primary reconfiguration that retains the
+three-member PC, removes the down S/N and admits the fresh I/S together. CC
+still has three members, now all live; there is no intermediate two-member CC.
+After that cycle completes, `repair_secondary_replica(1)` rebuilds the old
+Primary's placement and admits the fourth member. This uses the two original
+lost placements, not a new spare node, and does not change target/minimum.
+
+Minimum constrains configured CC size, not the number of Ready survivors.
+Two live members in the three-member CC can acknowledge writes with minimum
+three when they have the actual write quorum. Ready-Idle-first restoration
+preserves this behavior; it never lowers minimum or substitutes a copied Idle
+for committed membership. SF's independent PC/CC write-quorum checks during
+same-Primary reconfiguration remain in force
+(`ra/FailoverUnitProxy.cpp:1399-1455`).
 
 Every replacement retains predecessor exit/reaping/group/root cleanup,
 report/lookup/usage drainage, a fresh Hosting gate/runtime and newer replica
@@ -372,9 +389,10 @@ with its exact terminal loss/deletion and a newer Primary's history; an old
 in-flight stage is not converted into successful completion. CreateReplica,
 RAP BuildIdleReplica and real copy remain the sole construction path.
 
-Admission grows actual membership by one, not directly to target. It preserves
-every surviving owner and the completed configuration as PC. Secondary-only
-removal/admission retain the serving Primary's deactivation history.
+Each cycle admits one fresh replica, not an entire target set. Ordinary
+admission grows membership by one; combined removal/admission keeps its size.
+It preserves every surviving owner and the completed configuration as PC.
+Secondary-only removal/admission retain the serving Primary's deactivation history.
 `repair.ready` means the selected placement completed its cycle;
 `repair.target_restored` becomes true only at full target, and
 `repair.remaining_lost` lists the remaining one-based placements. Final replies
@@ -388,17 +406,21 @@ accounting and one-member admission), `fm/Replica.cpp:555-585` (new identities),
 `ra/ReconfigurationAgent.cpp:2244-2324` (newer CreateReplica from closed metadata)
 and `ra/FailoverUnit.cpp:736-810,2596-2646,3091-3248` (same-Primary history and
 per-live-survivor phase obligations). RA models restore partial/full membership
-at 5/3 and 64/32 across all four preceding survivor stages, with commit holds and
-exact-owner/history rejection. FM models additionally cover 4/2, 4/3 minimum
-blocking, unprocessed deletion, wrong order, concurrent calls and another loss
-before/during/after each repair phase.
+at 4/3, 5/3, 64/32 and 64/63 across all four preceding survivor stages, with
+commit holds and exact-owner/history rejection. FM models additionally cover
+4/2 and Ready-Idle-first restoration at 4/3, 6/5 and 64/63, unprocessed deletion,
+wrong order, concurrent calls and another loss before/during/after repair,
+including loss of the fresh incarnation.
 
-Real 5/3 processes restore both placements after a held final removal reply and
-after a deterministic phase-3 interruption. They lose/retry removal, build and
-admission replies, copy nonempty data, fence predecessor traffic, retain
-surviving owners and single Open, acknowledge continued writes, then fail over
-to a rebuilt replica and repair that later Primary loss. Shutdown independently
-joins cleanup. Native-stream qualification remains 179 cases; this is not
+Real 5/3 and 4/3 processes restore both placements after a held final removal
+reply and after a deterministic phase-3 interruption. They lose/retry build and
+admission replies (plus separate removal replies at 5/3), copy nonempty data,
+fence predecessor traffic, retain surviving owners and single Open, acknowledge
+continued writes, then fail over to a rebuilt replica and repair that later
+Primary loss. The 4/3 cases also acknowledge a write while the fresh Idle's
+build reply is held, then recopy that continued data into the old Primary's
+fresh replacement. Shutdown independently joins cleanup.
+Native-stream qualification remains 179 cases; this is not
 native C++ handler/Federation interoperability, generic interrupted-copy recovery,
 automatic restart, resize or durable/node/FM recovery.
 

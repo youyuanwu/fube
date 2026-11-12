@@ -2471,7 +2471,16 @@ impl Ledger {
             .0
             .iter()
             .any(|r| r.node == target.launch.node && r.current_role == 3 && !r.up);
-        if !in_cc && previous.replicas.0.iter().any(|r| !r.up) {
+        if !in_cc
+            && previous.replicas.0.iter().any(|r| !r.up)
+            && (previous.replicas.0.len() != previous.unit.minimum as usize
+                || previous.replicas.0.iter().filter(|r| !r.up).count() != 1
+                || previous
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| !r.up && r.current_role != 3))
+        {
             return Err(
                 "repair the down current-configuration member before the removed placement".into(),
             );
@@ -2481,7 +2490,7 @@ impl Ledger {
         body.configuration.replicas = previous.replicas.clone();
         let removal = if in_cc {
             if previous.replicas.0.len() <= previous.unit.minimum as usize {
-                return Err("Secondary removal is blocked at minimum; this topology has no ready spare placement".into());
+                return Err("Secondary removal is blocked at minimum; rebuild the already-removed placement to a Ready Idle first".into());
             }
             body.configuration.unit.previous = previous.unit.current;
             body.configuration.unit.current.configuration = previous
@@ -2747,6 +2756,9 @@ impl Ledger {
         body.configuration.replicas = previous.replicas.clone();
         for r in &mut body.configuration.replicas.0 {
             r.previous_role = r.current_role;
+            if !r.up {
+                r.current_role = 1;
+            }
         }
         let mut replica = built.replica.clone();
         replica.previous_role = 2;
@@ -2769,6 +2781,7 @@ impl Ledger {
         let config = repair.configuration.as_mut().expect("repair configuration");
         let mut expected = config.body.configuration.clone();
         expected.unit.previous = Epoch::default();
+        expected.replicas.0.retain(|r| r.current_role >= 3);
         for r in &mut expected.replicas.0 {
             r.previous_role = 1;
         }
