@@ -1,5 +1,118 @@
 use super::*;
 
+pub(super) fn lost_replica_replacement(
+    old: &EntityState,
+    body: &AddInstance,
+    source: &NodeInstance,
+    history: &ReplicaDeactivationInfo,
+) -> bool {
+    let secondary = !old.fm_primary
+        && old
+            .peer_creation
+            .as_ref()
+            .is_some_and(|p| p.host_down && p.delete_operation != 0 && p.deactivation == *history)
+        && old.reconfiguration.as_ref().is_some_and(|c| {
+            c.stage == ConfigurationStage::Complete
+                && c.request
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == *source && r.current_role == 4)
+                && c.request
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == old.body.replica.node && r.current_role == 3)
+        });
+    let promoted = reconfiguration::replica_replacement_metadata(old)
+        && old.reconfiguration.as_ref().is_some_and(|c| {
+            c.request
+                .replicas
+                .0
+                .iter()
+                .any(|r| r.node == *source && r.current_role == 3)
+        })
+        && old.body.unit.current.older_than(history.epoch)
+        && old.body.unit.current.data_loss == history.epoch.data_loss
+        && history.epoch.configuration & !0xffff_ffff
+            == body.unit.current.configuration & !0xffff_ffff
+        && !body.unit.current.older_than(history.epoch)
+        && old.body.unit.current.configuration & !0xffff_ffff
+            < history.epoch.configuration & !0xffff_ffff;
+    (old.fm_primary
+        || secondary
+        || (promoted
+            && old.peer_host_loss()
+            && old
+                .peer_creation
+                .as_ref()
+                .is_some_and(|p| p.delete_operation != 0)))
+        && old.phase == Phase::Closed
+        && old.local_deleted
+        && old.cleanup_pending
+        && old.fm_stage == FmStage::None
+        && (secondary
+            || !old.fm_primary
+            || old.primary_deactivation == Some((Epoch::default(), -2)))
+        && old.runtime.is_none()
+        && old.usage.is_none()
+        && old.registration_lookups.is_empty()
+        && reconfiguration::replica_replacement_metadata(old)
+        && old.reconfiguration.as_ref().is_some_and(|c| {
+            c.request.unit.target >= 2
+                && c.request
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == *source && r.current_role == if secondary { 4 } else { 3 })
+        })
+        && body.service == old.body.service
+        && body.replica.node == old.body.replica.node
+        && body.replica.id > old.body.replica.id
+        && body.replica.instance > old.body.replica.instance
+        && body.unit.id == old.body.unit.id
+        && body.unit.consistency == old.body.unit.consistency
+        && body.unit.target == old.body.unit.target
+        && body.unit.minimum == old.body.unit.minimum
+        && body.unit.previous == Epoch::default()
+        && body.unit.current.data_loss == old.body.unit.current.data_loss
+        && body
+            .unit
+            .current
+            .configuration
+            .checked_sub(old.body.unit.current.configuration)
+            .is_some_and(|delta| {
+                if promoted {
+                    delta > 0
+                } else if secondary {
+                    delta == 1
+                } else {
+                    delta > 0 && delta % 0x1_0000_0001 == 0
+                }
+            })
+        && (if promoted {
+            !history.epoch.older_than(
+                old.peer_creation
+                    .as_ref()
+                    .map_or(Epoch::default(), |p| p.deactivation.epoch),
+            )
+        } else if secondary {
+            history.epoch.data_loss == body.unit.current.data_loss
+                && history.epoch.configuration & !0xffff_ffff
+                    == body.unit.current.configuration & !0xffff_ffff
+        } else {
+            history.epoch == body.unit.current
+        })
+        && history.catchup_lsn >= 0
+}
+
+pub fn completed_primary_failover(state: &EntityState) -> bool {
+    state
+        .swap
+        .as_ref()
+        .is_some_and(|s| s.failover && s.stage == SwapStage::Complete)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerCreation {
     pub source: NodeInstance,
@@ -20,7 +133,10 @@ impl EntityState {
     /// Original opened-peer lineage for admission, not cleanup or replacement proof.
     pub fn peer_opened_lifetime(&self) -> bool {
         self.peer_creation.as_ref().is_some_and(|peer| {
-            self.body.replica.current_role == 2
+            (self.body.replica.current_role == 2
+                || (matches!(self.body.replica.current_role, 1 | 3)
+                    && self.reconfiguration.is_some())
+                || (self.body.replica.current_role == 4 && self.swap.is_some()))
                 && match self.phase {
                     Phase::Ready => self.runtime.is_some() && self.usage.is_some(),
                     Phase::Closing | Phase::Closed => peer.close_started_open || peer.host_down,
@@ -147,27 +263,89 @@ pub type RemovalCompletion = BuildCompletion;
 impl Executor {
     /// One original configured peer, bound before any local FT is accepted.
     pub fn bind_peer(&self, source: NodeInstance) -> Result<()> {
+        self.bind_peers(vec![source])
+    }
+
+    pub fn bind_peers(&self, sources: Vec<NodeInstance>) -> Result<()> {
         let mut view = lock(&self.shared.view);
         if !view.accepting {
             return Err(Failure::Closed);
         }
-        if view.peer.is_some()
+        if !view.peers.is_empty()
             || !view.entities.is_empty()
             || view.generations_touched
-            || source.id == self.shared.local_node.id
-            || source.id == self.shared.fm_source.id
-            || source.instance == 0
+            || sources.is_empty()
+            || sources.len() >= MAX_CONFIGURATION_REPLICAS
+            || sources.iter().enumerate().any(|(i, source)| {
+                source.id == self.shared.local_node.id
+                    || source.id == self.shared.fm_source.id
+                    || source.instance == 0
+                    || sources[..i].iter().any(|old| old.id == source.id)
+            })
         {
             return Err(Failure::Unsupported(
                 "peer requires a fresh original configured node",
             ));
         }
-        view.peer = Some(source);
+        view.peers = sources;
         Ok(())
     }
 
     pub fn peer(&self) -> Option<NodeInstance> {
-        lock(&self.shared.view).peer.clone()
+        lock(&self.shared.view).peers.first().cloned()
+    }
+
+    pub fn is_peer(&self, source: &NodeInstance) -> bool {
+        lock(&self.shared.view).peers.contains(source)
+    }
+    pub fn peer_count(&self) -> usize {
+        lock(&self.shared.view).peers.len()
+    }
+}
+
+pub(super) fn selected_peer<'a>(
+    work: &Submission,
+    peers: &'a [NodeInstance],
+) -> Result<Option<&'a NodeInstance>> {
+    let target = match &work.kind {
+        Kind::CreateRemoteIdle => {
+            let body: Replica = from_slice(&work.bytes)
+                .map_err(|_| Failure::Admission("invalid remote descriptor"))?;
+            Some(body.node)
+        }
+        Kind::AddReplica { .. } | Kind::RemoveReplica { .. } => {
+            let body: AddInstance = from_slice(&work.bytes)
+                .map_err(|_| Failure::Admission("invalid remote control"))?;
+            Some(body.replica.node)
+        }
+        Kind::CreateReplica { source, .. }
+        | Kind::CreateReplicaReply { source, .. }
+        | Kind::Activate { source, .. }
+        | Kind::ActivateReply { source, .. }
+        | Kind::Deactivate { source, .. }
+        | Kind::DeactivateReply { source, .. }
+        | Kind::GetLsn { source, .. }
+        | Kind::GetLsnReply { source, .. } => Some(source.clone()),
+        _ => None,
+    };
+    Ok(match target {
+        Some(target) => peers.iter().find(|peer| **peer == target),
+        None if peers.len() == 1 => peers.first(),
+        None => None,
+    })
+}
+
+impl EntityState {
+    pub fn remote_idle(&self, target: &NodeInstance) -> Option<&RemoteIdle> {
+        self.remote_idles
+            .iter()
+            .find(|remote| &remote.target == target)
+    }
+
+    fn remote_idle_mut(&mut self, target: &NodeInstance) -> Option<&mut RemoteIdle> {
+        self.remote_idles
+            .iter_mut()
+            .find(|remote| &remote.target == target)
     }
 }
 
@@ -212,7 +390,7 @@ pub(super) fn start_remote(
     let target: Replica = from_slice(&work.bytes)
         .map_err(|_| Failure::Admission("invalid remote Idle descriptor"))?;
     if current
-        .and_then(|state| state.remote_idle.as_ref())
+        .and_then(|state| state.remote_idle(&target.node))
         .is_some_and(|remote| remote.fm_request.is_some())
     {
         return Err(Failure::Unsupported("FM owns this remote Idle"));
@@ -229,6 +407,52 @@ fn create_remote(
     let current = current.ok_or(Failure::Admission(
         "remote creation needs an existing Primary",
     ))?;
+    let repair = (completed_primary_failover(current)
+        || reconfiguration::completed_secondary_removal(current))
+        && current.body.replica.current_role == 4
+        && reconfiguration::completed_configuration(current).is_some_and(|c| {
+            !c.replicas
+                .0
+                .iter()
+                .any(|r| r.node == target.node && r.current_role >= 3)
+        })
+        && current
+            .reconfiguration
+            .iter()
+            .map(|c| &c.request)
+            .chain(current.swap.iter().map(|s| &s.intent))
+            .any(|body| {
+                body.replicas.0.iter().any(|r| {
+                    r.node == target.node
+                        && !r.up
+                        && matches!(r.current_role, 1 | 3)
+                        && target.id > r.id
+                        && target.instance > r.instance
+                })
+            });
+    if current.reconfiguration.is_some() && !retired_configuration(current) && !repair {
+        return Err(Failure::Unsupported(
+            "active-configuration replica changes are gated",
+        ));
+    }
+    if let Some(retired) = current
+        .reconfiguration
+        .as_ref()
+        .filter(|_| retired_configuration(current))
+    {
+        if retired
+            .request
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.node != admission.local_node)
+            .any(|r| target.id <= r.id || target.instance <= r.instance)
+        {
+            return Err(Failure::Unsupported(
+                "retired configuration requires a fresh replica incarnation",
+            ));
+        }
+    }
     if !admission.node_open || !admission.owner_ready || !admission.node_activated {
         return Ok(Transition::ignored(Disposition::IgnoredNotReady));
     }
@@ -237,7 +461,7 @@ fn create_remote(
     ))?;
     if current.phase != Phase::Ready
         || !current.fm_primary
-        || current.peer_creation.is_some()
+        || (current.peer_creation.is_some() && !repair)
         || current.body.replica.current_role != 4
         || current.body.replica.state != 2
         || current.runtime.is_none()
@@ -254,7 +478,9 @@ fn create_remote(
         || target.version != current.body.service.version
         || !target.service_endpoint.is_empty()
         || !target.replication_endpoint.is_empty()
-        || deactivation != (current.body.unit.current, 0)
+        || (deactivation != (current.body.unit.current, 0)
+            && !retired_configuration(current)
+            && !repair)
     {
         return Err(Failure::Unsupported(
             "not the admitted fresh remote Idle profile",
@@ -271,16 +497,28 @@ fn create_remote(
             catchup_lsn: deactivation.1,
         },
     );
-    if let Some(previous) = &current.remote_idle {
+    if let Some(previous) = current.remote_idle(&target.node) {
         if previous.body.as_ref() != &body || previous.target != target.node {
-            return Err(Failure::Unsupported("remote Idle replacement is gated"));
-        }
-        if previous.reply.is_some() || previous.removal.is_some() {
+            let old = &previous.body.replica.0.replica;
+            if previous.target != target.node
+                || previous.fm_request.is_none()
+                || previous
+                    .removal
+                    .as_ref()
+                    .is_none_or(|removal| removal.result != Some(0) || removal.fm_request.is_none())
+                || target.id <= old.id
+                || target.instance <= old.instance
+            {
+                return Err(Failure::Unsupported(
+                    "fresh Idle requires completed original FM removal",
+                ));
+            }
+        } else if previous.reply.is_some() || previous.removal.is_some() {
             return Ok(Transition::ignored(Disposition::IgnoredStale));
         }
     }
     let mut state = current.clone();
-    state.remote_idle = Some(RemoteIdle {
+    let remote = RemoteIdle {
         target: target.node.clone(),
         body: Arc::new(body.clone()),
         reply: None,
@@ -288,7 +526,22 @@ fn create_remote(
         removal: None,
         fm_request: None,
         ready: false,
-    });
+    };
+    if let Some(previous) = state.remote_idle_mut(&target.node) {
+        *previous = remote;
+    } else {
+        if state.remote_idles.len() >= MAX_CONFIGURATION_REPLICAS - 1
+            || state
+                .remote_idles
+                .iter()
+                .any(|r| r.body.replica.0.replica.id == target.id)
+        {
+            return Err(Failure::Unsupported(
+                "remote replica capacity or duplicate identity",
+            ));
+        }
+        state.remote_idles.push(remote);
+    }
     Ok(lifecycle::changed(
         state,
         vec![Effect::PeerCreateReplica {
@@ -338,16 +591,30 @@ pub(super) fn add_from_fm(
             "AddReplica requires the original FT and service",
         ));
     }
-    if let Some(remote) = &current.remote_idle {
+    if let Some(remote) = current.remote_idle(&body.replica.node) {
         if body.replica.node == remote.target
             && body.replica.instance < remote.body.replica.0.replica.instance
         {
             return Ok(Transition::ignored(Disposition::IgnoredStale));
         }
         if remote.fm_request.as_deref() != Some(&body) {
-            return Err(Failure::Unsupported(
-                "remote replacement or manual-build adoption is gated",
-            ));
+            if remote.fm_request.is_none()
+                || body.replica.instance == remote.body.replica.0.replica.instance
+            {
+                return Err(Failure::Unsupported(
+                    "manual-build adoption or changed same-lifetime AddReplica is gated",
+                ));
+            }
+            let target = body.replica.node.clone();
+            let mut transition =
+                create_remote(body.replica.clone(), Some(current), admission, peer)?;
+            if let Update::Memory(state) = &mut transition.update {
+                state
+                    .remote_idle_mut(&target)
+                    .expect("created remote")
+                    .fm_request = Some(Arc::new(body));
+            }
+            return Ok(transition);
         }
         if remote.removal.is_some() {
             return Ok(Transition::ignored(Disposition::IgnoredStale));
@@ -371,11 +638,11 @@ pub(super) fn add_from_fm(
             false,
         ));
     }
+    let target = body.replica.node.clone();
     let mut transition = create_remote(body.replica.clone(), Some(current), admission, peer)?;
     if let Update::Memory(state) = &mut transition.update {
         state
-            .remote_idle
-            .as_mut()
+            .remote_idle_mut(&target)
             .expect("created remote")
             .fm_request = Some(Arc::new(body));
     }
@@ -400,7 +667,7 @@ pub(super) fn complete_remote(
     else {
         return Ok(Transition::ignored(Disposition::IgnoredStale));
     };
-    let Some(pending) = &current.remote_idle else {
+    let Some(pending) = current.remote_idle(source) else {
         return Ok(Transition::ignored(Disposition::IgnoredStale));
     };
     let expected = &pending.body.replica.0;
@@ -445,13 +712,11 @@ pub(super) fn complete_remote(
     let mut state = current.clone();
     let succeeded = body.error == 0;
     state
-        .remote_idle
-        .as_mut()
+        .remote_idle_mut(source)
         .expect("checked remote owner")
         .reply = Some(body);
     if state
-        .remote_idle
-        .as_ref()
+        .remote_idle(source)
         .expect("checked remote")
         .fm_request
         .is_some()
@@ -460,8 +725,7 @@ pub(super) fn complete_remote(
             return start_build(Some(&state), admission, peer);
         }
         let reply = state
-            .remote_idle
-            .as_ref()
+            .remote_idle(source)
             .and_then(RemoteIdle::add_reply)
             .expect("failed Open reply");
         return Ok(lifecycle::changed(
@@ -482,9 +746,9 @@ pub(super) fn start_build(
     if !admission.node_open || !admission.owner_ready || !admission.node_activated {
         return Ok(Transition::ignored(Disposition::IgnoredNotReady));
     }
+    let target = peer.ok_or(Failure::Unsupported("manual multi-peer build is gated"))?;
     let remote = current
-        .remote_idle
-        .as_ref()
+        .remote_idle(target)
         .ok_or(Failure::Unsupported("no opened peer Idle"))?;
     if remote.removal.is_some() {
         return Err(Failure::Unsupported("peer Idle removal is terminal"));
@@ -501,7 +765,9 @@ pub(super) fn start_build(
     if current.phase != Phase::Ready
         || !current.fm_primary
         || current.body.replica.current_role != 4
-        || current.peer_creation.is_some()
+        || (current.peer_creation.is_some()
+            && !completed_primary_failover(current)
+            && !reconfiguration::completed_secondary_removal(current))
         || peer != Some(&remote.target)
     {
         return Err(Failure::Unsupported(
@@ -520,7 +786,7 @@ pub(super) fn start_build(
         .build
         .as_ref()
         .map_or_else(|| current.body.clone(), |build| build.body.clone());
-    state.remote_idle.as_mut().expect("checked remote").build = Some(RemoteBuild {
+    state.remote_idle_mut(target).expect("checked remote").build = Some(RemoteBuild {
         body: body.clone(),
         result: None,
         detail: ProxyErrorDetail::default(),
@@ -546,7 +812,7 @@ pub(super) fn complete_build(
     else {
         return Ok(Transition::ignored(Disposition::IgnoredStale));
     };
-    let Some(remote) = &current.remote_idle else {
+    let Some(remote) = current.remote_idle(&event.remote.node) else {
         return Ok(Transition::ignored(Disposition::IgnoredStale));
     };
     let Some(build) = &remote.build else {
@@ -564,15 +830,16 @@ pub(super) fn complete_build(
     }
     let mut state = current.clone();
     let build = state
-        .remote_idle
-        .as_mut()
+        .remote_idle_mut(&event.remote.node)
         .expect("checked remote")
         .build
         .as_mut()
         .expect("checked build");
     build.result = Some(event.error);
     build.detail = event.detail;
-    let remote = state.remote_idle.as_mut().expect("checked remote");
+    let remote = state
+        .remote_idle_mut(&event.remote.node)
+        .expect("checked remote");
     if event.error == 0 && remote.fm_request.is_some() {
         remote.ready = true;
     }
@@ -590,12 +857,17 @@ pub(super) fn start_removal(
     peer: Option<&NodeInstance>,
 ) -> Result<Transition> {
     let current = current.ok_or(Failure::Admission("removal requires an existing Primary"))?;
+    if current.reconfiguration.is_some() {
+        return Err(Failure::Unsupported(
+            "configured-secondary removal is gated",
+        ));
+    }
     if !admission.node_open || !admission.owner_ready || !admission.node_activated {
         return Ok(Transition::ignored(Disposition::IgnoredNotReady));
     }
+    let target = peer.ok_or(Failure::Unsupported("manual multi-peer removal is gated"))?;
     let remote = current
-        .remote_idle
-        .as_ref()
+        .remote_idle(target)
         .ok_or(Failure::Unsupported("no opened peer Idle"))?;
     let reply = remote
         .reply
@@ -642,7 +914,7 @@ pub(super) fn start_removal(
         registration: registration.clone(),
     };
     let mut state = current.clone();
-    let remote = state.remote_idle.as_mut().expect("checked remote");
+    let remote = state.remote_idle_mut(target).expect("checked remote");
     remote.ready = false;
     remote.removal = Some(removal);
     Ok(lifecycle::changed(state, vec![effect], false))
@@ -683,8 +955,7 @@ pub(super) fn remove_from_fm(
         return Ok(Transition::ignored(Disposition::IgnoredStale));
     }
     let remote = current
-        .remote_idle
-        .as_ref()
+        .remote_idle(&body.replica.node)
         .ok_or(Failure::Unsupported("unknown-Idle removal is gated"))?;
     if current.body.replica.current_role != 4
         || current.body.replica.state != 2
@@ -739,7 +1010,9 @@ pub(super) fn remove_from_fm(
     }
     if local_only {
         let mut state = current.clone();
-        let remote = state.remote_idle.as_mut().expect("checked remote");
+        let remote = state
+            .remote_idle_mut(&body.replica.node)
+            .expect("checked remote");
         remote.ready = false;
         // Native InCreate/absent-after-abort cleanup echoes FM without InDrop or RAP.
         remote.removal = Some(RemoteRemoval {
@@ -758,11 +1031,11 @@ pub(super) fn remove_from_fm(
             false,
         ));
     }
+    let target = body.replica.node.clone();
     let mut transition = start_removal(Some(current), admission, peer)?;
     if let Update::Memory(state) = &mut transition.update {
         state
-            .remote_idle
-            .as_mut()
+            .remote_idle_mut(&target)
             .expect("checked remote")
             .removal
             .as_mut()
@@ -783,8 +1056,7 @@ pub(super) fn complete_removal(
         return Ok(Transition::ignored(Disposition::IgnoredStale));
     };
     let Some(removal) = current
-        .remote_idle
-        .as_ref()
+        .remote_idle(&event.remote.node)
         .and_then(|remote| remote.removal.as_ref())
     else {
         return Ok(Transition::ignored(Disposition::IgnoredStale));
@@ -797,8 +1069,7 @@ pub(super) fn complete_removal(
     }
     let mut state = current.clone();
     let removal = state
-        .remote_idle
-        .as_mut()
+        .remote_idle_mut(&event.remote.node)
         .expect("checked remote")
         .removal
         .as_mut()
@@ -806,8 +1077,7 @@ pub(super) fn complete_removal(
     removal.result = Some(event.error);
     removal.detail = event.detail;
     let effects = state
-        .remote_idle
-        .as_ref()
+        .remote_idle(&event.remote.node)
         .and_then(RemoteIdle::remove_reply)
         .map(Effect::RemoveReplicaReply)
         .into_iter()

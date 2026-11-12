@@ -141,7 +141,7 @@ class CatalogTests(unittest.TestCase):
             self.assertIn(term, replacement)
         records = {r["symbol"]: r for r in rows()}
         self.assertIn("drop-resend-replacement", records["AddInstance"]["status"])
-        self.assertEqual(sum("selected" in r["status"] for r in records.values()), 37)
+        self.assertEqual(sum("selected" in r["status"] for r in records.values()), 48)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,7 @@ pub enum CloseMode {
     /// Native non-force Abort: RAP Abort, without ForceAbort's admission rules.
     Abort = 8,
     DeactivateNode = 9,
+    Deactivate = 10,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) struct LocalCloseRequest {
@@ -146,7 +147,7 @@ fn mark_deleted(state: &mut EntityState) {
         state.cleanup_pending = true;
     }
 }
-fn dropped_description(state: &EntityState) -> Replica {
+pub(super) fn dropped_description(state: &EntityState) -> Replica {
     // Native CreateDroppedReplicaDescription resets roles, package, LSNs and endpoints.
     Replica {
         node: state.body.replica.node.clone(),
@@ -175,6 +176,9 @@ fn report(state: &EntityState) -> ReplicaUp {
     }
 }
 fn semantic_reply(state: &EntityState, mode: CloseMode, effects: &mut Vec<Effect>) {
+    if mode == CloseMode::Deactivate && state.phase == Phase::Closed {
+        effects.push(reconfiguration::deactivate_reply(state));
+    }
     if mode == CloseMode::Delete && state.phase == Phase::Closed && state.local_deleted {
         let body = Box::new(RemoveInstanceReply {
             unit: state.body.unit.clone(),
@@ -220,6 +224,7 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
                     | CloseMode::Abort
                     | CloseMode::ForceAbort
                     | CloseMode::Obliterate
+                    | CloseMode::Deactivate
             )
         {
             // Close/AppHostDown use OnReplicaDown; other terminal origins use OnDropped.
@@ -349,10 +354,21 @@ fn start_close_inner(
         return;
     }
     let was_creating = state.phase == Phase::Opening;
-    if state.body.replica.current_role == 2 && state.runtime.is_some() && state.usage.is_some() {
+    if (matches!(state.body.replica.current_role, 2 | 3)
+        || (state.body.replica.current_role == 4 && state.swap.is_some())
+        || (state.body.replica.current_role == 1
+            && state
+                .reconfiguration
+                .as_ref()
+                .is_some_and(|c| c.stage == ConfigurationStage::Retiring)))
+        && state.runtime.is_some()
+        && state.usage.is_some()
+    {
         if let Some(peer) = &mut state.peer_creation {
-            if matches!(mode, CloseMode::Close | CloseMode::Drop | CloseMode::Abort)
-                && state.phase == Phase::Ready
+            if matches!(
+                mode,
+                CloseMode::Close | CloseMode::Drop | CloseMode::Abort | CloseMode::Deactivate
+            ) && state.phase == Phase::Ready
             {
                 peer.close_started_open = true;
             }
@@ -361,7 +377,7 @@ fn start_close_inner(
                     || (state.phase == Phase::Closing
                         && ((matches!(
                             state.close_mode,
-                            Some(CloseMode::Close | CloseMode::Drop)
+                            Some(CloseMode::Close | CloseMode::Drop | CloseMode::Deactivate)
                         ) && peer.close_started_open)
                             || peer.delete_operation != 0)))
             {
@@ -373,7 +389,8 @@ fn start_close_inner(
         mark_deleted(state);
     }
     state.phase = Phase::Closing;
-    state.remote_idle = None;
+    state.remote_idles.clear();
+    state.progress_query = None;
     state.service_description_pending = false;
     state.close_mode = Some(mode);
     state.close_token = token;
@@ -565,12 +582,26 @@ pub(super) fn transition(
             let body = request.replica.0;
             let stateful = matches!(work.kind, Kind::DeleteReplica { .. });
             if stateful {
+                if current.is_some_and(|s| {
+                    s.peer_creation.is_some()
+                        && body.unit.current.older_than(s.body.unit.current)
+                        && body.replica.id < s.body.replica.id
+                        && body.replica.instance < s.body.replica.instance
+                }) {
+                    return Ok(Transition::ignored(Disposition::IgnoredStale));
+                }
                 if !body.service.stateful
                     || body.service.persisted
                     || body.service.group
                     || body.service.partitions != 1
-                    || body.service.target != 1
-                    || body.service.minimum != 1
+                    || !valid_stateful_sizes(&body.service)
+                    || ((body.service.target != 1 || body.service.minimum != 1)
+                        && current.is_none_or(|s| {
+                            s.phase != Phase::Closed
+                                || s.reconfiguration
+                                    .as_ref()
+                                    .is_none_or(|c| c.stage != ConfigurationStage::Complete)
+                        }))
                     || body.service.activation_mode != 0
                     || !body.service.scaling.0.is_empty()
                     || body.replica.node != admission.local_node
@@ -589,7 +620,14 @@ pub(super) fn transition(
                     ));
                 }
                 if let Some(original) = current.filter(|state| state.peer_creation.is_some()) {
-                    if original.body.replica.current_role != 2 {
+                    if original.body.replica.current_role != 2
+                        && !(original.phase == Phase::Closed
+                            && original.reconfiguration.as_ref().is_some_and(|c| {
+                                c.stage == ConfigurationStage::Retiring
+                                    || (c.stage == ConfigurationStage::Complete
+                                        && original.peer_host_loss())
+                            }))
+                    {
                         return Err(Failure::Unsupported(
                             "peer deletion requires an original opening or opened Idle",
                         ));
@@ -622,7 +660,10 @@ pub(super) fn transition(
                 fm_primary: stateful,
                 primary_deactivation: stateful.then_some((Epoch::default(), -2)),
                 peer_creation: None,
-                remote_idle: None,
+                remote_idles: vec![],
+                reconfiguration: None,
+                swap: None,
+                progress_query: None,
                 // TryCreateFailoverUnit constructs from ID, consistency and
                 // service, NOT the incoming previous epoch/target/minimum.
                 body: Arc::new(AddInstance {
@@ -839,8 +880,10 @@ pub(super) fn transition(
             let mode = state.close_mode.unwrap();
             let mut effects = Vec::new();
             if event.error == 0 {
-                if matches!(mode, CloseMode::Close | CloseMode::Drop | CloseMode::Abort)
-                    && state.runtime.is_some()
+                if matches!(
+                    mode,
+                    CloseMode::Close | CloseMode::Drop | CloseMode::Abort | CloseMode::Deactivate
+                ) && state.runtime.is_some()
                     && state.usage.is_some()
                 {
                     if let Some(peer) = &mut state.peer_creation {

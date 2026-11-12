@@ -50,7 +50,7 @@ class GenerationUpdateMessageBody : public Serialization::FabricSerializable {
         lines = []
         for action in consumer.GENERATION_ACTIONS:
             factory = ("CreateFMToRAMessage"
-                       if action in {"GenerationProposal", "GenerationUpdate"}
+                       if action in {"GenerationProposal", "GenerationUpdate", "LFUMUploadReply"}
                        else "CreateRAToFMMessage")
             lines.append(f'RSMessage::{action} = {factory}(L"{action}", true);')
         text = "\n".join(lines)
@@ -67,15 +67,16 @@ class GenerationUpdateMessageBody : public Serialization::FabricSerializable {
                 with self.assertRaisesRegex(ValueError, "native generation factory"):
                     schema.generation_factories(Path("unused-source-model"))
 
-    def test_catalog_selects_only_handshake_not_upload_or_full_rebuild(self):
+    def test_catalog_selects_live_upload_without_full_rebuild_or_fmm(self):
         root = Path(__file__).resolve().parents[2]
         with (root / "docs/cluster/NativeRaRegistry.csv").open(newline="") as stream:
             rows = {row["action"]: row for row in csv.DictReader(stream)}
-        for action in consumer.GENERATION_ACTIONS:
+        for action in consumer.GENERATION_ACTIONS - {"LFUMUpload", "LFUMUploadReply"}:
             self.assertIn("selected-C7", rows[action]["status"])
             self.assertEqual(rows[action]["boundary"], "true")
-        for action in ["LFUMUpload", "LFUMUploadReply", "GFUMTransfer"]:
-            self.assertNotIn("selected", rows[action]["status"])
+        for action in ["LFUMUpload", "LFUMUploadReply"]:
+            self.assertIn("selected-C14", rows[action]["status"])
+        self.assertNotIn("selected", rows["GFUMTransfer"]["status"])
         text = (root / "docs/cluster/NativeRaProtocol.md").read_text()
         for term in [
             "116 inputs", "75 types/237 fields", "120 bundle files",

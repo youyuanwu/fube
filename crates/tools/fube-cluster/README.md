@@ -1,6 +1,6 @@
 # Bounded native-free FM cluster
 
-This tool owns one in-memory FM and exactly two child processes running the
+This tool owns one in-memory FM and, by default, two child processes running the
 existing local RA/Hosting/runtime. It supports only the fixed
 `ClusterStatelessApp/ClusterService/Code/ClusterStatelessType` package. This is
 not native Federation interoperability, full M1, recovery, failover or a general
@@ -10,6 +10,171 @@ An explicit `--stateful-singleton` variant admits the existing
 `hosting-local-app` volatile package and one fresh 1/1 Primary lifetime per node.
 The two nodes host independent singleton partitions, not two replicas or an HA
 configuration. Stateless remains the default.
+
+`--stateful --target-replica-set-size N --min-replica-set-size M` /
+`ServiceProfile::Stateful { target: N, minimum: M }` creates one volatile
+partition on N original nodes, with **immutable** settings satisfying
+`1 <= M <= N <= 64`. The ceiling is an implementation resource limit, not
+an SF replica-set-size rule; existing message, metadata and output budgets
+remain enforced. Process qualification covers up to five replicas, not every
+size up to that ceiling.
+
+Send the existing `create` command for node1. Driving the cluster automatically
+builds the original Secondary destinations, one at a time, then admits all
+successful Idles through unchanged-Primary reconfiguration. Target/minimum
+are present from the first AddPrimary/CreateReplica, and neither the settings
+nor the service update version changes during admission. Minimum and
+configuration-derived quorum remain separate: opening the Primary alone
+does not bypass native write-access checks.
+
+For N > 1, the create operation remains pending until every exact peer
+activation and final RAP/FM configuration completion; `nodes[0].observed`
+can already say `running` for the local Primary. Poll `configuration.ready`
+or the retained create result, not registration or transport completion.
+Status exposes `replica_set: { target, minimum, immutable: true }`.
+For N = 1 the normal AddPrimary completion settles creation.
+
+After completed initial membership or explicit repair, a matched Primary app-host
+loss can start no-data-loss failover on the original live Node/RA sessions. Available
+Secondaries need not all have identical progress. RA collects per-member
+GetLSN/history, checks separate PC/CC read quorums, selects using deactivation
+history before LSN and can redirect the FM candidate with ChangeConfiguration.
+All required surviving Deactivate/Activate commits and final RAP/FM completion
+precede endpoint publication. FM-link loss alone cannot authorize promotion.
+Configured sizes and service version remain unchanged; current membership may
+shrink, respecting minimum when removing additional down Secondaries.
+
+After completed failover and processed predecessor deletion,
+`Cluster::repair_primary_replica().await` explicitly restores one missing member
+at the unchanged target/minimum. All other members must remain live. Continue
+`drive()` and poll `repair.ready`: fresh host ownership and Ready/Idle copy
+completion alone are not active membership. Physical predecessor cleanup gates
+a fresh host/incarnation; native creation, copy, every surviving S/S Deactivate
+and Secondary Activate commit precede final RAP/FM completion. The same live
+Node/RA/store/peer Channels support repeated failover/repair cycles.
+
+`Cluster::repair_secondary_replica(node).await` explicitly repairs one matched
+Secondary app-host loss on its original live Node, without moving or reopening
+the healthy Primary. Native same-Primary removal must finish before fresh-host
+replacement, real copy and readmission. Target/minimum and service version
+remain unchanged. Poll `repair.ready`; `removed` and `built` are intermediate
+states, not restored redundancy. Repeated Secondary repair can precede Primary
+failover/repair.
+
+SF does not remove a down Secondary at minimum without a ready spare. This
+original-node-only topology therefore rejects repair when minimum equals target;
+it never lowers minimum or invents a spare placement. Multiple losses also
+reject a new repair. A further loss during repair makes it unknown and blocks
+host replacement/completion. Before any replacement starts, a matched Primary
+app-host loss during pending Secondary removal can instead supersede removal:
+it retains the original PC and CC set (including the failed Primary as down S),
+checks both read quorums and completes normal GetLSN/history/catch-up and
+survivor phase commits. `repair.state` becomes `superseded`, not ready; the new
+Primary can serve. After completed supersession, explicitly restore the two known
+losses with `repair_secondary_replica(node)`: above minimum, repair the down CC
+Secondary (old Primary) first, then the previously removed placement. At minimum,
+rebuild the already-removed placement first: a fresh Ready Idle permits combined
+down-Secondary removal and Idle admission without shrinking CC below minimum.
+Then rebuild the old Primary's placement to restore target. For superseded 4/3,
+call `repair_secondary_replica(2)`, wait for `repair.ready`, then call
+`repair_secondary_replica(1)`. Each fresh-host/copy/admission cycle must finish
+before the next starts. `repair.ready` is per-cycle;
+`repair.target_restored` identifies full target and `repair.remaining_lost`
+lists the remaining placements. CC removal still obeys minimum/Ready-Idle
+accounting, and another loss fences restoration rather than enabling recovery.
+FM-link loss and interruption during copy/readmission do not authorize this
+bounded exception. Minimum counts configured CC members, not Ready survivors;
+data-plane writes still require their actual quorum.
+
+The configured profile still rejects resize, planned transfer and healthy
+Secondary retirement. Host replacement is explicit, never automatic.
+Insufficient read quorum blocks failover without declaring data loss. Additional
+loss during an in-flight transition makes its ownership unknown, not successful,
+except for the bounded pre-replacement Primary-loss supersession above.
+Another configured failover requires completed repair; general multi-loss repair,
+broader interrupted/superseding recovery and whole-node/FM restart remain unsupported.
+The named profiles below remain
+separate qualification paths, including their historical size transitions and
+repeated failover/repair.
+See [native mapping and acceptance](../../../docs/cluster/MinimalFmCluster.md#immutable-configured-initial-membership).
+See [configured failover evidence and limits](../../../docs/cluster/MinimalFmCluster.md#immutable-configured-primary-failover).
+See [configured repair evidence and limits](../../../docs/cluster/MinimalFmCluster.md#immutable-configured-primary-repair).
+See [Secondary-loss repair semantics and limits](../../../docs/cluster/MinimalFmCluster.md#standalone-secondary-app-host-loss-repair).
+
+`--stateful-three` / `ServiceProfile::StatefulThree` is a separate, fixed
+three-node volatile profile. Create only the original node1 Primary. Then call
+`Cluster::add_idle_replica_on(2)` and `add_idle_replica_on(3)` in either order.
+Drive until `status()["idle_build"]["ready"]` is true; each entry in `builds`
+retains its own native AddReplica request/reply and retry ownership.
+`Cluster::activate_idle_replica()` then admits both built Idles in one healthy
+1-to-3 DoReconfiguration, with target/minimum 3/2. Poll `configuration.ready`.
+The APIs, not additional stdin commands, own build/configuration admission.
+
+Both exact peer Activate replies and the final RAP EndReconfiguration must
+complete before the FM configuration is ready. Both destinations copy actual
+nonempty data and remain non-writers. A fresh write needs the Primary plus one
+Secondary, not both; missing members never restore the historical singleton
+quorum. Source-bound process tests also lose/replay build and final configuration
+replies, preserve all original owners/one Open each and verify independent
+three-child cleanup. The bounded Primary app-host failover and explicit repair
+below are supported; planned transfer, general replacement/retirement,
+generation upload, data loss and node/runtime adoption remain gated for this profile.
+See [source mapping and limits](../../../docs/cluster/MinimalFmCluster.md#healthy-three-replica-service).
+
+Once that original 3/2 configuration is complete, a matching native terminal
+report for node1's Primary automatically starts one no-data-loss failover to
+node2, provided both original Secondaries remain available. FM-link loss alone
+cannot authorize it. Original per-peer listeners/Channels connect the surviving
+RAs directly; no new process/runtime/service Open or replica build is substituted.
+Actual local/remote GetLSN must return matched initialized progress and compatible
+history before promotion/catch-up. Native S/S Deactivate is metadata-only, not
+Close or disposal; its committed reply precedes Activate and final RAP/FM
+completion. Poll `configuration.kind=primary_failover` and `configuration.ready`.
+Only the exact new-Primary completion publishes its service endpoint.
+
+The resulting current membership is node2 Primary plus node3 Secondary, still
+with desired target/minimum 3/2 and write quorum two. Original nonempty data
+continues on those owners. There is no automatic replacement of node1 or quorum
+fallback if another member is lost. Lost final replies replay without another
+promotion/Open; repeated old-Primary loss reports cannot undo the new endpoint.
+This first-cycle example qualifies Primary **app-host** loss with its RA/Node
+alive, not node/FM process failover, restart, mismatched-history repair or
+data-loss recovery. See [the SF flow and evidence](../../../docs/cluster/MinimalFmCluster.md#three-replica-primary-app-host-failover).
+
+After completed failover and the old Primary's processed native loss/deletion,
+`Cluster::repair_primary_replica().await` explicitly starts one repair on node1.
+Continue `drive()` and poll `status()["repair"]["ready"]`. The original Node/RA,
+store and peer Channels remain owned; the original dead app must be reaped,
+its process group drained, acquisitions released and Hosting directory removed
+before a new app host, registration and runtime can be installed. The old IPC
+gate is never revived. This is fresh volatile creation/copy, not persisted Open,
+runtime adoption or reuse of the lost replica's data/identity.
+
+The new Primary owns native AddReplica -> CreateReplica/Reply -> RAP build ->
+AddReplicaReply for a strictly newer node1 replica ID/incarnation. Actual
+nonempty copy precedes same-Primary reconfiguration from two to three current
+members. Desired target/minimum stays 3/2; service version and data-loss epoch
+do not change. Actual catch-up, committed S/S metadata Deactivate, both Activate
+replies and final RAP/FM completion restore 1P+2S. Lost replies replay the same
+operation. The new Primary and surviving Secondary never reopen; old reports
+and Delete traffic cannot retire the fresh owner. After repair one Secondary
+can be lost while writes continue; losing both still prevents acknowledgments.
+Shutdown verifies old and new app cleanup even if repair is interrupted before
+FM admits the new host. This is explicit app-host repair, not automatic
+placement or whole-node/FM restart.
+See [source mapping and qualification](../../../docs/cluster/MinimalFmCluster.md#post-failover-third-replica-repair).
+
+Once repair completes, another loss of the current Primary app can repeat this
+flow. FM uses latest committed membership and the lowest ready Secondary
+placement as candidate; both current Secondaries' matched progress/history are
+still required. Call `repair_primary_replica()` after each failover to restore
+1P+2S at unchanged 3/2. Poll `repair.ready` for that cycle, not an older completed
+configuration. Each replacement uses a strictly newer identity and physically
+cleans its exact predecessor; the same Node/RA/store/peer sessions remain alive.
+Three real-process cycles, repeated lost replies, stale predecessor traffic and
+interrupted-second-repair cleanup are qualified. Concurrent repair/failover,
+lagging-history selection, data loss and whole-node/FM recovery remain gated.
+See [repeated-cycle SF mapping and limits](../../../docs/cluster/MinimalFmCluster.md#repeated-live-session-primary-failover-and-repair).
 
 `--stateful-peer-idle` is a separate fresh-start, fixed-generation opt-in:
 node1 alone receives FM AddPrimary; node2 is the bound remote volatile Idle
@@ -31,6 +196,61 @@ Local explicit removal cancels the FM add obligation and fences late success,
 without claiming FM RemoveReplicaReply or destination disposal. Original session
 loss yields unknown, never recovery or transparent adoption.
 
+`Cluster::activate_idle_replica().await` is the separate opt-in same-Primary
+configuration path after successful FM Idle build. It sends native
+DoReconfiguration with a versioned service-size update to target/minimum 2/1.
+Real RAP catch-up, peer Activate/Reply, secondary role callbacks and the final
+RAP EndReconfiguration precede DoReconfigurationReply. Poll root
+`configuration.ready`; neither an Idle build nor peer activation completes FM.
+The destination becomes ActiveSecondary, not another Primary or a new
+application listener. The original Primary endpoint remains unchanged.
+Current two-member and previous singleton quorum obligations stay distinct:
+loss of the Secondary cannot acknowledge a fresh write from the old singleton.
+Exact original requests retry/replay without repeating Open/build/role work.
+Outside the explicit retirement/replacement and planned transfer below,
+Idle removal/replacement, node/service mutations, generation upload and
+additional configurations remain gated; owner
+shutdown remains available. See the [source mapping and acceptance boundaries](../../../docs/cluster/MinimalFmCluster.md#same-primary-active-configuration-stage-5-increment).
+
+`Cluster::retire_secondary_replica().await` explicitly retires the **healthy
+original ActiveSecondary**, keeping the same Primary. Native 2-to-1
+DoReconfiguration retains the two-member previous quorum until real RAP Catchup
+succeeds, then Deactivate drops/closes the original Secondary before replying.
+Final RAP EndReconfiguration and committed native FM completion remove the
+retired member. Poll `configuration.kind=same_primary_retirement` and
+`configuration.ready=true`; `peer_idle.state=retired_secondary` is not active
+membership. No synthetic Idle RemoveReplica/Reply completes this path.
+Explicit `delete_idle_replica_via_fm()` must still join its semantic reply with
+independent original disposal/usage-release proof before
+`replace_idle_replica()` can build the one fresh successor.
+`activate_idle_replica()` then reactivates that built Idle through real RAP.
+`configuration.history`/`idle_predecessor` preserve the predecessor results.
+Original processes, factory/runtime owners and Primary endpoint stay unchanged.
+Host loss never authorizes retirement or restores singleton quorum; second
+replacement, concurrent supersession and restart stay gated.
+See the [source mapping and evidence limits](../../../docs/cluster/MinimalFmCluster.md#healthy-configured-secondary-retirement-and-replacement).
+
+`Cluster::transfer_primary().await` explicitly transfers Primary from node 1
+to node 2 after completed healthy two-member active admission, including the
+supported replacement. Native phase-0 RAP demotion/write revocation must finish
+before peer DoReconfiguration continuation. The candidate then obtains actual
+local RAP and peer GetLSN progress, promotes/catches up, activates the demoted
+member and completes final RAP configuration and its committed FM reply.
+The native default PC=CC path skips phase-3 Deactivate; neither member reopens
+or rebuilds. Existing data and node/app/factory/runtime owners remain intact.
+Poll `configuration.kind=planned_primary_transfer` and `ready=true`.
+Only the exact new-Primary reply publishes node 2's endpoint in `nodes[1]`;
+the old endpoint is withdrawn while pending, and its retained listener rejects
+writes after real demotion. Proxy endpoint ACKs and optional native 30-second
+ReplicaEndpointUpdated/Reply publication remain distinct from final completion.
+Prior requests/replies remain in `configuration.history`; current swap
+phase/error is in `nodes[].retained_work.local_replica.swap`.
+Lost replies replay the retained continuation/completion without another Open.
+New-Primary loss yields unknown, never failback or quorum reduction. Second/
+reverse transfer, progress mismatch repair, swap abort, automatic failover,
+restart and full native handler/interoperability qualification remain gated.
+See the [source mapping and acceptance boundaries](../../../docs/cluster/MinimalFmCluster.md#healthy-planned-primary-transfer).
+
 `Cluster::remove_idle_replica_via_fm().await` lets FM cancel its original pending
 creation, retire failed creation or abandon the original opened Idle through native RemoveReplica/Reply,
 whether unbuilt, building, built or failed build.
@@ -50,7 +270,26 @@ service/data and registration remain intact; no remote deletion, active membersh
 or automatic removal after successful build is inferred. A late destination Open
 is ignored by the Primary and cannot start build; any resulting destination
 service remains owned until explicit cleanup or shutdown. Manual pre-Open,
-broader down/arbitrary-unknown cleanup and replacement remain gated.
+broader down/arbitrary-unknown cleanup and replacement outside the explicit
+fresh-Idle slice below remain gated.
+
+`Cluster::replace_idle_replica().await` explicitly authorizes **one fresh Idle**
+after the original successful FM build, matched Primary RemoveReplicaReply,
+normal non-force destination DeleteReplicaReply and independently verified
+original runtime disposal/committed Close/exact usage release. Both original
+node/app sessions must remain live. It is not automatically enabled by deletion,
+and does not admit failed/absent/host-lost predecessors or app adoption.
+The new replica ID/incarnation exceed the original IDs, with a new service/
+replicator lifetime on the same resident factory/processes. The normal native
+Add/Create/build sequence recopies nonempty Primary state and continues
+replication; poll `idle_build.ready` for semantic completion. The successor
+remains Idle/InBuild, non-serving and unconfigured.
+Repeated calls retry/observe that same successor; a second replacement is gated.
+`status()["idle_predecessor"]` retains original Add/Remove/Delete outcomes and
+disposal proof, while the ordinary Idle status fields follow the successor.
+Old messages/proofs cannot retire or complete the new lifetime. The successor
+supports explicit normal removal/deletion with its own matching proof.
+See the [source mapping and evidence limits](../../../docs/cluster/MinimalFmCluster.md#explicit-fresh-idle-replacement).
 
 `Cluster::delete_idle_replica_via_fm().await` separately authorizes native
 `DeleteReplica(force=false)` on the **original destination**,
@@ -242,7 +481,7 @@ metadata deletion and independent Primary removal/no-reuse boundaries are
 preserved. Controlled real provider/service disposal verifies actual Abort,
 lost-ACK retry and stable proof/metadata replay; model/store tests cover
 admission, both ACK lists and intent/completion/ACK commit barriers.
-HostDown during Abort, failed/ForceAbort reporting and replacement remain
+HostDown during Abort, failed/ForceAbort reporting and broader replacement remain
 gated. No new child-node control feature or native handler qualification is
 added; see the [bounded Abort guide](../../../docs/cluster/MinimalFmCluster.md#normal-opened-destination-abort-reporting).
 
@@ -429,17 +668,27 @@ the native default five-second FM scan interval. Status includes current intent,
 pending control, type status, service-update version and load receipt presence.
 Real service-description/load IPC and node-wide barriers are described in
 [stage-two coordination](../../../docs/cluster/MinimalFmCluster.md#node-wide-coordination-stage-2).
-Live endpoint publication, general multi-FT deployment and FMM remain gated.
+General endpoint publication outside the bounded planned swap, multi-FT
+deployment and FMM remain gated.
 
 The programmatic `Cluster::begin_generation_handshake()` starts the bounded
 ordinary-FM GenerationProposal/Reply and GenerationUpdate/Reject round.
 It requires two admitted nodes without pending lifecycle/control requests.
 This is opt-in, not a CLI command or a change to default bootstrap. Proposed,
 receive and send generations remain distinct; only receive changes on a
-matching Update. The round stops at `awaiting_upload`, `complete=false`:
-LFUM upload is not implemented, send generation does not advance, and new
-mutations/service updates are gated. Existing serving replicas and independent
-owned shutdown are not replaced. See the [stage-3 increment and remaining gates](../../../docs/cluster/MinimalFmCluster.md#ordinary-fm-generation-handshake-stage-3-increment).
+matching Update. The round waits at `awaiting_upload`, `complete=false`:
+the RA queues per-entity committed-inventory reads, then sends native correlated
+LFUMUpload/Reply on the same session. Only a reply matching current receive
+generation advances send generation. FM retains both exact original inventories
+in `generation_handshake.uploads`; both processed reports set `phase=complete`,
+`complete=true` and allow new-generation mutations/service updates.
+Lost replies retry the frozen metadata after the native 30-second interval,
+without blocking owner shutdown or reopening replicas. Existing Primary data
+and original node/app/runtime ownership remain intact. This is one live-session
+round for stateless/independent singleton profiles, not application-data upload,
+unknown-partition reconstruction, peer-profile upload, nonempty NodeUp,
+full ReplicaUp batching, FM/FMM recovery or durable restart.
+See the [source mapping and remaining gates](../../../docs/cluster/MinimalFmCluster.md#live-session-lfum-upload).
 
 Native NodeUp/Ack and the final empty ReplicaUp/Reply precede RA construction.
 FM learns the actual generated package version from the original node's bounded

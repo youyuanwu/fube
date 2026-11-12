@@ -3,6 +3,9 @@
 **Profile:** one foreground in-memory FM, two separate RA+Hosting processes,
 and one fixed stateless application profile. Explicit placement only; no
 automatic recovery, reconnect, failover or native FM/Federation parity.
+An opt-in [healthy three-replica profile](#healthy-three-replica-service) runs
+three original RA+Hosting processes for one volatile partition at target/minimum
+3/2. The default and existing two-node profiles are unchanged.
 
 The explicit `--stateful-singleton` variant now enables fresh FM-authorized
 volatile 1/1 Primary creation, using the separate `hosting-local-app` package.
@@ -13,6 +16,413 @@ The [launcher guide](../../crates/tools/fube-cluster/README.md) defines invocati
 bounded JSON commands, independent application contact and cleanup receipts.
 It uses the production local Node/RA/Hosting/runtime, memory store and common
 transport engine, not simulated application activation.
+
+## Immutable configured initial membership
+
+The configured volatile profile is selected with
+`--stateful --target-replica-set-size N --min-replica-set-size M`, or
+`ServiceProfile::Stateful { target: N, minimum: M }`. It creates one partition
+on N original nodes, validates `1 <= M <= N <= 64` before acquiring a deployment,
+and freezes both settings for that deployment. The 64-member ceiling is a Rust
+resource bound, not an ordinary-service restriction from native SF. Existing
+bounded serialization, metadata, command and output limits remain in force.
+
+The existing node1 `create` command opens the Primary, then the foreground
+controller builds each original Secondary with AddReplica/CreateReplica and
+real RAP copy before one unchanged-Primary DoReconfiguration. Successful
+Ready/Idle replies are not active membership. All exact peer Activate replies,
+their applied RA commits and final RAP EndReconfiguration/FM reply must complete
+before the retained create result becomes complete. A local `observed: running`
+Primary is not that service-level completion. Settings are present in every
+initial Open/build body, remain unchanged through admission and do not cause
+a service update-version increment. Only configuration epochs advance.
+
+Source correspondence at `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`:
+
+- `ServiceModel/reliability/failover/ServiceDescription.cpp:239-258` validates
+  positive stateful minimum and minimum no greater than target.
+- `fm/PlacementTask.cpp:43-117` computes placement difference from desired
+  target separately from existing/in-build membership.
+- `fm/ReconfigurationTask.cpp:377-418` admits ready Idles using the service's
+  configured minimum and removes excess members relative to target; admitting
+  members is not a service-description resize.
+- `ra/FailoverUnit.cpp:5962-5973` carries configured service sizes into the FT
+  description; `fm/FailoverUnitConfiguration.h:64-68` derives read/write quorums
+  from configuration membership rather than treating minimum as a quorum override.
+
+RA and Node accept validated initial configured sizes and generic ready P/P +
+I/S vectors. The existing per-peer activation accounting, exact owner/endpoint
+checks, separate PC/CC projection and commit barriers are reused. The configured
+adapter rejects incoming size changes and keeps unsupported lifecycle operations
+explicitly rejected. Original per-peer Channels and process cleanup receipts
+remain deployment/session/node bound; clean handoff now accounts for variable
+child counts without relaxing physical-owner cleanup.
+
+Acceptance covers `1/1`, `2/1`, `3/2`, `4/2`, `4/3`, `5/3` and `4/4`, real copy
+and application replication, blocked initial writes below minimum, lost final
+configuration-reply replay and clean original-owner shutdown. Four-member
+quorum checks distinguish configured minimum from actual majority: `4/2` cannot
+acknowledge with only two live members, while `4/4` can still acknowledge with
+three live members in its unchanged four-member configuration. RA tests pause
+each activation commit and reject malformed membership/ownership. Foreground
+acceptance builds four replicas from one create and relaunches only after clean
+handoff. These checks do not qualify every size up to 64.
+The RA model also exercises all 63 remote activation commits at target/minimum
+64/32; effect reservations scale with bound peer count before persistence.
+A native-shaped target-changing request that the legacy two-member retirement
+path could accept is rejected by the immutable profile's actual ingress.
+
+This initial slice deliberately waits for all original build destinations and
+admits them together. The failover extension below adds loss-driven promotion.
+Incremental/partial admission, resize, generic planned transfer,
+healthy Secondary retirement, whole-node/FM restart and persisted recovery remain
+unsupported for this new profile. The older named profiles remain separate
+qualification fixtures with their existing behavior; their bounded lifecycle
+support is not implicitly enabled for arbitrary configured sizes.
+
+## Immutable configured Primary failover
+
+After completed initial admission, a matched native terminal report for the
+Primary's app-host can start no-data-loss failover for the configured
+profile. The original FM, Nodes/RAs, stores and peer Channels remain owned.
+FM-link disappearance is not proof of Primary failure. No new service Open,
+host adoption, private data-engine access or size update is substituted for
+the normal RAP callbacks.
+
+FM keeps PC from the last committed membership and removes the failed Primary
+from CC. Other unavailable Secondaries can leave CC only while its count is
+above the configured minimum, matching `fm/ReconfigurationTask.cpp:325-344`.
+Desired target/minimum and service update version remain unchanged. Available
+members must cover PC's read quorum before this no-data-loss-only adapter
+starts promotion; it does not use minimum as a read/write-quorum override.
+
+RA retains one GetLSN result/history per exact replica incarnation. Phase 1
+checks PC and CC read quorums separately, waits for up replicas for the native
+dynamic 30-second progress-query duration, and never converts timer expiry into
+quorum success. Candidate selection filters older deactivation primary epochs
+before comparing last LSN, then considers first-LSN catch-up capability.
+Different survivor LSNs no longer reject an otherwise valid failover.
+
+If another member is preferable, RA commits ChangeConfiguration with initialized
+LSNs **only for that selected member**, reverts its local promotion intent and
+does not call RAP to promote itself. FM fences the exact configuration/source,
+advances the Primary epoch and sends DoReconfiguration to the new candidate,
+which performs its own GetLSN round. Exact duplicate reports replay the current
+round without another epoch bump. Candidate-report retention is bounded by the
+configured node count.
+
+The native FM still emits ChangeConfigurationReply, but pinned RA marks that
+action Deprecated. The Rust adapter explicitly rejects/logs it and exposes
+`deprecated_change_configuration_reply.state = rejected`; no RA state command
+or retry-completion gate depends on it. New GetLSN/DoReconfiguration traffic,
+not this legacy reply, advances the redirected transition.
+
+Catch-up uses the existing runtime projection of separate PC/CC configurations.
+Every required up Secondary's metadata-only Deactivate reply and Activate reply
+is accounted independently, after its applied RA commit. Retries target only
+outstanding members. Final RAP EndReconfiguration and the committed native FM
+reply precede publishing the new Primary endpoint. A lost final reply replays
+completion without another Open or promotion.
+
+Native correspondence at the pinned revision:
+
+- `ra/FailoverUnit.cpp:1929-2202`: eligible progress, deactivation-epoch filtering,
+  highest-LSN selection and first-LSN catch-up capability.
+- `ra/FailoverUnit.cpp:2878-2926,2968-3055`: ChangeConfiguration versus local
+  catch-up, separate PC/CC read quorum and progress-query waiting.
+- `ra/FailoverUnit.cpp:3123-3248,4153-4188`: phase-3/4 member accounting and
+  selected-candidate-only LSNs in ChangeConfiguration.
+- `ra/FailoverUnit.cpp:3543-3575`: revert candidate roles without rolling back
+  the FT epoch fence.
+- `fm/FailoverUnitMessageProcessor.cpp:529-660`: candidate change and new epoch.
+- `ra/Communication.MessageMetadataTable.cpp:46` and
+  `ra/MessageHandler.cpp:161-165`: explicit deprecated-reply rejection.
+- `common/FailoverConfig.h:633`: dynamic progress-query wait default.
+
+Real-process acceptance covers `2/1`, `4/2`, `4/3`, `4/4`, `5/3` and an
+insufficient-PC-quorum `5/1` case. It verifies nonempty data continuity,
+unavailable Secondaries, final-reply loss/replay, unchanged settings, original
+owners/one Open and cleanup. `4/4` can complete reconfiguration after Primary
+loss but cannot acknowledge a new write below minimum; retaining a down CC
+member at `4/3` does not replace the configuration-derived quorum.
+Separate process acceptance injects a native candidate-change FM input to
+verify new-candidate routing and deprecated-reply rejection without reopening
+survivors; it is not evidence that real differing runtime histories triggered
+selection. RA models cover unequal/older-history progress, catch-up capability,
+redirection/rejoining, read-quorum blocking, expiry and every survivor commit,
+including 64/32. The 64 bound is not 64-process qualification.
+
+This adds no resize, automatic placement/restart, whole-node/FM recovery,
+data-loss exchange or persisted recovery. Another configured-profile failover
+requires the explicit repair below; losses/supersession during a transition
+remain gated.
+
+## Immutable configured Primary repair
+
+`Cluster::repair_primary_replica()` now extends the existing named-profile
+repair path to immutable configured sizes. After completed no-data-loss failover,
+the failed Primary's native loss/deletion must be processed, all original Node/RA
+sessions must remain connected and every other member must still be running.
+Only one missing member is admitted; failover with additional unavailable
+Secondaries does not authorize partial or multi-loss repair.
+
+The same physical predecessor boundary described in
+[third-replica repair](#post-failover-third-replica-repair) is retained: exact
+Closed/deleted RA ownership, original process exit/reaping/group drainage,
+report/command/lookup/acquisition drainage and old Hosting-root removal precede
+a new host gate, app process and runtime registration. FM validates the original
+Node's exact replacement receipt and independently observes old PID/root
+absence. The successor receives a replica ID/incarnation above every retained
+identity. A redirected Primary epoch is accepted without weakening partition,
+source, service, data-loss epoch or newer-incarnation fences.
+
+The current Primary owns native AddReplica/CreateReplica and real RAP
+Open/BuildIdleReplica, copying nonempty state into the fresh volatile Idle.
+Target/minimum and service update version remain unchanged. After semantic
+Ready/Idle completion, same-Primary DoReconfiguration retains every survivor
+in PC and admits exactly one fresh I/S to CC. Each required S/S Deactivate
+reply commits independently before activation; retries address only outstanding
+members. A 2/1 repair has no remote PC Secondary to deactivate. Every CC
+Secondary's Activate reply and final RAP EndReconfiguration/RA commit precede
+FM repair completion. Poll `repair.ready`, not `host_ready` or `built`.
+
+Completed repair authorizes another matched current-Primary failover using the
+latest membership/history. Candidate-redirection retention is scoped to the
+current failover round, so stale reports cannot consume a later round's budget
+or replay its legacy reply. Existing predecessor reports, Delete requests/replies,
+configuration requests and replacement controls remain fenced across cycles.
+Resize and automatic placement/restart remain deferred.
+
+| Pinned SF source | Configured repair responsibility |
+|---|---|
+| `fm/FailoverUnit.cpp:718-739`; `fm/Replica.cpp:555-585` | Reuse a dropped placement with a fresh identity and reset build metadata, independently of target/minimum. |
+| `ra/ReconfigurationAgent.cpp:2244-2324` | A closed local lifetime creates a fresh Idle only for a newer incarnation; it does not recover the lost volatile runtime. |
+| `ra/FailoverUnit.cpp:3091-3248` | Distinct PC/CC obligations and per-member phase-3/4 completion; skip no required survivor or commit. |
+| `ra/ReconfigurationAgent.cpp:2626-2644,2766-2775` | Refresh committed deactivation history for subsequent failover rounds. |
+
+RA and FM models cover configured repair through 64/32, preserving sizes and
+rejecting changed owners, resize, stale/partial replies and survivor loss.
+RA holds each admission, Deactivate, Activate and final completion commit.
+Real-process acceptance runs three failover/repair cycles at 2/1, 4/2, 4/4 and
+5/3, promoting a rebuilt replica and replacing one placement twice. It covers
+nonempty recopy/continuing writes, lost build/final replies, old traffic,
+unchanged original Node/survivor owners and quorum blocking after repair.
+A 4/3 interrupted-second-repair case independently joins cleanup before FM
+admits the new host. The native-input-injected candidate-routing test also
+repairs after redirection and fails over to the rebuilt replica; it remains
+routing/repair evidence, not live differing-history selection qualification.
+
+This reuses existing wire contracts and adds no schema/action. The maintained
+native-stream gate remains 179 cases/55 native truncation rejections, not full
+native C++ handler/Federation interoperability. Sixty-four is a model/resource
+bound, not 64-process qualification. Multi-loss or interrupted transition recovery,
+node/FM restart, data-loss exchange and persisted
+recovery remain unsupported.
+
+## Standalone Secondary app-host loss repair
+
+`Cluster::repair_secondary_replica(node)` explicitly repairs one matched
+ActiveSecondary app-host loss while preserving the original healthy Primary.
+The one-based destination selects an original live Node/RA session, not a new
+placement. Initial admission or the preceding repair must have completed.
+The old replica's loss report and native closed metadata deletion must be
+processed, with every other member and original Node/peer session still owned.
+FM-link disappearance alone cannot authorize replacement.
+
+The pinned FM removes a dropped/down Secondary only while CC plus ready Idles
+exceeds minimum. With no spare placement in this topology, `minimum == target`
+returns an explicit blocked-at-minimum error. No size/service-version update,
+forced quorum reduction or fabricated ready Idle substitutes for that rule.
+Multiple losses reject new repair; insufficient live quorum cannot acknowledge
+a write. This is explicit placement/replacement authorization, not automatic PLB.
+
+First, same-Primary DoReconfiguration preserves PC from the last committed
+membership and removes only the failed S/N from CC. Target/minimum and
+data-loss/Primary epochs remain unchanged; only the configuration counter
+advances. Real RAP catch-up precedes metadata-only S/S Deactivate, then
+RAP-backed Activate for every required live survivor, each behind its applied RA commit.
+Dropped members do not owe phase-3 replies. A two-member service can finish
+removal with no remote Secondary, but still requires final RAP/FM completion.
+The healthy Primary keeps its endpoint, runtime, acquisitions and single Open.
+
+Only the exact successful removal reply permits physical host replacement.
+The same predecessor exit/reaping/group-drain, reporting/command/lookup/usage
+drain and Hosting-root removal fences used by Primary repair apply. A fresh
+host gate, runtime registration and globally newer replica incarnation are
+created on the original Node. Native AddReplica/CreateReplica and real
+BuildIdleReplica copy into an empty volatile application. Existing RAP may
+first remove the old custom-replicator resource; normal FM Add retries then
+continue the fresh build, without a private data-engine hook.
+
+Same-Primary admission retains every survivor in PC and adds exactly the fresh
+I/S to CC. Secondary-only removal/admission retains existing deactivation
+history, rather than inventing a new Primary catch-up boundary. Final RAP,
+per-Secondary activation and RA/FM completion restore target membership.
+Poll `repair.ready`: `removed`, `host_ready` and `built` are intermediate states.
+The current repair and retained predecessor histories fence late reports,
+Delete traffic and stale configuration/build replies across repeated cycles.
+
+A new loss during removal or admission makes repair unknown. A late successful
+reply cannot advance it or start an unproved replacement. The bounded
+[Primary-loss supersession](#primary-loss-during-secondary-removal) below can
+replace removal before host replacement; other overlapping recovery stays gated.
+Known in-flight report epochs remain admitted as terminal loss,
+not relabeled as an FM-link failure. Existing data-plane quorum/access checks
+remain independent of this uncertain control-plane result.
+
+| Pinned SF source | Secondary-loss responsibility |
+|---|---|
+| `fm/ReconfigurationTask.cpp:354-412` | Remove dropped/down Secondaries subject to minimum and ready-Idle accounting; admit built Idles under the unchanged Primary. |
+| `fm/FailoverUnit.cpp:718-739`; `fm/Replica.cpp:555-585` | Reuse a dropped placement only with a fresh identity and reset build metadata. |
+| `ra/ReconfigurationAgent.cpp:2244-2324` | Create a newer Idle from closed metadata; do not recover the lost volatile runtime. |
+| `ra/FailoverUnit.cpp:736-810,2596-2646,3091-3248` | Retain same-Primary deactivation history, skip dropped phase-3 members, and account for required live phase-3/4 completion. |
+
+RA/FM models cover metadata removal and fresh admission through 64/32,
+including unchanged history, commit holds/veto, exact survivor/incarnation
+fences, stale replies and minimum rejection. Real-process qualification runs
+two Secondary replacements at 2/1, 4/2, 4/3 and 5/3, then Primary failover to
+the rebuilt replica and repair of the old Primary. It loses/replays removal,
+build and final admission replies, preserves nonempty data and original owners,
+and verifies continuing acknowledged writes and independently joined cleanup.
+Separate 4/4 minimum, 4/2 and 5/3 quorum-loss, and further-loss-during-removal
+cases reject unsafe progress without weakening write quorum.
+
+No new native schema/action is introduced: the source-stream gate remains
+179 cases/55 native truncation rejections. This is source-derived model/process
+and native-stream/schema-adapter evidence, not full original C++ handler or
+Federation interoperability. Multi-loss repair, spare-node placement, automatic
+restart, broader interrupted-transition recovery, resize and node/FM restart remain
+deferred. The 64 bound is model/resource qualification, not 64-process testing.
+
+## Primary loss during Secondary removal
+
+If the current Primary app host is lost while an explicit Secondary removal
+still awaits its final FM reply, `drive()` can supersede that removal with
+no-data-loss Primary failover. The original Secondary loss/deletion must already
+be processed, no replacement host may have been requested/admitted, and every
+other original Node/RA session and surviving app host must remain live.
+FM-link loss, another Secondary loss, completed removal, and interrupted
+copy/readmission do not authorize this path.
+
+SF distinguishes this from failover out of stable membership. It preserves
+the removal's original PC epoch/roles and CC member set, increments the
+current epoch by `0x1_0000_0001`, and swaps the failed P/P to a down P/S
+while promoting one live S/P. The previously removed S/N stays out of CC;
+the failed Primary is not also removed from CC. Target/minimum, service
+version and data-loss epoch remain unchanged. FM checks separate PC/CC read
+quorums, then RA independently obtains real per-member progress/history and
+uses the existing history-first selection, catch-up, per-survivor
+Deactivate/Activate and final RAP/FM completion before publishing readiness.
+
+Survivors may not yet have received removal, may be deactivated, may have a
+pending RAP activation, or may have completed locally without FM receiving
+the final reply. Each admits only the matching newer failover/query epochs
+and exact retained owners. Secondary-only history is retained until the new
+Primary catch-up establishes its own deactivation boundary. Old peer messages,
+RAP completions, removal replies and retries cannot finish the new transition
+or start the old replacement. `repair.state` becomes `superseded` with
+`superseded_by` naming the failover epoch; `repair.ready` remains false.
+Supersession restores a serving Primary, not target redundancy. The explicit
+[sequential restoration](#sequential-restoration-after-supersession) below can
+then repair the two retained predecessor placements.
+
+| Pinned SF source | Supersession responsibility |
+|---|---|
+| `fm/ReconfigurationTask.cpp:40-48,225-259,320-352` | Reconfigure a lost Primary during an existing transition; retain PC and the CC set, independently checking their read quorums. |
+| `ra/FailoverUnit.cpp:624-672,1737-1751` | Accept newer GetLSN epochs, query the replicator's real status and retain the incoming PC when starting failover. |
+| `ra/FailoverUnit.cpp:1929-2202,2878-2926,2968-3055` | Select using retained history/progress and preserve separate PC/CC quorum obligations. |
+
+RA models cover the four survivor states above at 5/3 and 64/32, commit
+holds/veto, stale completions, exact query epochs, and a CC read quorum that
+cannot substitute for the larger PC read quorum. FM models additionally cover
+4/2, absent quorum at 3/2, FM-link loss, another Secondary loss, host-request
+and completed-removal fences. Real-process 5/3 cases lose removal delivery,
+interrupt phase 3 with deactivated survivors, and hold the final FM reply.
+All retain nonempty data, acknowledge a later write, preserve surviving
+app/runtime/Node ownership and single Open, reject stale replies, avoid
+replacement and independently join shutdown cleanup. A 3/2 process case
+cannot promote its lone survivor, even after the late removal reply arrives.
+These are source-derived model/process results, not native handler or
+Federation interoperability evidence. No native schema/action is added;
+general interrupted recovery, general multi-loss repair, resize and node/FM restart
+remain deferred.
+
+## Sequential restoration after supersession
+
+After completed Primary-loss supersession, the two exact processed predecessor
+losses can be repaired explicitly, one at a time, on their original live
+Node/RA sessions. Above minimum, `repair_secondary_replica(node)` first selects
+the old Primary, now a down CC Secondary, then the previously removed Secondary.
+At minimum, select the already-removed placement first to build a Ready Idle.
+The opposite order and concurrent repair are rejected. This is not a general
+multiple-loss placement/recovery API.
+
+For the qualified 5/3 case, CC starts with four members, three live. Native
+same-Primary removal drops the failed old Primary to reach three; fresh-host
+copy and committed I/S admission restore four live members. Only after that
+cycle completes can the already-removed placement be rebuilt and admitted,
+restoring five live members. Target five, minimum three, service version and
+the new Primary/data-loss epochs never change.
+
+For 4/3, completed supersession instead leaves three CC members, two live.
+`repair_secondary_replica(2)` rebuilds the already-removed Secondary with a
+fresh host and real copy while CC stays unchanged. Only its matching successful
+AddReplicaReply authorizes a same-Primary reconfiguration that retains the
+three-member PC, removes the down S/N and admits the fresh I/S together. CC
+still has three members, now all live; there is no intermediate two-member CC.
+After that cycle completes, `repair_secondary_replica(1)` rebuilds the old
+Primary's placement and admits the fourth member. This uses the two original
+lost placements, not a new spare node, and does not change target/minimum.
+
+Minimum constrains configured CC size, not the number of Ready survivors.
+Two live members in the three-member CC can acknowledge writes with minimum
+three when they have the actual write quorum. Ready-Idle-first restoration
+preserves this behavior; it never lowers minimum or substitutes a copied Idle
+for committed membership. SF's independent PC/CC write-quorum checks during
+same-Primary reconfiguration remain in force
+(`ra/FailoverUnitProxy.cpp:1399-1455`).
+
+Every replacement retains predecessor exit/reaping/group/root cleanup,
+report/lookup/usage drainage, a fresh Hosting gate/runtime and newer replica
+identity. Closed Primary metadata from an interrupted removal is eligible only
+with its exact terminal loss/deletion and a newer Primary's history; an old
+in-flight stage is not converted into successful completion. CreateReplica,
+RAP BuildIdleReplica and real copy remain the sole construction path.
+
+Each cycle admits one fresh replica, not an entire target set. Ordinary
+admission grows membership by one; combined removal/admission keeps its size.
+It preserves every surviving owner and the completed configuration as PC.
+Secondary-only removal/admission retain the serving Primary's deactivation history.
+`repair.ready` means the selected placement completed its cycle;
+`repair.target_restored` becomes true only at full target, and
+`repair.remaining_lost` lists the remaining one-based placements. Final replies
+cannot relabel an unrepaired placement Running. The serving Primary keeps its
+endpoint/runtime and original survivors are neither reopened nor moved.
+Another loss, including loss of a newly built incarnation, fences restoration
+as unknown; late replies cannot resume it or authorize overlapping failover.
+
+This follows pinned `fm/ReconfigurationTask.cpp:354-412` (minimum/Ready-Idle
+accounting and one-member admission), `fm/Replica.cpp:555-585` (new identities),
+`ra/ReconfigurationAgent.cpp:2244-2324` (newer CreateReplica from closed metadata)
+and `ra/FailoverUnit.cpp:736-810,2596-2646,3091-3248` (same-Primary history and
+per-live-survivor phase obligations). RA models restore partial/full membership
+at 4/3, 5/3, 64/32 and 64/63 across all four preceding survivor stages, with
+commit holds and exact-owner/history rejection. FM models additionally cover
+4/2 and Ready-Idle-first restoration at 4/3, 6/5 and 64/63, unprocessed deletion,
+wrong order, concurrent calls and another loss before/during/after repair,
+including loss of the fresh incarnation.
+
+Real 5/3 and 4/3 processes restore both placements after a held final removal
+reply and after a deterministic phase-3 interruption. They lose/retry build and
+admission replies (plus separate removal replies at 5/3), copy nonempty data,
+fence predecessor traffic, retain surviving owners and single Open, acknowledge
+continued writes, then fail over to a rebuilt replica and repair that later
+Primary loss. The 4/3 cases also acknowledge a write while the fresh Idle's
+build reply is held, then recopy that continued data into the old Primary's
+fresh replacement. Shutdown independently joins cleanup.
+Native-stream qualification remains 179 cases; this is not
+native C++ handler/Federation interoperability, generic interrupted-copy recovery,
+automatic restart, resize or durable/node/FM recovery.
 
 ## Run
 
@@ -156,9 +566,8 @@ An unmatched Update sends the native proposed-generation rejection; messages
 below receive are ignored. The generation/publication lock also protects
 locked-entity admission. Already-running commits retain their original
 operation/fence; definite failure and uncertainty cannot publish private state
-or fabricate an uploaded inventory. No snapshot job, LFUMUpload or upload ACK
-is implemented yet, so the handshake never advances send generation or grants
-new serving/restart authority.
+or fabricate an uploaded inventory. The live-session LFUM increment below now
+completes inventory upload without granting new serving/restart authority.
 
 Programmatic `Cluster::begin_generation_handshake()` opts the two original,
 admitted nodes into a bounded FM round only when lifecycle/control requests
@@ -166,21 +575,311 @@ are not pending. It is not a new CLI command and does not change default
 startup. The FM retries proposals and pending updates, restarting negotiation
 above a higher proposal or qualifying rejection. Retry timing uses native
 five-/ten-second defaults; dynamic FM rebuild configuration and Federation
-broadcast membership are not enabled. The round intentionally remains
-`awaiting_upload`, `complete=false`, with mutations/service updates gated.
+broadcast membership are not enabled. The round remains `awaiting_upload`,
+`complete=false`, with mutations/service updates gated until both original
+nodes' LFUM inventories are processed.
 Existing replicas are not reopened or relabeled as recovered; independent
 owner shutdown and real application access remain available.
 
-Only generation-control messages bypass the deployed envelope's frozen launch
-generation. Other live action families remain restricted to that original
-generation until LFUM completion is implemented; the generic RA model does
-apply current receive-generation admission. This is not a fully rebuilt FM or
-native Federation interoperability. Focused model/store tests cover stale and
-duplicate traffic, reordered proposals, definite/unknown commits and queued
-entity admission. Real nodes exercise correlated replies, rejection,
-renegotiation, unchanged send generation and independent sibling access.
+Generation-control messages and correlated LFUM replies have their own native
+admission; ordinary traffic uses the current receive-generation lower bound.
+This is not a fully rebuilt FM or native Federation interoperability.
+Focused model/store tests cover stale and duplicate traffic, reordered
+proposals, definite/unknown commits and queued entity admission. Real nodes
+exercise correlated replies, rejection, renegotiation and independent sibling access.
 Bidirectional native codecs and native ordering/admission helpers are separate
 from the still-required complete C++ handler traces and interoperability gates.
+
+### Live-session LFUM upload
+
+`Cluster::begin_generation_handshake()` now continues through ordinary-FM
+LFUMUpload/Reply on the same two admitted stateless or independent volatile
+singleton sessions. LFUM is the local failover-unit map: this uploads replica
+metadata, not application data, a database backup or a new runtime lifetime.
+The peer-Idle/active-configuration profile remains fixed-generation and excluded.
+
+Pinned SF revision `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the boundaries:
+
+| Source | Preserved contract |
+|---|---|
+| `ra/GenerationStateManager.cpp:359-455` | Capture the ordinary-FM entity set and AnyReplicaFound, then queue a read behind each entity's admitted work. Aggregate only after all jobs finish; no private or uncertain commit is sampled. |
+| `ra/FailoverUnit.cpp:3999-4134`; `ra/Replica.cpp:217-230`; `ra/ReconfigurationAgent.cpp:4345-4357` | Omit locally deleted replicas, retain canonical dropped descriptions for closed replicas, clear reported LSNs and preserve local-map AnyReplicaFound independently of the emitted list. Singleton intermediate epoch/role remain invalid/None. |
+| `common/LFUMMessageBody.h:18-61`; `common/RSMessage.cpp:181-182` | Body order is generation, full NodeDescription, FailoverUnitInfo vector, AnyReplicaFound. High-priority FM request has no GenerationHeader; the high-priority RA reply is bodyless and carries the echoed generation. |
+| `common/RALFUMUploadOperation.cpp:14-39`; `common/FailoverConfig.h:30` | A consuming correlated request owns the frozen upload. Timeout retains that body for a new request after the native 30-second retry interval; node drive and owner shutdown remain independent. |
+| `fm/RebuildContext.cpp:389-486`; `fm/FailoverManager.cpp:2620-2647` | Process inventory before acknowledgment. A duplicate/already-ready or different-generation upload receives its echoed reply without replacing accepted inventory or completing a different round. |
+| `ra/GenerationStateManager.cpp:318-337` | Only a reply equal to current receive generation advances send generation. An older in-flight reply cannot finish a superseding round. |
+
+The bounded surviving FM reconciles reports against its exact original node,
+partition, service, configuration and replica ownership; it does not reconstruct
+unknown partitions or elect writers from reports. `generation_handshake.uploads`
+retains each accepted inventory. Both processed uploads set
+`phase=complete`, `complete=true`, allowing ordinary control/service updates in
+the new generation. An individual RA keeps its upload pending until its own
+matching semantic reply; transport receipt and diagnostic observation files
+cannot substitute for that reply. A lost reply replays the same inventory even
+after FM has completed the round.
+
+Model/store tests cover multi-entity barriers, failed/unknown private commits,
+empty maps versus deleted-only maps, exact/stale/FMM replies and duplicate FM
+receipts. Original-process acceptance covers empty/nonempty inventories,
+renegotiation, resumed new-generation Add/Delete, an actually lost LFUM reply
+and native-interval retry, and continuing nonempty Primary data on the original
+app/runtime owners. FM-channel loss during an owned upload leaves it pending
+without advancing send generation or shutting down the original serving app.
+Native-stream/schema-adapter evidence adds six cases:
+169 bidirectional cases, 84 types/255 fields, 173 bundle files and 49 actual
+native truncation rejections. Full C++ handler traces/interoperability,
+nonempty NodeUp reconciliation, full ReplicaUp batching/final upload, peer
+configuration upload, FM/FMM rebuild and durable restart remain unqualified.
+
+## Healthy three-replica service
+
+`ServiceProfile::StatefulThree` (`--stateful-three` for startup) extends the
+native-free harness to three original nodes and one volatile partition.
+Only node1 receives AddPrimary. After it is ready, the public
+`Cluster::add_idle_replica_on(2)` and `add_idle_replica_on(3)` APIs independently
+authorize the two original destinations. Either build order is supported.
+Each native AddReplica drives its exact CreateReplica/Reply, RAP Build and
+AddReplicaReply, with separately retained retry/error/identity state.
+`idle_build.builds` exposes those semantic FM outcomes; aggregate `ready`
+requires both successful replies, not node observations or completed socket writes.
+
+After both builds, `activate_idle_replica()` sends one healthy same-Primary
+1-to-3 configuration with target/minimum 3/2. Previous membership contains only
+the Primary; current membership contains that same Primary and both Secondaries.
+The existing runtime projects those quorum obligations separately. RAP catch-up
+precedes peer activation; each exact ActivateReply commits independently.
+Only after both replies may RA send EndReconfiguration. Its matching successful
+RAP completion and commit precede DoReconfigurationReply and FM readiness.
+Retries retain the original bodies and resend only pending activation work;
+neither peer's result can complete the other's build or activation.
+
+Pinned SF revision `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` supplies the flow:
+
+| Source | Preserved responsibility |
+|---|---|
+| `ra/ReconfigurationAgent.cpp:1995-2040` | Per-replica Add/build ownership, identity checks and CreateReplica dispatch without changing the current configuration epoch. |
+| `ra/FailoverUnit.cpp:2703-2873` | Phase-4 per-remote activation stages; all up/Ready members must activate before EndReconfiguration can grant writes. |
+| `ra/FailoverUnit.cpp:4192-4220` | Each Activate carries the complete configuration, not a local-only role setter. |
+| `ra/FailoverUnit.cpp:3164-3272,3487-3496` | Final RAP completion and committed stable configuration before FM completion. |
+
+Model/store tests cover interleaved target ownership, stale completions, a
+failed/retried build, missing/duplicate activation ACKs, and held, failed or
+unknown ACK commits. Original-process tests copy nonempty data to both nodes,
+replay lost AddReplicaReply/final DoReconfigurationReply without another Open,
+continue replication to both and preserve original app/runtime ownership.
+Losing one Secondary still permits Primary-plus-survivor writes at quorum two;
+losing both cannot acknowledge a new write using the old singleton vote.
+These loss checks do not elect, shrink membership or authorize replacement.
+All three original node/app owners supply independent cleanup proof.
+
+The same native schema codecs now have three additional three-element-vector
+cases for DoReconfiguration, Activate and DoReconfigurationReply: 172
+bidirectional cases, 84 types/255 fields, 176 bundle files and 52 actual native
+truncation rejections. These are native-stream/schema-adapter and native-free
+process results, not full original-handler or FM/Federation interoperability.
+Three-member planned transfer, retirement/replacement, superseding configurations,
+generation/peer inventories, node/FM-loss failover, data loss, reconnect and restart remain
+explicitly gated. A failed native build remains failed/to-be-dropped with
+cleanup required; this profile does not invent successful repair or replacement.
+Original-owner shutdown still disposes all owned resources.
+Stdin retains its existing create/status/quit interface;
+the public Cluster APIs authorize build and configuration.
+
+### Three-replica Primary app-host failover
+
+The completed original 3/2 profile now supports one loss-driven Primary failover
+without changing the data-loss epoch. Its **original Primary app host** must
+actually exit while the original Node/RA and both configured Secondaries remain
+available. RA's committed canonical dropped ReplicaUp report is reconciled
+against the exact original FM ownership before FM starts reconfiguration.
+A broken FM link, diagnostic observation, cleanup sidecar or historical Ready
+label cannot supply that loss report. The normal processed ReplicaUp ACK and
+closed metadata Delete remain separate from disposal or replacement.
+
+FM selects original node2 as the bounded candidate and increments the Primary
+configuration epoch. PC contains all three original members; the old Primary is
+Dropped/down and removed from CC. CC contains node2 Primary and node3 Secondary.
+Desired target/minimum remains 3/2. All original peers are bound before entity
+work; each peer has its own original listener/Channel, so the two survivors
+exchange native reliability traffic directly without reconnect/adoption.
+
+The candidate starts phase 1, **not** healthy-swap phase-0 demotion of a dead
+writer. It obtains real local and peer RAP UpdateEpochAndGetStatus/GetLSN
+results. The peer commits its new epoch before querying RAP and returns its
+actual progress/deactivation history, never a descriptor/default LSN. This
+profile's original process acceptance used both survivors' initialized,
+matching tails and compatible original history. Missing progress, a changed
+data-loss epoch or catch-up progress inconsistent with phase 1 cannot grant
+promotion. The configured-failover extension above subsequently generalizes RA
+history selection and ChangeConfiguration; broader history repair and
+DatalossReport remain gated.
+
+Real promotion/catch-up retains separate PC/CC quorum obligations. Because PC
+and CC differ, phase 3 cannot use the equal-membership skip optimization:
+node3 receives S/S Deactivate, commits the configuration and new deactivation
+boundary, and returns the native fresh identity-only DeactivateReply. This is
+**metadata deactivation**, not service Close, runtime disposal or proof that
+the Secondary was dropped. Its actual service/replicator stays resident.
+The candidate then sends Activate, waits for node3's real RAP configuration
+completion and committed ActivateReply, and finishes RAP EndReconfiguration.
+Only the final matching DoReconfigurationReply publishes the promoted endpoint.
+An endpoint notification/ACK does not complete failover.
+
+Pinned SF revision `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines these decisions:
+
+| Source | Preserved responsibility |
+|---|---|
+| `fm/ReconfigurationTask.cpp:175-355`; `fm/FailoverUnit.cpp:878-895,1087-1105` | Available-member candidate admission, retain PC, increment Primary epoch and remove the down old Primary from CC without manufacturing singleton quorum. |
+| `ra/ReconfigurationState.cpp:76-119`; `ra/FailoverUnit.cpp:2204-2299,3013-3055` | Failover starts GetLSN; obtain local/remote progress and both configuration read-quorum evidence before selecting an eligible Primary. |
+| `ra/FailoverUnit.cpp:624-703,1993-2157` | GetLSN epoch commit, real RAP status, deactivation-history filtering and progress/catch-up-capability eligibility. |
+| `ra/FailoverUnit.cpp:736-818,2596-2637,3091-3124` | Actual catch-up result establishes the new boundary; unequal PC/CC requires phase-3 deactivation. |
+| `ra/ReconfigurationAgent.cpp:2590-2682`; `ra/FailoverUnit.cpp:929-958` | S/S Deactivate commits metadata/history and replies without RAP Close; S/N retirement is a different branch. |
+| `ra/FailoverUnit.cpp:2703-2873,3164-3272,3487-3496` | Peer activation, final RAP completion and committed stable configuration before FM completion/publication. |
+
+Model/store tests hold candidate admission, progress-query/deactivation and
+final completion commits; reject false progress/history, stale identities,
+missing/partial replies and unsupported data-loss changes. Definite/unknown
+S/S deactivation commits emit no early reply or invented Close. FM models reject
+channel-loss-only promotion and insufficient survivors, retain the native
+10/60-second retry and ignore repeated old loss reports after completion.
+Original-process acceptance kills the actual original Primary app host,
+retains nonempty data, loses/replays the final reply, checks the old listener
+is gone, and verifies new-Primary writes replicated on the original node3
+provider. Both survivors retain one Open and their original app/runtime owners.
+Insufficient survivors prevent failover; loss of the remaining Secondary after
+promotion cannot acknowledge a new admitted write or restore the old writer.
+All original cleanup owners remain independently verified.
+
+After completion, `configuration.kind=primary_failover`, `ready=true` means the
+two surviving configured members have completed this flow, not that a replacement
+third replica exists. The explicit rebuild below is separate. Repeat/aborted failover, whole-node/FM loss,
+restart/reconnect, arbitrary candidates and mismatched-history recovery remain
+unsupported. Native-stream evidence adds one three-element non-force Deactivate
+case: 173 bidirectional cases, 84 types/255 fields, 177 bundle files and 53 native
+truncation rejections. Neither these source-derived models/processes nor the
+schema adapter execute complete original C++ handlers or native Federation/FM.
+
+### Post-failover third-replica repair
+
+`Cluster::repair_primary_replica()` explicitly restores one third replica after
+the above completed failover and old Primary's processed loss/metadata deletion.
+`drive()` owns subsequent build and configuration work. Poll `repair.ready`;
+`host_ready` means only fresh host ownership, and `built` means only successful
+native AddReplicaReply. Neither authorizes active membership. The earlier
+`configuration.ready` may still describe the two surviving failover members
+until the separately owned repair configuration starts.
+
+Original node1's Node/RA, in-memory store, generation and peer Channels remain
+alive. Node independently requires actual original app-process exit, committed
+Closed/deleted metadata, drained reporting/commands/lookups and exact acquisition
+release. It explicitly reaps/drains the original process owner and terminates
+its Hosting activation before replacing it. The original host gate remains
+revoked; a new gate, host identity, app process, Hosting root and runtime
+registration are created. The launcher checks the exact original-node receipt
+and independent old PID/root absence. A loss-report ACK, dropped metadata or
+FM disconnect alone cannot supply this physical ownership boundary.
+
+FM allocates a strictly newer replica ID/incarnation above the original identities.
+New node2 Primary owns native AddReplica, peer CreateReplica/Reply, real RAP
+Open/BuildIdleReplica and AddReplicaReply. Node1's fresh volatile application
+starts empty and recopies nonempty state from node2; no old runtime/data lifetime
+is adopted and no persisted Existing Open is substituted. Copy completion is
+Ready/Idle, not ActiveSecondary. Both original survivors retain their runtime
+and acquisitions without another Open.
+
+After successful build, unchanged-Primary DoReconfiguration retains the two
+survivors as PC and adds the fresh I/S to CC. Desired target/minimum remains
+3/2, service update version is unchanged and only the configuration counter
+advances; no data-loss epoch is introduced. Actual RAP catch-up establishes the
+new deactivation boundary. Since PC differs from CC, node3's S/S metadata
+Deactivate and its committed identity-only reply precede activation. No RAP
+Close or disposal is involved in this S/S exchange. Both Secondary Activate
+replies commit independently before final RAP EndReconfiguration and the
+matching native DoReconfigurationReply complete repair.
+
+| Pinned SF source | Preserved responsibility |
+|---|---|
+| `fm/FailoverUnit.cpp:718-739`; `fm/Replica.cpp:555-585` | Reuse a dropped placement only with a new replica identity/incarnation and reset build/endpoint metadata. The fixed profile uses a deterministic monotonic allocator, not native wall-clock allocation. |
+| `ra/FailoverUnit.cpp:5487-5523`; `ra/ReconfigurationAgent.cpp:2244-2324` | A lost volatile replica is dropped, not recovered from local state. A newer incarnation creates a fresh local Idle after the old lifetime is closed. |
+| `ra/ReconfigurationAgent.cpp:1855-2038`; `ra/FailoverUnit.cpp:315-363` | The current Primary owns peer creation, real build and native semantic completion; unchanged current epoch during Idle build. |
+| `ra/FailoverUnit.cpp:736-818,2596-2637,3091-3124` | Real catch-up and separate PC/CC obligations; the native phase-3 skip currently requires equal memberships. |
+| `ra/ReconfigurationAgent.cpp:2590-2682`; `ra/FailoverUnit.cpp:929-958,2703-2873,3164-3272` | S/S Deactivate changes metadata/history without Close, followed by activation and final runtime/RA/FM completion. |
+
+Store/model tests hold repair admission, deactivation/activation and final
+completion commits, reject missing loss/deletion, reused/foreign host lineage,
+wrong-source/stale/partial replies and survivor loss, and retain frozen retries.
+Real three-node process acceptance builds nonempty state, kills the original
+Primary app, promotes node2, writes more data, replaces node1's host and recopies,
+loses/replays final completion and verifies new replica ownership. Old reports,
+Delete replies and native Delete requests cannot affect the successor. Losing
+node3 after repair still permits acknowledged writes on node2 plus rebuilt
+node1; losing both Secondaries blocks acknowledgment rather than restoring
+singleton quorum. Interrupted repair shutdown verifies both app-owner cleanups.
+
+This is explicit repair in the original live three-node session, not an
+automatic placement policy, whole-node/FM failure, arbitrary app restart,
+reconnect, history repair or data-loss recovery.
+Survivor loss during repair leaves it unknown; it never manufactures a successful
+build or reduces quorum. Existing native message schemas/factories are reused,
+including the three-element Deactivate fixture: the maintained codec gate remains
+173 cases/53 native truncation rejections. These are native-source-derived
+store/process and native-stream/schema-adapter results, not full original C++
+handler execution or deployed FM/Federation interoperability.
+
+### Repeated live-session Primary failover and repair
+
+After repair completes, another matched loss of the **current** Primary app
+can start the same no-data-loss failover protocol. FM takes PC from the latest
+completed three-member configuration, not the original launch roles. Both
+current Secondaries must remain available. This fixed profile deterministically
+chooses the lowest placement among those ready candidates; it does not implement
+PLB ranking. RA now applies the history/LSN selection and ChangeConfiguration
+rules described above; repeated-cycle process qualification still uses matched
+survivor progress/history.
+Target/minimum stays 3/2; only the configuration/Primary epoch advances.
+
+Call `repair_primary_replica()` after each completed failover and processed
+predecessor deletion. It is idempotent within that cycle. A new cycle cannot
+start until the preceding repair's final semantic completion. The current
+Primary owns the new build, and the dropped placement receives a replica
+ID/incarnation greater than every retained placement identity. The same live
+Node/RA/store/peer Channels can host successive fresh app owners, including
+replacing a previously repaired host. Every replacement independently reaps and
+drains its exact predecessor, removes its Hosting root and installs a new gate;
+no former runtime is adopted or reopened.
+
+S/S Deactivate and Activate commit the latest deactivation history, so a later
+GetLSN reply cannot accidentally report the first failover's boundary.
+Completed RA transitions may accept a newer configuration, while old epochs are
+fenced before routing to the new transition's peer. Exact completed current-cycle
+requests still replay their final reply. FM retains predecessor report/reply fences;
+Node retains old Delete lineage. Owned replacement commands and receipts are
+keyed by predecessor replica/incarnation. Shutdown validates each historical
+replacement and the final owner, including a replacement not yet admitted by FM.
+These are retained in-memory live-session histories, not durable restart state.
+
+| Pinned SF source | Repeated-cycle responsibility |
+|---|---|
+| `fm/ReconfigurationTask.cpp:176-320` | Re-evaluate the current Primary and current-configuration candidates under quorum obligations, rather than a one-time original-node transition. |
+| `fm/FailoverUnit.cpp:718-739`; `fm/Replica.cpp:555-585` | Reuse dropped placement with a fresh identity greater than prior/current replica identities. |
+| `ra/FailoverUnit.cpp:1355-1445` | Replay completed same-epoch work, or initialize a subsequent reconfiguration from its new epoch/roles. |
+| `ra/ReconfigurationAgent.cpp:2626-2644,2766-2775` | Refresh deactivation information on Deactivate/Activate, including already-open surviving replicas. |
+| `ra/infrastructure.FailoverUnitEntityTraits.cpp:222-267` | Reject stale epochs/incarnations before executing current transition handlers. |
+
+Real-process acceptance runs three complete failover/repair cycles, preserving
+acknowledged writes, promoting a rebuilt replica and replacing node1's host
+twice. The second repair loses/replays build and final configuration replies.
+Old reports, Delete requests/replies, failover requests and owned replacement
+commands cannot affect successors. Node process identities stay unchanged and
+each current app owner opens once. Losing a Secondary followed by the current
+Primary prevents another promotion; separate interrupted-second-repair coverage
+verifies shutdown before the new host receipt reaches FM.
+
+Overlapping/interrupted reconfiguration recovery, survivor loss during repair,
+whole-node/FM failure, reconnect, persisted recovery and data loss remain gated.
+This reuses existing native codecs; source-stream/schema-adapter evidence is
+still not complete original C++ handler execution or deployed interoperability.
 
 ## Peer-created Idle replica (stage-4 increment)
 
@@ -346,7 +1045,7 @@ Unresolved original-session loss leaves unknown/pending-remove, never recovery.
 Local removal cannot take over an FM-owned removal. The destination lifetime,
 data, registration and usage remain intact until separate deletion or normal shutdown; FM completion
 does not imply remote deletion or active configuration change. Native
-down/arbitrary-not-found cleanup and replacement remain gated
+down/arbitrary-not-found cleanup and broader replacement remain gated
 ([RA:2044-2140,4094-4149](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ReconfigurationAgent.cpp#L2044-L2140),
 [FM:201-214](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/fm/FailoverUnitMessageProcessor.cpp#L201-L214)).
 
@@ -460,7 +1159,7 @@ commit failures and uncertainty. Pending Drop process-loss acceptance also runs
 the actual 30-second lost-ACK retry with both original Nodes/peer/FM links
 progressing. This adds no child-node Close-control feature or wire schema.
 Opening loss, Abort/ForceAbort loss, broader down/arbitrary-unknown cleanup
-and replacement remain gated.
+and replacement outside the explicit fresh-Idle slice remain gated.
 
 ### Graceful opened destination Close reporting
 
@@ -583,7 +1282,7 @@ holds provider/service disposal separately, verifies actual Abort rather than
 Close, loses/retries an ACK at the unchanged native cadence and replays metadata
 replies with stable original proof and independent Primary removal/writes.
 Initial-Open cleanup, failed/ForceAbort reporting, HostDown during Abort and
-replacement remain gated. No wire schema, child-node control feature or native
+broader replacement remain gated. No wire schema, child-node control feature or native
 C++ handler/FM-Federation interoperability qualification is added.
 
 ### Deleting the original opened destination Idle
@@ -621,7 +1320,7 @@ uses native None/None/Dropped/down metadata, invalid version/LSNs and no endpoin
 Normal deletion schedules no ReplicaDown/ReplicaDropped report. Same-incarnation
 CreateReplica after deletion is ignored without Open, build or usage acquisition.
 Force for this original lifetime is supported by the explicit API below.
-Foreign identities, replacement, active membership and recovery remain gated.
+Foreign identities, broader replacement, active membership and recovery remain gated.
 
 ### Complete original-session destination Delete contract
 
@@ -696,6 +1395,55 @@ Create, historical proofs after app exit and continued Primary data access.
 These complete this original-session Delete subprofile, not persisted services,
 active membership, replacement, reconfiguration, recovery or native C++
 handler/FM-Federation interoperability qualification.
+
+### Explicit fresh Idle replacement
+
+`Cluster::replace_idle_replica()` explicitly authorizes **one** successor on
+the same original destination Node/app session. It requires the original
+successful FM Add, matched Primary RemoveReplicaReply, normal non-force
+DeleteReplicaReply and independently validated original runtime disposal,
+Applied Close and exact usage release. Both original node sessions must remain
+admitted, active and live, without loss reports or generation/node/service work.
+Deletion alone still leaves `reusable=false`; no timer, report ACK or cleanup
+receipt implicitly schedules replacement. Failed/absent creation, host loss,
+force deletion, arbitrary peers and a second successor remain gated.
+
+The source baseline remains `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`:
+
+| Native source | Preserved behavior |
+|---|---|
+| `fm/FailoverUnit.cpp:718-739`, `fm/Replica.cpp:555-585` | Reuse the placement only for a new replica identity/incarnation, resetting build/role/endpoint metadata. This fixed profile deterministically allocates equal new IDs above both original replica IDs and the destination instance; it does not reproduce the native wall-clock allocator. |
+| `ra/ReconfigurationAgent.cpp:1855-2038,4094-4148`, `ra/FailoverUnit.cpp:315-363` | Successful original Idle removal removes the Primary's old replica entry. A fresh FM Add then starts new CreateReplica/build work; old replies cannot complete the new incarnation. Replacement while removal remains pending is not enabled. |
+| `ra/ReconfigurationAgent.cpp:2244-2324` | A closed destination creates a fresh Idle only for a newer incarnation. Open follows durable creation; matching Open completion commits before CreateReplicaReply. Equal deleted traffic is ignored; older closed traffic receives native StaleRequest without reopening. |
+
+The destination Node separately requires its own genuine disposal proof,
+drained predecessor commands/acquisitions/reporting and a connected original
+runtime with a live owned app. No metadata acknowledgment can bypass that gate.
+The old proof remains intact through a failed/unknown creation commit and is
+cleared locally only when the committed successor's Open effect runs.
+Original node/app PIDs, Hosting package/factory and runtime root stay resident;
+this is a new service/replicator lifetime, not app restart or warm adoption.
+
+The existing AddReplica -> CreateReplica/Reply -> RAP build -> AddReplicaReply
+path opens and recopies the successor from the healthy Primary. Nonempty copy
+and continuing application ACKs are required; the destination remains
+Idle/InBuild, non-serving and unconfigured. Native action schemas and retry
+cadences are unchanged. Repeated replacement calls retry/observe the same
+successor rather than minting another identity.
+
+`status()["idle_predecessor"]` retains the frozen original Add/Remove/Delete
+outcomes and disposal proof. Current `idle_build`, `idle_removal` and
+`idle_deletion` refer to the successor; old native replies, reports and retained
+proof files cannot clear its work or replace its ownership. The successor can
+itself be explicitly removed/deleted with a new matching disposal proof.
+
+Model/store tests cover admission barriers, definite/unknown creation commits
+and stale FM/peer/RAP completions. A real public Cluster API test covers original
+cleanup, distinct successor identity on unchanged process owners, nonempty copy,
+continued replication, lost Add reply/replay, stale predecessor Add/Remove/Delete,
+retained history and successor cleanup. These are native-source-derived and
+native-free process results, not native C++ handler traces, FM/Federation
+interoperability, active membership, automatic replacement or recovery.
 
 ### Deleting the original registered destination during Open
 
@@ -948,6 +1696,192 @@ native C++ deletion-handler execution.
 
 These are native-derived model/store and native-free real-process contracts,
 not full C++ handler traces or native Federation interoperability.
+
+## Same-Primary active configuration (stage-5 increment)
+
+In the existing `--stateful-peer-idle` profile,
+`Cluster::activate_idle_replica()` explicitly admits the successfully FM-built
+Idle into one two-member configuration. The original Primary stays Primary;
+the original destination (or its one supported fresh successor) becomes
+ActiveSecondary. This is a separate opt-in programmatic operation, not a new
+CLI action, automatic scaling, primary transfer or failover.
+
+The native DoReconfiguration body carries a versioned service-size update from
+target/minimum 1/1 to 2/1, the next full configuration epoch in the same primary
+epoch, and exact original P/P and I/S descriptions. Both original nodes must
+remain admitted, active and healthy. Unanswered/failed Add, pending removal or
+deletion, generation upload, node/service work and unknown ownership reject.
+Service/package identity, replica IDs/incarnations and Primary endpoints do not
+change. Native configuration descriptions contain the local replica as well
+as the remote member; quorum counts do not come from a reduced remote-only list.
+
+Pinned SF source remains `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`:
+
+| Source | Preserved bounded flow |
+|---|---|
+| `ra/ReconfigurationAgent.cpp:2142-2238`; `ra/FailoverUnit.cpp:1386-1468,1754-1772,1909-1924` | Existing-Primary `Other` reconfiguration, durable new intent before effects, native service-description update and direct phase-2 catch-up rather than GetLSN or a role setter. |
+| `ra/FailoverUnit.cpp:736-818,2596-2637,3127-3162` | Matching successful RAP Catchup reply advances the phase. PC contains only the unchanged local Primary, so phase 3 has no peer deactivation work before phase 4. Errors remain pending; no invented catch-up success. |
+| `ra/ReconfigurationAgent.cpp:2685-2849`; `ra/FailoverUnit.cpp:959-1001,2703-2873` | Peer Activate records the exact new configuration, then invokes real RAP UpdateConfiguration on the existing Idle. ActivateReply follows matching role-update completion and its commit. The Primary waits for that exact reply before RAP EndReconfiguration. |
+| `ra/FailoverUnit.cpp:3164-3272,3487-3496` | Final matching RAP EndReconfiguration and commit precede DoReconfigurationReply. Stable completion clears previous epoch/roles; neither a transport write nor peer activation alone completes FM work. |
+
+The production Hosting IPC allowlist now admits native
+UpdateConfiguration/Reply on lifecycle-enabled original sessions. RAP retains
+its native empty-runtime/default-service control shape and flags:
+Catchup=2, secondary update=0, EndReconfiguration=1. The existing public runtime
+and data replicator perform the actual callbacks, configuration projection and
+application-ACK quorum waits. No direct engine configuration, private runtime
+state mutation or qualification-only execution hook supplies completion.
+
+Poll `status()["configuration"]` for `state=ready`/`ready=true`; only an exact
+ordinary-FM DoReconfigurationReply produces that result. Both placements then
+record their active replica roles; `peer_idle.active_secondary` distinguishes
+membership from historical Idle build completion. The Secondary has no new
+application listener/discovery endpoint, and cannot write as Primary. The
+existing Primary application endpoint remains independently contactable.
+
+FM retries its frozen request with the existing 10/60-second action cadence;
+the Node retains the existing 15-second pending RAP/peer retry. Identical
+completed requests replay the retained semantic result without repeating
+Open/build/role callbacks. Stale epochs/incarnations and late RAP completions
+cannot advance another phase. Store veto/uncertainty keeps proposed state,
+activation ACKs and final FM success private until actual resolution.
+
+Current configuration has two write-quorum members; previous configuration
+contains only the original Primary. The real process test first copies nonempty
+state, then acknowledges a new write under the active configuration. After
+positive original Secondary app-host loss, native down reporting/processed ACK
+marks configuration observation unknown without authorizing replacement. A
+distinct third write is admitted/applied locally but receives **no ACK** from
+the old singleton quorum. Original owners still perform independent shutdown
+and cleanup; loss is not graceful disposal or automatic reconfiguration.
+
+Model/store tests cover phase ordering, retryable RAP error, exact identities,
+duplicate/stale traffic, separate PC/CC descriptions, creation/activation commit
+veto/uncertainty and the final reply commit barrier. Actual original-child tests
+cover real ActiveSecondary callbacks, nonempty data/continuing ACKs, lost final
+reply/replay without a second Open and loss without quorum fallback.
+The maintained native-stream gate adds four action contracts and twelve cases:
+151 bidirectional cases, 81 schema types/248 fields, 155 bundle files and
+43 actual native truncation rejections, retaining every prior case.
+
+This qualifies the frozen same-Primary admission and terminal observation path;
+the bounded healthy retirement/replacement extension is described below.
+Outside the planned swap below, arbitrary configuration supersession, primary
+transfer, GetLSN, broader Deactivate, endpoint changes/publication and data loss,
+FMM, generation upload, reconnect and restart remain gated. Codec/schema
+execution and native-free process acceptance are not complete original C++
+handler traces or native FM/Federation interoperability.
+
+### Healthy configured-Secondary retirement and replacement
+
+After the original successful 1-to-2 admission,
+`Cluster::retire_secondary_replica()` explicitly requests a healthy, unchanged-
+Primary 2-to-1 reconfiguration. Both original admitted sessions must remain
+healthy; no down-report, missing process or old singleton quorum authorizes it.
+The next same-Primary epoch carries P/P and S/N, a versioned target-size change
+from 2/1 to 1/1, and both full previous/current configurations.
+
+Pinned SF source `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the flow:
+
+| Source | Preserved contract |
+|---|---|
+| `ra/FailoverUnit.cpp:736-818,2596-2702` | Real RAP Catchup (flags=2) must satisfy the two-member PC and singleton CC before phase-3 Deactivate is sent. Neither a transport write nor a report ACK supplies catch-up completion. |
+| `ra/ReconfigurationAgent.cpp:2620-2665,671-706`; `ra/FailoverUnit.cpp:5472-5540` | Non-force S/N Deactivate commits intent, closes the original volatile destination through real RAP Drop/Close (flags=8), releases its original ownership, then commits the canonical dropped DeactivateReply. Failed Close stays pending. |
+| `ra/FailoverUnit.cpp:1192-1222,2953-2960,3164-3272,3376-3415,3487-3496` | Exact peer completion precedes final RAP EndReconfiguration (flags=1). Final committed completion removes the non-CC peer from the Primary RA view and replies with only the surviving current Primary, with previous epoch/role cleared. It does not synthesize a separate Idle RemoveReplica/Reply. |
+| `common/DeactivateMessageBody.h:15-49` | Native ConfigurationMessageBody inheritance plus derived `isForce_`, nested deactivation information, exact peer actor/priority and sender generation. Force/restart and other Deactivate branches remain gated. |
+
+Poll `configuration` for `kind=same_primary_retirement` and `ready=true`.
+`peer_idle.active_secondary=false`/`state=retired_secondary` distinguishes
+retirement from active membership. Dropped reporting and processed-list ACKs
+remain native metadata exchanges, not loss-driven membership repair or
+replacement permission. In particular, a report-triggered deleted tombstone
+and disposal sidecar alone cannot authorize a successor.
+
+Explicit `delete_idle_replica_via_fm()` still joins its exact semantic reply
+with the original applied successful Close and independently validated disposal/
+usage-release proof. Only then may `replace_idle_replica()` authorize the one
+fresh successor. Existing native Add/Create/build recopies nonempty Primary
+state under a strictly newer replica ID/incarnation; `activate_idle_replica()`
+then performs the real 1-to-2 activation again. Original node, app, package,
+factory and runtime owners stay unchanged. `configuration.history` and
+`idle_predecessor` preserve the completed predecessor requests/replies and
+proofs. Same-phase retries replay retained work/results; stale predecessor
+epochs, replies, deletion and reports cannot complete or retire the successor.
+
+Model/store tests cover separate PC/CC descriptions, failed RAP catch-up/Close,
+exact identity/endpoints, duplicate/stale messages, commit veto/uncertainty and
+Close/final-reply commit barriers. HostDown during retirement retains native
+down reporting without a DeactivateReply or disposal claim.
+Original-process acceptance exercises lost
+retirement completion, explicit deletion/proof gating, singleton writes after
+safe retirement, successor nonempty copy, reactivation and new application ACKs
+without another Primary Open or process-owner replacement.
+The maintained native-stream gate now covers 157 bidirectional cases,
+82 types/250 fields, 161 bundle files and 45 actual native truncation rejections.
+
+This enables one healthy original configured-Secondary replacement, not a
+second replacement, retirement of an already-replaced Idle, concurrent/new
+reconfiguration supersession, automatic failure repair,
+endpoint publication, FMM, generation upload, reconnect or durable restart.
+The separate planned-Primary-transfer increment below adds its bounded role
+handoff and endpoint publication.
+Original C++ handler traces and native FM/Federation interoperability remain
+unqualified.
+
+### Healthy planned Primary transfer
+
+After completed two-member active admission (including the supported fresh
+Secondary), `Cluster::transfer_primary()` explicitly transfers Primary from
+original node 1 to node 2. Both original admitted sessions and replicas must be
+healthy, with no pending build/removal/deletion, node/service work or generation
+upload. The request keeps the service, membership and replica incarnations,
+sets P/S and S/P and increments the configuration version by `0x100000001`
+without changing data-loss version. The FM withdraws its old endpoint while
+transfer is pending; withdrawal alone is not proof of runtime write revocation.
+
+Pinned SF source `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the flow:
+
+| Source | Preserved contract |
+|---|---|
+| `fm/FailoverUnit.cpp:878-895`; `ra/ReconfigurationState.cpp:76-119`; `ra/FailoverUnit.cpp:1754-1779` | Explicit healthy SwapPrimary starts at the old Primary in phase 0, not direct promotion or a local role setter. Real RAP configuration/catch-up revokes writes, catches up the candidate and changes the old service/replicator to Secondary. |
+| `ra/FailoverUnit.cpp:736-782,2926-2950,3497-3540` | Matching successful demotion and its commit precede peer DoReconfiguration with retained non-Max phase-0 duration. A duplicate FM request replays that continuation, never an old-Primary success reply. |
+| `ra/FailoverUnit.cpp:628-703,2204-2299`; `ra/ReconfigurationAgent.cpp:2425-2507` | Candidate phase 1 uses real local RAP UpdateEpochAndGetStatus and native peer GetLSN/Reply. GetLSNReply inherits ReplicaReplyMessageBody and adds nested deactivation information. This bounded profile requires initialized matched progress on both original members; other histories stop rather than inventing election, repair or data loss. |
+| `ra/FailoverUnit.cpp:736-818,3063-3124`; `common/FailoverConfig.h:387` | Candidate promotion/catch-up uses full two-member PC and CC. The native default PC=CC optimization skips phase-3 Deactivate; it does not reuse the S/N retirement/Close path. |
+| `ra/FailoverUnit.cpp:2703-2873,3164-3272,3376-3415,3487-3496` | Peer Activate updates the demoted member without another Open/build. Exact ActivateReply precedes final RAP EndReconfiguration and commit before the new Primary's native DoReconfigurationReply. Stable completion clears previous epoch/roles. |
+| `ra/FailoverUnit.cpp:3590-3630,4597-4624,5701-5710`; `ra/EndpointPublishState.cpp:47-145`; `common/FailoverConfig.h:486` | Original-runtime ProxyReplicaEndpointUpdated is ACKed, but only matching active promotion updates the committed endpoint. The existing helper owns the native 30-second early-publication timeout and exact FM ACK. Final reconfiguration completion publishes the new Primary address; an endpoint update/ACK alone does not complete the transfer. |
+
+Poll `configuration` for `kind=planned_primary_transfer` and `ready=true`.
+Only the exact new-Primary native reply changes readiness and places the
+numeric loopback service endpoint on node 2. Early native
+ReplicaEndpointUpdated/Reply records are retained separately in
+`configuration.endpoint_update`, without making a pending transfer ready.
+`configuration.history` preserves prior admission/retirement records.
+`nodes[].retained_work.local_replica.swap` reports the owned phase/error;
+the older `local_replica.configuration` remains historical same-Primary work.
+
+The sample retains its original service/provider instances. Promotion stops the
+old Secondary stream consumer and starts the same service's Primary listener;
+demotion consumes replication on the existing provider without a new copy.
+The old listener remains contactable but rejects writes through the real public
+partition/replicator authority checks. No engine-specific mutation or
+qualification-only execution hook supplies progress, role change or success.
+
+Model/store tests cover failed demotion, both progress results, exact native FM
+completion, retained retries, endpoint timeout/publication, definite commit
+veto/uncertainty and demotion/endpoint/final-reply commit barriers.
+Original-process tests copy nonempty state, lose/replay the final reply, verify
+old-writer rejection and new-Primary ACKs continuing on the demoted member,
+retain both original owners and one Open each, and confirm new-Primary host
+loss cannot reactivate the old writer. Native down reporting makes transfer
+observation unknown; it supplies no replacement, election or quorum fallback.
+
+This enables one explicit healthy transfer only. Reverse/second transfer,
+concurrent supersession, mismatched progress, aborted-swap recovery, loss-driven
+failover, changed membership/endpoints outside this promotion, data loss,
+FMM, reconnect and restart remain gated. Native source-stream evidence covers
+163 bidirectional cases, 83 types/251 fields, 167 bundle files and 47 actual
+native truncation rejections. Original C++ handler traces and native
+FM/Federation interoperability remain unqualified.
 
 ## Initial stateful FM control
 

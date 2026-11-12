@@ -13,7 +13,10 @@ use fube_transport::{
     Channel, ChannelLimits,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::time::Instant;
 
 // Native pin 3988b451: Federation/PToPHeader.h FABRIC_FIELDS_06;
@@ -51,11 +54,15 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
         || !matches!(
             props.action.as_str(),
             "NodeUp"
+                | "LFUMUpload"
                 | "ReplicaUp"
                 | "ServiceTypeNotification"
                 | "AddInstanceReply"
                 | "AddPrimaryReply"
                 | "AddReplicaReply"
+                | "DoReconfigurationReply"
+                | "ChangeConfiguration"
+                | "ReplicaEndpointUpdated"
                 | "RemoveReplicaReply"
                 | "RemoveInstanceReply"
                 | "DeleteReplicaReply"
@@ -67,15 +74,18 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                 | "ReportLoad"
                 | "GenerationUpdateReject"
         )
-        || props.expects_reply != (props.action == "NodeUp")
+        || props.expects_reply != matches!(props.action.as_str(), "NodeUp" | "LFUMUpload")
         || props.high_priority
             != matches!(
                 props.action.as_str(),
                 "NodeUp"
+                    | "LFUMUpload"
                     | "ReplicaUp"
                     | "AddInstanceReply"
                     | "AddPrimaryReply"
                     | "AddReplicaReply"
+                    | "DoReconfigurationReply"
+                    | "ChangeConfiguration"
                     | "RemoveReplicaReply"
                     | "RemoveInstanceReply"
                     | "DeleteReplicaReply"
@@ -97,6 +107,8 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
                 "AddInstance"
                     | "AddPrimary"
                     | "AddReplica"
+                    | "DoReconfiguration"
+                    | "ChangeConfigurationReply"
                     | "RemoveReplica"
                     | "RemoveInstance"
                     | "DeleteReplica"
@@ -109,11 +121,14 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
             "AddInstance"
                 | "AddPrimary"
                 | "AddReplica"
+                | "DoReconfiguration"
+                | "ChangeConfigurationReply"
                 | "RemoveReplica"
                 | "RemoveInstance"
                 | "DeleteReplica"
                 | "ReplicaUpReply"
                 | "ServiceTypeNotificationReply"
+                | "ReplicaEndpointUpdatedReply"
                 | "NodeActivateRequest"
                 | "NodeDeactivateRequest"
                 | "NodeUpdateServiceRequest"
@@ -129,9 +144,10 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
 }
 fn ack(message: &Message, props: &Properties) -> fube_transport::Result<()> {
     bounded(message)?;
-    if props.actor != RS_ACTOR
-        || props.action != "NodeUpAck"
-        || props.expects_reply
+    if !matches!(
+        (props.actor, props.action.as_str()),
+        (RS_ACTOR, "NodeUpAck") | (RA_ACTOR, "LFUMUploadReply")
+    ) || props.expects_reply
         || props.uncorrelated_reply
         || !props.high_priority
     {
@@ -168,12 +184,12 @@ fn node_out(
     props: &Properties,
     kind: OutboundKind,
 ) -> fube_transport::Result<()> {
-    if (kind == OutboundKind::Rpc) != (props.action == "NodeUp") {
+    if (kind == OutboundKind::Rpc) != matches!(props.action.as_str(), "NodeUp" | "LFUMUpload") {
         return Err(fube_transport::Error::Protocol("wrong node send mechanism"));
     }
     // RPC adds ExpectsReply below outbound policy.
     let mut canonical = message.properties()?;
-    canonical.expects_reply = canonical.action == "NodeUp";
+    canonical.expects_reply = matches!(canonical.action.as_str(), "NodeUp" | "LFUMUpload");
     fm_ingress(message, &canonical)
 }
 fn peer_ingress(message: &Message, props: &Properties) -> fube_transport::Result<()> {
@@ -184,7 +200,15 @@ fn peer_ingress(message: &Message, props: &Properties) -> fube_transport::Result
         || props.uncorrelated_reply
         || !matches!(
             props.action.as_str(),
-            "CreateReplica" | "CreateReplicaReply"
+            "CreateReplica"
+                | "CreateReplicaReply"
+                | "Activate"
+                | "ActivateReply"
+                | "Deactivate"
+                | "DeactivateReply"
+                | "GetLSN"
+                | "GetLSNReply"
+                | "DoReconfiguration"
         )
         || message
             .headers
@@ -274,9 +298,53 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 pub fn predecode(message: &Message) -> Result<()> {
     use fube_ra::protocol::*;
     match message.properties().map_err(err)?.action.as_str() {
+        "GetLSN" => {
+            decode::<GetLsn>(&message.body)?;
+        }
+        "GetLSNReply" => {
+            decode::<GetLsnReply>(&message.body)?;
+        }
+        "ReplicaEndpointUpdated" => {
+            decode::<AddInstance>(&message.body)?;
+        }
+        "ReplicaEndpointUpdatedReply" => {
+            decode::<AddInstanceReply>(&message.body)?;
+        }
+        "DoReconfiguration" => {
+            decode::<DoReconfiguration>(&message.body)?;
+        }
+        "DoReconfigurationReply" => {
+            decode::<ConfigurationReply>(&message.body)?;
+        }
+        "ChangeConfiguration" => {
+            decode::<Configuration>(&message.body)?;
+        }
+        "ChangeConfigurationReply" => {
+            decode::<FailoverUnitReply>(&message.body)?;
+        }
+        "Activate" => {
+            decode::<Activate>(&message.body)?;
+        }
+        "ActivateReply" => {
+            decode::<ActivateReply>(&message.body)?;
+        }
+        "Deactivate" => {
+            decode::<Deactivate>(&message.body)?;
+        }
+        "DeactivateReply" => {
+            decode::<DeactivateReply>(&message.body)?;
+        }
         "GenerationProposal" => {
             if !message.body.is_empty() {
                 return Err("GenerationProposal must be bodyless".into());
+            }
+        }
+        "LFUMUpload" => {
+            decode::<LfumUpload>(&message.body)?;
+        }
+        "LFUMUploadReply" => {
+            if !message.body.is_empty() {
+                return Err("LFUMUploadReply must be bodyless".into());
             }
         }
         "GenerationProposalReply" => {
@@ -346,16 +414,23 @@ pub fn predecode(message: &Message) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct Link {
     pub channel: Channel,
     target: Arc<GatewayTarget>,
     local: NodeInstance,
     remote: NodeInstance,
-    generation: GenerationHeader,
+    generation: Arc<Mutex<GenerationHeader>>,
 }
 impl Link {
-    pub fn generation(&self) -> &GenerationHeader {
-        &self.generation
+    pub fn generation(&self) -> GenerationHeader {
+        self.generation.lock().unwrap().clone()
+    }
+    pub fn advance_generation(&self, generation: &GenerationHeader) {
+        let mut current = self.generation.lock().unwrap();
+        if !generation.number.older_than(&current.number) {
+            *current = generation.clone();
+        }
     }
     // Only the launch owner constructs a Link, from its original one-use
     // admitted Channel. Deployment/session binding is local capability state,
@@ -372,7 +447,7 @@ impl Link {
             target,
             local,
             remote,
-            generation,
+            generation: Arc::new(Mutex::new(generation)),
         })
     }
     pub fn seal(&self, mut message: Message) -> Result<Message> {
@@ -404,11 +479,11 @@ impl Link {
             let generation: GenerationHeader = decode(&header.value)?;
             let negotiation = matches!(
                 message.properties().map_err(err)?.action.as_str(),
-                "GenerationProposal" | "GenerationUpdate"
+                "GenerationProposal" | "GenerationUpdate" | "LFUMUploadReply"
             );
             if headers.next().is_some()
                 || generation.for_fm_replica
-                || (!negotiation && generation != self.generation)
+                || (!negotiation && generation.number.older_than(&self.generation().number))
             {
                 return Err("foreign/stale/duplicate native FM generation".into());
             }

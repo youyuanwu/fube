@@ -27,6 +27,9 @@ impl Foreground {
         Self::start_profile(root, false)
     }
     fn start_profile(root: &Path, stateful: bool) -> Self {
+        Self::start_options(root, stateful, None)
+    }
+    fn start_options(root: &Path, stateful: bool, sizes: Option<(i32, i32)>) -> Self {
         let app = if stateful {
             support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP")
         } else {
@@ -43,7 +46,15 @@ impl Foreground {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        if stateful {
+        if let Some((target, minimum)) = sizes {
+            command.args([
+                "--stateful",
+                "--target-replica-set-size",
+                &target.to_string(),
+                "--min-replica-set-size",
+                &minimum.to_string(),
+            ]);
+        } else if stateful {
             command.arg("--stateful-singleton");
         }
         let mut child = command.spawn().unwrap();
@@ -143,6 +154,52 @@ fn contact(endpoint: &str) -> Value {
     assert!(bytes.len() <= 4096 && bytes.last() == Some(&b'\n'));
     serde_json::from_slice(&bytes).unwrap()
 }
+#[test]
+fn foreground_configured_service_builds_four_replicas_from_one_create() {
+    let root = support::parent().join(format!("configured-foreground-{}", uuid::Uuid::new_v4()));
+    let mut foreground = Foreground::start_options(&root, true, Some((4, 3)));
+    let ready = foreground.read();
+    assert_eq!(ready["event"], "ready", "{ready}");
+    assert_eq!(ready["status"]["nodes"].as_array().unwrap().len(), 4);
+    let expected: Vec<_> = (1..=4).map(|node| Expected::capture(&root, node)).collect();
+    assert_eq!(
+        foreground.command(&json!({"op":"create","action":"create","node":1}))["state"],
+        "pending"
+    );
+    let status = poll(&mut foreground, &mut 0, |status| {
+        status["operations"][0]["state"] == "complete"
+    });
+    assert_eq!(status["configuration"]["ready"], true);
+    assert_eq!(
+        status["replica_set"],
+        json!({"target":4,"minimum":3,"immutable":true})
+    );
+    let endpoint = status["nodes"][0]["endpoint"].as_str().unwrap();
+    let mut socket = TcpStream::connect(endpoint).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    socket.write_all(b"write\n").unwrap();
+    let mut response = String::new();
+    socket.take(1024).read_to_string(&mut response).unwrap();
+    assert!(
+        response.contains("committed=1 value=acknowledged"),
+        "{response}"
+    );
+    assert_eq!(
+        foreground.command(&json!({"op":"create","action":"create","node":1}))["state"],
+        "complete"
+    );
+    foreground.finish();
+    for owner in expected {
+        owner.assert_gone();
+    }
+    let mut next = Foreground::start_options(&root, true, Some((2, 1)));
+    assert_eq!(next.read()["event"], "ready");
+    next.finish();
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn foreground_stateful_singleton_recreates_fresh_data_after_verified_fm_deletion() {
     let root = support::parent().join(format!("fm-primary-{}", uuid::Uuid::new_v4()));

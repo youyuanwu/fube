@@ -51,6 +51,13 @@ MODELS = [
     ("RAReplicaMessageBody", COMMON + "RAReplicaMessageBody.h", "ReplicaMessageBody"),
     ("DeleteReplicaMessageBody", COMMON + "DeleteReplicaMessageBody.h", "ReplicaMessageBody"),
     ("ReplicaReplyMessageBody", COMMON + "ReplicaReplyMessageBody.h", ""),
+    ("ConfigurationMessageBody", COMMON + "ConfigurationMessageBody.h", ""),
+    ("DoReconfigurationMessageBody", COMMON + "DoReconfigurationMessageBody.h", "ConfigurationMessageBody"),
+    ("ActivateMessageBody", COMMON + "ActivateMessageBody.h", "ConfigurationMessageBody"),
+    ("DeactivateMessageBody", COMMON + "DeactivateMessageBody.h", "ConfigurationMessageBody"),
+    ("GetLSNReplyMessageBody", COMMON + "GetLSNReplyMessageBody.h", "ReplicaReplyMessageBody"),
+    ("ConfigurationReplyMessageBody", COMMON + "ConfigurationReplyMessageBody.h", ""),
+    ("FailoverUnitReplyMessageBody", COMMON + "FailoverUnitReplyMessageBody.h", ""),
     ("ReplicaInfo", COMMON + "ReplicaInfo.h", ""),
     ("FailoverUnitInfo", COMMON + "FailoverUnitInfo.h", ""),
     ("ReplicaUpMessageBody", COMMON + "ReplicaUpMessageBody.h", ""),
@@ -67,6 +74,7 @@ MODELS = [
     ("FabricVersionInstance", "Common/FabricVersionInstance.h", ""),
     ("Uri", "Common/Uri.h", ""),
     ("NodeDescription", COMMON + "NodeDescription.h", ""),
+    ("LFUMMessageBody", COMMON + "LFUMMessageBody.h", ""),
     ("ServicePackageInfo", COMMON + "NodeUpMessageBody.h", ""),
     ("NodeUpMessageBody", COMMON + "NodeUpMessageBody.h", ""),
     ("ServicePackageUpgradeSpecification", MODEL + "ServicePackageUpgradeSpecification.h", ""),
@@ -158,6 +166,7 @@ DEFAULTS = {
     ("ReplicaDescription", "firstAcknowledgedLSN_"): "-1",
     ("ReplicaDescription", "state_"): "Enum(2)",
     ("ReplicaDeactivationInfo", "catchupLSN_"): "-1",
+    ("DoReconfigurationMessageBody", "phase0Duration_"): "TimeSpan::maximum()",
     ("ServiceDescription", "defaultMoveCost_"): "1",
     ("ServiceDescription", "replicaRestartWaitDuration_"): "TimeSpan::minimum()",
     ("ServiceDescription", "quorumLossWaitDuration_"): "TimeSpan::minimum()",
@@ -250,6 +259,8 @@ def generation_factories(native):
         ("GenerationProposalReply", "CreateRAToFMMessage", 11),
         ("GenerationUpdate", "CreateFMToRAMessage", 12),
         ("GenerationUpdateReject", "CreateRAToFMMessage", 11),
+        ("LFUMUpload", "CreateRAToFMMessage", 11),
+        ("LFUMUploadReply", "CreateFMToRAMessage", 12),
     ]:
         match = re.findall(
             rf'RSMessage::{action}\s*=\s*(\w+)\(L"([^"]+)",\s*(true|false)\b',
@@ -293,10 +304,34 @@ def replica_factories(native):
     return result
 
 
+def configuration_factories(native):
+    text = (native / "src/prod/src" / COMMON / "RSMessage.cpp").read_text()
+    result = {}
+    for action, factory, actor in [
+        ("DoReconfiguration", "CreateFMToRAMessage", 12),
+        ("DoReconfigurationReply", "CreateRAToFMMessage", 11),
+        ("Activate", "CreateRAToRAMessage", 12),
+        ("ActivateReply", "CreateRAToRAMessage", 12),
+        ("Deactivate", "CreateRAToRAMessage", 12),
+        ("DeactivateReply", "CreateRAToRAMessage", 12),
+        ("GetLSN", "CreateRAToRAMessage", 12),
+        ("GetLSNReply", "CreateRAToRAMessage", 12),
+        ("ChangeConfiguration", "CreateRAToFMMessage", 11),
+        ("ChangeConfigurationReply", "CreateFMToRAMessage", 12),
+    ]:
+        matches = re.findall(
+            rf'RSMessage::{action}\s*=\s*(\w+)\(L"([^"]+)",\s*(true|false)\b', text,
+        )
+        if matches != [(factory, action, "true")]:
+            raise ValueError(f"native configuration factory changed: {action}")
+        result[action] = {"actor": actor, "high_priority": True}
+    return result
+
+
 def generate(native, destination):
     models = extract(native)
     constants = native_constants(native)
-    factories = generation_factories(native) | peer_factories(native) | replica_factories(native)
+    factories = generation_factories(native) | peer_factories(native) | replica_factories(native) | configuration_factories(native)
     output = [
         "// Generated from pinned native headers; source macro/member provenance below.",
         "#pragma once", "#include <Serialization.h>", "#include <FabricSerializationHelper.h>",
@@ -336,6 +371,7 @@ def generate(native, destination):
             output.append(f" {cpp} {field} = {default}; // {native_type}")
         if name == "TimeSpan":
             output.append(" static TimeSpan minimum() { TimeSpan t; t.ticks_ = INT64_MIN; return t; }")
+            output.append(" static TimeSpan maximum() { TimeSpan t; t.ticks_ = INT64_MAX; return t; }")
         if name == "ReplicaDescription":
             output.append(
                 " ReplicaDescription() { packageVersionInstance_.version_.appVersion_.value_.major_=0;"

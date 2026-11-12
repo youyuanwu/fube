@@ -271,7 +271,9 @@ impl IStatefulServiceReplica for StatefulReplica {
     fn change_role(&self, role: ReplicaRole, _: Cancellation) -> ApiFuture<'_, String> {
         Box::pin(async move {
             if !matches!(role, ReplicaRole::IdleSecondary | ReplicaRole::None)
-                && !(role == ReplicaRole::Primary && self.resource.mode.primary)
+                && !(role == ReplicaRole::Primary
+                    && (self.resource.mode.primary || self.native.is_some()))
+                && !(role == ReplicaRole::ActiveSecondary && self.native.is_some())
             {
                 return Err(Error::Protocol(
                     "fixture prohibits Primary/secondary promotion",
@@ -286,7 +288,27 @@ impl IStatefulServiceReplica for StatefulReplica {
                 });
             }
             if role == ReplicaRole::Primary {
+                if let Some(mut secondary) = self.secondary.lock().unwrap().take() {
+                    secondary.join();
+                }
                 let data = self.data.lock().unwrap().clone().expect("real data owner");
+                if self.primary.lock().unwrap().is_none() {
+                    let service = PrimaryService::start(PrimaryState {
+                        native: self
+                            .native
+                            .as_ref()
+                            .expect("real native integration")
+                            .clone(),
+                        partition: self.partition.lock().unwrap().clone().expect("partition"),
+                        data: data.clone(),
+                        memory: self.memory.lock().unwrap().clone().expect("provider"),
+                    })?;
+                    marker(&format!(
+                        "LOCAL_PRIMARY listening endpoint={}",
+                        service.address
+                    ));
+                    *self.primary.lock().unwrap() = Some(service);
+                }
                 let before = data.snapshot();
                 assert_eq!(before.role, ReplicaRole::Primary);
                 assert!(!before.ready);
@@ -375,8 +397,22 @@ impl IStatefulServiceReplica for StatefulReplica {
                         partition,
                         data,
                         self.memory.lock().unwrap().clone().expect("real provider"),
+                        true,
                     )?);
                 }
+            }
+            if role == ReplicaRole::ActiveSecondary && self.secondary.lock().unwrap().is_none() {
+                let pump = SecondaryPump::start(
+                    self.native
+                        .as_ref()
+                        .expect("real native integration")
+                        .clone(),
+                    self.partition.lock().unwrap().clone().expect("partition"),
+                    self.data.lock().unwrap().clone().expect("real replicator"),
+                    self.memory.lock().unwrap().clone().expect("real provider"),
+                    false,
+                )?;
+                *self.secondary.lock().unwrap() = Some(pump);
             }
             Ok(String::new())
         })
@@ -458,18 +494,21 @@ impl Drop for ObservedProvider {
             assert!(!self.primary, "Primary cannot own partial destination copy");
         }
         if state.last != 0 {
-            assert!((1..=2).contains(&state.last));
+            assert!((1..=3).contains(&state.last));
             assert_eq!(
                 state.values.get("value").map(String::as_str),
-                Some(if state.last == 1 {
-                    "acknowledged"
-                } else {
-                    "continued"
+                Some(match state.last {
+                    1 => "acknowledged",
+                    2 => "continued",
+                    _ => "final",
                 })
             );
             assert_eq!(state.results.get("primary-write"), Some(&1));
-            if state.last == 2 {
+            if state.last >= 2 {
                 assert_eq!(state.results.get("primary-write-2"), Some(&2));
+            }
+            if state.last == 3 {
+                assert_eq!(state.results.get("primary-write-3"), Some(&3));
             }
             assert_eq!(
                 (state.values.len(), state.results.len()),
@@ -517,23 +556,40 @@ impl PrimaryState {
     }
     async fn request(&self, request: &[u8], stopped: Cancellation) -> Result<String> {
         match request {
-            b"write\n" | b"write-more\n" => {
+            b"write\n" | b"write-more\n" | b"write-final\n" => {
                 self.authority(true)?;
                 let more = request == b"write-more\n";
-                if more && !self.memory.snapshot().results.contains_key("primary-write") {
+                let final_write = request == b"write-final\n";
+                let predecessor = if final_write {
+                    "primary-write-2"
+                } else {
+                    "primary-write"
+                };
+                if (more || final_write)
+                    && !self.memory.snapshot().results.contains_key(predecessor)
+                {
                     return Err(Error::InvalidInput(
                         "continuing write requires the original write",
                     ));
                 }
                 let mutation = Mutation {
-                    id: if more {
+                    id: if final_write {
+                        "primary-write-3"
+                    } else if more {
                         "primary-write-2"
                     } else {
                         "primary-write"
                     }
                     .into(),
                     key: "value".into(),
-                    value: if more { "continued" } else { "acknowledged" }.into(),
+                    value: if final_write {
+                        "final"
+                    } else if more {
+                        "continued"
+                    } else {
+                        "acknowledged"
+                    }
+                    .into(),
                 };
                 if self.memory.admission(&mutation)?.is_some() {
                     return Err(Error::InvalidInput("fixture request already acknowledged"));
@@ -547,6 +603,7 @@ impl PrimaryState {
                     .await?;
                 let sequence = admission.sequence_number;
                 self.memory.apply_replication(sequence, &operation)?;
+                marker(&format!("LOCAL_PRIMARY admitted sequence={sequence}"));
                 assert_eq!(admission.completion.wait(stopped).await?, sequence);
                 self.authority(true)?;
                 marker(&format!("LOCAL_PRIMARY acknowledged sequence={sequence}"));
@@ -711,10 +768,15 @@ impl SecondaryPump {
         partition: Arc<dyn IStatefulServicePartition>,
         data: Arc<RuntimeReplicator>,
         memory: Arc<MemoryProvider>,
+        copying: bool,
     ) -> Result<Self> {
         let state = data.get_state_replicator();
-        let copy = state.get_copy_stream()?;
+        let mut streams = vec![];
+        if copying {
+            streams.push((state.get_copy_stream()?, true));
+        }
         let replication = state.get_replication_stream()?;
+        streams.push((replication, false));
         let data = Arc::downgrade(&data);
         let stopped = Cancellation::default();
         let stop = stopped.clone();
@@ -738,7 +800,7 @@ impl SecondaryPump {
                         let result = async {
                         // Copy EOS and replication EOS are independent. Consuming copy
                         // first prevents application replication into a partial snapshot.
-                        for (stream, copying) in [(copy, true), (replication, false)] {
+                        for (stream, copying) in streams {
                             loop {
                                 let operation = tokio::select! {
                                     biased;
@@ -768,6 +830,14 @@ impl SecondaryPump {
                                 if let Some(data) =
                                     data.upgrade().filter(|data| !data.snapshot().closed)
                                 {
+                                    if data.snapshot().role == ReplicaRole::Primary
+                                        && native.status().is_ok_and(|status| {
+                                            status.current_role == ReplicaRole::Primary
+                                        })
+                                    {
+                                        marker("LOCAL_IDLE_DATA role_handoff");
+                                        return;
+                                    }
                                     marker(&format!("LOCAL_IDLE_DATA_ERROR {error}"));
                                     data.close(Cancellation::default())
                                         .await

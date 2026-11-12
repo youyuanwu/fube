@@ -78,6 +78,13 @@ rich_fields!(LoadMetricStats: name, value, count, weighted_sum, weight, time);
 rich_fields!(NodeLoads: node, loads);
 rich_fields!(ReportLoad: legacy, reports, time);
 rich_fields!(ReplicaDeactivationInfo: epoch, catchup_lsn);
+rich_fields!(LfumUpload: generation, node, units, any_replica_found);
+
+impl Rich for NodeDescription {
+    fn rich(&mut self, c: &mut i32) {
+        *self = rich_node(c);
+    }
+}
 
 impl Rich for LegacyLoadReport {
     fn rich(&mut self, c: &mut i32) {
@@ -155,8 +162,7 @@ fn fresh_node_up() -> NodeUp {
     }
 }
 
-fn rich_node_up() -> NodeUp {
-    let c = &mut 0;
+fn rich_node(c: &mut i32) -> NodeDescription {
     let mut node = NodeDescription {
         upgrade_domain: filled(c),
         fault_domains: ObjectArray(vec![rich_uri(c), rich_uri(c)]),
@@ -172,6 +178,12 @@ fn rich_node_up() -> NodeUp {
     };
     *c += 1;
     node.http_gateway_port = 60000 + *c as u16;
+    node
+}
+
+fn rich_node_up() -> NodeUp {
+    let c = &mut 0;
+    let node = rich_node(c);
     let packages = filled(c);
     let _: bool = filled(c);
     NodeUp {
@@ -776,6 +788,272 @@ fn peer_contracts(input: &Path, output: &Path) {
     }
 }
 
+fn configuration_contracts(input: &Path, output: &Path) {
+    for (name, body) in [
+        ("default-change-configuration", Configuration::default()),
+        ("rich-change-configuration", filled::<Configuration>(&mut 0)),
+    ] {
+        check(input, output, name, body.clone());
+        for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
+            let mut native = stage_two_envelope(input, name, "ChangeConfiguration", actor, None);
+            native
+                .headers
+                .iter_mut()
+                .find(|h| h.id == HIGH_PRIORITY)
+                .unwrap()
+                .value = fs::read(input.join("priority.bin")).unwrap();
+            assert_eq!(
+                decode_change_configuration(&native).unwrap(),
+                (body.clone(), owner)
+            );
+            factory_contract(
+                &native,
+                &change_configuration_message(&body, owner).unwrap(),
+            );
+        }
+        reject_prefixes::<Configuration>(input, name);
+    }
+    for (name, body) in [
+        (
+            "default-change-configuration-reply",
+            FailoverUnitReply::default(),
+        ),
+        (
+            "rich-change-configuration-reply",
+            filled::<FailoverUnitReply>(&mut 0),
+        ),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "ChangeConfigurationReply",
+            body,
+            change_configuration_reply_message,
+            decode_change_configuration_reply,
+        );
+    }
+    for (name, body) in [
+        ("default-get-lsn", GetLsn::default()),
+        ("rich-get-lsn", filled::<GetLsn>(&mut 0)),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "GetLSN",
+            body,
+            get_lsn_message,
+            decode_get_lsn,
+        );
+    }
+    let c = &mut 0;
+    let replica = filled::<AddInstanceReply>(c);
+    let deactivation = filled::<ReplicaDeactivationInfo>(c);
+    for (name, body) in [
+        ("default-get-lsn-reply", GetLsnReply::default()),
+        (
+            "rich-get-lsn-reply",
+            GetLsnReply {
+                replica,
+                deactivation,
+            },
+        ),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "GetLSNReply",
+            body,
+            get_lsn_reply_message,
+            decode_get_lsn_reply,
+        );
+    }
+    let c = &mut 0;
+    let config = filled::<Configuration>(c);
+    let force = filled::<bool>(c);
+    let deactivation = filled::<ReplicaDeactivationInfo>(c);
+    let mut three = config.clone();
+    three.replicas.0.push(filled::<Replica>(&mut 5000));
+    for (name, body) in [
+        ("default-deactivate", Deactivate::default()),
+        (
+            "rich-deactivate",
+            Deactivate {
+                configuration: config,
+                force,
+                deactivation: deactivation.clone(),
+            },
+        ),
+        (
+            "three-deactivate",
+            Deactivate {
+                configuration: three,
+                force: false,
+                deactivation,
+            },
+        ),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "Deactivate",
+            body,
+            deactivate_message,
+            decode_deactivate,
+        );
+    }
+    for (name, body) in [
+        ("default-deactivate-reply", DeactivateReply::default()),
+        ("rich-deactivate-reply", filled::<DeactivateReply>(&mut 0)),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "DeactivateReply",
+            body,
+            deactivate_reply_message,
+            decode_deactivate_reply,
+        );
+    }
+    let c = &mut 0;
+    let config = filled::<Configuration>(c);
+    let duration = filled::<i64>(c);
+    let mut three = config.clone();
+    three.replicas.0.push(filled::<Replica>(&mut 5000));
+    for (name, body) in [
+        ("default-do-reconfiguration", DoReconfiguration::default()),
+        (
+            "rich-do-reconfiguration",
+            DoReconfiguration {
+                configuration: config,
+                phase0_duration: duration,
+            },
+        ),
+        (
+            "three-do-reconfiguration",
+            DoReconfiguration {
+                configuration: three,
+                phase0_duration: duration,
+            },
+        ),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "DoReconfiguration",
+            body,
+            do_reconfiguration_message,
+            decode_do_reconfiguration,
+        );
+    }
+    let c = &mut 0;
+    let config = filled::<Configuration>(c);
+    let deactivation = filled::<ReplicaDeactivationInfo>(c);
+    let mut three = config.clone();
+    three.replicas.0.push(filled::<Replica>(&mut 5000));
+    for (name, body) in [
+        ("default-activate", Activate::default()),
+        (
+            "rich-activate",
+            Activate {
+                configuration: config,
+                deactivation: deactivation.clone(),
+            },
+        ),
+        (
+            "three-activate",
+            Activate {
+                configuration: three,
+                deactivation,
+            },
+        ),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "Activate",
+            body,
+            activate_message,
+            decode_activate,
+        );
+    }
+    let mut three = filled::<ConfigurationReply>(&mut 0);
+    three.replicas.0.push(filled::<Replica>(&mut 5000));
+    for (name, body) in [
+        ("default-activate-reply", ActivateReply::default()),
+        ("rich-activate-reply", filled::<ActivateReply>(&mut 0)),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "ActivateReply",
+            body,
+            activate_reply_message,
+            decode_activate_reply,
+        );
+    }
+    for (name, body) in [
+        (
+            "default-do-reconfiguration-reply",
+            ConfigurationReply::default(),
+        ),
+        (
+            "rich-do-reconfiguration-reply",
+            filled::<ConfigurationReply>(&mut 0),
+        ),
+        ("three-do-reconfiguration-reply", three),
+    ] {
+        check(input, output, name, body.clone());
+        for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
+            let mut native = stage_two_envelope(input, name, "DoReconfigurationReply", actor, None);
+            native
+                .headers
+                .iter_mut()
+                .find(|h| h.id == HIGH_PRIORITY)
+                .unwrap()
+                .value = fs::read(input.join("priority.bin")).unwrap();
+            assert_eq!(
+                decode_do_reconfiguration_reply(&native).unwrap(),
+                (body.clone(), owner)
+            );
+            factory_contract(
+                &native,
+                &do_reconfiguration_reply_message(&body, owner).unwrap(),
+            );
+            assert!(decode_add_replica_reply(&native).is_err());
+        }
+        reject_prefixes::<ConfigurationReply>(input, name);
+    }
+    for action in [
+        "DoReconfiguration",
+        "DoReconfigurationReply",
+        "Activate",
+        "ActivateReply",
+        "Deactivate",
+        "DeactivateReply",
+        "GetLSN",
+        "GetLSNReply",
+        "ChangeConfiguration",
+        "ChangeConfigurationReply",
+    ] {
+        check(
+            input,
+            output,
+            &format!("action-{action}"),
+            Scalar {
+                value: action.to_string(),
+            },
+        );
+    }
+}
+
 fn replica_contracts(input: &Path, output: &Path) {
     let mut request = support::rich_request();
     request.unit.target = 1;
@@ -1009,7 +1287,7 @@ fn reject_generation_envelopes(
     wrong.headers[0] = Header::actor(FMM_ACTOR).unwrap();
     assert!(decode(&wrong).is_err());
     wrong.headers[0] = original.headers[0].clone();
-    wrong.headers[1] = Header::action("LFUMUpload").unwrap();
+    wrong.headers[1] = Header::action("UnsupportedGenerationAction").unwrap();
     assert!(decode(&wrong).is_err());
     if !with_generation {
         let mut unexpected = original.clone();
@@ -1160,6 +1438,49 @@ fn generation_handshake(input: &Path, output: &Path) {
     }
 }
 
+fn lfum_contracts(input: &Path, output: &Path) {
+    let rich = filled::<LfumUpload>(&mut 0);
+    let mut deleted = rich.clone();
+    deleted.units.0.clear();
+    deleted.any_replica_found = true;
+    for (name, body) in [
+        ("empty-lfum-upload", LfumUpload::default()),
+        ("rich-lfum-upload", rich),
+        ("deleted-only-lfum-upload", deleted),
+    ] {
+        check(input, output, name, body.clone());
+        let native = generation_envelope(input, name, "LFUMUpload", false, false);
+        assert_eq!(decode_lfum_upload(&native).unwrap(), body);
+        let made = lfum_upload_message(&body).unwrap();
+        factory_contract(&native, &made);
+        reject_generation_envelopes(&native, false, |message| {
+            decode_lfum_upload(message).map(|_| ())
+        });
+        reject_prefixes::<LfumUpload>(input, name);
+    }
+    let native = generation_envelope(
+        input,
+        "empty-lfum-upload-reply",
+        "LFUMUploadReply",
+        true,
+        false,
+    );
+    let generation = support::rich_generation(false);
+    assert_eq!(decode_lfum_upload_reply(&native).unwrap(), generation);
+    let made = lfum_upload_reply_message(&generation).unwrap();
+    factory_contract(&native, &made);
+    assert!(made.body.is_empty());
+    reject_generation_envelopes(&native, true, |message| {
+        decode_lfum_upload_reply(message).map(|_| ())
+    });
+    let mut fmm = native;
+    fmm.headers.retain(|header| header.id != GENERATION_HEADER);
+    fmm.headers
+        .push(support::rich_generation(true).header().unwrap());
+    assert!(decode_lfum_upload_reply(&fmm).is_err());
+    fs::write(output.join("empty-lfum-upload-reply.bin"), []).unwrap();
+}
+
 fn main() {
     let args = Arguments::parse();
     if args.identity {
@@ -1178,7 +1499,9 @@ fn main() {
         .as_deref()
         .expect("clap requires Rust output");
     assert!(input.is_dir() && output.is_dir());
+    lfum_contracts(input, output);
     peer_contracts(input, output);
+    configuration_contracts(input, output);
     replica_contracts(input, output);
     check(input, output, "default-request", AddInstance::default());
     check(input, output, "rich-request", support::rich_request());
@@ -1452,6 +1775,8 @@ fn main() {
         "GenerationProposalReply",
         "GenerationUpdate",
         "GenerationUpdateReject",
+        "LFUMUpload",
+        "LFUMUploadReply",
     ] {
         check(
             input,

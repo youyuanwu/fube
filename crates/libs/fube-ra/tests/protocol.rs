@@ -16,6 +16,124 @@ fn generation_owner(high: u64, low: u64) -> [u8; 16] {
 }
 
 #[test]
+fn change_configuration_preserves_native_configuration_and_unit_reply_schemas() {
+    use fube_transport::serialization::serde::ObjectArray;
+    let request = support::rich_request();
+    let body = Configuration {
+        unit: request.unit,
+        service: request.service,
+        replicas: ObjectArray(vec![request.replica]),
+    };
+    let generation = support::rich_generation(false);
+    let message = change_configuration_message(&body, Owner::Fm).unwrap();
+    assert_eq!(
+        decode_change_configuration(&message).unwrap(),
+        (body.clone(), Owner::Fm)
+    );
+    assert_eq!(message.properties().unwrap().actor, FM_ACTOR);
+    assert!(message.properties().unwrap().high_priority);
+    assert!(!message.headers.iter().any(|h| h.id == GENERATION_HEADER));
+    let reply = FailoverUnitReply {
+        unit: body.unit,
+        error: 0,
+    };
+    let ack = change_configuration_reply_message(&reply, &generation).unwrap();
+    assert_eq!(
+        decode_change_configuration_reply(&ack).unwrap(),
+        (reply, generation)
+    );
+    assert_eq!(ack.properties().unwrap().actor, RA_ACTOR);
+    assert!(ack.properties().unwrap().high_priority);
+    for id in [ACTOR, ACTION, HIGH_PRIORITY] {
+        let mut invalid = message.clone();
+        invalid.headers.retain(|h| h.id != id);
+        assert!(decode_change_configuration(&invalid).is_err());
+    }
+    let mut invalid = ack.clone();
+    invalid.headers.retain(|h| h.id != GENERATION_HEADER);
+    assert!(decode_change_configuration_reply(&invalid).is_err());
+    for len in 0..ack.body.len() {
+        let mut invalid = ack.clone();
+        invalid.body.truncate(len);
+        assert!(decode_change_configuration_reply(&invalid).is_err());
+    }
+}
+
+#[test]
+fn lfum_upload_preserves_native_body_generation_and_bodyless_correlated_ack() {
+    use fube_transport::serialization::serde::ObjectArray;
+    let generation = support::rich_generation(false);
+    let upload = LfumUpload {
+        generation: generation.number.clone(),
+        node: NodeDescription {
+            name: "original-node".into(),
+            ..NodeDescription::default()
+        },
+        units: ObjectArray(vec![FailoverUnitInfo {
+            service: support::rich_request().service,
+            unit: support::rich_request().unit,
+            ..FailoverUnitInfo::default()
+        }]),
+        any_replica_found: true,
+    };
+    let message = lfum_upload_message(&upload).unwrap();
+    assert_eq!(decode_lfum_upload(&message).unwrap(), upload);
+    assert!(!message
+        .headers
+        .iter()
+        .any(|header| header.id == GENERATION_HEADER));
+    let ack = lfum_upload_reply_message(&generation).unwrap();
+    assert!(ack.body.is_empty());
+    assert_eq!(decode_lfum_upload_reply(&ack).unwrap(), generation);
+    for id in [ACTOR, ACTION, HIGH_PRIORITY] {
+        for original in [&message, &ack] {
+            let mut bad = original.clone();
+            bad.headers.retain(|header| header.id != id);
+            assert!(if original.body.is_empty() {
+                decode_lfum_upload_reply(&bad).is_err()
+            } else {
+                decode_lfum_upload(&bad).is_err()
+            });
+            let mut duplicate = original.clone();
+            duplicate.headers.push(
+                original
+                    .headers
+                    .iter()
+                    .find(|header| header.id == id)
+                    .unwrap()
+                    .clone(),
+            );
+            assert!(if original.body.is_empty() {
+                decode_lfum_upload_reply(&duplicate).is_err()
+            } else {
+                decode_lfum_upload(&duplicate).is_err()
+            });
+        }
+    }
+    let mut bad = message.clone();
+    bad.headers.push(generation.header().unwrap());
+    assert!(decode_lfum_upload(&bad).is_err());
+    for length in 0..message.body.len() {
+        let mut bad = message.clone();
+        bad.body.truncate(length);
+        assert!(decode_lfum_upload(&bad).is_err());
+    }
+    let mut bad = ack.clone();
+    bad.body.push(0);
+    assert!(decode_lfum_upload_reply(&bad).is_err());
+    let mut bad = ack.clone();
+    bad.headers.retain(|header| header.id != GENERATION_HEADER);
+    assert!(decode_lfum_upload_reply(&bad).is_err());
+    let mut fmm = generation.clone();
+    fmm.for_fm_replica = true;
+    assert!(lfum_upload_reply_message(&fmm).is_err());
+    let mut bad = ack;
+    bad.headers.retain(|header| header.id != GENERATION_HEADER);
+    bad.headers.push(fmm.header().unwrap());
+    assert!(decode_lfum_upload_reply(&bad).is_err());
+}
+
+#[test]
 fn remove_replica_uses_replica_body_not_delete_scopes_and_distinct_native_headers() {
     let body = support::rich_request();
     let generation = support::rich_generation(false);

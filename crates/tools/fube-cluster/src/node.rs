@@ -6,7 +6,9 @@ use fube_hosting::local::{Activation, NodeContext, Options};
 use fube_node::local::{FmWork, LocalDisposition, Node};
 use fube_ra::{entity as ra, protocol::*};
 use fube_ra_store::{MemoryBackend, Settings, Store};
-use std::{collections::VecDeque, fs, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque, fs, future::Future, path::Path, pin::Pin, sync::Arc, time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::TcpListener,
@@ -38,10 +40,33 @@ struct Adapter {
     notification_pending: Option<ServiceTypeNotification>,
     report_pending: Option<ReplicaUp>,
     acknowledgements: Vec<(u64, SemanticAck)>,
+    rejected_change_configuration_reply: Option<FailoverUnitReply>,
 }
 enum SemanticAck {
     Notification(ServiceTypeNotification),
     Report(ReplicaUp),
+}
+struct PeerConnection {
+    link: Option<Link>,
+    incoming: Option<
+        fube_transport::channel::IncomingMessage<fube_transport::native_channel::GatewayTarget>,
+    >,
+    dialed: bool,
+}
+
+fn peer_target(effect: &ra::Effect) -> Option<&NodeInstance> {
+    match effect {
+        ra::Effect::PeerCreateReplica { target, .. }
+        | ra::Effect::PeerCreateReplicaReply { target, .. }
+        | ra::Effect::PeerActivate { target, .. }
+        | ra::Effect::PeerActivateReply { target, .. }
+        | ra::Effect::PeerDeactivate { target, .. }
+        | ra::Effect::PeerDeactivateReply { target, .. }
+        | ra::Effect::PeerContinueSwap { target, .. }
+        | ra::Effect::PeerGetLsn { target, .. }
+        | ra::Effect::PeerGetLsnReply { target, .. } => Some(target),
+        _ => None,
+    }
 }
 const REPORT_RETRY: Duration = Duration::from_secs(15);
 const STATEFUL_REPORT_RETRY: Duration = Duration::from_secs(30);
@@ -92,6 +117,26 @@ fn ticks(ticks: i64) -> Duration {
     Duration::from_nanos((ticks.max(0) as u64).saturating_mul(100))
 }
 impl Adapter {
+    fn reject_deprecated(
+        &mut self,
+        node: &Node,
+        message: &fube_transport::message::Message,
+    ) -> Result<bool> {
+        if message.properties().map_err(err)?.action != "ChangeConfigurationReply" {
+            return Ok(false);
+        }
+        wire::predecode(message)?;
+        let (body, generation) = decode_change_configuration_reply(message).map_err(err)?;
+        if generation.for_fm_replica || generation.number != node.generation_state().receive {
+            return Err("deprecated reply has a foreign FM generation".into());
+        }
+        if self.rejected_change_configuration_reply.as_ref() != Some(&body) {
+            eprintln!("rejected deprecated native action ChangeConfigurationReply");
+            self.rejected_change_configuration_reply = Some(body);
+        }
+        Ok(true)
+    }
+
     fn capture(&mut self, node: &mut Node) {
         for dispatch in node.take_external_up_to(32 - self.escrow.len()) {
             if matches!(dispatch.effect, ra::Effect::RequestReportRetry)
@@ -133,6 +178,13 @@ impl Adapter {
                         receipt.dispatch.effect,
                         ra::Effect::PeerCreateReplica { .. }
                             | ra::Effect::PeerCreateReplicaReply { .. }
+                            | ra::Effect::PeerActivate { .. }
+                            | ra::Effect::PeerActivateReply { .. }
+                            | ra::Effect::PeerDeactivate { .. }
+                            | ra::Effect::PeerDeactivateReply { .. }
+                            | ra::Effect::PeerContinueSwap { .. }
+                            | ra::Effect::PeerGetLsn { .. }
+                            | ra::Effect::PeerGetLsnReply { .. }
                     )
                 {
                     if let ra::Effect::PeerCreateReplicaReply { body, .. } =
@@ -147,6 +199,9 @@ impl Adapter {
                     && matches!(
                         receipt.dispatch.effect,
                         ra::Effect::NodeActivateReply(_)
+                            | ra::Effect::ChangeConfiguration(_)
+                            | ra::Effect::DoReconfigurationReply(_)
+                            | ra::Effect::ReplicaEndpointUpdated(_)
                             | ra::Effect::NodeDeactivateReply(_)
                             | ra::Effect::NodeUpdateServiceReply(_)
                             | ra::Effect::Reply(_)
@@ -275,13 +330,106 @@ impl Adapter {
         self.commands(node)?;
         if let (Some(link), Some(peer), Some(reply)) = (peer_link, peer, self.peer_replies.front())
         {
+            let swap_unit = match &reply.effect {
+                ra::Effect::PeerContinueSwap { body, .. } => Some(&body.configuration.unit),
+                ra::Effect::PeerGetLsn { body, .. } => Some(&body.unit),
+                ra::Effect::PeerGetLsnReply { body, .. } => Some(&body.replica.unit),
+                _ => None,
+            };
+            if let Some(unit) = swap_unit {
+                let snapshot = node.snapshot(reply.entity);
+                if snapshot.fenced
+                    || snapshot.committed.is_none_or(|s| {
+                        s.phase != ra::Phase::Ready
+                            || (s.swap.is_none() && s.progress_query.is_none())
+                            || s.body.unit.current != unit.current
+                    })
+                {
+                    self.peer_replies.pop_front();
+                    return Ok(());
+                }
+            }
+            if let ra::Effect::PeerDeactivateReply { body, .. } = &reply.effect {
+                let snapshot = node.snapshot(reply.entity);
+                if snapshot.fenced
+                    || snapshot.committed.is_none_or(|state| {
+                        let survivor_ack =
+                            state.phase == ra::Phase::Ready
+                                && (state.reconfiguration.as_ref().is_some_and(|c| {
+                                    c.stage == ra::ConfigurationStage::Deactivated
+                                }) || state.swap.as_ref().is_some_and(|s| {
+                                    s.failover && s.stage == ra::SwapStage::Deactivated
+                                }));
+                        (!survivor_ack && state.phase != ra::Phase::Closed)
+                            || state.body.unit != body.unit
+                            || state.body.replica.id != body.replica.id
+                            || state.body.replica.instance != body.replica.instance
+                            || (!survivor_ack
+                                && state
+                                    .peer_creation
+                                    .as_ref()
+                                    .is_none_or(|p| !p.close_completed || p.host_down))
+                    })
+                {
+                    self.peer_replies.pop_front();
+                    return Ok(());
+                }
+            }
+            if let ra::Effect::PeerActivateReply { body, .. } = &reply.effect {
+                let snapshot = node.snapshot(reply.entity);
+                if snapshot.fenced
+                    || snapshot.committed.is_none_or(|state| {
+                        state.phase != ra::Phase::Ready
+                            || state.body.unit != body.unit
+                            || state.body.replica != body.replica
+                            || if state
+                                .reconfiguration
+                                .as_ref()
+                                .is_some_and(|c| c.request.unit.current == body.unit.current)
+                            {
+                                state.reconfiguration.as_ref().is_none_or(|config| {
+                                    config.stage != ra::ConfigurationStage::Complete
+                                })
+                            } else {
+                                state
+                                    .swap
+                                    .as_ref()
+                                    .is_none_or(|swap| swap.stage != ra::SwapStage::Complete)
+                            }
+                    })
+                {
+                    self.peer_replies.pop_front();
+                    return Ok(());
+                }
+            }
             let sent = async {
                 let message = match &reply.effect {
                     ra::Effect::PeerCreateReplica { target, body } if target == &peer.node => {
-                        create_replica_message(body, link.generation())
+                        create_replica_message(body, &link.generation())
                     }
                     ra::Effect::PeerCreateReplicaReply { target, body } if target == &peer.node => {
-                        create_replica_reply_message(body, link.generation())
+                        create_replica_reply_message(body, &link.generation())
+                    }
+                    ra::Effect::PeerActivate { target, body } if target == &peer.node => {
+                        activate_message(body, &link.generation())
+                    }
+                    ra::Effect::PeerActivateReply { target, body } if target == &peer.node => {
+                        activate_reply_message(body, &link.generation())
+                    }
+                    ra::Effect::PeerDeactivate { target, body } if target == &peer.node => {
+                        deactivate_message(body, &link.generation())
+                    }
+                    ra::Effect::PeerDeactivateReply { target, body } if target == &peer.node => {
+                        deactivate_reply_message(body, &link.generation())
+                    }
+                    ra::Effect::PeerContinueSwap { target, body } if target == &peer.node => {
+                        do_reconfiguration_message(body, &link.generation())
+                    }
+                    ra::Effect::PeerGetLsn { target, body } if target == &peer.node => {
+                        get_lsn_message(body, &link.generation())
+                    }
+                    ra::Effect::PeerGetLsnReply { target, body } if target == &peer.node => {
+                        get_lsn_reply_message(body, &link.generation())
                     }
                     _ => return Err("peer receipt does not match the original bound peer".into()),
                 }
@@ -339,6 +487,60 @@ impl Adapter {
         }
         if let Some(link) = link {
             if let Some(reply) = self.replies.front() {
+                if let ra::Effect::ReplicaEndpointUpdated(body) = &reply.effect {
+                    let snapshot = node.snapshot(reply.entity);
+                    if snapshot.fenced
+                        || snapshot.committed.is_none_or(|s| {
+                            s.phase != ra::Phase::Ready
+                                || s.body.as_ref() != body.as_ref()
+                                || s.body.replica.current_role != 4
+                                || s.swap.as_ref().is_none_or(|swap| !swap.endpoint_available)
+                        })
+                    {
+                        self.replies.pop_front();
+                        return Ok(());
+                    }
+                }
+                if let ra::Effect::DoReconfigurationReply(body) = &reply.effect {
+                    let snapshot = node.snapshot(reply.entity);
+                    if snapshot.fenced
+                        || snapshot.committed.is_none_or(|state| {
+                            state.phase != ra::Phase::Ready
+                                || state.body.replica.current_role != 4
+                                || state.body.unit != body.unit
+                                || if state.reconfiguration.as_ref().is_some_and(|config| {
+                                    config.request.unit.current == body.unit.current
+                                }) {
+                                    state.reconfiguration.as_ref().is_none_or(|config| {
+                                        config.stage != ra::ConfigurationStage::Complete
+                                    })
+                                } else {
+                                    state.swap.as_ref().is_none_or(|swap| {
+                                        swap.stage != ra::SwapStage::Complete
+                                            || swap.body.unit != body.unit
+                                    })
+                                }
+                        })
+                    {
+                        self.replies.pop_front();
+                        return Ok(());
+                    }
+                    if let ra::Effect::ChangeConfiguration(body) = &reply.effect {
+                        let snapshot = node.snapshot(reply.entity);
+                        if snapshot.fenced
+                            || snapshot.committed.is_none_or(|s| {
+                                s.phase != ra::Phase::Ready
+                                    || s.swap.as_ref().is_none_or(|swap| {
+                                        swap.stage != ra::SwapStage::ChangeConfiguration
+                                            || swap.change.as_ref() != Some(body.as_ref())
+                                    })
+                            })
+                        {
+                            self.replies.pop_front();
+                            return Ok(());
+                        }
+                    }
+                }
                 if let ra::Effect::AddReplicaReply(body) | ra::Effect::RemoveReplicaReply(body) =
                     &reply.effect
                 {
@@ -349,8 +551,7 @@ impl Adapter {
                             state.phase != ra::Phase::Ready
                                 || !state.fm_primary
                                 || state
-                                    .remote_idle
-                                    .as_ref()
+                                    .remote_idle(&body.replica.node)
                                     .and_then(|remote| {
                                         if removing {
                                             remote.remove_reply()
@@ -377,6 +578,15 @@ impl Adapter {
                         node_update_service_reply_message(body, Owner::Fm)
                     }
                     ra::Effect::Reply(body) => add_instance_reply_message(body, Owner::Fm),
+                    ra::Effect::DoReconfigurationReply(body) => {
+                        do_reconfiguration_reply_message(body, Owner::Fm)
+                    }
+                    ra::Effect::ChangeConfiguration(body) => {
+                        change_configuration_message(body, Owner::Fm)
+                    }
+                    ra::Effect::ReplicaEndpointUpdated(body) => {
+                        replica_endpoint_updated_message(body, Owner::Fm)
+                    }
                     ra::Effect::PrimaryReply(body) => add_primary_reply_message(body, Owner::Fm),
                     ra::Effect::AddReplicaReply(body) => add_replica_reply_message(body, Owner::Fm),
                     ra::Effect::RemoveReplicaReply(body) => {
@@ -653,16 +863,14 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
     let address = listener.local_addr().map_err(err)?;
-    let mut peer_listener = if launch.peer.is_some() {
-        Some(TcpListener::bind("127.0.0.1:0").await.map_err(err)?)
-    } else {
-        None
-    };
-    let peer_address = peer_listener
-        .as_ref()
-        .map(TcpListener::local_addr)
-        .transpose()
-        .map_err(err)?;
+    let mut peer_listeners = vec![];
+    let mut peer_addresses = vec![];
+    for _ in &launch.peers {
+        let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
+        peer_addresses.push(listener.local_addr().map_err(err)?);
+        peer_listeners.push(Some(listener));
+    }
+    let peer_address = peer_addresses.first().copied();
     let mut metadata = Metadata {
         deployment: launch.deployment.clone(),
         session: launch.session.clone(),
@@ -670,6 +878,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         pid: std::process::id(),
         address,
         peer_address,
+        peer_addresses,
         profile: None,
     };
     write_json(&launch.directory.join("listener.json"), &metadata)?;
@@ -737,16 +946,15 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     // bootstrap exchanges completed for this original session.
     private_dir(&launch.directory.join("hosting"))?;
     let mut options = Options::new(launch.directory.join("hosting"));
-    if launch.profile == ServiceProfile::StatefulPeerIdle {
+    if launch.profile.peer_replicas() {
         options.service_package_version_instance = Some(1);
     }
     if launch.profile.stateful() {
-        options.profile =
-            if launch.profile == ServiceProfile::StatefulPeerIdle && launch.placement == 2 {
-                fube_hosting::local::Profile::VolatileStatefulLifecycle
-            } else {
-                fube_hosting::local::Profile::VolatileStatefulFmPrimary
-            };
+        options.profile = if launch.profile.peer_replicas() && launch.placement != 1 {
+            fube_hosting::local::Profile::VolatileStatefulLifecycle
+        } else {
+            fube_hosting::local::Profile::VolatileStatefulFmPrimary
+        };
     }
     options.node = Some(NodeContext {
         id: node_hex(&launch.node),
@@ -786,13 +994,14 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         },
     )
     .map_err(err)?;
-    if let Some(peer) = &launch.peer {
-        node.bind_peer(peer.node.clone()).map_err(err)?;
+    if !launch.peers.is_empty() {
+        node.bind_peers(launch.peers.iter().map(|p| p.node.clone()).collect())
+            .map_err(err)?;
     }
     node.apply_fresh_node_up_ack(&ack, &generation)
         .map_err(err)?;
     let mut adapter = Adapter::default();
-    let arguments = if launch.profile == ServiceProfile::StatefulPeerIdle && launch.placement == 2 {
+    let arguments = if launch.profile.peer_replicas() && launch.placement != 1 {
         vec![(
             "Arguments".into(),
             "--stateful-lifecycle --data-replicator".into(),
@@ -815,9 +1024,15 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         started
     };
     let mut link = Some(link);
-    let mut peer_link = None;
-    let mut peer_dialed = false;
-    let mut peer_incoming = None;
+    let mut connections: Vec<_> = launch
+        .peers
+        .iter()
+        .map(|_| PeerConnection {
+            link: None,
+            incoming: None,
+            dialed: false,
+        })
+        .collect();
     let mut failure = startup.err();
     let mut next_observation = Instant::now();
     let mut published_retirement = None;
@@ -826,11 +1041,46 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut published_failed_registration = None;
     let mut published_failed_open = None;
     let mut published_host_loss = false;
+    let mut repair_requested = None;
+    let mut repaired_hosts = Vec::new();
+    type UploadRequest =
+        Pin<Box<dyn Future<Output = Result<Option<fube_transport::message::Message>>> + Send>>;
+    let mut upload_request: Option<UploadRequest> = None;
+    let mut upload_body: Option<LfumUpload> = None;
+    let mut upload_retry_at = Instant::now();
     if failure.is_none() {
         loop {
             // Owned stop remains independent of FM connectivity. Link loss is
             // not permission to stop an existing app or fake lifecycle replies.
             tokio::select! {
+                reply = async {
+                    match upload_request.as_mut() {
+                        Some(request) => request.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    upload_request = None;
+                    match reply {
+                        Ok(Some(message)) => {
+                            let processed = wire::predecode(&message).and_then(|()| {
+                                let generation = decode_lfum_upload_reply(&message).map_err(err)?;
+                                node.process_lfum_upload_reply(&launch.fm, &generation).map_err(err)
+                            });
+                            match processed {
+                                Ok(true) => upload_body = None,
+                                Ok(false) => {}
+                                Err(error) => adapter.error = Some(error),
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => adapter.error = Some(error),
+                    }
+                    let ticks = node.native_config().node(ra::NodeProperty::LfumUploadRetryIntervalTicks).max(1);
+                    upload_retry_at = Instant::now() + Duration::new(
+                        ticks as u64 / 10_000_000,
+                        ((ticks as u64 % 10_000_000) * 100) as u32,
+                    );
+                }
                 control = control_line(&mut control) => {
                     match control {
                         Ok(Some(line)) if line == format!("stop {}\n", launch.capability).as_bytes() => break,
@@ -838,19 +1088,58 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             let command = std::str::from_utf8(&line).map_err(err);
                             let command = command.as_ref().map(|line| line.split_whitespace().collect::<Vec<_>>());
                             match command {
-                                Ok(parts) if parts.len() == 4 && parts[0] == "peer"
+                                Ok(parts) if parts.len() == 5 && parts[0] == "replace-host"
                                     && parts[1] == launch.session && parts[2] == launch.capability
-                                    && launch.placement == 1 && launch.peer.is_some() && !peer_dialed => {
-                                    peer_dialed = true;
-                                    peer_listener.take();
-                                    match dial_peer(launch, parts[3]).await {
-                                        Ok(link) => peer_link = Some(link),
+                                    && launch.profile.mesh_peers() => {
+                                    let identity = parts[3].parse::<i64>().and_then(|id| {
+                                        parts[4].parse::<i64>().map(|instance| (id, instance))
+                                    });
+                                    let identity = match identity {
+                                        Ok(identity) => identity,
+                                        Err(error) => {
+                                            failure = Some(format!("invalid replacement predecessor: {error}"));
+                                            break;
+                                        }
+                                    };
+                                    if !repaired_hosts.contains(&identity) {
+                                        let current = uuid::Uuid::parse_str(&launch.partition).ok()
+                                            .and_then(|id| node.snapshot(id.to_bytes_le()).committed);
+                                        if current.as_ref().is_none_or(|s| {
+                                            (s.body.replica.id, s.body.replica.instance) != identity
+                                                || s.phase != ra::Phase::Closed
+                                        }) || repair_requested.is_some_and(|pending| pending != identity) {
+                                            failure = Some("replacement command is not the current closed owner".into());
+                                            break;
+                                        }
+                                        repair_requested = Some(identity);
+                                    }
+                                }
+                                Ok(parts) if matches!(parts.len(), 4 | 5) && parts[0] == "peer"
+                                    && parts[1] == launch.session && parts[2] == launch.capability
+                                    && (launch.placement == 1 || launch.profile.mesh_peers()) && !launch.peers.is_empty() => {
+                                    let index = if parts.len() == 5 {
+                                        match parts[3].parse::<usize>() {
+                                            Ok(index) => index,
+                                            Err(error) => {
+                                                failure = Some(format!("invalid original peer index: {error}"));
+                                                break;
+                                            }
+                                        }
+                                    } else { 0 };
+                                    let Some(connection) = connections.get_mut(index).filter(|c| !c.dialed) else {
+                                        failure = Some("invalid or already dialed original peer".into());
+                                        break;
+                                    };
+                                    connection.dialed = true;
+                                    peer_listeners[index].take();
+                                    match dial_peer_to(launch, &launch.peers[index], parts[parts.len() - 1]).await {
+                                        Ok(link) => connection.link = Some(link),
                                         Err(error) => adapter.peer_error = Some(error),
                                     }
                                 }
                                 Ok(parts) if parts.len() == 3 && matches!(parts[0], "create-idle" | "build-idle" | "remove-idle")
                                     && parts[1] == launch.session && parts[2] == launch.capability
-                                    && launch.placement == 1 && launch.peer.is_some() => {
+                                    && launch.placement == 1 && !launch.peers.is_empty() => {
                                     let submitted = if adapter.peer_commands.len() == 32 {
                                         Err("peer command receipt capacity".into())
                                     } else {
@@ -878,19 +1167,19 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(2)) => {},
             }
-            if launch.placement == 2 {
-                if let Some(listener) = &peer_listener {
+            for (index, listener_slot) in peer_listeners.iter_mut().enumerate() {
+                if let Some(listener) = listener_slot {
                     match tokio::time::timeout(Duration::from_millis(1), listener.accept()).await {
                         Ok(Ok((stream, _))) => {
-                            peer_listener.take();
-                            match accept_peer(launch, stream).await {
-                                Ok(link) => peer_link = Some(link),
+                            listener_slot.take();
+                            match accept_peer_from(launch, &launch.peers[index], stream).await {
+                                Ok(link) => connections[index].link = Some(link),
                                 Err(error) => adapter.peer_error = Some(error),
                             }
                         }
                         Ok(Err(error)) => {
                             adapter.peer_error = Some(err(error));
-                            peer_listener.take();
+                            listener_slot.take();
                         }
                         Err(_) => {}
                     }
@@ -900,12 +1189,69 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 failure = Some(err(error));
                 break;
             }
+            let generations = node.generation_state();
+            if upload_request.is_none()
+                && upload_body
+                    .as_ref()
+                    .is_some_and(|body| body.generation != generations.receive)
+            {
+                upload_body = None;
+                upload_retry_at = Instant::now();
+            }
+            if generations.upload_pending && upload_body.is_none() && upload_request.is_none() {
+                upload_retry_at = Instant::now();
+            }
+            if generations.upload_pending
+                && link.is_some()
+                && adapter.error.is_none()
+                && upload_request.is_none()
+                && Instant::now() >= upload_retry_at
+            {
+                let inventory = node.lfum_inventory().map_err(err);
+                match inventory {
+                    Ok(Some(inventory)) => {
+                        let body = upload_body.get_or_insert_with(|| LfumUpload {
+                            generation: inventory.generation,
+                            node: up.node.clone(),
+                            units: inventory.units,
+                            any_replica_found: inventory.any_replica_found,
+                        });
+                        if let Some(owner) = &link {
+                            match lfum_upload_message(body) {
+                                Ok(request) => {
+                                    let owner = owner.clone();
+                                    upload_request = Some(Box::pin(async move {
+                                        owner.request_optional(request).await
+                                    }));
+                                }
+                                Err(error) => {
+                                    adapter.error = Some(err(error));
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => adapter.error = Some(error),
+                }
+            }
+            if adapter.error.is_some() {
+                if let Some(old) = link.take() {
+                    let _ = old.close().await;
+                }
+            }
+            adapter.capture(&mut node);
+            let selected_peer = adapter
+                .peer_replies
+                .front()
+                .and_then(|reply| peer_target(&reply.effect))
+                .and_then(|target| launch.peers.iter().position(|peer| &peer.node == target));
+            let selected_link = selected_peer.and_then(|index| connections[index].link.as_ref());
             if let Err(error) = adapter
                 .advance_with_peer(
                     &mut node,
                     link.as_ref(),
-                    peer_link.as_ref(),
-                    launch.peer.as_ref(),
+                    selected_link,
+                    selected_peer.map(|index| &launch.peers[index]),
                 )
                 .await
             {
@@ -914,36 +1260,38 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     let _ = old.close().await;
                 }
             }
-            if let Some(current) = &peer_link {
-                if peer_incoming.is_none() && adapter.peer_commands.len() < 32 {
-                    match current
-                        .receive(Instant::now() + Duration::from_millis(1))
-                        .await
-                    {
-                        Ok(incoming) => peer_incoming = incoming,
-                        Err(error) => adapter.peer_error = Some(error),
+            for (peer, connection) in launch.peers.iter().zip(&mut connections) {
+                if let Some(current) = &connection.link {
+                    if connection.incoming.is_none() && adapter.peer_commands.len() < 32 {
+                        match current
+                            .receive(Instant::now() + Duration::from_millis(1))
+                            .await
+                        {
+                            Ok(incoming) => connection.incoming = incoming,
+                            Err(error) => adapter.peer_error = Some(error),
+                        }
                     }
-                }
-                if let Some(incoming) = &mut peer_incoming {
-                    match receive_peer(launch, &mut node, &incoming.message) {
-                        Ok(Some(id)) => {
-                            adapter.peer_commands.push(id);
-                            if let Some(handoff) = incoming.handoff.as_mut() {
-                                handoff.acknowledge();
+                    if let Some(incoming) = &mut connection.incoming {
+                        match receive_peer_from(launch, peer, &mut node, &incoming.message) {
+                            Ok(Some(id)) => {
+                                adapter.peer_commands.push(id);
+                                if let Some(handoff) = incoming.handoff.as_mut() {
+                                    handoff.acknowledge();
+                                }
+                                connection.incoming = None;
                             }
-                            peer_incoming = None;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            adapter.peer_error = Some(error);
-                            peer_incoming = None;
-                            current.channel.dispose();
+                            Ok(None) => {}
+                            Err(error) => {
+                                adapter.peer_error = Some(error);
+                                connection.incoming = None;
+                                current.channel.dispose();
+                            }
                         }
                     }
-                }
-                if adapter.peer_error.is_some() {
-                    if let Some(old) = peer_link.take() {
-                        let _ = old.close().await;
+                    if adapter.peer_error.is_some() {
+                        if let Some(old) = connection.link.take() {
+                            let _ = old.close().await;
+                        }
                     }
                 }
             }
@@ -959,7 +1307,15 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         let received =
                             match receive_generation(launch, &node, current, &mut incoming).await {
                                 Ok(true) => Ok(None),
-                                Ok(false) => receive_command(launch, &mut node, &incoming.message),
+                                Ok(false) => {
+                                    match adapter.reject_deprecated(&node, &incoming.message) {
+                                        Ok(true) => Ok(None),
+                                        Ok(false) => {
+                                            receive_command(launch, &mut node, &incoming.message)
+                                        }
+                                        Err(error) => Err(error),
+                                    }
+                                }
                                 Err(error) => Err(error),
                             };
                         match received {
@@ -987,9 +1343,11 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 }
             }
             if link.is_some() && adapter.error.is_none() && adapter.replica_drained(&node) {
-                if let Err(error) = publish_host_loss(launch, &node, &mut published_host_loss) {
-                    failure = Some(error);
-                    break;
+                if launch.profile == ServiceProfile::StatefulPeerIdle {
+                    if let Err(error) = publish_host_loss(launch, &node, &mut published_host_loss) {
+                        failure = Some(error);
+                        break;
+                    }
                 }
                 if let Err(error) = publish_absence(launch, &node, &mut published_absence) {
                     failure = Some(error);
@@ -1047,6 +1405,33 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     }
                 }
             }
+            if let Some(identity) = repair_requested.filter(|_| adapter.replica_drained(&node)) {
+                match node.retire_lost_replica_host() {
+                    Ok(true) => match replace_replica_host(launch, &mut node) {
+                        Ok(receipt) => {
+                            metadata.profile = Some(receipt.profile.clone());
+                            if let Err(error) = write_json(
+                                &launch.host_replacement_path(identity.0, identity.1),
+                                &receipt,
+                            ) {
+                                failure = Some(error);
+                                break;
+                            }
+                            repaired_hosts.push(identity);
+                            repair_requested = None;
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    },
+                    Ok(false) => {}
+                    Err(error) => {
+                        failure = Some(err(error));
+                        break;
+                    }
+                }
+            }
             if next_observation <= Instant::now() {
                 let generations = node.generation_state();
                 let entity = uuid::Uuid::parse_str(&launch.partition)
@@ -1061,6 +1446,14 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         "open_token":state.open_token, "usage":format!("{:?}",state.usage),
                         "fm_stage":format!("{:?}",state.fm_stage),
                         "local_deleted":state.local_deleted,
+                        "swap":state.swap.as_ref().map(|swap| serde_json::json!({"stage":format!("{:?}",swap.stage),"error":swap.error})),
+                        "progress_query":state.progress_query.as_ref().map(|query| serde_json::json!({
+                            "source":query.source,"epoch":query.request.unit.current,
+                            "pending":query.reply.is_none(),"error":query.error,
+                        })),
+                        "configuration":state.reconfiguration.as_ref().map(|config| serde_json::json!({
+                            "stage":format!("{:?}", config.stage), "request":config.request, "error":config.error,
+                        })),
                         "pre_open_failure":node.pre_open_registration_failure(),
                         "runtime_open_failure":node.runtime_open_failure(),
                         "host_lost":node.activation().process_status().is_some_and(|process| process.exit_observed),
@@ -1073,7 +1466,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 });
                 let remote_idle =
                     state
-                        .and_then(|state| state.remote_idle.as_ref())
+                        .and_then(|state| state.remote_idles.first())
                         .map(|remote| {
                             serde_json::json!({
                                 "replica":remote.body.replica.0.replica,
@@ -1106,8 +1499,15 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     "adapter_pending":adapter.pending(), "commands":node.pending_commands(),
                     "semantic_pending":adapter.semantic_pending(),
                     "staged_status":format!("{:?}", node.pending_status()),
+                    "deprecated_change_configuration_reply":adapter.rejected_change_configuration_reply.as_ref()
+                        .map(|body| serde_json::json!({"state":"rejected","reason":"deprecated native action","body":body})),
                     "error":adapter.error, "link_alive":link.is_some(),
-                    "peer_link_alive":peer_link.is_some(), "peer_error":adapter.peer_error,
+                    "peer_link_alive":!connections.is_empty() && connections.iter().all(|c| c.link.is_some()), "peer_error":adapter.peer_error,
+                    "remote_idles":state.map(|s| s.remote_idles.iter().map(|r| serde_json::json!({
+                        "replica":r.body.replica.0.replica, "reply":r.reply,
+                        "ready":r.ready && r.removal.is_none(),
+                        "build":r.build.as_ref().map(|b| serde_json::json!({"result":b.result,"detail":b.detail})),
+                    })).collect::<Vec<_>>()),
                     "peer_command_error":adapter.peer_command_error,
                     "peer_idle":remote_idle, "local_replica":local_replica,
                     "app_observation":{
@@ -1116,13 +1516,17 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             .find_map(|line| line.split_once("LOCAL_IDLE_DATA_ERROR ").map(|(_, error)| error)),
                         "opens":app_logs.iter().filter(|line| line.contains("LOCAL_CALLBACK open")).count(),
                         "provider_acquisitions":app_logs.iter().filter(|line| line.contains("LOCAL_DATA_PROVIDER acquired")).count(),
+                        "primary_last_admitted":app_logs.iter().rev().find_map(|line|
+                            line.split_once("LOCAL_PRIMARY admitted sequence=").and_then(|(_, n)| n.trim().parse::<i64>().ok())),
+                        "primary_last_acknowledged":app_logs.iter().rev().find_map(|line|
+                            line.split_once("LOCAL_PRIMARY acknowledged sequence=").and_then(|(_, n)| n.trim().parse::<i64>().ok())),
                         "idle_access_denied":app_logs.iter().any(|line| line.contains("LOCAL_ACCESS denied")),
                         "idle_write_denials":app_logs.iter().filter(|line| line.contains("LOCAL_DATA write_denied NotPrimary assigned=0")).count(),
                     },
                     "generations": {
                         "proposed":generations.proposed, "receive":generations.receive,
                         "send":generations.send, "upload_pending":generations.upload_pending,
-                        "upload_supported":false,
+                        "upload_supported":!launch.profile.peer_replicas(),
                     },
                 });
                 if let Err(error) =
@@ -1135,11 +1539,14 @@ async fn run_owned(launch: &Launch) -> Result<()> {
             }
         }
     }
+    drop(upload_request);
     if let Some(link) = link.take() {
         let _ = link.close().await;
     }
-    if let Some(link) = peer_link.take() {
-        let _ = link.close().await;
+    for connection in &mut connections {
+        if let Some(link) = connection.link.take() {
+            let _ = link.close().await;
+        }
     }
     let receipt = cleanup(launch, &mut node, &store, &mut adapter).await?;
     write_json(&launch.directory.join("cleanup.json"), &receipt)?;
@@ -1149,7 +1556,16 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn dial_peer(launch: &Launch, address: &str) -> Result<Link> {
+    dial_peer_to(
+        launch,
+        launch.peers.first().ok_or("no original peer binding")?,
+        address,
+    )
+    .await
+}
+async fn dial_peer_to(launch: &Launch, peer: &Peer, address: &str) -> Result<Link> {
     let address: std::net::SocketAddr = address.parse().map_err(err)?;
     if !address.ip().is_loopback() || address.port() == 0 {
         return Err("peer requires original numeric loopback listener".into());
@@ -1163,10 +1579,28 @@ async fn dial_peer(launch: &Launch, address: &str) -> Result<Link> {
     .connect_until(wire::deadline())
     .await
     .map_err(err)?;
-    peer_link(launch, channel)
+    Link::new(
+        channel,
+        launch.node.clone(),
+        peer.node.clone(),
+        launch.generation.clone(),
+    )
 }
 
+#[cfg(test)]
 async fn accept_peer(launch: &Launch, stream: tokio::net::TcpStream) -> Result<Link> {
+    accept_peer_from(
+        launch,
+        launch.peers.first().ok_or("no original peer binding")?,
+        stream,
+    )
+    .await
+}
+async fn accept_peer_from(
+    launch: &Launch,
+    peer: &Peer,
+    stream: tokio::net::TcpStream,
+) -> Result<Link> {
     let channel = fube_transport::accept_unsecured_loopback(
         stream,
         wire::peer_composition().map_err(err)?,
@@ -1175,25 +1609,16 @@ async fn accept_peer(launch: &Launch, stream: tokio::net::TcpStream) -> Result<L
     )
     .await
     .map_err(err)?;
-    peer_link(launch, channel)
-}
-
-fn peer_link(launch: &Launch, channel: fube_transport::Channel) -> Result<Link> {
     Link::new(
         channel,
         launch.node.clone(),
-        launch
-            .peer
-            .as_ref()
-            .ok_or("no original peer binding")?
-            .node
-            .clone(),
+        peer.node.clone(),
         launch.generation.clone(),
     )
 }
 
 fn create_idle(launch: &Launch, node: &mut Node) -> Result<u64> {
-    let peer = launch.peer.as_ref().ok_or("no original peer binding")?;
+    let peer = launch.peers.first().ok_or("no original peer binding")?;
     let package_version = actual_profile(node)?.version;
     node.create_idle_on_peer(Replica {
         node: peer.node.clone(),
@@ -1209,17 +1634,78 @@ fn create_idle(launch: &Launch, node: &mut Node) -> Result<u64> {
     .map_err(err)
 }
 
+#[cfg(test)]
 fn receive_peer(
     launch: &Launch,
     node: &mut Node,
     message: &fube_transport::message::Message,
 ) -> Result<Option<u64>> {
+    receive_peer_from(
+        launch,
+        launch.peers.first().ok_or("unbound peer ingress")?,
+        node,
+        message,
+    )
+}
+fn receive_peer_from(
+    launch: &Launch,
+    peer: &Peer,
+    node: &mut Node,
+    message: &fube_transport::message::Message,
+) -> Result<Option<u64>> {
     wire::predecode(message)?;
-    let peer = launch.peer.as_ref().ok_or("unbound peer ingress")?;
-    let result = match message.properties().map_err(err)?.action.as_str() {
-        "CreateReplica" if launch.placement == 2 => {
+    let action = message.properties().map_err(err)?.action;
+    let result = match action.as_str() {
+        "DoReconfiguration" if launch.placement == 2 => {
+            let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
+            node.continue_swap_from_peer(body, &peer.node, &generation)
+        }
+        "GetLSN" => {
+            let (body, generation) = decode_get_lsn(message).map_err(err)?;
+            node.get_lsn_from_peer(body, &peer.node, &generation)
+        }
+        "GetLSNReply" => {
+            let (body, generation) = decode_get_lsn_reply(message).map_err(err)?;
+            node.get_lsn_reply_from_peer(body, &peer.node, &generation)
+        }
+        "Deactivate" if launch.placement == 2 || launch.profile.mesh_peers() => {
+            let (body, generation) = decode_deactivate(message).map_err(err)?;
+            launch.check_service_sizes(&body.configuration.unit, &body.configuration.service)?;
+            node.deactivate_replica_from_peer(body, &peer.node, &generation)
+        }
+        "DeactivateReply" if launch.placement == 1 || launch.profile.mesh_peers() => {
+            let (body, generation) = decode_deactivate_reply(message).map_err(err)?;
+            fixed_idle_target(
+                launch,
+                &body.unit.id,
+                &body.replica,
+                &peer.node,
+                peer.replica,
+                peer.incarnation,
+            )?;
+            node.deactivate_reply_from_peer(body, &peer.node, &generation)
+        }
+        "Activate" => {
+            let (body, generation) = decode_activate(message).map_err(err)?;
+            launch.check_service_sizes(&body.configuration.unit, &body.configuration.service)?;
+            node.activate_replica_from_peer(body, &peer.node, &generation)
+        }
+        "ActivateReply" => {
+            let (body, generation) = decode_activate_reply(message).map_err(err)?;
+            fixed_idle_target(
+                launch,
+                &body.unit.id,
+                &body.replica,
+                &peer.node,
+                peer.replica,
+                peer.incarnation,
+            )?;
+            node.activate_reply_from_peer(body, &peer.node, &generation)
+        }
+        "CreateReplica" if launch.placement != 1 || launch.profile.mesh_peers() => {
             let (body, generation) = decode_create_replica(message).map_err(err)?;
-            fixed_peer_target(
+            launch.check_service_sizes(&body.replica.0.unit, &body.replica.0.service)?;
+            fixed_idle_target(
                 launch,
                 &body.replica.0.unit.id,
                 &body.replica.0.replica,
@@ -1229,9 +1715,9 @@ fn receive_peer(
             )?;
             node.create_replica_from_peer(body, &peer.node, &generation)
         }
-        "CreateReplicaReply" if launch.placement == 1 => {
+        "CreateReplicaReply" if launch.placement == 1 || launch.profile.mesh_peers() => {
             let (body, generation) = decode_create_replica_reply(message).map_err(err)?;
-            fixed_peer_target(
+            fixed_idle_target(
                 launch,
                 &body.unit.id,
                 &body.replica,
@@ -1246,6 +1732,7 @@ fn receive_peer(
     match result {
         Ok(id) => Ok(Some(id)),
         Err(fube_node::local::Error::Capacity) => Ok(None),
+        Err(fube_node::local::Error::Busy) if action == "CreateReplica" => Ok(None),
         Err(error) => Err(err(error)),
     }
 }
@@ -1271,6 +1758,70 @@ fn fixed_peer_target(
     Ok(())
 }
 
+fn fixed_idle_target(
+    launch: &Launch,
+    partition: &PartitionId,
+    replica: &Replica,
+    node: &NodeInstance,
+    id: i64,
+    instance: i64,
+) -> Result<()> {
+    let expected = if (replica.id, replica.instance) == (id, instance) {
+        (id, instance)
+    } else if launch.profile.mesh_peers() && replica.id > id && replica.instance > instance {
+        // The live RA validates the exact current or freshly admitted incarnation.
+        (replica.id, replica.instance)
+    } else {
+        launch.idle_successor()?
+    };
+    fixed_peer_target(launch, partition, replica, node, expected.0, expected.1)
+}
+
+fn replace_replica_host(launch: &Launch, node: &mut Node) -> Result<HostReplacementReceipt> {
+    let predecessor = actual_profile(node)?;
+    let old_host = node
+        .activation()
+        .identity()
+        .ok_or("missing retired host identity")?
+        .host_id
+        .clone();
+    let mut options = Options::new(launch.directory.join("hosting"));
+    options.profile = fube_hosting::local::Profile::VolatileStatefulLifecycle;
+    options.service_package_version_instance = Some(1);
+    options.node = Some(NodeContext {
+        id: node_hex(&launch.node),
+        instance: launch.node.instance,
+        name: launch.name(),
+    });
+    node.replace_lost_replica_host(Activation::new(options).map_err(err)?)
+        .map_err(err)?;
+    node.start(
+        &launch.package,
+        APPLICATION,
+        &[(
+            "Arguments".into(),
+            "--stateful-lifecycle --data-replicator".into(),
+        )],
+    )
+    .map_err(err)?;
+    let profile = actual_profile(node)?;
+    profile.validate(launch)?;
+    let new_host = node
+        .activation()
+        .identity()
+        .ok_or("missing replacement host identity")?
+        .host_id
+        .clone();
+    Ok(HostReplacementReceipt {
+        deployment: launch.deployment.clone(),
+        session: launch.session.clone(),
+        node_pid: std::process::id(),
+        predecessor,
+        profile,
+        old_host,
+        new_host,
+    })
+}
 fn publish_host_loss(launch: &Launch, node: &Node, published: &mut bool) -> Result<()> {
     if *published {
         return Ok(());
@@ -1518,7 +2069,26 @@ fn receive_command(
         }
         "AddPrimary" => {
             let (body, generation) = decode_add_primary(message).map_err(err)?;
+            launch.check_service_sizes(&body.unit, &body.service)?;
             node.add_primary_from_fm(body, &launch.fm, &generation)
+                .map_err(err)?;
+        }
+        "DoReconfiguration" => {
+            if !launch.profile.peer_replicas()
+                || (launch.placement != 1
+                    && !launch.profile.mesh_peers()
+                    && launch.profile.configured_sizes().is_none())
+            {
+                return Err("DoReconfiguration requires the original coordinating Primary".into());
+            }
+            let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
+            launch.check_service_sizes(&body.configuration.unit, &body.configuration.service)?;
+            node.reconfigure_from_fm(body, &launch.fm, &generation)
+                .map_err(err)?;
+        }
+        "ReplicaEndpointUpdatedReply" => {
+            let (body, generation) = decode_replica_endpoint_updated_reply(message).map_err(err)?;
+            node.endpoint_reply_from_fm(body, &launch.fm, &generation)
                 .map_err(err)?;
         }
         "AddReplica" | "RemoveReplica" => {
@@ -1529,12 +2099,14 @@ fn receive_command(
                 decode_add_replica(message)
             }
             .map_err(err)?;
+            launch.check_service_sizes(&body.unit, &body.service)?;
             let peer = launch
-                .peer
-                .as_ref()
-                .filter(|_| launch.placement == 1)
+                .peers
+                .iter()
+                .find(|peer| peer.node == body.replica.node)
+                .filter(|_| launch.placement == 1 || launch.profile.mesh_peers())
                 .ok_or("replica control requires the original coordinating Primary")?;
-            fixed_peer_target(
+            fixed_idle_target(
                 launch,
                 &body.unit.id,
                 &body.replica,
@@ -1563,7 +2135,12 @@ fn receive_command(
             if launch.profile == ServiceProfile::StatefulPeerIdle && launch.placement == 2 {
                 let incoming = &body.replica.0;
                 // Native Delete matches ReplicaId, not FM's potentially older instance.
-                let instance = if incoming.replica.instance < launch.incarnation
+                let (id, expected_instance) = if incoming.replica.id == launch.replica {
+                    (launch.replica, launch.incarnation)
+                } else {
+                    launch.idle_successor()?
+                };
+                let instance = if incoming.replica.instance < expected_instance
                     && node
                         .snapshot(incoming.unit.id.guid.0)
                         .committed
@@ -1571,14 +2148,14 @@ fn receive_command(
                 {
                     incoming.replica.instance
                 } else {
-                    launch.incarnation
+                    expected_instance
                 };
                 fixed_peer_target(
                     launch,
                     &body.replica.0.unit.id,
                     &body.replica.0.replica,
                     &launch.node,
-                    launch.replica,
+                    id,
                     instance,
                 )?;
             }
@@ -1644,12 +2221,16 @@ async fn receive_generation(
         "GenerationUpdate" => {
             wire::predecode(message)?;
             let (body, header) = decode_generation_update(message).map_err(err)?;
-            if let ra::GenerationUpdateOutcome::Rejected(proposed) = node
+            match node
                 .process_generation_update(&launch.fm, &body, &header)
                 .map_err(err)?
             {
-                link.send(generation_update_reject_message(&proposed).map_err(err)?)
-                    .await?;
+                ra::GenerationUpdateOutcome::Rejected(proposed) => {
+                    link.send(generation_update_reject_message(&proposed).map_err(err)?)
+                        .await?;
+                }
+                ra::GenerationUpdateOutcome::UploadRequired => link.advance_generation(&header),
+                _ => {}
             }
         }
         _ => return Ok(false),
@@ -3573,7 +4154,7 @@ pub(crate) mod report_tests {
             },
         )
         .map_err(err)?;
-        if let Some(peer) = &launch.peer {
+        if let Some(peer) = launch.peers.first() {
             node.bind_peer(peer.node.clone()).map_err(err)?;
         }
         Ok((node, store))
@@ -3588,7 +4169,7 @@ pub(crate) mod report_tests {
     ) -> Result<()> {
         node.drive().map_err(err)?;
         adapter
-            .advance_with_peer(node, fm, Some(peer), launch.peer.as_ref())
+            .advance_with_peer(node, fm, Some(peer), launch.peers.first())
             .await?;
         if let Some(mut incoming) = peer
             .receive(Instant::now() + Duration::from_millis(1))
@@ -4702,7 +5283,7 @@ pub(crate) mod report_tests {
                             return Err("late Create opened/acquired/disposed a never-created destination".into());
                         }
                         let primary = source.snapshot(entity).committed.ok_or("Primary disappeared")?;
-                        if primary.remote_idle.as_ref().is_none_or(|remote| remote.build.is_some() || remote.ready || remote.reply.is_some()) {
+                        if primary.remote_idles.first().is_none_or(|remote| remote.build.is_some() || remote.ready || remote.reply.is_some()) {
                             return Err("late Create resurrected the cancelled source build".into());
                         }
                         ledger.idle_removal_reply(0, traffic.idle_removals[1].clone())?;
@@ -4775,8 +5356,7 @@ pub(crate) mod report_tests {
                     .committed
                     .ok_or("Primary disappeared")?;
                 let remote = current
-                    .remote_idle
-                    .as_ref()
+                    .remote_idles.first()
                     .ok_or("cancellation tombstone disappeared")?;
                 if remote.reply.as_ref().map(|reply| reply.error)
                     != failed.then_some(ra::RA_NOT_READY)
@@ -4977,6 +5557,27 @@ pub(crate) mod report_tests {
                         {
                             return Err("destination Delete completed Primary removal or authorized replacement".into());
                         }
+                        if !opening && !after_host_exit {
+                            let mut fresh = create.clone();
+                            let (id, instance) = launches[1].idle_successor()?;
+                            fresh.replica.0.replica.id = id;
+                            fresh.replica.0.replica.instance = instance;
+                            let message = create_replica_message(&fresh, &launches[0].generation).map_err(err)?;
+                            receive_command(&launches[1], &mut target,
+                                &delete_replica_message(&deleting, &launches[1].generation).map_err(err)?)?;
+                            let pending = target.pending_commands();
+                            let before = target.snapshot(entity).committed.ok_or("missing closed owner before busy Create")?;
+                            // Queued old-owner work must backpressure a fresh Create, not close the peer.
+                            for _ in 0..2 {
+                                if receive_peer(&launches[1], &mut target, &message)?.is_some()
+                                    || target.pending_commands() != pending
+                                    || target.snapshot(entity).committed.is_none_or(|state|
+                                        state.body != before.body || !state.local_deleted)
+                                {
+                                    return Err("busy Create changed the closed owner or consumed admission".into());
+                                }
+                            }
+                        }
                         source_link.send(create_replica_message(&create, &launches[0].generation).map_err(err)?).await?;
                         fm.send(add_replica_message(&request, &launches[0].generation).map_err(err)?).await?;
                         for _ in 0..15 {
@@ -4993,7 +5594,7 @@ pub(crate) mod report_tests {
                             || target.activation().logs().iter().filter(|line| line.contains("LOCAL_CALLBACK abort")).count() != usize::from(opening)
                             || target.activation().logs().iter().filter(|line| line.contains("LOCAL_DATA_PROVIDER acquired")).count() != 1
                             || !target_traffic.reports.is_empty()
-                            || source.snapshot(entity).committed.is_none_or(|state| state.remote_idle.as_ref().is_none_or(|remote| remote.build.is_some() || remote.ready))
+                            || source.snapshot(entity).committed.is_none_or(|state| state.remote_idles.first().is_none_or(|remote| remote.build.is_some() || remote.ready))
                         {
                             return Err("late peer/build traffic resurrected or reacquired the deleted Idle".into());
                         }
@@ -5110,7 +5711,7 @@ pub(crate) mod report_tests {
                     peer_step(&launches[0], &mut source, &mut source_adapter, &source_link, Some(&fm_link)).await?;
                     peer_step(&launches[1], &mut target, &mut target_adapter, &target_link, None).await?;
                     if source.snapshot(entity).committed.as_ref()
-                        .and_then(|state| state.remote_idle.as_ref())
+                        .and_then(|state| state.remote_idles.first())
                         .is_some_and(|remote| remote.reply.is_some())
                     {
                         break;
@@ -5122,7 +5723,7 @@ pub(crate) mod report_tests {
                 }
                 let original = target.snapshot(entity).committed.ok_or("missing Idle")?;
                 let request = source.snapshot(entity).committed.ok_or("missing Primary")?
-                    .remote_idle.as_ref().ok_or("missing remote request")?.body.clone();
+                    .remote_idles.first().ok_or("missing remote request")?.body.clone();
                 let mut stale_epoch = (*request).clone();
                 stale_epoch.replica.0.unit.current.configuration -= 1;
                 for request in [&stale_epoch, request.as_ref()] {

@@ -314,6 +314,85 @@ int main(int argc,char** argv) {
         cancelled_create.errorCode_.value_=Enum(0);
         run(mode,dir,"in-create-remove-replica-reply",cancelled_create);
         reject_truncated(cancelled_create);
+        DoReconfigurationMessageBody reconfig;
+        run(mode,dir,"default-do-reconfiguration",reconfig);
+        c=0; rich(reconfig,c);
+        run(mode,dir,"rich-do-reconfiguration",reconfig);
+        reject_truncated(reconfig);
+        ReplicaDescription third;
+        int third_counter=5000;
+        rich(third,third_counter);
+        reconfig.replicas_.push_back(third);
+        run(mode,dir,"three-do-reconfiguration",reconfig);
+        reject_truncated(reconfig);
+        ConfigurationReplyMessageBody configured;
+        run(mode,dir,"default-do-reconfiguration-reply",configured);
+        c=0; rich(configured,c);
+        run(mode,dir,"rich-do-reconfiguration-reply",configured);
+        reject_truncated(configured);
+        configured.replicas_.push_back(third);
+        run(mode,dir,"three-do-reconfiguration-reply",configured);
+        reject_truncated(configured);
+        ActivateMessageBody peer_activate;
+        run(mode,dir,"default-activate",peer_activate);
+        c=0; rich(peer_activate,c);
+        run(mode,dir,"rich-activate",peer_activate);
+        reject_truncated(peer_activate);
+        peer_activate.replicas_.push_back(third);
+        run(mode,dir,"three-activate",peer_activate);
+        reject_truncated(peer_activate);
+        ReplicaReplyMessageBody peer_activated;
+        run(mode,dir,"default-activate-reply",peer_activated);
+        c=0; rich(peer_activated,c);
+        run(mode,dir,"rich-activate-reply",peer_activated);
+        reject_truncated(peer_activated);
+        DeactivateMessageBody peer_deactivate;
+        peer_deactivate.isForce_=false;
+        run(mode,dir,"default-deactivate",peer_deactivate);
+        c=0; rich(peer_deactivate,c);
+        run(mode,dir,"rich-deactivate",peer_deactivate);
+        reject_truncated(peer_deactivate);
+        peer_deactivate.replicas_.push_back(third);
+        peer_deactivate.isForce_=false;
+        run(mode,dir,"three-deactivate",peer_deactivate);
+        reject_truncated(peer_deactivate);
+        ReplicaReplyMessageBody peer_deactivated;
+        run(mode,dir,"default-deactivate-reply",peer_deactivated);
+        c=0; rich(peer_deactivated,c);
+        run(mode,dir,"rich-deactivate-reply",peer_deactivated);
+        reject_truncated(peer_deactivated);
+        ReplicaMessageBody get_lsn;
+        run(mode,dir,"default-get-lsn",get_lsn);
+        c=0; rich(get_lsn,c);
+        run(mode,dir,"rich-get-lsn",get_lsn);
+        reject_truncated(get_lsn);
+        GetLSNReplyMessageBody lsn_reply;
+        run(mode,dir,"default-get-lsn-reply",lsn_reply);
+        c=0; rich(lsn_reply,c);
+        run(mode,dir,"rich-get-lsn-reply",lsn_reply);
+        reject_truncated(lsn_reply);
+        ConfigurationMessageBody change;
+        run(mode,dir,"default-change-configuration",change);
+        c=0; rich(change,c);
+        run(mode,dir,"rich-change-configuration",change);
+        reject_truncated(change);
+        FailoverUnitReplyMessageBody change_reply;
+        run(mode,dir,"default-change-configuration-reply",change_reply);
+        c=0; rich(change_reply,c);
+        run(mode,dir,"rich-change-configuration-reply",change_reply);
+        reject_truncated(change_reply);
+        if(DoReconfigurationActor!=12 || DoReconfigurationReplyActor!=11 ||
+           ActivateActor!=12 || ActivateReplyActor!=12 || DeactivateActor!=12 || DeactivateReplyActor!=12 || GetLSNActor!=12 || GetLSNReplyActor!=12 ||
+           ChangeConfigurationActor!=11 || ChangeConfigurationReplyActor!=12 ||
+           !DoReconfigurationPriority || !DoReconfigurationReplyPriority ||
+           !ChangeConfigurationPriority || !ChangeConfigurationReplyPriority ||
+           !ActivatePriority || !ActivateReplyPriority || !DeactivatePriority || !DeactivateReplyPriority || !GetLSNPriority || !GetLSNReplyPriority)
+            throw std::runtime_error("native configuration factory metadata mismatch");
+        for(auto name:{u"DoReconfiguration",u"DoReconfigurationReply",u"Activate",u"ActivateReply",u"Deactivate",u"DeactivateReply",u"GetLSN",u"GetLSNReply",u"ChangeConfiguration",u"ChangeConfigurationReply"}) {
+            action.action_=text(name);
+            std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
+            run(mode,dir,"action-"+ascii,action);
+        }
         // Native empty ctor leaves bools unspecified: explicitly initialize the fixture.
         ReplicaUpMessageBody up;
         up.isLastReplicaUpMessage_=false; up.isFromFMM_=false;
@@ -489,8 +568,21 @@ int main(int argc,char** argv) {
         generation_reject.owner_.low_=UINT64_MAX-1;
         run(mode,dir,"tie-generation-update-reject",generation_reject);
         reject_truncated(generation_reject);
+        LFUMMessageBody lfum;
+        lfum.anyReplicaFound_=false;
+        if(LFUMUploadActor!=11 || LFUMUploadReplyActor!=12 || !LFUMUploadPriority || !LFUMUploadReplyPriority)
+            throw std::runtime_error("native LFUM factory metadata mismatch");
+        run(mode,dir,"empty-lfum-upload",lfum);
+        c=0; rich(lfum,c);
+        run(mode,dir,"rich-lfum-upload",lfum);
+        reject_truncated(lfum);
+        lfum.failoverUnitInfos_.clear();
+        lfum.anyReplicaFound_=true;
+        run(mode,dir,"deleted-only-lfum-upload",lfum);
+        reject_truncated(lfum);
+        bodyless(mode,dir,"empty-lfum-upload-reply");
         for(auto name:{u"GenerationProposal",u"GenerationProposalReply",
-                      u"GenerationUpdate",u"GenerationUpdateReject"}) {
+                      u"GenerationUpdate",u"GenerationUpdateReject",u"LFUMUpload",u"LFUMUploadReply"}) {
             action.action_=text(name);
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);
@@ -540,7 +632,7 @@ int main(int argc,char** argv) {
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
         ++native_truncation_rejections;
-        if(native_truncation_rejections!=39)
+        if(native_truncation_rejections!=55)
             throw std::runtime_error("native truncation coverage mismatch");
         std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .schema import (
     EXTRA_NATIVE_INPUTS, MODELS, REVISION, generate, generation_factories, native_constants,
-    peer_factories, replica_factories,
+    peer_factories, replica_factories, configuration_factories,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -109,6 +109,7 @@ def produce(native, out, cxx, rust):
         "generation_factories": generation_factories(native),
         "peer_factories": peer_factories(native),
         "replica_factories": replica_factories(native),
+        "configuration_factories": configuration_factories(native),
         "cases": sorted(p.stem for p in (out / "native").glob("*.bin")),
         "files": {str(p.relative_to(out)): digest(p) for p in sorted(out.rglob("*"))
                   if p.is_file()},

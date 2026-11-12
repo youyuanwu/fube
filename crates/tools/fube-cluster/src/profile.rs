@@ -20,16 +20,57 @@ pub enum ServiceProfile {
     Stateless,
     StatefulSingleton,
     StatefulPeerIdle,
+    StatefulThree,
+    Stateful {
+        target: i32,
+        minimum: i32,
+    },
 }
 impl ServiceProfile {
     pub fn service(self) -> &'static str {
         match self {
             Self::Stateless => SERVICE,
-            Self::StatefulSingleton | Self::StatefulPeerIdle => "fabric:/Cluster/Singleton",
+            Self::StatefulSingleton
+            | Self::StatefulPeerIdle
+            | Self::StatefulThree
+            | Self::Stateful { .. } => "fabric:/Cluster/Singleton",
         }
     }
     pub fn stateful(self) -> bool {
         self != Self::Stateless
+    }
+    pub fn peer_replicas(self) -> bool {
+        matches!(self, Self::StatefulPeerIdle | Self::StatefulThree)
+            || matches!(self, Self::Stateful { target, .. } if target > 1)
+    }
+    pub fn configured_sizes(self) -> Option<(i32, i32)> {
+        match self {
+            Self::Stateful { target, minimum } => Some((target, minimum)),
+            _ => None,
+        }
+    }
+    pub fn mesh_peers(self) -> bool {
+        matches!(self, Self::StatefulThree | Self::Stateful { .. })
+    }
+    pub fn validate(self) -> Result<()> {
+        if let Some((target, minimum)) = self.configured_sizes() {
+            if minimum < 1
+                || target < minimum
+                || target as usize > fube_ra::entity::MAX_CONFIGURATION_REPLICAS
+            {
+                return Err("stateful sizes require 1 <= minimum <= target <= 64".into());
+            }
+        }
+        Ok(())
+    }
+    pub fn node_count(self) -> usize {
+        if let Self::Stateful { target, .. } = self {
+            target as usize
+        } else if self == Self::StatefulThree {
+            3
+        } else {
+            2
+        }
     }
 }
 
@@ -194,14 +235,53 @@ pub struct Launch {
     pub replica: i64,
     pub incarnation: i64,
     #[serde(default)]
-    pub peer: Option<Peer>,
+    pub peers: Vec<Peer>,
 }
 impl Launch {
+    pub fn check_service_sizes(&self, unit: &FailoverUnit, service: &Service) -> Result<()> {
+        if self
+            .profile
+            .configured_sizes()
+            .is_some_and(|(target, minimum)| {
+                unit.target != target
+                    || unit.minimum != minimum
+                    || service.target != target
+                    || service.minimum != minimum
+            })
+        {
+            return Err("replica-set settings are immutable for this service".into());
+        }
+        Ok(())
+    }
+    pub fn host_replacement_path(&self, replica: i64, instance: i64) -> PathBuf {
+        self.directory
+            .join(format!("repaired-host-{replica}-{instance}.json"))
+    }
+    pub fn idle_successor(&self) -> Result<(i64, i64)> {
+        if self.profile != ServiceProfile::StatefulPeerIdle {
+            return Err("replacement outside the original two-node profile is gated".into());
+        }
+        let peer = self.peers.first().ok_or("missing original peer")?;
+        let destination_instance = if self.placement == 2 {
+            self.incarnation
+        } else {
+            peer.incarnation
+        };
+        let next = self
+            .replica
+            .max(peer.replica)
+            .max(destination_instance)
+            .checked_add(1)
+            .ok_or("Idle replica identity exhausted")?;
+        Ok((next, next))
+    }
+
     pub fn name(&self) -> String {
         format!("node{}", self.placement)
     }
     pub fn validate(&self) -> Result<()> {
-        if !(1..=2).contains(&self.placement)
+        self.profile.validate()?;
+        if !(1..=self.profile.node_count()).contains(&usize::from(self.placement))
             || self.node.id == self.fm.id
             || self.node.instance == 0
             || self.fm.instance == 0
@@ -224,22 +304,38 @@ impl Launch {
         ] {
             uuid::Uuid::parse_str(id).map_err(err)?;
         }
-        match (&self.peer, self.profile) {
-            (Some(peer), ServiceProfile::StatefulPeerIdle)
-                if peer.node != self.node
-                    && peer.node.id != self.fm.id
-                    && peer.node.id != self.node.id
-                    && peer.node.instance > 0
-                    && peer.session != self.session
-                    && peer.partition == self.partition
-                    && peer.replica >= 0
-                    && peer.replica != self.replica
-                    && peer.incarnation > 0 =>
+        let expected = if self.profile.peer_replicas() {
+            if self.placement == 1 || self.profile.mesh_peers() {
+                self.profile.node_count() - 1
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+        if self.peers.len() != expected {
+            return Err("invalid original peer count".into());
+        }
+        for (i, peer) in self.peers.iter().enumerate() {
+            if peer.node != self.node
+                && peer.node.id != self.fm.id
+                && peer.node.id != self.node.id
+                && peer.node.instance > 0
+                && peer.session != self.session
+                && peer.partition == self.partition
+                && peer.replica >= 0
+                && peer.replica != self.replica
+                && peer.incarnation > 0
+                && self.peers[..i].iter().all(|other| {
+                    other.node.id != peer.node.id
+                        && other.replica != peer.replica
+                        && other.session != peer.session
+                })
             {
                 uuid::Uuid::parse_str(&peer.session).map_err(err)?;
+            } else {
+                return Err("invalid original peer binding".into());
             }
-            (None, ServiceProfile::Stateless | ServiceProfile::StatefulSingleton) => {}
-            _ => return Err("invalid original peer binding".into()),
         }
         Ok(())
     }
@@ -256,10 +352,12 @@ pub struct Metadata {
     pub address: SocketAddr,
     #[serde(default)]
     pub peer_address: Option<SocketAddr>,
+    #[serde(default)]
+    pub peer_addresses: Vec<SocketAddr>,
     pub profile: Option<ActualProfile>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActualProfile {
     pub service: String,
@@ -268,6 +366,40 @@ pub struct ActualProfile {
     pub code_package: String,
     pub app_pid: u32,
     pub runtime_root: PathBuf,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostReplacementReceipt {
+    pub deployment: String,
+    pub session: String,
+    pub node_pid: u32,
+    pub predecessor: ActualProfile,
+    pub profile: ActualProfile,
+    pub old_host: String,
+    pub new_host: String,
+}
+impl HostReplacementReceipt {
+    pub fn validate(&self, launch: &Launch, old: &ActualProfile, node_pid: u32) -> Result<()> {
+        self.profile.validate(launch)?;
+        if !launch.profile.mesh_peers()
+            || self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node_pid != node_pid
+            || self.old_host == self.new_host
+            || &self.predecessor != old
+            || self.profile.app_pid == old.app_pid
+            || self.profile.runtime_root == old.runtime_root
+            || self.profile.service != old.service
+            || self.profile.service_type != old.service_type
+            || self.profile.version != old.version
+            || self.profile.code_package != old.code_package
+        {
+            return Err("replacement host does not match the owned repair lineage".into());
+        }
+        uuid::Uuid::parse_str(&self.old_host).map_err(err)?;
+        uuid::Uuid::parse_str(&self.new_host).map_err(err)?;
+        Ok(())
+    }
 }
 impl ActualProfile {
     pub fn validate(&self, launch: &Launch) -> Result<()> {
@@ -304,7 +436,10 @@ pub fn fixed_type() -> ServiceType {
 pub fn fixed_type_for(profile: ServiceProfile) -> ServiceType {
     let (application, package, name) = match profile {
         ServiceProfile::Stateless => ("ClusterStatelessApp", "ClusterService", TYPE),
-        ServiceProfile::StatefulSingleton | ServiceProfile::StatefulPeerIdle => (
+        ServiceProfile::StatefulSingleton
+        | ServiceProfile::StatefulPeerIdle
+        | ServiceProfile::StatefulThree
+        | ServiceProfile::Stateful { .. } => (
             "HostingLocalStatefulApp",
             "LocalService",
             "LocalStatefulType",
@@ -332,8 +467,9 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
         configuration: 1,
         data_loss: 1,
     };
-    body.unit.target = 1;
-    body.unit.minimum = 1;
+    let (target, minimum) = launch.profile.configured_sizes().unwrap_or((1, 1));
+    body.unit.target = target;
+    body.unit.minimum = minimum;
     body.replica.node = launch.node.clone();
     body.replica.id = launch.replica;
     body.replica.instance = launch.incarnation;
@@ -345,8 +481,8 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
     body.service.service_type = profile.service_type.clone();
     body.service.version = profile.version.clone();
     body.service.partitions = 1;
-    body.service.target = 1;
-    body.service.minimum = 1;
+    body.service.target = target;
+    body.service.minimum = minimum;
     if launch.profile.stateful() {
         body.service.stateful = true;
         body.replica.current_role = 4;
@@ -407,7 +543,7 @@ impl PreOpenCancellationReceipt {
     pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
         if launch.profile != ServiceProfile::StatefulPeerIdle
             || launch.placement != 2
-            || launch.peer.is_none()
+            || launch.peers.is_empty()
             || self.deployment != launch.deployment
             || self.session != launch.session
             || self.node != launch.node
@@ -451,7 +587,7 @@ impl FailedRegistrationReceipt {
         let failure = &self.deletion.failure;
         if launch.profile != ServiceProfile::StatefulPeerIdle
             || launch.placement != 2
-            || launch.peer.is_none()
+            || launch.peers.is_empty()
             || self.deployment != launch.deployment
             || self.session != launch.session
             || self.node != launch.node
@@ -506,7 +642,7 @@ impl FailedOpenReceipt {
         original.replica.current_role = 2;
         if launch.profile != ServiceProfile::StatefulPeerIdle
             || launch.placement != 2
-            || launch.peer.is_none()
+            || launch.peers.is_empty()
             || self.deployment != launch.deployment
             || self.session != launch.session
             || self.node != launch.node
@@ -561,7 +697,7 @@ impl AbsenceReceipt {
     pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
         if launch.profile != ServiceProfile::StatefulPeerIdle
             || launch.placement != 2
-            || launch.peer.is_none()
+            || launch.peers.is_empty()
             || self.deployment != launch.deployment
             || self.session != launch.session
             || self.node != launch.node
@@ -602,6 +738,15 @@ pub struct RetirementReceipt {
 }
 impl RetirementReceipt {
     pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        self.validate_body(launch, profile, node_pid, &add_body(launch, profile))
+    }
+    pub fn validate_body(
+        &self,
+        launch: &Launch,
+        profile: &ActualProfile,
+        node_pid: u32,
+        body: &AddInstance,
+    ) -> Result<()> {
         let proof = &self.disposal;
         if self.deployment != launch.deployment
             || self.session != launch.session
@@ -611,8 +756,8 @@ impl RetirementReceipt {
             || self.node_pid != node_pid
             || self.app_pid != profile.app_pid
             || self.runtime_root != profile.runtime_root
-            || proof.body.unit != add_body(launch, profile).unit
-            || proof.body.service != add_body(launch, profile).service
+            || proof.body.unit != body.unit
+            || proof.body.service != body.service
             || proof.body.replica.node != launch.node
             || proof.body.replica.version != profile.version
             || proof.command == 0

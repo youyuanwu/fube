@@ -316,6 +316,7 @@ async fn generation_update_does_not_publish_private_commits_and_queued_work_rech
         );
         assert!(executor.snapshot([1; 16]).committed.is_none());
         assert!(executor.take_effects().is_empty());
+        assert!(executor.lfum_inventory().unwrap().is_none());
         if !fail {
             assert_eq!(first.wait(WAIT).await, Err(Failure::Unknown));
             assert!(executor.snapshot([1; 16]).fenced);
@@ -345,9 +346,222 @@ async fn generation_update_does_not_publish_private_commits_and_queued_work_rech
         }
         assert_eq!(executor.generation_state().send, admission().generation);
         assert!(executor.generation_state().upload_pending);
+        let inventory = wait_lfum(&executor).await;
+        assert!(inventory.any_replica_found);
+        assert_eq!(inventory.units.0.len(), usize::from(!fail));
+        if !fail {
+            assert_eq!(inventory.units.0[0].unit, body(1).unit);
+            assert_eq!(
+                inventory.units.0[0].replicas.0[0].description,
+                body(1).replica
+            );
+        }
         finish(&store, &executor).await;
     }
 }
+async fn wait_lfum(executor: &Executor) -> LfumInventory {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(inventory) = executor.lfum_inventory().unwrap() {
+                return inventory;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn lfum_snapshot_filters_deleted_entries_and_ack_fences_superseded_generations() {
+    let (store, executor, _) = setup(WAIT).await;
+    let source = admission().fm_source;
+    let update = GenerationUpdate::default();
+    assert!(executor.lfum_inventory().unwrap().is_none());
+    executor
+        .process_generation_proposal(&source, &generation_header(8))
+        .unwrap();
+    executor
+        .process_generation_update(&source, &update, &generation_header(8))
+        .unwrap();
+    let empty = wait_lfum(&executor).await;
+    assert!(!empty.any_replica_found);
+    assert!(empty.units.0.is_empty());
+    assert!(!executor
+        .process_lfum_upload_reply(&source, &generation_header(7))
+        .unwrap());
+    assert!(executor
+        .process_lfum_upload_reply(&source, &generation_header(8))
+        .unwrap());
+    assert_eq!(
+        executor.generation_state().send,
+        generation_header(8).number
+    );
+    assert!(!executor.generation_state().upload_pending);
+
+    // Missing-FT Delete retains a real deleted tombstone, not an uploaded replica.
+    run(
+        &executor,
+        Command::Remove {
+            body: Box::new(RemoveInstance::new(body(2), false)),
+            source: source.clone(),
+            generation: generation_header(8),
+        },
+    )
+    .await;
+    assert!(executor.snapshot([2; 16]).committed.unwrap().local_deleted);
+    executor.take_effects();
+    executor
+        .process_generation_proposal(&source, &generation_header(9))
+        .unwrap();
+    executor
+        .process_generation_update(&source, &update, &generation_header(9))
+        .unwrap();
+    assert!(!executor
+        .process_lfum_upload_reply(&source, &generation_header(8))
+        .unwrap());
+    let inventory = wait_lfum(&executor).await;
+    assert!(inventory.any_replica_found);
+    assert!(inventory.units.0.is_empty());
+    assert_eq!(executor.lfum_inventory().unwrap(), Some(inventory.clone()));
+    assert_eq!(
+        executor.generation_state().send,
+        generation_header(8).number
+    );
+    let mut fmm = generation_header(9);
+    fmm.for_fm_replica = true;
+    assert!(executor.process_lfum_upload_reply(&source, &fmm).is_err());
+    assert!(executor
+        .process_lfum_upload_reply(&NodeInstance::default(), &generation_header(9))
+        .is_err());
+    assert!(executor
+        .process_lfum_upload_reply(&source, &generation_header(9))
+        .unwrap());
+    assert!(executor
+        .process_lfum_upload_reply(&source, &generation_header(9))
+        .unwrap());
+    assert!(!executor.generation_state().upload_pending);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn lfum_read_jobs_capture_each_committed_replica_without_advancing_runtime_authority() {
+    let (store, executor, _) = setup(WAIT).await;
+    for id in [1, 2] {
+        run(&executor, add(body(id))).await;
+    }
+    executor.take_effects();
+    let before = [1, 2].map(|id| executor.snapshot([id; 16]).committed.unwrap());
+    let source = admission().fm_source;
+    executor
+        .process_generation_proposal(&source, &generation_header(8))
+        .unwrap();
+    executor
+        .process_generation_update(&source, &GenerationUpdate::default(), &generation_header(8))
+        .unwrap();
+    assert!(executor
+        .process_lfum_upload_reply(&source, &generation_header(8))
+        .is_err());
+    let inventory = wait_lfum(&executor).await;
+    assert_eq!(inventory.units.0.len(), 2);
+    for (info, state) in inventory.units.0.iter().zip(&before) {
+        assert_eq!(info.unit, state.body.unit);
+        assert_eq!(info.service, state.body.service);
+        assert!(!info.report_from_primary);
+        assert!(!info.local_deleted);
+        assert_eq!(info.replicas.0[0].intermediate_role, 1);
+        assert_eq!(info.replicas.0[0].description, state.body.replica);
+        assert_eq!(
+            executor
+                .snapshot(state.body.unit.id.guid.0)
+                .committed
+                .as_deref(),
+            Some(state.as_ref())
+        );
+    }
+    assert!(executor.take_effects().is_empty());
+    assert!(executor
+        .process_lfum_upload_reply(&source, &generation_header(8))
+        .unwrap());
+    finish(&store, &executor).await;
+}
+#[tokio::test]
+async fn lfum_reports_open_then_canonical_closed_replica_without_claiming_deletion() {
+    let (store, executor, _) = setup(WAIT).await;
+    let request = body(1);
+    let open = executor.submit(add(request.clone())).unwrap();
+    open.wait(WAIT).await.unwrap();
+    executor.take_effects();
+    registered(&executor, &request, open.id).await;
+    let normalized = executor.snapshot([1; 16]).committed.unwrap().body.clone();
+    let completion = complete(&normalized, open.id);
+    run(&executor, Command::CompleteOpen(Box::new(completion))).await;
+    executor.take_effects();
+    assert!(!executor
+        .snapshot([1; 16])
+        .committed
+        .unwrap()
+        .body
+        .replica
+        .service_endpoint
+        .is_empty());
+    let source = admission().fm_source;
+    executor
+        .process_generation_proposal(&source, &generation_header(8))
+        .unwrap();
+    executor
+        .process_generation_update(&source, &GenerationUpdate::default(), &generation_header(8))
+        .unwrap();
+    let inventory = wait_lfum(&executor).await;
+    assert_eq!(inventory.units.0[0].replicas.0[0].description.first_lsn, -1);
+    assert_eq!(inventory.units.0[0].replicas.0[0].description.last_lsn, -1);
+    executor
+        .process_lfum_upload_reply(&source, &generation_header(8))
+        .unwrap();
+    run(
+        &executor,
+        Command::CloseLocal {
+            unit: request.unit.id,
+            mode: CloseMode::Drop,
+        },
+    )
+    .await;
+    let closing = executor.snapshot([1; 16]).committed.unwrap();
+    run(
+        &executor,
+        Command::CompleteClose(Box::new(CloseCompletion {
+            unit: closing.body.unit.clone(),
+            replica: closing.body.replica.clone(),
+            error: 0,
+        })),
+    )
+    .await;
+    assert!(!executor.snapshot([1; 16]).committed.unwrap().local_deleted);
+    executor.take_effects();
+    executor
+        .process_generation_proposal(&source, &generation_header(9))
+        .unwrap();
+    executor
+        .process_generation_update(&source, &GenerationUpdate::default(), &generation_header(9))
+        .unwrap();
+    let closed = wait_lfum(&executor).await;
+    let replica = &closed.units.0[0].replicas.0[0].description;
+    assert!(closed.any_replica_found);
+    assert!(!closed.units.0[0].report_from_primary);
+    assert_eq!(
+        *replica,
+        Replica {
+            node: admission().local_node,
+            id: 40,
+            instance: 50,
+            up: false,
+            state: 3,
+            ..Replica::default()
+        }
+    );
+    finish(&store, &executor).await;
+}
+
 #[tokio::test]
 async fn generation_update_cannot_skip_the_local_fm_service_epoch_branch() {
     let (store, executor, _) = setup(WAIT).await;
@@ -2524,8 +2738,21 @@ async fn peer_idle_failed_or_unknown_open_commit_cannot_publish_reply_or_reopen(
 }
 
 async fn make_peer_idle_ready(executor: &Executor) -> CreateReplica {
-    executor.bind_peer(peer_source()).unwrap();
+    make_peer_idle_ready_with_peers(executor, vec![peer_source()]).await
+}
+async fn make_peer_idle_ready_with_peers(
+    executor: &Executor,
+    peers: Vec<NodeInstance>,
+) -> CreateReplica {
     let request = peer_request();
+    open_peer_request(executor, peers, request).await
+}
+async fn open_peer_request(
+    executor: &Executor,
+    peers: Vec<NodeInstance>,
+    request: CreateReplica,
+) -> CreateReplica {
+    executor.bind_peers(peers).unwrap();
     run(executor, peer_create(request.clone())).await;
     effects(executor);
     registered(executor, &request.replica.0, state(executor).open_token).await;
@@ -3870,19 +4097,97 @@ async fn fm_peer_idle_delete_uses_stateful_reply_and_retains_original_deleted_to
         Disposition::IgnoredStale
     );
     assert!(effects(&executor).is_empty());
-    let mut replacement = request;
+    let mut replacement = request.clone();
     replacement.replica.0.replica.id += 1;
     replacement.replica.0.replica.instance += 1;
-    assert!(matches!(
-        executor
-            .submit(peer_create(replacement))
-            .unwrap()
-            .wait(WAIT)
-            .await,
-        Err(Failure::Unsupported(_))
-    ));
-    assert_eq!(hooks.calls.load(Ordering::SeqCst), writes);
+    assert_eq!(
+        run(&executor, peer_create(replacement.clone())).await,
+        Disposition::Applied
+    );
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::Open { body, .. }]
+        if body.replica == replacement.replica.0.replica)
+    );
+    assert_eq!(hooks.calls.load(Ordering::SeqCst), writes + 1);
+    assert_eq!(state(&executor).phase, Phase::Opening);
+    assert!(!state(&executor).local_deleted);
+    registered(
+        &executor,
+        &replacement.replica.0,
+        state(&executor).open_token,
+    )
+    .await;
+    let mut completion = complete(&state(&executor).body, 0);
+    completion.replica.service_endpoint.clear();
+    completion.replica.replication_endpoint = "127.0.0.1:12346".into();
+    run(&executor, Command::CompleteOpen(Box::new(completion))).await;
+    effects(&executor);
+    run(&executor, primary_delete(replacement.replica.0, false)).await;
+    effects(&executor);
+    close_done(&executor, 0).await;
+    effects(&executor);
+    let successor_closed = state(&executor);
+    run(&executor, peer_create(request.clone())).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerCreateReplicaReply { body, .. }]
+        if body.error == STALE_REQUEST && body.replica == request.replica.0.replica)
+    );
+    assert!(Arc::ptr_eq(&successor_closed, &state(&executor)));
     finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn peer_idle_replacement_commit_barrier_keeps_old_tombstone_and_fences_old_completions() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        let original = make_peer_idle_ready(&executor).await;
+        run(&executor, primary_delete(original.replica.0.clone(), false)).await;
+        effects(&executor);
+        close_done(&executor, 0).await;
+        effects(&executor);
+        let old = state(&executor);
+        let mut next = original.clone();
+        next.replica.0.replica.id += 1;
+        next.replica.0.replica.instance += 1;
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor.submit(peer_create(next.clone())).unwrap();
+        entered.await.unwrap();
+        assert!(Arc::ptr_eq(&old, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot(original.replica.0.unit.id.guid.0).fenced);
+            assert!(effects(&executor).is_empty());
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(Arc::ptr_eq(&old, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+            run(&executor, peer_create(next.clone())).await;
+        } else {
+            assert_eq!(ticket.resolve(WAIT).await, Ok(Disposition::Applied));
+        }
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::Open { body, .. }]
+            if body.replica == next.replica.0.replica)
+        );
+        let opening = state(&executor);
+        run(&executor, primary_delete(original.replica.0.clone(), false)).await;
+        run(&executor, peer_create(original.clone())).await;
+        let mut late = complete(&old.body, old.open_token);
+        late.replica.service_endpoint.clear();
+        late.replica.replication_endpoint = old.body.replica.replication_endpoint.clone();
+        run(&executor, Command::CompleteOpen(Box::new(late))).await;
+        assert!(effects(&executor).is_empty());
+        assert!(Arc::ptr_eq(&opening, &state(&executor)));
+        finish(&store, &executor).await;
+    }
 }
 
 #[tokio::test]
@@ -3919,7 +4224,7 @@ async fn fm_delete_before_peer_create_retains_native_absent_tombstone_without_op
             && absent.usage.is_none()
             && absent.registration_lookups.is_empty()
     );
-    assert!(absent.peer_creation.is_none() && absent.remote_idle.is_none());
+    assert!(absent.peer_creation.is_none() && absent.remote_idles.is_empty());
     assert!(
         matches!(effects(&executor).as_slice(), [Effect::DeleteReplicaReply(reply)] if **reply == expected)
     );
@@ -5086,16 +5391,16 @@ async fn primary_peer_open_observation_never_builds_or_changes_quorum_and_close_
     stale.replica.instance -= 1;
     assert_eq!(run(&executor, ack(stale)).await, Disposition::IgnoredStale);
     assert!(state(&executor)
-        .remote_idle
-        .as_ref()
+        .remote_idles
+        .first()
         .unwrap()
         .reply
         .is_none());
     run(&executor, ack(reply.clone())).await;
     assert_eq!(
         state(&executor)
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .reply
             .as_ref(),
@@ -5120,7 +5425,7 @@ async fn primary_peer_open_observation_never_builds_or_changes_quorum_and_close_
     )
     .await;
     executor.take_effects();
-    assert!(state(&executor).remote_idle.is_none());
+    assert!(state(&executor).remote_idles.is_empty());
     assert_eq!(run(&executor, ack(reply)).await, Disposition::IgnoredStale);
     assert!(executor.take_effects().is_empty());
     finish(&store, &executor).await;
@@ -5197,8 +5502,8 @@ async fn peer_build_is_explicit_correlated_and_never_grants_membership() {
     );
     assert_eq!(
         state(&executor)
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .build
             .as_ref()
@@ -5244,8 +5549,8 @@ async fn peer_build_is_explicit_correlated_and_never_grants_membership() {
     }
     assert_eq!(
         state(&executor)
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .build
             .as_ref()
@@ -5259,8 +5564,8 @@ async fn peer_build_is_explicit_correlated_and_never_grants_membership() {
     let after = state(&executor);
     assert_eq!(
         after
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .build
             .as_ref()
@@ -5271,8 +5576,8 @@ async fn peer_build_is_explicit_correlated_and_never_grants_membership() {
     assert_eq!(after.body, primary.body);
     assert_eq!(
         after
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .reply
             .as_ref()
@@ -5314,7 +5619,7 @@ async fn peer_build_errors_retry_the_original_rap_obligation_and_close_fences_la
         if error != 0 {
             run(&executor, Command::CompleteBuild(Box::new(event.clone()))).await;
             let after = state(&executor);
-            let build = after.remote_idle.as_ref().unwrap().build.as_ref().unwrap();
+            let build = after.remote_idles.first().unwrap().build.as_ref().unwrap();
             assert_eq!(build.result, Some(error));
             assert_eq!(build.detail, event.detail);
             run(
@@ -5325,8 +5630,8 @@ async fn peer_build_errors_retry_the_original_rap_obligation_and_close_fences_la
             assert_eq!(effects(&executor), first);
             assert_eq!(
                 state(&executor)
-                    .remote_idle
-                    .as_ref()
+                    .remote_idles
+                    .first()
                     .unwrap()
                     .build
                     .as_ref()
@@ -5341,8 +5646,8 @@ async fn peer_build_errors_retry_the_original_rap_obligation_and_close_fences_la
             run(&executor, Command::CompleteBuild(Box::new(success))).await;
             assert_eq!(
                 state(&executor)
-                    .remote_idle
-                    .as_ref()
+                    .remote_idles
+                    .first()
                     .unwrap()
                     .build
                     .as_ref()
@@ -5366,7 +5671,7 @@ async fn peer_build_errors_retry_the_original_rap_obligation_and_close_fences_la
             run(&executor, Command::CompleteBuild(Box::new(late))).await,
             Disposition::IgnoredStale
         );
-        assert!(state(&executor).remote_idle.is_none());
+        assert!(state(&executor).remote_idles.is_empty());
         assert!(effects(&executor).is_empty());
         finish(&store, &executor).await;
     }
@@ -5416,8 +5721,8 @@ async fn peer_idle_removal_is_terminal_for_unbuilt_pending_successful_and_failed
         assert_eq!(state(&executor).body, primary.body);
         assert_eq!(
             state(&executor)
-                .remote_idle
-                .as_ref()
+                .remote_idles
+                .first()
                 .unwrap()
                 .removal
                 .as_ref()
@@ -5476,8 +5781,8 @@ async fn peer_idle_removal_is_terminal_for_unbuilt_pending_successful_and_failed
         .await;
         let after = state(&executor);
         let removal = after
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .removal
             .as_ref()
@@ -5494,8 +5799,8 @@ async fn peer_idle_removal_is_terminal_for_unbuilt_pending_successful_and_failed
         let after = state(&executor);
         assert_eq!(
             after
-                .remote_idle
-                .as_ref()
+                .remote_idles
+                .first()
                 .unwrap()
                 .removal
                 .as_ref()
@@ -5504,7 +5809,7 @@ async fn peer_idle_removal_is_terminal_for_unbuilt_pending_successful_and_failed
             Some(0)
         );
         assert_eq!(
-            after.remote_idle.as_ref().unwrap().reply,
+            after.remote_idles.first().unwrap().reply,
             Some(remote.clone())
         );
         assert_eq!(after.body, primary.body);
@@ -5546,7 +5851,7 @@ async fn peer_idle_removal_is_terminal_for_unbuilt_pending_successful_and_failed
             run(&executor, Command::CompleteRemoval(Box::new(removed))).await,
             Disposition::IgnoredStale,
         );
-        assert!(state(&executor).remote_idle.is_none());
+        assert!(state(&executor).remote_idles.is_empty());
         finish(&store, &executor).await;
     }
 }
@@ -5580,7 +5885,7 @@ async fn primary_close_fences_pending_idle_removal_without_claiming_remote_dispo
     .await;
     let closing = state(&executor);
     assert_eq!(closing.phase, Phase::Closing);
-    assert!(closing.remote_idle.is_none());
+    assert!(closing.remote_idles.is_empty());
     effects(&executor);
     assert_eq!(
         run(&executor, Command::CompleteRemoval(Box::new(completion))).await,
@@ -5622,6 +5927,3853 @@ fn fm_remove_idle(body: RemoveReplica) -> Command {
     }
 }
 
+fn secondary_configuration(primary: &AddInstance, secondary: &Replica) -> Configuration {
+    let mut unit = primary.unit.clone();
+    unit.previous = unit.current;
+    unit.current.configuration += 1;
+    unit.target = 2;
+    let mut service = primary.service.clone();
+    service.target = 2;
+    service.update_version += 1;
+    let mut p = primary.replica.clone();
+    p.current_role = 4;
+    p.previous_role = 4;
+    p.state = 2;
+    let mut s = secondary.clone();
+    s.current_role = 3;
+    s.previous_role = 2;
+    s.state = 2;
+    Configuration {
+        unit,
+        service,
+        replicas: fube_transport::serialization::serde::ObjectArray(vec![p, s]),
+    }
+}
+fn reconfigure(body: Configuration) -> Command {
+    Command::DoReconfiguration {
+        body: Box::new(DoReconfiguration {
+            configuration: body,
+            phase0_duration: i64::MAX,
+        }),
+        source: admission().fm_source,
+        generation: GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        },
+    }
+}
+fn configured(actions: &[Effect]) -> ConfigurationCompletion {
+    actions
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::UpdateConfiguration {
+                body, local, flags, ..
+            } => Some(ConfigurationCompletion {
+                unit: body.unit.clone(),
+                local: (**local).clone(),
+                replicas: body.replicas.clone(),
+                flags: *flags,
+                error: 0,
+            }),
+            _ => None,
+        })
+        .expect("actual RAP configuration effect")
+}
+async fn built_fm_idle(executor: &Executor) -> Configuration {
+    executor.bind_peer(peer_source()).unwrap();
+    make_ready(executor, &primary_body()).await;
+    let primary = state(executor);
+    let request = fm_idle_request(&primary);
+    run(executor, fm_add_idle(request.clone())).await;
+    effects(executor);
+    let mut opened = CreateReplicaReply {
+        unit: request.unit,
+        replica: request.replica,
+        error: 0,
+    };
+    opened.replica.replication_endpoint = "127.0.0.1:12346".into();
+    run(executor, peer_opened(opened.clone())).await;
+    effects(executor);
+    run(
+        executor,
+        Command::CompleteBuild(Box::new(BuildCompletion {
+            unit: primary.body.unit.clone(),
+            local: primary.body.replica.clone(),
+            remote: opened.replica.clone(),
+            error: 0,
+            detail: ProxyErrorDetail::default(),
+        })),
+    )
+    .await;
+    effects(executor);
+    secondary_configuration(&primary.body, &opened.replica)
+}
+
+async fn built_three_idles(executor: &Executor) -> Configuration {
+    let mut second = peer_source();
+    second.id = [7; 16];
+    executor
+        .bind_peers(vec![peer_source(), second.clone()])
+        .unwrap();
+    make_ready(executor, &primary_body()).await;
+    let original = state(executor);
+    let first = fm_idle_request(&original);
+    let mut other = first.clone();
+    other.replica.node = second;
+    other.replica.id += 1;
+    other.replica.instance += 1;
+    for request in [&first, &other] {
+        run(executor, fm_add_idle(request.clone())).await;
+        effects(executor);
+    }
+    let mut opened = vec![];
+    for (i, request) in [other, first].into_iter().enumerate() {
+        let mut reply = CreateReplicaReply {
+            unit: request.unit,
+            replica: request.replica,
+            error: 0,
+        };
+        reply.replica.replication_endpoint = format!("127.0.0.1:{}", 12346 + i);
+        run(
+            executor,
+            Command::CreateReplicaReply {
+                source: reply.replica.node.clone(),
+                body: Box::new(reply.clone()),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+        )
+        .await;
+        assert!(
+            matches!(effects(executor).as_slice(), [Effect::BuildIdle { replica, .. }] if **replica == reply.replica)
+        );
+        opened.push(reply.replica);
+    }
+    for (i, remote) in opened.iter().enumerate() {
+        let mut completion = BuildCompletion {
+            unit: original.body.unit.clone(),
+            local: original.body.replica.clone(),
+            remote: remote.clone(),
+            error: 0,
+            detail: ProxyErrorDetail::default(),
+        };
+        if i == 0 {
+            completion.remote.instance -= 1;
+            assert_eq!(
+                run(
+                    executor,
+                    Command::CompleteBuild(Box::new(completion.clone()))
+                )
+                .await,
+                Disposition::IgnoredStale
+            );
+            assert!(effects(executor).is_empty());
+            completion.remote = remote.clone();
+            completion.error = -991;
+            run(
+                executor,
+                Command::CompleteBuild(Box::new(completion.clone())),
+            )
+            .await;
+            assert!(effects(executor).is_empty());
+            let request = state(executor)
+                .remote_idle(&remote.node)
+                .unwrap()
+                .fm_request
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .clone();
+            run(executor, fm_add_idle(request)).await;
+            assert!(
+                matches!(effects(executor).as_slice(), [Effect::BuildIdle { replica, .. }] if **replica == *remote)
+            );
+            completion.error = 0;
+        }
+        run(executor, Command::CompleteBuild(Box::new(completion))).await;
+        assert!(
+            matches!(effects(executor).as_slice(), [Effect::AddReplicaReply(reply)] if reply.replica.node == remote.node)
+        );
+        assert_eq!(
+            state(executor)
+                .remote_idles
+                .iter()
+                .filter(|r| r.ready)
+                .count(),
+            i + 1
+        );
+    }
+    let mut config = secondary_configuration(&original.body, &opened[0]);
+    config.unit.target = 3;
+    config.unit.minimum = 2;
+    config.service.target = 3;
+    config.service.minimum = 2;
+    let mut secondary = opened[1].clone();
+    secondary.previous_role = 2;
+    secondary.current_role = 3;
+    secondary.state = 2;
+    config.replicas.0.push(secondary);
+    config
+}
+
+fn survivor_peer() -> NodeInstance {
+    NodeInstance {
+        id: [7; 16],
+        instance: 41,
+    }
+}
+async fn active_survivor(executor: &Executor) {
+    make_peer_idle_ready_with_peers(executor, vec![peer_source(), survivor_peer()]).await;
+    let original = state(executor);
+    let mut primary = (*original.body).clone();
+    primary.replica.node = peer_source();
+    primary.replica.id += 1;
+    primary.replica.instance += 1;
+    primary.replica.replication_endpoint = "127.0.0.1:12346".into();
+    let mut config = secondary_configuration(&primary, &original.body.replica);
+    config.unit.target = 3;
+    config.unit.minimum = 2;
+    config.service.target = 3;
+    config.service.minimum = 2;
+    let mut other = config.replicas.0[1].clone();
+    other.node = survivor_peer();
+    other.id += 2;
+    other.instance += 2;
+    other.replication_endpoint = "127.0.0.1:12347".into();
+    config.replicas.0.push(other);
+    run(
+        executor,
+        Command::Activate {
+            body: Box::new(Activate {
+                configuration: config,
+                deactivation: original
+                    .peer_creation
+                    .as_ref()
+                    .unwrap()
+                    .deactivation
+                    .clone(),
+            }),
+            source: peer_source(),
+            generation: generation_header(admission().generation.generation),
+        },
+    )
+    .await;
+    let completion = configured(&effects(executor));
+    run(
+        executor,
+        Command::CompleteConfiguration(Box::new(completion)),
+    )
+    .await;
+    effects(executor);
+}
+fn failover_configuration(state: &EntityState, candidate: &NodeInstance) -> Configuration {
+    let mut config = state.reconfiguration.as_ref().unwrap().request.clone();
+    config.unit.previous = config.unit.current;
+    config.unit.current.configuration += 0x1_0000_0001;
+    for r in &mut config.replicas.0 {
+        r.previous_role = r.current_role;
+        if r.current_role == 4 {
+            r.current_role = 1;
+            r.state = 3;
+            r.up = false;
+        } else if &r.node == candidate {
+            r.current_role = 4;
+        }
+        r.first_lsn = -1;
+        r.last_lsn = -1;
+    }
+    config
+}
+fn status_completion(actions: &[Effect]) -> ConfigurationCompletion {
+    actions
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::QueryReplicaStatus { body, .. } => {
+                let mut local = body.replica.clone();
+                local.first_lsn = 1;
+                local.last_lsn = 8;
+                Some(ConfigurationCompletion {
+                    unit: body.unit.clone(),
+                    local,
+                    replicas: fube_transport::serialization::serde::ObjectArray(vec![]),
+                    flags: 0,
+                    error: 0,
+                })
+            }
+            _ => None,
+        })
+        .expect("actual RAP progress query")
+}
+
+#[tokio::test]
+async fn failover_requires_both_progress_results_history_deactivation_and_final_commit() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    active_survivor(&executor).await;
+    let original = state(&executor);
+    let intent = failover_configuration(&original, &admission().local_node);
+    for invalid in 0..4 {
+        let mut bad = intent.clone();
+        match invalid {
+            0 => bad.unit.current.data_loss += 1,
+            1 => bad.replicas.0[0].up = true,
+            2 => bad.replicas.0[2].id = bad.replicas.0[1].id,
+            _ => bad.replicas.0[2].current_role = 4,
+        }
+        assert!(executor
+            .submit(reconfigure(bad))
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .is_err());
+        assert!(effects(&executor).is_empty());
+    }
+    let (entered, release) = hooks.pause(false);
+    let start = executor.submit(reconfigure(intent.clone())).unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    assert!(state(&executor).swap.is_none());
+    release.send(()).unwrap();
+    start.wait(WAIT).await.unwrap();
+    let actions = effects(&executor);
+    assert!(actions
+        .iter()
+        .any(|e| matches!(e, Effect::PeerGetLsn { target, .. } if *target == survivor_peer())));
+    assert!(!actions
+        .iter()
+        .any(|e| matches!(e, Effect::UpdateConfiguration { .. })));
+    let progress = status_completion(&actions);
+    run(&executor, Command::CompleteStatus(Box::new(progress))).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::PeerGetLsn { .. }]
+    ));
+    let mut remote = intent.replicas.0[2].clone();
+    remote.first_lsn = 1;
+    remote.last_lsn = 8;
+    let reply = GetLsnReply {
+        replica: AddInstanceReply {
+            unit: intent.unit.clone(),
+            replica: remote,
+            error: 0,
+        },
+        deactivation: original
+            .peer_creation
+            .as_ref()
+            .unwrap()
+            .deactivation
+            .clone(),
+    };
+    let lsn_reply = |body| Command::GetLsnReply {
+        body: Box::new(body),
+        source: survivor_peer(),
+        generation: generation_header(admission().generation.generation),
+    };
+    for incompatible in 0..2 {
+        let mut bad = reply.clone();
+        if incompatible == 0 {
+            bad.replica.replica.first_lsn = -1;
+        } else {
+            bad.deactivation.epoch.data_loss += 1;
+        }
+        assert_eq!(
+            run(&executor, lsn_reply(bad)).await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty());
+        assert_eq!(
+            state(&executor).swap.as_ref().unwrap().stage,
+            SwapStage::GetLsn
+        );
+    }
+    run(&executor, lsn_reply(reply)).await;
+    let mut catchup = configured(&effects(&executor));
+    assert_eq!(catchup.flags, 2);
+    assert_eq!(
+        catchup
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.previous_role >= 3)
+            .count(),
+        3
+    );
+    assert_eq!(
+        catchup
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.current_role >= 3)
+            .count(),
+        2
+    );
+    catchup.local.service_endpoint = "127.0.0.1:12349".into();
+    let mut invalid_progress = catchup.clone();
+    invalid_progress.local.last_lsn += 1;
+    assert!(matches!(
+        executor
+            .submit(Command::CompleteConfiguration(Box::new(invalid_progress)))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Admission(_))
+    ));
+    assert!(effects(&executor).is_empty());
+    assert_eq!(
+        state(&executor).swap.as_ref().unwrap().stage,
+        SwapStage::Catchup
+    );
+    run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+    let actions = effects(&executor);
+    let [Effect::PeerDeactivate { body, target }] = actions.as_slice() else {
+        panic!("native phase-3 Deactivate");
+    };
+    assert_eq!(*target, survivor_peer());
+    assert!(!body.force);
+    let deactivation = body.clone();
+    run(
+        &executor,
+        Command::RetryConfiguration(intent.unit.id.clone()),
+    )
+    .await;
+    assert_eq!(effects(&executor), actions);
+    let deactivated = || Command::DeactivateReply {
+        source: survivor_peer(),
+        generation: generation_header(admission().generation.generation),
+        body: Box::new(DeactivateReply {
+            unit: intent.unit.clone(),
+            replica: Replica {
+                node: survivor_peer(),
+                id: intent.replicas.0[2].id,
+                instance: intent.replicas.0[2].instance,
+                up: false,
+                state: 3,
+                ..Replica::default()
+            },
+            error: 0,
+        }),
+    };
+    let (entered, release) = hooks.pause(false);
+    let ack = executor.submit(deactivated()).unwrap();
+    entered.await.unwrap();
+    assert_eq!(
+        state(&executor).swap.as_ref().unwrap().stage,
+        SwapStage::Deactivate
+    );
+    assert!(effects(&executor).is_empty());
+    release.send(()).unwrap();
+    ack.wait(WAIT).await.unwrap();
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerActivate { body, .. }]
+        if body.deactivation == deactivation.deactivation)
+    );
+    let mut unit = intent.unit.clone();
+    unit.previous = Epoch::default();
+    let mut remote = state(&executor).swap.as_ref().unwrap().body.replicas.0[2].clone();
+    remote.previous_role = 1;
+    run(
+        &executor,
+        Command::ActivateReply {
+            source: survivor_peer(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(ActivateReply {
+                unit,
+                replica: remote,
+                error: 0,
+            }),
+        },
+    )
+    .await;
+    let end = configured(&effects(&executor));
+    assert_eq!(end.flags, 1);
+    let (entered, release) = hooks.pause(false);
+    let final_reply = executor
+        .submit(Command::CompleteConfiguration(Box::new(end)))
+        .unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    release.send(()).unwrap();
+    final_reply.wait(WAIT).await.unwrap();
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(reply)]
+        if reply.replicas.0.len() == 2 && reply.replicas.0.iter().all(|r| r.current_role >= 3 && r.previous_role == 1))
+    );
+    assert_eq!(state(&executor).runtime, original.runtime);
+    assert_eq!(state(&executor).usage, original.usage);
+    run(&executor, reconfigure(intent.clone())).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::DoReconfigurationReply(_)]
+    ));
+    let promoted = state(&executor);
+    let mut target = intent.replicas.0[0].clone();
+    target.id += 100;
+    target.instance += 100;
+    target.previous_role = 1;
+    target.current_role = 2;
+    target.state = 1;
+    target.up = true;
+    target.service_endpoint.clear();
+    target.replication_endpoint.clear();
+    let build = AddReplica {
+        unit: promoted.body.unit.clone(),
+        service: promoted.body.service.clone(),
+        replica: target.clone(),
+    };
+    run(&executor, fm_add_idle(build.clone())).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerCreateReplica { body, .. }]
+        if body.deactivation.epoch == promoted.body.unit.current && body.deactivation.catchup_lsn == 8)
+    );
+    target.replication_endpoint = "127.0.0.1:12350".into();
+    run(
+        &executor,
+        Command::CreateReplicaReply {
+            body: Box::new(CreateReplicaReply {
+                unit: build.unit.clone(),
+                replica: target.clone(),
+                error: 0,
+            }),
+            source: peer_source(),
+            generation: generation_header(admission().generation.generation),
+        },
+    )
+    .await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::BuildIdle { .. }]
+    ));
+    run(
+        &executor,
+        Command::CompleteBuild(Box::new(BuildCompletion {
+            unit: build.unit,
+            local: promoted.body.replica.clone(),
+            remote: target.clone(),
+            error: 0,
+            detail: ProxyErrorDetail::default(),
+        })),
+    )
+    .await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::AddReplicaReply(_)]
+    ));
+    let mut repair = promoted.swap.as_ref().unwrap().body.clone();
+    repair.unit.previous = repair.unit.current;
+    repair.unit.current.configuration += 1;
+    for r in &mut repair.replicas.0 {
+        r.previous_role = r.current_role;
+    }
+    target.state = 2;
+    target.previous_role = 2;
+    target.current_role = 3;
+    repair.replicas.0.push(target);
+    let (entered, release) = hooks.pause(false);
+    let work = executor.submit(reconfigure(repair.clone())).unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    release.send(()).unwrap();
+    work.wait(WAIT).await.unwrap();
+    let catchup = configured(&effects(&executor));
+    assert_eq!(catchup.flags, 2);
+    run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerDeactivate { target, .. }] if *target == survivor_peer())
+    );
+    let survivor = repair
+        .replicas
+        .0
+        .iter()
+        .find(|r| r.node == survivor_peer())
+        .unwrap();
+    let (entered, release) = hooks.pause(false);
+    let ack = executor
+        .submit(Command::DeactivateReply {
+            source: survivor_peer(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(DeactivateReply {
+                unit: repair.unit.clone(),
+                replica: Replica {
+                    node: survivor_peer(),
+                    id: survivor.id,
+                    instance: survivor.instance,
+                    up: false,
+                    state: 3,
+                    ..Replica::default()
+                },
+                error: 0,
+            }),
+        })
+        .unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    assert_eq!(
+        state(&executor).reconfiguration.as_ref().unwrap().stage,
+        ConfigurationStage::Deactivate
+    );
+    release.send(()).unwrap();
+    ack.wait(WAIT).await.unwrap();
+    assert_eq!(
+        effects(&executor)
+            .iter()
+            .filter(|e| matches!(e, Effect::PeerActivate { .. }))
+            .count(),
+        2
+    );
+    for remote in repair.replicas.0.iter().filter(|r| r.current_role == 3) {
+        let mut unit = repair.unit.clone();
+        unit.previous = Epoch::default();
+        let mut replica = remote.clone();
+        replica.previous_role = 1;
+        run(
+            &executor,
+            Command::ActivateReply {
+                body: Box::new(ActivateReply {
+                    unit,
+                    replica,
+                    error: 0,
+                }),
+                source: remote.node.clone(),
+                generation: generation_header(admission().generation.generation),
+            },
+        )
+        .await;
+    }
+    let end = configured(&effects(&executor));
+    assert_eq!(end.flags, 1);
+    let (entered, release) = hooks.pause(false);
+    let final_reply = executor
+        .submit(Command::CompleteConfiguration(Box::new(end)))
+        .unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    release.send(()).unwrap();
+    final_reply.wait(WAIT).await.unwrap();
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(reply)] if reply.replicas.0.len() == 3)
+    );
+    assert_eq!(state(&executor).runtime, original.runtime);
+    assert_eq!(state(&executor).usage, original.usage);
+    run(&executor, reconfigure(intent)).await;
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
+}
+
+async fn active_configured_survivor(executor: &Executor, target: i32, minimum: i32) {
+    let peers: Vec<_> = std::iter::once(peer_source())
+        .chain((0..target - 2).map(|i| NodeInstance {
+            id: [20 + i as u8; 16],
+            instance: 100 + i as u64,
+        }))
+        .collect();
+    let mut request = peer_request();
+    request.replica.0.service.target = target;
+    request.replica.0.service.minimum = minimum;
+    request.replica.0.unit.target = target;
+    request.replica.0.unit.minimum = minimum;
+    open_peer_request(executor, peers.clone(), request).await;
+    let original = state(executor);
+    let mut local = original.body.replica.clone();
+    local.previous_role = 2;
+    local.current_role = 3;
+    local.state = 2;
+    let mut primary = local.clone();
+    primary.node = peer_source();
+    primary.id += 1;
+    primary.instance += 1;
+    primary.previous_role = 4;
+    primary.current_role = 4;
+    primary.replication_endpoint = "127.0.0.1:12346".into();
+    let mut replicas = vec![primary, local];
+    for (i, peer) in peers.into_iter().skip(1).enumerate() {
+        let mut remote = replicas[1].clone();
+        remote.node = peer;
+        remote.id += 2 + i as i64;
+        remote.instance += 2 + i as i64;
+        remote.replication_endpoint = format!("127.0.0.1:{}", 12347 + i);
+        replicas.push(remote);
+    }
+    let mut unit = original.body.unit.clone();
+    unit.previous = unit.current;
+    unit.current.configuration += 1;
+    run(
+        executor,
+        Command::Activate {
+            source: peer_source(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(Activate {
+                configuration: Configuration {
+                    unit,
+                    service: original.body.service.clone(),
+                    replicas: fube_transport::serialization::serde::ObjectArray(replicas),
+                },
+                deactivation: original
+                    .peer_creation
+                    .as_ref()
+                    .unwrap()
+                    .deactivation
+                    .clone(),
+            }),
+        },
+    )
+    .await;
+    let completion = configured(&effects(executor));
+    run(
+        executor,
+        Command::CompleteConfiguration(Box::new(completion)),
+    )
+    .await;
+    effects(executor);
+}
+
+fn failover_progress(
+    intent: &Configuration,
+    remote: &Replica,
+    history: ReplicaDeactivationInfo,
+    last: i64,
+) -> Command {
+    let mut replica = remote.clone();
+    replica.first_lsn = 1;
+    replica.last_lsn = last;
+    Command::GetLsnReply {
+        source: remote.node.clone(),
+        generation: generation_header(admission().generation.generation),
+        body: Box::new(GetLsnReply {
+            replica: AddInstanceReply {
+                unit: intent.unit.clone(),
+                replica,
+                error: 0,
+            },
+            deactivation: history,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn configured_failover_and_repair_track_every_survivor_and_commit_with_unequal_progress() {
+    for (target, minimum) in [(2, 1), (4, 2), (4, 3), (4, 4), (5, 3), (64, 32)] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        active_configured_survivor(&executor, target, minimum).await;
+        let original = state(&executor);
+        let intent = failover_configuration(&original, &admission().local_node);
+        run(&executor, reconfigure(intent.clone())).await;
+        let actions = effects(&executor);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|e| matches!(e, Effect::PeerGetLsn { .. }))
+                .count(),
+            target as usize - 2
+        );
+        let progress = status_completion(&actions);
+        run(&executor, Command::CompleteStatus(Box::new(progress))).await;
+        let mut actions = effects(&executor);
+        for (i, remote) in intent
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.current_role == 3)
+            .enumerate()
+        {
+            run(
+                &executor,
+                failover_progress(
+                    &intent,
+                    remote,
+                    original
+                        .peer_creation
+                        .as_ref()
+                        .unwrap()
+                        .deactivation
+                        .clone(),
+                    7 - (i as i64 % 3),
+                ),
+            )
+            .await;
+            actions = effects(&executor);
+        }
+        let mut catchup = configured(&actions);
+        catchup.local.service_endpoint = "127.0.0.1:12349".into();
+        run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+        let mut actions = effects(&executor);
+        for remote in intent.replicas.0.iter().filter(|r| r.current_role == 3) {
+            let ack = Command::DeactivateReply {
+                source: remote.node.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(DeactivateReply {
+                    unit: intent.unit.clone(),
+                    replica: Replica {
+                        node: remote.node.clone(),
+                        id: remote.id,
+                        instance: remote.instance,
+                        up: false,
+                        state: 3,
+                        ..Replica::default()
+                    },
+                    error: 0,
+                }),
+            };
+            let before = state(&executor).swap.as_ref().unwrap().deactivated.len();
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor.submit(ack).unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            assert_eq!(
+                state(&executor).swap.as_ref().unwrap().deactivated.len(),
+                before
+            );
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            actions = effects(&executor);
+        }
+        for remote in intent.replicas.0.iter().filter(|r| r.current_role == 3) {
+            let mut unit = intent.unit.clone();
+            unit.previous = Epoch::default();
+            let mut replica = remote.clone();
+            replica.previous_role = 1;
+            replica.first_lsn = 1;
+            replica.last_lsn = 8;
+            let ack = Command::ActivateReply {
+                source: remote.node.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(ActivateReply {
+                    unit,
+                    replica,
+                    error: 0,
+                }),
+            };
+            let before = state(&executor).swap.as_ref().unwrap().activated.len();
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor.submit(ack).unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            assert_eq!(
+                state(&executor).swap.as_ref().unwrap().activated.len(),
+                before
+            );
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            actions = effects(&executor);
+        }
+        let end = configured(&actions);
+        assert_eq!(end.flags, 1);
+        run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(r)]
+            if r.replicas.0.len() == target as usize - 1)
+        );
+        assert_eq!(state(&executor).body.service, original.body.service);
+        assert_eq!(state(&executor).runtime, original.runtime);
+        let promoted = state(&executor);
+        let mut fresh = intent
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.current_role == 1)
+            .unwrap()
+            .clone();
+        fresh.id += 1000;
+        fresh.instance += 1000;
+        fresh.previous_role = 1;
+        fresh.current_role = 2;
+        fresh.state = 1;
+        fresh.up = true;
+        fresh.service_endpoint.clear();
+        fresh.replication_endpoint.clear();
+        let build = AddReplica {
+            unit: promoted.body.unit.clone(),
+            service: promoted.body.service.clone(),
+            replica: fresh.clone(),
+        };
+        run(&executor, fm_add_idle(build.clone())).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::PeerCreateReplica { .. }]
+        ));
+        fresh.replication_endpoint = "127.0.0.1:12350".into();
+        run(
+            &executor,
+            Command::CreateReplicaReply {
+                source: fresh.node.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(CreateReplicaReply {
+                    unit: build.unit.clone(),
+                    replica: fresh.clone(),
+                    error: 0,
+                }),
+            },
+        )
+        .await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::BuildIdle { .. }]
+        ));
+        run(
+            &executor,
+            Command::CompleteBuild(Box::new(BuildCompletion {
+                unit: build.unit,
+                local: promoted.body.replica.clone(),
+                remote: fresh.clone(),
+                error: 0,
+                detail: ProxyErrorDetail::default(),
+            })),
+        )
+        .await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::AddReplicaReply(_)]
+        ));
+        let mut repair = promoted.swap.as_ref().unwrap().body.clone();
+        repair.unit.previous = repair.unit.current;
+        repair.unit.current.configuration += 1;
+        for r in &mut repair.replicas.0 {
+            r.previous_role = r.current_role;
+        }
+        fresh.previous_role = 2;
+        fresh.current_role = 3;
+        fresh.state = 2;
+        repair.replicas.0.push(fresh.clone());
+        for kind in 0..3 {
+            let mut bad = repair.clone();
+            match kind {
+                0 => bad.replicas.0[0].instance += 1,
+                1 => bad.service.minimum = if minimum == 1 { 2 } else { 1 },
+                _ => bad.replicas.0.truncate(target as usize - 1),
+            }
+            assert!(executor
+                .submit(reconfigure(bad))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+            assert!(effects(&executor).is_empty());
+        }
+        let (entered, release) = hooks.pause(false);
+        let ticket = executor.submit(reconfigure(repair.clone())).unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        release.send(()).unwrap();
+        ticket.wait(WAIT).await.unwrap();
+        let catchup = configured(&effects(&executor));
+        assert_eq!(catchup.flags, 2);
+        assert_eq!(
+            catchup
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.previous_role >= 3)
+                .count(),
+            target as usize - 1
+        );
+        run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+        let mut actions = effects(&executor);
+        for remote in repair.replicas.0.iter().filter(|r| r.previous_role == 3) {
+            assert!(!actions
+                .iter()
+                .any(|e| matches!(e, Effect::PeerActivate { .. })));
+            let ack = || Command::DeactivateReply {
+                source: remote.node.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(DeactivateReply {
+                    unit: repair.unit.clone(),
+                    replica: Replica {
+                        node: remote.node.clone(),
+                        id: remote.id,
+                        instance: remote.instance,
+                        up: false,
+                        state: 3,
+                        ..Replica::default()
+                    },
+                    error: 0,
+                }),
+            };
+            let before = state(&executor)
+                .reconfiguration
+                .as_ref()
+                .unwrap()
+                .deactivated
+                .len();
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor.submit(ack()).unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            assert_eq!(
+                state(&executor)
+                    .reconfiguration
+                    .as_ref()
+                    .unwrap()
+                    .deactivated
+                    .len(),
+                before
+            );
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            actions = effects(&executor);
+            assert!(!actions.iter().any(
+                |e| matches!(e, Effect::PeerDeactivate { target, .. } if *target == remote.node)
+            ));
+            assert_eq!(run(&executor, ack()).await, Disposition::IgnoredStale);
+            assert!(effects(&executor).is_empty());
+        }
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|e| matches!(e, Effect::PeerActivate { .. }))
+                .count(),
+            target as usize - 1
+        );
+        for remote in repair.replicas.0.iter().filter(|r| r.current_role == 3) {
+            let mut unit = repair.unit.clone();
+            unit.previous = Epoch::default();
+            let mut replica = remote.clone();
+            replica.previous_role = 1;
+            let before = state(&executor)
+                .reconfiguration
+                .as_ref()
+                .unwrap()
+                .activated
+                .len();
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor
+                .submit(Command::ActivateReply {
+                    source: remote.node.clone(),
+                    generation: generation_header(admission().generation.generation),
+                    body: Box::new(ActivateReply {
+                        unit,
+                        replica,
+                        error: 0,
+                    }),
+                })
+                .unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            assert_eq!(
+                state(&executor)
+                    .reconfiguration
+                    .as_ref()
+                    .unwrap()
+                    .activated
+                    .len(),
+                before
+            );
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            actions = effects(&executor);
+        }
+        let end = configured(&actions);
+        assert_eq!(end.flags, 1);
+        let (entered, release) = hooks.pause(false);
+        let ticket = executor
+            .submit(Command::CompleteConfiguration(Box::new(end)))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        release.send(()).unwrap();
+        ticket.wait(WAIT).await.unwrap();
+        let completed = effects(&executor);
+        assert!(
+            matches!(completed.as_slice(), [Effect::DoReconfigurationReply(r)]
+            if r.replicas.0.len() == target as usize)
+        );
+        assert_eq!(state(&executor).body.service, original.body.service);
+        assert_eq!(state(&executor).runtime, original.runtime);
+        run(&executor, reconfigure(repair)).await;
+        assert_eq!(effects(&executor), completed);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn configured_failover_selects_history_before_lsn_and_redirects_without_promotion() {
+    for (local_last, remote_last, old_remote_history, expected_redirect) in [
+        (7, 8, false, true),
+        (8, 7, false, false),
+        (8, 20, true, false),
+    ] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        active_configured_survivor(&executor, 4, 2).await;
+        let original = state(&executor);
+        let intent = failover_configuration(&original, &admission().local_node);
+        run(&executor, reconfigure(intent.clone())).await;
+        let mut local = status_completion(&effects(&executor));
+        local.local.last_lsn = local_last;
+        run(&executor, Command::CompleteStatus(Box::new(local))).await;
+        effects(&executor);
+        let mut history = original
+            .peer_creation
+            .as_ref()
+            .unwrap()
+            .deactivation
+            .clone();
+        if old_remote_history {
+            history.epoch.configuration -= 0x1_0000_0000;
+        }
+        for remote in intent.replicas.0.iter().filter(|r| r.current_role == 3) {
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor
+                .submit(failover_progress(
+                    &intent,
+                    remote,
+                    history.clone(),
+                    remote_last,
+                ))
+                .unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            let actions = effects(&executor);
+            if state(&executor)
+                .swap
+                .as_ref()
+                .unwrap()
+                .remote_progress
+                .len()
+                < 2
+            {
+                continue;
+            }
+            if expected_redirect {
+                let [Effect::ChangeConfiguration(change)] = actions.as_slice() else {
+                    panic!("native candidate redirection");
+                };
+                assert_eq!(
+                    change.replicas.0.iter().filter(|r| r.last_lsn >= 0).count(),
+                    1
+                );
+                assert_eq!(state(&executor).body.replica.current_role, 3);
+                assert_eq!(state(&executor).body.unit, intent.unit);
+                assert_eq!(
+                    run(
+                        &executor,
+                        reconfigure(original.reconfiguration.as_ref().unwrap().request.clone())
+                    )
+                    .await,
+                    Disposition::IgnoredStale
+                );
+                assert!(effects(&executor).is_empty());
+                run(
+                    &executor,
+                    Command::RetryConfiguration(intent.unit.id.clone()),
+                )
+                .await;
+                assert_eq!(effects(&executor), actions);
+            } else {
+                assert_eq!(configured(&actions).flags, 2);
+            }
+        }
+        assert_eq!(state(&executor).runtime, original.runtime);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn configured_failover_keeps_pc_and_cc_read_quorums_separate_and_waits_for_up_progress() {
+    for pc_only in [false, true] {
+        let (store, executor, _) = setup(WAIT).await;
+        active_configured_survivor(&executor, 5, 1).await;
+        let original = state(&executor);
+        let mut intent = failover_configuration(&original, &admission().local_node);
+        for r in &mut intent.replicas.0[3..] {
+            r.up = false;
+            r.state = 3;
+            if pc_only {
+                r.current_role = 1;
+            }
+        }
+        run(&executor, reconfigure(intent.clone())).await;
+        let local = status_completion(&effects(&executor));
+        run(&executor, Command::CompleteStatus(Box::new(local))).await;
+        effects(&executor);
+        run(
+            &executor,
+            failover_progress(
+                &intent,
+                &intent.replicas.0[2],
+                original
+                    .peer_creation
+                    .as_ref()
+                    .unwrap()
+                    .deactivation
+                    .clone(),
+                8,
+            ),
+        )
+        .await;
+        assert!(effects(&executor).is_empty());
+        assert_eq!(
+            state(&executor).swap.as_ref().unwrap().stage,
+            SwapStage::GetLsn
+        );
+        // Even expiration cannot turn two PC replies into a read quorum of three.
+        executor
+            .config()
+            .set_node(NodeProperty::RemoteReplicaProgressQueryWaitTicks, 0);
+        run(
+            &executor,
+            Command::RetryConfiguration(intent.unit.id.clone()),
+        )
+        .await;
+        assert!(effects(&executor).is_empty());
+        assert_eq!(
+            state(&executor).swap.as_ref().unwrap().stage,
+            SwapStage::GetLsn
+        );
+        finish(&store, &executor).await;
+    }
+    let (store, executor, _) = setup(WAIT).await;
+    active_configured_survivor(&executor, 4, 2).await;
+    let original = state(&executor);
+    let intent = failover_configuration(&original, &admission().local_node);
+    run(&executor, reconfigure(intent.clone())).await;
+    let local = status_completion(&effects(&executor));
+    run(&executor, Command::CompleteStatus(Box::new(local))).await;
+    effects(&executor);
+    run(
+        &executor,
+        failover_progress(
+            &intent,
+            &intent.replicas.0[2],
+            original
+                .peer_creation
+                .as_ref()
+                .unwrap()
+                .deactivation
+                .clone(),
+            8,
+        ),
+    )
+    .await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::PeerGetLsn { .. }]
+    ));
+    assert_eq!(
+        state(&executor).swap.as_ref().unwrap().stage,
+        SwapStage::GetLsn
+    );
+    executor
+        .config()
+        .set_node(NodeProperty::RemoteReplicaProgressQueryWaitTicks, 0);
+    run(
+        &executor,
+        Command::RetryConfiguration(intent.unit.id.clone()),
+    )
+    .await;
+    assert_eq!(configured(&effects(&executor)).flags, 2);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn configured_failover_prefers_catchup_capability_only_when_a_secondary_is_behind() {
+    for lagging in [false, true] {
+        let (store, executor, _) = setup(WAIT).await;
+        active_configured_survivor(&executor, 4, 2).await;
+        let original = state(&executor);
+        let intent = failover_configuration(&original, &admission().local_node);
+        run(&executor, reconfigure(intent.clone())).await;
+        let mut local = status_completion(&effects(&executor));
+        local.local.first_lsn = 9;
+        local.local.last_lsn = 10;
+        run(&executor, Command::CompleteStatus(Box::new(local))).await;
+        effects(&executor);
+        run(
+            &executor,
+            failover_progress(
+                &intent,
+                &intent.replicas.0[2],
+                original
+                    .peer_creation
+                    .as_ref()
+                    .unwrap()
+                    .deactivation
+                    .clone(),
+                10,
+            ),
+        )
+        .await;
+        effects(&executor);
+        run(
+            &executor,
+            failover_progress(
+                &intent,
+                &intent.replicas.0[3],
+                original
+                    .peer_creation
+                    .as_ref()
+                    .unwrap()
+                    .deactivation
+                    .clone(),
+                if lagging { 7 } else { 10 },
+            ),
+        )
+        .await;
+        let actions = effects(&executor);
+        if lagging {
+            assert!(
+                matches!(actions.as_slice(), [Effect::ChangeConfiguration(c)]
+                if c.replicas.0[2].last_lsn == 10 && c.replicas.0[1].last_lsn == -1)
+            );
+        } else {
+            assert_eq!(configured(&actions).flags, 2);
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn redirected_candidate_rejoins_as_secondary_and_replays_activation_after_membership_compaction(
+) {
+    let (store, executor, _) = setup(WAIT).await;
+    active_configured_survivor(&executor, 4, 2).await;
+    let original = state(&executor);
+    let intent = failover_configuration(&original, &admission().local_node);
+    run(&executor, reconfigure(intent.clone())).await;
+    let local = status_completion(&effects(&executor));
+    run(&executor, Command::CompleteStatus(Box::new(local))).await;
+    effects(&executor);
+    for remote in intent.replicas.0.iter().filter(|r| r.current_role == 3) {
+        run(
+            &executor,
+            failover_progress(
+                &intent,
+                remote,
+                original
+                    .peer_creation
+                    .as_ref()
+                    .unwrap()
+                    .deactivation
+                    .clone(),
+                9,
+            ),
+        )
+        .await;
+        effects(&executor);
+    }
+    assert_eq!(
+        state(&executor).swap.as_ref().unwrap().stage,
+        SwapStage::ChangeConfiguration
+    );
+    let mut next = intent.clone();
+    let primary = next.replicas.0[2].node.clone();
+    next.unit.current.configuration += 0x1_0000_0001;
+    next.replicas.0[1].current_role = 3;
+    next.replicas.0[2].current_role = 4;
+    run(
+        &executor,
+        Command::GetLsn {
+            source: primary.clone(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(GetLsn {
+                unit: next.unit.clone(),
+                service: next.service.clone(),
+                replica: Replica {
+                    node: admission().local_node,
+                    id: original.body.replica.id,
+                    instance: original.body.replica.instance,
+                    ..Replica::default()
+                },
+            }),
+        },
+    )
+    .await;
+    let local = status_completion(&effects(&executor));
+    run(&executor, Command::CompleteStatus(Box::new(local))).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerGetLsnReply { target, .. }] if *target == primary)
+    );
+    let history = ReplicaDeactivationInfo {
+        epoch: next.unit.current,
+        catchup_lsn: 9,
+    };
+    run(
+        &executor,
+        Command::Deactivate {
+            source: primary.clone(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(Deactivate {
+                configuration: next.clone(),
+                deactivation: history.clone(),
+                force: false,
+            }),
+        },
+    )
+    .await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerDeactivateReply { target, .. }] if *target == primary)
+    );
+    let activation = || Command::Activate {
+        source: primary.clone(),
+        generation: generation_header(admission().generation.generation),
+        body: Box::new(Activate {
+            configuration: next.clone(),
+            deactivation: history.clone(),
+        }),
+    };
+    run(&executor, activation()).await;
+    let mut completion = configured(&effects(&executor));
+    completion.local.first_lsn = 1;
+    completion.local.last_lsn = 9;
+    run(
+        &executor,
+        Command::CompleteConfiguration(Box::new(completion)),
+    )
+    .await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerActivateReply { target, .. }] if *target == primary)
+    );
+    run(&executor, activation()).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerActivateReply { target, .. }] if *target == primary)
+    );
+    assert_eq!(state(&executor).body.replica.current_role, 3);
+    assert_eq!(state(&executor).runtime, original.runtime);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn failover_survivor_get_lsn_and_ss_deactivate_wait_for_their_own_commits() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        active_survivor(&executor).await;
+        let original = state(&executor);
+        let mut config = failover_configuration(&original, &survivor_peer());
+        let local = config
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.node == admission().local_node)
+            .unwrap();
+        let query = Command::GetLsn {
+            body: Box::new(AddInstance {
+                unit: config.unit.clone(),
+                service: config.service.clone(),
+                replica: Replica {
+                    node: local.node.clone(),
+                    id: local.id,
+                    instance: local.instance,
+                    ..Replica::default()
+                },
+            }),
+            source: survivor_peer(),
+            generation: generation_header(admission().generation.generation),
+        };
+        let (entered, release) = hooks.pause(false);
+        let work = executor.submit(query).unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        release.send(()).unwrap();
+        work.wait(WAIT).await.unwrap();
+        let progress = status_completion(&effects(&executor));
+        let mut failure = progress.clone();
+        failure.error = -991;
+        run(&executor, Command::CompleteStatus(Box::new(failure))).await;
+        assert!(effects(&executor).is_empty());
+        assert_eq!(
+            state(&executor).progress_query.as_ref().unwrap().error,
+            -991
+        );
+        run(&executor, Command::CompleteStatus(Box::new(progress))).await;
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::PeerGetLsnReply { body, .. }]
+            if body.replica.replica.last_lsn == 8 && body.deactivation == original.peer_creation.as_ref().unwrap().deactivation)
+        );
+        for r in &mut config.replicas.0 {
+            if r.up {
+                r.first_lsn = 1;
+                r.last_lsn = 8;
+            }
+        }
+        let body = Deactivate {
+            configuration: config.clone(),
+            force: false,
+            deactivation: ReplicaDeactivationInfo {
+                epoch: config.unit.current,
+                catchup_lsn: 8,
+            },
+        };
+        let command = || Command::Deactivate {
+            body: Box::new(body.clone()),
+            source: survivor_peer(),
+            generation: generation_header(admission().generation.generation),
+        };
+        let (entered, release) = hooks.pause(fail);
+        let work = executor.submit(command()).unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        assert!(state(&executor).swap.is_none());
+        if unknown {
+            assert_eq!(work.wait(WAIT).await, Err(Failure::Unknown));
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(work.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(effects(&executor).is_empty());
+            assert!(state(&executor).swap.is_none());
+        } else {
+            work.resolve(WAIT).await.unwrap();
+            let ack = effects(&executor);
+            assert!(
+                matches!(ack.as_slice(), [Effect::PeerDeactivateReply { body, .. }] if body.error == 0)
+            );
+            assert_eq!(state(&executor).phase, Phase::Ready);
+            assert_eq!(state(&executor).runtime, original.runtime);
+            assert_eq!(state(&executor).usage, original.usage);
+            if !unknown {
+                run(&executor, command()).await;
+                assert_eq!(effects(&executor), ack);
+                run(
+                    &executor,
+                    Command::Activate {
+                        body: Box::new(Activate {
+                            configuration: config.clone(),
+                            deactivation: body.deactivation.clone(),
+                        }),
+                        source: survivor_peer(),
+                        generation: generation_header(admission().generation.generation),
+                    },
+                )
+                .await;
+                let completion = configured(&effects(&executor));
+                run(
+                    &executor,
+                    Command::CompleteConfiguration(Box::new(completion)),
+                )
+                .await;
+                effects(&executor);
+                let stable = state(&executor);
+                assert_eq!(
+                    run(
+                        &executor,
+                        Command::GetLsn {
+                            body: Box::new(AddInstance {
+                                unit: config.unit.clone(),
+                                service: config.service.clone(),
+                                replica: Replica {
+                                    node: stable.body.replica.node.clone(),
+                                    id: stable.body.replica.id,
+                                    instance: stable.body.replica.instance,
+                                    ..Replica::default()
+                                },
+                            }),
+                            source: survivor_peer(),
+                            generation: generation_header(admission().generation.generation),
+                        }
+                    )
+                    .await,
+                    Disposition::Applied,
+                );
+                assert!(matches!(
+                    effects(&executor).as_slice(),
+                    [Effect::QueryReplicaStatus { .. }]
+                ));
+                assert_eq!(state(&executor).body, stable.body);
+                assert!(state(&executor).progress_query.is_none());
+                let mut repair = stable.swap.as_ref().unwrap().body.clone();
+                repair.unit.previous = repair.unit.current;
+                repair.unit.current.configuration += 1;
+                for r in &mut repair.replicas.0 {
+                    r.previous_role = r.current_role;
+                }
+                let mut fresh = config
+                    .replicas
+                    .0
+                    .iter()
+                    .find(|r| r.current_role == 1)
+                    .unwrap()
+                    .clone();
+                fresh.id += 100;
+                fresh.instance += 100;
+                fresh.previous_role = 2;
+                fresh.current_role = 3;
+                fresh.state = 2;
+                fresh.up = true;
+                fresh.service_endpoint.clear();
+                fresh.replication_endpoint = "127.0.0.1:12350".into();
+                repair.replicas.0.push(fresh);
+                let deactivate = || Command::Deactivate {
+                    body: Box::new(Deactivate {
+                        configuration: repair.clone(),
+                        force: false,
+                        deactivation: ReplicaDeactivationInfo {
+                            epoch: repair.unit.current,
+                            catchup_lsn: 8,
+                        },
+                    }),
+                    source: survivor_peer(),
+                    generation: generation_header(admission().generation.generation),
+                };
+                let (entered, release) = hooks.pause(false);
+                let work = executor.submit(deactivate()).unwrap();
+                entered.await.unwrap();
+                assert!(effects(&executor).is_empty());
+                assert_eq!(state(&executor).body.unit, stable.body.unit);
+                release.send(()).unwrap();
+                work.wait(WAIT).await.unwrap();
+                assert!(matches!(
+                    effects(&executor).as_slice(),
+                    [Effect::PeerDeactivateReply { .. }]
+                ));
+                assert_eq!(state(&executor).phase, Phase::Ready);
+                assert_eq!(state(&executor).runtime, original.runtime);
+                assert_eq!(state(&executor).usage, original.usage);
+                run(&executor, deactivate()).await;
+                assert!(matches!(
+                    effects(&executor).as_slice(),
+                    [Effect::PeerDeactivateReply { .. }]
+                ));
+                run(
+                    &executor,
+                    Command::Activate {
+                        body: Box::new(Activate {
+                            configuration: repair.clone(),
+                            deactivation: ReplicaDeactivationInfo {
+                                epoch: repair.unit.current,
+                                catchup_lsn: 8,
+                            },
+                        }),
+                        source: survivor_peer(),
+                        generation: generation_header(admission().generation.generation),
+                    },
+                )
+                .await;
+                let completion = configured(&effects(&executor));
+                run(
+                    &executor,
+                    Command::CompleteConfiguration(Box::new(completion)),
+                )
+                .await;
+                effects(&executor);
+                let next = failover_configuration(&state(&executor), &peer_source());
+                let local = &state(&executor).body.replica;
+                let query = Command::GetLsn {
+                    body: Box::new(AddInstance {
+                        unit: next.unit.clone(),
+                        service: next.service,
+                        replica: Replica {
+                            node: local.node.clone(),
+                            id: local.id,
+                            instance: local.instance,
+                            ..Replica::default()
+                        },
+                    }),
+                    source: peer_source(),
+                    generation: generation_header(admission().generation.generation),
+                };
+                let (entered, release) = hooks.pause(false);
+                let work = executor.submit(query).unwrap();
+                entered.await.unwrap();
+                assert!(effects(&executor).is_empty());
+                release.send(()).unwrap();
+                work.wait(WAIT).await.unwrap();
+                let progress = status_completion(&effects(&executor));
+                run(&executor, Command::CompleteStatus(Box::new(progress))).await;
+                assert!(
+                    matches!(effects(&executor).as_slice(), [Effect::PeerGetLsnReply { target, body }]
+                    if *target == peer_source() && body.deactivation.epoch == repair.unit.current
+                        && body.deactivation.catchup_lsn == 8)
+                );
+                assert_eq!(run(&executor, command()).await, Disposition::IgnoredStale);
+                assert!(effects(&executor).is_empty());
+                assert_eq!(state(&executor).runtime, original.runtime);
+                assert_eq!(state(&executor).usage, original.usage);
+            }
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+async fn finish_same_primary_restoration(executor: &Executor, hooks: &Hooks, body: Configuration) {
+    let before = state(executor);
+    let (entered, release) = hooks.pause(false);
+    let ticket = executor.submit(reconfigure(body.clone())).unwrap();
+    entered.await.unwrap();
+    assert!(effects(executor).is_empty());
+    assert_eq!(state(executor).body, before.body);
+    release.send(()).unwrap();
+    ticket.wait(WAIT).await.unwrap();
+    let catchup = configured(&effects(executor));
+    run(executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+    effects(executor);
+    for r in body
+        .replicas
+        .0
+        .iter()
+        .filter(|r| r.up && r.previous_role == 3)
+    {
+        run(
+            executor,
+            Command::DeactivateReply {
+                source: r.node.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(DeactivateReply {
+                    unit: body.unit.clone(),
+                    replica: Replica {
+                        node: r.node.clone(),
+                        id: r.id,
+                        instance: r.instance,
+                        up: false,
+                        state: 3,
+                        ..Replica::default()
+                    },
+                    error: 0,
+                }),
+            },
+        )
+        .await;
+        effects(executor);
+    }
+    let mut actions = vec![];
+    for r in body
+        .replicas
+        .0
+        .iter()
+        .filter(|r| r.up && r.current_role == 3)
+    {
+        let mut unit = body.unit.clone();
+        unit.previous = Epoch::default();
+        let mut replica = r.clone();
+        replica.previous_role = 1;
+        run(
+            executor,
+            Command::ActivateReply {
+                source: r.node.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(ActivateReply {
+                    unit,
+                    replica,
+                    error: 0,
+                }),
+            },
+        )
+        .await;
+        actions = effects(executor);
+    }
+    let end = configured(&actions);
+    assert_eq!(end.flags, 1);
+    let (entered, release) = hooks.pause(false);
+    let ticket = executor
+        .submit(Command::CompleteConfiguration(Box::new(end)))
+        .unwrap();
+    entered.await.unwrap();
+    assert!(effects(executor).is_empty());
+    release.send(()).unwrap();
+    ticket.wait(WAIT).await.unwrap();
+    assert!(matches!(
+        effects(executor).as_slice(),
+        [Effect::DoReconfigurationReply(_)]
+    ));
+    assert_eq!(
+        state(executor).primary_deactivation,
+        before.primary_deactivation
+    );
+    assert_eq!(state(executor).runtime, before.runtime);
+    assert_eq!(state(executor).usage, before.usage);
+}
+
+#[tokio::test]
+async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit() {
+    for (target, minimum) in [(4, 3), (5, 3), (64, 32), (64, 63)] {
+        for stage in 0..4 {
+            let (store, executor, hooks) = setup(WAIT).await;
+            active_configured_survivor(&executor, target, minimum).await;
+            let original = state(&executor);
+            let mut removal = original.reconfiguration.as_ref().unwrap().request.clone();
+            removal.unit.previous = removal.unit.current;
+            removal.unit.current.configuration += 1;
+            for r in &mut removal.replicas.0 {
+                r.previous_role = r.current_role;
+            }
+            let lost = removal.replicas.0.last_mut().unwrap();
+            lost.current_role = 1;
+            lost.up = false;
+            lost.state = 3;
+            let history = original
+                .peer_creation
+                .as_ref()
+                .unwrap()
+                .deactivation
+                .clone();
+            let old_deactivate = || Command::Deactivate {
+                source: peer_source(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(Deactivate {
+                    configuration: removal.clone(),
+                    force: false,
+                    deactivation: history.clone(),
+                }),
+            };
+            let old_activate = || Command::Activate {
+                source: peer_source(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(Activate {
+                    configuration: removal.clone(),
+                    deactivation: history.clone(),
+                }),
+            };
+            let mut old_completion = None;
+            if stage > 0 {
+                run(&executor, old_deactivate()).await;
+                effects(&executor);
+            }
+            if stage > 1 {
+                run(&executor, old_activate()).await;
+                old_completion = Some(configured(&effects(&executor)));
+            }
+            if stage > 2 {
+                run(
+                    &executor,
+                    Command::CompleteConfiguration(Box::new(old_completion.clone().unwrap())),
+                )
+                .await;
+                effects(&executor);
+            }
+            let mut intent = removal.clone();
+            intent.unit.current.configuration += 0x1_0000_0001;
+            for r in &mut intent.replicas.0 {
+                if r.current_role == 4 {
+                    r.current_role = 3;
+                    r.up = false;
+                    r.state = 3;
+                } else if r.node == admission().local_node {
+                    r.current_role = 4;
+                }
+                r.first_lsn = -1;
+                r.last_lsn = -1;
+            }
+            for invalid in 0..5 {
+                let mut bad = intent.clone();
+                match invalid {
+                    0 => bad.unit.previous = removal.unit.current,
+                    1 => bad.replicas.0[0].current_role = 1,
+                    2 => bad.replicas.0[2].previous_role = 1,
+                    3 => bad.replicas.0[2].instance += 1,
+                    _ => bad.service.minimum -= 1,
+                }
+                assert!(executor
+                    .submit(reconfigure(bad))
+                    .unwrap()
+                    .wait(WAIT)
+                    .await
+                    .is_err());
+                assert!(effects(&executor).is_empty());
+            }
+            let before = state(&executor);
+            let (entered, release) = hooks.pause(true);
+            let ticket = executor.submit(reconfigure(intent.clone())).unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            release.send(()).unwrap();
+            assert!(matches!(ticket.wait(WAIT).await, Err(Failure::Store(_))));
+            assert_eq!(state(&executor).body, before.body);
+            assert!(effects(&executor).is_empty());
+            run(&executor, reconfigure(intent.clone())).await;
+            let progress = status_completion(&effects(&executor));
+            for command in [old_deactivate(), old_activate()]
+                .into_iter()
+                .chain(old_completion.map(|c| Command::CompleteConfiguration(Box::new(c))))
+            {
+                assert_eq!(run(&executor, command).await, Disposition::IgnoredStale);
+                assert!(effects(&executor).is_empty());
+            }
+            run(&executor, Command::CompleteStatus(Box::new(progress))).await;
+            let mut actions = effects(&executor);
+            for remote in intent
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.up && r.current_role == 3)
+            {
+                run(
+                    &executor,
+                    failover_progress(&intent, remote, history.clone(), 7),
+                )
+                .await;
+                actions = effects(&executor);
+                if target == 5
+                    && state(&executor)
+                        .swap
+                        .as_ref()
+                        .unwrap()
+                        .remote_progress
+                        .len()
+                        == 1
+                {
+                    executor
+                        .config()
+                        .set_node(NodeProperty::RemoteReplicaProgressQueryWaitTicks, 0);
+                    run(
+                        &executor,
+                        Command::RetryConfiguration(intent.unit.id.clone()),
+                    )
+                    .await;
+                    actions = effects(&executor);
+                    assert_eq!(
+                        state(&executor).swap.as_ref().unwrap().stage,
+                        SwapStage::GetLsn
+                    );
+                    assert!(!actions
+                        .iter()
+                        .any(|e| matches!(e, Effect::UpdateConfiguration { .. })));
+                }
+            }
+            let mut catchup = configured(&actions);
+            assert_eq!(catchup.unit.previous, removal.unit.previous);
+            assert_eq!(
+                catchup
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|r| r.previous_role >= 3)
+                    .count(),
+                target as usize
+            );
+            assert_eq!(
+                catchup
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|r| r.current_role >= 3)
+                    .count(),
+                target as usize - 1
+            );
+            catchup.local.service_endpoint = "127.0.0.1:12349".into();
+            run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+            effects(&executor);
+            for remote in intent
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.up && r.current_role == 3)
+            {
+                let (entered, release) = hooks.pause(false);
+                let ticket = executor
+                    .submit(Command::DeactivateReply {
+                        source: remote.node.clone(),
+                        generation: generation_header(admission().generation.generation),
+                        body: Box::new(DeactivateReply {
+                            unit: intent.unit.clone(),
+                            replica: Replica {
+                                node: remote.node.clone(),
+                                id: remote.id,
+                                instance: remote.instance,
+                                up: false,
+                                state: 3,
+                                ..Replica::default()
+                            },
+                            error: 0,
+                        }),
+                    })
+                    .unwrap();
+                entered.await.unwrap();
+                assert!(effects(&executor).is_empty());
+                release.send(()).unwrap();
+                ticket.wait(WAIT).await.unwrap();
+                effects(&executor);
+            }
+            let mut actions = vec![];
+            for remote in intent
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.up && r.current_role == 3)
+            {
+                let mut unit = intent.unit.clone();
+                unit.previous = Epoch::default();
+                let mut replica = remote.clone();
+                replica.previous_role = 1;
+                replica.first_lsn = 1;
+                replica.last_lsn = 7;
+                run(
+                    &executor,
+                    Command::ActivateReply {
+                        source: remote.node.clone(),
+                        generation: generation_header(admission().generation.generation),
+                        body: Box::new(ActivateReply {
+                            unit,
+                            replica,
+                            error: 0,
+                        }),
+                    },
+                )
+                .await;
+                actions = effects(&executor);
+            }
+            let end = configured(&actions);
+            assert_eq!(end.flags, 1);
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor
+                .submit(Command::CompleteConfiguration(Box::new(end)))
+                .unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            assert!(
+                matches!(effects(&executor).as_slice(),[Effect::DoReconfigurationReply(r)]
+                if r.replicas.0.len() == target as usize-1 && r.replicas.0.iter().filter(|r| r.up).count() == target as usize-2)
+            );
+            assert_eq!(state(&executor).runtime, original.runtime);
+            assert_eq!(state(&executor).usage, original.usage);
+            assert_eq!(state(&executor).body.service, original.body.service);
+            let mut active = state(&executor).swap.as_ref().unwrap().body.clone();
+            let mut removal = active.clone();
+            removal.unit.previous = active.unit.current;
+            removal.unit.current.configuration += 1;
+            for r in &mut removal.replicas.0 {
+                r.previous_role = r.current_role;
+                if !r.up {
+                    r.current_role = 1;
+                }
+            }
+            let ready_idle_first = target - 1 == minimum;
+            if !ready_idle_first {
+                finish_same_primary_restoration(&executor, &hooks, removal.clone()).await;
+                active = removal.clone();
+            }
+            let mut losses = [
+                intent.replicas.0[0].clone(),
+                intent.replicas.0.last().unwrap().clone(),
+            ];
+            if ready_idle_first {
+                losses.reverse();
+            }
+            for lost in losses {
+                let ready = state(&executor);
+                let mut fresh = lost;
+                fresh.id += 1000;
+                fresh.instance += 1000;
+                fresh.previous_role = 1;
+                fresh.current_role = 2;
+                fresh.up = true;
+                fresh.state = 1;
+                fresh.service_endpoint.clear();
+                fresh.replication_endpoint.clear();
+                fresh.first_lsn = -1;
+                fresh.last_lsn = -1;
+                let add = AddReplica {
+                    unit: ready.body.unit.clone(),
+                    service: ready.body.service.clone(),
+                    replica: fresh.clone(),
+                };
+                run(&executor, fm_add_idle(add.clone())).await;
+                assert!(matches!(
+                    effects(&executor).as_slice(),
+                    [Effect::PeerCreateReplica { .. }]
+                ));
+                fresh.replication_endpoint = format!("127.0.0.1:{}", 12350 + fresh.id);
+                run(
+                    &executor,
+                    Command::CreateReplicaReply {
+                        source: fresh.node.clone(),
+                        generation: generation_header(admission().generation.generation),
+                        body: Box::new(CreateReplicaReply {
+                            unit: add.unit.clone(),
+                            replica: fresh.clone(),
+                            error: 0,
+                        }),
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    effects(&executor).as_slice(),
+                    [Effect::BuildIdle { .. }]
+                ));
+                run(
+                    &executor,
+                    Command::CompleteBuild(Box::new(BuildCompletion {
+                        unit: add.unit,
+                        local: ready.body.replica.clone(),
+                        remote: fresh.clone(),
+                        error: 0,
+                        detail: ProxyErrorDetail::default(),
+                    })),
+                )
+                .await;
+                assert!(matches!(
+                    effects(&executor).as_slice(),
+                    [Effect::AddReplicaReply(_)]
+                ));
+                active.replicas.0.retain(|r| r.current_role >= 3);
+                active.unit.previous = active.unit.current;
+                active.unit.current.configuration += 1;
+                for r in &mut active.replicas.0 {
+                    r.previous_role = r.current_role;
+                    if !r.up {
+                        r.current_role = 1;
+                    }
+                }
+                fresh.previous_role = 2;
+                fresh.current_role = 3;
+                fresh.state = 2;
+                active.replicas.0.push(fresh);
+                let mut omitted = active.clone();
+                omitted.replicas.0.remove(0);
+                assert!(executor
+                    .submit(reconfigure(omitted))
+                    .unwrap()
+                    .wait(WAIT)
+                    .await
+                    .is_err());
+                assert!(effects(&executor).is_empty());
+                if ready_idle_first && active.replicas.0.iter().any(|r| !r.up) {
+                    for invalid in 0..6 {
+                        let mut bad = active.clone();
+                        match invalid {
+                            0 => bad.service.minimum -= 1,
+                            1 => bad.replicas.0.iter_mut().find(|r| !r.up).unwrap().instance += 1,
+                            2 => bad.replicas.0.last_mut().unwrap().instance += 1,
+                            3 => bad.replicas.0.last_mut().unwrap().up = false,
+                            4 => {
+                                bad.replicas.0.pop();
+                            }
+                            _ => bad.unit.current.configuration += 1,
+                        }
+                        assert!(executor
+                            .submit(reconfigure(bad))
+                            .unwrap()
+                            .wait(WAIT)
+                            .await
+                            .is_err());
+                        assert!(effects(&executor).is_empty());
+                    }
+                }
+                finish_same_primary_restoration(&executor, &hooks, active.clone()).await;
+                assert_eq!(
+                    run(
+                        &executor,
+                        reconfigure(if ready_idle_first {
+                            original.reconfiguration.as_ref().unwrap().request.clone()
+                        } else {
+                            removal.clone()
+                        }),
+                    )
+                    .await,
+                    Disposition::IgnoredStale
+                );
+                assert!(effects(&executor).is_empty());
+            }
+            assert_eq!(active.replicas.0.len(), target as usize);
+            finish(&store, &executor).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn removal_survivor_queries_retained_history_and_fences_old_activation() {
+    for stage in 0..4 {
+        let (store, executor, _) = setup(WAIT).await;
+        active_configured_survivor(&executor, 5, 3).await;
+        let original = state(&executor);
+        let history = original
+            .peer_creation
+            .as_ref()
+            .unwrap()
+            .deactivation
+            .clone();
+        let mut removal = original.reconfiguration.as_ref().unwrap().request.clone();
+        removal.unit.previous = removal.unit.current;
+        removal.unit.current.configuration += 1;
+        for r in &mut removal.replicas.0 {
+            r.previous_role = r.current_role;
+        }
+        let lost = removal.replicas.0.last_mut().unwrap();
+        lost.current_role = 1;
+        lost.up = false;
+        lost.state = 3;
+        let old_deactivate = || Command::Deactivate {
+            source: peer_source(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(Deactivate {
+                configuration: removal.clone(),
+                force: false,
+                deactivation: history.clone(),
+            }),
+        };
+        let old_activate = || Command::Activate {
+            source: peer_source(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(Activate {
+                configuration: removal.clone(),
+                deactivation: history.clone(),
+            }),
+        };
+        let mut old_completion = None;
+        if stage > 0 {
+            run(&executor, old_deactivate()).await;
+            effects(&executor);
+        }
+        if stage > 1 {
+            run(&executor, old_activate()).await;
+            old_completion = Some(configured(&effects(&executor)));
+        }
+        if stage > 2 {
+            run(
+                &executor,
+                Command::CompleteConfiguration(Box::new(old_completion.clone().unwrap())),
+            )
+            .await;
+            effects(&executor);
+        }
+        let candidate = removal.replicas.0[2].node.clone();
+        let mut intent = removal.clone();
+        intent.unit.current.configuration += 0x1_0000_0001;
+        for r in &mut intent.replicas.0 {
+            if r.current_role == 4 {
+                r.current_role = 3;
+                r.up = false;
+                r.state = 3;
+            } else if r.node == candidate {
+                r.current_role = 4;
+            }
+            r.first_lsn = -1;
+            r.last_lsn = -1;
+        }
+        run(
+            &executor,
+            Command::GetLsn {
+                source: candidate.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(AddInstance {
+                    unit: intent.unit.clone(),
+                    service: intent.service.clone(),
+                    replica: Replica {
+                        node: original.body.replica.node.clone(),
+                        id: original.body.replica.id,
+                        instance: original.body.replica.instance,
+                        ..Replica::default()
+                    },
+                }),
+            },
+        )
+        .await;
+        let completion = status_completion(&effects(&executor));
+        for command in [old_deactivate(), old_activate()]
+            .into_iter()
+            .chain(old_completion.map(|c| Command::CompleteConfiguration(Box::new(c))))
+        {
+            assert_eq!(run(&executor, command).await, Disposition::IgnoredStale);
+            assert!(effects(&executor).is_empty());
+        }
+        run(&executor, Command::CompleteStatus(Box::new(completion))).await;
+        assert!(
+            matches!(effects(&executor).as_slice(),[Effect::PeerGetLsnReply { body,.. }] if body.deactivation==history)
+        );
+        let next_history = ReplicaDeactivationInfo {
+            epoch: intent.unit.current,
+            catchup_lsn: 8,
+        };
+        let mut future = intent.clone();
+        future.unit.current.configuration += 0x1_0000_0001;
+        assert!(executor
+            .submit(Command::Deactivate {
+                source: candidate.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(Deactivate {
+                    deactivation: ReplicaDeactivationInfo {
+                        epoch: future.unit.current,
+                        catchup_lsn: 8
+                    },
+                    configuration: future,
+                    force: false,
+                }),
+            })
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .is_err());
+        assert!(effects(&executor).is_empty());
+        run(
+            &executor,
+            Command::Deactivate {
+                source: candidate.clone(),
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(Deactivate {
+                    configuration: intent.clone(),
+                    force: false,
+                    deactivation: next_history.clone(),
+                }),
+            },
+        )
+        .await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::PeerDeactivateReply { .. }]
+        ));
+        run(
+            &executor,
+            Command::Activate {
+                source: candidate,
+                generation: generation_header(admission().generation.generation),
+                body: Box::new(Activate {
+                    configuration: intent,
+                    deactivation: next_history,
+                }),
+            },
+        )
+        .await;
+        let mut completion = configured(&effects(&executor));
+        completion.local.first_lsn = 1;
+        completion.local.last_lsn = 8;
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(completion)),
+        )
+        .await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::PeerActivateReply { .. }]
+        ));
+        assert_eq!(state(&executor).runtime, original.runtime);
+        assert_eq!(state(&executor).usage, original.usage);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn closed_secondary_replacement_from_promoted_primary_requires_exact_fresh_history_and_owner()
+{
+    let (store, executor, _) = setup(WAIT).await;
+    active_configured_survivor(&executor, 5, 3).await;
+    let original = state(&executor);
+    let source = original
+        .reconfiguration
+        .as_ref()
+        .unwrap()
+        .request
+        .replicas
+        .0[2]
+        .node
+        .clone();
+    run(
+        &executor,
+        Command::HostDown(Box::new(HostDown {
+            unit: original.body.unit.id.clone(),
+            host: original.runtime.as_ref().unwrap().host.clone(),
+        })),
+    )
+    .await;
+    effects(&executor);
+    run(&executor, primary_delete((*original.body).clone(), false)).await;
+    effects(&executor);
+    assert!(state(&executor).local_deleted);
+    let closed = state(&executor);
+    let mut body = (*original.body).clone();
+    body.unit.previous = Epoch::default();
+    body.unit.current.configuration += 0x1_0000_0004;
+    body.replica.previous_role = 1;
+    body.replica.current_role = 2;
+    body.replica.state = 1;
+    body.replica.id += 1000;
+    body.replica.instance += 1000;
+    body.replica.service_endpoint.clear();
+    body.replica.replication_endpoint.clear();
+    let mut epoch = body.unit.current;
+    epoch.configuration -= 2;
+    let history = ReplicaDeactivationInfo {
+        epoch,
+        catchup_lsn: 8,
+    };
+    for bad in 0..6 {
+        let mut request = CreateReplica::new(body.clone(), history.clone());
+        match bad {
+            0 => request.replica.0.replica.instance = original.body.replica.instance,
+            1 => request.replica.0.service.minimum = 2,
+            2 => request.deactivation.epoch.data_loss += 1,
+            3 => request.deactivation.epoch.configuration += 0x1_0000_0001,
+            4 => request.deactivation.catchup_lsn = -1,
+            _ => request.replica.0.replica.node.instance += 1,
+        }
+        assert!(executor
+            .submit(Command::CreateReplica {
+                body: Box::new(request),
+                source: source.clone(),
+                generation: generation_header(admission().generation.generation),
+            })
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .is_err());
+        assert!(effects(&executor).is_empty());
+        assert_eq!(state(&executor).body, closed.body);
+    }
+    run(
+        &executor,
+        Command::CreateReplica {
+            body: Box::new(CreateReplica::new(body.clone(), history.clone())),
+            source: source.clone(),
+            generation: generation_header(admission().generation.generation),
+        },
+    )
+    .await;
+    assert_eq!(state(&executor).body.replica.id, body.replica.id);
+    assert_eq!(
+        state(&executor).peer_creation.as_ref().unwrap().source,
+        source
+    );
+    assert_eq!(
+        state(&executor)
+            .peer_creation
+            .as_ref()
+            .unwrap()
+            .deactivation,
+        history
+    );
+    assert_eq!(state(&executor).phase, Phase::Opening);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_commit() {
+    for (target, minimum, veto) in [
+        (4, 2, false),
+        (5, 3, false),
+        (64, 32, false),
+        (4, 2, true),
+        (4, 4, false),
+    ] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        active_configured_survivor(&executor, target, minimum).await;
+        let original = state(&executor);
+        let mut removal = original.reconfiguration.as_ref().unwrap().request.clone();
+        removal.unit.previous = removal.unit.current;
+        removal.unit.current.configuration += 1;
+        for r in &mut removal.replicas.0 {
+            r.previous_role = r.current_role;
+        }
+        let lost = removal.replicas.0.last_mut().unwrap();
+        lost.current_role = 1;
+        lost.state = 3;
+        lost.up = false;
+        let lost = lost.clone();
+        let history = original
+            .peer_creation
+            .as_ref()
+            .unwrap()
+            .deactivation
+            .clone();
+        let deactivate = |configuration| Command::Deactivate {
+            source: peer_source(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(Deactivate {
+                configuration,
+                force: false,
+                deactivation: history.clone(),
+            }),
+        };
+        if target == minimum {
+            assert!(executor
+                .submit(deactivate(removal))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+            assert!(effects(&executor).is_empty());
+            assert_eq!(state(&executor).body, original.body);
+            finish(&store, &executor).await;
+            continue;
+        }
+        for invalid in 0..3 {
+            let mut bad = removal.clone();
+            match invalid {
+                0 => bad.replicas.0[0].instance += 1,
+                1 => bad.service.minimum = 1,
+                _ => bad.unit.current.configuration += 1,
+            }
+            assert!(executor
+                .submit(deactivate(bad))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+            assert!(effects(&executor).is_empty());
+        }
+        let mut fresh = lost.clone();
+        fresh.id += 1000;
+        fresh.instance += 1000;
+        fresh.up = true;
+        fresh.previous_role = 2;
+        fresh.current_role = 3;
+        fresh.state = 2;
+        fresh.replication_endpoint = "127.0.0.1:12350".into();
+        let mut repair = removal.clone();
+        repair.unit.previous = repair.unit.current;
+        repair.unit.current.configuration += 1;
+        repair.replicas.0.retain(|r| r.current_role >= 3);
+        for r in &mut repair.replicas.0 {
+            r.previous_role = r.current_role;
+        }
+        repair.replicas.0.push(fresh);
+        for body in [removal, repair] {
+            let before = state(&executor);
+            let (entered, release) = hooks.pause(veto);
+            let ticket = executor.submit(deactivate(body.clone())).unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            assert_eq!(state(&executor).body, before.body);
+            release.send(()).unwrap();
+            if veto {
+                assert!(matches!(ticket.wait(WAIT).await, Err(Failure::Store(_))));
+                assert!(effects(&executor).is_empty());
+                assert_eq!(state(&executor).body, before.body);
+                break;
+            }
+            ticket.wait(WAIT).await.unwrap();
+            let response = effects(&executor);
+            assert!(matches!(
+                response.as_slice(),
+                [Effect::PeerDeactivateReply { .. }]
+            ));
+            run(&executor, deactivate(body.clone())).await;
+            assert_eq!(effects(&executor), response);
+            run(
+                &executor,
+                Command::Activate {
+                    source: peer_source(),
+                    generation: generation_header(admission().generation.generation),
+                    body: Box::new(Activate {
+                        configuration: body,
+                        deactivation: history.clone(),
+                    }),
+                },
+            )
+            .await;
+            let completion = configured(&effects(&executor));
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor
+                .submit(Command::CompleteConfiguration(Box::new(completion)))
+                .unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::PeerActivateReply { .. }]
+            ));
+            assert_eq!(state(&executor).runtime, original.runtime);
+            assert_eq!(state(&executor).usage, original.usage);
+            assert_eq!(
+                state(&executor)
+                    .peer_creation
+                    .as_ref()
+                    .unwrap()
+                    .deactivation,
+                history
+            );
+        }
+        if !veto {
+            let current = state(&executor);
+            let candidate = current
+                .reconfiguration
+                .as_ref()
+                .unwrap()
+                .request
+                .replicas
+                .0
+                .last()
+                .unwrap()
+                .node
+                .clone();
+            let next = failover_configuration(&current, &candidate);
+            run(
+                &executor,
+                Command::GetLsn {
+                    source: candidate,
+                    generation: generation_header(admission().generation.generation),
+                    body: Box::new(AddInstance {
+                        unit: next.unit,
+                        service: next.service,
+                        replica: Replica {
+                            node: current.body.replica.node.clone(),
+                            id: current.body.replica.id,
+                            instance: current.body.replica.instance,
+                            ..Replica::default()
+                        },
+                    }),
+                },
+            )
+            .await;
+            let progress = status_completion(&effects(&executor));
+            run(&executor, Command::CompleteStatus(Box::new(progress))).await;
+            assert!(
+                matches!(effects(&executor).as_slice(), [Effect::PeerGetLsnReply { body, .. }] if body.deactivation == history)
+            );
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn configured_initial_membership_preserves_sizes_and_waits_for_every_activation_commit() {
+    for (target, minimum) in [(2, 1), (3, 2), (4, 2), (4, 3), (5, 3), (4, 4), (64, 32)] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        let peers: Vec<_> = (0..target - 1)
+            .map(|i| NodeInstance {
+                id: [10 + i as u8; 16],
+                instance: 100 + i as u64,
+            })
+            .collect();
+        executor.bind_peers(peers.clone()).unwrap();
+        let mut request = primary_body();
+        request.service.target = target;
+        request.service.minimum = minimum;
+        request.unit.target = target;
+        request.unit.minimum = minimum;
+        make_ready(&executor, &request).await;
+        let original = state(&executor);
+        let mut replicas = vec![original.body.replica.clone()];
+        replicas[0].previous_role = 4;
+        for (i, peer) in peers.iter().enumerate() {
+            let mut add = fm_idle_request(&original);
+            add.replica.node = peer.clone();
+            add.replica.id += i as i64;
+            add.replica.instance += i as i64;
+            run(&executor, fm_add_idle(add.clone())).await;
+            assert!(
+                matches!(effects(&executor).as_slice(), [Effect::PeerCreateReplica { body, .. }]
+                if body.replica.0.service == request.service)
+            );
+            let mut opened = CreateReplicaReply {
+                unit: add.unit,
+                replica: add.replica,
+                error: 0,
+            };
+            opened.replica.replication_endpoint = format!("127.0.0.1:{}", 12346 + i);
+            run(
+                &executor,
+                Command::CreateReplicaReply {
+                    source: peer.clone(),
+                    body: Box::new(opened.clone()),
+                    generation: generation_header(admission().generation.generation),
+                },
+            )
+            .await;
+            effects(&executor);
+            run(
+                &executor,
+                Command::CompleteBuild(Box::new(BuildCompletion {
+                    unit: original.body.unit.clone(),
+                    local: original.body.replica.clone(),
+                    remote: opened.replica.clone(),
+                    error: 0,
+                    detail: ProxyErrorDetail::default(),
+                })),
+            )
+            .await;
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::AddReplicaReply(_)]
+            ));
+            opened.replica.previous_role = 2;
+            opened.replica.current_role = 3;
+            opened.replica.state = 2;
+            replicas.push(opened.replica);
+        }
+        let mut unit = request.unit.clone();
+        unit.previous = unit.current;
+        unit.current.configuration += 1;
+        let config = Configuration {
+            unit,
+            service: request.service.clone(),
+            replicas: fube_transport::serialization::serde::ObjectArray(replicas),
+        };
+        for bad in 0..4 {
+            let mut invalid = config.clone();
+            match bad {
+                0 => {
+                    invalid.service.minimum = 0;
+                    invalid.unit.minimum = 0;
+                }
+                1 => {
+                    invalid.service.target += 1;
+                    invalid.unit.target += 1;
+                }
+                2 => {
+                    invalid.replicas.0.pop();
+                }
+                _ => invalid.replicas.0[1].instance += 1,
+            }
+            assert!(executor
+                .submit(reconfigure(invalid))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+            assert_eq!(state(&executor).body, original.body);
+            assert!(effects(&executor).is_empty());
+        }
+        run(&executor, reconfigure(config.clone())).await;
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(configured(&effects(&executor)))),
+        )
+        .await;
+        assert_eq!(
+            effects(&executor)
+                .iter()
+                .filter(|e| matches!(e, Effect::PeerActivate { .. }))
+                .count(),
+            peers.len()
+        );
+        for (i, peer) in peers.iter().enumerate() {
+            let mut unit = config.unit.clone();
+            unit.previous = Epoch::default();
+            let mut replica = config.replicas.0[i + 1].clone();
+            replica.previous_role = 1;
+            let ack = Command::ActivateReply {
+                source: peer.clone(),
+                body: Box::new(ActivateReply {
+                    unit,
+                    replica,
+                    error: 0,
+                }),
+                generation: generation_header(admission().generation.generation),
+            };
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor.submit(ack).unwrap();
+            entered.await.unwrap();
+            assert_eq!(
+                state(&executor)
+                    .reconfiguration
+                    .as_ref()
+                    .unwrap()
+                    .activated
+                    .len(),
+                i
+            );
+            assert!(effects(&executor).is_empty());
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            let actions = effects(&executor);
+            assert!(!actions
+                .iter()
+                .any(|e| matches!(e, Effect::DoReconfigurationReply(_))));
+            if i + 1 == peers.len() {
+                let end = configured(&actions);
+                assert_eq!(end.flags, 1);
+                run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
+            }
+        }
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(reply)]
+            if reply.replicas.0.len() == target as usize)
+        );
+        assert_eq!(state(&executor).body.service, request.service);
+        assert_eq!(state(&executor).body.unit.target, target);
+        assert_eq!(state(&executor).body.unit.minimum, minimum);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn three_replica_activation_waits_for_each_exact_peer_and_its_commit() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        let config = built_three_idles(&executor).await;
+        let original = state(&executor);
+        run(&executor, reconfigure(config.clone())).await;
+        let catchup = configured(&effects(&executor));
+        assert_eq!(
+            catchup
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.previous_role >= 3)
+                .count(),
+            1
+        );
+        assert_eq!(
+            catchup
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.current_role >= 3)
+                .count(),
+            3
+        );
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(catchup.clone())),
+        )
+        .await;
+        let actions = effects(&executor);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|e| matches!(e, Effect::PeerActivate { .. }))
+                .count(),
+            2
+        );
+        let mut unit = config.unit.clone();
+        unit.previous = Epoch::default();
+        let ack = |index: usize| {
+            let mut replica = config.replicas.0[index].clone();
+            replica.previous_role = 1;
+            Command::ActivateReply {
+                source: replica.node.clone(),
+                body: Box::new(ActivateReply {
+                    unit: unit.clone(),
+                    replica,
+                    error: 0,
+                }),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            }
+        };
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor.submit(ack(1)).unwrap();
+        entered.await.unwrap();
+        assert!(state(&executor)
+            .reconfiguration
+            .as_ref()
+            .unwrap()
+            .activated
+            .is_empty());
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot(config.unit.id.guid.0).fenced);
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(effects(&executor).is_empty());
+            assert!(state(&executor)
+                .reconfiguration
+                .as_ref()
+                .unwrap()
+                .activated
+                .is_empty());
+            finish(&store, &executor).await;
+            continue;
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::PeerActivate { target, .. }] if *target == config.replicas.0[2].node)
+        );
+        if unknown {
+            assert_eq!(
+                state(&executor).reconfiguration.as_ref().unwrap().stage,
+                ConfigurationStage::Activate
+            );
+            assert_eq!(
+                state(&executor)
+                    .reconfiguration
+                    .as_ref()
+                    .unwrap()
+                    .activated
+                    .len(),
+                1
+            );
+            finish(&store, &executor).await;
+            continue;
+        }
+        assert_eq!(run(&executor, ack(1)).await, Disposition::IgnoredStale);
+        assert!(effects(&executor).is_empty());
+        let mut early = catchup;
+        early.flags = 1;
+        assert_eq!(
+            run(&executor, Command::CompleteConfiguration(Box::new(early))).await,
+            Disposition::IgnoredStale
+        );
+        run(
+            &executor,
+            Command::RetryConfiguration(config.unit.id.clone()),
+        )
+        .await;
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::PeerActivate { target, .. }] if *target == config.replicas.0[2].node)
+        );
+        run(&executor, ack(2)).await;
+        let end = configured(&effects(&executor));
+        assert_eq!(end.flags, 1);
+        run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(reply)] if reply.replicas.0.len() == 3)
+        );
+        assert_eq!(state(&executor).runtime, original.runtime);
+        assert_eq!(state(&executor).remote_idles.len(), 2);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn same_primary_configuration_requires_catchup_peer_activation_and_end_reply_in_order() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let config = built_fm_idle(&executor).await;
+    let original = state(&executor);
+    for kind in 0..3 {
+        let mut invalid = config.clone();
+        match kind {
+            0 => invalid.replicas.0[1].instance += 1,
+            1 => invalid.replicas.0[0].service_endpoint = "foreign".into(),
+            _ => invalid.replicas.0[1].service_endpoint = "foreign".into(),
+        }
+        assert!(executor
+            .submit(reconfigure(invalid))
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .is_err());
+    }
+    assert!(effects(&executor).is_empty());
+    run(&executor, reconfigure(config.clone())).await;
+    let actions = effects(&executor);
+    let mut catchup = configured(&actions);
+    assert_eq!(catchup.flags, 2);
+    assert_eq!(
+        catchup
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.previous_role >= 3)
+            .count(),
+        1
+    );
+    assert_eq!(
+        catchup
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.current_role >= 3)
+            .count(),
+        2
+    );
+    catchup.error = -993;
+    run(
+        &executor,
+        Command::CompleteConfiguration(Box::new(catchup.clone())),
+    )
+    .await;
+    assert!(effects(&executor).is_empty());
+    assert_eq!(
+        state(&executor).reconfiguration.as_ref().unwrap().stage,
+        ConfigurationStage::Catchup
+    );
+    run(
+        &executor,
+        Command::RetryConfiguration(config.unit.id.clone()),
+    )
+    .await;
+    assert_eq!(configured(&effects(&executor)).flags, 2);
+    catchup.error = 0;
+    run(
+        &executor,
+        Command::CompleteConfiguration(Box::new(catchup.clone())),
+    )
+    .await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerActivate { body, .. }]
+        if body.configuration == config)
+    );
+    let mut premature = catchup;
+    premature.flags = 1;
+    assert_eq!(
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(premature))
+        )
+        .await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    let mut unit = config.unit.clone();
+    unit.previous = Epoch::default();
+    let mut replica = config.replicas.0[1].clone();
+    replica.previous_role = 1;
+    run(
+        &executor,
+        Command::ActivateReply {
+            body: Box::new(ActivateReply {
+                unit,
+                replica,
+                error: 0,
+            }),
+            source: peer_source(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        },
+    )
+    .await;
+    let end = configured(&effects(&executor));
+    assert_eq!(end.flags, 1);
+    let (entered, release) = hooks.pause(false);
+    let completed = executor
+        .submit(Command::CompleteConfiguration(Box::new(end.clone())))
+        .unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    assert_eq!(
+        state(&executor).reconfiguration.as_ref().unwrap().stage,
+        ConfigurationStage::End
+    );
+    release.send(()).unwrap();
+    completed.wait(WAIT).await.unwrap();
+    let reply = effects(&executor);
+    assert!(
+        matches!(reply.as_slice(), [Effect::DoReconfigurationReply(body)]
+        if body.unit.previous == Epoch::default() && body.replicas.0.iter().all(|r| r.previous_role == 1))
+    );
+    assert_eq!(
+        state(&executor).reconfiguration.as_ref().unwrap().stage,
+        ConfigurationStage::Complete
+    );
+    assert_eq!(state(&executor).runtime, original.runtime);
+    run(&executor, reconfigure(config.clone())).await;
+    assert_eq!(effects(&executor), reply);
+    assert_eq!(
+        run(&executor, Command::CompleteConfiguration(Box::new(end))).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn same_primary_configuration_creation_commit_failure_and_uncertainty_publish_no_actions() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        let config = built_fm_idle(&executor).await;
+        let original = state(&executor);
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor.submit(reconfigure(config)).unwrap();
+        entered.await.unwrap();
+        assert!(Arc::ptr_eq(&original, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot(original.body.unit.id.guid.0).fenced);
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(Arc::ptr_eq(&original, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+            assert_eq!(configured(&effects(&executor)).flags, 2);
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn secondary_activation_ack_waits_for_real_rap_result_and_its_commit() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        make_peer_idle_ready(&executor).await;
+        let original = state(&executor);
+        let mut primary = (*original.body).clone();
+        primary.replica.node = peer_source();
+        primary.replica.id += 1;
+        primary.replica.instance += 1;
+        primary.replica.replication_endpoint = "127.0.0.1:12346".into();
+        let config = secondary_configuration(&primary, &original.body.replica);
+        let command = || Command::Activate {
+            body: Box::new(Activate {
+                configuration: config.clone(),
+                deactivation: original
+                    .peer_creation
+                    .as_ref()
+                    .unwrap()
+                    .deactivation
+                    .clone(),
+            }),
+            source: peer_source(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        };
+        run(&executor, command()).await;
+        let completion = configured(&effects(&executor));
+        assert_eq!(completion.flags, 0);
+        run(&executor, command()).await;
+        assert_eq!(configured(&effects(&executor)).flags, 0);
+        let pending = state(&executor);
+        let mut stale = completion.clone();
+        stale.local.instance -= 1;
+        assert_eq!(
+            run(&executor, Command::CompleteConfiguration(Box::new(stale))).await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty());
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::CompleteConfiguration(Box::new(completion.clone())))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(Arc::ptr_eq(&pending, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(effects(&executor).is_empty());
+            run(
+                &executor,
+                Command::CompleteConfiguration(Box::new(completion)),
+            )
+            .await;
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        let reply = effects(&executor);
+        assert!(
+            matches!(reply.as_slice(), [Effect::PeerActivateReply { body, .. }]
+            if body.replica.current_role == 3 && body.replica.previous_role == 1
+                && body.unit.previous == Epoch::default())
+        );
+        run(&executor, command()).await;
+        assert_eq!(effects(&executor), reply);
+        finish(&store, &executor).await;
+    }
+}
+
+fn retiring_configuration(active: &Configuration) -> Configuration {
+    let mut body = active.clone();
+    body.unit.previous = body.unit.current;
+    body.unit.current.configuration += 1;
+    body.unit.target = 1;
+    body.service.target = 1;
+    body.service.update_version += 1;
+    for r in &mut body.replicas.0 {
+        r.previous_role = r.current_role;
+        if r.current_role == 3 {
+            r.current_role = 1;
+        }
+    }
+    body
+}
+fn deactivation_reply(config: &Configuration) -> DeactivateReply {
+    let s = &config.replicas.0[1];
+    DeactivateReply {
+        unit: config.unit.clone(),
+        replica: Replica {
+            node: s.node.clone(),
+            id: s.id,
+            instance: s.instance,
+            up: false,
+            state: 3,
+            ..Replica::default()
+        },
+        error: 0,
+    }
+}
+fn peer_deactivated(body: DeactivateReply) -> Command {
+    Command::DeactivateReply {
+        body: Box::new(body),
+        source: peer_source(),
+        generation: GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        },
+    }
+}
+async fn complete_primary_activation(executor: &Executor, config: &Configuration) {
+    run(executor, reconfigure(config.clone())).await;
+    let completion = configured(&effects(executor));
+    run(
+        executor,
+        Command::CompleteConfiguration(Box::new(completion)),
+    )
+    .await;
+    effects(executor);
+    let mut unit = config.unit.clone();
+    unit.previous = Epoch::default();
+    let mut replica = config.replicas.0[1].clone();
+    replica.previous_role = 1;
+    run(
+        executor,
+        Command::ActivateReply {
+            body: Box::new(ActivateReply {
+                unit,
+                replica,
+                error: 0,
+            }),
+            source: peer_source(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        },
+    )
+    .await;
+    let completion = configured(&effects(executor));
+    run(
+        executor,
+        Command::CompleteConfiguration(Box::new(completion)),
+    )
+    .await;
+    effects(executor);
+}
+
+#[tokio::test]
+async fn planned_swap_demote_commit_and_original_progress_precede_peer_continuation() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        let active = built_fm_idle(&executor).await;
+        complete_primary_activation(&executor, &active).await;
+        let before = state(&executor);
+        let mut intent = active;
+        intent.unit.previous = intent.unit.current;
+        intent.unit.current.configuration += 0x1_0000_0001;
+        for r in &mut intent.replicas.0 {
+            r.previous_role = r.current_role;
+            r.current_role = if r.current_role == 4 { 3 } else { 4 };
+        }
+        run(&executor, reconfigure(intent.clone())).await;
+        let mut demoted = configured(&effects(&executor));
+        demoted.error = -99;
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(demoted.clone())),
+        )
+        .await;
+        assert!(effects(&executor).is_empty());
+        run(
+            &executor,
+            Command::RetryConfiguration(intent.unit.id.clone()),
+        )
+        .await;
+        assert_eq!(configured(&effects(&executor)).flags, 2);
+        demoted.error = 0;
+        demoted.local.service_endpoint.clear();
+        demoted.local.first_lsn = 0;
+        demoted.local.last_lsn = 1;
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::CompleteConfiguration(Box::new(demoted.clone())))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        assert_eq!(
+            state(&executor).swap.as_ref().unwrap().stage,
+            SwapStage::Demote
+        );
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(effects(&executor).is_empty());
+            run(&executor, Command::CompleteConfiguration(Box::new(demoted))).await;
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        let forwarded = effects(&executor);
+        assert!(
+            matches!(forwarded.as_slice(), [Effect::PeerContinueSwap { body, .. }]
+            if body.phase0_duration > 0 && body.phase0_duration != i64::MAX
+                && body.configuration.replicas.0[0].service_endpoint.is_empty())
+        );
+        assert_eq!(state(&executor).runtime, before.runtime);
+        assert_eq!(state(&executor).usage, before.usage);
+        run(&executor, reconfigure(intent)).await;
+        assert_eq!(effects(&executor), forwarded);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn planned_swap_candidate_requires_both_lsn_results_endpoint_commit_and_final_barriers() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        make_peer_idle_ready(&executor).await;
+        let idle = state(&executor);
+        let mut p = (*idle.body).clone();
+        p.replica.node = peer_source();
+        p.replica.id += 1;
+        p.replica.instance += 1;
+        p.replica.replication_endpoint = "127.0.0.1:12346".into();
+        let active = secondary_configuration(&p, &idle.body.replica);
+        let history = idle.peer_creation.as_ref().unwrap().deactivation.clone();
+        run(
+            &executor,
+            Command::Activate {
+                body: Box::new(Activate {
+                    configuration: active.clone(),
+                    deactivation: history.clone(),
+                }),
+                source: peer_source(),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+        )
+        .await;
+        let completion = configured(&effects(&executor));
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(completion)),
+        )
+        .await;
+        effects(&executor);
+        let mut intent = active;
+        intent.unit.previous = intent.unit.current;
+        intent.unit.current.configuration += 0x1_0000_0001;
+        for r in &mut intent.replicas.0 {
+            r.previous_role = r.current_role;
+            r.current_role = if r.current_role == 4 { 3 } else { 4 };
+        }
+        let continue_swap = || Command::DoReconfiguration {
+            body: Box::new(DoReconfiguration {
+                configuration: intent.clone(),
+                phase0_duration: 1,
+            }),
+            source: peer_source(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        };
+        run(&executor, continue_swap()).await;
+        let actions = effects(&executor);
+        assert!(actions
+            .iter()
+            .any(|e| matches!(e, Effect::QueryReplicaStatus { .. })));
+        assert!(actions
+            .iter()
+            .any(|e| matches!(e, Effect::PeerGetLsn { .. })));
+        let local = state(&executor);
+        let mut sample = local.body.replica.clone();
+        sample.first_lsn = 0;
+        sample.last_lsn = 1;
+        run(
+            &executor,
+            Command::CompleteStatus(Box::new(ConfigurationCompletion {
+                unit: local.body.unit.clone(),
+                local: sample,
+                replicas: Default::default(),
+                flags: 0,
+                error: 0,
+            })),
+        )
+        .await;
+        assert!(!effects(&executor)
+            .iter()
+            .any(|e| matches!(e, Effect::UpdateConfiguration { .. })));
+        let mut remote = intent.replicas.0[0].clone();
+        remote.first_lsn = 0;
+        remote.last_lsn = 1;
+        run(
+            &executor,
+            Command::GetLsnReply {
+                body: Box::new(GetLsnReply {
+                    replica: AddInstanceReply {
+                        unit: intent.unit.clone(),
+                        replica: remote,
+                        error: 0,
+                    },
+                    deactivation: history,
+                }),
+                source: peer_source(),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+        )
+        .await;
+        let mut catchup = configured(&effects(&executor));
+        assert_eq!(catchup.flags, 2);
+        executor
+            .config()
+            .set_node(NodeProperty::EndpointPublishTimeoutTicks, 0);
+        let mut endpoint = (*state(&executor).body).clone();
+        endpoint.replica.service_endpoint = "127.0.0.1:23456".into();
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::ProxyEndpoint(Box::new(endpoint.clone())))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(effects(&executor).is_empty());
+            run(
+                &executor,
+                Command::ProxyEndpoint(Box::new(endpoint.clone())),
+            )
+            .await;
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        let actions = effects(&executor);
+        assert!(actions
+            .iter()
+            .any(|e| matches!(e, Effect::AcknowledgeEndpoint { .. })));
+        assert!(actions
+            .iter()
+            .any(|e| matches!(e, Effect::ReplicaEndpointUpdated(_))));
+        if unknown {
+            finish(&store, &executor).await;
+            continue;
+        }
+        run(
+            &executor,
+            Command::EndpointReply {
+                body: Box::new(AddInstanceReply {
+                    unit: endpoint.unit,
+                    replica: endpoint.replica,
+                    error: 0,
+                }),
+                source: admission().fm_source,
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+        )
+        .await;
+        assert!(effects(&executor).is_empty());
+        catchup.local.service_endpoint = "127.0.0.1:23456".into();
+        run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+        let actions = effects(&executor);
+        let activate = actions
+            .iter()
+            .find_map(|e| match e {
+                Effect::PeerActivate { body, .. } => Some((**body).clone()),
+                _ => None,
+            })
+            .unwrap();
+        let mut stable = activate.configuration.clone();
+        stable.unit.previous = Epoch::default();
+        for r in &mut stable.replicas.0 {
+            r.previous_role = 1;
+        }
+        run(
+            &executor,
+            Command::ActivateReply {
+                body: Box::new(ActivateReply {
+                    unit: stable.unit,
+                    replica: stable.replicas.0[0].clone(),
+                    error: 0,
+                }),
+                source: peer_source(),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+        )
+        .await;
+        let end = configured(&effects(&executor));
+        assert_eq!(end.flags, 1);
+        let (entered, release) = hooks.pause(false);
+        let ticket = executor
+            .submit(Command::CompleteConfiguration(Box::new(end)))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        release.send(()).unwrap();
+        ticket.wait(WAIT).await.unwrap();
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(body)] if body.unit.previous == Epoch::default() && body.replicas.0[1].service_endpoint == "127.0.0.1:23456")
+        );
+        run(&executor, continue_swap()).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::DoReconfigurationReply(_)]
+        ));
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn configured_secondary_retirement_preserves_both_quorums_and_exact_phase_commit_barriers() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let active = built_fm_idle(&executor).await;
+    complete_primary_activation(&executor, &active).await;
+    let retirement = retiring_configuration(&active);
+    for field in 0..3 {
+        let mut bad = retirement.clone();
+        match field {
+            0 => bad.replicas.0[1].instance += 1,
+            1 => bad.replicas.0[1].replication_endpoint = "foreign".into(),
+            _ => bad.replicas.0[0].service_endpoint = "foreign".into(),
+        }
+        assert!(executor
+            .submit(reconfigure(bad))
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .is_err());
+    }
+    run(&executor, reconfigure(retirement.clone())).await;
+    let mut catchup = configured(&effects(&executor));
+    assert_eq!(catchup.flags, 2);
+    assert_eq!(
+        catchup
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.previous_role >= 3)
+            .count(),
+        2
+    );
+    assert_eq!(
+        catchup
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.current_role >= 3)
+            .count(),
+        1
+    );
+    assert_eq!(
+        run(&executor, peer_deactivated(deactivation_reply(&retirement))).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    catchup.error = -99;
+    run(
+        &executor,
+        Command::CompleteConfiguration(Box::new(catchup.clone())),
+    )
+    .await;
+    assert!(effects(&executor).is_empty());
+    run(
+        &executor,
+        Command::RetryConfiguration(retirement.unit.id.clone()),
+    )
+    .await;
+    assert_eq!(configured(&effects(&executor)).flags, 2);
+    catchup.error = 0;
+    run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+    let deactivate = effects(&executor);
+    assert!(
+        matches!(deactivate.as_slice(), [Effect::PeerDeactivate { body, .. }] if body.configuration == retirement && !body.force)
+    );
+    run(&executor, reconfigure(retirement.clone())).await;
+    assert_eq!(effects(&executor), deactivate);
+    let mut stale = deactivation_reply(&retirement);
+    stale.replica.instance -= 1;
+    assert_eq!(
+        run(&executor, peer_deactivated(stale)).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    run(&executor, peer_deactivated(deactivation_reply(&retirement))).await;
+    let end = configured(&effects(&executor));
+    assert_eq!(end.flags, 1);
+    let (entered, release) = hooks.pause(false);
+    let ticket = executor
+        .submit(Command::CompleteConfiguration(Box::new(end)))
+        .unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    assert!(!state(&executor).remote_idles.is_empty());
+    release.send(()).unwrap();
+    ticket.wait(WAIT).await.unwrap();
+    let reply = effects(&executor);
+    assert!(
+        matches!(reply.as_slice(), [Effect::DoReconfigurationReply(body)] if body.replicas.0.len() == 1 && body.unit.previous == Epoch::default())
+    );
+    assert!(state(&executor).remote_idles.is_empty());
+    run(&executor, reconfigure(retirement)).await;
+    assert_eq!(effects(&executor), reply);
+    assert_eq!(
+        run(&executor, reconfigure(active)).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    let mut successor = fm_idle_request(&state(&executor));
+    successor.replica.id += 10;
+    successor.replica.instance += 10;
+    run(&executor, fm_add_idle(successor.clone())).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerCreateReplica { body, .. }] if body.replica.0.replica == successor.replica)
+    );
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn configured_secondary_deactivate_ack_requires_successful_close_and_resolved_commit() {
+    for (unknown, fail, lost) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (false, false, true),
+    ] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        make_peer_idle_ready(&executor).await;
+        let idle = state(&executor);
+        let mut primary = (*idle.body).clone();
+        primary.replica.node = peer_source();
+        primary.replica.id += 1;
+        primary.replica.instance += 1;
+        primary.replica.replication_endpoint = "127.0.0.1:12346".into();
+        let active = secondary_configuration(&primary, &idle.body.replica);
+        let deactivation = idle.peer_creation.as_ref().unwrap().deactivation.clone();
+        run(
+            &executor,
+            Command::Activate {
+                body: Box::new(Activate {
+                    configuration: active.clone(),
+                    deactivation: deactivation.clone(),
+                }),
+                source: peer_source(),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+        )
+        .await;
+        let completion = configured(&effects(&executor));
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(completion)),
+        )
+        .await;
+        effects(&executor);
+        let retirement = retiring_configuration(&active);
+        let command = || Command::Deactivate {
+            body: Box::new(Deactivate {
+                configuration: retirement.clone(),
+                deactivation: deactivation.clone(),
+                force: false,
+            }),
+            source: peer_source(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        };
+        let (entered, release) = hooks.pause(false);
+        let start = executor.submit(command()).unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        assert_eq!(state(&executor).phase, Phase::Ready);
+        release.send(()).unwrap();
+        start.wait(WAIT).await.unwrap();
+        assert!(effects(&executor)
+            .iter()
+            .any(|e| matches!(e, Effect::Close { flags: 8, .. })));
+        let closed = state(&executor);
+        if lost {
+            run(
+                &executor,
+                Command::HostDown(Box::new(HostDown {
+                    unit: closed.body.unit.id.clone(),
+                    host: closed.runtime.as_ref().unwrap().host.clone(),
+                })),
+            )
+            .await;
+            let actions = effects(&executor);
+            assert!(state(&executor).peer_host_loss());
+            assert_eq!(state(&executor).phase, Phase::Closed);
+            assert_eq!(state(&executor).fm_stage, FmStage::ReplicaDown);
+            assert!(!actions
+                .iter()
+                .any(|e| matches!(e, Effect::PeerDeactivateReply { .. })));
+            run(&executor, command()).await;
+            assert!(effects(&executor).is_empty());
+            finish(&store, &executor).await;
+            continue;
+        }
+        let mut completion = CloseCompletion {
+            unit: closed.body.unit.clone(),
+            replica: closed.body.replica.clone(),
+            error: -99,
+        };
+        run(
+            &executor,
+            Command::CompleteClose(Box::new(completion.clone())),
+        )
+        .await;
+        assert!(!effects(&executor)
+            .iter()
+            .any(|e| matches!(e, Effect::PeerDeactivateReply { .. })));
+        run(&executor, command()).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::Close { .. }]
+        ));
+        completion.error = 0;
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::CompleteClose(Box::new(completion.clone())))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        assert_eq!(state(&executor).phase, Phase::Closing);
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(effects(&executor).is_empty());
+            run(&executor, Command::CompleteClose(Box::new(completion))).await;
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        let actions = effects(&executor);
+        assert!(actions.iter().any(|e| matches!(e, Effect::PeerDeactivateReply { body, .. } if body.replica.state == 3 && !body.replica.up)));
+        assert_eq!(state(&executor).phase, Phase::Closed);
+        assert!(state(&executor).runtime.is_none() && state(&executor).usage.is_none());
+        run(&executor, command()).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::PeerDeactivateReply { .. }]
+        ));
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn fm_idle_replacement_requires_completed_removal_and_ignores_predecessor_traffic() {
+    let (store, executor, _) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    make_ready(&executor, &primary_body()).await;
+    let primary = state(&executor);
+    let original = fm_idle_request(&primary);
+    run(&executor, fm_add_idle(original.clone())).await;
+    effects(&executor);
+    let mut opened = CreateReplicaReply {
+        unit: original.unit.clone(),
+        replica: original.replica.clone(),
+        error: 0,
+    };
+    opened.replica.replication_endpoint = "127.0.0.1:12346".into();
+    run(&executor, peer_opened(opened.clone())).await;
+    effects(&executor);
+    let built = BuildCompletion {
+        unit: primary.body.unit.clone(),
+        local: primary.body.replica.clone(),
+        remote: opened.replica.clone(),
+        error: 0,
+        detail: ProxyErrorDetail::default(),
+    };
+    run(&executor, Command::CompleteBuild(Box::new(built.clone()))).await;
+    effects(&executor);
+    let mut removal = original.clone();
+    removal.replica = opened.replica.clone();
+    removal.replica.state = 2;
+    run(&executor, fm_remove_idle(removal.clone())).await;
+    effects(&executor);
+    let mut successor = original.clone();
+    successor.replica.id += 1;
+    successor.replica.instance += 1;
+    assert!(executor
+        .submit(fm_add_idle(successor.clone()))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .is_err());
+    assert!(effects(&executor).is_empty());
+    let mut removed = built.clone();
+    removed.remote.state = 3;
+    run(
+        &executor,
+        Command::CompleteRemoval(Box::new(removed.clone())),
+    )
+    .await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::RemoveReplicaReply(_)]
+    ));
+    run(&executor, fm_add_idle(successor.clone())).await;
+    let create = effects(&executor);
+    assert!(
+        matches!(create.as_slice(), [Effect::PeerCreateReplica { body, .. }]
+        if body.replica.0.replica == successor.replica)
+    );
+    for late in [
+        fm_add_idle(original),
+        fm_remove_idle(removal),
+        peer_opened(opened),
+        Command::CompleteBuild(Box::new(built)),
+        Command::CompleteRemoval(Box::new(removed)),
+    ] {
+        assert_eq!(run(&executor, late).await, Disposition::IgnoredStale);
+        assert!(effects(&executor).is_empty());
+    }
+    run(&executor, fm_add_idle(successor.clone())).await;
+    assert_eq!(effects(&executor), create);
+    let mut next_opened = CreateReplicaReply {
+        unit: successor.unit.clone(),
+        replica: successor.replica.clone(),
+        error: 0,
+    };
+    next_opened.replica.replication_endpoint = "127.0.0.1:12347".into();
+    run(&executor, peer_opened(next_opened.clone())).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::BuildIdle { replica, .. }]
+        if **replica == next_opened.replica)
+    );
+    run(
+        &executor,
+        Command::CompleteBuild(Box::new(BuildCompletion {
+            unit: primary.body.unit.clone(),
+            local: primary.body.replica.clone(),
+            remote: next_opened.replica,
+            error: 0,
+            detail: ProxyErrorDetail::default(),
+        })),
+    )
+    .await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::AddReplicaReply(reply)]
+        if reply.replica.id == successor.replica.id && reply.replica.state == 2)
+    );
+    assert_eq!(state(&executor).body, primary.body);
+    assert_eq!(state(&executor).runtime, primary.runtime);
+    finish(&store, &executor).await;
+}
+
 #[tokio::test]
 async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_semantic_success() {
     for outcome in [None, Some(-993), Some(0)] {
@@ -5638,7 +9790,7 @@ async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_seman
             .wait(WAIT)
             .await
             .is_err());
-        assert!(state(&executor).remote_idle.is_none());
+        assert!(state(&executor).remote_idles.is_empty());
         run(&executor, fm_add_idle(request.clone())).await;
         effects(&executor);
         let mut opened = CreateReplicaReply {
@@ -5711,10 +9863,10 @@ async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_seman
                 if body == &primary.body && **replica == dropped
                     && Some(registration) == primary.runtime.as_ref())
         );
-        assert!(!state(&executor).remote_idle.as_ref().unwrap().ready);
+        assert!(!state(&executor).remote_idles.first().unwrap().ready);
         assert!(state(&executor)
-            .remote_idle
-            .as_ref()
+            .remote_idles
+            .first()
             .unwrap()
             .add_reply()
             .is_none());
@@ -5730,8 +9882,8 @@ async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_seman
             .is_err());
         assert_eq!(
             state(&executor)
-                .remote_idle
-                .as_ref()
+                .remote_idles
+                .first()
                 .unwrap()
                 .removal
                 .as_ref()
@@ -5774,8 +9926,8 @@ async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_seman
         assert!(effects(&executor).is_empty());
         assert_eq!(
             state(&executor)
-                .remote_idle
-                .as_ref()
+                .remote_idles
+                .first()
                 .unwrap()
                 .removal
                 .as_ref()
@@ -5890,7 +10042,7 @@ async fn fm_remove_in_create_echoes_request_without_rap_and_fences_late_open_and
     })];
     assert_eq!(effects(&executor), reply);
     let cancelled = state(&executor);
-    let remote = cancelled.remote_idle.as_ref().unwrap();
+    let remote = cancelled.remote_idles.first().unwrap();
     assert!(remote.reply.is_none() && remote.build.is_none() && !remote.ready);
     assert!(remote.add_reply().is_none());
     let removal = remote.removal.as_ref().unwrap();
@@ -5934,7 +10086,7 @@ async fn fm_remove_in_create_echoes_request_without_rap_and_fences_late_open_and
         .wait(WAIT)
         .await
         .is_err());
-    assert_eq!(state(&executor).remote_idle, cancelled.remote_idle);
+    assert_eq!(state(&executor).remote_idles, cancelled.remote_idles);
     assert!(effects(&executor).is_empty());
     run(
         &executor,
@@ -5957,7 +10109,7 @@ async fn fm_remove_in_create_echoes_request_without_rap_and_fences_late_open_and
 async fn fm_remove_unbuilt_idle_keeps_original_lifetime_and_close_fences_pending_reply() {
     let (store, executor, opened) = opened_peer_primary().await;
     let primary = state(&executor);
-    let request = primary.remote_idle.as_ref().unwrap().body.replica.0.clone();
+    let request = primary.remote_idles.first().unwrap().body.replica.0.clone();
     run(&executor, fm_remove_idle(request.clone())).await;
     assert!(matches!(
         &effects(&executor)[..],
@@ -6007,7 +10159,7 @@ async fn fm_add_idle_retries_creation_build_and_ready_reply_without_granting_mem
         if target == &peer_source() && body.replica.0 == request)
     );
     let creating = state(&executor);
-    let remote = creating.remote_idle.as_ref().unwrap();
+    let remote = creating.remote_idles.first().unwrap();
     assert_eq!(remote.fm_request.as_deref(), Some(&request));
     assert!(remote.reply.is_none() && remote.build.is_none() && !remote.ready);
     run(&executor, fm_add_idle(request.clone())).await;
@@ -6046,7 +10198,7 @@ async fn fm_add_idle_retries_creation_build_and_ready_reply_without_granting_mem
     )
     .await;
     assert!(effects(&executor).is_empty()); // Native build errors do not finish FM AddReplica.
-    assert!(!state(&executor).remote_idle.as_ref().unwrap().ready);
+    assert!(!state(&executor).remote_idles.first().unwrap().ready);
     run(&executor, fm_add_idle(request.clone())).await;
     assert_eq!(effects(&executor), build);
     completion.error = 0;
@@ -6061,9 +10213,9 @@ async fn fm_add_idle_retries_creation_build_and_ready_reply_without_granting_mem
     let reply = vec![Effect::AddReplicaReply(ready)];
     assert_eq!(effects(&executor), reply);
     let built = state(&executor);
-    assert!(built.remote_idle.as_ref().unwrap().ready);
+    assert!(built.remote_idles.first().unwrap().ready);
     assert_eq!(
-        built.remote_idle.as_ref().unwrap().reply.as_ref(),
+        built.remote_idles.first().unwrap().reply.as_ref(),
         Some(&opened)
     );
     assert_eq!(built.body, primary.body);
@@ -6090,8 +10242,8 @@ async fn fm_add_idle_retries_creation_build_and_ready_reply_without_granting_mem
         Disposition::IgnoredStale
     );
     assert!(state(&executor)
-        .remote_idle
-        .as_ref()
+        .remote_idles
+        .first()
         .unwrap()
         .add_reply()
         .is_none());
@@ -6135,7 +10287,7 @@ async fn fm_add_idle_admission_open_failure_and_close_never_fabricate_ready() {
         ] {
             assert!(executor.submit(command).unwrap().wait(WAIT).await.is_err());
         }
-        assert!(state(&executor).remote_idle.is_none());
+        assert!(state(&executor).remote_idles.is_empty());
         assert!(effects(&executor).is_empty());
         run(&executor, fm_add_idle(request.clone())).await;
         effects(&executor);
@@ -6173,16 +10325,16 @@ async fn fm_add_idle_admission_open_failure_and_close_never_fabricate_ready() {
                 run(&executor, fm_add_idle(request)).await,
                 Disposition::IgnoredStale
             );
-            assert!(state(&executor).remote_idle.is_none());
+            assert!(state(&executor).remote_idles.is_empty());
         } else {
             run(&executor, peer_opened(reply.clone())).await;
             assert_eq!(effects(&executor), [Effect::AddReplicaReply(reply.clone())]);
             run(&executor, fm_add_idle(request.clone())).await;
             assert_eq!(effects(&executor), [Effect::AddReplicaReply(reply)]);
-            assert!(!state(&executor).remote_idle.as_ref().unwrap().ready);
+            assert!(!state(&executor).remote_idles.first().unwrap().ready);
             assert!(state(&executor)
-                .remote_idle
-                .as_ref()
+                .remote_idles
+                .first()
                 .unwrap()
                 .removal
                 .is_none());
@@ -6229,7 +10381,7 @@ async fn failed_peer_creation_is_retired_by_original_fm_removal_without_rap_or_r
         [Effect::AddReplicaReply(failed.clone())]
     );
     let aborted = state(&executor);
-    let remote = aborted.remote_idle.as_ref().unwrap();
+    let remote = aborted.remote_idles.first().unwrap();
     assert!(remote.creation_failed() && remote.build.is_none() && !remote.ready);
     assert_eq!(aborted.body, primary.body);
     assert_eq!(aborted.runtime, primary.runtime);
@@ -6279,7 +10431,7 @@ async fn failed_peer_creation_is_retired_by_original_fm_removal_without_rap_or_r
     })];
     assert_eq!(effects(&executor), reply);
     let retired = state(&executor);
-    let remote = retired.remote_idle.as_ref().unwrap();
+    let remote = retired.remote_idles.first().unwrap();
     assert!(remote.creation_failed() && remote.build.is_none() && !remote.ready);
     assert_eq!(remote.reply.as_ref(), Some(&failed));
     assert_eq!(remote.removal.as_ref().unwrap().result, Some(0));
@@ -6309,7 +10461,7 @@ async fn failed_peer_creation_is_retired_by_original_fm_removal_without_rap_or_r
         .await
         .is_err());
     assert!(effects(&executor).is_empty());
-    assert_eq!(state(&executor).remote_idle, retired.remote_idle);
+    assert_eq!(state(&executor).remote_idles, retired.remote_idles);
     run(
         &executor,
         Command::CloseLocal {

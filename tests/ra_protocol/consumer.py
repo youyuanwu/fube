@@ -48,9 +48,10 @@ CASES |= {"fmm-node-activate-request", "fmm-node-deactivate-request",
           "legacy-report-load", "modern-report-load"}
 GENERATION_ACTIONS = {
     "GenerationProposal", "GenerationProposalReply", "GenerationUpdate", "GenerationUpdateReject",
+    "LFUMUpload", "LFUMUploadReply",
 }
 GENERATION_FACTORIES = {
-    action: {"actor": 12 if action in {"GenerationProposal", "GenerationUpdate"} else 11,
+    action: {"actor": 12 if action in {"GenerationProposal", "GenerationUpdate", "LFUMUploadReply"} else 11,
              "high_priority": True}
     for action in GENERATION_ACTIONS
 }
@@ -61,6 +62,8 @@ GENERATION_CASES = {
     "default-generation-update", "rich-generation-update",
     "default-generation-update-reject", "high-generation-update-reject",
     "tie-generation-update-reject",
+    "empty-lfum-upload", "rich-lfum-upload", "deleted-only-lfum-upload",
+    "empty-lfum-upload-reply",
 } | {f"action-{action}" for action in GENERATION_ACTIONS}
 CASES |= GENERATION_CASES
 PEER_ACTIONS = {"CreateReplica", "CreateReplicaReply"}
@@ -87,8 +90,19 @@ REPLICA_CASES = {
     "in-create-remove-replica-reply",
 }
 CASES |= REPLICA_CASES
-SCHEMA_TYPES = 77
-SCHEMA_FIELDS = 240
+CONFIGURATION_FACTORIES = {
+    action: {"actor": 11 if action in {"DoReconfigurationReply", "ChangeConfiguration"} else 12, "high_priority": True}
+    for action in ["DoReconfiguration", "DoReconfigurationReply", "Activate", "ActivateReply", "Deactivate", "DeactivateReply", "GetLSN", "GetLSNReply", "ChangeConfiguration", "ChangeConfigurationReply"]
+}
+CONFIGURATION_CASES = {
+    f"{profile}-{root}" for profile in ["default", "rich"]
+    for root in ["do-reconfiguration", "do-reconfiguration-reply", "activate", "activate-reply", "deactivate", "deactivate-reply", "get-lsn", "get-lsn-reply", "change-configuration", "change-configuration-reply"]
+} | {f"action-{action}" for action in CONFIGURATION_FACTORIES} | {
+    "three-do-reconfiguration", "three-do-reconfiguration-reply", "three-activate", "three-deactivate",
+}
+CASES |= CONFIGURATION_CASES
+SCHEMA_TYPES = 85
+SCHEMA_FIELDS = 257
 
 
 def validate(bundle, expected_head, expected_source):
@@ -114,6 +128,7 @@ def validate(bundle, expected_head, expected_source):
             or manifest.get("generation_factories") != GENERATION_FACTORIES
             or manifest.get("peer_factories") != PEER_FACTORIES
             or manifest.get("replica_factories") != REPLICA_FACTORIES
+            or manifest.get("configuration_factories") != CONFIGURATION_FACTORIES
             or not manifest.get("native_sources")):
         raise ValueError("source/schema manifest mismatch")
     expected_files = {"schema.h", "native-oracle", "ra-conformance"} | {

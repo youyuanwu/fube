@@ -34,8 +34,16 @@ struct ChildOwner {
     link: Option<Link>,
     metadata: Option<Metadata>,
 }
+impl ChildOwner {
+    fn generation(&self) -> GenerationHeader {
+        self.link
+            .as_ref()
+            .map(Link::generation)
+            .unwrap_or_else(|| self.launch.generation.clone())
+    }
+}
 
-/// One ephemeral foreground authority; no reconnect, replacement or adoption.
+/// One ephemeral foreground authority; no reconnect, automatic replacement or adoption.
 /// Keep this owner through explicit shutdown, including after any error.
 pub struct Cluster {
     interlock: interlock::Interlock,
@@ -47,6 +55,8 @@ pub struct Cluster {
 }
 impl Cluster {
     pub fn new(mut config: Config) -> Result<Self> {
+        config.profile.validate()?;
+        let node_count = config.profile.node_count();
         config.app = config.app.canonicalize().map_err(err)?;
         config.executable = config.executable.canonicalize().map_err(err)?;
         use std::os::unix::fs::PermissionsExt;
@@ -70,47 +80,65 @@ impl Cluster {
             },
             for_fm_replica: false,
         };
-        let mut launches = [1, 2].map(|placement| Launch {
-            profile: config.profile,
-            deployment: interlock.deployment.clone(),
-            session: uuid::Uuid::new_v4().to_string(),
-            capability: uuid::Uuid::new_v4().to_string(),
-            parent_pid: std::process::id(),
-            node: NodeInstance {
-                id: uuid::Uuid::new_v4().to_bytes_le(),
-                instance: sequence(),
-            },
-            fm: fm.clone(),
-            generation: generation.clone(),
-            placement,
-            directory: config
-                .root
-                .join("deployment")
-                .join(format!("node{placement}")),
-            package: config.root.join("deployment/package"),
-            partition: uuid::Uuid::new_v4().to_string(),
-            replica: i64::from(placement),
-            incarnation: (sequence() & i64::MAX as u64).max(1) as i64,
-            peer: None,
-        });
-        if config.profile == ServiceProfile::StatefulPeerIdle {
-            launches[1].partition = launches[0].partition.clone();
-            for index in 0..2 {
-                let remote = &launches[1 - index];
-                launches[index].peer = Some(Peer {
-                    node: remote.node.clone(),
-                    session: remote.session.clone(),
-                    partition: remote.partition.clone(),
-                    replica: remote.replica,
-                    incarnation: remote.incarnation,
-                });
+        let mut launches: Vec<_> = (1..=config.profile.node_count() as u8)
+            .map(|placement| Launch {
+                profile: config.profile,
+                deployment: interlock.deployment.clone(),
+                session: uuid::Uuid::new_v4().to_string(),
+                capability: uuid::Uuid::new_v4().to_string(),
+                parent_pid: std::process::id(),
+                node: NodeInstance {
+                    id: uuid::Uuid::new_v4().to_bytes_le(),
+                    instance: sequence(),
+                },
+                fm: fm.clone(),
+                generation: generation.clone(),
+                placement,
+                directory: config
+                    .root
+                    .join("deployment")
+                    .join(format!("node{placement}")),
+                package: config.root.join("deployment/package"),
+                partition: uuid::Uuid::new_v4().to_string(),
+                replica: i64::from(placement),
+                incarnation: (sequence() & i64::MAX as u64).max(1) as i64,
+                peers: vec![],
+            })
+            .collect();
+        if config.profile.peer_replicas() {
+            let partition = launches[0].partition.clone();
+            for launch in &mut launches {
+                launch.partition = partition.clone();
+            }
+            for index in 0..launches.len() {
+                let peers = launches
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| {
+                        if config.profile.mesh_peers() {
+                            *other != index
+                        } else if index == 0 {
+                            *other != 0
+                        } else {
+                            *other == 0
+                        }
+                    })
+                    .map(|(_, remote)| Peer {
+                        node: remote.node.clone(),
+                        session: remote.session.clone(),
+                        partition: remote.partition.clone(),
+                        replica: remote.replica,
+                        incarnation: remote.incarnation,
+                    })
+                    .collect();
+                launches[index].peers = peers;
             }
         }
         Ok(Self {
             interlock,
             config,
             ledger: Ledger::new(launches),
-            children: Vec::with_capacity(2),
+            children: Vec::with_capacity(node_count),
             finished: None,
             peer_idle_requested: false,
         })
@@ -120,28 +148,52 @@ impl Cluster {
             return Err("one cluster start per owner".into());
         }
         self.prepare()?;
-        for index in 0..2 {
+        for index in 0..self.ledger.placements.len() {
             self.spawn(index).await?;
         }
-        if self.config.profile == ServiceProfile::StatefulPeerIdle {
-            let address = self.children[1]
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.peer_address)
-                .ok_or("missing original node2 peer listener")?;
-            let child = &mut self.children[0];
-            child
-                .process
-                .as_mut()
-                .ok_or("missing original Primary owner")?
-                .command(
-                    format!(
-                        "peer {} {} {address}\n",
-                        child.launch.session, child.launch.capability
-                    )
-                    .as_bytes(),
-                )
-                .map_err(err)?;
+        if self.config.profile.peer_replicas() {
+            for source in 0..self.children.len() {
+                for index in source + 1..self.children.len() {
+                    if !self.config.profile.peer_replicas()
+                        || (source != 0 && !self.config.profile.mesh_peers())
+                    {
+                        continue;
+                    }
+                    let source_node = &self.children[source].launch.node;
+                    let incoming_slot = self.children[index]
+                        .launch
+                        .peers
+                        .iter()
+                        .position(|p| &p.node == source_node)
+                        .ok_or("missing original incoming mesh binding")?;
+                    let address = self.children[index]
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.peer_addresses.get(incoming_slot))
+                        .copied()
+                        .ok_or("missing original peer-specific listener")?;
+                    let target = &self.children[index].launch.node;
+                    let peer_index = self.children[source]
+                        .launch
+                        .peers
+                        .iter()
+                        .position(|p| &p.node == target)
+                        .ok_or("missing original mesh peer")?;
+                    let child = &mut self.children[source];
+                    child
+                        .process
+                        .as_mut()
+                        .ok_or("missing original Primary owner")?
+                        .command(
+                            format!(
+                                "peer {} {} {} {address}\n",
+                                child.launch.session, child.launch.capability, peer_index
+                            )
+                            .as_bytes(),
+                        )
+                        .map_err(err)?;
+                }
+            }
         }
         Ok(())
     }
@@ -300,13 +352,23 @@ impl Cluster {
             || !metadata.address.ip().is_loopback()
             || metadata.address.port() == 0
             || profile != metadata.profile.is_some()
-            || (owner.launch.profile == ServiceProfile::StatefulPeerIdle)
-                != metadata.peer_address.is_some()
+            || owner.launch.profile.peer_replicas() != metadata.peer_address.is_some()
             || metadata
                 .peer_address
                 .is_some_and(|address| !address.ip().is_loopback() || address.port() == 0)
+            || metadata.peer_addresses.len() != owner.launch.peers.len()
+            || metadata.peer_address != metadata.peer_addresses.first().copied()
+            || metadata
+                .peer_addresses
+                .iter()
+                .enumerate()
+                .any(|(i, address)| {
+                    !address.ip().is_loopback()
+                        || address.port() == 0
+                        || metadata.peer_addresses[..i].contains(address)
+                })
             || owner.metadata.as_ref().is_some_and(|prior| {
-                prior.address != metadata.address || prior.peer_address != metadata.peer_address
+                prior.address != metadata.address || prior.peer_addresses != metadata.peer_addresses
             })
         {
             return Err(
@@ -340,8 +402,67 @@ impl Cluster {
             .ok_or("original node link absent")?;
         wire::predecode(&incoming.message)?;
         let action = incoming.message.properties().map_err(err)?.action;
-        let generation = self.children[index].launch.generation.clone();
+        let generation = self.children[index].generation();
         match action.as_str() {
+            "LFUMUpload" => {
+                let body = decode_lfum_upload(&incoming.message).map_err(err)?;
+                let header = self.ledger.lfum_upload(index, body)?;
+                let response = lfum_upload_reply_message(&header).map_err(err)?;
+                incoming
+                    .reply
+                    .take()
+                    .ok_or("LFUMUpload missing consuming reply authority")?
+                    .reply(link.seal(response)?, wire::deadline())
+                    .await
+                    .map_err(err)?;
+                if self.ledger.generation.as_ref().is_some_and(|round| {
+                    round.number == header.number && round.uploads[index].is_some()
+                }) {
+                    link.advance_generation(&header);
+                }
+            }
+            "ReplicaEndpointUpdated" => {
+                let (body, owner) =
+                    decode_replica_endpoint_updated(&incoming.message).map_err(err)?;
+                if owner != Owner::Fm {
+                    return Err("FMM endpoint publication is gated".into());
+                }
+                if let Some(reply) = self.ledger.endpoint_updated(index, body)? {
+                    let message =
+                        replica_endpoint_updated_reply_message(&reply, &generation).map_err(err)?;
+                    link.send(message).await?;
+                }
+            }
+            "DoReconfigurationReply" => {
+                let (body, owner) =
+                    decode_do_reconfiguration_reply(&incoming.message).map_err(err)?;
+                if owner != Owner::Fm {
+                    return Err("FMM configuration reply is gated".into());
+                }
+                self.ledger.configuration_reply(index, body)?;
+            }
+            "ChangeConfiguration" => {
+                let (body, owner) = decode_change_configuration(&incoming.message).map_err(err)?;
+                if owner != Owner::Fm {
+                    return Err("FMM candidate redirection is gated".into());
+                }
+                if let Some(reply) =
+                    self.ledger
+                        .change_configuration(index, body, Instant::now())?
+                {
+                    link.send(
+                        change_configuration_reply_message(&reply, &generation).map_err(err)?,
+                    )
+                    .await?;
+                    let next = &self
+                        .ledger
+                        .swap
+                        .as_ref()
+                        .ok_or("missing redirected failover")?
+                        .body;
+                    self.send_configuration(next).await?;
+                }
+            }
             "GenerationUpdateReject" => {
                 let current = decode_generation_update_reject(&incoming.message).map_err(err)?;
                 if let Some(round) = &mut self.ledger.generation {
@@ -409,6 +530,7 @@ impl Cluster {
                         "unexpected/stale native NodeUp identity or recovery contents".into(),
                     );
                 }
+                placement.node_description = Some(body.node.clone());
                 let ack = NodeUpAck::fresh_activated(body.node.version, 1).map_err(err)?;
                 placement.activation_sequence = ack.activation_sequence;
                 placement.activated = ack.activated;
@@ -428,7 +550,7 @@ impl Cluster {
                 if owner != Owner::Fm {
                     return Err("FMM report unsupported".into());
                 }
-                if self.ledger.generation.is_some() {
+                if self.ledger.generation_pending() {
                     if let Some(handoff) = incoming.handoff.as_mut() {
                         handoff.acknowledge();
                     }
@@ -465,7 +587,7 @@ impl Cluster {
             }
             "AddReplicaReply" => {
                 let (body, owner) = decode_add_replica_reply(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm || self.config.profile != ServiceProfile::StatefulPeerIdle {
+                if owner != Owner::Fm || !self.config.profile.peer_replicas() {
                     return Err("AddReplicaReply requires the original peer-idle FM profile".into());
                 }
                 self.ledger.idle_reply(index, body)?;
@@ -534,7 +656,7 @@ impl Cluster {
             };
             let result = result.and_then(|()| self.read_retirement(index));
             let result = match result {
-                Ok(()) if self.ledger.generation.is_some() => self.retry_generation(index).await,
+                Ok(()) if self.ledger.generation_pending() => self.retry_generation(index).await,
                 Ok(()) => self.retry_primary(index).await,
                 Err(error) => Err(error),
             };
@@ -558,6 +680,16 @@ impl Cluster {
                 Ok(()) => self.retry_idle_deletion(index).await,
                 Err(error) => Err(error),
             };
+            let result = match result {
+                Ok(()) if index == self.ledger.primary_index() => {
+                    if let Some(body) = self.ledger.configuration_retry(Instant::now()) {
+                        self.send_configuration(&body).await
+                    } else {
+                        Ok(())
+                    }
+                }
+                result => result,
+            };
             if let Err(error) = result {
                 self.ledger.lost(index, error);
                 if let Some(link) = &self.children[index].link {
@@ -565,11 +697,208 @@ impl Cluster {
                 }
             }
         }
+        if let Err(error) = self.advance_initial_membership().await {
+            self.ledger.lost(0, error);
+        }
+        self.start_failover().await;
+        if let Err(error) = self.advance_repair().await {
+            self.ledger
+                .lost(self.ledger.repair_destination_index().unwrap_or(0), error);
+        }
     }
-    /// Begin the bounded native handshake, not a completed FM rebuild. New
-    /// mutations remain gated until the future LFUM implementation completes.
+    async fn advance_initial_membership(&mut self) -> Result<()> {
+        if self.config.profile.configured_sizes().is_none()
+            || self.children.len() <= 1
+            || self.ledger.configuration.is_some()
+            || self.ledger.placements[0].observed != fm::Observed::Running
+            || self
+                .ledger
+                .placements
+                .iter()
+                .any(|p| !p.link_alive || p.loss_reported)
+        {
+            return Ok(());
+        }
+        if let Some(destination) = (1..self.children.len()).find(|index| {
+            !self
+                .ledger
+                .idles
+                .iter()
+                .any(|idle| idle.body.replica.node == self.children[*index].launch.node)
+        }) {
+            if self
+                .ledger
+                .idles
+                .iter()
+                .all(|idle| idle.reply.as_ref().is_some_and(|reply| reply.error == 0))
+            {
+                let body = self.ledger.request_idle_on(destination, Instant::now())?;
+                self.send_idle(&body).await?;
+            }
+        } else if self.ledger.idle_status()["ready"] == true {
+            let body = self.ledger.request_configuration(Instant::now())?;
+            self.send_configuration(&body).await?;
+        }
+        Ok(())
+    }
+    /// Restore one lost volatile Primary as a fresh Secondary on its original live Node.
+    pub async fn repair_primary_replica(&mut self) -> Result<Value> {
+        if self.finished.is_some()
+            || !self.config.profile.mesh_peers()
+            || self.children.len() != self.config.profile.node_count()
+        {
+            return Err("Primary repair requires the original running configured cluster".into());
+        }
+        if self.ledger.begin_primary_repair(Instant::now())? {
+            self.request_repair_host()?;
+        }
+        Ok(self.ledger.repair_status())
+    }
+
+    /// Restore a lost Secondary without moving or reopening the current Primary.
+    pub async fn repair_secondary_replica(&mut self, destination: u8) -> Result<Value> {
+        if self.finished.is_some()
+            || destination == 0
+            || self.children.len() != self.config.profile.node_count()
+        {
+            return Err("Secondary repair requires the original running cluster".into());
+        }
+        if let Some(body) = self
+            .ledger
+            .begin_secondary_repair(usize::from(destination - 1), Instant::now())?
+        {
+            if let Err(error) = self.send_configuration(&body).await {
+                self.ledger.lost(self.ledger.primary_index(), error.clone());
+                return Err(error);
+            }
+        }
+        Ok(self.ledger.repair_status())
+    }
+
+    fn request_repair_host(&mut self) -> Result<()> {
+        let destination = self
+            .ledger
+            .repair_destination_index()
+            .ok_or("missing failed replica")?;
+        let predecessor = &self
+            .ledger
+            .repair
+            .as_ref()
+            .expect("repair")
+            .predecessor
+            .replica;
+        let child = &mut self.children[destination];
+        let result = child
+            .process
+            .as_mut()
+            .ok_or("missing original Node owner")?
+            .command(
+                format!(
+                    "replace-host {} {} {} {}\n",
+                    child.launch.session,
+                    child.launch.capability,
+                    predecessor.id,
+                    predecessor.instance
+                )
+                .as_bytes(),
+            )
+            .map_err(err);
+        if let Err(error) = result {
+            self.ledger.lost(destination, error.clone());
+            return Err(error);
+        }
+        self.ledger.repair.as_mut().expect("repair").host_requested = true;
+        Ok(())
+    }
+
+    async fn advance_repair(&mut self) -> Result<()> {
+        if self
+            .ledger
+            .repair
+            .as_ref()
+            .is_some_and(|r| r.removal.as_ref().is_some_and(|c| c.reply.is_none()) || r.unknown)
+        {
+            return Ok(());
+        }
+        if self
+            .ledger
+            .repair
+            .as_ref()
+            .is_some_and(|r| !r.host_requested)
+        {
+            self.request_repair_host()?;
+        }
+        if self
+            .ledger
+            .repair
+            .as_ref()
+            .is_some_and(|r| r.profile.is_none())
+        {
+            let destination = self
+                .ledger
+                .repair_destination_index()
+                .ok_or("missing failed replica")?;
+            let predecessor = &self
+                .ledger
+                .repair
+                .as_ref()
+                .expect("repair")
+                .predecessor
+                .replica;
+            let path = self.children[destination]
+                .launch
+                .host_replacement_path(predecessor.id, predecessor.instance);
+            if path.try_exists().map_err(err)? {
+                let receipt: HostReplacementReceipt = read_json(&path)?;
+                if receipt.predecessor.runtime_root.exists()
+                    || Path::new(&format!("/proc/{}", receipt.predecessor.app_pid)).exists()
+                    || !receipt.profile.runtime_root.exists()
+                    || !Path::new(&format!("/proc/{}", receipt.profile.app_pid)).exists()
+                {
+                    return Err("physical host replacement is not independently observable".into());
+                }
+                let pid = self.children[destination]
+                    .process
+                    .as_ref()
+                    .ok_or("missing original Node")?
+                    .pid();
+                if self.ledger.repaired_host(&receipt, pid)? {
+                    self.children[destination]
+                        .metadata
+                        .as_mut()
+                        .ok_or("missing node metadata")?
+                        .profile = Some(receipt.profile);
+                    let body = self
+                        .ledger
+                        .repair
+                        .as_ref()
+                        .expect("repair")
+                        .build
+                        .body
+                        .clone();
+                    self.send_idle(&body).await?;
+                }
+            }
+        }
+        if let Some(body) = self.ledger.start_repair_configuration(Instant::now())? {
+            self.send_configuration(&body).await?;
+        }
+        Ok(())
+    }
+    async fn start_failover(&mut self) {
+        let failover = match self.ledger.start_primary_failover(Instant::now()) {
+            Ok(Some(body)) => self.send_configuration(&body).await,
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = failover {
+            self.ledger.lost(self.ledger.primary_index(), error);
+        }
+    }
+    /// Begin one live-session ordinary-FM inventory reconciliation. New
+    /// mutations remain gated until both native LFUM uploads are processed.
     pub fn begin_generation_handshake(&mut self) -> Result<Value> {
-        if self.config.profile == ServiceProfile::StatefulPeerIdle {
+        if self.config.profile.peer_replicas() {
             return Err("peer-idle profile is bound to the original fixed generation".into());
         }
         if self.finished.is_some() || self.children.len() != 2 {
@@ -617,12 +946,13 @@ impl Cluster {
                     .map_err(err)?,
                 )
                 .await?;
+                link.advance_generation(&header);
             }
         }
         Ok(())
     }
     async fn retry_node_work(&mut self, index: usize) -> Result<()> {
-        if self.ledger.generation.is_some() {
+        if self.ledger.generation_pending() {
             return Ok(());
         }
         let now = Instant::now();
@@ -632,17 +962,16 @@ impl Cluster {
         let link = child.link.as_ref().ok_or("original node link absent")?;
         if let Some((activate, body)) = control {
             let message = if activate {
-                node_activate_request_message(&body, &child.launch.generation)
+                node_activate_request_message(&body, &child.generation())
             } else {
-                node_deactivate_request_message(&body, &child.launch.generation)
+                node_deactivate_request_message(&body, &child.generation())
             }
             .map_err(err)?;
             link.send(message).await?;
         }
         if let Some(body) = service {
             link.send(
-                node_update_service_request_message(&body, &child.launch.generation)
-                    .map_err(err)?,
+                node_update_service_request_message(&body, &child.generation()).map_err(err)?,
             )
             .await?;
         }
@@ -653,7 +982,7 @@ impl Cluster {
             return Ok(());
         };
         let child = &self.children[index];
-        let message = add_primary_message(&body, &child.launch.generation).map_err(err)?;
+        let message = add_primary_message(&body, &child.generation()).map_err(err)?;
         child
             .link
             .as_ref()
@@ -670,13 +999,13 @@ impl Cluster {
     async fn send_idle(&self, body: &AddReplica) -> Result<()> {
         let child = self
             .children
-            .first()
+            .get(self.ledger.primary_index())
             .ok_or("missing original Primary owner")?;
         child
             .link
             .as_ref()
             .ok_or("original Primary link absent")?
-            .send(add_replica_message(body, &child.launch.generation).map_err(err)?)
+            .send(add_replica_message(body, &child.generation()).map_err(err)?)
             .await
     }
     async fn retry_idle_removal(&mut self, index: usize) -> Result<()> {
@@ -694,18 +1023,18 @@ impl Cluster {
             .link
             .as_ref()
             .ok_or("original Primary link absent")?
-            .send(remove_replica_message(body, &child.launch.generation).map_err(err)?)
+            .send(remove_replica_message(body, &child.generation()).map_err(err)?)
             .await
     }
     async fn retry_deletion(&mut self, index: usize) -> Result<()> {
-        if self.ledger.generation.is_some() {
+        if self.ledger.generation_pending() {
             return Ok(());
         }
         let Some(body) = self.ledger.deletion_retry(index, Instant::now())? else {
             return Ok(());
         };
         let child = &self.children[index];
-        let message = delete_replica_message(&body, &child.launch.generation).map_err(err)?;
+        let message = delete_replica_message(&body, &child.generation()).map_err(err)?;
         child
             .link
             .as_ref()
@@ -728,7 +1057,7 @@ impl Cluster {
             .link
             .as_ref()
             .ok_or("original destination link absent")?
-            .send(delete_replica_message(body, &child.launch.generation).map_err(err)?)
+            .send(delete_replica_message(body, &child.generation()).map_err(err)?)
             .await
     }
     fn read_retirement(&mut self, index: usize) -> Result<()> {
@@ -815,15 +1144,22 @@ impl Cluster {
             let removing = source["peer_idle"]["removal"].is_object();
             let removed = removing && source["peer_idle"]["removal"]["result"] == 0;
             let destination_lost = self.ledger.placements[1].loss_reported;
+            let configuration = self.ledger.configuration_status();
+            let configured = configuration["ready"] == true
+                && configuration["kind"] == "same_primary_configuration";
+            let retired = configuration["ready"] == true
+                && configuration["kind"] == "same_primary_retirement"
+                && self.ledger.idle_predecessor.is_none();
             let built = !destination_lost
                 && opened
                 && !removing
                 && source["peer_idle"]["build"]["result"] == 0;
             status["peer_idle"] = json!({
                 "requested":self.peer_idle_requested,
-                "state": if destination_lost { "lost" } else if removed { "removed" } else if removing { "removing" } else if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
+                "state": if configured { "active_secondary" } else if retired { "retired_secondary" } else if destination_lost { "lost" } else if removed { "removed" } else if removing { "removing" } else if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
                 "error": if failed { reply["error"].clone() } else { Value::Null },
                 "built":built, "serving":false,
+                "active_secondary":configured,
                 "build":source["peer_idle"]["build"],
                 "fm":self.ledger.idle_status(),
                 "fm_removal":self.ledger.idle_removal_status(),
@@ -842,7 +1178,7 @@ impl Cluster {
     /// Ask the original Primary RA to open its bound remote Idle. This is not
     /// an FM operation, build completion, or permission to serve.
     pub async fn create_idle_replica(&mut self) -> Result<Value> {
-        if self.ledger.idle.is_some() {
+        if !self.ledger.idles.is_empty() {
             return Err("FM owns this Idle; use add_idle_replica".into());
         }
         if self.config.profile != ServiceProfile::StatefulPeerIdle
@@ -886,7 +1222,7 @@ impl Cluster {
     /// Ask the original Primary runtime to build its already opened peer Idle.
     /// Completion proves copy/application ACK, not active configuration or FM AddReplica.
     pub async fn build_idle_replica(&mut self) -> Result<Value> {
-        if self.ledger.idle.is_some() {
+        if !self.ledger.idles.is_empty() {
             return Err("FM owns this Idle's build choreography".into());
         }
         if self.config.profile != ServiceProfile::StatefulPeerIdle
@@ -925,11 +1261,12 @@ impl Cluster {
     /// FM AddReplica owns peer creation, RAP build and semantic Ready-Idle completion.
     pub async fn add_idle_replica(&mut self) -> Result<Value> {
         let current = self.ledger.idle_status();
-        if self.finished.is_some()
+        if self.ledger.configuration.is_some()
+            || self.finished.is_some()
             || self.children.len() != 2
             || self.config.profile != ServiceProfile::StatefulPeerIdle
             || (self.ledger.idle_removal.is_some() && current["state"] != "failed")
-            || self.peer_idle_requested && self.ledger.idle.is_none()
+            || self.peer_idle_requested && self.ledger.idles.is_empty()
         {
             return Err("FM AddReplica requires the original unused peer-idle profile".into());
         }
@@ -943,6 +1280,99 @@ impl Cluster {
             return Err(error);
         }
         Ok(self.ledger.idle_status())
+    }
+    /// Build one original Secondary destination selected by its one-based node number.
+    pub async fn add_idle_replica_on(&mut self, destination: u8) -> Result<Value> {
+        if !(self.config.profile == ServiceProfile::StatefulThree
+            || self.config.profile.configured_sizes().is_some())
+            || self.finished.is_some()
+            || self.children.len() != self.config.profile.node_count()
+            || !(2..=self.children.len()).contains(&usize::from(destination))
+        {
+            return Err(
+                "targeted build requires an original configured Secondary destination".into(),
+            );
+        }
+        let body = self
+            .ledger
+            .request_idle_on(usize::from(destination - 1), Instant::now())?;
+        if let Err(error) = self.send_idle(&body).await {
+            self.ledger.lost(0, error.clone());
+            return Err(error);
+        }
+        Ok(self.ledger.idle_status())
+    }
+    /// Explicitly authorize one fresh Idle after original FM removal and proved disposal.
+    pub async fn replace_idle_replica(&mut self) -> Result<Value> {
+        if self.finished.is_some()
+            || self.children.len() != 2
+            || self.config.profile != ServiceProfile::StatefulPeerIdle
+        {
+            return Err("Idle replacement requires the original peer-idle profile".into());
+        }
+        let current = self.ledger.idle_status();
+        if self.ledger.idle_predecessor.is_some() && current["state"] == "ready" {
+            return Ok(current);
+        }
+        let body = self.ledger.request_idle_replacement(Instant::now())?;
+        self.peer_idle_requested = true;
+        if let Err(error) = self.send_idle(&body).await {
+            self.ledger.lost(0, error.clone());
+            return Err(error);
+        }
+        Ok(self.ledger.idle_status())
+    }
+    pub async fn activate_idle_replica(&mut self) -> Result<Value> {
+        if self.finished.is_some() || self.children.len() != self.config.profile.node_count() {
+            return Err("configuration requires the original running cluster".into());
+        }
+        let body = self.ledger.request_configuration(Instant::now())?;
+        if self.ledger.configuration_status()["ready"] == true {
+            return Ok(self.ledger.configuration_status());
+        }
+        if let Err(error) = self.send_configuration(&body).await {
+            self.ledger.lost(0, error.clone());
+            return Err(error);
+        }
+        Ok(self.ledger.configuration_status())
+    }
+    pub async fn transfer_primary(&mut self) -> Result<Value> {
+        if self.finished.is_some() || self.children.len() != 2 {
+            return Err("Primary transfer requires the original running cluster".into());
+        }
+        let body = self.ledger.request_primary_transfer(Instant::now())?;
+        if self.ledger.configuration_status()["ready"] != true {
+            if let Err(error) = self.send_configuration(&body).await {
+                self.ledger.lost(0, error.clone());
+                return Err(error);
+            }
+        }
+        Ok(self.ledger.configuration_status())
+    }
+    pub async fn retire_secondary_replica(&mut self) -> Result<Value> {
+        if self.finished.is_some() || self.children.len() != 2 {
+            return Err("Secondary retirement requires the original running cluster".into());
+        }
+        let body = self.ledger.request_secondary_retirement(Instant::now())?;
+        if self.ledger.configuration_status()["ready"] != true {
+            if let Err(error) = self.send_configuration(&body).await {
+                self.ledger.lost(0, error.clone());
+                return Err(error);
+            }
+        }
+        Ok(self.ledger.configuration_status())
+    }
+    async fn send_configuration(&self, body: &DoReconfiguration) -> Result<()> {
+        let child = self
+            .children
+            .get(self.ledger.primary_index())
+            .ok_or("missing original Primary owner")?;
+        child
+            .link
+            .as_ref()
+            .ok_or("missing original Primary link")?
+            .send(do_reconfiguration_message(body, &child.generation()).map_err(err)?)
+            .await
     }
     /// Remove the original Idle from the Primary's replicator, not its remote
     /// application. Pending calls retry cancellation/cleanup; success is terminal.
@@ -983,7 +1413,7 @@ impl Cluster {
                 .as_bytes(),
             )
             .map_err(err)?;
-        if let Some(idle) = &mut self.ledger.idle {
+        if let Some(idle) = self.ledger.idles.first_mut() {
             idle.cancelled = true;
         }
         Ok(json!({"state":"pending","kind":"peer_idle_removal","built":false,"serving":false}))
@@ -1106,7 +1536,7 @@ impl Cluster {
         let op = command.op.clone();
         match self.ledger.accept(command)? {
             Accepted::NodeControl(index, activate, body) => {
-                let generation = &self.children[index].launch.generation;
+                let generation = &self.children[index].generation();
                 let message = if activate {
                     node_activate_request_message(&body, generation)
                 } else {
@@ -1130,8 +1560,7 @@ impl Cluster {
                 } else {
                     add_instance_message
                 };
-                let message =
-                    factory(&body, &self.children[index].launch.generation).map_err(err)?;
+                let message = factory(&body, &self.children[index].generation()).map_err(err)?;
                 let result = self.children[index]
                     .link
                     .as_ref()
@@ -1148,8 +1577,7 @@ impl Cluster {
                 } else {
                     remove_instance_message
                 };
-                let message =
-                    factory(&body, &self.children[index].launch.generation).map_err(err)?;
+                let message = factory(&body, &self.children[index].generation()).map_err(err)?;
                 let result = self.children[index]
                     .link
                     .as_ref()
@@ -1172,10 +1600,10 @@ impl Cluster {
         Ok(self.ledger.result(&op))
     }
     pub async fn update_service(&mut self, index: usize, service: Service) -> Result<()> {
-        if self.config.profile == ServiceProfile::StatefulPeerIdle {
+        if self.config.profile.peer_replicas() {
             return Err("peer-idle service description is fixed for the original lifetime".into());
         }
-        if self.ledger.generation.is_some() {
+        if self.ledger.generation_pending() {
             return Err("service update is gated while generation upload is pending".into());
         }
         let placement = self
@@ -1213,7 +1641,7 @@ impl Cluster {
             &NodeUpdateServiceRequest {
                 service: service.clone(),
             },
-            &placement.launch.generation,
+            &self.children[index].generation(),
         )
         .map_err(err)?;
         self.children[index]
@@ -1261,6 +1689,45 @@ impl Cluster {
             let cleanup = process.cleanup();
             let physical = process.status();
             let receipt = read_json::<CleanupReceipt>(&child.launch.directory.join("cleanup.json"));
+            for repair in self
+                .ledger
+                .repair_history
+                .iter()
+                .chain(self.ledger.repair.iter())
+                .filter(|r| r.predecessor.replica.node == child.launch.node)
+            {
+                let path = child.launch.host_replacement_path(
+                    repair.predecessor.replica.id,
+                    repair.predecessor.replica.instance,
+                );
+                if path.exists() {
+                    let replacement = read_json::<HostReplacementReceipt>(&path).and_then(|r| {
+                        r.validate(&child.launch, &repair.old_profile, process.pid())?;
+                        if r.predecessor.runtime_root.exists()
+                            || Path::new(&format!("/proc/{}", r.predecessor.app_pid)).exists()
+                        {
+                            return Err(
+                                "predecessor host physical cleanup remains unresolved".into()
+                            );
+                        }
+                        Ok(r)
+                    });
+                    match replacement {
+                        Ok(r) => {
+                            if let Some(metadata) = &mut child.metadata {
+                                metadata.profile = Some(r.profile);
+                            }
+                        }
+                        Err(error) => {
+                            complete = false;
+                            item["host_replacement_error"] = json!(error);
+                        }
+                    }
+                } else if repair.profile.is_some() {
+                    complete = false;
+                    item["host_replacement_error"] = json!("admitted replacement receipt missing");
+                }
+            }
             let valid = receipt.as_ref().is_ok_and(|receipt| {
                 receipt.deployment == child.launch.deployment
                     && receipt.session == child.launch.session

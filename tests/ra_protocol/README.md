@@ -37,7 +37,57 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 139 inputs.
+The C++ producer independently constructs expected values and emits 179 inputs.
+Configured failover adds default/rich ChangeConfiguration and legacy
+ChangeConfigurationReply bodies plus both literal action headers.
+The request reuses ConfigurationMessageBody; the reply adds the two-field
+FailoverUnitReplyMessageBody. Both directions use source-extracted actors and
+priority. The deprecated reply has codec coverage but remains explicitly
+rejected by RA, never a reconfiguration-completion gate.
+Bounded three-member Primary failover adds a three-element non-force Deactivate
+body, independently checked in both native/Rust directions and for truncation.
+Healthy three-member admission adds three-element-vector cases for
+DoReconfiguration, Activate and DoReconfigurationReply. A separately initialized
+third descriptor is appended to the rich native/Rust bodies; these are synthetic
+codec fixtures, not a native handler trace or live membership proof.
+The maintained gate covers 85 types/257 fields, 183 bundle files and 55 actual
+native truncation rejections, retaining the prior 173-case failover gate,
+172-case three-member gate
+and all prior 169 LFUM cases.
+Live-session LFUM adds empty/rich/deleted-only metadata bodies, a bodyless
+correlated reply and both action headers. Native LFUMMessageBody extraction
+preserves generation/NodeDescription/FailoverUnitInfo-vector/AnyReplicaFound
+order; the request has no GenerationHeader and the reply echoes it.
+The LFUM gate covered 84 types/255 fields, 173 bundle files and 49 actual
+native truncation rejections. All prior 163 cases and 47 rejections remain.
+The empty LFUM fixture explicitly initializes AnyReplicaFound=false; the native
+body's empty constructor does not initialize that scalar.
+Healthy planned Primary transfer adds six default/rich/action cases for
+GetLSN/Reply. GetLSN reuses ReplicaMessageBody; GetLSNReply inherits
+ReplicaReplyMessageBody and adds nested deactivation information in its derived
+scope. Native extraction now covers 83 types/251 fields and 167 bundle files;
+native executes 47 truncation rejections. All prior 157 cases and 45
+truncation rejections remain retained. Rust verifies peer actor/priority,
+generation, exact action factories and every proper body prefix.
+Healthy configured-Secondary retirement adds six default/rich/action cases for
+Deactivate/Reply. Its inherited configuration is followed by a derived scope
+containing `isForce_` and the nested deactivation information. This adds one
+native schema type and two fields, for 82 types/250 fields and 161 bundle files.
+Rust verifies exact peer factories/generation, complete decoding and proper
+prefix rejection; native executes 45 truncation rejections. All prior
+151 cases and 43 truncation rejections remain retained.
+The same-Primary configuration extension adds twelve independent cases for
+DoReconfiguration/Reply and Activate/Reply: four default/rich body pairs and
+four literal action headers. Four native schema types add eight fields
+(81 types/248 fields in total). The inherited ConfigurationMessageBody keeps
+native unit/replica-vector/service order, with derived phase-0 duration or
+deactivation information in its own scope. Default phase-0 duration remains
+TimeSpan::MaxValue; configuration replies contain the full replica vector.
+Production Rust factories/decoders verify both reply owners, exact priority/
+generation and cross-action rejection. Proper-prefix checks cover every new
+body; that extension increased native rejection coverage to 43 truncations. This is source
+stream/schema-adapter evidence, not native handler execution or FMM admission.
+All previous 139 inputs and 39 truncation rejections remain retained.
 The existing 36 cases and their contracts are retained:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp

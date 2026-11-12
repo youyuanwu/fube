@@ -154,6 +154,18 @@ pub struct PackageRegistration {
 }
 #[derive(Clone)]
 enum Work {
+    GetLsn(Arc<GetLsn>, NodeInstance, GenerationHeader),
+    GetLsnReply(Arc<GetLsnReply>, NodeInstance, GenerationHeader),
+    ReplicaStatus(ra::ConfigurationCompletion),
+    Endpoint(Arc<AddInstance>),
+    EndpointAck(Arc<AddInstanceReply>, NodeInstance, GenerationHeader),
+    Reconfigure(Arc<DoReconfiguration>, NodeInstance, GenerationHeader),
+    Deactivate(Arc<Deactivate>, NodeInstance, GenerationHeader),
+    Deactivated(Arc<DeactivateReply>, NodeInstance, GenerationHeader),
+    Activate(Arc<Activate>, NodeInstance, GenerationHeader),
+    Activated(Arc<ActivateReply>, NodeInstance, GenerationHeader),
+    Configured(ra::ConfigurationCompletion),
+    RetryConfiguration(PartitionId),
     BuildIdle(PartitionId),
     Built(ra::BuildCompletion),
     RemoveIdle(PartitionId),
@@ -164,7 +176,7 @@ enum Work {
     Status(ServiceType, u64, bool),
     Load(Box<ReportLoad>),
     Description(Box<ra::ServiceDescriptionCompletion>),
-    Add(Arc<AddInstance>),
+    Add(Arc<AddInstance>, NodeInstance, GenerationHeader),
     StatefulOpen(Arc<AddInstance>),
     PrimaryOpen(Arc<AddInstance>),
     AddPrimary(Arc<AddPrimary>, NodeInstance, GenerationHeader),
@@ -318,7 +330,7 @@ fn pre_open_cancelled(state: &ra::EntityState, creation: u64) -> bool {
         && state.runtime.is_none()
         && state.usage.is_none()
         && state.peer_creation.is_some()
-        && state.remote_idle.is_none()
+        && state.remote_idles.is_empty()
         && state.fm_stage == ra::FmStage::None
 }
 fn never_created(state: &ra::EntityState) -> bool {
@@ -330,7 +342,7 @@ fn never_created(state: &ra::EntityState) -> bool {
         && state.runtime.is_none()
         && state.usage.is_none()
         && state.peer_creation.is_none()
-        && state.remote_idle.is_none()
+        && state.remote_idles.is_empty()
         && state.registration_lookups.is_empty()
         && state.fm_stage == ra::FmStage::None
 }
@@ -394,6 +406,7 @@ pub struct Node {
     failed_registration: Option<FailedRegistrationDeletion>,
     open_failure: Option<OpenFailureWitness>,
     failed_open: Option<FailedOpenDeletion>,
+    host_predecessors: Vec<Arc<AddInstance>>,
     #[cfg(feature = "qualification")]
     hold_replies: bool,
 }
@@ -458,6 +471,7 @@ impl Node {
             failed_registration: None,
             open_failure: None,
             failed_open: None,
+            host_predecessors: Vec::new(),
             #[cfg(feature = "qualification")]
             hold_replies: false,
         })
@@ -476,6 +490,99 @@ impl Node {
     }
     pub fn activation(&self) -> &Activation {
         &self.activation
+    }
+    pub fn retire_lost_primary_host(&mut self) -> Result<bool> {
+        self.retire_lost_replica_host()
+    }
+    pub fn replace_lost_primary_host(&mut self, activation: Activation) -> Result<()> {
+        self.replace_lost_replica_host(activation)
+    }
+    /// Retire the physically lost volatile replica owner without replacing RA.
+    pub fn retire_lost_replica_host(&mut self) -> Result<bool> {
+        let selected = self.selected.as_ref().ok_or(Error::Unsupported)?;
+        let snapshot = self.ra.snapshot(selected.unit.id.guid.0);
+        let state = snapshot.committed.ok_or(Error::Busy)?;
+        if !matches!(
+            self.activation.profile(),
+            h::local::Profile::VolatileStatefulFmPrimary
+                | h::local::Profile::VolatileStatefulLifecycle
+        ) || snapshot.fenced
+            || (!state.fm_primary
+                && !state
+                    .peer_creation
+                    .as_ref()
+                    .is_some_and(|p| p.host_down && p.delete_operation != 0))
+            || state.phase != ra::Phase::Closed
+            || !state.local_deleted
+            || !state.cleanup_pending
+            || state.fm_stage != ra::FmStage::None
+            || (state.fm_primary && state.primary_deactivation != Some((Epoch::default(), -2)))
+            || state.runtime.is_some()
+            || state.usage.is_some()
+            || !state.registration_lookups.is_empty()
+            || !ra::replica_replacement_metadata(&state)
+            || self
+                .activation
+                .process_status()
+                .is_none_or(|p| !p.exit_observed)
+            || self.last_error.is_some()
+            || self.rejected_reply.is_some()
+        {
+            return Err(Error::Unsupported);
+        }
+        self.stop_admission();
+        let cleaned = match self.activation.terminate() {
+            Ok(cleaned) => cleaned,
+            Err(h::local::LocalError::Busy) => false,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(cleaned && self.quiescent() && self.commands.is_empty() && self.receipts.is_empty())
+    }
+
+    /// Install a new, unstarted host only after exact old-owner physical cleanup.
+    pub fn replace_lost_replica_host(&mut self, mut activation: Activation) -> Result<()> {
+        if !self.retire_lost_replica_host()?
+            || !self.activation.producers_stopped()
+            || !self.activation.deliveries_drained()
+            || !self.activation.cleanup_status().directory_released
+            || self
+                .activation
+                .process_status()
+                .is_none_or(|p| !p.reaped || !p.group_drained)
+            || activation.identity().is_some()
+            || activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+        {
+            return Err(Error::Busy);
+        }
+        // Never revive the gate retained by the old IPC session.
+        let live = Arc::new(AtomicBool::new(true));
+        activation.bind_consumer(Arc::new(Gate {
+            live: live.clone(),
+            ra: self.ra.consumer_lifetime(),
+        }))?;
+        let entity = self
+            .selected
+            .as_ref()
+            .ok_or(Error::Unsupported)?
+            .unit
+            .id
+            .guid
+            .0;
+        self.host_predecessors.push(
+            self.ra
+                .snapshot(entity)
+                .committed
+                .ok_or(Error::Busy)?
+                .body
+                .clone(),
+        );
+        self.activation = activation;
+        self.live = live;
+        self.route = None;
+        self.held_reply = None;
+        self.selected = None;
+        self.package_registration.registered = false;
+        Ok(())
     }
     pub fn snapshot(&self, unit: ra::EntityId) -> ra::Snapshot {
         self.ra.snapshot(unit)
@@ -498,7 +605,9 @@ impl Node {
     fn admit_fm(&self, source: &NodeInstance, generation: &GenerationHeader) -> Result<()> {
         if source != &self.admission.fm_source
             || generation.for_fm_replica
-            || generation.number != self.admission.generation
+            || generation
+                .number
+                .older_than(&self.ra.generation_state().receive)
         {
             return Err(Error::Protocol);
         }
@@ -515,7 +624,7 @@ impl Node {
             return Err(Error::Unsupported);
         }
         self.admit_fm(source, generation)?;
-        self.add(body)
+        self.authorize_open(body, 1, Some((source.clone(), generation.clone())))
     }
     pub fn fm_work(&mut self, work: FmWork) -> Result<u64> {
         let stateless = self.activation.profile() == h::local::Profile::Stateless;
@@ -610,18 +719,48 @@ impl Node {
                 let closed = current
                     .as_ref()
                     .is_some_and(|state| state.phase == ra::Phase::Closed);
-                if peer_work {
+                let stale_host = self.host_predecessors.iter().any(|old| {
+                    incoming.unit == old.unit
+                        && incoming.service == old.service
+                        && incoming.replica.node == old.replica.node
+                        && incoming.replica.id == old.replica.id
+                        && incoming.replica.instance == old.replica.instance
+                        && current.as_ref().is_some_and(|s| {
+                            incoming.replica.id < s.body.replica.id
+                                && incoming.replica.instance < s.body.replica.instance
+                                && incoming.unit.current.older_than(s.body.unit.current)
+                        })
+                });
+                if peer_work && !stale_host {
                     let eligible = match &current {
                         None => self.selected.is_none() || self.pending.iter().any(|pending| {
                             matches!(&pending.work, Work::Fm(FmWork::DeleteReplica(original, ..))
                                 if original == body)
                         }),
                         Some(state) => {
-                            state.body.replica.id == incoming.replica.id
+                            (state.body.replica.id == incoming.replica.id
+                                || self.selected.as_ref().is_some_and(|selected| {
+                                    incoming.replica.id == selected.replica.id
+                                        && incoming.replica.instance <= selected.replica.instance
+                                        && state.body.replica.id > selected.replica.id
+                                        && state.body.replica.instance > selected.replica.instance
+                                }))
                                 && ((never_created(state)
                                     && state.body.replica.instance == incoming.replica.instance)
                                     || (state.peer_creation.is_some()
-                                        && state.body.replica.current_role == 2))
+                                        && (state.body.replica.current_role == 2
+                                            || (incoming.replica.id < state.body.replica.id
+                                                && incoming.replica.instance
+                                                    < state.body.replica.instance)
+                                            || (state.phase == ra::Phase::Closed
+                                                && state.reconfiguration.as_ref().is_some_and(
+                                                    |c| {
+                                                        c.stage == ra::ConfigurationStage::Retiring
+                                                            || (c.stage
+                                                                == ra::ConfigurationStage::Complete
+                                                                && state.peer_host_loss())
+                                                    },
+                                                )))))
                         }
                     };
                     if !eligible
@@ -648,7 +787,13 @@ impl Node {
                     || self.selected.as_ref().is_some_and(|selected| {
                         incoming.unit.id != selected.unit.id
                             || incoming.unit.consistency != selected.unit.consistency
-                            || incoming.service != selected.service
+                            || (incoming.service != selected.service
+                                && current.as_ref().is_none_or(|s| {
+                                    incoming.service != s.body.service
+                                        && s.reconfiguration.as_ref().is_none_or(|c| {
+                                            !c.history.iter().any(|b| b.service == incoming.service)
+                                        })
+                                }))
                     })
                     || incoming.replica.id < 0
                     || incoming.replica.instance < 0
@@ -719,11 +864,14 @@ impl Node {
     pub fn bind_peer(&self, source: NodeInstance) -> Result<()> {
         Ok(self.ra.bind_peer(source)?)
     }
+    pub fn bind_peers(&self, sources: Vec<NodeInstance>) -> Result<()> {
+        Ok(self.ra.bind_peers(sources)?)
+    }
     pub fn create_idle_on_peer(&mut self, replica: Replica) -> Result<u64> {
         if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
             || !self.live.load(Ordering::SeqCst)
             || self.ra.generation_state().upload_pending
-            || self.ra.peer().as_ref() != Some(&replica.node)
+            || !self.ra.is_peer(&replica.node)
         {
             return Err(Error::Unsupported);
         }
@@ -781,30 +929,68 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         let base = &body.replica.0;
-        let retired_original =
-            self.ra
-                .snapshot(base.unit.id.guid.0)
-                .committed
-                .is_some_and(|state| {
-                    state.phase == ra::Phase::Closed
-                        && state.local_deleted
-                        && state.body.replica.node == base.replica.node
-                        && state.body.replica.id == base.replica.id
-                        && state.body.replica.instance == base.replica.instance
-                        && state.body.unit == base.unit
-                });
+        let current = self.ra.snapshot(base.unit.id.guid.0).committed;
+        let retired_original = current.as_ref().is_some_and(|state| {
+            state.phase == ra::Phase::Closed
+                && state.local_deleted
+                && state.body.replica.node == base.replica.node
+                && state.body.replica.id == base.replica.id
+                && state.body.replica.instance == base.replica.instance
+                && state.body.unit == base.unit
+        });
         if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
-            || self.ra.peer().as_ref() != Some(source)
+            || !self.ra.is_peer(source)
             || generation.for_fm_replica
             || (!self.live.load(Ordering::SeqCst) && !retired_original)
             || !self.ra.consumer_lifetime().is_accepting()
         {
             return Err(Error::Unsupported);
         }
+        if let Some(current) = current.as_ref().filter(|state| {
+            state.phase == ra::Phase::Closed && base.replica.instance > state.body.replica.instance
+        }) {
+            let admitted_retry = self.pending.iter().any(|pending| {
+                matches!(&pending.work, Work::PeerCreate(approved, ..) if approved.as_ref() == &body)
+                    && pending.ticket.as_ref().is_none_or(|ticket| {
+                        matches!(
+                            ticket.observation(),
+                            ra::TicketObservation::Status(
+                                ra::Status::Pending | ra::Status::Unknown | ra::Status::Complete(Ok(_))
+                            )
+                        )
+                    })
+            });
+            if !current.local_deleted
+                || current.fm_stage != ra::FmStage::None
+                || base.replica.id <= current.body.replica.id
+                || self
+                    .activation
+                    .session_status()?
+                    .is_none_or(|session| !session.connected)
+                || self
+                    .activation
+                    .process_status()
+                    .is_none_or(|process| process.exit_observed)
+                || (!admitted_retry
+                    && ((self.host_predecessors.is_empty() && self.instance_disposal().is_none())
+                        || !self.quiescent()
+                        || !self.commands.is_empty()
+                        || self
+                            .external
+                            .iter()
+                            .any(|work| work.effect.is_replica_reporting())))
+            {
+                return Err(Error::Busy);
+            }
+        }
         self.check_service(base, true)?;
         if to_vec(&body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
             || self.selected.as_ref().is_some_and(|selected| {
-                selected.unit.id != base.unit.id || selected.service != base.service
+                selected.unit.id != base.unit.id
+                    || (selected.service != base.service
+                        && current
+                            .as_ref()
+                            .is_none_or(|s| s.body.service != base.service))
             })
         {
             return Err(Error::Unsupported);
@@ -830,8 +1016,17 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
-            || self.ra.peer().as_ref() != Some(source)
+        if (self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            && !self
+                .ra
+                .snapshot(body.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| {
+                    s.fm_primary
+                        && s.body.replica.current_role == 4
+                        && ra::completed_primary_failover(&s)
+                }))
+            || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
             return Err(Error::Unsupported);
@@ -858,6 +1053,16 @@ impl Node {
         Ok(self
             .ra
             .process_generation_update(source, body, generation)?)
+    }
+    pub fn lfum_inventory(&self) -> Result<Option<ra::LfumInventory>> {
+        Ok(self.ra.lfum_inventory()?)
+    }
+    pub fn process_lfum_upload_reply(
+        &self,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<bool> {
+        Ok(self.ra.process_lfum_upload_reply(source, generation)?)
     }
     pub fn apply_fresh_node_up_ack(
         &self,
@@ -1200,6 +1405,239 @@ impl Node {
             generation.clone(),
         ))
     }
+    pub fn continue_swap_from_peer(
+        &mut self,
+        body: DoReconfiguration,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+            || !self.ra.is_peer(source)
+            || generation.for_fm_replica
+        {
+            return Err(Error::Unsupported);
+        }
+        self.admit_configuration(&body.configuration)?;
+        self.enqueue(Work::Reconfigure(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn get_lsn_from_peer(
+        &mut self,
+        body: GetLsn,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if !self.ra.is_peer(source)
+            || generation.for_fm_replica
+            || self
+                .ra
+                .snapshot(body.unit.id.guid.0)
+                .committed
+                .is_none_or(|s| {
+                    s.swap.is_none() && !self.active_stateful_configuration(body.unit.id.guid.0)
+                })
+        {
+            return Err(Error::Unsupported);
+        }
+        self.enqueue(Work::GetLsn(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn get_lsn_reply_from_peer(
+        &mut self,
+        body: GetLsnReply,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if !self.ra.is_peer(source)
+            || generation.for_fm_replica
+            || self
+                .ra
+                .snapshot(body.replica.unit.id.guid.0)
+                .committed
+                .is_none_or(|s| {
+                    s.swap.is_none()
+                        && !self.active_stateful_configuration(body.replica.unit.id.guid.0)
+                })
+        {
+            return Err(Error::Unsupported);
+        }
+        self.enqueue(Work::GetLsnReply(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn endpoint_reply_from_fm(
+        &mut self,
+        body: AddInstanceReply,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        self.admit_fm(source, generation)?;
+        self.enqueue(Work::EndpointAck(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn reconfigure_from_fm(
+        &mut self,
+        body: DoReconfiguration,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        self.admit_fm(source, generation)?;
+        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            && !(self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
+                && self.active_stateful_configuration(body.configuration.unit.id.guid.0))
+        {
+            return Err(Error::Unsupported);
+        }
+        self.admit_configuration(&body.configuration)?;
+        self.enqueue(Work::Reconfigure(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn activate_replica_from_peer(
+        &mut self,
+        body: Activate,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        let swapping = self
+            .ra
+            .snapshot(body.configuration.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.swap.is_some());
+        if (!swapping && self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle)
+            || !self.ra.is_peer(source)
+            || generation.for_fm_replica
+        {
+            return Err(Error::Unsupported);
+        }
+        self.admit_configuration(&body.configuration)?;
+        self.enqueue(Work::Activate(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn deactivate_replica_from_peer(
+        &mut self,
+        body: Deactivate,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+            || !self.ra.is_peer(source)
+            || generation.for_fm_replica
+        {
+            return Err(Error::Unsupported);
+        }
+        self.admit_configuration(&body.configuration)?;
+        self.enqueue(Work::Deactivate(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn deactivate_reply_from_peer(
+        &mut self,
+        body: DeactivateReply,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if (self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            && !self.active_stateful_configuration(body.unit.id.guid.0)
+            && !self
+                .ra
+                .snapshot(body.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| {
+                    s.fm_primary
+                        && s.body.replica.current_role == 4
+                        && ra::completed_primary_failover(&s)
+                }))
+            || !self.ra.is_peer(source)
+            || generation.for_fm_replica
+        {
+            return Err(Error::Unsupported);
+        }
+        self.enqueue(Work::Deactivated(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn activate_reply_from_peer(
+        &mut self,
+        body: ActivateReply,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        let swapping = self
+            .ra
+            .snapshot(body.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.swap.is_some());
+        if (!swapping
+            && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            && !self.active_stateful_configuration(body.unit.id.guid.0))
+            || !self.ra.is_peer(source)
+            || generation.for_fm_replica
+        {
+            return Err(Error::Unsupported);
+        }
+        self.enqueue(Work::Activated(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    fn admit_configuration(&self, body: &Configuration) -> Result<()> {
+        if !self.live.load(Ordering::SeqCst)
+            || self.ra.generation_state().upload_pending
+            || !self.ra.consumer_lifetime().is_accepting()
+            || !(2..=ra::MAX_CONFIGURATION_REPLICAS).contains(&body.replicas.0.len())
+            || to_vec(body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
+        {
+            return Err(Error::Unsupported);
+        }
+        let current = self
+            .ra
+            .snapshot(body.unit.id.guid.0)
+            .committed
+            .ok_or(Error::Unsupported)?;
+        if current.body.unit.id != body.unit.id
+            || current.body.unit.consistency != body.unit.consistency
+            || (!body.unit.current.older_than(current.body.unit.current)
+                && body.service != current.body.service
+                && !ra::secondary_service(&current.body.service, &body.service))
+        {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
+    }
+    fn active_stateful_configuration(&self, entity: ra::EntityId) -> bool {
+        self.ra.peer_count() >= 1
+            && self.ra.snapshot(entity).committed.is_some_and(|s| {
+                s.phase == ra::Phase::Ready
+                    && s.reconfiguration.as_ref().is_some_and(|c| {
+                        (c.stage == ra::ConfigurationStage::Complete
+                            || ra::secondary_removal_in_progress(&s))
+                            && c.request.replicas.0.len() >= 2
+                            && ra::valid_stateful_sizes(&c.request.service)
+                    })
+            })
+    }
     pub fn remove_replica_from_fm(
         &mut self,
         body: RemoveReplica,
@@ -1220,13 +1658,30 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<()> {
         self.admit_fm(source, generation)?;
-        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+        if (self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            && !self
+                .ra
+                .snapshot(body.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| {
+                    s.fm_primary
+                        && s.body.replica.current_role == 4
+                        && ra::completed_primary_failover(&s)
+                }))
             || !self.live.load(Ordering::SeqCst)
             || self.ra.generation_state().upload_pending
-            || self.ra.peer().as_ref() != Some(&body.replica.node)
-            || self.selected.as_ref().is_none_or(|selected| {
-                body.unit != selected.unit || body.service != selected.service
-            })
+            || !self.ra.is_peer(&body.replica.node)
+            || self
+                .ra
+                .snapshot(body.unit.id.guid.0)
+                .committed
+                .as_ref()
+                .is_none_or(|current| {
+                    (body.unit != current.body.unit || body.service != current.body.service)
+                        && self.selected.as_ref().is_none_or(|selected| {
+                            body.unit != selected.unit || body.service != selected.service
+                        })
+                })
             || to_vec(&body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
         {
             return Err(Error::Unsupported);
@@ -1247,8 +1702,13 @@ impl Node {
             || body.service.activation_mode != 0
             || !body.service.scaling.0.is_empty()
             || body.service.partitions != 1
-            || body.service.target != 1
-            || body.service.minimum != 1
+            || (self.host_predecessors.is_empty()
+                && ((stateful && !ra::valid_stateful_sizes(&body.service))
+                    || (!stateful && (body.service.target != 1 || body.service.minimum != 1))))
+            || self
+                .host_predecessors
+                .last()
+                .is_some_and(|old| !stateful || body.service != old.service)
             || body.unit.consistency.kind != 1
             || !body.unit.consistency.name.is_empty()
             || body.unit.consistency.low != 0
@@ -1395,7 +1855,18 @@ impl Node {
             }
             (4, None) => Work::PrimaryOpen(Arc::new(body.clone())),
             (2, _) => Work::StatefulOpen(Arc::new(body.clone())),
-            _ => Work::Add(Arc::new(body.clone())),
+            (_, fm) => {
+                let (source, generation) = fm.unwrap_or_else(|| {
+                    (
+                        self.admission.fm_source.clone(),
+                        GenerationHeader {
+                            number: self.ra.generation_state().receive,
+                            for_fm_replica: false,
+                        },
+                    )
+                });
+                Work::Add(Arc::new(body.clone()), source, generation)
+            }
         };
         let id = self.enqueue(work)?;
         if self.disposal.as_ref().is_some_and(|witness| {
@@ -1461,6 +1932,50 @@ impl Node {
     }
     fn build(&self, work: &Work) -> ra::Command {
         match work {
+            Work::GetLsn(body, source, generation) => ra::Command::GetLsn {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::GetLsnReply(body, source, generation) => ra::Command::GetLsnReply {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::ReplicaStatus(body) => ra::Command::CompleteStatus(Box::new(body.clone())),
+            Work::Endpoint(body) => ra::Command::ProxyEndpoint(Box::new((**body).clone())),
+            Work::EndpointAck(body, source, generation) => ra::Command::EndpointReply {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::Deactivate(body, source, generation) => ra::Command::Deactivate {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::Deactivated(body, source, generation) => ra::Command::DeactivateReply {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::Reconfigure(body, source, generation) => ra::Command::DoReconfiguration {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::Activate(body, source, generation) => ra::Command::Activate {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::Activated(body, source, generation) => ra::Command::ActivateReply {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::Configured(body) => ra::Command::CompleteConfiguration(Box::new(body.clone())),
+            Work::RetryConfiguration(unit) => ra::Command::RetryConfiguration(unit.clone()),
             Work::BuildIdle(unit) => ra::Command::BuildRemoteIdle(unit.clone()),
             Work::Built(event) => ra::Command::CompleteBuild(Box::new(event.clone())),
             Work::AddReplica(body, source, generation) => ra::Command::AddReplica {
@@ -1503,13 +2018,10 @@ impl Node {
                 source: source.clone(),
                 generation: generation.clone(),
             },
-            Work::Add(body) => ra::Command::Add {
+            Work::Add(body, source, generation) => ra::Command::Add {
                 body: Box::new((**body).clone()),
-                source: self.admission.fm_source.clone(),
-                generation: GenerationHeader {
-                    number: self.admission.generation.clone(),
-                    for_fm_replica: false,
-                },
+                source: source.clone(),
+                generation: generation.clone(),
             },
             Work::Fm(work) => match work {
                 FmWork::CaptureTypeStatus => ra::Command::CaptureServiceTypeStatus,
@@ -1897,6 +2409,16 @@ impl Node {
                     let unit = body.unit.id.clone();
                     if matches!(state.phase, ra::Phase::Opening | ra::Phase::Closing) {
                         self.retry(unit)?;
+                    } else if state
+                        .swap
+                        .as_ref()
+                        .is_some_and(|s| s.stage != ra::SwapStage::Complete)
+                        || state.reconfiguration.as_ref().is_some_and(|config| {
+                            config.request.unit.current == state.body.unit.current
+                                && config.stage != ra::ConfigurationStage::Complete
+                        })
+                    {
+                        self.enqueue(Work::RetryConfiguration(unit))?;
                     } else if state.service_description_pending {
                         self.enqueue(Work::RetryDescription(unit))?;
                     }
@@ -2120,8 +2642,57 @@ impl Node {
                 if !self.room() {
                     return Ok(());
                 }
+                if self.disposal.as_ref().is_some_and(|witness| {
+                    body.replica.id > witness.proof.body.replica.id
+                        && body.replica.instance > witness.proof.body.replica.instance
+                }) {
+                    self.disposal = None;
+                }
                 self.lookup(*token, *lookup, body, *usage)?;
                 LocalDisposition::LocalResponse
+            }
+            ra::Effect::UpdateConfiguration {
+                body,
+                local,
+                flags,
+                registration,
+            } => {
+                let Some(lease) = self.activation.host_lease() else {
+                    return Err(Error::OwnerLost);
+                };
+                if self
+                    .activation
+                    .identity()
+                    .is_none_or(|id| id.host_id != registration.host)
+                {
+                    return Err(Error::Protocol);
+                }
+                let bytes = to_vec(&rap::Request {
+                    runtime: String::new(),
+                    unit: body.unit.clone(),
+                    local: (**local).clone(),
+                    remote: body.replicas.clone(),
+                    service: Service::default(),
+                    flags: *flags,
+                })
+                .map_err(|_| Error::Protocol)?;
+                if bytes.len() > BODY {
+                    return Err(Error::Capacity);
+                }
+                match lease.send_lifecycle("UpdateConfiguration", bytes) {
+                    Ok(send) => {
+                        self.route = Some(Route {
+                            runtime: registration.runtime.clone(),
+                            lease,
+                        });
+                        self.effects.pop_front();
+                        self.sending = Some(Sending { dispatch, send });
+                        return Ok(());
+                    }
+                    Err(fube_transport::Error::ResourceLimit(_)) => return Ok(()),
+                    Err(fube_transport::Error::Protocol(_)) => return Err(Error::Protocol),
+                    Err(_) => LocalDisposition::WriteFailed,
+                }
             }
             ra::Effect::RuntimeOpen {
                 body, registration, ..
@@ -2135,7 +2706,9 @@ impl Node {
             }
             | ra::Effect::RemoveIdle {
                 body, registration, ..
-            } => {
+            }
+            | ra::Effect::QueryReplicaStatus { body, registration }
+            | ra::Effect::AcknowledgeEndpoint { body, registration } => {
                 let Some(lease) = self.activation.host_lease() else {
                     self.effects.pop_front();
                     self.receipts.push_back(EffectReceipt {
@@ -2156,12 +2729,31 @@ impl Node {
                     }
                     ra::Effect::BuildIdle { .. } => ("ReplicatorBuildIdleReplica", 0),
                     ra::Effect::RemoveIdle { .. } => ("ReplicatorRemoveIdleReplica", 0),
+                    ra::Effect::QueryReplicaStatus { .. } => {
+                        ("ReplicatorUpdateEpochAndGetStatus", 0)
+                    }
+                    ra::Effect::AcknowledgeEndpoint { .. } => {
+                        ("ProxyReplicaEndpointUpdatedReply", 0)
+                    }
                     _ => unreachable!(),
                 };
                 let bytes = if let ra::Effect::BuildIdle { replica, .. }
                 | ra::Effect::RemoveIdle { replica, .. } = &dispatch.effect
                 {
                     rap::idle_request(body, replica)?
+                } else if matches!(
+                    dispatch.effect,
+                    ra::Effect::QueryReplicaStatus { .. } | ra::Effect::AcknowledgeEndpoint { .. }
+                ) {
+                    to_vec(&rap::Request {
+                        runtime: registration.runtime.clone(),
+                        unit: body.unit.clone(),
+                        local: body.replica.clone(),
+                        remote: ObjectArray(vec![]),
+                        service: Service::default(),
+                        flags: 0,
+                    })
+                    .map_err(|_| Error::Protocol)?
                 } else {
                     rap::request(registration, body, flags)?
                 };
@@ -2239,6 +2831,16 @@ impl Node {
                 LocalDisposition::LocalResponse
             }
             ra::Effect::Reply(_)
+            | ra::Effect::ChangeConfiguration(_)
+            | ra::Effect::DoReconfigurationReply(_)
+            | ra::Effect::PeerActivate { .. }
+            | ra::Effect::PeerActivateReply { .. }
+            | ra::Effect::PeerDeactivate { .. }
+            | ra::Effect::PeerDeactivateReply { .. }
+            | ra::Effect::PeerContinueSwap { .. }
+            | ra::Effect::PeerGetLsn { .. }
+            | ra::Effect::PeerGetLsnReply { .. }
+            | ra::Effect::ReplicaEndpointUpdated(_)
             | ra::Effect::PeerCreateReplica { .. }
             | ra::Effect::PeerCreateReplicaReply { .. }
             | ra::Effect::NodeActivateReply(_)
@@ -2325,13 +2927,23 @@ impl Node {
             self.held_reply = None;
             return Ok(());
         }
+        if action == "ProxyReplicaEndpointUpdated" {
+            let body: AddInstance = decode(reply.body())?;
+            self.enqueue(Work::Endpoint(Arc::new(body)))?;
+            self.held_reply = None;
+            return Ok(());
+        }
         let body: rap::Reply = decode(reply.body())?;
         let idle = matches!(
             action.as_str(),
             "ReplicatorBuildIdleReplicaReply" | "ReplicatorRemoveIdleReplicaReply"
         );
+        let configuration = action == "UpdateConfigurationReply";
         if (idle && (body.remote.0.len() != 1 || body.flags != 0))
-            || (!idle && (!body.remote.0.is_empty() || body.flags & !12 != 0))
+            || (configuration
+                && (!(2..=ra::MAX_CONFIGURATION_REPLICAS).contains(&body.remote.0.len())
+                    || body.flags & !3 != 0))
+            || (!idle && !configuration && (!body.remote.0.is_empty() || body.flags & !12 != 0))
         {
             return Err(Error::Protocol);
         }
@@ -2352,6 +2964,22 @@ impl Node {
             return Err(Error::Protocol);
         }
         let work = match reply.action().map_err(|_| Error::Protocol)?.as_str() {
+            "ReplicatorUpdateEpochAndGetStatusReply" => {
+                Work::ReplicaStatus(ra::ConfigurationCompletion {
+                    unit: body.unit,
+                    local: body.local,
+                    replicas: body.remote,
+                    flags: body.flags,
+                    error: body.error.error,
+                })
+            }
+            "UpdateConfigurationReply" => Work::Configured(ra::ConfigurationCompletion {
+                unit: body.unit,
+                local: body.local,
+                replicas: body.remote,
+                flags: body.flags,
+                error: body.error.error,
+            }),
             "ReplicatorBuildIdleReplicaReply" | "ReplicatorRemoveIdleReplicaReply" => {
                 let event = ra::BuildCompletion {
                     unit: body.unit,

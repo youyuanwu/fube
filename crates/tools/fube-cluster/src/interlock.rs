@@ -66,7 +66,7 @@ impl Interlock {
                 || handoff.deployment != marker.deployment
                 || handoff.predecessor != marker.predecessor
                 || handoff.receipts.as_ref().is_none_or(|receipts| {
-                    receipts.len() > 2
+                    receipts.len() > fube_ra::entity::MAX_CONFIGURATION_REPLICAS
                         || receipts
                             .iter()
                             .any(|receipt| receipt.deployment != marker.deployment)
@@ -117,13 +117,15 @@ impl Interlock {
         if self.root.join("deployment").exists() {
             return Err("runtime tree remains; clean handoff forbidden".into());
         }
-        if receipts.len() > 2
+        if receipts.len() > fube_ra::entity::MAX_CONFIGURATION_REPLICAS
             || receipts
                 .iter()
                 .any(|receipt| receipt.deployment != self.deployment)
-            || (receipts.len() == 2
-                && (receipts[0].node == receipts[1].node
-                    || receipts[0].session == receipts[1].session))
+            || receipts.iter().enumerate().any(|(i, receipt)| {
+                receipts[..i]
+                    .iter()
+                    .any(|old| old.node == receipt.node || old.session == receipt.session)
+            })
         {
             return Err("clean handoff proof does not match original deployment children".into());
         }
