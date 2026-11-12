@@ -63,14 +63,29 @@ fn local<'a>(body: &'a Configuration, node: &NodeInstance) -> Result<&'a Replica
         .find(|replica| &replica.node == node)
         .ok_or(Failure::Admission("configuration omitted exact local node"))
 }
+fn initial_configuration(body: &Configuration, old: &EntityState) -> bool {
+    old.reconfiguration.is_none()
+        && old.body.replica.current_role == if old.fm_primary { 4 } else { 2 }
+        && body.service == old.body.service
+        && valid_stateful_sizes(&body.service)
+        && body.replicas.0.len() == body.service.target as usize
+        && body.replicas.0.len() >= 2
+        && body
+            .replicas
+            .0
+            .iter()
+            .all(|r| matches!((r.previous_role, r.current_role), (4, 4) | (2, 3)))
+}
 fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Result<()> {
     let old_epoch = old.body.unit.current;
-    let repair = body.unit.target == 3
+    let initial = initial_configuration(body, old);
+    let repair = !initial
+        && body.unit.target == 3
         && old.body.service.target == 3
         && old.body.service.minimum == 2
         && body.service == old.body.service;
     let three = body.unit.target == 3 && old.body.service.target == 1;
-    if body.replicas.0.len() != if three || repair { 3 } else { 2 }
+    if (!initial && body.replicas.0.len() != if three || repair { 3 } else { 2 })
         || body.unit.id != old.body.unit.id
         || body.unit.consistency != old.body.unit.consistency
         || body.unit.previous != old_epoch
@@ -82,12 +97,12 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                 .ok_or(Failure::Capacity)?
         || body.unit.current.configuration & !0xffff_ffff != old_epoch.configuration & !0xffff_ffff
         || body.unit.target != body.service.target
-        || body.unit.minimum != if three || repair { 2 } else { 1 }
+        || (!initial && body.unit.minimum != if three || repair { 2 } else { 1 })
         || body.unit.minimum != body.service.minimum
-        || (!repair && !secondary_service(&old.body.service, &body.service))
+        || (!initial && !repair && !secondary_service(&old.body.service, &body.service))
     {
         return Err(Failure::Unsupported(
-            "only bounded same-Primary 1-to-2, 1-to-3 or 2-to-1 configuration is enabled",
+            "only initial configured admission or qualified legacy same-Primary configuration is enabled",
         ));
     }
     let p = local(body, primary)?;
@@ -377,10 +392,12 @@ pub(super) fn transition(
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
             }
             shape(&body.configuration, current, &admission.local_node)?;
+            let initial = initial_configuration(&body.configuration, current);
             let repair = completed_primary_failover(current)
                 && body.configuration.service == current.body.service
                 && body.configuration.unit.target == 3;
-            if body.configuration.unit.target == 3
+            if !initial
+                && body.configuration.unit.target == 3
                 && (peers.len() != 2
                     || (!repair && current.reconfiguration.is_some())
                     || current.remote_idles.len() != if repair { 1 } else { 2 })
@@ -474,7 +491,9 @@ pub(super) fn transition(
             }
             let body: Activate =
                 from_slice(&work.bytes).map_err(|_| Failure::Admission("invalid Activate"))?;
-            let repair = body.configuration.unit.target == 3
+            let initial = initial_configuration(&body.configuration, current);
+            let repair = !initial
+                && body.configuration.unit.target == 3
                 && body.configuration.service == current.body.service
                 && current.body.service.target == 3
                 && (completed_primary_failover(current) || current.body.replica.current_role == 2)

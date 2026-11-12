@@ -17,6 +17,68 @@ bounded JSON commands, independent application contact and cleanup receipts.
 It uses the production local Node/RA/Hosting/runtime, memory store and common
 transport engine, not simulated application activation.
 
+## Immutable configured initial membership
+
+The configured volatile profile is selected with
+`--stateful --target-replica-set-size N --min-replica-set-size M`, or
+`ServiceProfile::Stateful { target: N, minimum: M }`. It creates one partition
+on N original nodes, validates `1 <= M <= N <= 64` before acquiring a deployment,
+and freezes both settings for that deployment. The 64-member ceiling is a Rust
+resource bound, not an ordinary-service restriction from native SF. Existing
+bounded serialization, metadata, command and output limits remain in force.
+
+The existing node1 `create` command opens the Primary, then the foreground
+controller builds each original Secondary with AddReplica/CreateReplica and
+real RAP copy before one unchanged-Primary DoReconfiguration. Successful
+Ready/Idle replies are not active membership. All exact peer Activate replies,
+their applied RA commits and final RAP EndReconfiguration/FM reply must complete
+before the retained create result becomes complete. A local `observed: running`
+Primary is not that service-level completion. Settings are present in every
+initial Open/build body, remain unchanged through admission and do not cause
+a service update-version increment. Only configuration epochs advance.
+
+Source correspondence at `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`:
+
+- `ServiceModel/reliability/failover/ServiceDescription.cpp:239-258` validates
+  positive stateful minimum and minimum no greater than target.
+- `fm/PlacementTask.cpp:43-117` computes placement difference from desired
+  target separately from existing/in-build membership.
+- `fm/ReconfigurationTask.cpp:377-418` admits ready Idles using the service's
+  configured minimum and removes excess members relative to target; admitting
+  members is not a service-description resize.
+- `ra/FailoverUnit.cpp:5962-5973` carries configured service sizes into the FT
+  description; `fm/FailoverUnitConfiguration.h:64-68` derives read/write quorums
+  from configuration membership rather than treating minimum as a quorum override.
+
+RA and Node accept validated initial configured sizes and generic ready P/P +
+I/S vectors. The existing per-peer activation accounting, exact owner/endpoint
+checks, separate PC/CC projection and commit barriers are reused. The configured
+adapter rejects incoming size changes and keeps unsupported lifecycle operations
+explicitly rejected. Original per-peer Channels and process cleanup receipts
+remain deployment/session/node bound; clean handoff now accounts for variable
+child counts without relaxing physical-owner cleanup.
+
+Acceptance covers `1/1`, `2/1`, `3/2`, `4/2`, `4/3`, `5/3` and `4/4`, real copy
+and application replication, blocked initial writes below minimum, lost final
+configuration-reply replay and clean original-owner shutdown. Four-member
+quorum checks distinguish configured minimum from actual majority: `4/2` cannot
+acknowledge with only two live members, while `4/4` can still acknowledge with
+three live members in its unchanged four-member configuration. RA tests pause
+each activation commit and reject malformed membership/ownership. Foreground
+acceptance builds four replicas from one create and relaunches only after clean
+handoff. These checks do not qualify every size up to 64.
+The RA model also exercises all 63 remote activation commits at target/minimum
+64/32; effect reservations scale with bound peer count before persistence.
+A native-shaped target-changing request that the legacy two-member retirement
+path could accept is rejected by the immutable profile's actual ingress.
+
+This slice deliberately waits for all original build destinations and admits
+them together. Incremental/partial admission, resize, generic planned transfer,
+failover, replacement/repair, whole-node/FM restart and persisted recovery remain
+unsupported for this new profile. The older named profiles remain separate
+qualification fixtures with their existing behavior; their bounded lifecycle
+support is not implicitly enabled for arbitrary configured sizes.
+
 ## Run
 
 Build both binaries with the workspace toolchain:

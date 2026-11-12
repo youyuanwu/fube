@@ -27,7 +27,18 @@ struct Arguments {
     #[arg(long)]
     stateful_three: bool,
 
-    #[arg(long, hide = true, conflicts_with_all = ["root", "app", "stateful_singleton", "stateful_peer_idle", "stateful_three"])]
+    /// Create a volatile service with immutable configured replica-set sizes.
+    #[arg(long, requires_all = ["target_replica_set_size", "min_replica_set_size"],
+        conflicts_with_all = ["stateful_singleton", "stateful_peer_idle", "stateful_three"])]
+    stateful: bool,
+
+    #[arg(long, requires = "stateful")]
+    target_replica_set_size: Option<i32>,
+
+    #[arg(long, requires = "stateful")]
+    min_replica_set_size: Option<i32>,
+
+    #[arg(long, hide = true, conflicts_with_all = ["root", "app", "stateful_singleton", "stateful_peer_idle", "stateful_three", "stateful"])]
     internal_node: Option<PathBuf>,
 }
 
@@ -156,7 +167,16 @@ async fn run(arguments: Arguments) -> Result<bool> {
         fube_cluster::internal_node(&path).await?;
         return Ok(true);
     }
-    let profile = if arguments.stateful_three {
+    let profile = if arguments.stateful {
+        ServiceProfile::Stateful {
+            target: arguments
+                .target_replica_set_size
+                .expect("clap requires target"),
+            minimum: arguments
+                .min_replica_set_size
+                .expect("clap requires minimum"),
+        }
+    } else if arguments.stateful_three {
         ServiceProfile::StatefulThree
     } else if arguments.stateful_singleton {
         ServiceProfile::StatefulSingleton
@@ -217,6 +237,44 @@ mod tests {
             Arguments::try_parse_from(["fube-cluster", "--internal-node", "/node.json"]).unwrap();
         assert_eq!(args.internal_node, Some(PathBuf::from("/node.json")));
         assert!(args.root.is_none() && args.app.is_none());
+    }
+
+    #[test]
+    fn configured_stateful_mode_requires_both_sizes_and_excludes_legacy_profiles() {
+        let base = [
+            "fube-cluster",
+            "--root",
+            "/root",
+            "--app",
+            "/app",
+            "--stateful",
+        ];
+        assert!(Arguments::try_parse_from(base).is_err());
+        assert!(Arguments::try_parse_from(
+            base.into_iter().chain(["--target-replica-set-size", "4"])
+        )
+        .is_err());
+        let sizes = [
+            "--target-replica-set-size",
+            "4",
+            "--min-replica-set-size",
+            "3",
+        ];
+        let args = Arguments::try_parse_from(base.into_iter().chain(sizes)).unwrap();
+        assert_eq!(
+            (args.target_replica_set_size, args.min_replica_set_size),
+            (Some(4), Some(3))
+        );
+        assert!(Arguments::try_parse_from(
+            base.into_iter().chain(sizes).chain(["--stateful-three"])
+        )
+        .is_err());
+        assert!(Arguments::try_parse_from(
+            base.into_iter()
+                .chain(sizes)
+                .chain(["--internal-node", "/node"])
+        )
+        .is_err());
     }
 
     #[test]

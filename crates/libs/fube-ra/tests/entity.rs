@@ -6811,6 +6811,168 @@ async fn failover_survivor_get_lsn_and_ss_deactivate_wait_for_their_own_commits(
 }
 
 #[tokio::test]
+async fn configured_initial_membership_preserves_sizes_and_waits_for_every_activation_commit() {
+    for (target, minimum) in [(2, 1), (3, 2), (4, 2), (4, 3), (5, 3), (4, 4), (64, 32)] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        let peers: Vec<_> = (0..target - 1)
+            .map(|i| NodeInstance {
+                id: [10 + i as u8; 16],
+                instance: 100 + i as u64,
+            })
+            .collect();
+        executor.bind_peers(peers.clone()).unwrap();
+        let mut request = primary_body();
+        request.service.target = target;
+        request.service.minimum = minimum;
+        request.unit.target = target;
+        request.unit.minimum = minimum;
+        make_ready(&executor, &request).await;
+        let original = state(&executor);
+        let mut replicas = vec![original.body.replica.clone()];
+        replicas[0].previous_role = 4;
+        for (i, peer) in peers.iter().enumerate() {
+            let mut add = fm_idle_request(&original);
+            add.replica.node = peer.clone();
+            add.replica.id += i as i64;
+            add.replica.instance += i as i64;
+            run(&executor, fm_add_idle(add.clone())).await;
+            assert!(
+                matches!(effects(&executor).as_slice(), [Effect::PeerCreateReplica { body, .. }]
+                if body.replica.0.service == request.service)
+            );
+            let mut opened = CreateReplicaReply {
+                unit: add.unit,
+                replica: add.replica,
+                error: 0,
+            };
+            opened.replica.replication_endpoint = format!("127.0.0.1:{}", 12346 + i);
+            run(
+                &executor,
+                Command::CreateReplicaReply {
+                    source: peer.clone(),
+                    body: Box::new(opened.clone()),
+                    generation: generation_header(admission().generation.generation),
+                },
+            )
+            .await;
+            effects(&executor);
+            run(
+                &executor,
+                Command::CompleteBuild(Box::new(BuildCompletion {
+                    unit: original.body.unit.clone(),
+                    local: original.body.replica.clone(),
+                    remote: opened.replica.clone(),
+                    error: 0,
+                    detail: ProxyErrorDetail::default(),
+                })),
+            )
+            .await;
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::AddReplicaReply(_)]
+            ));
+            opened.replica.previous_role = 2;
+            opened.replica.current_role = 3;
+            opened.replica.state = 2;
+            replicas.push(opened.replica);
+        }
+        let mut unit = request.unit.clone();
+        unit.previous = unit.current;
+        unit.current.configuration += 1;
+        let config = Configuration {
+            unit,
+            service: request.service.clone(),
+            replicas: fube_transport::serialization::serde::ObjectArray(replicas),
+        };
+        for bad in 0..4 {
+            let mut invalid = config.clone();
+            match bad {
+                0 => {
+                    invalid.service.minimum = 0;
+                    invalid.unit.minimum = 0;
+                }
+                1 => {
+                    invalid.service.target += 1;
+                    invalid.unit.target += 1;
+                }
+                2 => {
+                    invalid.replicas.0.pop();
+                }
+                _ => invalid.replicas.0[1].instance += 1,
+            }
+            assert!(executor
+                .submit(reconfigure(invalid))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+            assert_eq!(state(&executor).body, original.body);
+            assert!(effects(&executor).is_empty());
+        }
+        run(&executor, reconfigure(config.clone())).await;
+        run(
+            &executor,
+            Command::CompleteConfiguration(Box::new(configured(&effects(&executor)))),
+        )
+        .await;
+        assert_eq!(
+            effects(&executor)
+                .iter()
+                .filter(|e| matches!(e, Effect::PeerActivate { .. }))
+                .count(),
+            peers.len()
+        );
+        for (i, peer) in peers.iter().enumerate() {
+            let mut unit = config.unit.clone();
+            unit.previous = Epoch::default();
+            let mut replica = config.replicas.0[i + 1].clone();
+            replica.previous_role = 1;
+            let ack = Command::ActivateReply {
+                source: peer.clone(),
+                body: Box::new(ActivateReply {
+                    unit,
+                    replica,
+                    error: 0,
+                }),
+                generation: generation_header(admission().generation.generation),
+            };
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor.submit(ack).unwrap();
+            entered.await.unwrap();
+            assert_eq!(
+                state(&executor)
+                    .reconfiguration
+                    .as_ref()
+                    .unwrap()
+                    .activated
+                    .len(),
+                i
+            );
+            assert!(effects(&executor).is_empty());
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            let actions = effects(&executor);
+            assert!(!actions
+                .iter()
+                .any(|e| matches!(e, Effect::DoReconfigurationReply(_))));
+            if i + 1 == peers.len() {
+                let end = configured(&actions);
+                assert_eq!(end.flags, 1);
+                run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
+            }
+        }
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(reply)]
+            if reply.replicas.0.len() == target as usize)
+        );
+        assert_eq!(state(&executor).body.service, request.service);
+        assert_eq!(state(&executor).body.unit.target, target);
+        assert_eq!(state(&executor).body.unit.minimum, minimum);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
 async fn three_replica_activation_waits_for_each_exact_peer_and_its_commit() {
     for (unknown, fail) in [(false, false), (false, true), (true, false)] {
         let (store, executor, hooks) = setup(if unknown {

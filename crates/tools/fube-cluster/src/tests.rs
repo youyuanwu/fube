@@ -1742,6 +1742,7 @@ async fn hold_peer_loss_frame(
                 cluster.receive_message(index, incoming).await?;
             }
         }
+        cluster.advance_initial_membership().await?;
         cluster.start_failover().await;
         cluster.advance_repair().await?;
         if Instant::now() >= end { return Err(format!("held {action} deadline: {}", cluster.status())); }
@@ -3081,6 +3082,131 @@ async fn fm_deletes_original_built_idle_destination_without_replacing_or_stoppin
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
     result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn immutable_configured_service_builds_initial_membership_without_resize() {
+    for (target, minimum) in [(1, 1), (2, 1), (3, 2), (4, 2), (4, 3), (5, 3), (4, 4)] {
+        let fixture = Fixture::new("immutable-sizes");
+        let mut config = fixture.config();
+        config.profile = ServiceProfile::Stateful { target, minimum };
+        config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+        let mut cluster = Cluster::new(config).unwrap();
+        if let Err(error) = cluster.start().await {
+            let cleanup = cluster.shutdown().await;
+            panic!("configured startup: {error}; cleanup={cleanup}");
+        }
+        let result = peer_idle_catch(async {
+            let creation = cluster.ledger.placements[0].body()?;
+            let service = creation.service.clone();
+            assert_eq!((service.target, service.minimum), (target, minimum));
+            cluster.execute(command("primary", "create", Some(1))).await?;
+            until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
+            let endpoint = cluster.ledger.placements[0].endpoint.clone().ok_or("missing endpoint")?;
+            if target > 1 {
+                assert_eq!(cluster.ledger.result("primary")["state"], "pending");
+                assert!(!cluster.ledger.configuration_status()["ready"].as_bool().unwrap());
+            }
+            if minimum > 1 {
+                assert!(!data_contact(&endpoint, b"write\n").starts_with("OK "));
+            }
+            if target > 1 {
+                let lost = hold_peer_loss_frame(&mut cluster, 0, "DoReconfigurationReply", Duration::from_secs(30)).await?;
+                assert_eq!(cluster.ledger.result("primary")["state"], "pending");
+                assert_eq!(cluster.ledger.configuration_status()["ready"], false);
+                let request = cluster.ledger.configuration.as_ref().unwrap().body.clone();
+                assert_eq!(request.configuration.service, service);
+                assert_eq!(request.configuration.replicas.0.len(), target as usize);
+                for idle in &cluster.ledger.idles {
+                    assert_eq!(idle.body.service, service);
+                    assert_eq!((idle.body.unit.target, idle.body.unit.minimum), (target, minimum));
+                }
+                let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11)).ok_or("missing configuration retry")?;
+                assert_eq!(retry, request);
+                cluster.send_configuration(&retry).await?;
+                until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+                let (reply, _) = decode_do_reconfiguration_reply(&lost).map_err(err)?;
+                assert_eq!(cluster.ledger.configuration.as_ref().unwrap().reply.as_ref(), Some(&reply));
+            }
+            until(&mut cluster, |c| c.ledger.result("primary")["state"] == "complete").await;
+            until(&mut cluster, |_| data_contact(&endpoint, b"read\n").starts_with("OK ")).await;
+            let written = data_contact(&endpoint, b"write\n");
+            assert!(written.contains("committed=1 value=acknowledged"), "{target}/{minimum}: {written}");
+            until(&mut cluster, |c| (1..target as usize).all(|i|
+                c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 1)).await;
+            until(&mut cluster, |c| (0..target as usize).all(|i|
+                c.status()["nodes"][i]["retained_work"]["app_observation"]["opens"] == 1
+                && c.status()["nodes"][i]["retained_work"]["local_replica"]["replica"]["current_role"] == if i == 0 { 4 } else { 3 })).await;
+            assert!(cluster.transfer_primary().await.is_err());
+            assert!(cluster.retire_secondary_replica().await.is_err());
+            assert!(cluster.repair_primary_replica().await.is_err());
+            for placement in &cluster.ledger.placements {
+                assert_eq!(placement.body()?.service, service);
+                let mut resize = placement.body()?;
+                resize.service.minimum = if minimum == 1 { 2 } else { 1 };
+                assert!(placement.launch.check_service_sizes(&resize.unit, &resize.service).is_err());
+            }
+            let status = cluster.status();
+            for (i, node) in status["nodes"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(node["retained_work"]["app_observation"]["opens"], 1);
+                assert_eq!(node["retained_work"]["local_replica"]["replica"]["current_role"], if i == 0 { 4 } else { 3 });
+            }
+            if target == 4 && (minimum == 2 || minimum == 4) {
+                let lost: &[usize] = if minimum == 2 { &[2, 3] } else { &[3] };
+                for &index in lost {
+                    let pid = cluster.ledger.placements[index].profile.as_ref().unwrap().app_pid;
+                    assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+                }
+                until(&mut cluster, |c| lost.iter().all(|index| c.ledger.placements[*index].loss_reported)).await;
+                assert_eq!(cluster.ledger.configuration_status()["state"], "unknown");
+                assert!(cluster.ledger.start_primary_failover(Instant::now())?.is_none());
+                if minimum == 4 {
+                    assert!(data_contact(&endpoint, b"write-more\n").contains("committed=2"));
+                } else {
+                    let mut pending = TcpStream::connect(&endpoint).map_err(err)?;
+                    pending.set_read_timeout(Some(Duration::from_millis(250))).map_err(err)?;
+                    pending.write_all(b"write-more\n").map_err(err)?;
+                    until(&mut cluster, |c| c.status()["nodes"][0]["retained_work"]["app_observation"]["primary_last_admitted"] == 2).await;
+                    let mut bytes = [0; 1024];
+                    assert!(matches!(pending.read(&mut bytes), Err(ref e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)));
+                    assert_eq!(cluster.status()["nodes"][0]["retained_work"]["app_observation"]["primary_last_acknowledged"], 1);
+                }
+            } else if target == 2 {
+                let mut resize = cluster.ledger.configuration.as_ref().unwrap().body.clone();
+                resize.configuration.unit.previous = resize.configuration.unit.current;
+                resize.configuration.unit.current.configuration += 1;
+                resize.configuration.unit.target = 1;
+                resize.configuration.service.target = 1;
+                resize.configuration.service.update_version += 1;
+                for replica in &mut resize.configuration.replicas.0 {
+                    replica.previous_role = replica.current_role;
+                    if replica.current_role == 3 { replica.current_role = 1; }
+                }
+                cluster.send_configuration(&resize).await?;
+                until(&mut cluster, |c| !c.ledger.placements[0].link_alive).await;
+                assert_eq!(cluster.ledger.configuration_status()["state"], "unknown");
+            }
+            Ok::<(), String>(())
+        }).await;
+        if !matches!(&result, Ok(Ok(()))) {
+            eprintln!("CONFIGURED_STATUS {}", cluster.status());
+            for child in &cluster.children { eprintln!("CONFIGURED_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+        }
+        let cleanup = cluster.shutdown().await;
+        assert_eq!(cleanup["clean"], true, "{cleanup}");
+        result.unwrap().unwrap();
+    }
+}
+
+#[test]
+fn configured_sizes_reject_invalid_bounds_before_acquiring_a_deployment() {
+    for (target, minimum) in [(0, 0), (1, 0), (2, 3), (65, 1), (-1, 1)] {
+        let fixture = Fixture::new("invalid-sizes");
+        let mut config = fixture.config();
+        config.profile = ServiceProfile::Stateful { target, minimum };
+        assert!(Cluster::new(config).is_err());
+        assert!(!fixture.root.exists());
+    }
 }
 
 #[tokio::test]

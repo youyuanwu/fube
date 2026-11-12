@@ -64,6 +64,13 @@ pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
 pub const RA_NOT_READY: i64 = -2_147_017_447;
 pub const SERVICE_TYPE_NOT_REGISTERED: i64 = -2_147_017_448;
+pub const MAX_CONFIGURATION_REPLICAS: usize = 64;
+
+pub fn valid_stateful_sizes(service: &Service) -> bool {
+    service.minimum >= 1
+        && service.target >= service.minimum
+        && service.target as usize <= MAX_CONFIGURATION_REPLICAS
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
@@ -1359,6 +1366,10 @@ impl Executor {
             Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => 8,
             Kind::NodeDeactivate { .. } => 3,
             Kind::CheckNodeDeactivation => self.shared.settings.max_entities + 1,
+            Kind::DoReconfiguration { .. }
+            | Kind::CompleteConfiguration
+            | Kind::ActivateReply { .. }
+            | Kind::RetryConfiguration => view.peers.len().max(8),
             kind if kind.node_work() => 2,
             _ => 8,
         };
@@ -1924,7 +1935,6 @@ fn transition(
         | Kind::OpenLocalStateful
         | Kind::OpenLocalPrimary => {
             let body: AddInstance = from_slice(&work.bytes).map_err(decode_error)?;
-            let mut three_peer = false;
             let peer_creation = match &work.kind {
                 Kind::CreateReplica {
                     source,
@@ -1964,7 +1974,6 @@ fn transition(
                             && body.replica.instance == s.body.replica.instance
                             && body.replica.current_role == 2
                     });
-                    three_peer = peers.len() == 2 && (lost_primary || retained_peer);
                     if !retired_peer
                         && !lost_primary
                         && !retained_peer
@@ -2039,13 +2048,7 @@ fn transition(
             if local_stateful
                 && (body.replica.previous_role != 1
                     || body.service.partitions != 1
-                    || ((body.service.target != 1 || body.service.minimum != 1)
-                        && !(three_peer
-                            && peer_creation.is_some()
-                            && body.service.target == 3
-                            && body.service.minimum == 2
-                            && body.unit.target == 3
-                            && body.unit.minimum == 2))
+                    || !valid_stateful_sizes(&body.service)
                     || body.service.activation_mode != 0
                     || !body.service.scaling.0.is_empty()
                     || body.unit.consistency.kind != 1
@@ -2059,7 +2062,7 @@ fn transition(
                     || !body.replica.replication_endpoint.is_empty())
             {
                 return Err(Failure::Unsupported(
-                    "only local volatile singleton initial Open",
+                    "only local volatile initial Open with valid configured sizes",
                 ));
             }
             if role == 4 && !fm_primary && body.unit.previous != Epoch::default() {

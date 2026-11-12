@@ -1593,7 +1593,7 @@ impl Node {
         if !self.live.load(Ordering::SeqCst)
             || self.ra.generation_state().upload_pending
             || !self.ra.consumer_lifetime().is_accepting()
-            || !matches!(body.replicas.0.len(), 2 | 3)
+            || !(2..=ra::MAX_CONFIGURATION_REPLICAS).contains(&body.replicas.0.len())
             || to_vec(body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
         {
             return Err(Error::Unsupported);
@@ -1687,7 +1687,8 @@ impl Node {
             || !body.service.scaling.0.is_empty()
             || body.service.partitions != 1
             || (self.host_predecessors.is_empty()
-                && (body.service.target != 1 || body.service.minimum != 1))
+                && ((stateful && !ra::valid_stateful_sizes(&body.service))
+                    || (!stateful && (body.service.target != 1 || body.service.minimum != 1))))
             || (!self.host_predecessors.is_empty()
                 && (body.service.target != 3 || body.service.minimum != 2))
             || body.unit.consistency.kind != 1
@@ -2920,7 +2921,9 @@ impl Node {
         );
         let configuration = action == "UpdateConfigurationReply";
         if (idle && (body.remote.0.len() != 1 || body.flags != 0))
-            || (configuration && (!matches!(body.remote.0.len(), 2 | 3) || body.flags & !3 != 0))
+            || (configuration
+                && (!(2..=ra::MAX_CONFIGURATION_REPLICAS).contains(&body.remote.0.len())
+                    || body.flags & !3 != 0))
             || (!idle && !configuration && (!body.remote.0.is_empty() || body.flags & !12 != 0))
         {
             return Err(Error::Protocol);

@@ -214,7 +214,7 @@ impl Executor {
             || !view.entities.is_empty()
             || view.generations_touched
             || sources.is_empty()
-            || sources.len() > 2
+            || sources.len() >= MAX_CONFIGURATION_REPLICAS
             || sources.iter().enumerate().any(|(i, source)| {
                 source.id == self.shared.local_node.id
                     || source.id == self.shared.fm_source.id
@@ -457,7 +457,7 @@ fn create_remote(
     if let Some(previous) = state.remote_idle_mut(&target.node) {
         *previous = remote;
     } else {
-        if state.remote_idles.len() >= 2
+        if state.remote_idles.len() >= MAX_CONFIGURATION_REPLICAS - 1
             || state
                 .remote_idles
                 .iter()

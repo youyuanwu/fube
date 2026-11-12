@@ -124,6 +124,13 @@ uses latest committed membership, refreshed deactivation history and strictly
 newer replica incarnations. Three process cycles include promotion of a rebuilt
 replica and two replacements on one live Node/RA. Repair remains explicit;
 overlapping recovery, whole-node/FM failure and data loss remain gated.
+The [immutable configured initial-membership profile](MinimalFmCluster.md#immutable-configured-initial-membership)
+now carries creation-time target/minimum unchanged through Primary Open, generic
+Idle build and full initial Secondary admission, without service-size updates.
+Real-process qualification includes even/odd targets and different minima up to
+five replicas; a finite 64-member resource ceiling and existing byte budgets
+remain. Resize, partial admission and general failover/repair remain gated for
+this new profile; the named lifecycle qualification profiles are unchanged.
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's

@@ -66,7 +66,7 @@ impl Interlock {
                 || handoff.deployment != marker.deployment
                 || handoff.predecessor != marker.predecessor
                 || handoff.receipts.as_ref().is_none_or(|receipts| {
-                    receipts.len() > 3
+                    receipts.len() > fube_ra::entity::MAX_CONFIGURATION_REPLICAS
                         || receipts
                             .iter()
                             .any(|receipt| receipt.deployment != marker.deployment)
@@ -117,7 +117,7 @@ impl Interlock {
         if self.root.join("deployment").exists() {
             return Err("runtime tree remains; clean handoff forbidden".into());
         }
-        if receipts.len() > 3
+        if receipts.len() > fube_ra::entity::MAX_CONFIGURATION_REPLICAS
             || receipts
                 .iter()
                 .any(|receipt| receipt.deployment != self.deployment)

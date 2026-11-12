@@ -21,14 +21,19 @@ pub enum ServiceProfile {
     StatefulSingleton,
     StatefulPeerIdle,
     StatefulThree,
+    Stateful {
+        target: i32,
+        minimum: i32,
+    },
 }
 impl ServiceProfile {
     pub fn service(self) -> &'static str {
         match self {
             Self::Stateless => SERVICE,
-            Self::StatefulSingleton | Self::StatefulPeerIdle | Self::StatefulThree => {
-                "fabric:/Cluster/Singleton"
-            }
+            Self::StatefulSingleton
+            | Self::StatefulPeerIdle
+            | Self::StatefulThree
+            | Self::Stateful { .. } => "fabric:/Cluster/Singleton",
         }
     }
     pub fn stateful(self) -> bool {
@@ -36,9 +41,32 @@ impl ServiceProfile {
     }
     pub fn peer_replicas(self) -> bool {
         matches!(self, Self::StatefulPeerIdle | Self::StatefulThree)
+            || matches!(self, Self::Stateful { target, .. } if target > 1)
+    }
+    pub fn configured_sizes(self) -> Option<(i32, i32)> {
+        match self {
+            Self::Stateful { target, minimum } => Some((target, minimum)),
+            _ => None,
+        }
+    }
+    pub fn mesh_peers(self) -> bool {
+        matches!(self, Self::StatefulThree | Self::Stateful { .. })
+    }
+    pub fn validate(self) -> Result<()> {
+        if let Some((target, minimum)) = self.configured_sizes() {
+            if minimum < 1
+                || target < minimum
+                || target as usize > fube_ra::entity::MAX_CONFIGURATION_REPLICAS
+            {
+                return Err("stateful sizes require 1 <= minimum <= target <= 64".into());
+            }
+        }
+        Ok(())
     }
     pub fn node_count(self) -> usize {
-        if self == Self::StatefulThree {
+        if let Self::Stateful { target, .. } = self {
+            target as usize
+        } else if self == Self::StatefulThree {
             3
         } else {
             2
@@ -210,6 +238,21 @@ pub struct Launch {
     pub peers: Vec<Peer>,
 }
 impl Launch {
+    pub fn check_service_sizes(&self, unit: &FailoverUnit, service: &Service) -> Result<()> {
+        if self
+            .profile
+            .configured_sizes()
+            .is_some_and(|(target, minimum)| {
+                unit.target != target
+                    || unit.minimum != minimum
+                    || service.target != target
+                    || service.minimum != minimum
+            })
+        {
+            return Err("replica-set settings are immutable for this service".into());
+        }
+        Ok(())
+    }
     pub fn host_replacement_path(&self, replica: i64, instance: i64) -> PathBuf {
         self.directory
             .join(format!("repaired-host-{replica}-{instance}.json"))
@@ -237,6 +280,7 @@ impl Launch {
         format!("node{}", self.placement)
     }
     pub fn validate(&self) -> Result<()> {
+        self.profile.validate()?;
         if !(1..=self.profile.node_count()).contains(&usize::from(self.placement))
             || self.node.id == self.fm.id
             || self.node.instance == 0
@@ -261,7 +305,7 @@ impl Launch {
             uuid::Uuid::parse_str(id).map_err(err)?;
         }
         let expected = if self.profile.peer_replicas() {
-            if self.placement == 1 || self.profile == ServiceProfile::StatefulThree {
+            if self.placement == 1 || self.profile.mesh_peers() {
                 self.profile.node_count() - 1
             } else {
                 1
@@ -394,7 +438,8 @@ pub fn fixed_type_for(profile: ServiceProfile) -> ServiceType {
         ServiceProfile::Stateless => ("ClusterStatelessApp", "ClusterService", TYPE),
         ServiceProfile::StatefulSingleton
         | ServiceProfile::StatefulPeerIdle
-        | ServiceProfile::StatefulThree => (
+        | ServiceProfile::StatefulThree
+        | ServiceProfile::Stateful { .. } => (
             "HostingLocalStatefulApp",
             "LocalService",
             "LocalStatefulType",
@@ -422,8 +467,9 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
         configuration: 1,
         data_loss: 1,
     };
-    body.unit.target = 1;
-    body.unit.minimum = 1;
+    let (target, minimum) = launch.profile.configured_sizes().unwrap_or((1, 1));
+    body.unit.target = target;
+    body.unit.minimum = minimum;
     body.replica.node = launch.node.clone();
     body.replica.id = launch.replica;
     body.replica.instance = launch.incarnation;
@@ -435,8 +481,8 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
     body.service.service_type = profile.service_type.clone();
     body.service.version = profile.version.clone();
     body.service.partitions = 1;
-    body.service.target = 1;
-    body.service.minimum = 1;
+    body.service.target = target;
+    body.service.minimum = minimum;
     if launch.profile.stateful() {
         body.service.stateful = true;
         body.replica.current_role = 4;

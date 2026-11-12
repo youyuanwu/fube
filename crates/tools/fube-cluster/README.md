@@ -11,6 +11,37 @@ An explicit `--stateful-singleton` variant admits the existing
 The two nodes host independent singleton partitions, not two replicas or an HA
 configuration. Stateless remains the default.
 
+`--stateful --target-replica-set-size N --min-replica-set-size M` /
+`ServiceProfile::Stateful { target: N, minimum: M }` creates one volatile
+partition on N original nodes, with **immutable** settings satisfying
+`1 <= M <= N <= 64`. The ceiling is an implementation resource limit, not
+an SF replica-set-size rule; existing message, metadata and output budgets
+remain enforced. Process qualification covers up to five replicas, not every
+size up to that ceiling.
+
+Send the existing `create` command for node1. Driving the cluster automatically
+builds the original Secondary destinations, one at a time, then admits all
+successful Idles through unchanged-Primary reconfiguration. Target/minimum
+are present from the first AddPrimary/CreateReplica, and neither the settings
+nor the service update version changes during admission. Minimum and
+configuration-derived quorum remain separate: opening the Primary alone
+does not bypass native write-access checks.
+
+For N > 1, the create operation remains pending until every exact peer
+activation and final RAP/FM configuration completion; `nodes[0].observed`
+can already say `running` for the local Primary. Poll `configuration.ready`
+or the retained create result, not registration or transport completion.
+Status exposes `replica_set: { target, minimum, immutable: true }`.
+For N = 1 the normal AddPrimary completion settles creation.
+
+This configured profile currently qualifies **initial build/admission only**.
+It rejects resize, planned transfer, Secondary retirement/replacement and
+Primary repair; it does not automatically promote or restart an application
+after loss. Node loss makes membership unknown. The named profiles below
+remain separate legacy qualification paths, including their historical
+service-size transitions and bounded failover/repair.
+See [native mapping and acceptance](../../../docs/cluster/MinimalFmCluster.md#immutable-configured-initial-membership).
+
 `--stateful-three` / `ServiceProfile::StatefulThree` is a separate, fixed
 three-node volatile profile. Create only the original node1 Primary. Then call
 `Cluster::add_idle_replica_on(2)` and `add_idle_replica_on(3)` in either order.

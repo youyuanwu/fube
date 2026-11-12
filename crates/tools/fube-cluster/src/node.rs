@@ -1067,7 +1067,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                                 }
                                 Ok(parts) if matches!(parts.len(), 4 | 5) && parts[0] == "peer"
                                     && parts[1] == launch.session && parts[2] == launch.capability
-                                    && (launch.placement == 1 || launch.profile == ServiceProfile::StatefulThree) && !launch.peers.is_empty() => {
+                                    && (launch.placement == 1 || launch.profile.mesh_peers()) && !launch.peers.is_empty() => {
                                     let index = if parts.len() == 5 {
                                         match parts[3].parse::<usize>() {
                                             Ok(index) => index,
@@ -1630,6 +1630,7 @@ fn receive_peer_from(
         }
         "Activate" => {
             let (body, generation) = decode_activate(message).map_err(err)?;
+            launch.check_service_sizes(&body.configuration.unit, &body.configuration.service)?;
             node.activate_replica_from_peer(body, &peer.node, &generation)
         }
         "ActivateReply" => {
@@ -1648,6 +1649,7 @@ fn receive_peer_from(
             if launch.placement != 1 || launch.profile == ServiceProfile::StatefulThree =>
         {
             let (body, generation) = decode_create_replica(message).map_err(err)?;
+            launch.check_service_sizes(&body.replica.0.unit, &body.replica.0.service)?;
             fixed_idle_target(
                 launch,
                 &body.replica.0.unit.id,
@@ -2016,6 +2018,7 @@ fn receive_command(
         }
         "AddPrimary" => {
             let (body, generation) = decode_add_primary(message).map_err(err)?;
+            launch.check_service_sizes(&body.unit, &body.service)?;
             node.add_primary_from_fm(body, &launch.fm, &generation)
                 .map_err(err)?;
         }
@@ -2026,6 +2029,7 @@ fn receive_command(
                 return Err("DoReconfiguration requires the original coordinating Primary".into());
             }
             let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
+            launch.check_service_sizes(&body.configuration.unit, &body.configuration.service)?;
             node.reconfigure_from_fm(body, &launch.fm, &generation)
                 .map_err(err)?;
         }
@@ -2042,6 +2046,7 @@ fn receive_command(
                 decode_add_replica(message)
             }
             .map_err(err)?;
+            launch.check_service_sizes(&body.unit, &body.service)?;
             let peer = launch
                 .peers
                 .iter()

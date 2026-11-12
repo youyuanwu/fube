@@ -69,6 +69,11 @@ The [repeated live-session extension](MinimalFmCluster.md#repeated-live-session-
 uses latest committed membership/history for subsequent cycles, retaining native
 epoch/incarnation fencing and the same codecs. Three-cycle process acceptance
 and repeated survivor commit-barrier tests add no wire schema or action.
+The [immutable configured initial-membership extension](MinimalFmCluster.md#immutable-configured-initial-membership)
+also reuses existing AddPrimary, AddReplica, CreateReplica, DoReconfiguration
+and Activate codecs. It propagates fixed creation-time sizes and generalizes
+healthy membership vectors/activation accounting, not native action/schema
+counts or the scope of native interoperability evidence.
 The maintained source-stream oracle now has 173 inputs, 84 types/255 fields,
 177 bundle files and 53 native truncation rejections, retaining the preceding
 172-case healthy three-member gate, the

@@ -55,6 +55,7 @@ pub struct Cluster {
 }
 impl Cluster {
     pub fn new(mut config: Config) -> Result<Self> {
+        config.profile.validate()?;
         let node_count = config.profile.node_count();
         config.app = config.app.canonicalize().map_err(err)?;
         config.executable = config.executable.canonicalize().map_err(err)?;
@@ -114,7 +115,7 @@ impl Cluster {
                     .iter()
                     .enumerate()
                     .filter(|(other, _)| {
-                        if config.profile == ServiceProfile::StatefulThree {
+                        if config.profile.mesh_peers() {
                             *other != index
                         } else if index == 0 {
                             *other != 0
@@ -154,7 +155,7 @@ impl Cluster {
             for source in 0..self.children.len() {
                 for index in source + 1..self.children.len() {
                     if !self.config.profile.peer_replicas()
-                        || (source != 0 && self.config.profile != ServiceProfile::StatefulThree)
+                        || (source != 0 && !self.config.profile.mesh_peers())
                     {
                         continue;
                     }
@@ -674,11 +675,49 @@ impl Cluster {
                 }
             }
         }
+        if let Err(error) = self.advance_initial_membership().await {
+            self.ledger.lost(0, error);
+        }
         self.start_failover().await;
         if let Err(error) = self.advance_repair().await {
             self.ledger
                 .lost(self.ledger.failed_primary_index().unwrap_or(0), error);
         }
+    }
+    async fn advance_initial_membership(&mut self) -> Result<()> {
+        if self.config.profile.configured_sizes().is_none()
+            || self.children.len() <= 1
+            || self.ledger.configuration.is_some()
+            || self.ledger.placements[0].observed != fm::Observed::Running
+            || self
+                .ledger
+                .placements
+                .iter()
+                .any(|p| !p.link_alive || p.loss_reported)
+        {
+            return Ok(());
+        }
+        if let Some(destination) = (1..self.children.len()).find(|index| {
+            !self
+                .ledger
+                .idles
+                .iter()
+                .any(|idle| idle.body.replica.node == self.children[*index].launch.node)
+        }) {
+            if self
+                .ledger
+                .idles
+                .iter()
+                .all(|idle| idle.reply.as_ref().is_some_and(|reply| reply.error == 0))
+            {
+                let body = self.ledger.request_idle_on(destination, Instant::now())?;
+                self.send_idle(&body).await?;
+            }
+        } else if self.ledger.idle_status()["ready"] == true {
+            let body = self.ledger.request_configuration(Instant::now())?;
+            self.send_configuration(&body).await?;
+        }
+        Ok(())
     }
     /// Restore one lost volatile Primary as a fresh Secondary on its original live Node.
     pub async fn repair_primary_replica(&mut self) -> Result<Value> {
@@ -1175,16 +1214,16 @@ impl Cluster {
         }
         Ok(self.ledger.idle_status())
     }
-    /// Build one original destination in the explicit three-member profile.
-    /// Destination is the one-based node number (2 or 3).
+    /// Build one original Secondary destination selected by its one-based node number.
     pub async fn add_idle_replica_on(&mut self, destination: u8) -> Result<Value> {
-        if self.config.profile != ServiceProfile::StatefulThree
+        if !(self.config.profile == ServiceProfile::StatefulThree
+            || self.config.profile.configured_sizes().is_some())
             || self.finished.is_some()
-            || self.children.len() != 3
-            || !(2..=3).contains(&destination)
+            || self.children.len() != self.config.profile.node_count()
+            || !(2..=self.children.len()).contains(&usize::from(destination))
         {
             return Err(
-                "targeted build requires the original three-node profile and node 2|3".into(),
+                "targeted build requires an original configured Secondary destination".into(),
             );
         }
         let body = self

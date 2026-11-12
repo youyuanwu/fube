@@ -1165,6 +1165,12 @@ impl Ledger {
     }
     pub fn accept(&mut self, command: Command) -> Result<Accepted> {
         command.validate()?;
+        if command
+            .node
+            .is_some_and(|node| usize::from(node) > self.placements.len())
+        {
+            return Err("node is outside the configured topology".into());
+        }
         if let Some(operation) = self
             .operations
             .iter()
@@ -1526,7 +1532,13 @@ impl Ledger {
         }
     }
     pub fn down(&mut self, index: usize) {
-        if self.placements[0].launch.profile == crate::ServiceProfile::StatefulThree {
+        if self.placements[0].launch.profile == crate::ServiceProfile::StatefulThree
+            || self.placements[0]
+                .launch
+                .profile
+                .configured_sizes()
+                .is_some()
+        {
             if let Some(configuration) = &mut self.configuration {
                 configuration.unknown = true;
             }
@@ -1694,7 +1706,12 @@ impl Ledger {
             placement.endpoint = endpoint;
         }
         placement.error = None;
-        let outcome = json!({"op":op,"state":"complete",
+        let configuring = placement
+            .launch
+            .profile
+            .configured_sizes()
+            .is_some_and(|(target, _)| target > 1);
+        let outcome = json!({"op":op,"state":if configuring { "pending" } else { "complete" },
             "observed":"running", "replica":placement.replica,
             "incarnation":placement.incarnation, "endpoint":placement.endpoint});
         self.complete(&op, outcome);
@@ -1837,6 +1854,8 @@ impl Ledger {
     }
     pub fn status(&self) -> Value {
         json!({"nodes":self.placements.iter().map(Placement::status).collect::<Vec<_>>(),
+            "replica_set":self.placements[0].launch.profile.configured_sizes().map(|(target, minimum)|
+                json!({"target":target,"minimum":minimum,"immutable":true})),
             "idle_build":self.idle_status(),
             "idle_removal":self.idle_removal_status(),
             "idle_deletion":self.idle_deletion_status(),
@@ -2203,6 +2222,7 @@ impl Ledger {
     }
     pub fn request_configuration(&mut self, now: Instant) -> Result<DoReconfiguration> {
         let count = self.placements.len() as i32;
+        let configured = self.placements[0].launch.profile.configured_sizes();
         if self.swap.is_some() {
             return Err("another configuration after Primary transfer is gated".into());
         }
@@ -2276,15 +2296,21 @@ impl Ledger {
         {
             return Err("same-Primary configuration epoch exhausted".into());
         }
-        body.unit.target = count;
-        body.unit.minimum = if count == 3 { 2 } else { 1 };
-        body.service.target = count;
-        body.service.minimum = body.unit.minimum;
-        body.service.update_version = body
-            .service
-            .update_version
-            .checked_add(1)
-            .ok_or("service version exhausted")?;
+        if let Some((target, minimum)) = configured {
+            if target != count || body.service.target != target || body.service.minimum != minimum {
+                return Err("initial membership cannot resize the configured service".into());
+            }
+        } else {
+            body.unit.target = count;
+            body.unit.minimum = if count == 3 { 2 } else { 1 };
+            body.service.target = count;
+            body.service.minimum = body.unit.minimum;
+            body.service.update_version = body
+                .service
+                .update_version
+                .checked_add(1)
+                .ok_or("service version exhausted")?;
+        }
         let body = DoReconfiguration {
             configuration: Configuration {
                 unit: body.unit,
@@ -2466,6 +2492,18 @@ impl Ledger {
             placement.created = true;
         }
         config.reply = Some(body);
+        if self.placements[0]
+            .launch
+            .profile
+            .configured_sizes()
+            .is_some()
+        {
+            if let Some(op) = self.placements[0].create_op.clone() {
+                let mut outcome = self.result(&op);
+                outcome["state"] = json!("complete");
+                self.complete(&op, outcome);
+            }
+        }
         Ok(())
     }
     pub fn configuration_retry(&mut self, now: Instant) -> Option<DoReconfiguration> {
@@ -2936,7 +2974,13 @@ impl Ledger {
         Some(idle.body.clone())
     }
     pub fn idle_status(&self) -> Value {
-        if self.placements[0].launch.profile == crate::ServiceProfile::StatefulThree {
+        if self.placements[0].launch.profile == crate::ServiceProfile::StatefulThree
+            || self.placements[0]
+                .launch
+                .profile
+                .configured_sizes()
+                .is_some()
+        {
             let builds: Vec<_> = self.idles.iter().map(|idle| {
                 let error = idle.reply.as_ref().map(|r| r.error);
                 let state = if idle.unknown { "unknown" }
@@ -2947,7 +2991,8 @@ impl Ledger {
                     "to_be_dropped":error.is_some_and(|e| e != 0),
                     "cleanup_required":error.is_some_and(|e| e != 0)})
             }).collect();
-            let ready = builds.len() == 2 && builds.iter().all(|b| b["ready"] == true);
+            let ready = builds.len() == self.placements.len() - 1
+                && builds.iter().all(|b| b["ready"] == true);
             let state = if builds.iter().any(|b| b["state"] == "unknown") {
                 "unknown"
             } else if builds.iter().any(|b| b["state"] == "failed") {
