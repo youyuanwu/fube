@@ -1,17 +1,35 @@
 use super::*;
 
-pub(super) fn lost_primary_replacement(
+pub(super) fn lost_replica_replacement(
     old: &EntityState,
     body: &AddInstance,
     source: &NodeInstance,
     history: &ReplicaDeactivationInfo,
 ) -> bool {
-    old.fm_primary
+    let secondary = !old.fm_primary
+        && old
+            .peer_creation
+            .as_ref()
+            .is_some_and(|p| p.host_down && p.delete_operation != 0 && p.deactivation == *history)
+        && old.reconfiguration.as_ref().is_some_and(|c| {
+            c.stage == ConfigurationStage::Complete
+                && c.request
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == *source && r.current_role == 4)
+                && c.request
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == old.body.replica.node && r.current_role == 3)
+        });
+    (old.fm_primary || secondary)
         && old.phase == Phase::Closed
         && old.local_deleted
         && old.cleanup_pending
         && old.fm_stage == FmStage::None
-        && old.primary_deactivation == Some((Epoch::default(), -2))
+        && (secondary || old.primary_deactivation == Some((Epoch::default(), -2)))
         && old.runtime.is_none()
         && old.usage.is_none()
         && old.registration_lookups.is_empty()
@@ -23,7 +41,7 @@ pub(super) fn lost_primary_replacement(
                     .replicas
                     .0
                     .iter()
-                    .any(|r| r.node == *source && r.current_role == 3)
+                    .any(|r| r.node == *source && r.current_role == if secondary { 4 } else { 3 })
         })
         && body.service == old.body.service
         && body.replica.node == old.body.replica.node
@@ -40,8 +58,20 @@ pub(super) fn lost_primary_replacement(
             .current
             .configuration
             .checked_sub(old.body.unit.current.configuration)
-            .is_some_and(|delta| delta > 0 && delta % 0x1_0000_0001 == 0)
-        && history.epoch == body.unit.current
+            .is_some_and(|delta| {
+                if secondary {
+                    delta == 1
+                } else {
+                    delta > 0 && delta % 0x1_0000_0001 == 0
+                }
+            })
+        && (if secondary {
+            history.epoch.data_loss == body.unit.current.data_loss
+                && history.epoch.configuration & !0xffff_ffff
+                    == body.unit.current.configuration & !0xffff_ffff
+        } else {
+            history.epoch == body.unit.current
+        })
         && history.catchup_lsn >= 0
 }
 
@@ -346,10 +376,16 @@ fn create_remote(
     let current = current.ok_or(Failure::Admission(
         "remote creation needs an existing Primary",
     ))?;
-    let repair = completed_primary_failover(current)
+    let repair = (completed_primary_failover(current)
+        || reconfiguration::completed_secondary_removal(current))
         && current.body.replica.current_role == 4
-        && current.swap.as_ref().is_some_and(|s| {
-            s.intent.replicas.0.iter().any(|r| {
+        && (if reconfiguration::completed_secondary_removal(current) {
+            current.reconfiguration.as_ref().map(|c| &c.request)
+        } else {
+            current.swap.as_ref().map(|s| &s.intent)
+        })
+        .is_some_and(|body| {
+            body.replicas.0.iter().any(|r| {
                 r.node == target.node
                     && !r.up
                     && r.current_role == 1
@@ -692,7 +728,9 @@ pub(super) fn start_build(
     if current.phase != Phase::Ready
         || !current.fm_primary
         || current.body.replica.current_role != 4
-        || (current.peer_creation.is_some() && !completed_primary_failover(current))
+        || (current.peer_creation.is_some()
+            && !completed_primary_failover(current)
+            && !reconfiguration::completed_secondary_removal(current))
         || peer != Some(&remote.target)
     {
         return Err(Failure::Unsupported(

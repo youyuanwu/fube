@@ -1397,8 +1397,8 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 }
             }
             if let Some(identity) = repair_requested.filter(|_| adapter.replica_drained(&node)) {
-                match node.retire_lost_primary_host() {
-                    Ok(true) => match replace_primary_host(launch, &mut node) {
+                match node.retire_lost_replica_host() {
+                    Ok(true) => match replace_replica_host(launch, &mut node) {
                         Ok(receipt) => {
                             metadata.profile = Some(receipt.profile.clone());
                             if let Err(error) = write_json(
@@ -1766,7 +1766,7 @@ fn fixed_idle_target(
     fixed_peer_target(launch, partition, replica, node, expected.0, expected.1)
 }
 
-fn replace_primary_host(launch: &Launch, node: &mut Node) -> Result<HostReplacementReceipt> {
+fn replace_replica_host(launch: &Launch, node: &mut Node) -> Result<HostReplacementReceipt> {
     let predecessor = actual_profile(node)?;
     let old_host = node
         .activation()
@@ -1782,7 +1782,7 @@ fn replace_primary_host(launch: &Launch, node: &mut Node) -> Result<HostReplacem
         instance: launch.node.instance,
         name: launch.name(),
     });
-    node.replace_lost_primary_host(Activation::new(options).map_err(err)?)
+    node.replace_lost_replica_host(Activation::new(options).map_err(err)?)
         .map_err(err)?;
     node.start(
         &launch.package,

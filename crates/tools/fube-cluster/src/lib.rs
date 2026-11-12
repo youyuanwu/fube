@@ -703,7 +703,7 @@ impl Cluster {
         self.start_failover().await;
         if let Err(error) = self.advance_repair().await {
             self.ledger
-                .lost(self.ledger.failed_primary_index().unwrap_or(0), error);
+                .lost(self.ledger.repair_destination_index().unwrap_or(0), error);
         }
     }
     async fn advance_initial_membership(&mut self) -> Result<()> {
@@ -750,42 +750,84 @@ impl Cluster {
             return Err("Primary repair requires the original running configured cluster".into());
         }
         if self.ledger.begin_primary_repair(Instant::now())? {
-            let destination = self
-                .ledger
-                .failed_primary_index()
-                .ok_or("missing failed Primary")?;
-            let predecessor = &self
-                .ledger
-                .repair
-                .as_ref()
-                .expect("repair")
-                .predecessor
-                .replica;
-            let child = &mut self.children[destination];
-            let result = child
-                .process
-                .as_mut()
-                .ok_or("missing original Node owner")?
-                .command(
-                    format!(
-                        "replace-host {} {} {} {}\n",
-                        child.launch.session,
-                        child.launch.capability,
-                        predecessor.id,
-                        predecessor.instance
-                    )
-                    .as_bytes(),
-                )
-                .map_err(err);
-            if let Err(error) = result {
-                self.ledger.lost(destination, error.clone());
+            self.request_repair_host()?;
+        }
+        Ok(self.ledger.repair_status())
+    }
+
+    /// Restore a lost Secondary without moving or reopening the current Primary.
+    pub async fn repair_secondary_replica(&mut self, destination: u8) -> Result<Value> {
+        if self.finished.is_some()
+            || destination == 0
+            || self.children.len() != self.config.profile.node_count()
+        {
+            return Err("Secondary repair requires the original running cluster".into());
+        }
+        if let Some(body) = self
+            .ledger
+            .begin_secondary_repair(usize::from(destination - 1), Instant::now())?
+        {
+            if let Err(error) = self.send_configuration(&body).await {
+                self.ledger.lost(self.ledger.primary_index(), error.clone());
                 return Err(error);
             }
         }
         Ok(self.ledger.repair_status())
     }
 
+    fn request_repair_host(&mut self) -> Result<()> {
+        let destination = self
+            .ledger
+            .repair_destination_index()
+            .ok_or("missing failed replica")?;
+        let predecessor = &self
+            .ledger
+            .repair
+            .as_ref()
+            .expect("repair")
+            .predecessor
+            .replica;
+        let child = &mut self.children[destination];
+        let result = child
+            .process
+            .as_mut()
+            .ok_or("missing original Node owner")?
+            .command(
+                format!(
+                    "replace-host {} {} {} {}\n",
+                    child.launch.session,
+                    child.launch.capability,
+                    predecessor.id,
+                    predecessor.instance
+                )
+                .as_bytes(),
+            )
+            .map_err(err);
+        if let Err(error) = result {
+            self.ledger.lost(destination, error.clone());
+            return Err(error);
+        }
+        self.ledger.repair.as_mut().expect("repair").host_requested = true;
+        Ok(())
+    }
+
     async fn advance_repair(&mut self) -> Result<()> {
+        if self
+            .ledger
+            .repair
+            .as_ref()
+            .is_some_and(|r| r.removal.as_ref().is_some_and(|c| c.reply.is_none()) || r.unknown)
+        {
+            return Ok(());
+        }
+        if self
+            .ledger
+            .repair
+            .as_ref()
+            .is_some_and(|r| !r.host_requested)
+        {
+            self.request_repair_host()?;
+        }
         if self
             .ledger
             .repair
@@ -794,8 +836,8 @@ impl Cluster {
         {
             let destination = self
                 .ledger
-                .failed_primary_index()
-                .ok_or("missing failed Primary")?;
+                .repair_destination_index()
+                .ok_or("missing failed replica")?;
             let predecessor = &self
                 .ledger
                 .repair

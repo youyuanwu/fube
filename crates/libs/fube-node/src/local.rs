@@ -491,8 +491,14 @@ impl Node {
     pub fn activation(&self) -> &Activation {
         &self.activation
     }
-    /// Retire the physically lost volatile Primary owner without replacing RA.
     pub fn retire_lost_primary_host(&mut self) -> Result<bool> {
+        self.retire_lost_replica_host()
+    }
+    pub fn replace_lost_primary_host(&mut self, activation: Activation) -> Result<()> {
+        self.replace_lost_replica_host(activation)
+    }
+    /// Retire the physically lost volatile replica owner without replacing RA.
+    pub fn retire_lost_replica_host(&mut self) -> Result<bool> {
         let selected = self.selected.as_ref().ok_or(Error::Unsupported)?;
         let snapshot = self.ra.snapshot(selected.unit.id.guid.0);
         let state = snapshot.committed.ok_or(Error::Busy)?;
@@ -501,12 +507,16 @@ impl Node {
             h::local::Profile::VolatileStatefulFmPrimary
                 | h::local::Profile::VolatileStatefulLifecycle
         ) || snapshot.fenced
-            || !state.fm_primary
+            || (!state.fm_primary
+                && !state
+                    .peer_creation
+                    .as_ref()
+                    .is_some_and(|p| p.host_down && p.delete_operation != 0))
             || state.phase != ra::Phase::Closed
             || !state.local_deleted
             || !state.cleanup_pending
             || state.fm_stage != ra::FmStage::None
-            || state.primary_deactivation != Some((Epoch::default(), -2))
+            || (state.fm_primary && state.primary_deactivation != Some((Epoch::default(), -2)))
             || state.runtime.is_some()
             || state.usage.is_some()
             || !state.registration_lookups.is_empty()
@@ -534,8 +544,8 @@ impl Node {
     }
 
     /// Install a new, unstarted host only after exact old-owner physical cleanup.
-    pub fn replace_lost_primary_host(&mut self, mut activation: Activation) -> Result<()> {
-        if !self.retire_lost_primary_host()?
+    pub fn replace_lost_replica_host(&mut self, mut activation: Activation) -> Result<()> {
+        if !self.retire_lost_replica_host()?
             || !self.activation.producers_stopped()
             || !self.activation.deliveries_drained()
             || !self.activation.cleanup_status().directory_released
@@ -748,7 +758,12 @@ impl Node {
                                                     < state.body.replica.instance)
                                             || (state.phase == ra::Phase::Closed
                                                 && state.reconfiguration.as_ref().is_some_and(
-                                                    |c| c.stage == ra::ConfigurationStage::Retiring,
+                                                    |c| {
+                                                        c.stage == ra::ConfigurationStage::Retiring
+                                                            || (c.stage
+                                                                == ra::ConfigurationStage::Complete
+                                                                && state.peer_host_loss())
+                                                    },
                                                 )))))
                         }
                     };

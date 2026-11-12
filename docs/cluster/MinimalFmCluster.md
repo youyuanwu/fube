@@ -75,7 +75,7 @@ path could accept is rejected by the immutable profile's actual ingress.
 This initial slice deliberately waits for all original build destinations and
 admits them together. The failover extension below adds loss-driven promotion.
 Incremental/partial admission, resize, generic planned transfer,
-standalone Secondary replacement, whole-node/FM restart and persisted recovery remain
+healthy Secondary retirement, whole-node/FM restart and persisted recovery remain
 unsupported for this new profile. The older named profiles remain separate
 qualification fixtures with their existing behavior; their bounded lifecycle
 support is not implicitly enabled for arbitrary configured sizes.
@@ -216,8 +216,81 @@ This reuses existing wire contracts and adds no schema/action. The maintained
 native-stream gate remains 179 cases/55 native truncation rejections, not full
 native C++ handler/Federation interoperability. Sixty-four is a model/resource
 bound, not 64-process qualification. Multi-loss or interrupted transition recovery,
-standalone Secondary repair, node/FM restart, data-loss exchange and persisted
+node/FM restart, data-loss exchange and persisted
 recovery remain unsupported.
+
+## Standalone Secondary app-host loss repair
+
+`Cluster::repair_secondary_replica(node)` explicitly repairs one matched
+ActiveSecondary app-host loss while preserving the original healthy Primary.
+The one-based destination selects an original live Node/RA session, not a new
+placement. Initial admission or the preceding repair must have completed.
+The old replica's loss report and native closed metadata deletion must be
+processed, with every other member and original Node/peer session still owned.
+FM-link disappearance alone cannot authorize replacement.
+
+The pinned FM removes a dropped/down Secondary only while CC plus ready Idles
+exceeds minimum. With no spare placement in this topology, `minimum == target`
+returns an explicit blocked-at-minimum error. No size/service-version update,
+forced quorum reduction or fabricated ready Idle substitutes for that rule.
+Multiple losses reject new repair; insufficient live quorum cannot acknowledge
+a write. This is explicit placement/replacement authorization, not automatic PLB.
+
+First, same-Primary DoReconfiguration preserves PC from the last committed
+membership and removes only the failed S/N from CC. Target/minimum and
+data-loss/Primary epochs remain unchanged; only the configuration counter
+advances. Real RAP catch-up precedes metadata-only S/S Deactivate, then
+RAP-backed Activate for every required live survivor, each behind its applied RA commit.
+Dropped members do not owe phase-3 replies. A two-member service can finish
+removal with no remote Secondary, but still requires final RAP/FM completion.
+The healthy Primary keeps its endpoint, runtime, acquisitions and single Open.
+
+Only the exact successful removal reply permits physical host replacement.
+The same predecessor exit/reaping/group-drain, reporting/command/lookup/usage
+drain and Hosting-root removal fences used by Primary repair apply. A fresh
+host gate, runtime registration and globally newer replica incarnation are
+created on the original Node. Native AddReplica/CreateReplica and real
+BuildIdleReplica copy into an empty volatile application. Existing RAP may
+first remove the old custom-replicator resource; normal FM Add retries then
+continue the fresh build, without a private data-engine hook.
+
+Same-Primary admission retains every survivor in PC and adds exactly the fresh
+I/S to CC. Secondary-only removal/admission retains existing deactivation
+history, rather than inventing a new Primary catch-up boundary. Final RAP,
+per-Secondary activation and RA/FM completion restore target membership.
+Poll `repair.ready`: `removed`, `host_ready` and `built` are intermediate states.
+The current repair and retained predecessor histories fence late reports,
+Delete traffic and stale configuration/build replies across repeated cycles.
+
+A new loss during removal or admission makes repair unknown. A late successful
+reply cannot advance it, start an unproved replacement or trigger overlapping
+Primary failover. Known in-flight report epochs remain admitted as terminal loss,
+not relabeled as an FM-link failure. Existing data-plane quorum/access checks
+remain independent of this uncertain control-plane result.
+
+| Pinned SF source | Secondary-loss responsibility |
+|---|---|
+| `fm/ReconfigurationTask.cpp:354-412` | Remove dropped/down Secondaries subject to minimum and ready-Idle accounting; admit built Idles under the unchanged Primary. |
+| `fm/FailoverUnit.cpp:718-739`; `fm/Replica.cpp:555-585` | Reuse a dropped placement only with a fresh identity and reset build metadata. |
+| `ra/ReconfigurationAgent.cpp:2244-2324` | Create a newer Idle from closed metadata; do not recover the lost volatile runtime. |
+| `ra/FailoverUnit.cpp:736-810,2596-2646,3091-3248` | Retain same-Primary deactivation history, skip dropped phase-3 members, and account for required live phase-3/4 completion. |
+
+RA/FM models cover metadata removal and fresh admission through 64/32,
+including unchanged history, commit holds/veto, exact survivor/incarnation
+fences, stale replies and minimum rejection. Real-process qualification runs
+two Secondary replacements at 2/1, 4/2, 4/3 and 5/3, then Primary failover to
+the rebuilt replica and repair of the old Primary. It loses/replays removal,
+build and final admission replies, preserves nonempty data and original owners,
+and verifies continuing acknowledged writes and independently joined cleanup.
+Separate 4/4 minimum, 4/2 and 5/3 quorum-loss, and further-loss-during-removal
+cases reject unsafe progress without weakening write quorum.
+
+No new native schema/action is introduced: the source-stream gate remains
+179 cases/55 native truncation rejections. This is source-derived model/process
+and native-stream/schema-adapter evidence, not full original C++ handler or
+Federation interoperability. Multi-loss repair, spare-node placement, automatic
+restart, interrupted-transition recovery, resize and node/FM restart remain
+deferred. The 64 bound is model/resource qualification, not 64-process testing.
 
 ## Run
 

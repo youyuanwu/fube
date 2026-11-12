@@ -1964,7 +1964,7 @@ fn transition(
                             && s.body.unit.current == body.unit.current
                     });
                     let lost_primary = state.is_some_and(|s| {
-                        peer::lost_primary_replacement(s, &body, source, deactivation)
+                        peer::lost_replica_replacement(s, &body, source, deactivation)
                     });
                     let retained_peer = state.is_some_and(|s| {
                         matches!(s.phase, Phase::Opening | Phase::Ready)
@@ -2111,7 +2111,7 @@ fn transition(
                         });
                     }
                     replacing_peer = peer_creation.as_ref().is_some_and(|origin| {
-                        peer::lost_primary_replacement(
+                        peer::lost_replica_replacement(
                             current,
                             &body,
                             &origin.source,

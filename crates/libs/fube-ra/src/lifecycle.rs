@@ -594,8 +594,14 @@ pub(super) fn transition(
                     || body.service.persisted
                     || body.service.group
                     || body.service.partitions != 1
-                    || body.service.target != 1
-                    || body.service.minimum != 1
+                    || !valid_stateful_sizes(&body.service)
+                    || ((body.service.target != 1 || body.service.minimum != 1)
+                        && current.is_none_or(|s| {
+                            s.phase != Phase::Closed
+                                || s.reconfiguration
+                                    .as_ref()
+                                    .is_none_or(|c| c.stage != ConfigurationStage::Complete)
+                        }))
                     || body.service.activation_mode != 0
                     || !body.service.scaling.0.is_empty()
                     || body.replica.node != admission.local_node
@@ -616,10 +622,11 @@ pub(super) fn transition(
                 if let Some(original) = current.filter(|state| state.peer_creation.is_some()) {
                     if original.body.replica.current_role != 2
                         && !(original.phase == Phase::Closed
-                            && original
-                                .reconfiguration
-                                .as_ref()
-                                .is_some_and(|c| c.stage == ConfigurationStage::Retiring))
+                            && original.reconfiguration.as_ref().is_some_and(|c| {
+                                c.stage == ConfigurationStage::Retiring
+                                    || (c.stage == ConfigurationStage::Complete
+                                        && original.peer_host_loss())
+                            }))
                     {
                         return Err(Failure::Unsupported(
                             "peer deletion requires an original opening or opened Idle",

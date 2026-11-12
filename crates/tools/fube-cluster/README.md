@@ -53,8 +53,22 @@ a fresh host/incarnation; native creation, copy, every surviving S/S Deactivate
 and Secondary Activate commit precede final RAP/FM completion. The same live
 Node/RA/store/peer Channels support repeated failover/repair cycles.
 
-The configured profile still rejects resize, planned transfer and standalone
-Secondary retirement/replacement. Host replacement is explicit, never automatic.
+`Cluster::repair_secondary_replica(node).await` explicitly repairs one matched
+Secondary app-host loss on its original live Node, without moving or reopening
+the healthy Primary. Native same-Primary removal must finish before fresh-host
+replacement, real copy and readmission. Target/minimum and service version
+remain unchanged. Poll `repair.ready`; `removed` and `built` are intermediate
+states, not restored redundancy. Repeated Secondary repair can precede Primary
+failover/repair.
+
+SF does not remove a down Secondary at minimum without a ready spare. This
+original-node-only topology therefore rejects repair when minimum equals target;
+it never lowers minimum or invents a spare placement. Multiple losses also
+reject a new repair. A further loss during repair makes it unknown and blocks
+host replacement/completion. Data-plane writes still require their actual quorum.
+
+The configured profile still rejects resize, planned transfer and healthy
+Secondary retirement. Host replacement is explicit, never automatic.
 Insufficient read quorum blocks failover without declaring data loss. Additional
 loss during an in-flight transition makes its ownership unknown, not successful.
 Another configured failover requires completed repair; multi-loss repair,
@@ -65,6 +79,7 @@ repeated failover/repair.
 See [native mapping and acceptance](../../../docs/cluster/MinimalFmCluster.md#immutable-configured-initial-membership).
 See [configured failover evidence and limits](../../../docs/cluster/MinimalFmCluster.md#immutable-configured-primary-failover).
 See [configured repair evidence and limits](../../../docs/cluster/MinimalFmCluster.md#immutable-configured-primary-repair).
+See [Secondary-loss repair semantics and limits](../../../docs/cluster/MinimalFmCluster.md#standalone-secondary-app-host-loss-repair).
 
 `--stateful-three` / `ServiceProfile::StatefulThree` is a separate, fixed
 three-node volatile profile. Create only the original node1 Primary. Then call

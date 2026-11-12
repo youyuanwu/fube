@@ -122,16 +122,18 @@ pub struct Ledger {
     swap_endpoint: Option<AddInstance>,
     candidate_changes: Vec<Configuration>,
     configuration_history: Vec<ActiveConfiguration>,
-    pub(crate) repair: Option<PrimaryRepair>,
-    pub(crate) repair_history: Vec<PrimaryRepair>,
+    pub(crate) repair: Option<ReplicaRepair>,
+    pub(crate) repair_history: Vec<ReplicaRepair>,
 }
-pub(crate) struct PrimaryRepair {
+pub(crate) struct ReplicaRepair {
     pub predecessor: AddInstance,
     pub old_profile: ActualProfile,
     pub profile: Option<ActualProfile>,
     pub build: IdleBuild,
     pub configuration: Option<ActiveConfiguration>,
-    unknown: bool,
+    pub removal: Option<ActiveConfiguration>,
+    pub host_requested: bool,
+    pub(crate) unknown: bool,
 }
 pub(crate) struct ActiveConfiguration {
     pub body: DoReconfiguration,
@@ -578,6 +580,10 @@ impl Ledger {
             || self.generation.is_some()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
+            || self
+                .repair
+                .as_ref()
+                .is_some_and(|r| r.configuration.as_ref().is_none_or(|c| c.reply.is_none()))
             || (self.swap.is_some()
                 && !self
                     .repair
@@ -977,16 +983,19 @@ impl Ledger {
         {
             return Ok(None);
         }
-        if let Some(swap) = &self.swap {
+        if let Some(swap) = self
+            .repair
+            .as_ref()
+            .and_then(|r| r.configuration.as_ref().or(r.removal.as_ref()))
+            .or(self.swap.as_ref())
+        {
             let mut stable = swap.body.configuration.unit.clone();
             stable.previous = Epoch::default();
-            if body
-                .dropped
-                .0
-                .first()
-                .is_some_and(|i| i.unit == stable && i.service == swap.body.configuration.service)
-            {
-                self.placements[index].active_unit = Some(stable);
+            if body.dropped.0.first().is_some_and(|i| {
+                (i.unit == stable || i.unit == swap.body.configuration.unit)
+                    && i.service == swap.body.configuration.service
+            }) {
+                self.placements[index].active_unit = Some(body.dropped.0[0].unit.clone());
             }
         }
         let peer_idle = index != 0 && self.placements[index].launch.profile.peer_replicas();
@@ -2134,11 +2143,124 @@ impl Ledger {
             })
     }
 
+    pub fn repair_destination_index(&self) -> Option<usize> {
+        let repair = self.repair.as_ref()?;
+        self.placements
+            .iter()
+            .position(|p| p.launch.node == repair.predecessor.replica.node)
+    }
+
+    pub fn begin_secondary_repair(
+        &mut self,
+        destination: usize,
+        now: Instant,
+    ) -> Result<Option<DoReconfiguration>> {
+        if !self.placements[0].launch.profile.mesh_peers() || destination >= self.placements.len() {
+            return Err("Secondary repair requires an original configured placement".into());
+        }
+        if let Some(repair) = &self.repair {
+            let completed = repair
+                .configuration
+                .as_ref()
+                .is_some_and(|c| c.reply.is_some());
+            if !completed || !self.placements[destination].loss_reported {
+                if self.repair_destination_index() != Some(destination) || repair.removal.is_none()
+                {
+                    return Err("another repair owns the current cycle".into());
+                }
+                return Ok(None);
+            }
+        }
+        let active = self
+            .repair
+            .as_ref()
+            .and_then(|r| r.configuration.as_ref())
+            .or(self.swap.as_ref())
+            .or(self.configuration.as_ref())
+            .filter(|c| c.reply.is_some())
+            .ok_or("Secondary repair requires completed membership")?;
+        let previous = active.reply.as_ref().expect("completed configuration");
+        let target = &self.placements[destination];
+        if self.generation.is_some()
+            || self.idle_removal.is_some()
+            || self.idle_deletion.is_some()
+            || !target.loss_reported
+            || !target.remove_received
+            || !previous
+                .replicas
+                .0
+                .iter()
+                .any(|r| r.node == target.launch.node && r.current_role == 3)
+            || previous.replicas.0.len() != self.placements.len()
+            || self.placements.iter().enumerate().any(|(i, p)| {
+                !p.link_alive
+                    || !p.activated
+                    || p.bootstrap != Bootstrap::Admitted
+                    || p.pending.is_some()
+                    || p.node_control.is_some()
+                    || p.service_update.is_some()
+                    || (i != destination && (p.loss_reported || p.observed != Observed::Running))
+            })
+        {
+            return Err(
+                "Secondary repair requires one processed loss/deletion and every other live member"
+                    .into(),
+            );
+        }
+        if previous.replicas.0.len() <= previous.unit.minimum as usize {
+            return Err("Secondary removal is blocked at minimum; this topology has no ready spare placement".into());
+        }
+        let mut body = active.body.clone();
+        body.configuration.unit = previous.unit.clone();
+        body.configuration.unit.previous = previous.unit.current;
+        body.configuration.unit.current.configuration = previous
+            .unit
+            .current
+            .configuration
+            .checked_add(1)
+            .ok_or("Secondary removal epoch exhausted")?;
+        if body.configuration.unit.current.configuration & !0xffff_ffff
+            != previous.unit.current.configuration & !0xffff_ffff
+        {
+            return Err("same-Primary Secondary removal epoch exhausted".into());
+        }
+        body.configuration.replicas = previous.replicas.clone();
+        for r in &mut body.configuration.replicas.0 {
+            r.previous_role = r.current_role;
+            if r.node == target.launch.node {
+                r.current_role = 1;
+                r.state = 3;
+                r.up = false;
+            }
+        }
+        let mut unit = body.configuration.unit.clone();
+        unit.previous = Epoch::default();
+        let repair = self.new_repair(
+            destination,
+            unit,
+            now,
+            Some(ActiveConfiguration {
+                body: body.clone(),
+                reply: None,
+                unknown: false,
+                started: now,
+                last: now,
+            }),
+        )?;
+        if let Some(previous) = self.repair.replace(repair) {
+            self.repair_history.push(previous);
+        }
+        Ok(Some(body))
+    }
+
     pub fn begin_primary_repair(&mut self, now: Instant) -> Result<bool> {
         if !self.placements[0].launch.profile.mesh_peers() {
             return Err("Primary repair requires a configured replica-set profile".into());
         }
-        if self.repair.is_some() {
+        if let Some(repair) = &self.repair {
+            if repair.removal.is_some() {
+                return Err("Secondary repair owns the current cycle".into());
+            }
             return Ok(false);
         }
         let swap = self
@@ -2180,6 +2302,18 @@ impl Ledger {
         {
             return Err("repair requires exactly one missing configured member".into());
         }
+        let unit = reply.unit.clone();
+        self.repair = Some(self.new_repair(destination, unit, now, None)?);
+        Ok(true)
+    }
+
+    fn new_repair(
+        &self,
+        destination: usize,
+        unit: FailoverUnit,
+        now: Instant,
+        removal: Option<ActiveConfiguration>,
+    ) -> Result<ReplicaRepair> {
         let next = self
             .placements
             .iter()
@@ -2190,7 +2324,7 @@ impl Ledger {
             .checked_add(1)
             .ok_or("repair identity exhausted")?;
         let mut body = self.placements[self.primary_index()].body()?;
-        body.unit = reply.unit.clone();
+        body.unit = unit;
         body.replica = self.placements[destination].body()?.replica;
         body.replica.id = next;
         body.replica.instance = next;
@@ -2202,7 +2336,7 @@ impl Ledger {
         body.replica.last_lsn = -1;
         body.replica.service_endpoint.clear();
         body.replica.replication_endpoint.clear();
-        self.repair = Some(PrimaryRepair {
+        Ok(ReplicaRepair {
             predecessor: self.placements[destination].body()?,
             old_profile: self.placements[destination]
                 .profile
@@ -2218,9 +2352,10 @@ impl Ledger {
                 last: now,
             },
             configuration: None,
+            removal,
+            host_requested: false,
             unknown: false,
-        });
-        Ok(true)
+        })
     }
 
     pub fn repaired_host(
@@ -2229,12 +2364,15 @@ impl Ledger {
         node_pid: u32,
     ) -> Result<bool> {
         let destination = self
-            .failed_primary_index()
-            .ok_or("missing failed Primary placement")?;
+            .repair_destination_index()
+            .ok_or("missing failed replica placement")?;
         let repair = self.repair.as_mut().ok_or("unsolicited host replacement")?;
         let placement = &mut self.placements[destination];
         receipt.validate(&placement.launch, &repair.old_profile, node_pid)?;
-        if repair.unknown || !placement.link_alive {
+        if repair.unknown
+            || !placement.link_alive
+            || repair.removal.as_ref().is_some_and(|c| c.reply.is_none())
+        {
             return Err("replacement owner is unknown".into());
         }
         if repair.profile.is_some() {
@@ -2315,12 +2453,19 @@ impl Ledger {
         let Some(built) = repair.build.reply.as_ref().filter(|r| r.error == 0) else {
             return Ok(None);
         };
-        let previous = self
-            .swap
+        let previous = repair
+            .removal
             .as_ref()
+            .or(self.swap.as_ref())
             .and_then(|s| s.reply.as_ref())
-            .ok_or("missing failover completion")?;
-        let mut body = self.swap.as_ref().expect("swap").body.clone();
+            .ok_or("missing loss reconfiguration completion")?;
+        let mut body = repair
+            .removal
+            .as_ref()
+            .or(self.swap.as_ref())
+            .expect("loss configuration")
+            .body
+            .clone();
         body.configuration.unit = previous.unit.clone();
         body.configuration.unit.previous = previous.unit.current;
         body.configuration.unit.current.configuration = previous
@@ -2406,6 +2551,8 @@ impl Ledger {
             "pending"
         };
         json!({"state":state,"ready":state == "ready","predecessor":r.predecessor,
+            "kind":if r.removal.is_some() {"secondary"} else {"primary"},
+            "removed":r.removal.as_ref().is_some_and(|c| c.reply.is_some()),
             "old_profile":r.old_profile,"profile":r.profile,"request":r.build.body,"build_reply":r.build.reply,
             "host_ready":r.profile.is_some(),"built":r.build.reply.as_ref().is_some_and(|b| b.error == 0)})
     }
@@ -2674,6 +2821,44 @@ impl Ledger {
         if self
             .repair
             .as_ref()
+            .is_some_and(|r| r.removal.as_ref().is_some_and(|c| c.reply.is_none()))
+        {
+            let primary = self.primary_index();
+            let destination = self.repair_destination_index().expect("repair destination");
+            let live = self
+                .placements
+                .iter()
+                .enumerate()
+                .all(|(i, p)| p.link_alive && (i == destination || !p.loss_reported));
+            let repair = self.repair.as_mut().expect("repair");
+            let config = repair.removal.as_mut().expect("removal");
+            let mut expected = config.body.configuration.clone();
+            expected.unit.previous = Epoch::default();
+            expected.replicas.0.retain(|r| r.current_role >= 3);
+            for r in &mut expected.replicas.0 {
+                r.previous_role = 1;
+            }
+            if index != primary
+                || !live
+                || repair.unknown
+                || body.error != 0
+                || body.unit != expected.unit
+                || body.replicas != expected.replicas
+            {
+                return Ok(());
+            }
+            for p in &mut self.placements {
+                if let Some(r) = body.replicas.0.iter().find(|r| r.node == p.launch.node) {
+                    p.active_unit = Some(body.unit.clone());
+                    p.ready_replica = Some(r.clone());
+                }
+            }
+            config.reply = Some(body);
+            return Ok(());
+        }
+        if self
+            .repair
+            .as_ref()
             .is_some_and(|r| r.configuration.is_some())
         {
             return self.repair_configuration_reply(index, body);
@@ -2744,7 +2929,7 @@ impl Ledger {
     }
     pub fn configuration_retry(&mut self, now: Instant) -> Option<DoReconfiguration> {
         if let Some(repair) = &mut self.repair {
-            let config = repair.configuration.as_mut()?;
+            let config = repair.configuration.as_mut().or(repair.removal.as_mut())?;
             if repair.unknown
                 || config.unknown
                 || config.reply.is_some()
@@ -3014,7 +3199,7 @@ impl Ledger {
     }
     pub fn configuration_status(&self) -> Value {
         if let Some(repair) = &self.repair {
-            if let Some(config) = &repair.configuration {
+            if let Some(config) = repair.configuration.as_ref().or(repair.removal.as_ref()) {
                 let state = if repair.unknown || config.unknown {
                     "unknown"
                 } else if config.reply.is_some() {
@@ -3022,7 +3207,7 @@ impl Ledger {
                 } else {
                     "pending"
                 };
-                return json!({"state":state,"ready":state == "ready","kind":"post_failover_repair",
+                return json!({"state":state,"ready":state == "ready","kind":if repair.configuration.is_some() {if repair.removal.is_some() {"secondary_repair"} else {"post_failover_repair"}} else {"secondary_loss_removal"},
                     "request":{"configuration":config.body.configuration,"phase0_duration":config.body.phase0_duration},
                     "reply":config.reply});
             }

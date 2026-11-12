@@ -7590,6 +7590,187 @@ async fn failover_survivor_get_lsn_and_ss_deactivate_wait_for_their_own_commits(
 }
 
 #[tokio::test]
+async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_commit() {
+    for (target, minimum, veto) in [
+        (4, 2, false),
+        (5, 3, false),
+        (64, 32, false),
+        (4, 2, true),
+        (4, 4, false),
+    ] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        active_configured_survivor(&executor, target, minimum).await;
+        let original = state(&executor);
+        let mut removal = original.reconfiguration.as_ref().unwrap().request.clone();
+        removal.unit.previous = removal.unit.current;
+        removal.unit.current.configuration += 1;
+        for r in &mut removal.replicas.0 {
+            r.previous_role = r.current_role;
+        }
+        let lost = removal.replicas.0.last_mut().unwrap();
+        lost.current_role = 1;
+        lost.state = 3;
+        lost.up = false;
+        let lost = lost.clone();
+        let history = original
+            .peer_creation
+            .as_ref()
+            .unwrap()
+            .deactivation
+            .clone();
+        let deactivate = |configuration| Command::Deactivate {
+            source: peer_source(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(Deactivate {
+                configuration,
+                force: false,
+                deactivation: history.clone(),
+            }),
+        };
+        if target == minimum {
+            assert!(executor
+                .submit(deactivate(removal))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+            assert!(effects(&executor).is_empty());
+            assert_eq!(state(&executor).body, original.body);
+            finish(&store, &executor).await;
+            continue;
+        }
+        for invalid in 0..3 {
+            let mut bad = removal.clone();
+            match invalid {
+                0 => bad.replicas.0[0].instance += 1,
+                1 => bad.service.minimum = 1,
+                _ => bad.unit.current.configuration += 1,
+            }
+            assert!(executor
+                .submit(deactivate(bad))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+            assert!(effects(&executor).is_empty());
+        }
+        let mut fresh = lost.clone();
+        fresh.id += 1000;
+        fresh.instance += 1000;
+        fresh.up = true;
+        fresh.previous_role = 2;
+        fresh.current_role = 3;
+        fresh.state = 2;
+        fresh.replication_endpoint = "127.0.0.1:12350".into();
+        let mut repair = removal.clone();
+        repair.unit.previous = repair.unit.current;
+        repair.unit.current.configuration += 1;
+        repair.replicas.0.retain(|r| r.current_role >= 3);
+        for r in &mut repair.replicas.0 {
+            r.previous_role = r.current_role;
+        }
+        repair.replicas.0.push(fresh);
+        for body in [removal, repair] {
+            let before = state(&executor);
+            let (entered, release) = hooks.pause(veto);
+            let ticket = executor.submit(deactivate(body.clone())).unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            assert_eq!(state(&executor).body, before.body);
+            release.send(()).unwrap();
+            if veto {
+                assert!(matches!(ticket.wait(WAIT).await, Err(Failure::Store(_))));
+                assert!(effects(&executor).is_empty());
+                assert_eq!(state(&executor).body, before.body);
+                break;
+            }
+            ticket.wait(WAIT).await.unwrap();
+            let response = effects(&executor);
+            assert!(matches!(
+                response.as_slice(),
+                [Effect::PeerDeactivateReply { .. }]
+            ));
+            run(&executor, deactivate(body.clone())).await;
+            assert_eq!(effects(&executor), response);
+            run(
+                &executor,
+                Command::Activate {
+                    source: peer_source(),
+                    generation: generation_header(admission().generation.generation),
+                    body: Box::new(Activate {
+                        configuration: body,
+                        deactivation: history.clone(),
+                    }),
+                },
+            )
+            .await;
+            let completion = configured(&effects(&executor));
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor
+                .submit(Command::CompleteConfiguration(Box::new(completion)))
+                .unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::PeerActivateReply { .. }]
+            ));
+            assert_eq!(state(&executor).runtime, original.runtime);
+            assert_eq!(state(&executor).usage, original.usage);
+            assert_eq!(
+                state(&executor)
+                    .peer_creation
+                    .as_ref()
+                    .unwrap()
+                    .deactivation,
+                history
+            );
+        }
+        if !veto {
+            let current = state(&executor);
+            let candidate = current
+                .reconfiguration
+                .as_ref()
+                .unwrap()
+                .request
+                .replicas
+                .0
+                .last()
+                .unwrap()
+                .node
+                .clone();
+            let next = failover_configuration(&current, &candidate);
+            run(
+                &executor,
+                Command::GetLsn {
+                    source: candidate,
+                    generation: generation_header(admission().generation.generation),
+                    body: Box::new(AddInstance {
+                        unit: next.unit,
+                        service: next.service,
+                        replica: Replica {
+                            node: current.body.replica.node.clone(),
+                            id: current.body.replica.id,
+                            instance: current.body.replica.instance,
+                            ..Replica::default()
+                        },
+                    }),
+                },
+            )
+            .await;
+            let progress = status_completion(&effects(&executor));
+            run(&executor, Command::CompleteStatus(Box::new(progress))).await;
+            assert!(
+                matches!(effects(&executor).as_slice(), [Effect::PeerGetLsnReply { body, .. }] if body.deactivation == history)
+            );
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
 async fn configured_initial_membership_preserves_sizes_and_waits_for_every_activation_commit() {
     for (target, minimum) in [(2, 1), (3, 2), (4, 2), (4, 3), (5, 3), (4, 4), (64, 32)] {
         let (store, executor, hooks) = setup(WAIT).await;
