@@ -323,6 +323,107 @@ fn configured_three_ledger() -> Ledger {
     ledger
 }
 
+fn configured_ledger(target: i32, minimum: i32) -> Ledger {
+    let template = launches()[0].clone();
+    let mut launches: Vec<_> = (1..=target as u8).map(|placement| {
+        let mut launch = template.clone();
+        launch.profile = ServiceProfile::Stateful { target, minimum };
+        launch.placement = placement;
+        launch.node.id = [placement; 16];
+        launch.node.instance += u64::from(placement);
+        launch.session = uuid::Uuid::new_v4().to_string();
+        launch.replica = i64::from(placement);
+        launch.incarnation += i64::from(placement);
+        launch.directory = PathBuf::from(format!("/owned/node{placement}"));
+        launch
+    }).collect();
+    let peers: Vec<_> = launches.iter().map(|l| Peer {
+        node: l.node.clone(), session: l.session.clone(), partition: l.partition.clone(),
+        replica: l.replica, incarnation: l.incarnation,
+    }).collect();
+    for (i, launch) in launches.iter_mut().enumerate() {
+        launch.peers = peers.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| p.clone()).collect();
+        launch.validate().unwrap();
+    }
+    let mut ledger = Ledger::new(launches);
+    for p in &mut ledger.placements {
+        p.bootstrap = Bootstrap::Metadata;
+        let mut actual = profile(&p.launch);
+        actual.service = p.launch.profile.service().into();
+        actual.service_type = fixed_type_for(p.launch.profile);
+        p.admit_profile(actual).unwrap();
+    }
+    ledger.accept(command("primary", "create", Some(1))).unwrap();
+    ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+    for destination in 1..target as usize {
+        let body = ledger.request_idle_on(destination, Instant::now()).unwrap();
+        let mut replica = body.replica;
+        replica.state = 2;
+        replica.replication_endpoint = format!("127.0.0.1:{}", 12346 + destination);
+        ledger.idle_reply(0, AddReplicaReply { unit: body.unit, replica, error: 0 }).unwrap();
+    }
+    let body = ledger.request_configuration(Instant::now()).unwrap();
+    let mut reply = ConfigurationReply {
+        unit: body.configuration.unit, replicas: body.configuration.replicas, error: 0,
+    };
+    reply.unit.previous = Epoch::default();
+    for r in &mut reply.replicas.0 { r.previous_role = 1; }
+    ledger.configuration_reply(0, reply).unwrap();
+    ledger
+}
+
+#[test]
+fn configured_failover_redirects_only_exact_native_progress_and_replays_legacy_reply() {
+    let mut ledger = configured_ledger(5, 3);
+    let service = ledger.placements[0].body().unwrap().service;
+    let lost_secondary = stateful_loss_report(&ledger.placements[4]);
+    ledger.report(4, &lost_secondary).unwrap();
+    let loss = stateful_loss_report(&ledger.placements[0]);
+    ledger.report(0, &loss).unwrap();
+    let intent = ledger.start_primary_failover(Instant::now()).unwrap().unwrap();
+    let mut change = intent.configuration.clone();
+    let selected = change.replicas.0.iter_mut().find(|r| r.node == ledger.placements[2].launch.node).unwrap();
+    selected.first_lsn = 1;
+    selected.last_lsn = 9;
+    for invalid in 0..5 {
+        let mut bad = change.clone();
+        match invalid {
+            0 => bad.replicas.0[2].instance += 1,
+            1 => bad.unit.current.configuration += 1,
+            2 => { bad.replicas.0[1].first_lsn = 1; bad.replicas.0[1].last_lsn = 10; },
+            3 => bad.service.minimum = 1,
+            _ => { bad.replicas.0[2].first_lsn = -1; bad.replicas.0[2].last_lsn = -1; },
+        }
+        assert!(ledger.change_configuration(1, bad, Instant::now()).unwrap().is_none());
+    }
+    assert!(ledger.change_configuration(2, change.clone(), Instant::now()).unwrap().is_none());
+    let ack = ledger.change_configuration(1, change.clone(), Instant::now()).unwrap().unwrap();
+    assert_eq!(ledger.primary_index(), 2);
+    assert_eq!(ledger.swap.as_ref().unwrap().body.configuration.service, service);
+    assert_eq!(ack.unit.previous, intent.configuration.unit.previous);
+    assert!(ack.unit.current.configuration > intent.configuration.unit.current.configuration);
+    assert_eq!(ledger.change_configuration(1, change, Instant::now()).unwrap(), Some(ack));
+    assert_eq!(ledger.configuration_status()["candidate_redirections"].as_array().unwrap().len(), 1);
+    ledger.report(4, &lost_secondary).unwrap();
+    assert_eq!(ledger.configuration_status()["state"], "pending");
+    let next = ledger.configuration_retry(Instant::now() + Duration::from_secs(11)).unwrap();
+    let mut reply = ConfigurationReply { unit: next.configuration.unit, replicas: next.configuration.replicas, error: 0 };
+    reply.unit.previous = Epoch::default();
+    reply.replicas.0.retain(|r| r.current_role >= 3);
+    for r in &mut reply.replicas.0 {
+        r.previous_role = 1;
+        r.first_lsn = 1;
+        r.last_lsn = 9;
+        r.service_endpoint = if r.current_role == 4 { "127.0.0.1:12349".into() } else { String::new() };
+    }
+    ledger.configuration_reply(1, reply.clone()).unwrap();
+    assert_eq!(ledger.configuration_status()["ready"], false);
+    ledger.configuration_reply(2, reply).unwrap();
+    assert_eq!(ledger.configuration_status()["ready"], true);
+    assert!(ledger.placements[0].endpoint.is_none());
+    assert!(ledger.placements[4].endpoint.is_none());
+}
+
 #[test]
 fn primary_repair_requires_fresh_host_owned_build_and_exact_final_membership() {
     for lose_survivor in [false, true] {
@@ -3207,6 +3308,151 @@ fn configured_sizes_reject_invalid_bounds_before_acquiring_a_deployment() {
         assert!(Cluster::new(config).is_err());
         assert!(!fixture.root.exists());
     }
+}
+
+#[tokio::test]
+async fn configured_primary_failover_preserves_sizes_data_and_quorum_with_unavailable_secondaries() {
+    for (target, minimum, secondary_losses, expected) in [
+        (2, 1, 0, true), (4, 2, 1, true), (4, 3, 1, true), (4, 4, 0, true),
+        (5, 3, 1, true), (5, 1, 3, false),
+    ] {
+        let fixture = Fixture::new("configured-failover");
+        let mut config = fixture.config();
+        config.profile = ServiceProfile::Stateful { target, minimum };
+        config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+        let mut cluster = Cluster::new(config).unwrap();
+        if let Err(error) = cluster.start().await {
+            let cleanup = cluster.shutdown().await;
+            panic!("configured failover startup: {error}; cleanup={cleanup}");
+        }
+        let result = peer_idle_catch(async {
+            cluster.execute(command("primary", "create", Some(1))).await?;
+            until(&mut cluster, |c| c.ledger.result("primary")["state"] == "complete").await;
+            let service = cluster.ledger.placements[0].body()?.service;
+            let old_endpoint = cluster.ledger.placements[0].endpoint.clone().ok_or("missing endpoint")?;
+            until(&mut cluster, |_| data_contact(&old_endpoint, b"read\n").starts_with("OK ")).await;
+            assert!(data_contact(&old_endpoint, b"write\n").contains("committed=1"));
+            until(&mut cluster, |c| (1..target as usize).all(|i|
+                c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 1)).await;
+            let owners = cluster.status()["nodes"].as_array().unwrap().iter()
+                .map(|n| (n["node_pid"].clone(), n["app_pid"].clone(), n["runtime_root"].clone())).collect::<Vec<_>>();
+            let losses: Vec<_> = (target as usize - secondary_losses..target as usize).collect();
+            for &index in &losses {
+                let pid = cluster.ledger.placements[index].profile.as_ref().unwrap().app_pid;
+                assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+            }
+            until(&mut cluster, |c| losses.iter().all(|i| c.ledger.placements[*i].loss_reported)).await;
+            let pid = cluster.ledger.placements[0].profile.as_ref().unwrap().app_pid;
+            assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+            if !expected {
+                until(&mut cluster, |c| c.ledger.placements[0].loss_reported).await;
+                for _ in 0..20 { cluster.drive().await; }
+                assert!(cluster.ledger.swap.is_none());
+                assert!(cluster.ledger.placements.iter().all(|p| p.endpoint.is_none()));
+                assert_eq!(cluster.status()["nodes"][1]["retained_work"]["local_replica"]["replica"]["current_role"], 3);
+                return Ok(());
+            }
+            let lost = hold_peer_loss_frame(&mut cluster, 1, "DoReconfigurationReply", Duration::from_secs(30)).await?;
+            assert_eq!(cluster.ledger.configuration_status()["ready"], false);
+            assert!(cluster.ledger.placements.iter().all(|p| p.endpoint.is_none()));
+            let request = cluster.ledger.swap.as_ref().unwrap().body.clone();
+            assert_eq!(request.configuration.service, service);
+            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), target as usize);
+            let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11)).ok_or("missing failover retry")?;
+            assert_eq!(retry, request);
+            cluster.send_configuration(&retry).await?;
+            until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+            let (reply, _) = decode_do_reconfiguration_reply(&lost).map_err(err)?;
+            assert_eq!(cluster.ledger.swap.as_ref().unwrap().reply.as_ref(), Some(&reply));
+            let endpoint = cluster.ledger.placements[1].endpoint.clone().ok_or("missing new Primary endpoint")?;
+            if minimum as usize > reply.replicas.0.len() {
+                assert!(!data_contact(&endpoint, b"write-more\n").starts_with("OK "));
+                assert_eq!(cluster.ledger.placements[1].body()?.service, service);
+                return Ok(());
+            }
+            assert!(data_contact(&endpoint, b"read\n").contains("committed=1 value=acknowledged"));
+            let written = data_contact(&endpoint, b"write-more\n");
+            assert!(written.contains("committed=2 value=continued"), "{target}/{minimum}: {written}");
+            until(&mut cluster, |c| (2..target as usize).filter(|i| !losses.contains(i)).all(|i|
+                c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 2)).await;
+            until(&mut cluster, |c| (1..target as usize).filter(|i| !losses.contains(i)).all(|i|
+                c.status()["nodes"][i]["retained_work"]["app_observation"]["opens"] == 1)).await;
+            let status = cluster.status();
+            for i in (1..target as usize).filter(|i| !losses.contains(i)) {
+                assert_eq!(owners[i], (status["nodes"][i]["node_pid"].clone(), status["nodes"][i]["app_pid"].clone(), status["nodes"][i]["runtime_root"].clone()));
+                assert_eq!(status["nodes"][i]["retained_work"]["peer_command_error"], Value::Null);
+                assert_eq!(status["nodes"][i]["retained_work"]["peer_error"], Value::Null);
+                assert_eq!(cluster.ledger.placements[i].body()?.service, service);
+            }
+            assert!(cluster.repair_primary_replica().await.is_err());
+            Ok::<(), String>(())
+        }).await;
+        if !matches!(&result, Ok(Ok(()))) {
+            eprintln!("CONFIGURED_FAILOVER_STATUS {}", cluster.status());
+            for child in &cluster.children { eprintln!("CONFIGURED_FAILOVER_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+        }
+        let cleanup = cluster.shutdown().await;
+        assert_eq!(cleanup["clean"], true, "{cleanup}");
+        result.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn configured_candidate_redirection_routes_new_epoch_and_rejects_deprecated_reply() {
+    let fixture = Fixture::new("configured-redirection");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::Stateful { target: 4, minimum: 2 };
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    if let Err(error) = cluster.start().await {
+        let cleanup = cluster.shutdown().await;
+        panic!("redirection startup: {error}; cleanup={cleanup}");
+    }
+    let result = peer_idle_catch(async {
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        until(&mut cluster, |c| c.ledger.result("primary")["state"] == "complete").await;
+        let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        until(&mut cluster, |_| data_contact(&endpoint, b"read\n").starts_with("OK ")).await;
+        assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+        until(&mut cluster, |c| (1..4).all(|i|
+            c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 1)).await;
+        let pid = cluster.ledger.placements[0].profile.as_ref().unwrap().app_pid;
+        assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+        let lost = hold_peer_loss_frame(&mut cluster, 0, "ReplicaUp", Duration::from_secs(12)).await?;
+        let (report, _) = decode_replica_up(&lost).map_err(err)?;
+        let response = cluster.ledger.report(0, &report)?.ok_or("missing loss ACK")?;
+        cluster.children[0].link.as_ref().unwrap().send(replica_up_reply_message(&response, &cluster.children[0].generation()).map_err(err)?).await?;
+        let intent = cluster.ledger.start_primary_failover(Instant::now())?.ok_or("missing failover intent")?;
+        // Inject a native FM input; RA's actual history selection is tested in its model suite.
+        let mut change = intent.configuration;
+        let selected = change.replicas.0.iter_mut().find(|r| r.node == cluster.children[2].launch.node).unwrap();
+        selected.first_lsn = 1;
+        selected.last_lsn = 1;
+        let legacy = cluster.ledger.change_configuration(1, change, Instant::now())?.ok_or("redirection rejected")?;
+        cluster.children[1].link.as_ref().unwrap().send(change_configuration_reply_message(&legacy, &cluster.children[1].generation()).map_err(err)?).await?;
+        cluster.send_configuration(&cluster.ledger.swap.as_ref().unwrap().body).await?;
+        until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true
+            && c.status()["nodes"][1]["retained_work"]["deprecated_change_configuration_reply"]["state"] == "rejected").await;
+        assert_eq!(cluster.ledger.primary_index(), 2);
+        assert!(cluster.ledger.placements[1].link_alive);
+        let endpoint = cluster.ledger.placements[2].endpoint.clone().ok_or("missing redirected endpoint")?;
+        assert!(data_contact(&endpoint, b"read\n").contains("committed=1 value=acknowledged"));
+        assert!(data_contact(&endpoint, b"write-more\n").contains("committed=2 value=continued"));
+        until(&mut cluster, |c| [1, 3].iter().all(|i|
+            c.status()["nodes"][*i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 2)).await;
+        for i in 1..4 {
+            assert_eq!(cluster.status()["nodes"][i]["retained_work"]["app_observation"]["opens"], 1);
+            assert_eq!(cluster.status()["nodes"][i]["retained_work"]["peer_command_error"], Value::Null);
+        }
+        Ok::<(), String>(())
+    }).await;
+    if !matches!(&result, Ok(Ok(()))) {
+        eprintln!("REDIRECTION_STATUS {}", cluster.status());
+        for child in &cluster.children { eprintln!("REDIRECTION_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+    }
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
 }
 
 #[tokio::test]

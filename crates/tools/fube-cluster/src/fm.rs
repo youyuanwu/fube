@@ -120,6 +120,7 @@ pub struct Ledger {
     pub(crate) configuration: Option<ActiveConfiguration>,
     pub(crate) swap: Option<ActiveConfiguration>,
     swap_endpoint: Option<AddInstance>,
+    candidate_changes: Vec<Configuration>,
     configuration_history: Vec<ActiveConfiguration>,
     pub(crate) repair: Option<PrimaryRepair>,
     pub(crate) repair_history: Vec<PrimaryRepair>,
@@ -525,14 +526,37 @@ fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Resul
 }
 impl Ledger {
     pub fn primary_failover(&self) -> bool {
-        self.placements[0].launch.profile == crate::ServiceProfile::StatefulThree
-            && self
-                .swap
-                .as_ref()
-                .is_some_and(|s| s.body.configuration.replicas.0.len() == 3)
+        self.swap.as_ref().is_some_and(|s| {
+            s.body
+                .configuration
+                .replicas
+                .0
+                .iter()
+                .any(|r| r.previous_role == 4 && r.current_role == 1 && !r.up)
+        })
     }
 
     fn primary_transition_live(&self) -> bool {
+        if self.placements[0]
+            .launch
+            .profile
+            .configured_sizes()
+            .is_some()
+        {
+            return self.swap.as_ref().is_some_and(|s| {
+                s.body
+                    .configuration
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|r| r.up && r.current_role >= 3)
+                    .all(|r| {
+                        self.placements
+                            .iter()
+                            .any(|p| p.launch.node == r.node && p.link_alive && !p.loss_reported)
+                    })
+            });
+        }
         let lost = self.failed_primary_index();
         self.placements
             .iter()
@@ -544,7 +568,13 @@ impl Ledger {
     }
 
     pub fn start_primary_failover(&mut self, now: Instant) -> Result<Option<DoReconfiguration>> {
-        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulThree
+        let configured = self.placements[0]
+            .launch
+            .profile
+            .configured_sizes()
+            .is_some();
+        if (!configured
+            && self.placements[0].launch.profile != crate::ServiceProfile::StatefulThree)
             || self.generation.is_some()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
@@ -563,15 +593,16 @@ impl Ledger {
             .or(self.configuration.as_ref())
             .filter(|c| {
                 c.reply.is_some()
-                    && c.body.configuration.unit.target == 3
-                    && c.body.configuration.unit.minimum == 2
+                    && (configured
+                        || (c.body.configuration.unit.target == 3
+                            && c.body.configuration.unit.minimum == 2))
             })
         else {
             return Ok(None);
         };
         let previous = active.reply.as_ref().expect("completed configuration");
-        if previous.replicas.0.len() != 3 {
-            return Err("Primary failover requires completed current 1P+2S membership".into());
+        if previous.replicas.0.len() < 2 {
+            return Ok(None);
         }
         let lost = self.placements.iter().position(|p| {
             previous
@@ -583,26 +614,54 @@ impl Ledger {
         let Some(lost) = lost else {
             return Ok(None);
         };
-        if self.placements.iter().enumerate().any(|(i, p)| {
-            !p.link_alive
-                || !p.activated
-                || p.bootstrap != Bootstrap::Admitted
-                || p.pending.is_some()
-                || p.node_control.is_some()
-                || p.service_update.is_some()
-                || (i != lost && (p.loss_reported || p.observed != Observed::Running))
-        }) {
+        if !self.placements[lost].link_alive
+            || self.placements.iter().enumerate().any(|(i, p)| {
+                if configured && i != lost && (!p.link_alive || p.loss_reported) {
+                    return false;
+                }
+                !p.link_alive
+                    || !p.activated
+                    || p.bootstrap != Bootstrap::Admitted
+                    || p.pending.is_some()
+                    || p.node_control.is_some()
+                    || p.service_update.is_some()
+                    || (i != lost && (p.loss_reported || p.observed != Observed::Running))
+            })
+        {
             return Ok(None);
         }
-        let candidate =
-            self.placements
+        let available =
+            |p: &Placement| p.link_alive && !p.loss_reported && p.observed == Observed::Running;
+        if configured
+            && previous
+                .replicas
+                .0
                 .iter()
-                .position(|p| {
-                    previous.replicas.0.iter().any(|r| {
-                        r.node == p.launch.node && r.current_role == 3 && r.up && r.state == 2
-                    })
+                .filter(|r| {
+                    r.current_role >= 3
+                        && self
+                            .placements
+                            .iter()
+                            .any(|p| p.launch.node == r.node && available(p))
                 })
-                .ok_or("missing current ActiveSecondary candidate")?;
+                .count()
+                < previous.replicas.0.len().div_ceil(2)
+        {
+            return Ok(None);
+        }
+        let candidate = self
+            .placements
+            .iter()
+            .position(|p| {
+                previous.replicas.0.iter().any(|r| {
+                    r.node == p.launch.node
+                        && r.current_role == 3
+                        && r.up
+                        && r.state == 2
+                        && available(p)
+                })
+            })
+            .ok_or("missing current ActiveSecondary candidate")?;
         let mut body = active.body.clone();
         body.configuration.unit = previous.unit.clone();
         body.configuration.unit.previous = previous.unit.current;
@@ -621,13 +680,39 @@ impl Ledger {
                 r.state = 3;
             } else if r.node == self.placements[candidate].launch.node {
                 r.current_role = 4;
+            } else if configured {
+                let placement = self
+                    .placements
+                    .iter()
+                    .find(|p| p.launch.node == r.node)
+                    .ok_or("missing configured member owner")?;
+                r.up = available(placement);
+                if placement.loss_reported {
+                    r.state = 3;
+                }
             }
             r.first_lsn = -1;
             r.last_lsn = -1;
         }
+        if configured {
+            let mut count = body
+                .configuration
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.current_role >= 3)
+                .count();
+            for r in &mut body.configuration.replicas.0 {
+                if !r.up && r.current_role == 3 && count > body.configuration.unit.minimum as usize
+                {
+                    r.current_role = 1;
+                    count -= 1;
+                }
+            }
+        }
         body.phase0_duration = i64::MAX;
         for (i, p) in self.placements.iter_mut().enumerate() {
-            if i == lost {
+            if i == lost || (configured && !available(p)) {
                 continue;
             }
             p.active_unit = Some(body.configuration.unit.clone());
@@ -652,6 +737,130 @@ impl Ledger {
             last: now,
         });
         Ok(Some(body))
+    }
+
+    pub fn change_configuration(
+        &mut self,
+        index: usize,
+        body: Configuration,
+        now: Instant,
+    ) -> Result<Option<FailoverUnitReply>> {
+        let Some(swap) = self
+            .swap
+            .as_ref()
+            .filter(|s| self.primary_failover() && !s.unknown)
+        else {
+            return Ok(None);
+        };
+        if self.candidate_changes.iter().any(|previous| {
+            previous == &body
+                && previous
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.current_role == 4 && r.node == self.placements[index].launch.node)
+        }) {
+            return Ok(Some(FailoverUnitReply {
+                unit: swap.body.configuration.unit.clone(),
+                error: 0,
+            }));
+        }
+        if swap.reply.is_some()
+            || index != self.transition_primary_index()
+            || body.unit != swap.body.configuration.unit
+            || body.service != swap.body.configuration.service
+            || body.replicas.0.len() != swap.body.configuration.replicas.0.len()
+            || !self.primary_transition_live()
+        {
+            return Ok(None);
+        }
+        let mut selected = None;
+        for expected in &swap.body.configuration.replicas.0 {
+            let actual: Vec<_> = body
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.node == expected.node)
+                .collect();
+            let [actual] = actual.as_slice() else {
+                return Ok(None);
+            };
+            let mut normalized = (*actual).clone();
+            normalized.first_lsn = expected.first_lsn;
+            normalized.last_lsn = expected.last_lsn;
+            if normalized != *expected {
+                return Ok(None);
+            }
+            if actual.last_lsn >= 0 {
+                if actual.first_lsn < 0
+                    || !actual.up
+                    || actual.current_role != 3
+                    || selected.is_some()
+                {
+                    return Ok(None);
+                }
+                selected = Some(actual.node.clone());
+            } else if actual.first_lsn != -1 || actual.last_lsn != -1 {
+                return Ok(None);
+            }
+        }
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        if self.candidate_changes.len() >= self.placements.len() {
+            return Err("configured failover candidate redirection budget exhausted".into());
+        }
+        let mut next = swap.body.clone();
+        next.configuration.unit.current.configuration = next
+            .configuration
+            .unit
+            .current
+            .configuration
+            .checked_add(0x1_0000_0001)
+            .ok_or("Primary redirection epoch exhausted")?;
+        for r in &mut next.configuration.replicas.0 {
+            if r.current_role == 4 {
+                r.current_role = 3;
+            }
+            if r.node == selected {
+                r.current_role = 4;
+            }
+            r.first_lsn = -1;
+            r.last_lsn = -1;
+        }
+        for p in &mut self.placements {
+            if next
+                .configuration
+                .replicas
+                .0
+                .iter()
+                .any(|r| r.node == p.launch.node && r.up)
+            {
+                p.active_unit = Some(next.configuration.unit.clone());
+                p.ready_replica = next
+                    .configuration
+                    .replicas
+                    .0
+                    .iter()
+                    .find(|r| r.node == p.launch.node)
+                    .cloned();
+                p.endpoint = None;
+            }
+        }
+        let reply = FailoverUnitReply {
+            unit: next.configuration.unit.clone(),
+            error: 0,
+        };
+        self.candidate_changes.push(body);
+        self.swap_endpoint = None;
+        self.swap = Some(ActiveConfiguration {
+            body: next,
+            reply: None,
+            unknown: false,
+            started: now,
+            last: now,
+        });
+        Ok(Some(reply))
     }
     pub fn generation_pending(&self) -> bool {
         self.generation
@@ -829,7 +1038,15 @@ impl Ledger {
             && placement.bootstrap == Bootstrap::Admitted
             && placement.launch.profile.stateful()
         {
-            if let Some(swap) = self.swap.as_mut().filter(|_| !old_failover_primary) {
+            if let Some(swap) = self.swap.as_mut().filter(|s| {
+                !old_failover_primary
+                    && s.body
+                        .configuration
+                        .replicas
+                        .0
+                        .iter()
+                        .any(|r| r.node == placement.launch.node && r.up && r.current_role >= 3)
+            }) {
                 swap.unknown = true;
             }
             if let Some(configuration) = &mut self.configuration {
@@ -1158,6 +1375,7 @@ impl Ledger {
             configuration: None,
             swap: None,
             swap_endpoint: None,
+            candidate_changes: vec![],
             configuration_history: vec![],
             repair: None,
             repair_history: Vec::new(),
@@ -1483,7 +1701,12 @@ impl Ledger {
         }
         let failover = self.primary_failover();
         let old_primary = self.failed_primary_index() == Some(index);
-        if let Some(swap) = self.swap.as_mut().filter(|_| !old_primary) {
+        if let Some(swap) = self.swap.as_mut().filter(|s| {
+            !old_primary
+                && s.body.configuration.replicas.0.iter().any(|r| {
+                    r.node == self.placements[index].launch.node && r.up && r.current_role >= 3
+                })
+        }) {
             swap.unknown = true;
         }
         if let Some(configuration) = &mut self.configuration {
@@ -1911,6 +2134,11 @@ impl Ledger {
     }
 
     pub fn begin_primary_repair(&mut self, now: Instant) -> Result<bool> {
+        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulThree {
+            return Err(
+                "Primary repair remains qualified only for the named three-member profile".into(),
+            );
+        }
         if self.repair.is_some() {
             return Ok(false);
         }
@@ -2686,7 +2914,15 @@ impl Ledger {
         if index != primary
             || body.error != 0
             || body.unit != unit
-            || body.replicas.0.len() != 2
+            || body.replicas.0.len()
+                != swap
+                    .body
+                    .configuration
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|r| r.current_role >= 3)
+                    .count()
             || swap
                 .body
                 .configuration
@@ -2722,7 +2958,10 @@ impl Ledger {
             actual.first_lsn = expected.first_lsn;
             actual.last_lsn = expected.last_lsn;
             actual.service_endpoint = expected.service_endpoint.clone();
-            if actual != *expected || r.previous_role != 1 || r.first_lsn < 0 || r.last_lsn < 0 {
+            if actual != *expected
+                || r.previous_role != 1
+                || (r.up && (r.first_lsn < 0 || r.last_lsn < 0))
+            {
                 return Ok(());
             }
             if r.current_role == 4 {
@@ -2733,12 +2972,21 @@ impl Ledger {
                 if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
                     return Err("unsupported final Primary endpoint".into());
                 }
-            } else if !r.service_endpoint.is_empty() {
+            } else if r.up && !r.service_endpoint.is_empty() {
                 return Err("demoted Primary retained a published service endpoint".into());
             }
         }
         for (i, p) in self.placements.iter_mut().enumerate() {
-            if failover && Some(i) == lost {
+            if failover
+                && (Some(i) == lost
+                    || !swap
+                        .body
+                        .configuration
+                        .replicas
+                        .0
+                        .iter()
+                        .any(|r| r.node == p.launch.node && r.up && r.current_role >= 3))
+            {
                 continue;
             }
             let replica = body
@@ -2783,6 +3031,7 @@ impl Ledger {
                 "request":{"configuration":swap.body.configuration,"phase0_duration":swap.body.phase0_duration},
                 "reply":swap.reply,"endpoint_update":self.swap_endpoint,"primary_transfer":true,
                 "from":self.failed_primary_index().map_or(1, |i| i + 1),"to":self.transition_primary_index() + 1,
+                "candidate_redirections":self.candidate_changes,
                 "history":self.configuration_history.iter().chain(self.configuration.iter()).map(|c| json!({"request":c.body.configuration,"reply":c.reply})).collect::<Vec<_>>()});
         }
         let Some(config) = &self.configuration else {

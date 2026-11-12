@@ -117,6 +117,7 @@ rich!(AddInstance: unit, replica, service);
 rich!(AddInstanceReply: unit, replica, [error]);
 rich!(Configuration: unit, replicas, service);
 rich!(ConfigurationReply: unit, replicas, [error]);
+rich!(FailoverUnitReply: unit, [error]);
 rich!(GenerationNumber: generation, owner);
 rich!(GenerationHeader: number, for_fm_replica);
 rich!(ReplicaInfo: description, [intermediate_role]);

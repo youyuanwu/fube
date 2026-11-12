@@ -40,6 +40,7 @@ struct Adapter {
     notification_pending: Option<ServiceTypeNotification>,
     report_pending: Option<ReplicaUp>,
     acknowledgements: Vec<(u64, SemanticAck)>,
+    rejected_change_configuration_reply: Option<FailoverUnitReply>,
 }
 enum SemanticAck {
     Notification(ServiceTypeNotification),
@@ -116,6 +117,26 @@ fn ticks(ticks: i64) -> Duration {
     Duration::from_nanos((ticks.max(0) as u64).saturating_mul(100))
 }
 impl Adapter {
+    fn reject_deprecated(
+        &mut self,
+        node: &Node,
+        message: &fube_transport::message::Message,
+    ) -> Result<bool> {
+        if message.properties().map_err(err)?.action != "ChangeConfigurationReply" {
+            return Ok(false);
+        }
+        wire::predecode(message)?;
+        let (body, generation) = decode_change_configuration_reply(message).map_err(err)?;
+        if generation.for_fm_replica || generation.number != node.generation_state().receive {
+            return Err("deprecated reply has a foreign FM generation".into());
+        }
+        if self.rejected_change_configuration_reply.as_ref() != Some(&body) {
+            eprintln!("rejected deprecated native action ChangeConfigurationReply");
+            self.rejected_change_configuration_reply = Some(body);
+        }
+        Ok(true)
+    }
+
     fn capture(&mut self, node: &mut Node) {
         for dispatch in node.take_external_up_to(32 - self.escrow.len()) {
             if matches!(dispatch.effect, ra::Effect::RequestReportRetry)
@@ -178,6 +199,7 @@ impl Adapter {
                     && matches!(
                         receipt.dispatch.effect,
                         ra::Effect::NodeActivateReply(_)
+                            | ra::Effect::ChangeConfiguration(_)
                             | ra::Effect::DoReconfigurationReply(_)
                             | ra::Effect::ReplicaEndpointUpdated(_)
                             | ra::Effect::NodeDeactivateReply(_)
@@ -494,6 +516,21 @@ impl Adapter {
                         self.replies.pop_front();
                         return Ok(());
                     }
+                    if let ra::Effect::ChangeConfiguration(body) = &reply.effect {
+                        let snapshot = node.snapshot(reply.entity);
+                        if snapshot.fenced
+                            || snapshot.committed.is_none_or(|s| {
+                                s.phase != ra::Phase::Ready
+                                    || s.swap.as_ref().is_none_or(|swap| {
+                                        swap.stage != ra::SwapStage::ChangeConfiguration
+                                            || swap.change.as_ref() != Some(body.as_ref())
+                                    })
+                            })
+                        {
+                            self.replies.pop_front();
+                            return Ok(());
+                        }
+                    }
                 }
                 if let ra::Effect::AddReplicaReply(body) | ra::Effect::RemoveReplicaReply(body) =
                     &reply.effect
@@ -534,6 +571,9 @@ impl Adapter {
                     ra::Effect::Reply(body) => add_instance_reply_message(body, Owner::Fm),
                     ra::Effect::DoReconfigurationReply(body) => {
                         do_reconfiguration_reply_message(body, Owner::Fm)
+                    }
+                    ra::Effect::ChangeConfiguration(body) => {
+                        change_configuration_message(body, Owner::Fm)
                     }
                     ra::Effect::ReplicaEndpointUpdated(body) => {
                         replica_endpoint_updated_message(body, Owner::Fm)
@@ -1258,7 +1298,15 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         let received =
                             match receive_generation(launch, &node, current, &mut incoming).await {
                                 Ok(true) => Ok(None),
-                                Ok(false) => receive_command(launch, &mut node, &incoming.message),
+                                Ok(false) => {
+                                    match adapter.reject_deprecated(&node, &incoming.message) {
+                                        Ok(true) => Ok(None),
+                                        Ok(false) => {
+                                            receive_command(launch, &mut node, &incoming.message)
+                                        }
+                                        Err(error) => Err(error),
+                                    }
+                                }
                                 Err(error) => Err(error),
                             };
                         match received {
@@ -1442,6 +1490,8 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     "adapter_pending":adapter.pending(), "commands":node.pending_commands(),
                     "semantic_pending":adapter.semantic_pending(),
                     "staged_status":format!("{:?}", node.pending_status()),
+                    "deprecated_change_configuration_reply":adapter.rejected_change_configuration_reply.as_ref()
+                        .map(|body| serde_json::json!({"state":"rejected","reason":"deprecated native action","body":body})),
                     "error":adapter.error, "link_alive":link.is_some(),
                     "peer_link_alive":!connections.is_empty() && connections.iter().all(|c| c.link.is_some()), "peer_error":adapter.peer_error,
                     "remote_idles":state.map(|s| s.remote_idles.iter().map(|r| serde_json::json!({
@@ -1608,15 +1658,12 @@ fn receive_peer_from(
             let (body, generation) = decode_get_lsn_reply(message).map_err(err)?;
             node.get_lsn_reply_from_peer(body, &peer.node, &generation)
         }
-        "Deactivate"
-            if launch.placement == 2 || launch.profile == ServiceProfile::StatefulThree =>
-        {
+        "Deactivate" if launch.placement == 2 || launch.profile.mesh_peers() => {
             let (body, generation) = decode_deactivate(message).map_err(err)?;
+            launch.check_service_sizes(&body.configuration.unit, &body.configuration.service)?;
             node.deactivate_replica_from_peer(body, &peer.node, &generation)
         }
-        "DeactivateReply"
-            if launch.placement == 1 || launch.profile == ServiceProfile::StatefulThree =>
-        {
+        "DeactivateReply" if launch.placement == 1 || launch.profile.mesh_peers() => {
             let (body, generation) = decode_deactivate_reply(message).map_err(err)?;
             fixed_idle_target(
                 launch,
@@ -2024,7 +2071,9 @@ fn receive_command(
         }
         "DoReconfiguration" => {
             if !launch.profile.peer_replicas()
-                || (launch.placement != 1 && launch.profile != ServiceProfile::StatefulThree)
+                || (launch.placement != 1
+                    && !launch.profile.mesh_peers()
+                    && launch.profile.configured_sizes().is_none())
             {
                 return Err("DoReconfiguration requires the original coordinating Primary".into());
             }

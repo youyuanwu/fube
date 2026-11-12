@@ -34,13 +34,26 @@ or the retained create result, not registration or transport completion.
 Status exposes `replica_set: { target, minimum, immutable: true }`.
 For N = 1 the normal AddPrimary completion settles creation.
 
-This configured profile currently qualifies **initial build/admission only**.
-It rejects resize, planned transfer, Secondary retirement/replacement and
-Primary repair; it does not automatically promote or restart an application
-after loss. Node loss makes membership unknown. The named profiles below
-remain separate legacy qualification paths, including their historical
-service-size transitions and bounded failover/repair.
+After completed initial membership, a matched Primary app-host loss can start
+one no-data-loss failover on the original live Node/RA sessions. Available
+Secondaries need not all have identical progress. RA collects per-member
+GetLSN/history, checks separate PC/CC read quorums, selects using deactivation
+history before LSN and can redirect the FM candidate with ChangeConfiguration.
+All required surviving Deactivate/Activate commits and final RAP/FM completion
+precede endpoint publication. FM-link loss alone cannot authorize promotion.
+Configured sizes and service version remain unchanged; current membership may
+shrink, respecting minimum when removing additional down Secondaries.
+
+The configured profile still rejects resize, planned transfer, Secondary
+retirement/replacement and Primary repair. It does not restart applications.
+Insufficient read quorum blocks failover without declaring data loss. Additional
+loss during an in-flight transition makes its ownership unknown, not successful.
+Repeated configured-profile failover, interrupted/superseding reconfiguration
+and whole-node/FM restart remain unsupported. The named profiles below remain
+separate qualification paths, including their historical size transitions and
+repeated failover/repair.
 See [native mapping and acceptance](../../../docs/cluster/MinimalFmCluster.md#immutable-configured-initial-membership).
+See [configured failover evidence and limits](../../../docs/cluster/MinimalFmCluster.md#immutable-configured-primary-failover).
 
 `--stateful-three` / `ServiceProfile::StatefulThree` is a separate, fixed
 three-node volatile profile. Create only the original node1 Primary. Then call

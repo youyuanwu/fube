@@ -37,15 +37,22 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 173 inputs.
+The C++ producer independently constructs expected values and emits 179 inputs.
+Configured failover adds default/rich ChangeConfiguration and legacy
+ChangeConfigurationReply bodies plus both literal action headers.
+The request reuses ConfigurationMessageBody; the reply adds the two-field
+FailoverUnitReplyMessageBody. Both directions use source-extracted actors and
+priority. The deprecated reply has codec coverage but remains explicitly
+rejected by RA, never a reconfiguration-completion gate.
 Bounded three-member Primary failover adds a three-element non-force Deactivate
 body, independently checked in both native/Rust directions and for truncation.
 Healthy three-member admission adds three-element-vector cases for
 DoReconfiguration, Activate and DoReconfigurationReply. A separately initialized
 third descriptor is appended to the rich native/Rust bodies; these are synthetic
 codec fixtures, not a native handler trace or live membership proof.
-The maintained gate covers 84 types/255 fields, 177 bundle files and 53 actual
-native truncation rejections, retaining the prior 172-case three-member gate
+The maintained gate covers 85 types/257 fields, 183 bundle files and 55 actual
+native truncation rejections, retaining the prior 173-case failover gate,
+172-case three-member gate
 and all prior 169 LFUM cases.
 Live-session LFUM adds empty/rich/deleted-only metadata bodies, a bodyless
 correlated reply and both action headers. Native LFUMMessageBody extraction

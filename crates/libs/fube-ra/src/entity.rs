@@ -686,6 +686,7 @@ pub struct Snapshot {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    ChangeConfiguration(Box<Configuration>),
     PeerContinueSwap {
         target: NodeInstance,
         body: Box<DoReconfiguration>,
@@ -1369,7 +1370,10 @@ impl Executor {
             Kind::DoReconfiguration { .. }
             | Kind::CompleteConfiguration
             | Kind::ActivateReply { .. }
-            | Kind::RetryConfiguration => view.peers.len().max(8),
+            | Kind::DeactivateReply { .. }
+            | Kind::CompleteStatus
+            | Kind::GetLsnReply { .. }
+            | Kind::RetryConfiguration => (view.peers.len() + 1).max(8),
             kind if kind.node_work() => 2,
             _ => 8,
         };

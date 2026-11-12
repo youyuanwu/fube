@@ -61,6 +61,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                 | "AddPrimaryReply"
                 | "AddReplicaReply"
                 | "DoReconfigurationReply"
+                | "ChangeConfiguration"
                 | "ReplicaEndpointUpdated"
                 | "RemoveReplicaReply"
                 | "RemoveInstanceReply"
@@ -84,6 +85,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                     | "AddPrimaryReply"
                     | "AddReplicaReply"
                     | "DoReconfigurationReply"
+                    | "ChangeConfiguration"
                     | "RemoveReplicaReply"
                     | "RemoveInstanceReply"
                     | "DeleteReplicaReply"
@@ -106,6 +108,7 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
                     | "AddPrimary"
                     | "AddReplica"
                     | "DoReconfiguration"
+                    | "ChangeConfigurationReply"
                     | "RemoveReplica"
                     | "RemoveInstance"
                     | "DeleteReplica"
@@ -119,6 +122,7 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
                 | "AddPrimary"
                 | "AddReplica"
                 | "DoReconfiguration"
+                | "ChangeConfigurationReply"
                 | "RemoveReplica"
                 | "RemoveInstance"
                 | "DeleteReplica"
@@ -311,6 +315,12 @@ pub fn predecode(message: &Message) -> Result<()> {
         }
         "DoReconfigurationReply" => {
             decode::<ConfigurationReply>(&message.body)?;
+        }
+        "ChangeConfiguration" => {
+            decode::<Configuration>(&message.body)?;
+        }
+        "ChangeConfigurationReply" => {
+            decode::<FailoverUnitReply>(&message.body)?;
         }
         "Activate" => {
             decode::<Activate>(&message.body)?;

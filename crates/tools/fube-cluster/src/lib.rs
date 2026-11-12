@@ -441,6 +441,28 @@ impl Cluster {
                 }
                 self.ledger.configuration_reply(index, body)?;
             }
+            "ChangeConfiguration" => {
+                let (body, owner) = decode_change_configuration(&incoming.message).map_err(err)?;
+                if owner != Owner::Fm {
+                    return Err("FMM candidate redirection is gated".into());
+                }
+                if let Some(reply) =
+                    self.ledger
+                        .change_configuration(index, body, Instant::now())?
+                {
+                    link.send(
+                        change_configuration_reply_message(&reply, &generation).map_err(err)?,
+                    )
+                    .await?;
+                    let next = &self
+                        .ledger
+                        .swap
+                        .as_ref()
+                        .ok_or("missing redirected failover")?
+                        .body;
+                    self.send_configuration(next).await?;
+                }
+            }
             "GenerationUpdateReject" => {
                 let current = decode_generation_update_reject(&incoming.message).map_err(err)?;
                 if let Some(round) = &mut self.ledger.generation {

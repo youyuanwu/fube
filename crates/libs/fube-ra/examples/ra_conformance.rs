@@ -790,6 +790,50 @@ fn peer_contracts(input: &Path, output: &Path) {
 
 fn configuration_contracts(input: &Path, output: &Path) {
     for (name, body) in [
+        ("default-change-configuration", Configuration::default()),
+        ("rich-change-configuration", filled::<Configuration>(&mut 0)),
+    ] {
+        check(input, output, name, body.clone());
+        for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
+            let mut native = stage_two_envelope(input, name, "ChangeConfiguration", actor, None);
+            native
+                .headers
+                .iter_mut()
+                .find(|h| h.id == HIGH_PRIORITY)
+                .unwrap()
+                .value = fs::read(input.join("priority.bin")).unwrap();
+            assert_eq!(
+                decode_change_configuration(&native).unwrap(),
+                (body.clone(), owner)
+            );
+            factory_contract(
+                &native,
+                &change_configuration_message(&body, owner).unwrap(),
+            );
+        }
+        reject_prefixes::<Configuration>(input, name);
+    }
+    for (name, body) in [
+        (
+            "default-change-configuration-reply",
+            FailoverUnitReply::default(),
+        ),
+        (
+            "rich-change-configuration-reply",
+            filled::<FailoverUnitReply>(&mut 0),
+        ),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "ChangeConfigurationReply",
+            body,
+            change_configuration_reply_message,
+            decode_change_configuration_reply,
+        );
+    }
+    for (name, body) in [
         ("default-get-lsn", GetLsn::default()),
         ("rich-get-lsn", filled::<GetLsn>(&mut 0)),
     ] {
@@ -996,6 +1040,8 @@ fn configuration_contracts(input: &Path, output: &Path) {
         "DeactivateReply",
         "GetLSN",
         "GetLSNReply",
+        "ChangeConfiguration",
+        "ChangeConfigurationReply",
     ] {
         check(
             input,

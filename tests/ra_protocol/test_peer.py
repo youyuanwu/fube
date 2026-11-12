@@ -82,7 +82,7 @@ class RAReplicaMessageBody : public ReplicaMessageBody {
         self.assertEqual(len(peer), 8)
         self.assertEqual({row["action"] for row in peer if "selected" in row["status"]},
                          consumer.PEER_ACTIONS | {"Activate", "ActivateReply", "Deactivate", "DeactivateReply", "GetLSN", "GetLSNReply"})
-        self.assertEqual(sum("selected" in row["status"] for row in rows if row not in peer), 39)
+        self.assertEqual(sum("selected" in row["status"] for row in rows if row not in peer), 40)
         records = {row["action"]: row for row in rows}
         self.assertEqual(records["CreateReplica"]["ra_metadata"], "FC")
         self.assertEqual(records["CreateReplicaReply"]["ra_metadata"], "F")
@@ -91,7 +91,11 @@ class RAReplicaMessageBody : public ReplicaMessageBody {
         for action in ["RemoveReplica", "RemoveReplicaReply"]:
             self.assertIn("selected-C10", records[action]["status"])
         for action in consumer.CONFIGURATION_FACTORIES:
-            contract = "selected-C13" if action.startswith("GetLSN") else "selected-C12" if action.startswith("Deactivate") else "selected-C11"
+            if action == "ChangeConfigurationReply":
+                self.assertEqual(records[action]["ra_metadata"], "D")
+                self.assertNotIn("selected", records[action]["status"])
+                continue
+            contract = "selected-C15" if action == "ChangeConfiguration" else "selected-C13" if action.startswith("GetLSN") else "selected-C12" if action.startswith("Deactivate") else "selected-C11"
             self.assertIn(contract, records[action]["status"])
         text = (root / "docs/cluster/NativeRaProtocol.md").read_text()
         for term in ["124 inputs", "77 types/240 fields", "128 bundle files",
@@ -103,7 +107,8 @@ class RAReplicaMessageBody : public ReplicaMessageBody {
                      "DoReconfigurationReply": "CreateRAToFMMessage",
                      "Activate": "CreateRAToRAMessage", "ActivateReply": "CreateRAToRAMessage",
                      "Deactivate": "CreateRAToRAMessage", "DeactivateReply": "CreateRAToRAMessage",
-                     "GetLSN": "CreateRAToRAMessage", "GetLSNReply": "CreateRAToRAMessage"}
+                     "GetLSN": "CreateRAToRAMessage", "GetLSNReply": "CreateRAToRAMessage",
+                     "ChangeConfiguration": "CreateRAToFMMessage", "ChangeConfigurationReply": "CreateFMToRAMessage"}
         lines = [f'RSMessage::{action} = {factory}(L"{action}", true);'
                  for action, factory in factories.items()]
         text = "\n".join(lines)

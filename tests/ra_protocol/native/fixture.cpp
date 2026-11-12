@@ -371,12 +371,24 @@ int main(int argc,char** argv) {
         c=0; rich(lsn_reply,c);
         run(mode,dir,"rich-get-lsn-reply",lsn_reply);
         reject_truncated(lsn_reply);
+        ConfigurationMessageBody change;
+        run(mode,dir,"default-change-configuration",change);
+        c=0; rich(change,c);
+        run(mode,dir,"rich-change-configuration",change);
+        reject_truncated(change);
+        FailoverUnitReplyMessageBody change_reply;
+        run(mode,dir,"default-change-configuration-reply",change_reply);
+        c=0; rich(change_reply,c);
+        run(mode,dir,"rich-change-configuration-reply",change_reply);
+        reject_truncated(change_reply);
         if(DoReconfigurationActor!=12 || DoReconfigurationReplyActor!=11 ||
            ActivateActor!=12 || ActivateReplyActor!=12 || DeactivateActor!=12 || DeactivateReplyActor!=12 || GetLSNActor!=12 || GetLSNReplyActor!=12 ||
+           ChangeConfigurationActor!=11 || ChangeConfigurationReplyActor!=12 ||
            !DoReconfigurationPriority || !DoReconfigurationReplyPriority ||
+           !ChangeConfigurationPriority || !ChangeConfigurationReplyPriority ||
            !ActivatePriority || !ActivateReplyPriority || !DeactivatePriority || !DeactivateReplyPriority || !GetLSNPriority || !GetLSNReplyPriority)
             throw std::runtime_error("native configuration factory metadata mismatch");
-        for(auto name:{u"DoReconfiguration",u"DoReconfigurationReply",u"Activate",u"ActivateReply",u"Deactivate",u"DeactivateReply",u"GetLSN",u"GetLSNReply"}) {
+        for(auto name:{u"DoReconfiguration",u"DoReconfigurationReply",u"Activate",u"ActivateReply",u"Deactivate",u"DeactivateReply",u"GetLSN",u"GetLSNReply",u"ChangeConfiguration",u"ChangeConfigurationReply"}) {
             action.action_=text(name);
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);
@@ -620,7 +632,7 @@ int main(int argc,char** argv) {
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
         ++native_truncation_rejections;
-        if(native_truncation_rejections!=53)
+        if(native_truncation_rejections!=55)
             throw std::runtime_error("native truncation coverage mismatch");
         std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;

@@ -72,12 +72,90 @@ The RA model also exercises all 63 remote activation commits at target/minimum
 A native-shaped target-changing request that the legacy two-member retirement
 path could accept is rejected by the immutable profile's actual ingress.
 
-This slice deliberately waits for all original build destinations and admits
-them together. Incremental/partial admission, resize, generic planned transfer,
-failover, replacement/repair, whole-node/FM restart and persisted recovery remain
+This initial slice deliberately waits for all original build destinations and
+admits them together. The failover extension below adds loss-driven promotion.
+Incremental/partial admission, resize, generic planned transfer,
+replacement/repair, whole-node/FM restart and persisted recovery remain
 unsupported for this new profile. The older named profiles remain separate
 qualification fixtures with their existing behavior; their bounded lifecycle
 support is not implicitly enabled for arbitrary configured sizes.
+
+## Immutable configured Primary failover
+
+After completed initial admission, a matched native terminal report for the
+Primary's app-host can start one no-data-loss failover for the configured
+profile. The original FM, Nodes/RAs, stores and peer Channels remain owned.
+FM-link disappearance is not proof of Primary failure. No new service Open,
+host adoption, private data-engine access or size update is substituted for
+the normal RAP callbacks.
+
+FM keeps PC from the last committed membership and removes the failed Primary
+from CC. Other unavailable Secondaries can leave CC only while its count is
+above the configured minimum, matching `fm/ReconfigurationTask.cpp:325-344`.
+Desired target/minimum and service update version remain unchanged. Available
+members must cover PC's read quorum before this no-data-loss-only adapter
+starts promotion; it does not use minimum as a read/write-quorum override.
+
+RA retains one GetLSN result/history per exact replica incarnation. Phase 1
+checks PC and CC read quorums separately, waits for up replicas for the native
+dynamic 30-second progress-query duration, and never converts timer expiry into
+quorum success. Candidate selection filters older deactivation primary epochs
+before comparing last LSN, then considers first-LSN catch-up capability.
+Different survivor LSNs no longer reject an otherwise valid failover.
+
+If another member is preferable, RA commits ChangeConfiguration with initialized
+LSNs **only for that selected member**, reverts its local promotion intent and
+does not call RAP to promote itself. FM fences the exact configuration/source,
+advances the Primary epoch and sends DoReconfiguration to the new candidate,
+which performs its own GetLSN round. Exact duplicate reports replay the current
+round without another epoch bump. Candidate-report retention is bounded by the
+configured node count.
+
+The native FM still emits ChangeConfigurationReply, but pinned RA marks that
+action Deprecated. The Rust adapter explicitly rejects/logs it and exposes
+`deprecated_change_configuration_reply.state = rejected`; no RA state command
+or retry-completion gate depends on it. New GetLSN/DoReconfiguration traffic,
+not this legacy reply, advances the redirected transition.
+
+Catch-up uses the existing runtime projection of separate PC/CC configurations.
+Every required up Secondary's metadata-only Deactivate reply and Activate reply
+is accounted independently, after its applied RA commit. Retries target only
+outstanding members. Final RAP EndReconfiguration and the committed native FM
+reply precede publishing the new Primary endpoint. A lost final reply replays
+completion without another Open or promotion.
+
+Native correspondence at the pinned revision:
+
+- `ra/FailoverUnit.cpp:1929-2202`: eligible progress, deactivation-epoch filtering,
+  highest-LSN selection and first-LSN catch-up capability.
+- `ra/FailoverUnit.cpp:2878-2926,2968-3055`: ChangeConfiguration versus local
+  catch-up, separate PC/CC read quorum and progress-query waiting.
+- `ra/FailoverUnit.cpp:3123-3248,4153-4188`: phase-3/4 member accounting and
+  selected-candidate-only LSNs in ChangeConfiguration.
+- `ra/FailoverUnit.cpp:3543-3575`: revert candidate roles without rolling back
+  the FT epoch fence.
+- `fm/FailoverUnitMessageProcessor.cpp:529-660`: candidate change and new epoch.
+- `ra/Communication.MessageMetadataTable.cpp:46` and
+  `ra/MessageHandler.cpp:161-165`: explicit deprecated-reply rejection.
+- `common/FailoverConfig.h:633`: dynamic progress-query wait default.
+
+Real-process acceptance covers `2/1`, `4/2`, `4/3`, `4/4`, `5/3` and an
+insufficient-PC-quorum `5/1` case. It verifies nonempty data continuity,
+unavailable Secondaries, final-reply loss/replay, unchanged settings, original
+owners/one Open and cleanup. `4/4` can complete reconfiguration after Primary
+loss but cannot acknowledge a new write below minimum; retaining a down CC
+member at `4/3` does not replace the configuration-derived quorum.
+Separate process acceptance injects a native candidate-change FM input to
+verify new-candidate routing and deprecated-reply rejection without reopening
+survivors; it is not evidence that real differing runtime histories triggered
+selection. RA models cover unequal/older-history progress, catch-up capability,
+redirection/rejoining, read-quorum blocking, expiry and every survivor commit,
+including 64/32. The 64 bound is not 64-process qualification.
+
+This adds no resize, automatic placement/restart, generic repair, whole-node/FM
+recovery, data-loss exchange or persisted recovery. Repeated configured-profile
+failover and losses/supersession during a transition remain gated; repeated
+failover after explicit repair remains qualified on the named 3/2 profile.
 
 ## Run
 
@@ -363,10 +441,12 @@ The candidate starts phase 1, **not** healthy-swap phase-0 demotion of a dead
 writer. It obtains real local and peer RAP UpdateEpochAndGetStatus/GetLSN
 results. The peer commits its new epoch before querying RAP and returns its
 actual progress/deactivation history, never a descriptor/default LSN. This
-profile requires both survivors' initialized, matching tails and compatible
-original history. Missing progress, incompatible history, a changed data-loss
-epoch or catch-up progress inconsistent with phase 1 cannot grant promotion.
-ChangeConfiguration, broader history repair and DatalossReport remain gated.
+profile's original process acceptance used both survivors' initialized,
+matching tails and compatible original history. Missing progress, a changed
+data-loss epoch or catch-up progress inconsistent with phase 1 cannot grant
+promotion. The configured-failover extension above subsequently generalizes RA
+history selection and ChangeConfiguration; broader history repair and
+DatalossReport remain gated.
 
 Real promotion/catch-up retains separate PC/CC quorum obligations. Because PC
 and CC differ, phase 3 cannot use the equal-membership skip optimization:
@@ -487,8 +567,9 @@ can start the same no-data-loss failover protocol. FM takes PC from the latest
 completed three-member configuration, not the original launch roles. Both
 current Secondaries must remain available. This fixed profile deterministically
 chooses the lowest placement among those ready candidates; it does not implement
-PLB ranking, lagging-history selection or ChangeConfiguration. RA still requires
-both actual progress results and matching deactivation history before promotion.
+PLB ranking. RA now applies the history/LSN selection and ChangeConfiguration
+rules described above; repeated-cycle process qualification still uses matched
+survivor progress/history.
 Target/minimum stays 3/2; only the configuration/Primary epoch advances.
 
 Call `repair_primary_replica()` after each completed failover and processed

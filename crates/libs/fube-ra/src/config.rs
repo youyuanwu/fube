@@ -39,12 +39,13 @@ pub enum NodeProperty {
     StatusHistoryTtlTicks,
     EndpointPublishTimeoutTicks,
     LfumUploadRetryIntervalTicks,
+    RemoteReplicaProgressQueryWaitTicks,
 }
 
 pub struct NativeConfig {
     thresholds: [[AtomicI32; 4]; 5],
     notification: [AtomicI64; 4],
-    node: [AtomicI64; 8],
+    node: [AtomicI64; 9],
 }
 impl NativeConfig {
     pub(super) fn new(settings: &Settings) -> Self {
@@ -92,6 +93,7 @@ impl NativeConfig {
                 300_000_000,
                 36_000_000_000,
                 6_000_000_000,
+                300_000_000,
                 300_000_000,
                 300_000_000,
             ]

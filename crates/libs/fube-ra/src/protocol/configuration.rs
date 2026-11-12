@@ -63,6 +63,57 @@ pub struct ConfigurationReply {
     pub error: i64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FailoverUnitReply {
+    pub unit: FailoverUnit,
+    pub error: i64,
+}
+
+pub fn change_configuration_message(body: &Configuration, owner: Owner) -> Result<Message> {
+    reliability_message(
+        body,
+        "ChangeConfiguration",
+        match owner {
+            Owner::Fm => FM_ACTOR,
+            Owner::Fmm => FMM_ACTOR,
+        },
+        true,
+        None,
+    )
+}
+pub fn decode_change_configuration(message: &Message) -> Result<(Configuration, Owner)> {
+    let actor = check_factory(message, "ChangeConfiguration", &[FM_ACTOR, FMM_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        if actor == FM_ACTOR {
+            Owner::Fm
+        } else {
+            Owner::Fmm
+        },
+    ))
+}
+pub fn change_configuration_reply_message(
+    body: &FailoverUnitReply,
+    generation: &GenerationHeader,
+) -> Result<Message> {
+    reliability_message(
+        body,
+        "ChangeConfigurationReply",
+        RA_ACTOR,
+        true,
+        Some(generation),
+    )
+}
+pub fn decode_change_configuration_reply(
+    message: &Message,
+) -> Result<(FailoverUnitReply, GenerationHeader)> {
+    check_factory(message, "ChangeConfigurationReply", &[RA_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+    ))
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Activate {
     pub configuration: Configuration,

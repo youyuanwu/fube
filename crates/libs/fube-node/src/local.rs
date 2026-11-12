@@ -1424,7 +1424,7 @@ impl Node {
                 .snapshot(body.unit.id.guid.0)
                 .committed
                 .is_none_or(|s| {
-                    s.swap.is_none() && !self.three_member_configuration(body.unit.id.guid.0)
+                    s.swap.is_none() && !self.active_stateful_configuration(body.unit.id.guid.0)
                 })
         {
             return Err(Error::Unsupported);
@@ -1449,7 +1449,7 @@ impl Node {
                 .committed
                 .is_none_or(|s| {
                     s.swap.is_none()
-                        && !self.three_member_configuration(body.replica.unit.id.guid.0)
+                        && !self.active_stateful_configuration(body.replica.unit.id.guid.0)
                 })
         {
             return Err(Error::Unsupported);
@@ -1482,7 +1482,7 @@ impl Node {
         self.admit_fm(source, generation)?;
         if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
             && !(self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
-                && self.three_member_configuration(body.configuration.unit.id.guid.0))
+                && self.active_stateful_configuration(body.configuration.unit.id.guid.0))
         {
             return Err(Error::Unsupported);
         }
@@ -1543,7 +1543,7 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         if (self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
-            && !self.three_member_configuration(body.unit.id.guid.0)
+            && !self.active_stateful_configuration(body.unit.id.guid.0)
             && !self
                 .ra
                 .snapshot(body.unit.id.guid.0)
@@ -1619,6 +1619,17 @@ impl Node {
                 s.phase == ra::Phase::Ready
                     && s.reconfiguration.as_ref().is_some_and(|c| {
                         c.stage == ra::ConfigurationStage::Complete && c.request.unit.target == 3
+                    })
+            })
+    }
+    fn active_stateful_configuration(&self, entity: ra::EntityId) -> bool {
+        self.ra.peer_count() >= 1
+            && self.ra.snapshot(entity).committed.is_some_and(|s| {
+                s.phase == ra::Phase::Ready
+                    && s.reconfiguration.as_ref().is_some_and(|c| {
+                        c.stage == ra::ConfigurationStage::Complete
+                            && c.request.replicas.0.len() >= 2
+                            && ra::valid_stateful_sizes(&c.request.service)
                     })
             })
     }
@@ -2813,6 +2824,7 @@ impl Node {
                 LocalDisposition::LocalResponse
             }
             ra::Effect::Reply(_)
+            | ra::Effect::ChangeConfiguration(_)
             | ra::Effect::DoReconfigurationReply(_)
             | ra::Effect::PeerActivate { .. }
             | ra::Effect::PeerActivateReply { .. }

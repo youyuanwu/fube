@@ -91,18 +91,18 @@ REPLICA_CASES = {
 }
 CASES |= REPLICA_CASES
 CONFIGURATION_FACTORIES = {
-    action: {"actor": 11 if action == "DoReconfigurationReply" else 12, "high_priority": True}
-    for action in ["DoReconfiguration", "DoReconfigurationReply", "Activate", "ActivateReply", "Deactivate", "DeactivateReply", "GetLSN", "GetLSNReply"]
+    action: {"actor": 11 if action in {"DoReconfigurationReply", "ChangeConfiguration"} else 12, "high_priority": True}
+    for action in ["DoReconfiguration", "DoReconfigurationReply", "Activate", "ActivateReply", "Deactivate", "DeactivateReply", "GetLSN", "GetLSNReply", "ChangeConfiguration", "ChangeConfigurationReply"]
 }
 CONFIGURATION_CASES = {
     f"{profile}-{root}" for profile in ["default", "rich"]
-    for root in ["do-reconfiguration", "do-reconfiguration-reply", "activate", "activate-reply", "deactivate", "deactivate-reply", "get-lsn", "get-lsn-reply"]
+    for root in ["do-reconfiguration", "do-reconfiguration-reply", "activate", "activate-reply", "deactivate", "deactivate-reply", "get-lsn", "get-lsn-reply", "change-configuration", "change-configuration-reply"]
 } | {f"action-{action}" for action in CONFIGURATION_FACTORIES} | {
     "three-do-reconfiguration", "three-do-reconfiguration-reply", "three-activate", "three-deactivate",
 }
 CASES |= CONFIGURATION_CASES
-SCHEMA_TYPES = 84
-SCHEMA_FIELDS = 255
+SCHEMA_TYPES = 85
+SCHEMA_FIELDS = 257
 
 
 def validate(bundle, expected_head, expected_source):

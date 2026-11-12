@@ -16,6 +16,50 @@ fn generation_owner(high: u64, low: u64) -> [u8; 16] {
 }
 
 #[test]
+fn change_configuration_preserves_native_configuration_and_unit_reply_schemas() {
+    use fube_transport::serialization::serde::ObjectArray;
+    let request = support::rich_request();
+    let body = Configuration {
+        unit: request.unit,
+        service: request.service,
+        replicas: ObjectArray(vec![request.replica]),
+    };
+    let generation = support::rich_generation(false);
+    let message = change_configuration_message(&body, Owner::Fm).unwrap();
+    assert_eq!(
+        decode_change_configuration(&message).unwrap(),
+        (body.clone(), Owner::Fm)
+    );
+    assert_eq!(message.properties().unwrap().actor, FM_ACTOR);
+    assert!(message.properties().unwrap().high_priority);
+    assert!(!message.headers.iter().any(|h| h.id == GENERATION_HEADER));
+    let reply = FailoverUnitReply {
+        unit: body.unit,
+        error: 0,
+    };
+    let ack = change_configuration_reply_message(&reply, &generation).unwrap();
+    assert_eq!(
+        decode_change_configuration_reply(&ack).unwrap(),
+        (reply, generation)
+    );
+    assert_eq!(ack.properties().unwrap().actor, RA_ACTOR);
+    assert!(ack.properties().unwrap().high_priority);
+    for id in [ACTOR, ACTION, HIGH_PRIORITY] {
+        let mut invalid = message.clone();
+        invalid.headers.retain(|h| h.id != id);
+        assert!(decode_change_configuration(&invalid).is_err());
+    }
+    let mut invalid = ack.clone();
+    invalid.headers.retain(|h| h.id != GENERATION_HEADER);
+    assert!(decode_change_configuration_reply(&invalid).is_err());
+    for len in 0..ack.body.len() {
+        let mut invalid = ack.clone();
+        invalid.body.truncate(len);
+        assert!(decode_change_configuration_reply(&invalid).is_err());
+    }
+}
+
+#[test]
 fn lfum_upload_preserves_native_body_generation_and_bodyless_correlated_ack() {
     use fube_transport::serialization::serde::ObjectArray;
     let generation = support::rich_generation(false);
