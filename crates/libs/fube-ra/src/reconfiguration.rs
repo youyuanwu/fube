@@ -564,6 +564,8 @@ pub(super) fn transition(
                     .ok_or(Failure::Admission("missing peer origin"))?;
                 origin.source = source.clone();
                 origin.deactivation = body.deactivation.clone();
+                state.primary_deactivation =
+                    Some((body.deactivation.epoch, body.deactivation.catchup_lsn));
             }
             let mut effects = vec![];
             description::update(&mut state, &body.configuration.service, &mut effects);
@@ -655,7 +657,9 @@ pub(super) fn transition(
                 let mut state = current.clone();
                 let origin = state.peer_creation.as_mut().expect("surviving peer");
                 origin.source = source.clone();
-                origin.deactivation = body.deactivation;
+                origin.deactivation = body.deactivation.clone();
+                state.primary_deactivation =
+                    Some((body.deactivation.epoch, body.deactivation.catchup_lsn));
                 apply_body(&mut state, &body.configuration, &admission.local_node)?;
                 state.reconfiguration = Some(Reconfiguration {
                     request: body.configuration,

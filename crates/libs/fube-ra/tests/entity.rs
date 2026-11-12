@@ -6669,6 +6669,33 @@ async fn failover_survivor_get_lsn_and_ss_deactivate_wait_for_their_own_commits(
                 .await;
                 effects(&executor);
                 let stable = state(&executor);
+                assert_eq!(
+                    run(
+                        &executor,
+                        Command::GetLsn {
+                            body: Box::new(AddInstance {
+                                unit: config.unit.clone(),
+                                service: config.service.clone(),
+                                replica: Replica {
+                                    node: stable.body.replica.node.clone(),
+                                    id: stable.body.replica.id,
+                                    instance: stable.body.replica.instance,
+                                    ..Replica::default()
+                                },
+                            }),
+                            source: survivor_peer(),
+                            generation: generation_header(admission().generation.generation),
+                        }
+                    )
+                    .await,
+                    Disposition::Applied,
+                );
+                assert!(matches!(
+                    effects(&executor).as_slice(),
+                    [Effect::QueryReplicaStatus { .. }]
+                ));
+                assert_eq!(state(&executor).body, stable.body);
+                assert!(state(&executor).progress_query.is_none());
                 let mut repair = stable.swap.as_ref().unwrap().body.clone();
                 repair.unit.previous = repair.unit.current;
                 repair.unit.current.configuration += 1;
@@ -6722,6 +6749,61 @@ async fn failover_survivor_get_lsn_and_ss_deactivate_wait_for_their_own_commits(
                     effects(&executor).as_slice(),
                     [Effect::PeerDeactivateReply { .. }]
                 ));
+                run(
+                    &executor,
+                    Command::Activate {
+                        body: Box::new(Activate {
+                            configuration: repair.clone(),
+                            deactivation: ReplicaDeactivationInfo {
+                                epoch: repair.unit.current,
+                                catchup_lsn: 8,
+                            },
+                        }),
+                        source: survivor_peer(),
+                        generation: generation_header(admission().generation.generation),
+                    },
+                )
+                .await;
+                let completion = configured(&effects(&executor));
+                run(
+                    &executor,
+                    Command::CompleteConfiguration(Box::new(completion)),
+                )
+                .await;
+                effects(&executor);
+                let next = failover_configuration(&state(&executor), &peer_source());
+                let local = &state(&executor).body.replica;
+                let query = Command::GetLsn {
+                    body: Box::new(AddInstance {
+                        unit: next.unit.clone(),
+                        service: next.service,
+                        replica: Replica {
+                            node: local.node.clone(),
+                            id: local.id,
+                            instance: local.instance,
+                            ..Replica::default()
+                        },
+                    }),
+                    source: peer_source(),
+                    generation: generation_header(admission().generation.generation),
+                };
+                let (entered, release) = hooks.pause(false);
+                let work = executor.submit(query).unwrap();
+                entered.await.unwrap();
+                assert!(effects(&executor).is_empty());
+                release.send(()).unwrap();
+                work.wait(WAIT).await.unwrap();
+                let progress = status_completion(&effects(&executor));
+                run(&executor, Command::CompleteStatus(Box::new(progress))).await;
+                assert!(
+                    matches!(effects(&executor).as_slice(), [Effect::PeerGetLsnReply { target, body }]
+                    if *target == peer_source() && body.deactivation.epoch == repair.unit.current
+                        && body.deactivation.catchup_lsn == 8)
+                );
+                assert_eq!(run(&executor, command()).await, Disposition::IgnoredStale);
+                assert!(effects(&executor).is_empty());
+                assert_eq!(state(&executor).runtime, original.runtime);
+                assert_eq!(state(&executor).usage, original.usage);
             }
         }
         finish(&store, &executor).await;

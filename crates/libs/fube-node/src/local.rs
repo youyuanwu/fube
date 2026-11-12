@@ -406,7 +406,7 @@ pub struct Node {
     failed_registration: Option<FailedRegistrationDeletion>,
     open_failure: Option<OpenFailureWitness>,
     failed_open: Option<FailedOpenDeletion>,
-    host_predecessor: Option<Arc<AddInstance>>,
+    host_predecessors: Vec<Arc<AddInstance>>,
     #[cfg(feature = "qualification")]
     hold_replies: bool,
 }
@@ -471,7 +471,7 @@ impl Node {
             failed_registration: None,
             open_failure: None,
             failed_open: None,
-            host_predecessor: None,
+            host_predecessors: Vec::new(),
             #[cfg(feature = "qualification")]
             hold_replies: false,
         })
@@ -496,9 +496,11 @@ impl Node {
         let selected = self.selected.as_ref().ok_or(Error::Unsupported)?;
         let snapshot = self.ra.snapshot(selected.unit.id.guid.0);
         let state = snapshot.committed.ok_or(Error::Busy)?;
-        if self.host_predecessor.is_some()
-            || self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
-            || snapshot.fenced
+        if !matches!(
+            self.activation.profile(),
+            h::local::Profile::VolatileStatefulFmPrimary
+                | h::local::Profile::VolatileStatefulLifecycle
+        ) || snapshot.fenced
             || !state.fm_primary
             || state.phase != ra::Phase::Closed
             || !state.local_deleted
@@ -558,7 +560,7 @@ impl Node {
             .id
             .guid
             .0;
-        self.host_predecessor = Some(
+        self.host_predecessors.push(
             self.ra
                 .snapshot(entity)
                 .committed
@@ -709,7 +711,7 @@ impl Node {
                 let closed = current
                     .as_ref()
                     .is_some_and(|state| state.phase == ra::Phase::Closed);
-                let stale_host = self.host_predecessor.as_ref().is_some_and(|old| {
+                let stale_host = self.host_predecessors.iter().any(|old| {
                     incoming.unit == old.unit
                         && incoming.service == old.service
                         && incoming.replica.node == old.replica.node
@@ -957,7 +959,7 @@ impl Node {
                     .process_status()
                     .is_none_or(|process| process.exit_observed)
                 || (!admitted_retry
-                    && ((self.host_predecessor.is_none() && self.instance_disposal().is_none())
+                    && ((self.host_predecessors.is_empty() && self.instance_disposal().is_none())
                         || !self.quiescent()
                         || !self.commands.is_empty()
                         || self
@@ -1445,7 +1447,10 @@ impl Node {
                 .ra
                 .snapshot(body.replica.unit.id.guid.0)
                 .committed
-                .is_none_or(|s| s.swap.is_none())
+                .is_none_or(|s| {
+                    s.swap.is_none()
+                        && !self.three_member_configuration(body.replica.unit.id.guid.0)
+                })
         {
             return Err(Error::Unsupported);
         }
@@ -1570,7 +1575,9 @@ impl Node {
             .snapshot(body.unit.id.guid.0)
             .committed
             .is_some_and(|s| s.swap.is_some());
-        if (!swapping && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary)
+        if (!swapping
+            && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            && !self.three_member_configuration(body.unit.id.guid.0))
             || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
@@ -1679,9 +1686,9 @@ impl Node {
             || body.service.activation_mode != 0
             || !body.service.scaling.0.is_empty()
             || body.service.partitions != 1
-            || (self.host_predecessor.is_none()
+            || (self.host_predecessors.is_empty()
                 && (body.service.target != 1 || body.service.minimum != 1))
-            || (self.host_predecessor.is_some()
+            || (!self.host_predecessors.is_empty()
                 && (body.service.target != 3 || body.service.minimum != 2))
             || body.unit.consistency.kind != 1
             || !body.unit.consistency.name.is_empty()

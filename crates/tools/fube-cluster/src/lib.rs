@@ -658,7 +658,7 @@ impl Cluster {
                 Err(error) => Err(error),
             };
             let result = match result {
-                Ok(()) if index == usize::from(self.ledger.primary_failover()) => {
+                Ok(()) if index == self.ledger.primary_index() => {
                     if let Some(body) = self.ledger.configuration_retry(Instant::now()) {
                         self.send_configuration(&body).await
                     } else {
@@ -676,7 +676,8 @@ impl Cluster {
         }
         self.start_failover().await;
         if let Err(error) = self.advance_repair().await {
-            self.ledger.lost(0, error);
+            self.ledger
+                .lost(self.ledger.failed_primary_index().unwrap_or(0), error);
         }
     }
     /// Restore one lost volatile Primary as a fresh Secondary on its original live Node.
@@ -685,21 +686,35 @@ impl Cluster {
             return Err("Primary repair requires the original running three-node cluster".into());
         }
         if self.ledger.begin_primary_repair(Instant::now())? {
-            let child = &mut self.children[0];
+            let destination = self
+                .ledger
+                .failed_primary_index()
+                .ok_or("missing failed Primary")?;
+            let predecessor = &self
+                .ledger
+                .repair
+                .as_ref()
+                .expect("repair")
+                .predecessor
+                .replica;
+            let child = &mut self.children[destination];
             let result = child
                 .process
                 .as_mut()
                 .ok_or("missing original Node owner")?
                 .command(
                     format!(
-                        "replace-host {} {}\n",
-                        child.launch.session, child.launch.capability
+                        "replace-host {} {} {} {}\n",
+                        child.launch.session,
+                        child.launch.capability,
+                        predecessor.id,
+                        predecessor.instance
                     )
                     .as_bytes(),
                 )
                 .map_err(err);
             if let Err(error) = result {
-                self.ledger.lost(0, error.clone());
+                self.ledger.lost(destination, error.clone());
                 return Err(error);
             }
         }
@@ -713,7 +728,20 @@ impl Cluster {
             .as_ref()
             .is_some_and(|r| r.profile.is_none())
         {
-            let path = self.children[0].launch.directory.join("repaired-host.json");
+            let destination = self
+                .ledger
+                .failed_primary_index()
+                .ok_or("missing failed Primary")?;
+            let predecessor = &self
+                .ledger
+                .repair
+                .as_ref()
+                .expect("repair")
+                .predecessor
+                .replica;
+            let path = self.children[destination]
+                .launch
+                .host_replacement_path(predecessor.id, predecessor.instance);
             if path.try_exists().map_err(err)? {
                 let receipt: HostReplacementReceipt = read_json(&path)?;
                 if receipt.predecessor.runtime_root.exists()
@@ -723,13 +751,13 @@ impl Cluster {
                 {
                     return Err("physical host replacement is not independently observable".into());
                 }
-                let pid = self.children[0]
+                let pid = self.children[destination]
                     .process
                     .as_ref()
                     .ok_or("missing original Node")?
                     .pid();
                 if self.ledger.repaired_host(&receipt, pid)? {
-                    self.children[0]
+                    self.children[destination]
                         .metadata
                         .as_mut()
                         .ok_or("missing node metadata")?
@@ -758,7 +786,7 @@ impl Cluster {
             Err(error) => Err(error),
         };
         if let Err(error) = failover {
-            self.ledger.lost(1, error);
+            self.ledger.lost(self.ledger.primary_index(), error);
         }
     }
     /// Begin one live-session ordinary-FM inventory reconciliation. New
@@ -1555,13 +1583,17 @@ impl Cluster {
             let cleanup = process.cleanup();
             let physical = process.status();
             let receipt = read_json::<CleanupReceipt>(&child.launch.directory.join("cleanup.json"));
-            if let Some(repair) = self
+            for repair in self
                 .ledger
-                .repair
-                .as_ref()
-                .filter(|_| child.launch.placement == 1)
+                .repair_history
+                .iter()
+                .chain(self.ledger.repair.iter())
+                .filter(|r| r.predecessor.replica.node == child.launch.node)
             {
-                let path = child.launch.directory.join("repaired-host.json");
+                let path = child.launch.host_replacement_path(
+                    repair.predecessor.replica.id,
+                    repair.predecessor.replica.instance,
+                );
                 if path.exists() {
                     let replacement = read_json::<HostReplacementReceipt>(&path).and_then(|r| {
                         r.validate(&child.launch, &repair.old_profile, process.pid())?;
@@ -1585,6 +1617,9 @@ impl Cluster {
                             item["host_replacement_error"] = json!(error);
                         }
                     }
+                } else if repair.profile.is_some() {
+                    complete = false;
+                    item["host_replacement_error"] = json!("admitted replacement receipt missing");
                 }
             }
             let valid = receipt.as_ref().is_ok_and(|receipt| {

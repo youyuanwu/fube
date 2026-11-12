@@ -1839,6 +1839,52 @@ fn transition(
 ) -> Result<Transition> {
     let decode_error = |_| Failure::Admission("invalid native command payload");
     let peer = peer::selected_peer(work, peers)?;
+    let epoch = match &work.kind {
+        Kind::DoReconfiguration { source, .. } if source == &admission.fm_source => Some(
+            from_slice::<DoReconfiguration>(&work.bytes)
+                .map_err(decode_error)?
+                .configuration
+                .unit
+                .current,
+        ),
+        Kind::Activate { .. } if peer.is_some() => Some(
+            from_slice::<Activate>(&work.bytes)
+                .map_err(decode_error)?
+                .configuration
+                .unit
+                .current,
+        ),
+        Kind::Deactivate { .. } if peer.is_some() => Some(
+            from_slice::<Deactivate>(&work.bytes)
+                .map_err(decode_error)?
+                .configuration
+                .unit
+                .current,
+        ),
+        Kind::GetLsn { .. } if peer.is_some() => Some(
+            from_slice::<GetLsn>(&work.bytes)
+                .map_err(decode_error)?
+                .unit
+                .current,
+        ),
+        Kind::GetLsnReply { .. } if peer.is_some() => Some(
+            from_slice::<GetLsnReply>(&work.bytes)
+                .map_err(decode_error)?
+                .replica
+                .unit
+                .current,
+        ),
+        Kind::ActivateReply { .. } | Kind::DeactivateReply { .. } if peer.is_some() => Some(
+            from_slice::<AddInstanceReply>(&work.bytes)
+                .map_err(decode_error)?
+                .unit
+                .current,
+        ),
+        _ => None,
+    };
+    if state.is_some_and(|s| epoch.is_some_and(|epoch| epoch.older_than(s.body.unit.current))) {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    }
     if swap::handles(work, state)? {
         return swap::transition(work, state, admission, config, peers);
     }

@@ -122,6 +122,7 @@ pub struct Ledger {
     swap_endpoint: Option<AddInstance>,
     configuration_history: Vec<ActiveConfiguration>,
     pub(crate) repair: Option<PrimaryRepair>,
+    pub(crate) repair_history: Vec<PrimaryRepair>,
 }
 pub(crate) struct PrimaryRepair {
     pub predecessor: AddInstance,
@@ -532,45 +533,76 @@ impl Ledger {
     }
 
     fn primary_transition_live(&self) -> bool {
-        let first = usize::from(
-            self.primary_failover() && self.repair.as_ref().is_none_or(|r| r.profile.is_none()),
-        );
-        self.placements[first..]
+        let lost = self.failed_primary_index();
+        self.placements
             .iter()
-            .all(|p| p.link_alive && !p.loss_reported)
+            .enumerate()
+            .filter(|(i, _)| {
+                Some(*i) != lost || self.repair.as_ref().is_some_and(|r| r.profile.is_some())
+            })
+            .all(|(_, p)| p.link_alive && !p.loss_reported)
     }
 
     pub fn start_primary_failover(&mut self, now: Instant) -> Result<Option<DoReconfiguration>> {
         if self.placements[0].launch.profile != crate::ServiceProfile::StatefulThree
-            || self.swap.is_some()
-            || !self.placements[0].loss_reported
             || self.generation.is_some()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
-            || self.placements[1..].iter().any(|p| {
-                !p.link_alive
-                    || p.loss_reported
-                    || p.observed != Observed::Running
-                    || !p.activated
-                    || p.bootstrap != Bootstrap::Admitted
-                    || p.pending.is_some()
-                    || p.node_control.is_some()
-                    || p.service_update.is_some()
-            })
+            || (self.swap.is_some()
+                && !self
+                    .repair
+                    .as_ref()
+                    .is_some_and(|r| r.configuration.as_ref().is_some_and(|c| c.reply.is_some())))
         {
             return Ok(None);
         }
-        let Some(active) = self.configuration.as_ref().filter(|c| {
-            c.reply.is_some()
-                && c.body.configuration.unit.target == 3
-                && c.body.configuration.unit.minimum == 2
-        }) else {
+        let Some(active) = self
+            .repair
+            .as_ref()
+            .and_then(|r| r.configuration.as_ref())
+            .or(self.configuration.as_ref())
+            .filter(|c| {
+                c.reply.is_some()
+                    && c.body.configuration.unit.target == 3
+                    && c.body.configuration.unit.minimum == 2
+            })
+        else {
             return Ok(None);
         };
         let previous = active.reply.as_ref().expect("completed configuration");
         if previous.replicas.0.len() != 3 {
-            return Err("Primary failover requires original completed 1P+2S membership".into());
+            return Err("Primary failover requires completed current 1P+2S membership".into());
         }
+        let lost = self.placements.iter().position(|p| {
+            previous
+                .replicas
+                .0
+                .iter()
+                .any(|r| r.node == p.launch.node && r.current_role == 4 && p.loss_reported)
+        });
+        let Some(lost) = lost else {
+            return Ok(None);
+        };
+        if self.placements.iter().enumerate().any(|(i, p)| {
+            !p.link_alive
+                || !p.activated
+                || p.bootstrap != Bootstrap::Admitted
+                || p.pending.is_some()
+                || p.node_control.is_some()
+                || p.service_update.is_some()
+                || (i != lost && (p.loss_reported || p.observed != Observed::Running))
+        }) {
+            return Ok(None);
+        }
+        let candidate =
+            self.placements
+                .iter()
+                .position(|p| {
+                    previous.replicas.0.iter().any(|r| {
+                        r.node == p.launch.node && r.current_role == 3 && r.up && r.state == 2
+                    })
+                })
+                .ok_or("missing current ActiveSecondary candidate")?;
         let mut body = active.body.clone();
         body.configuration.unit = previous.unit.clone();
         body.configuration.unit.previous = previous.unit.current;
@@ -583,18 +615,21 @@ impl Ledger {
         body.configuration.replicas = previous.replicas.clone();
         for r in &mut body.configuration.replicas.0 {
             r.previous_role = r.current_role;
-            if r.node == self.placements[0].launch.node {
+            if r.node == self.placements[lost].launch.node {
                 r.current_role = 1;
                 r.up = false;
                 r.state = 3;
-            } else if r.node == self.placements[1].launch.node {
+            } else if r.node == self.placements[candidate].launch.node {
                 r.current_role = 4;
             }
             r.first_lsn = -1;
             r.last_lsn = -1;
         }
         body.phase0_duration = i64::MAX;
-        for p in &mut self.placements[1..] {
+        for (i, p) in self.placements.iter_mut().enumerate() {
+            if i == lost {
+                continue;
+            }
             p.active_unit = Some(body.configuration.unit.clone());
             p.ready_replica = body
                 .configuration
@@ -605,6 +640,10 @@ impl Ledger {
                 .cloned();
             p.endpoint = None;
         }
+        if let Some(repair) = self.repair.take() {
+            self.repair_history.push(repair);
+        }
+        self.swap_endpoint = None;
         self.swap = Some(ActiveConfiguration {
             body: body.clone(),
             reply: None,
@@ -709,9 +748,13 @@ impl Ledger {
         if !self.placements[index].link_alive {
             return Err("report requires the original live node session".into());
         }
-        if index == 0
-            && self.repair.as_ref().is_some_and(|repair| {
-                body.replicas.0.is_empty()
+        if self
+            .repair
+            .iter()
+            .chain(&self.repair_history)
+            .any(|repair| {
+                self.placements[index].launch.node == repair.predecessor.replica.node
+                    && body.replicas.0.is_empty()
                     && body.dropped.0.len() == 1
                     && body.dropped.0[0].unit == repair.predecessor.unit
                     && body.dropped.0[0].service == repair.predecessor.service
@@ -780,7 +823,7 @@ impl Ledger {
         if peer_idle && self.retiring_secondary() && self.idle_predecessor.is_none() {
             return Ok(response);
         }
-        let old_failover_primary = self.primary_failover() && index == 0;
+        let old_failover_primary = self.failed_primary_index() == Some(index);
         let placement = &mut self.placements[index];
         if response.is_some()
             && placement.bootstrap == Bootstrap::Admitted
@@ -1117,6 +1160,7 @@ impl Ledger {
             swap_endpoint: None,
             configuration_history: vec![],
             repair: None,
+            repair_history: Vec::new(),
         }
     }
     pub fn accept(&mut self, command: Command) -> Result<Accepted> {
@@ -1432,7 +1476,8 @@ impl Ledger {
             repair.unknown = true;
         }
         let failover = self.primary_failover();
-        if let Some(swap) = self.swap.as_mut().filter(|_| !failover || index != 0) {
+        let old_primary = self.failed_primary_index() == Some(index);
+        if let Some(swap) = self.swap.as_mut().filter(|_| !old_primary) {
             swap.unknown = true;
         }
         if let Some(configuration) = &mut self.configuration {
@@ -1456,7 +1501,7 @@ impl Ledger {
         placement.pending = None;
         placement.observed = Observed::Unknown;
         placement.error = Some(error.clone());
-        if failover && index != 0 {
+        if failover && !old_primary {
             placement.endpoint = None;
         }
         let control = placement.node_control.take().map(|(op, _, _)| op);
@@ -1517,15 +1562,14 @@ impl Ledger {
         }
     }
     pub fn reply(&mut self, index: usize, body: AddInstanceReply, removing: bool) -> Result<()> {
-        if index == 0
-            && self.repair.as_ref().is_some_and(|r| {
-                body.unit.id == r.predecessor.unit.id
-                    && body.unit.current.older_than(r.build.body.unit.current)
-                    && body.replica.node == r.predecessor.replica.node
-                    && body.replica.id == r.predecessor.replica.id
-                    && body.replica.instance == r.predecessor.replica.instance
-            })
-        {
+        if self.repair.iter().chain(&self.repair_history).any(|r| {
+            self.placements[index].launch.node == r.predecessor.replica.node
+                && body.unit.id == r.predecessor.unit.id
+                && body.unit.current.older_than(r.build.body.unit.current)
+                && body.replica.node == r.predecessor.replica.node
+                && body.replica.id == r.predecessor.replica.id
+                && body.replica.instance == r.predecessor.replica.instance
+        }) {
             return Ok(());
         }
         if index == 1
@@ -1811,7 +1855,40 @@ impl Ledger {
         self.request_idle_on(1, now)
     }
     pub fn primary_index(&self) -> usize {
-        usize::from(self.primary_failover())
+        if self.primary_failover() {
+            self.transition_primary_index()
+        } else {
+            0
+        }
+    }
+
+    fn transition_primary_index(&self) -> usize {
+        self.swap
+            .as_ref()
+            .and_then(|s| {
+                self.placements.iter().position(|p| {
+                    s.body
+                        .configuration
+                        .replicas
+                        .0
+                        .iter()
+                        .any(|r| r.node == p.launch.node && r.current_role == 4)
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn failed_primary_index(&self) -> Option<usize> {
+        self.swap
+            .as_ref()
+            .filter(|_| self.primary_failover())
+            .and_then(|s| {
+                self.placements.iter().position(|p| {
+                    s.body.configuration.replicas.0.iter().any(|r| {
+                        r.node == p.launch.node && r.previous_role == 4 && r.current_role == 1
+                    })
+                })
+            })
     }
 
     pub fn begin_primary_repair(&mut self, now: Instant) -> Result<bool> {
@@ -1823,11 +1900,14 @@ impl Ledger {
             .as_ref()
             .filter(|s| self.primary_failover() && !s.unknown && s.reply.is_some())
             .ok_or("repair requires completed three-member Primary failover")?;
+        let destination = self
+            .failed_primary_index()
+            .ok_or("missing failed Primary placement")?;
         if self.generation.is_some()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
-            || !self.placements[0].loss_reported
-            || !self.placements[0].remove_received
+            || !self.placements[destination].loss_reported
+            || !self.placements[destination].remove_received
             || self.placements.iter().any(|p| {
                 !p.link_alive
                     || !p.activated
@@ -1836,21 +1916,29 @@ impl Ledger {
                     || p.node_control.is_some()
                     || p.service_update.is_some()
             })
-            || self.placements[1..]
-                .iter()
-                .any(|p| p.loss_reported || p.observed != Observed::Running)
+            || self.placements.iter().enumerate().any(|(i, p)| {
+                i != destination && (p.loss_reported || p.observed != Observed::Running)
+            })
         {
             return Err(
                 "repair requires processed old loss/deletion and both live survivors".into(),
             );
         }
         let reply = swap.reply.as_ref().expect("completed failover");
-        let (id, instance) = self.placements[0].launch.primary_successor()?;
-        let mut body = self.placements[1].body()?;
+        let next = self
+            .placements
+            .iter()
+            .flat_map(|p| {
+                std::iter::once((p.replica, p.incarnation)).chain(p.retired.iter().copied())
+            })
+            .fold(0, |n, (id, instance)| n.max(id).max(instance))
+            .checked_add(1)
+            .ok_or("repair identity exhausted")?;
+        let mut body = self.placements[self.primary_index()].body()?;
         body.unit = reply.unit.clone();
-        body.replica = self.placements[0].body()?.replica;
-        body.replica.id = id;
-        body.replica.instance = instance;
+        body.replica = self.placements[destination].body()?.replica;
+        body.replica.id = next;
+        body.replica.instance = next;
         body.replica.previous_role = 1;
         body.replica.current_role = 2;
         body.replica.state = 1;
@@ -1860,8 +1948,8 @@ impl Ledger {
         body.replica.service_endpoint.clear();
         body.replica.replication_endpoint.clear();
         self.repair = Some(PrimaryRepair {
-            predecessor: self.placements[0].body()?,
-            old_profile: self.placements[0]
+            predecessor: self.placements[destination].body()?,
+            old_profile: self.placements[destination]
                 .profile
                 .clone()
                 .ok_or("missing original host profile")?,
@@ -1885,8 +1973,11 @@ impl Ledger {
         receipt: &crate::profile::HostReplacementReceipt,
         node_pid: u32,
     ) -> Result<bool> {
+        let destination = self
+            .failed_primary_index()
+            .ok_or("missing failed Primary placement")?;
         let repair = self.repair.as_mut().ok_or("unsolicited host replacement")?;
-        let placement = &mut self.placements[0];
+        let placement = &mut self.placements[destination];
         receipt.validate(&placement.launch, &repair.old_profile, node_pid)?;
         if repair.unknown || !placement.link_alive {
             return Err("replacement owner is unknown".into());
@@ -1920,9 +2011,10 @@ impl Ledger {
             .placements
             .iter()
             .all(|p| p.link_alive && !p.loss_reported);
+        let primary = self.primary_index();
         let repair = self.repair.as_mut().expect("repair");
         let expected = &repair.build.body;
-        if index != 1
+        if index != primary
             || !live
             || repair.unknown
             || repair.profile.is_none()
@@ -2010,6 +2102,7 @@ impl Ledger {
             .placements
             .iter()
             .all(|p| p.link_alive && !p.loss_reported);
+        let primary = self.primary_index();
         let repair = self.repair.as_mut().expect("repair");
         let config = repair.configuration.as_mut().expect("repair configuration");
         let mut expected = config.body.configuration.clone();
@@ -2017,7 +2110,7 @@ impl Ledger {
         for r in &mut expected.replicas.0 {
             r.previous_role = 1;
         }
-        if index != 1
+        if index != primary
             || !live
             || repair.unknown
             || config.reply.is_some()
@@ -2501,7 +2594,7 @@ impl Ledger {
         else {
             return Ok(None);
         };
-        if index != 1 || !live {
+        if index != self.transition_primary_index() || !live {
             return Ok(None);
         }
         let expected = swap
@@ -2510,7 +2603,7 @@ impl Ledger {
             .replicas
             .0
             .iter()
-            .find(|r| r.node == self.placements[1].launch.node)
+            .find(|r| r.node == self.placements[index].launch.node)
             .ok_or("missing new Primary")?;
         let mut actual = body.replica.clone();
         actual.service_endpoint = expected.service_endpoint.clone();
@@ -2541,6 +2634,8 @@ impl Ledger {
     fn swap_reply(&mut self, index: usize, body: ConfigurationReply) -> Result<()> {
         let failover = self.primary_failover();
         let live = self.primary_transition_live();
+        let primary = self.transition_primary_index();
+        let lost = self.failed_primary_index();
         let Some(swap) = self
             .swap
             .as_mut()
@@ -2550,7 +2645,7 @@ impl Ledger {
         };
         let mut unit = swap.body.configuration.unit.clone();
         unit.previous = Epoch::default();
-        if index != 1
+        if index != primary
             || body.error != 0
             || body.unit != unit
             || body.replicas.0.len() != 2
@@ -2605,7 +2700,7 @@ impl Ledger {
             }
         }
         for (i, p) in self.placements.iter_mut().enumerate() {
-            if failover && i == 0 {
+            if failover && Some(i) == lost {
                 continue;
             }
             let replica = body
@@ -2648,7 +2743,8 @@ impl Ledger {
             };
             return json!({"state":state,"ready":state == "ready","kind":if self.primary_failover() {"primary_failover"} else {"planned_primary_transfer"},
                 "request":{"configuration":swap.body.configuration,"phase0_duration":swap.body.phase0_duration},
-                "reply":swap.reply,"endpoint_update":self.swap_endpoint,"primary_transfer":true,"from":1,"to":2,
+                "reply":swap.reply,"endpoint_update":self.swap_endpoint,"primary_transfer":true,
+                "from":self.failed_primary_index().map_or(1, |i| i + 1),"to":self.transition_primary_index() + 1,
                 "history":self.configuration_history.iter().chain(self.configuration.iter()).map(|c| json!({"request":c.body.configuration,"reply":c.reply})).collect::<Vec<_>>()});
         }
         let Some(config) = &self.configuration else {
@@ -2800,8 +2896,9 @@ impl Ledger {
         Ok(())
     }
     pub fn idle_retry(&mut self, index: usize, now: Instant) -> Option<AddReplica> {
+        let primary = self.primary_index();
         if let Some(repair) = &mut self.repair {
-            if index != 1
+            if index != primary
                 || repair.unknown
                 || repair.profile.is_none()
                 || repair.build.reply.is_some()

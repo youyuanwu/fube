@@ -397,9 +397,45 @@ fn primary_repair_requires_fresh_host_owned_build_and_exact_final_membership() {
         if lose_survivor {
             ledger.lost(2, "survivor lost while repairing".into());
         }
-        ledger.configuration_reply(1, final_reply).unwrap();
+        ledger.configuration_reply(1, final_reply.clone()).unwrap();
         assert_eq!(ledger.repair_status()["ready"], !lose_survivor);
         assert_eq!(ledger.configuration_status()["ready"], !lose_survivor);
+        if !lose_survivor {
+            let current = ledger.placements[1].body().unwrap();
+            let next_loss = stateful_loss_report(&ledger.placements[1]);
+            ledger.report(1, &next_loss).unwrap();
+            let second = ledger.start_primary_failover(Instant::now()).unwrap().unwrap();
+            assert_eq!(ledger.primary_index(), 0);
+            assert_eq!(ledger.failed_primary_index(), Some(1));
+            assert_eq!(ledger.repair_history.len(), 1);
+            assert_eq!(second.configuration.unit.previous, final_reply.unit.current);
+            assert!(second.configuration.replicas.0.iter().any(|r| {
+                r.node == ledger.placements[0].launch.node && r.id == ledger.placements[0].replica
+                    && r.previous_role == 3 && r.current_role == 4
+            }));
+            ledger.configuration_reply(1, final_reply).unwrap();
+            assert_eq!(ledger.configuration_status()["ready"], false);
+            assert!(ledger.begin_primary_repair(Instant::now()).is_err());
+            let mut reply = ConfigurationReply {
+                unit: second.configuration.unit, replicas: second.configuration.replicas, error: 0,
+            };
+            reply.unit.previous = Epoch::default();
+            reply.replicas.0.retain(|r| r.current_role >= 3);
+            for r in &mut reply.replicas.0 {
+                r.previous_role = 1;
+                r.first_lsn = 1;
+                r.last_lsn = 8;
+                r.service_endpoint = if r.current_role == 4 { "127.0.0.1:12351".into() } else { String::new() };
+            }
+            ledger.configuration_reply(0, reply).unwrap();
+            ledger.reply(1, AddInstanceReply {
+                unit: current.unit, replica: dropped_replica(&current.replica), error: 0,
+            }, true).unwrap();
+            assert!(ledger.begin_primary_repair(Instant::now()).unwrap());
+            let new_build = &ledger.repair.as_ref().unwrap().build.body;
+            assert!(ledger.placements.iter().all(|p| new_build.replica.id > p.replica && new_build.replica.instance > p.incarnation));
+            assert!(ledger.report(0, &loss).unwrap().is_none());
+        }
     }
 }
 
@@ -3084,7 +3120,7 @@ async fn three_replica_primary_repair_recopies_fresh_owner_and_restores_majority
         assert!(data_contact(&endpoint, b"write-more\n").contains("committed=2"));
         assert_eq!(cluster.repair_primary_replica().await?["state"], "pending");
         if mode == 2 {
-            let path = cluster.children[0].launch.directory.join("repaired-host.json");
+            let path = cluster.children[0].launch.host_replacement_path(original.replica.id, original.replica.instance);
             let end = Instant::now() + Duration::from_secs(10);
             while !path.exists() {
                 assert!(Instant::now() < end, "replacement host startup deadline");
@@ -3168,6 +3204,159 @@ async fn three_replica_primary_repair_recopies_fresh_owner_and_restores_majority
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
     result.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn repeated_primary_failover_and_repair_preserve_current_owners_and_data() {
+    for interrupted in [false, true] {
+        let fixture = Fixture::new("repeated-primary-repair");
+        let mut config = fixture.config();
+        config.profile = ServiceProfile::StatefulThree;
+        config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+        let mut cluster = Cluster::new(config).unwrap();
+        if let Err(error) = cluster.start().await {
+            let cleanup = cluster.shutdown().await;
+            panic!("repeat startup: {error}; cleanup={cleanup}");
+        }
+        let result = peer_idle_catch(async {
+            cluster.execute(command("primary", "create", Some(1))).await?;
+            until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
+            let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+            until(&mut cluster, |_| data_contact(&endpoint, b"read\n").starts_with("OK ")).await;
+            assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+            for destination in [2, 3] { cluster.add_idle_replica_on(destination).await?; }
+            until(&mut cluster, |c| c.ledger.idle_status()["ready"] == true).await;
+            cluster.activate_idle_replica().await?;
+            until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+            let node_pids = cluster.status()["nodes"].as_array().unwrap().iter()
+                .map(|n| n["node_pid"].clone()).collect::<Vec<_>>();
+            let mut predecessors = Vec::new();
+            let mut old_requests = Vec::new();
+            let mut epoch = cluster.ledger.placements[0].body()?.unit.current;
+            for cycle in 0..3 {
+                let lost = cluster.ledger.primary_index();
+                let original = cluster.ledger.placements[lost].body()?;
+                let loss = stateful_loss_report(&cluster.ledger.placements[lost]);
+                let profile = cluster.ledger.placements[lost].profile.clone().unwrap();
+                let survivors = cluster.ledger.placements.iter().enumerate()
+                    .filter(|(i, _)| *i != lost)
+                    .map(|(i, p)| (i, p.profile.clone().unwrap())).collect::<Vec<_>>();
+                assert!(std::process::Command::new("kill").args(["-KILL", &profile.app_pid.to_string()])
+                    .status().map_err(err)?.success());
+                until(&mut cluster, |c| c.ledger.failed_primary_index() == Some(lost)
+                    && c.ledger.swap.as_ref().is_some_and(|s| s.reply.is_some())
+                    && c.ledger.placements[lost].status()["native_replica_deleted"] == true
+                    && c.ledger.repair.is_none()).await;
+                let primary = cluster.ledger.primary_index();
+                assert_ne!(primary, lost);
+                let endpoint = cluster.ledger.placements[primary].endpoint.clone().ok_or("missing current Primary endpoint")?;
+                assert!(data_contact(&endpoint, b"read\n").contains(&format!("committed={}", if cycle == 0 { 1 } else { 3.min(cycle + 1) })));
+                if cycle < 2 {
+                    let written = data_contact(&endpoint, if cycle == 0 { b"write-more\n" } else { b"write-final\n" });
+                    assert!(written.contains(&format!("committed={}", cycle + 2)), "{written}");
+                }
+                let failover = cluster.ledger.swap.as_ref().unwrap().body.clone();
+                assert_eq!(failover.configuration.unit.previous, epoch);
+                assert_eq!(failover.configuration.unit.current.data_loss, epoch.data_loss);
+                assert!(epoch.older_than(failover.configuration.unit.current));
+                old_requests.push((primary, failover));
+                assert_eq!(cluster.repair_primary_replica().await?["state"], "pending");
+                if interrupted && cycle == 1 {
+                    let path = cluster.children[lost].launch.host_replacement_path(original.replica.id, original.replica.instance);
+                    let end = Instant::now() + Duration::from_secs(10);
+                    while !path.exists() {
+                        assert!(Instant::now() < end, "second replacement startup deadline");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert_eq!(cluster.ledger.repair_status()["host_ready"], false);
+                    return Ok(());
+                }
+                if cycle == 1 {
+                    let lost_reply = hold_peer_loss_frame(&mut cluster, primary, "AddReplicaReply", Duration::from_secs(30)).await?;
+                    let (built, _) = decode_add_replica_reply(&lost_reply).map_err(err)?;
+                    assert_eq!(cluster.ledger.repair_status()["built"], false);
+                    assert!(cluster.ledger.idle_retry(lost, Instant::now() + Duration::from_secs(11)).is_none());
+                    let retry = cluster.ledger.idle_retry(primary, Instant::now() + Duration::from_secs(11))
+                        .ok_or("missing repeated build retry")?;
+                    cluster.send_idle(&retry).await?;
+                    let lost_reply = hold_peer_loss_frame(&mut cluster, primary, "DoReconfigurationReply", Duration::from_secs(30)).await?;
+                    let (completed, _) = decode_do_reconfiguration_reply(&lost_reply).map_err(err)?;
+                    assert_eq!(cluster.ledger.repair.as_ref().unwrap().build.reply.as_ref(), Some(&built));
+                    assert_eq!(cluster.ledger.repair_status()["ready"], false);
+                    assert_eq!(completed.replicas.0.len(), 3);
+                    let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11))
+                        .ok_or("missing repeated configuration retry")?;
+                    cluster.send_configuration(&retry).await?;
+                }
+                until(&mut cluster, |c| c.ledger.repair_status()["ready"] == true
+                    && c.status()["nodes"][lost]["retained_work"]["local_replica"]["replica"]["current_role"] == 3
+                    && c.status()["nodes"][lost]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 3.min(cycle + 2)).await;
+                epoch = cluster.ledger.placements[primary].body()?.unit.current;
+                let fresh = cluster.ledger.placements[lost].profile.as_ref().unwrap();
+                assert_ne!(fresh.app_pid, profile.app_pid);
+                assert_ne!(fresh.runtime_root, profile.runtime_root);
+                assert!(!profile.runtime_root.exists());
+                assert!(!Path::new(&format!("/proc/{}", profile.app_pid)).exists());
+                assert!(cluster.ledger.placements[lost].replica > original.replica.id);
+                assert!(cluster.ledger.placements[lost].incarnation > original.replica.instance);
+                for (i, owner) in survivors {
+                    assert_eq!(cluster.ledger.placements[i].profile.as_ref(), Some(&owner));
+                }
+                predecessors.push((lost, original, loss));
+                for (i, body, report) in &predecessors {
+                    assert!(cluster.ledger.report(*i, report)?.is_none());
+                    cluster.ledger.reply(*i, AddInstanceReply {
+                        unit: body.unit.clone(), replica: dropped_replica(&body.replica), error: 0,
+                    }, true)?;
+                    let link = cluster.children[*i].link.as_ref().unwrap();
+                    link.send(delete_replica_message(&DeleteReplica::new(body.clone(), false), &link.generation()).map_err(err)?).await?;
+                    let child = &mut cluster.children[*i];
+                    child.process.as_mut().unwrap().command(format!(
+                        "replace-host {} {} {} {}\n", child.launch.session, child.launch.capability,
+                        body.replica.id, body.replica.instance,
+                    ).as_bytes()).map_err(err)?;
+                }
+                for (i, body) in &old_requests {
+                    let link = cluster.children[*i].link.as_ref().unwrap();
+                    link.send(do_reconfiguration_message(body, &link.generation()).map_err(err)?).await?;
+                }
+                for _ in 0..20 { cluster.drive().await; }
+                assert!(cluster.ledger.placements.iter().all(|p| p.link_alive && !p.loss_reported));
+                assert_eq!(cluster.ledger.repair_status()["ready"], true);
+                let status = cluster.status();
+                for i in 0..3 {
+                    assert_eq!(status["nodes"][i]["node_pid"], node_pids[i]);
+                    assert_eq!(status["nodes"][i]["retained_work"]["app_observation"]["opens"], 1);
+                }
+                assert!(data_contact(&endpoint, b"read\n").contains(&format!("committed={}", 3.min(cycle + 2))));
+            }
+            assert_eq!(cluster.ledger.repair_history.len(), 2);
+            assert_eq!(cluster.ledger.placements[0].retired.len(), 2);
+            let primary = cluster.ledger.primary_index();
+            let survivor = (0..3).find(|i| *i != primary).unwrap();
+            let last = (0..3).find(|i| *i != primary && *i != survivor).unwrap();
+            let completed_epoch = cluster.ledger.swap.as_ref().unwrap().body.configuration.unit.current;
+            for i in [survivor, primary] {
+                let pid = cluster.ledger.placements[i].profile.as_ref().unwrap().app_pid;
+                assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()])
+                    .status().map_err(err)?.success());
+                until(&mut cluster, |c| c.ledger.placements[i].loss_reported).await;
+            }
+            for _ in 0..20 { cluster.drive().await; }
+            assert_eq!(cluster.ledger.swap.as_ref().unwrap().body.configuration.unit.current, completed_epoch);
+            assert_eq!(cluster.ledger.repair_history.len(), 2);
+            assert_eq!(cluster.status()["nodes"][last]["retained_work"]["local_replica"]["replica"]["current_role"], 3);
+            assert!(cluster.ledger.placements.iter().all(|p| p.endpoint.is_none()));
+            Ok::<(), String>(())
+        }).await;
+        if !matches!(&result, Ok(Ok(()))) {
+            eprintln!("REPEAT_STATUS {}", cluster.status());
+            for child in &cluster.children { eprintln!("REPEAT_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+        }
+        let cleanup = cluster.shutdown().await;
+        assert_eq!(cleanup["clean"], true, "{cleanup}");
+        result.unwrap().unwrap();
     }
 }
 

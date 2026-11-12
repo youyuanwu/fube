@@ -408,15 +408,68 @@ node3 after repair still permits acknowledged writes on node2 plus rebuilt
 node1; losing both Secondaries blocks acknowledgment rather than restoring
 singleton quorum. Interrupted repair shutdown verifies both app-owner cleanups.
 
-This is one explicit repair in the original live three-node session, not an
+This is explicit repair in the original live three-node session, not an
 automatic placement policy, whole-node/FM failure, arbitrary app restart,
-reconnect, a second failover/repair, history repair or data-loss recovery.
+reconnect, history repair or data-loss recovery.
 Survivor loss during repair leaves it unknown; it never manufactures a successful
 build or reduces quorum. Existing native message schemas/factories are reused,
 including the three-element Deactivate fixture: the maintained codec gate remains
 173 cases/53 native truncation rejections. These are native-source-derived
 store/process and native-stream/schema-adapter results, not full original C++
 handler execution or deployed FM/Federation interoperability.
+
+### Repeated live-session Primary failover and repair
+
+After repair completes, another matched loss of the **current** Primary app
+can start the same no-data-loss failover protocol. FM takes PC from the latest
+completed three-member configuration, not the original launch roles. Both
+current Secondaries must remain available. This fixed profile deterministically
+chooses the lowest placement among those ready candidates; it does not implement
+PLB ranking, lagging-history selection or ChangeConfiguration. RA still requires
+both actual progress results and matching deactivation history before promotion.
+Target/minimum stays 3/2; only the configuration/Primary epoch advances.
+
+Call `repair_primary_replica()` after each completed failover and processed
+predecessor deletion. It is idempotent within that cycle. A new cycle cannot
+start until the preceding repair's final semantic completion. The current
+Primary owns the new build, and the dropped placement receives a replica
+ID/incarnation greater than every retained placement identity. The same live
+Node/RA/store/peer Channels can host successive fresh app owners, including
+replacing a previously repaired host. Every replacement independently reaps and
+drains its exact predecessor, removes its Hosting root and installs a new gate;
+no former runtime is adopted or reopened.
+
+S/S Deactivate and Activate commit the latest deactivation history, so a later
+GetLSN reply cannot accidentally report the first failover's boundary.
+Completed RA transitions may accept a newer configuration, while old epochs are
+fenced before routing to the new transition's peer. Exact completed current-cycle
+requests still replay their final reply. FM retains predecessor report/reply fences;
+Node retains old Delete lineage. Owned replacement commands and receipts are
+keyed by predecessor replica/incarnation. Shutdown validates each historical
+replacement and the final owner, including a replacement not yet admitted by FM.
+These are retained in-memory live-session histories, not durable restart state.
+
+| Pinned SF source | Repeated-cycle responsibility |
+|---|---|
+| `fm/ReconfigurationTask.cpp:176-320` | Re-evaluate the current Primary and current-configuration candidates under quorum obligations, rather than a one-time original-node transition. |
+| `fm/FailoverUnit.cpp:718-739`; `fm/Replica.cpp:555-585` | Reuse dropped placement with a fresh identity greater than prior/current replica identities. |
+| `ra/FailoverUnit.cpp:1355-1445` | Replay completed same-epoch work, or initialize a subsequent reconfiguration from its new epoch/roles. |
+| `ra/ReconfigurationAgent.cpp:2626-2644,2766-2775` | Refresh deactivation information on Deactivate/Activate, including already-open surviving replicas. |
+| `ra/infrastructure.FailoverUnitEntityTraits.cpp:222-267` | Reject stale epochs/incarnations before executing current transition handlers. |
+
+Real-process acceptance runs three complete failover/repair cycles, preserving
+acknowledged writes, promoting a rebuilt replica and replacing node1's host
+twice. The second repair loses/replays build and final configuration replies.
+Old reports, Delete requests/replies, failover requests and owned replacement
+commands cannot affect successors. Node process identities stay unchanged and
+each current app owner opens once. Losing a Secondary followed by the current
+Primary prevents another promotion; separate interrupted-second-repair coverage
+verifies shutdown before the new host receipt reaches FM.
+
+Overlapping/interrupted reconfiguration recovery, survivor loss during repair,
+whole-node/FM failure, reconnect, persisted recovery and data loss remain gated.
+This reuses existing native codecs; source-stream/schema-adapter evidence is
+still not complete original C++ handler execution or deployed interoperability.
 
 ## Peer-created Idle replica (stage-4 increment)
 

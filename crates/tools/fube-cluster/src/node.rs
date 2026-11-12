@@ -992,8 +992,8 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut published_failed_registration = None;
     let mut published_failed_open = None;
     let mut published_host_loss = false;
-    let mut repair_requested = false;
-    let mut repaired_host = false;
+    let mut repair_requested = None;
+    let mut repaired_hosts = Vec::new();
     type UploadRequest =
         Pin<Box<dyn Future<Output = Result<Option<fube_transport::message::Message>>> + Send>>;
     let mut upload_request: Option<UploadRequest> = None;
@@ -1039,11 +1039,31 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             let command = std::str::from_utf8(&line).map_err(err);
                             let command = command.as_ref().map(|line| line.split_whitespace().collect::<Vec<_>>());
                             match command {
-                                Ok(parts) if parts.len() == 3 && parts[0] == "replace-host"
+                                Ok(parts) if parts.len() == 5 && parts[0] == "replace-host"
                                     && parts[1] == launch.session && parts[2] == launch.capability
-                                    && launch.profile == ServiceProfile::StatefulThree && launch.placement == 1
-                                    && !repair_requested => {
-                                    repair_requested = true;
+                                    && launch.profile == ServiceProfile::StatefulThree => {
+                                    let identity = parts[3].parse::<i64>().and_then(|id| {
+                                        parts[4].parse::<i64>().map(|instance| (id, instance))
+                                    });
+                                    let identity = match identity {
+                                        Ok(identity) => identity,
+                                        Err(error) => {
+                                            failure = Some(format!("invalid replacement predecessor: {error}"));
+                                            break;
+                                        }
+                                    };
+                                    if !repaired_hosts.contains(&identity) {
+                                        let current = uuid::Uuid::parse_str(&launch.partition).ok()
+                                            .and_then(|id| node.snapshot(id.to_bytes_le()).committed);
+                                        if current.as_ref().is_none_or(|s| {
+                                            (s.body.replica.id, s.body.replica.instance) != identity
+                                                || s.phase != ra::Phase::Closed
+                                        }) || repair_requested.is_some_and(|pending| pending != identity) {
+                                            failure = Some("replacement command is not the current closed owner".into());
+                                            break;
+                                        }
+                                        repair_requested = Some(identity);
+                                    }
                                 }
                                 Ok(parts) if matches!(parts.len(), 4 | 5) && parts[0] == "peer"
                                     && parts[1] == launch.session && parts[2] == launch.capability
@@ -1328,18 +1348,20 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     }
                 }
             }
-            if repair_requested && !repaired_host && adapter.replica_drained(&node) {
+            if let Some(identity) = repair_requested.filter(|_| adapter.replica_drained(&node)) {
                 match node.retire_lost_primary_host() {
                     Ok(true) => match replace_primary_host(launch, &mut node) {
                         Ok(receipt) => {
                             metadata.profile = Some(receipt.profile.clone());
-                            if let Err(error) =
-                                write_json(&launch.directory.join("repaired-host.json"), &receipt)
-                            {
+                            if let Err(error) = write_json(
+                                &launch.host_replacement_path(identity.0, identity.1),
+                                &receipt,
+                            ) {
                                 failure = Some(error);
                                 break;
                             }
-                            repaired_host = true;
+                            repaired_hosts.push(identity);
+                            repair_requested = None;
                         }
                         Err(error) => {
                             failure = Some(error);
@@ -1690,12 +1712,14 @@ fn fixed_idle_target(
 ) -> Result<()> {
     let expected = if (replica.id, replica.instance) == (id, instance) {
         (id, instance)
+    } else if launch.profile == ServiceProfile::StatefulThree
+        && replica.id > id
+        && replica.instance > instance
+    {
+        // The live RA validates the exact current or freshly admitted incarnation.
+        (replica.id, replica.instance)
     } else {
-        if launch.profile == ServiceProfile::StatefulThree {
-            launch.primary_successor()?
-        } else {
-            launch.idle_successor()?
-        }
+        launch.idle_successor()?
     };
     fixed_peer_target(launch, partition, replica, node, expected.0, expected.1)
 }

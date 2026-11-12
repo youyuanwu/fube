@@ -47,9 +47,9 @@ with desired target/minimum 3/2 and write quorum two. Original nonempty data
 continues on those owners. There is no automatic replacement of node1 or quorum
 fallback if another member is lost. Lost final replies replay without another
 promotion/Open; repeated old-Primary loss reports cannot undo the new endpoint.
-This qualifies original Primary **app-host** loss with its RA/Node alive, not
-node/FM process failover, restart, mismatched-history repair, a second failover
-or data-loss recovery. See [the SF flow and evidence](../../../docs/cluster/MinimalFmCluster.md#three-replica-primary-app-host-failover).
+This first-cycle example qualifies Primary **app-host** loss with its RA/Node
+alive, not node/FM process failover, restart, mismatched-history repair or
+data-loss recovery. See [the SF flow and evidence](../../../docs/cluster/MinimalFmCluster.md#three-replica-primary-app-host-failover).
 
 After completed failover and the old Primary's processed native loss/deletion,
 `Cluster::repair_primary_replica().await` explicitly starts one repair on node1.
@@ -70,9 +70,21 @@ operation. The new Primary and surviving Secondary never reopen; old reports
 and Delete traffic cannot retire the fresh owner. After repair one Secondary
 can be lost while writes continue; losing both still prevents acknowledgments.
 Shutdown verifies old and new app cleanup even if repair is interrupted before
-FM admits the new host. This is one explicit original-Primary app-host repair,
-not automatic placement, a second repair/failover or whole-node/FM restart.
+FM admits the new host. This is explicit app-host repair, not automatic
+placement or whole-node/FM restart.
 See [source mapping and qualification](../../../docs/cluster/MinimalFmCluster.md#post-failover-third-replica-repair).
+
+Once repair completes, another loss of the current Primary app can repeat this
+flow. FM uses latest committed membership and the lowest ready Secondary
+placement as candidate; both current Secondaries' matched progress/history are
+still required. Call `repair_primary_replica()` after each failover to restore
+1P+2S at unchanged 3/2. Poll `repair.ready` for that cycle, not an older completed
+configuration. Each replacement uses a strictly newer identity and physically
+cleans its exact predecessor; the same Node/RA/store/peer sessions remain alive.
+Three real-process cycles, repeated lost replies, stale predecessor traffic and
+interrupted-second-repair cleanup are qualified. Concurrent repair/failover,
+lagging-history selection, data loss and whole-node/FM recovery remain gated.
+See [repeated-cycle SF mapping and limits](../../../docs/cluster/MinimalFmCluster.md#repeated-live-session-primary-failover-and-repair).
 
 `--stateful-peer-idle` is a separate fresh-start, fixed-generation opt-in:
 node1 alone receives FM AddPrimary; node2 is the bound remote volatile Idle

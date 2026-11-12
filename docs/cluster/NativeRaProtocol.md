@@ -65,6 +65,10 @@ The [explicit post-failover repair](MinimalFmCluster.md#post-failover-third-repl
 reuses these codecs for fresh-incarnation creation/copy and committed S/S
 deactivation/activation; it adds no native schema or action. Its separate
 original-owner/process tests are not native handler or Federation evidence.
+The [repeated live-session extension](MinimalFmCluster.md#repeated-live-session-primary-failover-and-repair)
+uses latest committed membership/history for subsequent cycles, retaining native
+epoch/incarnation fencing and the same codecs. Three-cycle process acceptance
+and repeated survivor commit-barrier tests add no wire schema or action.
 The maintained source-stream oracle now has 173 inputs, 84 types/255 fields,
 177 bundle files and 53 native truncation rejections, retaining the preceding
 172-case healthy three-member gate, the

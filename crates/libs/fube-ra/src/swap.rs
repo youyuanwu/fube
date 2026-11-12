@@ -53,7 +53,7 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
         .as_ref()
         .filter(|c| c.stage == ConfigurationStage::Complete && c.request.unit.target == 3)
         .ok_or(Failure::Unsupported(
-            "failover requires completed original three-member membership",
+            "failover requires completed current three-member membership",
         ))?;
     let old = &active.request;
     if body.replicas.0.len() != 3
@@ -73,7 +73,7 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
                 .ok_or(Failure::Capacity)?
     {
         return Err(Failure::Unsupported(
-            "only one no-data-loss three-member Primary failover is enabled",
+            "only no-data-loss three-member Primary failover is enabled",
         ));
     }
     let mut primaries = 0;
@@ -115,7 +115,12 @@ fn progress_query(
     admission: &Admission,
     peers: &[NodeInstance],
 ) -> Result<Option<Transition>> {
-    if current.swap.is_some() || peers.len() != 2 {
+    if current
+        .swap
+        .as_ref()
+        .is_some_and(|s| s.stage != SwapStage::Complete)
+        || peers.len() != 2
+    {
         return Ok(None);
     }
     match &work.kind {
@@ -131,6 +136,13 @@ fn progress_query(
             }
             let request: GetLsn = from_slice(&work.bytes)
                 .map_err(|_| Failure::Admission("invalid failover progress query"))?;
+            if current
+                .swap
+                .as_ref()
+                .is_some_and(|s| !s.body.unit.current.older_than(request.unit.current))
+            {
+                return Ok(None);
+            }
             let active = current
                 .reconfiguration
                 .as_ref()
@@ -757,7 +769,14 @@ pub(super) fn transition(
             {
                 return stale();
             }
-            if let Some(swap) = &current.swap {
+            if let Some(swap) = current.swap.as_ref().filter(|s| {
+                s.stage != SwapStage::Complete
+                    || !s
+                        .body
+                        .unit
+                        .current
+                        .older_than(body.configuration.unit.current)
+            }) {
                 let expected = if from_fm {
                     &swap.intent
                 } else {
@@ -830,6 +849,10 @@ pub(super) fn transition(
                 endpoint_available: false,
                 started: Instant::now(),
             });
+            if failover {
+                state.remote_idles.clear();
+                state.progress_query = None;
+            }
             apply(&mut state, &admission.local_node)?;
         }
         Kind::GetLsn {

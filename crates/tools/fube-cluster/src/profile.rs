@@ -210,19 +210,9 @@ pub struct Launch {
     pub peers: Vec<Peer>,
 }
 impl Launch {
-    pub fn primary_successor(&self) -> Result<(i64, i64)> {
-        if self.profile != ServiceProfile::StatefulThree {
-            return Err("Primary repair requires the original three-node profile".into());
-        }
-        let next = self
-            .peers
-            .iter()
-            .fold(self.replica.max(self.incarnation), |n, p| {
-                n.max(p.replica).max(p.incarnation)
-            })
-            .checked_add(1)
-            .ok_or("repair identity exhausted")?;
-        Ok((next, next))
+    pub fn host_replacement_path(&self, replica: i64, instance: i64) -> PathBuf {
+        self.directory
+            .join(format!("repaired-host-{replica}-{instance}.json"))
     }
     pub fn idle_successor(&self) -> Result<(i64, i64)> {
         if self.profile != ServiceProfile::StatefulPeerIdle {
@@ -348,7 +338,6 @@ impl HostReplacementReceipt {
     pub fn validate(&self, launch: &Launch, old: &ActualProfile, node_pid: u32) -> Result<()> {
         self.profile.validate(launch)?;
         if launch.profile != ServiceProfile::StatefulThree
-            || launch.placement != 1
             || self.deployment != launch.deployment
             || self.session != launch.session
             || self.node_pid != node_pid
