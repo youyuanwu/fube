@@ -554,6 +554,7 @@ fn terminal_session_loss_rejects_new_usage_but_keeps_existing_owner_releasable()
         !owner.process_status().unwrap().exit_observed,
         "orderly detached child remains alive"
     );
+    assert!(owner.observe_process_exit().unwrap().is_none());
     let acquisitions = owner.residency().resources().acquisitions;
     assert!(matches!(
         owner.acquire_usage(),
@@ -562,6 +563,22 @@ fn terminal_session_loss_rejects_new_usage_but_keeps_existing_owner_releasable()
     assert_eq!(owner.residency().resources().acquisitions, acquisitions);
     let pid = owner.process_status().unwrap().pid;
     let root = owner.root().unwrap().to_path_buf();
+    assert!(std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while owner.observe_process_exit().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < end,
+            "owned exit observation deadline"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let status = owner.process_status().unwrap();
+    assert!(status.exit_observed && !status.reaped && !status.termination_requested);
+    assert_eq!(owner.poll_registration(), Err(LocalError::SessionLost));
     assert_eq!(owner.terminate(), Err(LocalError::Busy));
     assert!(matches!(
         owner.release_usage(acquisition),
