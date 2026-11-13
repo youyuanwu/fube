@@ -420,7 +420,7 @@ there is no disposal/absence/failure cleanup receipt, completed physical
 cleanup, reuse or replacement. Primary pending-remove needs its own reply,
 and explicit FM Primary-side removal remains available after loss.
 Actual two-child acceptance kills the original destination app, holds Primary
-removal, exercises stale/lost ACK and metadata reply replay, and verifies
+removal, exercises stale ACK and metadata reply replay, and verifies
 continued Primary writes. Pending-Add and commit/owner cases have separate
 model/store coverage.
 Normal RAP Close/Drop now preserves the original committed opened Idle's origin
@@ -431,7 +431,8 @@ HostDown stale; completed Drop keeps ReplicaDropped stage and its disposal proof
 Controlled owned-Node/process/Channel tests hold real provider/service disposal,
 kill the app, and verify metadata reply replay, late traffic and independent
 Primary removal/writes. The pending-Drop provider-held case also exercises
-an actual 30-second lost-ACK retry while both original Nodes/peer/FM links progress.
+the native 30-second deadline and explicitly fires its retained lost-ACK retry
+while both original Nodes/peer/FM links progress.
 Separate opened-origin/loss/ACK commit barriers and both races for each mode are
 covered by model/store tests. No child-node Close-control feature is added.
 Opening loss, Abort/ForceAbort loss and broader unknown targets remain
@@ -447,8 +448,8 @@ Close. The app host/runtime/factory stay resident. FM records lost volatile
 state, not a reusable placement: even a valid retirement sidecar is not reuse
 authority in this terminal-report flow, and Primary pending-remove needs its
 own reply. Controlled process/Channel tests hold provider/service disposal,
-lose/retry an ACK at the unchanged 30-second cadence, replay metadata replies
-and retain healthy Primary writes. Initial-Open, failed or other-mode Close
+check the native 30-second deadline, fire the retained lost-ACK retry, replay
+metadata replies and retain healthy Primary writes. Initial-Open, failed or other-mode Close
 does not gain this down-stage reporting authority.
 
 Normal `CloseMode::Drop` of that original opened Idle now uses
@@ -459,8 +460,9 @@ cannot clear it, even before the first retry. The processed-list ACK/closed
 metadata Delete and original disposal/usage proof remain independent, with
 no second RAP Close, Primary pending-remove completion or reuse/replacement
 authority. A later Drop cannot supersede an already-closing Close or relabel
-its closed Down report. Controlled provider/service disposal, actual 30-second
-lost-ACK retry, stable proof/metadata replay and healthy Primary writes are
+its closed Down report. Controlled provider/service disposal, native retry-deadline
+checks and timer-fired lost-ACK retry, stable proof/metadata replay and healthy
+Primary writes are
 covered separately from intent/completion/ACK commit and both-list ACK tests.
 Matching HostDown during opened-origin Drop now uses ReplicaDown instead and
 cannot turn partial cleanup or late RAP replies into disposal proof.
@@ -684,7 +686,9 @@ in `generation_handshake.uploads`; both processed reports set `phase=complete`,
 `complete=true` and allow new-generation mutations/service updates.
 Lost replies retry the frozen metadata after the native 30-second interval,
 without blocking owner shutdown or reopening replicas. Existing Primary data
-and original node/app/runtime ownership remain intact. This is one live-session
+and original node/app/runtime ownership remain intact. Retry qualification drives
+the shared upload state at explicit deadlines over real correlated Channels;
+separate process cases retain the original node/app/runtime owners. This is one live-session
 round for stateless/independent singleton profiles, not application-data upload,
 unknown-partition reconstruction, peer-profile upload, nonempty NodeUp,
 full ReplicaUp batching, FM/FMM recovery or durable restart.
@@ -782,8 +786,9 @@ requested fresh-data recreation after verified normal deletion. Same-session
 predecessor frames and old receipts cannot retire the successor. The
 archive includes both fixed app binaries; no consumer-side build fallback exists.
 Owned app-crash/lease-loss compositions additionally exercise real FM channels,
-native processed-versus-dropped reply semantics, a lost ACK with the actual
-30-second retry, metadata-only DeleteReplicaReply and unaffected sibling data.
+native processed-versus-dropped reply semantics, a lost ACK with a checked native
+30-second deadline and explicitly fired timer, metadata-only DeleteReplicaReply
+and unaffected sibling data.
 They retain their selected trusted construction premises rather than claiming
 full native handler execution or unexpected-loss CLI/Federation parity.
 The same composition covers graceful Close with separately held provider and

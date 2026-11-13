@@ -622,9 +622,11 @@ after FM has completed the round.
 Model/store tests cover multi-entity barriers, failed/unknown private commits,
 empty maps versus deleted-only maps, exact/stale/FMM replies and duplicate FM
 receipts. Original-process acceptance covers empty/nonempty inventories,
-renegotiation, resumed new-generation Add/Delete, an actually lost LFUM reply
-and native-interval retry, and continuing nonempty Primary data on the original
-app/runtime owners. FM-channel loss during an owned upload leaves it pending
+renegotiation, resumed new-generation Add/Delete and continuing nonempty Primary
+data on the original app/runtime owners. A shared upload-state/Channel test loses
+an actual correlated LFUM reply, checks the native retry deadline and fires that
+deadline explicitly, preserving the frozen inventory without a wall-clock wait.
+FM-channel loss during an owned upload leaves it pending
 without advancing send generation or shutting down the original serving app.
 Native-stream/schema-adapter evidence adds six cases:
 169 bidirectional cases, 84 types/255 fields, 173 bundle files and 49 actual
@@ -1141,7 +1143,7 @@ the destination loss. No automatic reconfiguration/recovery is introduced.
 
 Real two-child acceptance kills the exact destination app while both original
 RA/FM sessions and the healthy Primary remain alive. It holds Primary removal,
-rejects a stale ACK, waits the actual 30-second report retry, loses/replays the
+rejects a stale ACK, loses/replays the
 metadata Delete reply, then verifies independent Primary removal and writes.
 Model/store tests cover pending/acknowledged Add, unrelated reports, independent
 owner loss and separate failed/unknown loss/ACK commits. These are source-derived
@@ -1155,9 +1157,10 @@ callbacks, HostDown's exact usage release or metadata deletion. Stale ACK,
 metadata reply replay, late Create/Add and independent Primary removal/writes
 retain their existing barriers. Model/store tests cover Close versus HostDown
 winning for each mode, late Close replies, and separate opened-origin/loss/ACK
-commit failures and uncertainty. Pending Drop process-loss acceptance also runs
-the actual 30-second lost-ACK retry with both original Nodes/peer/FM links
-progressing. This adds no child-node Close-control feature or wire schema.
+commit failures and uncertainty. Controlled Close/Drop process-loss acceptance
+also checks the native 30-second deadline and explicitly fires the retained
+lost-ACK retry with both original Nodes/peer/FM links progressing. This adds no
+child-node Close-control feature or wire schema.
 Opening loss, Abort/ForceAbort loss, broader down/arbitrary-unknown cleanup
 and replacement outside the explicit fresh-Idle slice remain gated.
 
@@ -1198,8 +1201,8 @@ deletion; that does not change those FM authority boundaries.
 Controlled owned-Node/production-adapter/process/Channel acceptance holds real
 provider or service disposal, releases it without killing the app, and verifies
 the exact original proof before ACK and after metadata reply replay. It checks
-stale ACKs, the unchanged native 30-second report retry after losing an ACK,
-late traffic and independent Primary removal/writes. Both original nodes
+stale ACKs, the native 30-second deadline and explicitly fired retry after losing
+an ACK, late traffic and independent Primary removal/writes. Both original nodes
 continue to progress during that retry. Model/store tests cover separate
 completion/ACK commit failure and uncertainty, excluded Close origins and late
 HostDown. No child-node Close-control feature, wire schema or native C++
@@ -1992,8 +1995,9 @@ without completing an operator deletion lacking its independent disposal proof.
 The original Activation still owns physical cleanup.
 
 Real-process/channel tests cover app crash and lease expiry, public acknowledged
-write/readback before loss, a genuinely lost acknowledgment and the 30-second
-retry, stale/duplicate replies and an independently serving sibling. Hard exit
+write/readback before loss, a genuinely lost acknowledgment, the native 30-second
+deadline and explicitly fired retry, stale/duplicate replies and an independently
+serving sibling. Hard exit
 does not manufacture provider/service destructor receipts. These are native-free
 composition tests with selected trusted premises, not deployed native handler
 or Federation-interoperability qualification.

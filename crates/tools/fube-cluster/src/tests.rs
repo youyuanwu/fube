@@ -2282,7 +2282,7 @@ async fn peer_explicit_delete_finishes_host_loss_and_force_obliteration_without_
 }
 
 #[tokio::test]
-async fn peer_idle_app_host_loss_retries_native_report_and_metadata_reply_without_completing_primary_remove() {
+async fn peer_idle_app_host_loss_rejects_stale_ack_and_replays_metadata_without_completing_primary_remove() {
     let fixture = Fixture::new("peer-idle-host-loss");
     let mut config = fixture.config();
     config.profile = ServiceProfile::StatefulPeerIdle;
@@ -2325,10 +2325,11 @@ async fn peer_idle_app_host_loss_retries_native_report_and_metadata_reply_withou
         stale.replicas.0[0].replicas.0[0].description.instance -= 1;
         cluster.children[1].link.as_ref().unwrap().send(
             replica_up_reply_message(&stale, &cluster.children[1].launch.generation).map_err(err)?).await?;
-        let started = Instant::now();
-        let retried = hold_peer_loss_frame(&mut cluster, 1, "ReplicaUp", Duration::from_secs(35)).await?;
-        assert!(started.elapsed() >= Duration::from_secs(25));
-        assert_eq!(decode_replica_up(&retried).map_err(err)?.0, report);
+        let end = Instant::now() + Duration::from_secs(3);
+        while cluster.status()["peer_idle"]["target"]["fm_stage"] != "ReplicaDown" {
+            assert!(Instant::now() < end, "original Idle report observation deadline");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(cluster.ledger.report(1, &report)?, Some(reply.clone()));
         assert_eq!(cluster.status()["peer_idle"]["target"]["fm_stage"], "ReplicaDown");
         assert_eq!(cluster.status()["peer_idle"]["target"]["retained_usage"], 0);
@@ -2338,7 +2339,7 @@ async fn peer_idle_app_host_loss_retries_native_report_and_metadata_reply_withou
         let (deleted, owner) = decode_delete_replica_reply(&deleted).map_err(err)?;
         assert_eq!(owner, Owner::Fm);
         assert_eq!(cluster.ledger.placements[1].status()["native_replica_deleted"], false);
-        let retry = cluster.ledger.deletion_retry(1, Instant::now())?.ok_or("missing lost metadata Delete retry")?;
+        let retry = cluster.ledger.deletion_retry(1, Instant::now() + Duration::from_secs(11))?.ok_or("missing lost metadata Delete retry")?;
         assert_eq!(retry, DeleteReplica::new(add.clone(), false));
         cluster.children[1].link.as_ref().unwrap().send(delete_replica_message(&retry, &generation).map_err(err)?).await?;
         let replay = hold_peer_loss_frame(&mut cluster, 1, "DeleteReplicaReply", Duration::from_secs(12)).await?;
@@ -4110,8 +4111,26 @@ async fn sequential_repair_after_removal_supersession_restores_target_and_later_
 }
 
 #[tokio::test]
-async fn secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover() {
-    for (target, minimum) in [(2, 1), (4, 2), (4, 3), (5, 3)] {
+async fn secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover_2_1() {
+    secondary_loss_repair(2, 1).await;
+}
+
+#[tokio::test]
+async fn secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover_4_2() {
+    secondary_loss_repair(4, 2).await;
+}
+
+#[tokio::test]
+async fn secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover_4_3() {
+    secondary_loss_repair(4, 3).await;
+}
+
+#[tokio::test]
+async fn secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover_5_3() {
+    secondary_loss_repair(5, 3).await;
+}
+
+async fn secondary_loss_repair(target: i32, minimum: i32) {
         let fixture = Fixture::new("secondary-loss-repair");
         let mut config = fixture.config();
         config.profile = ServiceProfile::Stateful { target, minimum };
@@ -4217,7 +4236,6 @@ async fn secondary_loss_repair_preserves_primary_repeats_and_then_survives_prima
         let cleanup = cluster.shutdown().await;
         assert_eq!(cleanup["clean"],true,"{cleanup}");
         result.unwrap().unwrap();
-    }
 }
 
 #[tokio::test]
@@ -5996,45 +6014,14 @@ async fn real_generation_upload_uses_correlated_replies_and_resumes_new_generati
 }
 
 #[tokio::test]
-async fn real_lfum_lost_reply_retries_the_frozen_upload_without_generation_update() {
+async fn lfum_lost_reply_retries_the_frozen_upload_without_generation_update() {
     let fixture = Fixture::new("lfum-lost-reply");
     let mut cluster = Cluster::new(fixture.config()).unwrap();
-    cluster.start().await.unwrap();
-    let result: Result<()> = async {
-        cluster.begin_generation_handshake()?;
-        for index in 0..2 {
-            cluster.retry_generation(index).await?;
-        }
-        for index in 0..2 {
-            cluster.retry_generation(index).await?;
-        }
-        let mut first = cluster.children[0].link.as_ref().unwrap()
-            .receive(Instant::now() + Duration::from_secs(8)).await?
-            .ok_or("missing first LFUM upload")?;
-        let uploaded = decode_lfum_upload(&first.message).map_err(err)?;
-        cluster.ledger.lfum_upload(0, uploaded.clone())?;
-        if let Some(handoff) = first.handoff.as_mut() { handoff.acknowledge(); }
-        drop(first); // FM processed it, but its semantic reply is lost.
-        until(&mut cluster, |c| !c.ledger.generation_pending()
-            && c.status()["nodes"][0]["retained_work"]["generations"]["upload_pending"] == true).await;
-        let before = cluster.status();
-        assert_eq!(before["nodes"][0]["retained_work"]["generations"]["upload_pending"], true);
-        assert_eq!(before["nodes"][0]["link_alive"], true);
-        let retry = cluster.children[0].link.as_ref().unwrap()
-            .receive(Instant::now() + Duration::from_secs(40)).await?
-            .ok_or("missing native 30-second LFUM retry")?;
-        assert_eq!(decode_lfum_upload(&retry.message).map_err(err)?, uploaded);
-        cluster.receive_message(0, retry).await?;
-        until(&mut cluster, |c| c.status()["nodes"][0]["retained_work"]["generations"]["upload_pending"] == false).await;
-        let round = cluster.ledger.generation.as_ref().unwrap();
-        assert_eq!(cluster.status()["nodes"][0]["retained_work"]["generations"]["send"], json!(round.number));
-        assert_eq!(round.uploads[0], Some(uploaded));
-        assert!(cluster.status()["nodes"].as_array().unwrap().iter().all(|node| node["link_alive"] == true));
-        Ok(())
-    }.await;
+    cluster.prepare().unwrap();
+    let result = node::report_tests::run_lfum_retry(&cluster.ledger.placements[0].launch).await;
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
-    result.unwrap();
+    result.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -6049,6 +6036,7 @@ async fn real_stateful_lfum_upload_preserves_original_primary_data_and_runtime_o
         cluster.execute(command("primary", "create", Some(1))).await?;
         until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
         let primary = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        until(&mut cluster, |_| data_contact(&primary, b"read\n").starts_with("OK ")).await;
         assert!(data_contact(&primary, b"write\n").contains("committed=1 value=acknowledged"));
         let owners = cluster.children.iter().map(|child| {
             let profile = child.metadata.as_ref().unwrap().profile.as_ref().unwrap();

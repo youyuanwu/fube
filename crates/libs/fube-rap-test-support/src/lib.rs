@@ -408,6 +408,18 @@ impl Host {
             .expect("model epoch admitted");
         receive
     }
+    /// Dropping result observation does not cancel the original admitted RAP work.
+    pub async fn begin_role(&self, role: ReplicaRole) -> oneshot::Receiver<Result<()>> {
+        let (result, receive) = oneshot::channel();
+        self.commands
+            .send(Command {
+                action: Action::Role(role),
+                result,
+            })
+            .await
+            .expect("model role admitted");
+        receive
+    }
     /// Subscribe before triggering work. Bounded best-effort events have no replay;
     /// lag and closure are explicit receiver errors, not shutdown completion.
     pub fn subscribe_events(&self) -> broadcast::Receiver<HostEvent> {

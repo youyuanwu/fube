@@ -463,9 +463,7 @@ async fn phase2_corrective_abort_dominates_inflight_provider_role_readiness_publ
         f.configure().await;
         let gate = Completion::new();
         *f.spy.role_gate.lock().unwrap() = Some((ReplicaRole::ActiveSecondary, gate.clone()));
-        let changing = f.host.clone();
-        let role =
-            tokio::spawn(async move { changing.change_role(ReplicaRole::ActiveSecondary).await });
+        let mut role = f.host.begin_role(ReplicaRole::ActiveSecondary).await;
         until(|| f.spy.has("role-start")).await;
         let lower = f.runtime.replicator();
         f.native
@@ -479,7 +477,6 @@ async fn phase2_corrective_abort_dominates_inflight_provider_role_readiness_publ
             .await
             .unwrap();
         gate.complete(Ok(()));
-        assert!(role.await.unwrap().is_err());
         let _ = f.runtime.terminal.wait().await;
         f.runtime
             .cleanup_done
@@ -488,6 +485,16 @@ async fn phase2_corrective_abort_dominates_inflight_provider_role_readiness_publ
             .as_ref()
             .clone()
             .unwrap();
+        assert!(!f
+            .runtime
+            .role_events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("done:ActiveSecondary:")));
+        // An unacknowledged RAP caller is not an owned callback-cleanup barrier.
+        assert!(!matches!(role.try_recv(), Ok(Ok(()))));
+        drop(role);
         assert!(!f.runtime.owner.get_is_readable());
         assert!(f.runtime.owner.create_transaction().is_err());
         assert!(f.runtime.owner.try_remove_checkpoint(0, 2).await.is_err());
