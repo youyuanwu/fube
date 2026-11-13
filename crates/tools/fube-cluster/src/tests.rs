@@ -6415,6 +6415,7 @@ async fn stateful_delete_lost_reply_retries_original_lifetime_after_independent_
     };
     until(&mut cluster, |_| {
         request(&endpoint, b"read\n").starts_with("OK ")
+            && request(&sibling, b"read\n").starts_with("OK ")
     })
     .await;
     let written = request(&endpoint, b"write\n");
