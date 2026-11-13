@@ -1,7 +1,7 @@
 # Standalone container Nodes with an external FM
 
-**Status: networking foundation implemented; standalone container profile remains
-proposed and unqualified.**
+**Status: networking and shared control foundations implemented; standalone
+container profile remains proposed and unqualified.**
 
 **Baseline:** `4847cb10e39ca0b0dbd76a96a8f2dfedbf6a93ff`, inspected 2026-11-13.
 
@@ -12,9 +12,21 @@ the application, and `ReplicationEndpointOptions::advertised_ip` supports
 wildcard replication listeners while preserving the bound port and actor
 identity. Local runtime IPC retains its loopback validation. Offline tests
 exercise actual same-host non-loopback TCP, normal public replicator construction
-and owned application registration. The shared control adapter, standalone
-runner, source-IP mesh association and three-container qualification are not
-implemented by this networking slice.
+and owned application registration. Networking alone does not provide a
+standalone runner or qualify the three-container profile.
+
+**Shared control update (2026-11-13):**
+[`fube_node::control`](../../crates/libs/fube-node/src/control/mod.rs) now owns
+the reusable retained FM/peer effect adapter, native timers, applied semantic-ACK
+tracking and original-session LFUM upload state.
+[`control::wire`](../../crates/libs/fube-node/src/control/wire.rs) owns the same
+bounded native action/body decode, FM/peer Channel compositions and exact
+source/generation-bound Link previously private to the launcher. The local
+launcher consumes these shared implementations, not copied replacements.
+Its profile-specific inbound admission, parent/stdin supervision, package
+selection and physical-cleanup receipts remain in `fube-cluster`. The standalone
+runner, source-IP mesh association and three-container qualification remain
+unimplemented.
 
 ## 1. Goal and agreed scope
 
@@ -124,6 +136,27 @@ client protocol. Neither FM nor RA proxies application data.
   versus peer-created Idle is selected by the first valid native creation
   request, not by a hardcoded node number or sample-only executable mode.
   Selection does not permit a second entity or adoption of an existing runtime.
+
+### Shared control integration
+
+The composition owns one `control::Adapter` alongside its local `Node`, supplies
+the original admitted FM/peer `wire::Link` values, and drives Node work and
+adapter progress. Adapter queue/status views are read-only; admitted peer
+command and semantic-ACK observations use bounded tracking methods. Socket
+writes do not clear retained RA notification/report state: its matched native
+reply must apply before the adapter retires that observation.
+
+The same module retains each native retry owner and the frozen LFUM body/request
+across lost replies. Production retry defaults are unchanged. Existing
+qualification fixtures may explicitly make their retained timer due or hold an
+original peer reply through the `qualification` feature; production callers
+cannot mutate these queues through the observation API. This is adapter
+qualification, not a private data-engine control seam.
+
+The composition still validates its deployment/service/placement profile before
+forwarding inbound work to the existing typed Node APIs. Public wire codecs and
+source headers do not grant deployment readiness, authentication, process
+adoption or permission to enable deferred operations.
 
 ## 4. Configuration and container contract
 

@@ -2,8 +2,12 @@
 //! The separate [`local`] owner composes production stateless local RA/RAP
 //! over Activation's owned session; this original prepared-registration owner
 //! retains its distinct readiness/capability gates.
+//! [`control`] supplies reusable native FM/peer wire and retained-effect
+//! adapters; the composition still owns profile admission and network/process
+//! lifetimes. It is not a standalone node executable or an FM.
 //! Hosting has no dependency on this crate, RA, runtime or test-host.
 #![forbid(unsafe_code)]
+pub mod control;
 pub mod local;
 use fube_hosting::{self as hosting, ipc::*};
 use fube_ra::{entity as ra, protocol};

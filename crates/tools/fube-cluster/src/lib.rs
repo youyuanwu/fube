@@ -2,7 +2,7 @@ mod fm;
 mod interlock;
 mod node;
 mod profile;
-mod wire;
+pub(crate) use fube_node::control::wire;
 
 pub use fm::Command;
 pub use profile::Result;
