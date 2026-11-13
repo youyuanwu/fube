@@ -146,6 +146,10 @@ name collisions and publish a new attempt-bound producer receipt.
 Python offline tests and Rust quality checks run independently of the producer.
 Quality covers formatting, production-only native-free library checks,
 workspace Clippy/docs and doctests. Nextest does not include doctests.
+The [external-FM runner's process tests](../crates/tools/fube-node-runner/README.md#process-binary-tests)
+run as ordinary archived Rust tests. They launch actual `fube-node` binaries
+and application children under a native fixture FM; no Docker image or container
+qualification job is required. Container deployment belongs to the user.
 The existing **Linux onebox native client** aggregate also requires successful
 archived Rust tests, Rust quality, Python tests and standalone acceptance;
 failed, skipped or cancelled checks cannot pass the final gate.

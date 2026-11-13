@@ -6,10 +6,9 @@ reliability exchanges. The execution profile is one fresh volatile partition,
 three original Nodes, immutable target/minimum **3/2**, and one initial
 unchanged-Primary admission.
 
-This is experimental. Native-free tests exercise three separate Node processes,
+This is experimental. Native-free tests exercise three separate Node binaries,
 real runtime/replicator construction, copy/build, application replication,
-configuration replay and owned shutdown. Separate container/network-namespace
-qualification is still pending. No native FM/Federation interoperability,
+lost-reply replay and owned shutdown. No native FM/Federation interoperability,
 failover, replacement, reconnect, resize or restart recovery is claimed.
 The [process integration tests](tests/standalone.rs) also lose the original FM
 Channel, verify continuing acknowledged writes on the same Primary, and require
@@ -32,6 +31,34 @@ The user supplies a trusted minimal ExeHost package supported by
 volatile stateful default sizes 3/2. Existing local package profiles retain their
 1/1 checks. Hosting still owns actual process/registration/usage/lease cleanup;
 running inside an OCI container does not enable native SF container activation.
+
+### Process-binary tests
+
+The crate-local integration tests launch three actual `fube-node` processes
+with separate run directories and concrete loopback-alias IPs. A native fixture
+FM selects the middle Node as Primary and drives the real application children
+through bootstrap, copy/build, 3/2 admission, acknowledged writes/readback,
+lost-reply replay, refusal and owned shutdown.
+
+```sh
+cargo build --locked --workspace --bins --examples --all-features
+cargo nextest run --locked --workspace --all-targets --all-features \
+  --test-threads 1 --no-fail-fast -E 'package(fube-node-runner)'
+```
+
+These are ordinary non-ignored Rust tests, included in archived workspace CI.
+They require no Docker daemon, image build, native Service Fabric or onebox.
+Build the executables before testing; archived runs use their bundled binaries.
+Set `FUBE_CLUSTER_TEST_ROOT` to an existing absolute directory to choose where
+fixtures live. Successful fixtures are removed; failed status/log evidence is
+retained.
+
+The delivered component is the standalone process binary and its native FM
+contract. Container images, networking and orchestration belong to the user;
+they are not a separate fube test tier. If deployed in a container, use a
+container init so the runner is not the PID-1 namespace reaper, provide writable
+run-directory storage, and disable automatic restart. Process-level tests do
+not claim container-environment qualification or recovery.
 
 ## Configuration
 
