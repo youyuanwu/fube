@@ -1,4 +1,5 @@
-use crate::profile::{err, Result, LIMIT};
+//! Native FM/RA and RA/RA channel policy, bounded decode and exact source binding.
+use super::{err, Result, MAX_BODY_BYTES as LIMIT};
 use fube_ra::protocol::{
     GenerationHeader, NodeInstance, FM_ACTOR, GENERATION_HEADER, RA_ACTOR, RS_ACTOR,
 };
@@ -432,7 +433,7 @@ impl Link {
             *current = generation.clone();
         }
     }
-    // Only the launch owner constructs a Link, from its original one-use
+    // Only the composition owner constructs a Link, from its original one-use
     // admitted Channel. Deployment/session binding is local capability state,
     // not a fabricated universal native header or a reconnect credential.
     pub fn new(

@@ -529,8 +529,9 @@ async fn legitimate_empty_initial_sync_is_acked_without_an_application_event() {
 }
 
 #[tokio::test]
-async fn notification_endpoint_rejects_nonloopback_and_zero_port_without_dialing() {
-    for endpoint in ["192.0.2.1:19000", "127.0.0.1:0"] {
+async fn notification_endpoint_accepts_nonloopback_but_rejects_invalid_endpoints_without_dialing() {
+    ServiceNotificationClient::endpoint_clear("192.0.2.1:19000".parse().unwrap()).unwrap();
+    for endpoint in ["0.0.0.0:19000", "224.0.0.1:19000", "127.0.0.1:0"] {
         assert!(matches!(
             ServiceNotificationClient::endpoint_clear(endpoint.parse().unwrap()),
             Err(Error::InvalidInput(_))

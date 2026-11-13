@@ -362,6 +362,7 @@ impl Engine {
         partition: std::sync::Arc<dyn fube_core::IStatefulServicePartition>,
         actor: Actor,
         address: &str,
+        advertised_ip: Option<std::net::IpAddr>,
         provider: Arc<dyn IStateProvider>,
         replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         settings: Settings,
@@ -373,6 +374,7 @@ impl Engine {
         Self::bind_integrated(
             actor,
             address,
+            advertised_ip,
             provider,
             replay,
             settings,
@@ -433,6 +435,7 @@ impl Engine {
         Self::bind_integrated(
             actor,
             address,
+            None,
             provider,
             replay,
             settings,
@@ -447,6 +450,7 @@ impl Engine {
     fn bind_integrated(
         actor: Actor,
         address: &str,
+        advertised_ip: Option<std::net::IpAddr>,
         provider: Arc<dyn IStateProvider>,
         replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         settings: Settings,
@@ -540,7 +544,8 @@ impl Engine {
             })
             .transpose()?;
         let partition_publication = partition.as_ref().map(|partition| partition.publication());
-        let (transport, incoming) = PeerTransport::bind(address, settings.clone())?;
+        let (transport, incoming) =
+            PeerTransport::bind_with_advertised_ip(address, advertised_ip, settings.clone())?;
         let endpoint = Endpoint {
             actor,
             address: transport.address().to_owned(),

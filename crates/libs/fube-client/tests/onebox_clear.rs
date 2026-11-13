@@ -443,7 +443,7 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     fn probe_reply(_: &Message, _: &Properties) -> fube_transport::Result<()> {
         Ok(())
     }
-    let probe = Endpoint::unsecured_loopback(
+    let probe = Endpoint::unsecured_tcp(
         config.gateway.parse().unwrap(),
         ChannelComposition {
             outbound: probe_outbound,

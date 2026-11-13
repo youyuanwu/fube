@@ -51,7 +51,7 @@ fn upload_limits() -> ChannelLimits {
 }
 
 /// Native `fabric:ImageStore` v1.2 uploader for explicitly unsecured development
-/// numeric loopback gateways with a nonzero port. Owns a dedicated upload
+/// numeric TCP gateways with a nonzero port. Owns a dedicated upload
 /// GatewayChannel; no authentication, reconnect or protocol fallback.
 pub struct ImageStoreClient {
     channel: Channel,
@@ -91,7 +91,7 @@ impl ImageStoreClient {
     /// uploader keeps a dedicated connection and one private serial inbox.
     pub fn endpoint_clear(address: SocketAddr) -> Result<Endpoint> {
         Ok(
-            Endpoint::unsecured_loopback(address, crate::channel_adapter::upload()?)?
+            Endpoint::unsecured_tcp(address, crate::channel_adapter::upload()?)?
                 .channel_limits(upload_limits()),
         )
     }

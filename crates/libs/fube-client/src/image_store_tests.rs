@@ -177,7 +177,7 @@ async fn local_composition_preserves_inbox_policy_and_terminal_provenance() {
     assert!(matches!(channel.terminal_error(), Some(Error::Timeout)));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = Endpoint::unsecured_loopback(
+    let endpoint = Endpoint::unsecured_tcp(
         listener.local_addr().unwrap(),
         crate::channel_adapter::notifications().unwrap(),
     )
@@ -388,13 +388,11 @@ fn semantic_ack_decoder_preserves_full_legacy_invalid_matrix_and_remote_codes() 
 }
 
 #[tokio::test]
-async fn upload_endpoint_profile_rejects_nonloopback_zero_port_and_hostname() {
-    for address in [
-        "192.0.2.1:19000",
-        "[2001:db8::1]:19000",
-        "127.0.0.1:0",
-        "[::1]:0",
-    ] {
+async fn upload_endpoint_accepts_nonloopback_but_rejects_invalid_endpoints_and_hostname() {
+    for address in ["192.0.2.1:19000", "[2001:db8::1]:19000"] {
+        ImageStoreClient::endpoint_clear(address.parse().unwrap()).unwrap();
+    }
+    for address in ["0.0.0.0:19000", "224.0.0.1:19000", "127.0.0.1:0", "[::1]:0"] {
         assert!(matches!(
             ImageStoreClient::endpoint_clear(address.parse().unwrap()),
             Err(Error::InvalidInput(_))
@@ -500,7 +498,7 @@ async fn cancelled_upload_retires_only_its_owned_socket_not_query_or_notificatio
             .unwrap();
             peer
         });
-        let channel = Endpoint::unsecured_loopback(
+        let channel = Endpoint::unsecured_tcp(
             endpoint,
             if notifications {
                 crate::channel_adapter::notifications().unwrap()

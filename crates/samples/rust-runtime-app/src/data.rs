@@ -765,6 +765,7 @@ impl IStatefulServiceReplica for Service {
                 Some(provider.clone()),
                 ReplicationEndpointOptions {
                     listen_address: address.to_string(),
+                    advertised_ip: None,
                     actor_incarnation: self.incarnation,
                 },
                 Settings::default(),

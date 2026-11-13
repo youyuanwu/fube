@@ -10,7 +10,9 @@ constructors are removed, without deprecated wrappers or compatibility aliases.
 | `FabricClient::connect_clear(address, timeout)` | `FabricClient::endpoint_clear(address)` -> Endpoint connect -> `FabricClient::new(channel, ClientOptions)` |
 | `ImageStoreClient::connect_clear(address, timeout)` | `ImageStoreClient::endpoint_clear(address)` -> Endpoint connect -> `ImageStoreClient::new(channel, ImageStoreClientOptions)` |
 | `ServiceNotificationClient::connect_clear(address, timeout)` | `ServiceNotificationClient::endpoint_clear(address)` -> Endpoint connect -> async `ServiceNotificationClient::start(channel, NotificationClientOptions)` |
-| `Channel::connect_unsecured_loopback(address, composition, limits, deadline)` | `Endpoint::unsecured_loopback(address, composition)?.channel_limits(limits).connect_until(deadline)` |
+| `Channel::connect_unsecured_loopback(address, composition, limits, deadline)` | `Endpoint::unsecured_tcp(address, composition)?.channel_limits(limits).connect_until(deadline)` |
+| `Endpoint::unsecured_loopback(address, composition)` | `Endpoint::unsecured_tcp(address, composition)`; general TCP now accepts non-loopback unicast addresses. |
+| `fube_transport::accept_unsecured_loopback(stream, composition, limits, deadline)` | `fube_transport::accept_unsecured_tcp(stream, composition, limits, deadline)`; local runtime IPC keeps its separate loopback-only constructors. |
 
 `Endpoint::connect_timeout` governs dialing; client options govern subsequent
 operations, and notification options separately govern real native startup.
@@ -23,6 +25,13 @@ Protocol-specific endpoint factories still install immutable authorization.
 Client construction cannot upgrade permissions. Dedicated notification/upload
 inboxes, clone ownership and cancellation/retirement semantics are unchanged.
 IPC's separate session setup and replication's raw-session API are unaffected.
+
+Public `ReplicationEndpointOptions` literals must set `advertised_ip`: use
+`None` for an existing concrete listener, or `Some(ip)` for the concrete IP to
+publish from a wildcard listener. The actual bound port is retained; there is
+no NAT/port translation. Hosting's local `NodeContext` now also requires an
+explicit `ip`, propagated through native node metadata and application
+environment without changing the container-local IPC address.
 
 ## Breaking runtime and data API migration
 

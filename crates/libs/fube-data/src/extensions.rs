@@ -85,6 +85,9 @@ impl OperationOriginStream for crate::api::OperationStream {
 #[derive(Clone, Debug)]
 pub struct ReplicationEndpointOptions {
     pub listen_address: String,
+    /// Advertised listener IP; the actual bound port is preserved. Required for
+    /// wildcard listeners. None publishes a concrete bound address unchanged.
+    pub advertised_ip: Option<std::net::IpAddr>,
     pub actor_incarnation: uuid::Uuid,
 }
 

@@ -5,25 +5,25 @@
 `fube_transport::native_channel` implements the existing
 [`MessageChannel`, `RpcChannel`, `MessageReceiver` and consuming `ReplyContext`
 contracts](../../crates/libs/fube-transport/src/channel.rs) for one dedicated
-**explicitly unsecured-development, numeric-loopback connection**, composed for
+**plain-TCP connection to a numeric endpoint**, composed for
 NamingGateway clients or activated-host IPC.
 This is native Fabric TCP messaging, not `IFabricTransport`, UDP, actor36,
 a typed client, router or adapter around `Connection`.
 
 `Endpoint::connect()` or `Endpoint::connect_until(deadline)` establishes TCP and
 the clear ListenInstance exchange inside one absolute deadline. Endpoint setup
-rejects non-loopback/zero-port addresses; connection setup rejects invalid
-limits. Clear loopback assumes trusted local peers; it does not authenticate
-hostile local processes and does not qualify secure production clusters.
-Existing permissions, security controls and concrete connection roles are not
-disabled or widened.
+rejects unspecified, multicast and zero-port destinations; connection setup
+rejects invalid limits. General TCP supports both loopback and non-loopback
+addresses without a security opt-in. It is unencrypted and unauthenticated;
+TLS is not supplied. Protocol authorization, concrete connection roles and
+local IPC validation remain unchanged.
 
 ### Endpoint, Channel and adapters
 
 `fube_transport::{Endpoint, Channel, ChannelLimits}` exposes the existing backend:
 `Channel` and `native_channel::GatewayChannel` are the **same implementation**,
-not two transports. `Endpoint::unsecured_loopback(address, composition)` requires
-explicit trusted authorization. Adapter factories such as
+not two transports. `Endpoint::unsecured_tcp(address, composition)` requires
+explicit protocol composition. Adapter factories such as
 `FabricClient::endpoint_clear` and `ImageStoreClient::endpoint_clear` choose that
 policy outside core; there is no default business profile or profile query.
 Construction, setters and bounded configuration clones perform no I/O. The
@@ -66,7 +66,7 @@ staged reader, fenced frame writer and joined I/O lifetime. Raw sessions support
 initiating sockets (zero ListenInstance nonce) and accepted sockets (fresh
 listen-side nonce). One absolute establishment budget includes connect and both
 hello directions. This does **not** make `GatewayChannel` an arbitrary peer
-server: its numeric-loopback and composition checks remain in force.
+server: its composition and domain-admission checks remain in force.
 
 The raw reader validates fixed lengths before allocation, then offers a bounded
 header-stage admission/drain decision before body allocation. Idle waiting has

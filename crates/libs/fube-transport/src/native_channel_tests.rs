@@ -23,6 +23,15 @@ enum GatewayProfile {
     Upload,
 }
 
+fn non_loopback_ip() -> std::net::IpAddr {
+    let route = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    // UDP connect selects a local route without transmitting a packet.
+    route.connect("192.0.2.1:9").unwrap();
+    let ip = route.local_addr().unwrap().ip();
+    assert!(!ip.is_loopback() && !ip.is_unspecified());
+    ip
+}
+
 fn fixture_reply(_: &Message, props: &Properties) -> Result<()> {
     if matches!(props.actor, 25 | 27) {
         return Err(Error::Protocol("fixture ACK cannot complete RPC"));
@@ -1896,15 +1905,22 @@ async fn complete_write_after_deadline_is_timeout_and_late_reply_never_becomes_s
 }
 
 #[tokio::test]
-async fn connection_establishment_enforces_profile_and_rejects_oversized_frame_before_tail() {
+async fn connection_establishment_rejects_invalid_endpoints_and_oversized_frame_before_tail() {
     use tokio::net::TcpListener;
-    assert!(matches!(
-        crate::Endpoint::unsecured_loopback(
-            "192.0.2.1:19000".parse().unwrap(),
-            fixture_composition(GatewayProfile::Ordinary),
-        ),
-        Err(Error::InvalidInput(_))
-    ));
+    for address in [
+        "0.0.0.0:19000",
+        "224.0.0.1:19000",
+        "127.0.0.1:0",
+        "[::]:19000",
+    ] {
+        assert!(matches!(
+            crate::Endpoint::unsecured_tcp(
+                address.parse().unwrap(),
+                fixture_composition(GatewayProfile::Ordinary),
+            ),
+            Err(Error::InvalidInput(_))
+        ));
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -1937,15 +1953,13 @@ async fn connection_establishment_enforces_profile_and_rejects_oversized_frame_b
         let mut eof = [0; 1];
         assert_eq!(stream.read(&mut eof).await.unwrap(), 0);
     });
-    let channel = crate::Endpoint::unsecured_loopback(
-        endpoint,
-        fixture_composition(GatewayProfile::Ordinary),
-    )
-    .unwrap()
-    .channel_limits(limits())
-    .connect_until(deadline())
-    .await
-    .unwrap();
+    let channel =
+        crate::Endpoint::unsecured_tcp(endpoint, fixture_composition(GatewayProfile::Ordinary))
+            .unwrap()
+            .channel_limits(limits())
+            .connect_until(deadline())
+            .await
+            .unwrap();
     assert_eq!(channel.remote_instance().instance, 33);
     until(|| channel.terminal_error().is_some()).await;
     assert!(matches!(

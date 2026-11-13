@@ -1,6 +1,10 @@
 //! Reusable native connection configuration, without live session state.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::time::Instant;
 
@@ -11,7 +15,7 @@ use crate::{
     Channel, ChannelLimits, Error, Result,
 };
 
-/// Explicitly trusted clear-loopback dial settings and immutable authorization.
+/// Plain-TCP dial settings and immutable protocol authorization.
 ///
 /// Construction, setters and cloning do no I/O. Each [`Self::connect`] creates a
 /// fresh owner, target, ID history and driver; cloning a [`Channel`] instead
@@ -20,32 +24,42 @@ use crate::{
 #[derive(Clone)]
 pub struct Endpoint {
     address: SocketAddr,
+    local_ip: Option<IpAddr>,
     timeout: Duration,
     limits: ChannelLimits,
     composition: ChannelComposition,
 }
 
+pub(crate) fn validate_tcp_endpoint(address: SocketAddr) -> Result<()> {
+    if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+        return Err(Error::InvalidInput(
+            "TCP endpoint requires a unicast address and nonzero port",
+        ));
+    }
+    Ok(())
+}
+
 impl Endpoint {
-    /// Configure an explicit numeric nonzero-port loopback endpoint.
+    /// Configure an explicit numeric unicast endpoint with a nonzero port.
     ///
     /// No permissive policy is supplied: adapters choose their composition.
     /// The default connection budget is 30 seconds, independent of the
     /// started-frame watchdog and any typed client's operation defaults.
-    pub fn unsecured_loopback(
-        address: SocketAddr,
-        composition: ChannelComposition,
-    ) -> Result<Self> {
-        if !address.ip().is_loopback() || address.port() == 0 {
-            return Err(Error::InvalidInput(
-                "unsecured gateway requires explicit loopback endpoint",
-            ));
-        }
+    pub fn unsecured_tcp(address: SocketAddr, composition: ChannelComposition) -> Result<Self> {
+        validate_tcp_endpoint(address)?;
         Ok(Self {
             address,
+            local_ip: None,
             timeout: Duration::from_secs(30),
             limits: ChannelLimits::default(),
             composition,
         })
+    }
+
+    /// Select the actual outgoing interface, retaining an ephemeral source port.
+    pub fn local_ip(mut self, address: IpAddr) -> Self {
+        self.local_ip = Some(address);
+        self
     }
 
     /// Set the whole-establishment budget; validated before dialing.
@@ -81,6 +95,7 @@ impl Endpoint {
     ) -> Result<Channel> {
         let channel = Channel::connect_with_envelope(
             self.address,
+            self.local_ip,
             self.composition.clone(),
             self.limits,
             deadline,

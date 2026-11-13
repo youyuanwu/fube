@@ -217,6 +217,7 @@ impl IStatefulServiceReplica for ModelReplica {
                 Some(self.replay.clone()),
                 ReplicationEndpointOptions {
                     listen_address: "127.0.0.1:0".into(),
+                    advertised_ip: None,
                     actor_incarnation: Uuid::new_v4(),
                 },
                 Settings::default(),

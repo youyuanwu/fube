@@ -3,889 +3,27 @@ use crate::{
     wire::{self, Link},
 };
 use fube_hosting::local::{Activation, NodeContext, Options};
-use fube_node::local::{FmWork, LocalDisposition, Node};
+#[cfg(test)]
+use fube_node::control::{ticks, Escrow};
+use fube_node::{
+    control::{peer_target, Adapter, LfumUploadState, SemanticAck},
+    local::{FmWork, Node},
+};
 use fube_ra::{entity as ra, protocol::*};
 use fube_ra_store::{MemoryBackend, Settings, Store};
-use std::{
-    collections::VecDeque, fs, future::Future, path::Path, pin::Pin, sync::Arc, time::Duration,
-};
+use std::{fs, path::Path, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::TcpListener,
     time::Instant,
 };
 
-struct Escrow {
-    original: ra::Dispatched,
-    due: Instant,
-    submitted: Option<u64>,
-    sent: bool,
-}
-#[derive(Default)]
-struct Adapter {
-    status_due: Option<Instant>,
-    status_last_start: Option<Instant>,
-    status_requested: bool,
-    status_cleanup_due: Option<Instant>,
-    status_cleanup_command: Option<u64>,
-    status_capture: Option<u64>,
-    escrow: VecDeque<Escrow>,
-    replies: VecDeque<ra::Dispatched>,
-    peer_replies: VecDeque<ra::Dispatched>,
-    peer_last_reply: Option<CreateReplicaReply>,
-    peer_error: Option<String>,
-    peer_command_error: Option<String>,
-    peer_commands: Vec<u64>,
-    error: Option<String>,
-    notification_pending: Option<ServiceTypeNotification>,
-    report_pending: Option<ReplicaUp>,
-    acknowledgements: Vec<(u64, SemanticAck)>,
-    rejected_change_configuration_reply: Option<FailoverUnitReply>,
-}
-enum SemanticAck {
-    Notification(ServiceTypeNotification),
-    Report(ReplicaUp),
-}
 struct PeerConnection {
     link: Option<Link>,
     incoming: Option<
         fube_transport::channel::IncomingMessage<fube_transport::native_channel::GatewayTarget>,
     >,
     dialed: bool,
-}
-
-type UploadRequest =
-    Pin<Box<dyn Future<Output = Result<Option<fube_transport::message::Message>>> + Send>>;
-
-struct LfumUploadState {
-    request: Option<UploadRequest>,
-    body: Option<LfumUpload>,
-    retry_at: Instant,
-}
-
-impl Default for LfumUploadState {
-    fn default() -> Self {
-        Self {
-            request: None,
-            body: None,
-            retry_at: Instant::now(),
-        }
-    }
-}
-
-impl LfumUploadState {
-    fn complete(
-        &mut self,
-        node: &Node,
-        source: &NodeInstance,
-        reply: Result<Option<fube_transport::message::Message>>,
-        now: Instant,
-    ) -> Result<()> {
-        self.request = None;
-        self.retry_at = now
-            + ticks(
-                node.native_config()
-                    .node(ra::NodeProperty::LfumUploadRetryIntervalTicks)
-                    .max(1),
-            );
-        if let Some(message) = reply? {
-            wire::predecode(&message)?;
-            let generation = decode_lfum_upload_reply(&message).map_err(err)?;
-            if node
-                .process_lfum_upload_reply(source, &generation)
-                .map_err(err)?
-            {
-                self.body = None;
-            }
-        }
-        Ok(())
-    }
-
-    fn advance(
-        &mut self,
-        node: &Node,
-        description: &NodeDescription,
-        link: Option<&Link>,
-        now: Instant,
-    ) -> Result<()> {
-        let generations = node.generation_state();
-        if self.request.is_none()
-            && self
-                .body
-                .as_ref()
-                .is_some_and(|body| body.generation != generations.receive)
-        {
-            self.body = None;
-            self.retry_at = now;
-        }
-        if generations.upload_pending && self.body.is_none() && self.request.is_none() {
-            self.retry_at = now;
-        }
-        let Some(link) = link else { return Ok(()) };
-        if !generations.upload_pending || self.request.is_some() || now < self.retry_at {
-            return Ok(());
-        }
-        let Some(inventory) = node.lfum_inventory().map_err(err)? else {
-            return Ok(());
-        };
-        let body = self.body.get_or_insert_with(|| LfumUpload {
-            generation: inventory.generation,
-            node: description.clone(),
-            units: inventory.units,
-            any_replica_found: inventory.any_replica_found,
-        });
-        let request = lfum_upload_message(body).map_err(err)?;
-        let link = link.clone();
-        self.request = Some(Box::pin(
-            async move { link.request_optional(request).await },
-        ));
-        Ok(())
-    }
-}
-
-fn peer_target(effect: &ra::Effect) -> Option<&NodeInstance> {
-    match effect {
-        ra::Effect::PeerCreateReplica { target, .. }
-        | ra::Effect::PeerCreateReplicaReply { target, .. }
-        | ra::Effect::PeerActivate { target, .. }
-        | ra::Effect::PeerActivateReply { target, .. }
-        | ra::Effect::PeerDeactivate { target, .. }
-        | ra::Effect::PeerDeactivateReply { target, .. }
-        | ra::Effect::PeerContinueSwap { target, .. }
-        | ra::Effect::PeerGetLsn { target, .. }
-        | ra::Effect::PeerGetLsnReply { target, .. } => Some(target),
-        _ => None,
-    }
-}
-const REPORT_RETRY: Duration = Duration::from_secs(15);
-const STATEFUL_REPORT_RETRY: Duration = Duration::from_secs(30);
-
-fn report_retry(node: &Node, entity: ra::EntityId) -> Duration {
-    if node
-        .snapshot(entity)
-        .committed
-        .is_some_and(|state| state.fm_primary || state.peer_terminal_report())
-    {
-        STATEFUL_REPORT_RETRY
-    } else {
-        REPORT_RETRY
-    }
-}
-
-fn report_cleared(node: &Node, entity: ra::EntityId) -> bool {
-    let snapshot = node.snapshot(entity);
-    !snapshot.fenced
-        && snapshot
-            .committed
-            .is_some_and(|state| state.fm_stage == ra::FmStage::None || state.local_deleted)
-}
-
-fn current_report(node: &Node, entity: ra::EntityId, body: &ReplicaUp) -> bool {
-    let snapshot = node.snapshot(entity);
-    if snapshot.fenced {
-        return false;
-    }
-    let Some(state) = snapshot.committed else {
-        return false;
-    };
-    if state.fm_stage == ra::FmStage::None || state.local_deleted {
-        return false;
-    }
-    let Some(info) = body.dropped.0.first().or_else(|| body.replicas.0.first()) else {
-        return false;
-    };
-    info.unit == state.body.unit
-        && info.service == state.body.service
-        && info.replicas.0.len() == 1
-        && info.replicas.0[0].description.node == state.body.replica.node
-        && info.replicas.0[0].description.id == state.body.replica.id
-        && info.replicas.0[0].description.instance == state.body.replica.instance
-}
-
-fn ticks(ticks: i64) -> Duration {
-    Duration::from_nanos((ticks.max(0) as u64).saturating_mul(100))
-}
-impl Adapter {
-    fn reject_deprecated(
-        &mut self,
-        node: &Node,
-        message: &fube_transport::message::Message,
-    ) -> Result<bool> {
-        if message.properties().map_err(err)?.action != "ChangeConfigurationReply" {
-            return Ok(false);
-        }
-        wire::predecode(message)?;
-        let (body, generation) = decode_change_configuration_reply(message).map_err(err)?;
-        if generation.for_fm_replica || generation.number != node.generation_state().receive {
-            return Err("deprecated reply has a foreign FM generation".into());
-        }
-        if self.rejected_change_configuration_reply.as_ref() != Some(&body) {
-            eprintln!("rejected deprecated native action ChangeConfigurationReply");
-            self.rejected_change_configuration_reply = Some(body);
-        }
-        Ok(true)
-    }
-
-    fn capture(&mut self, node: &mut Node) {
-        for dispatch in node.take_external_up_to(32 - self.escrow.len()) {
-            if matches!(dispatch.effect, ra::Effect::RequestReportRetry)
-                && self.escrow.iter().any(|item| {
-                    item.original.entity == dispatch.entity
-                        && matches!(item.original.effect, ra::Effect::RequestReportRetry)
-                })
-            {
-                continue; // The retained current-stage owner also owns this retry request.
-            }
-            let delay = match &dispatch.effect {
-                ra::Effect::RequestServiceTypeWork { after_ticks, .. }
-                | ra::Effect::ArmServiceTypeRetry { after_ticks, .. }
-                | ra::Effect::ArmNodeDeactivationCheck { after_ticks, .. } => ticks(*after_ticks),
-                ra::Effect::RequestReportRetry
-                    if node
-                        .snapshot(dispatch.entity)
-                        .committed
-                        .is_some_and(|s| s.fm_primary || s.peer_terminal_report()) =>
-                {
-                    Duration::ZERO
-                }
-                ra::Effect::RequestReportRetry => REPORT_RETRY,
-                _ => Duration::ZERO,
-            };
-            self.escrow.push_back(Escrow {
-                original: dispatch,
-                due: Instant::now() + delay,
-                submitted: None,
-                sent: false,
-            });
-        }
-        // Receipt capacity is separate from original external-effect escrow.
-        // Never transfer a whole receipt batch unless all 32 slots are free.
-        if self.replies.is_empty() && self.peer_replies.is_empty() {
-            for receipt in node.take_effect_receipts() {
-                if matches!(receipt.disposition, LocalDisposition::LocalResponse)
-                    && matches!(
-                        receipt.dispatch.effect,
-                        ra::Effect::PeerCreateReplica { .. }
-                            | ra::Effect::PeerCreateReplicaReply { .. }
-                            | ra::Effect::PeerActivate { .. }
-                            | ra::Effect::PeerActivateReply { .. }
-                            | ra::Effect::PeerDeactivate { .. }
-                            | ra::Effect::PeerDeactivateReply { .. }
-                            | ra::Effect::PeerContinueSwap { .. }
-                            | ra::Effect::PeerGetLsn { .. }
-                            | ra::Effect::PeerGetLsnReply { .. }
-                    )
-                {
-                    if let ra::Effect::PeerCreateReplicaReply { body, .. } =
-                        &receipt.dispatch.effect
-                    {
-                        self.peer_last_reply = Some((**body).clone());
-                    }
-                    self.peer_replies.push_back(receipt.dispatch);
-                    continue;
-                }
-                if matches!(receipt.disposition, LocalDisposition::LocalResponse)
-                    && matches!(
-                        receipt.dispatch.effect,
-                        ra::Effect::NodeActivateReply(_)
-                            | ra::Effect::ChangeConfiguration(_)
-                            | ra::Effect::DoReconfigurationReply(_)
-                            | ra::Effect::ReplicaEndpointUpdated(_)
-                            | ra::Effect::NodeDeactivateReply(_)
-                            | ra::Effect::NodeUpdateServiceReply(_)
-                            | ra::Effect::Reply(_)
-                            | ra::Effect::PrimaryReply(_)
-                            | ra::Effect::AddReplicaReply(_)
-                            | ra::Effect::RemoveReplicaReply(_)
-                            | ra::Effect::RemoveReply(_)
-                            | ra::Effect::DeleteReplicaReply(_)
-                    )
-                {
-                    self.replies.push_back(receipt.dispatch);
-                }
-            }
-        }
-    }
-    fn commands(&mut self, node: &mut Node) -> Result<()> {
-        for receipt in node.take_command_receipts() {
-            if let Some(index) = self.peer_commands.iter().position(|id| *id == receipt.id) {
-                self.peer_commands.remove(index);
-                if let Err(error) = receipt.result {
-                    self.peer_command_error = Some(err(error));
-                }
-                continue;
-            }
-            let disposition = receipt.result.map_err(err)?;
-            if self.status_capture == Some(receipt.id) {
-                self.status_capture = None;
-                self.status_last_start = Some(Instant::now());
-            }
-            if self.status_cleanup_command == Some(receipt.id) {
-                self.status_cleanup_command = None;
-            }
-            if let Some(index) = self
-                .acknowledgements
-                .iter()
-                .position(|(id, _)| *id == receipt.id)
-            {
-                let (_, acknowledgement) = self.acknowledgements.remove(index);
-                if disposition == ra::Disposition::Applied {
-                    match acknowledgement {
-                        SemanticAck::Notification(body) => {
-                            if let Some(pending) = &mut self.notification_pending {
-                                pending.infos.0.retain(|info| !body.infos.0.contains(info));
-                                if pending.infos.0.is_empty() {
-                                    self.notification_pending = None;
-                                }
-                            }
-                        }
-                        SemanticAck::Report(body) => {
-                            if self.report_pending.as_ref().is_some_and(|pending| {
-                                let sent = pending.dropped.0.first().or_else(|| pending.replicas.0.first());
-                                let ack = body.dropped.0.first().or_else(|| body.replicas.0.first());
-                                matches!((sent, ack), (Some(sent), Some(ack)) if sent.unit.id == ack.unit.id)
-                            }) && body
-                                    .dropped
-                                    .0
-                                    .first()
-                                    .or_else(|| body.replicas.0.first())
-                                    .is_some_and(|info| report_cleared(node, info.unit.id.guid.0))
-                            {
-                                self.report_pending = None;
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(index) = self
-                .escrow
-                .iter()
-                .position(|item| item.submitted == Some(receipt.id))
-            {
-                let item = &mut self.escrow[index];
-                if matches!(item.original.effect, ra::Effect::RequestReportRetry) {
-                    if disposition == ra::Disposition::Applied {
-                        // Keep this pass in flight until its report dispatch is
-                        // sent or superseded; the receipt is not a semantic ACK.
-                        item.sent = true;
-                    } else {
-                        item.submitted = None;
-                        item.due = Instant::now() + report_retry(node, item.original.entity);
-                    }
-                } else {
-                    self.escrow.remove(index);
-                }
-            }
-        }
-        Ok(())
-    }
-    fn finish_report_pass(&mut self, entity: ra::EntityId, delay: Duration) {
-        if let Some(item) = self.escrow.iter_mut().find(|item| {
-            item.original.entity == entity
-                && matches!(item.original.effect, ra::Effect::RequestReportRetry)
-        }) {
-            item.submitted = None;
-            item.sent = false;
-            item.due = Instant::now() + delay;
-        }
-    }
-    fn retire_reports(&mut self, node: &Node) {
-        self.escrow.retain(|item| {
-            !matches!(item.original.effect, ra::Effect::RequestReportRetry)
-                || (item.submitted.is_some() && !item.sent)
-                || !report_cleared(node, item.original.entity)
-        });
-        if self.report_pending.as_ref().is_some_and(|body| {
-            body.dropped
-                .0
-                .first()
-                .or_else(|| body.replicas.0.first())
-                .is_some_and(|info| report_cleared(node, info.unit.id.guid.0))
-        }) {
-            self.report_pending = None;
-        }
-    }
-    async fn advance(&mut self, node: &mut Node, link: Option<&Link>) -> Result<()> {
-        self.advance_with_peer(node, link, None, None).await
-    }
-    async fn advance_with_peer(
-        &mut self,
-        node: &mut Node,
-        link: Option<&Link>,
-        peer_link: Option<&Link>,
-        peer: Option<&Peer>,
-    ) -> Result<()> {
-        self.capture(node);
-        self.commands(node)?;
-        if let (Some(link), Some(peer), Some(reply)) = (peer_link, peer, self.peer_replies.front())
-        {
-            let swap_unit = match &reply.effect {
-                ra::Effect::PeerContinueSwap { body, .. } => Some(&body.configuration.unit),
-                ra::Effect::PeerGetLsn { body, .. } => Some(&body.unit),
-                ra::Effect::PeerGetLsnReply { body, .. } => Some(&body.replica.unit),
-                _ => None,
-            };
-            if let Some(unit) = swap_unit {
-                let snapshot = node.snapshot(reply.entity);
-                if snapshot.fenced
-                    || snapshot.committed.is_none_or(|s| {
-                        s.phase != ra::Phase::Ready
-                            || (s.swap.is_none() && s.progress_query.is_none())
-                            || s.body.unit.current != unit.current
-                    })
-                {
-                    self.peer_replies.pop_front();
-                    return Ok(());
-                }
-            }
-            if let ra::Effect::PeerDeactivateReply { body, .. } = &reply.effect {
-                let snapshot = node.snapshot(reply.entity);
-                if snapshot.fenced
-                    || snapshot.committed.is_none_or(|state| {
-                        let survivor_ack =
-                            state.phase == ra::Phase::Ready
-                                && (state.reconfiguration.as_ref().is_some_and(|c| {
-                                    c.stage == ra::ConfigurationStage::Deactivated
-                                }) || state.swap.as_ref().is_some_and(|s| {
-                                    s.failover && s.stage == ra::SwapStage::Deactivated
-                                }));
-                        (!survivor_ack && state.phase != ra::Phase::Closed)
-                            || state.body.unit != body.unit
-                            || state.body.replica.id != body.replica.id
-                            || state.body.replica.instance != body.replica.instance
-                            || (!survivor_ack
-                                && state
-                                    .peer_creation
-                                    .as_ref()
-                                    .is_none_or(|p| !p.close_completed || p.host_down))
-                    })
-                {
-                    self.peer_replies.pop_front();
-                    return Ok(());
-                }
-            }
-            if let ra::Effect::PeerActivateReply { body, .. } = &reply.effect {
-                let snapshot = node.snapshot(reply.entity);
-                if snapshot.fenced
-                    || snapshot.committed.is_none_or(|state| {
-                        state.phase != ra::Phase::Ready
-                            || state.body.unit != body.unit
-                            || state.body.replica != body.replica
-                            || if state
-                                .reconfiguration
-                                .as_ref()
-                                .is_some_and(|c| c.request.unit.current == body.unit.current)
-                            {
-                                state.reconfiguration.as_ref().is_none_or(|config| {
-                                    config.stage != ra::ConfigurationStage::Complete
-                                })
-                            } else {
-                                state
-                                    .swap
-                                    .as_ref()
-                                    .is_none_or(|swap| swap.stage != ra::SwapStage::Complete)
-                            }
-                    })
-                {
-                    self.peer_replies.pop_front();
-                    return Ok(());
-                }
-            }
-            let sent = async {
-                let message = match &reply.effect {
-                    ra::Effect::PeerCreateReplica { target, body } if target == &peer.node => {
-                        create_replica_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerCreateReplicaReply { target, body } if target == &peer.node => {
-                        create_replica_reply_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerActivate { target, body } if target == &peer.node => {
-                        activate_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerActivateReply { target, body } if target == &peer.node => {
-                        activate_reply_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerDeactivate { target, body } if target == &peer.node => {
-                        deactivate_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerDeactivateReply { target, body } if target == &peer.node => {
-                        deactivate_reply_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerContinueSwap { target, body } if target == &peer.node => {
-                        do_reconfiguration_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerGetLsn { target, body } if target == &peer.node => {
-                        get_lsn_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerGetLsnReply { target, body } if target == &peer.node => {
-                        get_lsn_reply_message(body, &link.generation())
-                    }
-                    _ => return Err("peer receipt does not match the original bound peer".into()),
-                }
-                .map_err(err)?;
-                link.send(message).await
-            }
-            .await;
-            match sent {
-                Ok(()) => {
-                    self.peer_replies.pop_front();
-                }
-                Err(error) => {
-                    self.peer_error = Some(error);
-                    link.channel.dispose();
-                }
-            }
-        }
-        self.retire_reports(node);
-        self.escrow.retain(|item| {
-            !matches!(item.original.effect, ra::Effect::ArmNodeDeactivationCheck { sequence, .. }
-                if item.submitted.is_none() && node.pending_node_deactivation() != Some(sequence))
-        });
-        if !node.has_service_type_status() {
-            self.status_due = None;
-            self.status_requested = false;
-        }
-        let now = Instant::now();
-        let cleanup_interval = ticks(
-            node.native_config()
-                .node(ra::NodeProperty::StatusCleanupIntervalTicks),
-        )
-        .max(Duration::from_nanos(100));
-        let cleanup_due = self
-            .status_cleanup_due
-            .get_or_insert(now + cleanup_interval);
-        if *cleanup_due <= now && self.status_cleanup_command.is_none() {
-            self.status_cleanup_command =
-                Some(node.fm_work(FmWork::CleanupTypeStatus).map_err(err)?);
-            *cleanup_due = now + cleanup_interval;
-        }
-        let minimum = ticks(
-            node.native_config()
-                .node(ra::NodeProperty::StatusNodeIntervalTicks),
-        );
-        if (self.status_requested || self.status_due.is_some_and(|due| due <= now))
-            && self
-                .status_last_start
-                .is_none_or(|start| now >= start + minimum)
-            && self.status_capture.is_none()
-            && link.is_some()
-        {
-            self.status_capture = Some(node.fm_work(FmWork::CaptureTypeStatus).map_err(err)?);
-            self.status_requested = false;
-            self.status_due = None;
-        }
-        if let Some(link) = link {
-            if let Some(reply) = self.replies.front() {
-                if let ra::Effect::ReplicaEndpointUpdated(body) = &reply.effect {
-                    let snapshot = node.snapshot(reply.entity);
-                    if snapshot.fenced
-                        || snapshot.committed.is_none_or(|s| {
-                            s.phase != ra::Phase::Ready
-                                || s.body.as_ref() != body.as_ref()
-                                || s.body.replica.current_role != 4
-                                || s.swap.as_ref().is_none_or(|swap| !swap.endpoint_available)
-                        })
-                    {
-                        self.replies.pop_front();
-                        return Ok(());
-                    }
-                }
-                if let ra::Effect::DoReconfigurationReply(body) = &reply.effect {
-                    let snapshot = node.snapshot(reply.entity);
-                    if snapshot.fenced
-                        || snapshot.committed.is_none_or(|state| {
-                            state.phase != ra::Phase::Ready
-                                || state.body.replica.current_role != 4
-                                || state.body.unit != body.unit
-                                || if state.reconfiguration.as_ref().is_some_and(|config| {
-                                    config.request.unit.current == body.unit.current
-                                }) {
-                                    state.reconfiguration.as_ref().is_none_or(|config| {
-                                        config.stage != ra::ConfigurationStage::Complete
-                                    })
-                                } else {
-                                    state.swap.as_ref().is_none_or(|swap| {
-                                        swap.stage != ra::SwapStage::Complete
-                                            || swap.body.unit != body.unit
-                                    })
-                                }
-                        })
-                    {
-                        self.replies.pop_front();
-                        return Ok(());
-                    }
-                    if let ra::Effect::ChangeConfiguration(body) = &reply.effect {
-                        let snapshot = node.snapshot(reply.entity);
-                        if snapshot.fenced
-                            || snapshot.committed.is_none_or(|s| {
-                                s.phase != ra::Phase::Ready
-                                    || s.swap.as_ref().is_none_or(|swap| {
-                                        swap.stage != ra::SwapStage::ChangeConfiguration
-                                            || swap.change.as_ref() != Some(body.as_ref())
-                                    })
-                            })
-                        {
-                            self.replies.pop_front();
-                            return Ok(());
-                        }
-                    }
-                }
-                if let ra::Effect::AddReplicaReply(body) | ra::Effect::RemoveReplicaReply(body) =
-                    &reply.effect
-                {
-                    let removing = matches!(reply.effect, ra::Effect::RemoveReplicaReply(_));
-                    let snapshot = node.snapshot(reply.entity);
-                    if snapshot.fenced
-                        || snapshot.committed.as_ref().is_none_or(|state| {
-                            state.phase != ra::Phase::Ready
-                                || !state.fm_primary
-                                || state
-                                    .remote_idle(&body.replica.node)
-                                    .and_then(|remote| {
-                                        if removing {
-                                            remote.remove_reply()
-                                        } else {
-                                            remote.add_reply()
-                                        }
-                                    })
-                                    .as_ref()
-                                    != Some(body)
-                        })
-                    {
-                        self.replies.pop_front();
-                        return Ok(());
-                    }
-                }
-                let message = match &reply.effect {
-                    ra::Effect::NodeActivateReply(body) => {
-                        node_activate_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::NodeDeactivateReply(body) => {
-                        node_deactivate_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::NodeUpdateServiceReply(body) => {
-                        node_update_service_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::Reply(body) => add_instance_reply_message(body, Owner::Fm),
-                    ra::Effect::DoReconfigurationReply(body) => {
-                        do_reconfiguration_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::ChangeConfiguration(body) => {
-                        change_configuration_message(body, Owner::Fm)
-                    }
-                    ra::Effect::ReplicaEndpointUpdated(body) => {
-                        replica_endpoint_updated_message(body, Owner::Fm)
-                    }
-                    ra::Effect::PrimaryReply(body) => add_primary_reply_message(body, Owner::Fm),
-                    ra::Effect::AddReplicaReply(body) => add_replica_reply_message(body, Owner::Fm),
-                    ra::Effect::RemoveReplicaReply(body) => {
-                        remove_replica_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::RemoveReply(body) => remove_instance_reply_message(body, Owner::Fm),
-                    ra::Effect::DeleteReplicaReply(body) => {
-                        delete_replica_reply_message(body, Owner::Fm)
-                    }
-                    _ => return Err("unimplemented semantic reply retained".into()),
-                }
-                .map_err(err)?;
-                link.send(message).await?;
-                self.replies.pop_front();
-            }
-        }
-        // Cancel only the exact original armed timer, never notification
-        // semantic pending state. Cancellation and work completion differ.
-        if let Some(index) = self.escrow.iter().position(|item| {
-            matches!(
-                item.original.effect,
-                ra::Effect::CancelServiceTypeRetry { .. }
-            )
-        }) {
-            let timer = match self.escrow[index].original.effect {
-                ra::Effect::CancelServiceTypeRetry { timer } => timer,
-                _ => unreachable!(),
-            };
-            self.escrow.remove(index);
-            if let Some(armed) = self.escrow.iter().position(|item|
-                matches!(item.original.effect, ra::Effect::ArmServiceTypeRetry { timer: id, .. } if id == timer)
-                && item.submitted.is_none())
-            {
-                self.escrow.remove(armed);
-            }
-        }
-        for index in 0..self.escrow.len() {
-            let item = &self.escrow[index];
-            if item.submitted.is_some() || item.due > Instant::now() {
-                continue;
-            }
-            let effect = item.original.effect.clone();
-            let sent = item.sent;
-            let entity = item.original.entity;
-            let work = match &effect {
-                ra::Effect::ServiceTypeStatusWork => {
-                    self.status_requested = true;
-                    self.escrow.remove(index);
-                    return Ok(());
-                }
-                ra::Effect::ServiceTypeStatus { enabled, body } => {
-                    let Some(link) = link else {
-                        continue;
-                    };
-                    let message = if *enabled {
-                        service_type_enabled_message(body)
-                    } else {
-                        service_type_disabled_message(body)
-                    }
-                    .map_err(err)?;
-                    link.send(message).await?;
-                    self.status_due = Some(
-                        Instant::now()
-                            + ticks(
-                                node.native_config()
-                                    .node(ra::NodeProperty::StatusRetryIntervalTicks),
-                            )
-                            .max(Duration::from_nanos(100)),
-                    );
-                    self.escrow.remove(index);
-                    return Ok(());
-                }
-                ra::Effect::ReportLoad(body) => {
-                    let Some(link) = link else {
-                        continue;
-                    };
-                    link.send(report_load_message(body).map_err(err)?).await?;
-                    self.escrow.remove(index);
-                    return Ok(());
-                }
-                ra::Effect::ArmNodeDeactivationCheck { sequence, .. } => {
-                    Some(FmWork::CheckNodeDeactivation(*sequence))
-                }
-                ra::Effect::RequestServiceTypeWork { work, .. } => {
-                    Some(FmWork::CaptureServiceTypeWork(*work))
-                }
-                ra::Effect::ArmServiceTypeRetry { timer, after_ticks } => {
-                    if *after_ticks == i64::MAX {
-                        continue;
-                    }
-                    Some(FmWork::ServiceTypeRetryTimer(*timer))
-                }
-                ra::Effect::RequestReportRetry => {
-                    if link.is_none() {
-                        continue;
-                    }
-                    Some(FmWork::RetryReport(PartitionId {
-                        guid: fube_transport::serialization::serde::Guid(entity),
-                    }))
-                }
-                ra::Effect::ServiceTypeWorkCaptured { work, body } => {
-                    if !sent {
-                        if let Some(body) = body {
-                            let Some(link) = link else {
-                                continue;
-                            };
-                            if self
-                                .notification_pending
-                                .as_ref()
-                                .is_some_and(|prior| prior != body.as_ref())
-                            {
-                                return Err("unsupported replaced notification remains semantically pending".into());
-                            }
-                            self.notification_pending = Some((**body).clone());
-                            link.send(service_type_notification_message(body).map_err(err)?)
-                                .await?;
-                        }
-                        self.escrow[index].sent = true;
-                    }
-                    Some(FmWork::CompleteServiceTypeWork(*work))
-                }
-                ra::Effect::ReplicaUp(body) => {
-                    let snapshot = node.snapshot(entity);
-                    if node.pending_commands() != 0
-                        || snapshot.fenced
-                        || snapshot.committed.is_none()
-                    {
-                        continue;
-                    }
-                    if !current_report(node, entity, body) {
-                        self.escrow.remove(index);
-                        self.finish_report_pass(entity, Duration::ZERO);
-                        return Ok(());
-                    }
-                    if self.escrow.iter().any(|item| {
-                        item.original.entity == entity
-                            && matches!(item.original.effect, ra::Effect::RequestReportRetry)
-                            && item.submitted.is_some()
-                            && !item.sent
-                    }) {
-                        continue;
-                    }
-                    let Some(link) = link else {
-                        continue;
-                    };
-                    self.report_pending = Some((**body).clone());
-                    link.send(replica_up_message(body, Owner::Fm).map_err(err)?)
-                        .await?;
-                    self.escrow.remove(index);
-                    self.finish_report_pass(entity, report_retry(node, entity));
-                    return Ok(());
-                }
-                ra::Effect::StatefulClosePending { body, .. }
-                | ra::Effect::StatefulDroppedPending(body) => {
-                    // Native deleted metadata suppresses reporting, not cleanup proof.
-                    let snapshot = node.snapshot(entity);
-                    if !snapshot.fenced
-                        && snapshot.committed.is_some_and(|state| {
-                            state.local_deleted
-                                && state.phase == ra::Phase::Closed
-                                && state.body.unit == body.unit
-                                && state.body.replica.id == body.replica.id
-                                && state.body.replica.instance == body.replica.instance
-                        })
-                    {
-                        self.escrow.remove(index);
-                        return Ok(());
-                    }
-                    continue;
-                }
-                _ => continue, // Unsupported original work remains retained.
-            };
-            if let Some(work) = work {
-                match node.fm_work(work) {
-                    Ok(id) => self.escrow[index].submitted = Some(id),
-                    Err(fube_node::local::Error::Capacity) => return Ok(()),
-                    Err(error) => return Err(err(error)),
-                }
-            }
-            return Ok(());
-        }
-        Ok(())
-    }
-    fn pending(&self) -> usize {
-        self.escrow.len()
-            + self.replies.len()
-            + self.peer_replies.len()
-            + self.peer_commands.len()
-            + self.acknowledgements.len()
-            + usize::from(self.status_capture.is_some())
-            + usize::from(self.status_cleanup_command.is_some())
-    }
-    fn semantic_pending(&self) -> usize {
-        self.notification_pending
-            .as_ref()
-            .map_or(0, |body| body.infos.0.len())
-            + usize::from(self.report_pending.is_some())
-            + usize::from(self.status_due.is_some() || self.status_requested)
-    }
-    fn replica_drained(&self, node: &Node) -> bool {
-        let replica_work = |dispatch: &ra::Dispatched| dispatch.effect.is_replica_reporting();
-        self.replies.is_empty()
-            && self.report_pending.is_none()
-            && !self
-                .acknowledgements
-                .iter()
-                .any(|(_, ack)| matches!(ack, SemanticAck::Report(_)))
-            && !self.escrow.iter().any(|item| replica_work(&item.original))
-            && !node.external_pending().iter().any(replica_work)
-    }
 }
 
 async fn control_line(input: &mut BufReader<tokio::io::Stdin>) -> Result<Option<Vec<u8>>> {
@@ -984,7 +122,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         .map_err(err)?
         .map_err(err)?;
     drop(listener); // Exactly one original session; no reconnect listener.
-    let channel = fube_transport::accept_unsecured_loopback(
+    let channel = fube_transport::accept_unsecured_tcp(
         stream,
         wire::composition(false).map_err(err)?,
         wire::limits(),
@@ -1049,6 +187,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         id: node_hex(&launch.node),
         instance: launch.node.instance,
         name: launch.name(),
+        ip: std::net::Ipv4Addr::LOCALHOST.into(),
     });
     let store = Arc::new(
         Store::new(Box::new(MemoryBackend::new()), Settings::default())
@@ -1138,14 +277,9 @@ async fn run_owned(launch: &Launch) -> Result<()> {
             // Owned stop remains independent of FM connectivity. Link loss is
             // not permission to stop an existing app or fake lifecycle replies.
             tokio::select! {
-                reply = async {
-                    match upload.request.as_mut() {
-                        Some(request) => request.await,
-                        None => std::future::pending().await,
-                    }
-                } => {
+                reply = upload.receive() => {
                     if let Err(error) = upload.complete(&node, &launch.fm, reply, Instant::now()) {
-                        adapter.error = Some(error);
+                        adapter.record_error(error);
                     }
                 }
                 control = control_line(&mut control) => {
@@ -1201,13 +335,13 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                                     peer_listeners[index].take();
                                     match dial_peer_to(launch, &launch.peers[index], parts[parts.len() - 1]).await {
                                         Ok(link) => connection.link = Some(link),
-                                        Err(error) => adapter.peer_error = Some(error),
+                                        Err(error) => adapter.record_peer_error(error),
                                     }
                                 }
                                 Ok(parts) if parts.len() == 3 && matches!(parts[0], "create-idle" | "build-idle" | "remove-idle")
                                     && parts[1] == launch.session && parts[2] == launch.capability
                                     && launch.placement == 1 && !launch.peers.is_empty() => {
-                                    let submitted = if adapter.peer_commands.len() == 32 {
+                                    let submitted = if adapter.peer_commands().len() == 32 {
                                         Err("peer command receipt capacity".into())
                                     } else {
                                         match parts[0] {
@@ -1218,8 +352,8 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                                         }
                                     };
                                     match submitted {
-                                        Ok(id) => adapter.peer_commands.push(id),
-                                        Err(error) => adapter.peer_command_error = Some(error),
+                                        Ok(id) => adapter.track_peer_command(id)?,
+                                        Err(error) => adapter.record_peer_command_error(error),
                                     }
                                 }
                                 _ => {
@@ -1241,11 +375,11 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             listener_slot.take();
                             match accept_peer_from(launch, &launch.peers[index], stream).await {
                                 Ok(link) => connections[index].link = Some(link),
-                                Err(error) => adapter.peer_error = Some(error),
+                                Err(error) => adapter.record_peer_error(error),
                             }
                         }
                         Ok(Err(error)) => {
-                            adapter.peer_error = Some(err(error));
+                            adapter.record_peer_error(err(error));
                             listener_slot.take();
                         }
                         Err(_) => {}
@@ -1259,19 +393,19 @@ async fn run_owned(launch: &Launch) -> Result<()> {
             if let Err(error) = upload.advance(
                 &node,
                 &up.node,
-                link.as_ref().filter(|_| adapter.error.is_none()),
+                link.as_ref().filter(|_| adapter.error().is_none()),
                 Instant::now(),
             ) {
-                adapter.error = Some(error);
+                adapter.record_error(error);
             }
-            if adapter.error.is_some() {
+            if adapter.error().is_some() {
                 if let Some(old) = link.take() {
                     let _ = old.close().await;
                 }
             }
             adapter.capture(&mut node);
             let selected_peer = adapter
-                .peer_replies
+                .peer_replies()
                 .front()
                 .and_then(|reply| peer_target(&reply.effect))
                 .and_then(|target| launch.peers.iter().position(|peer| &peer.node == target));
@@ -1281,30 +415,30 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     &mut node,
                     link.as_ref(),
                     selected_link,
-                    selected_peer.map(|index| &launch.peers[index]),
+                    selected_peer.map(|index| &launch.peers[index].node),
                 )
                 .await
             {
-                adapter.error = Some(error);
+                adapter.record_error(error);
                 if let Some(old) = link.take() {
                     let _ = old.close().await;
                 }
             }
             for (peer, connection) in launch.peers.iter().zip(&mut connections) {
                 if let Some(current) = &connection.link {
-                    if connection.incoming.is_none() && adapter.peer_commands.len() < 32 {
+                    if connection.incoming.is_none() && adapter.peer_commands().len() < 32 {
                         match current
                             .receive(Instant::now() + Duration::from_millis(1))
                             .await
                         {
                             Ok(incoming) => connection.incoming = incoming,
-                            Err(error) => adapter.peer_error = Some(error),
+                            Err(error) => adapter.record_peer_error(error),
                         }
                     }
                     if let Some(incoming) = &mut connection.incoming {
                         match receive_peer_from(launch, peer, &mut node, &incoming.message) {
                             Ok(Some(id)) => {
-                                adapter.peer_commands.push(id);
+                                adapter.track_peer_command(id)?;
                                 if let Some(handoff) = incoming.handoff.as_mut() {
                                     handoff.acknowledge();
                                 }
@@ -1312,13 +446,13 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             }
                             Ok(None) => {}
                             Err(error) => {
-                                adapter.peer_error = Some(error);
+                                adapter.record_peer_error(error);
                                 connection.incoming = None;
                                 current.channel.dispose();
                             }
                         }
                     }
-                    if adapter.peer_error.is_some() {
+                    if adapter.peer_error().is_some() {
                         if let Some(old) = connection.link.take() {
                             let _ = old.close().await;
                         }
@@ -1326,7 +460,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 }
             }
             if let Some(current) = &link {
-                if adapter.acknowledgements.len() == 32 {
+                if adapter.acknowledgements().len() == 32 {
                     continue;
                 }
                 match current
@@ -1351,28 +485,28 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         match received {
                             Ok(acknowledgement) => {
                                 if let Some(acknowledgement) = acknowledgement {
-                                    adapter.acknowledgements.push(acknowledgement);
+                                    adapter.track_acknowledgement(acknowledgement)?;
                                 }
                                 if let Some(handoff) = incoming.handoff.as_mut() {
                                     handoff.acknowledge();
                                 }
                             }
                             Err(error) => {
-                                adapter.error = Some(error);
+                                adapter.record_error(error);
                                 current.channel.dispose();
                             }
                         }
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        adapter.error = Some(error);
+                        adapter.record_error(error);
                         if let Some(old) = link.take() {
                             let _ = old.close().await;
                         }
                     }
                 }
             }
-            if link.is_some() && adapter.error.is_none() && adapter.replica_drained(&node) {
+            if link.is_some() && adapter.error().is_none() && adapter.replica_drained(&node) {
                 if launch.profile == ServiceProfile::StatefulPeerIdle {
                     if let Err(error) = publish_host_loss(launch, &node, &mut published_host_loss) {
                         failure = Some(error);
@@ -1487,7 +621,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         "pre_open_failure":node.pre_open_registration_failure(),
                         "runtime_open_failure":node.runtime_open_failure(),
                         "host_lost":node.activation().process_status().is_some_and(|process| process.exit_observed),
-                        "retained_usage":node.retained_usage(), "reply":adapter.peer_last_reply,
+                        "retained_usage":node.retained_usage(), "reply":adapter.last_peer_reply(),
                         "registration":state.runtime.as_ref().map(|runtime| serde_json::json!({
                             "host":runtime.host, "runtime":runtime.runtime, "acquisition":runtime.acquisition,
                         })),
@@ -1529,16 +663,16 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     "adapter_pending":adapter.pending(), "commands":node.pending_commands(),
                     "semantic_pending":adapter.semantic_pending(),
                     "staged_status":format!("{:?}", node.pending_status()),
-                    "deprecated_change_configuration_reply":adapter.rejected_change_configuration_reply.as_ref()
+                    "deprecated_change_configuration_reply":adapter.rejected_change_configuration_reply()
                         .map(|body| serde_json::json!({"state":"rejected","reason":"deprecated native action","body":body})),
-                    "error":adapter.error, "link_alive":link.is_some(),
-                    "peer_link_alive":!connections.is_empty() && connections.iter().all(|c| c.link.is_some()), "peer_error":adapter.peer_error,
+                    "error":adapter.error(), "link_alive":link.is_some(),
+                    "peer_link_alive":!connections.is_empty() && connections.iter().all(|c| c.link.is_some()), "peer_error":adapter.peer_error(),
                     "remote_idles":state.map(|s| s.remote_idles.iter().map(|r| serde_json::json!({
                         "replica":r.body.replica.0.replica, "reply":r.reply,
                         "ready":r.ready && r.removal.is_none(),
                         "build":r.build.as_ref().map(|b| serde_json::json!({"result":b.result,"detail":b.detail})),
                     })).collect::<Vec<_>>()),
-                    "peer_command_error":adapter.peer_command_error,
+                    "peer_command_error":adapter.peer_command_error(),
                     "peer_idle":remote_idle, "local_replica":local_replica,
                     "app_observation":{
                         "idle_data":idle_data,
@@ -1600,15 +734,13 @@ async fn dial_peer_to(launch: &Launch, peer: &Peer, address: &str) -> Result<Lin
     if !address.ip().is_loopback() || address.port() == 0 {
         return Err("peer requires original numeric loopback listener".into());
     }
-    let channel = fube_transport::Endpoint::unsecured_loopback(
-        address,
-        wire::peer_composition().map_err(err)?,
-    )
-    .map_err(err)?
-    .channel_limits(wire::limits())
-    .connect_until(wire::deadline())
-    .await
-    .map_err(err)?;
+    let channel =
+        fube_transport::Endpoint::unsecured_tcp(address, wire::peer_composition().map_err(err)?)
+            .map_err(err)?
+            .channel_limits(wire::limits())
+            .connect_until(wire::deadline())
+            .await
+            .map_err(err)?;
     Link::new(
         channel,
         launch.node.clone(),
@@ -1631,7 +763,7 @@ async fn accept_peer_from(
     peer: &Peer,
     stream: tokio::net::TcpStream,
 ) -> Result<Link> {
-    let channel = fube_transport::accept_unsecured_loopback(
+    let channel = fube_transport::accept_unsecured_tcp(
         stream,
         wire::peer_composition().map_err(err)?,
         wire::limits(),
@@ -1822,6 +954,7 @@ fn replace_replica_host(launch: &Launch, node: &mut Node) -> Result<HostReplacem
         id: node_hex(&launch.node),
         instance: launch.node.instance,
         name: launch.name(),
+        ip: std::net::Ipv4Addr::LOCALHOST.into(),
     });
     node.replace_lost_replica_host(Activation::new(options).map_err(err)?)
         .map_err(err)?;
@@ -2424,7 +1557,7 @@ pub(crate) mod report_tests {
 
     async fn links(launch: &Launch) -> Result<(Link, Link)> {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
-        let endpoint = fube_transport::Endpoint::unsecured_loopback(
+        let endpoint = fube_transport::Endpoint::unsecured_tcp(
             listener.local_addr().map_err(err)?,
             wire::composition(true).map_err(err)?,
         )
@@ -2432,7 +1565,7 @@ pub(crate) mod report_tests {
         .channel_limits(wire::limits());
         let (fm, node) = tokio::join!(endpoint.connect_until(wire::deadline()), async {
             let (stream, _) = listener.accept().await.map_err(err)?;
-            fube_transport::accept_unsecured_loopback(
+            fube_transport::accept_unsecured_tcp(
                 stream,
                 wire::composition(false).map_err(err)?,
                 wire::limits(),
@@ -2468,7 +1601,7 @@ pub(crate) mod report_tests {
             .await?
         {
             if let Some(ack) = receive_command(launch, node, &incoming.message)? {
-                adapter.acknowledgements.push(ack);
+                adapter.track_acknowledgement(ack)?;
             }
             if let Some(handoff) = incoming.handoff.as_mut() {
                 handoff.acknowledge();
@@ -2667,17 +1800,7 @@ pub(crate) mod report_tests {
     }
 
     fn timer(adapter: &mut Adapter) -> Result<&mut Escrow> {
-        let mut owners = adapter
-            .escrow
-            .iter_mut()
-            .filter(|item| matches!(item.original.effect, ra::Effect::RequestReportRetry));
-        let owner = owners
-            .next()
-            .ok_or("report retry owner disappeared before semantic clearance")?;
-        if owners.next().is_some() {
-            return Err("more than one current report retry owner".into());
-        }
-        Ok(owner)
+        adapter.qualification_report_retry()
     }
 
     async fn queued_report(
@@ -2690,10 +1813,7 @@ pub(crate) mod report_tests {
     ) -> Result<()> {
         timer(adapter)?.due = Instant::now();
         until(launch, node, adapter, fm, link, traffic, |_, adapter, _| {
-            adapter.escrow.iter().any(|item| {
-                matches!(item.original.effect, ra::Effect::RequestReportRetry)
-                    && item.submitted.is_some()
-            })
+            adapter.report_retry_submitted()
         })
         .await?;
         let end = Instant::now() + Duration::from_secs(3);
@@ -2724,8 +1844,8 @@ pub(crate) mod report_tests {
         fm.send(replica_up_reply_message(body, &launch.generation).map_err(err)?)
             .await?;
         let end = Instant::now() + Duration::from_secs(3);
-        let before = adapter.acknowledgements.len();
-        while adapter.acknowledgements.len() == before {
+        let before = adapter.acknowledgements().len();
+        while adapter.acknowledgements().len() == before {
             if Instant::now() >= end {
                 return Err("semantic ACK did not cross the original live channel".into());
             }
@@ -2784,9 +1904,8 @@ pub(crate) mod report_tests {
                         s.phase == ra::Phase::Closed && s.fm_stage == ra::FmStage::ReplicaDropped
                     })
                     && adapter
-                        .escrow
-                        .iter()
-                        .any(|item| matches!(item.original.effect, ra::Effect::RequestReportRetry))
+                        .retained_effects()
+                        .any(|item| matches!(item.effect, ra::Effect::RequestReportRetry))
             },
         )
         .await?;
@@ -2805,7 +1924,7 @@ pub(crate) mod report_tests {
             .await?;
             if timer(adapter)?.original != original
                 || timer(adapter)?.submitted.is_some()
-                || adapter.report_pending.as_ref() != traffic.reports.first()
+                || adapter.report_pending() != traffic.reports.first()
                 || !node
                     .snapshot(entity)
                     .committed
@@ -2852,7 +1971,7 @@ pub(crate) mod report_tests {
                 .snapshot(entity)
                 .committed
                 .is_some_and(|s| s.fm_stage == ra::FmStage::ReplicaDropped && !s.local_deleted)
-                || adapter.report_pending.as_ref() != Some(&first)
+                || adapter.report_pending() != Some(&first)
             {
                 return Err(
                     "stale/foreign/nonclearing ACK retired current report semantics".into(),
@@ -2919,9 +2038,7 @@ pub(crate) mod report_tests {
         .await?;
         let mut current = first;
         current.dropped.0[0].service.update_version += 1;
-        if traffic.reports.last() != Some(&current)
-            || adapter.report_pending.as_ref() != Some(&current)
-        {
+        if traffic.reports.last() != Some(&current) || adapter.report_pending() != Some(&current) {
             return Err("adapter replayed a superseded captured report body".into());
         }
 
@@ -2933,10 +2050,10 @@ pub(crate) mod report_tests {
             step(launch, node, adapter, fm, link, &mut traffic).await?;
         }
         if traffic.reports.len() != count
-            || adapter.report_pending.is_some()
-            || adapter.escrow.iter().any(|item| {
+            || adapter.report_pending().is_some()
+            || adapter.retained_effects().any(|item| {
                 matches!(
-                    item.original.effect,
+                    item.effect,
                     ra::Effect::RequestReportRetry | ra::Effect::ReplicaUp(_)
                 )
             })
@@ -3072,7 +2189,7 @@ pub(crate) mod report_tests {
             assert_eq!(after.phase, ra::Phase::Ready);
             assert_eq!(after.body, before.body);
             assert!(node.instance_disposal().is_none());
-            assert!(adapter.report_pending.is_none());
+            assert!(adapter.report_pending().is_none());
         }
         // Replay actual captured old completions and an old native report from
         // the original node-side Link. Source/PToP/generation/schema checks
@@ -3645,7 +2762,7 @@ pub(crate) mod report_tests {
                 || node.instance_disposal().is_some()
                 || !traffic.reports.is_empty()
                 || traffic.removed
-                || adapter.report_pending.is_some()
+                || adapter.report_pending().is_some()
             {
                 return Err(
                     "held graceful disposal published completion/report or released usage".into(),
@@ -3707,7 +2824,7 @@ pub(crate) mod report_tests {
             || state.local_deleted
             || node.retained_usage() != 0
             || node.instance_disposal().is_some() != graceful
-            || adapter.report_pending.as_ref() != Some(&report)
+            || adapter.report_pending() != Some(&report)
         {
             return Err(
                 "terminal completion did not retain the exact native reporting stage".into(),
@@ -3796,7 +2913,7 @@ pub(crate) mod report_tests {
                 .snapshot(entity)
                 .committed
                 .is_none_or(|s| s.fm_stage != expected_stage)
-                || adapter.report_pending.is_none()
+                || adapter.report_pending().is_none()
                 || node.instance_disposal().is_some() != graceful
             {
                 return Err("stale ACK retired the original loss obligation".into());
@@ -4012,10 +3129,12 @@ pub(crate) mod report_tests {
     ) -> Result<
         fube_transport::channel::IncomingMessage<fube_transport::native_channel::GatewayTarget>,
     > {
-        let request = upload.request.as_mut().ok_or("missing LFUM request")?;
+        if !upload.is_in_flight() {
+            return Err("missing LFUM request".into());
+        }
         tokio::select! {
             incoming = fm.receive(wire::deadline()) => incoming?.ok_or("missing LFUM upload".into()),
-            reply = request => Err(format!("LFUM request completed before FM received it: {reply:?}")),
+            reply = upload.receive() => Err(format!("LFUM request completed before FM received it: {reply:?}")),
         }
     }
 
@@ -4053,7 +3172,7 @@ pub(crate) mod report_tests {
                 }
                 let mut upload = LfumUploadState::default();
                 let end = Instant::now() + Duration::from_secs(3);
-                while upload.request.is_none() {
+                while !upload.is_in_flight() {
                     node.drive().map_err(err)?;
                     upload.advance(&node, &up.node, Some(&link), Instant::now())?;
                     if Instant::now() >= end {
@@ -4067,19 +3186,19 @@ pub(crate) mod report_tests {
                     handoff.acknowledge();
                 }
                 drop(first);
-                let reply = upload.request.as_mut().unwrap().await?;
+                let reply = upload.receive().await?;
                 if reply.is_some() {
                     return Err("lost LFUM reply unexpectedly completed".into());
                 }
                 let completed = Instant::now();
                 upload.complete(&node, &launch.fm, Ok(None), completed)?;
-                let due = upload.retry_at;
+                let due = upload.retry_at();
                 if due - completed
                     != ticks(
                         node.native_config()
                             .node(ra::NodeProperty::LfumUploadRetryIntervalTicks),
                     )
-                    || upload.body.as_ref() != Some(&frozen)
+                    || upload.frozen_body() != Some(&frozen)
                     || !node.generation_state().upload_pending
                 {
                     return Err(
@@ -4087,7 +3206,7 @@ pub(crate) mod report_tests {
                     );
                 }
                 upload.advance(&node, &up.node, Some(&link), due - Duration::from_nanos(1))?;
-                if upload.request.is_some() {
+                if upload.is_in_flight() {
                     return Err("LFUM retried before its native deadline".into());
                 }
                 upload.advance(&node, &up.node, Some(&link), due)?;
@@ -4108,16 +3227,16 @@ pub(crate) mod report_tests {
                 if let Some(handoff) = retry.handoff.as_mut() {
                     handoff.acknowledge();
                 }
-                let reply = upload.request.as_mut().unwrap().await;
+                let reply = upload.receive().await;
                 upload.complete(&node, &launch.fm, reply, Instant::now())?;
                 if node.generation_state().upload_pending
                     || node.generation_state().send != generation.number
-                    || upload.body.is_some()
+                    || upload.frozen_body().is_some()
                 {
                     return Err("matched LFUM reply did not settle the original upload".into());
                 }
                 upload.advance(&node, &up.node, Some(&link), due + Duration::from_secs(60))?;
-                if upload.request.is_some() {
+                if upload.is_in_flight() {
                     return Err("completed LFUM upload retried".into());
                 }
                 Ok(())
@@ -4284,6 +3403,7 @@ pub(crate) mod report_tests {
             id: node_hex(&launch.node),
             instance: launch.node.instance,
             name: launch.name(),
+            ip: std::net::Ipv4Addr::LOCALHOST.into(),
         });
         let store = Arc::new(
             Store::new(Box::new(MemoryBackend::new()), Settings::default())
@@ -4327,7 +3447,12 @@ pub(crate) mod report_tests {
     ) -> Result<()> {
         node.drive().map_err(err)?;
         adapter
-            .advance_with_peer(node, fm, Some(peer), launch.peers.first())
+            .advance_with_peer(
+                node,
+                fm,
+                Some(peer),
+                launch.peers.first().map(|peer| &peer.node),
+            )
             .await?;
         if let Some(mut incoming) = peer
             .receive(Instant::now() + Duration::from_millis(1))
@@ -4336,7 +3461,7 @@ pub(crate) mod report_tests {
             let id = receive_peer(launch, node, &incoming.message)
                 .map_err(|error| format!("node{} peer ingress: {error}", launch.placement))?
                 .ok_or("unexpected peer command capacity in bounded test")?;
-            adapter.peer_commands.push(id);
+            adapter.track_peer_command(id)?;
             if let Some(handoff) = incoming.handoff.as_mut() {
                 handoff.acknowledge();
             }
@@ -4612,7 +3737,7 @@ pub(crate) mod report_tests {
                 &fm,
                 &fm_link,
                 &mut traffic,
-                |_, adapter, traffic| traffic.added && adapter.notification_pending.is_none(),
+                |_, adapter, traffic| traffic.added && adapter.notification_pending().is_none(),
             )
             .await?;
             let endpoint = traffic
@@ -4680,12 +3805,10 @@ pub(crate) mod report_tests {
                 &fm,
                 &fm_link,
                 &mut traffic,
-                |_, adapter, _| !adapter.peer_replies.is_empty(),
+                |_, adapter, _| !adapter.peer_replies().is_empty(),
             )
             .await?;
-            let held = source_adapter
-                .peer_replies
-                .pop_front()
+            let held = source_adapter.qualification_take_peer_reply()
                 .ok_or("missing original CreateReplica")?;
             let ra::Effect::PeerCreateReplica { body: create, .. } = held.effect else {
                 return Err("unexpected original peer effect".into());
@@ -4716,7 +3839,7 @@ pub(crate) mod report_tests {
                     let mut incoming = target_link.receive(Instant::now() + Duration::from_secs(2)).await?
                         .ok_or("missing original Create before lookup")?;
                     let id = receive_peer(&launches[1], &mut target, &incoming.message)?.ok_or("original Create capacity")?;
-                    target_adapter.peer_commands.push(id);
+                    target_adapter.track_peer_command(id)?;
                     if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
                     target.drive().map_err(err)?;
                     while target.snapshot(entity).committed.is_none() {
@@ -4742,7 +3865,7 @@ pub(crate) mod report_tests {
                             if provider { "LOCAL_DATA_PROVIDER dispose begin" } else { "LOCAL_DISPOSE begin" }))
                     } else if opening {
                         !target.activation().logs().iter().any(|line| line.contains("LOCAL_OPEN held"))
-                    } else { target_adapter.peer_last_reply.is_none() } {
+                    } else { target_adapter.last_peer_reply().is_none() } {
                         peer_step(
                             &launches[1],
                             &mut target,
@@ -4770,13 +3893,13 @@ pub(crate) mod report_tests {
                     if failed_open {
                         if target.runtime_open_failure().is_some() || target.failed_open_deletion().is_some()
                             || target.instance_disposal().is_some() || target.retained_usage() != 1
-                            || target_adapter.peer_last_reply.is_some() || !traffic.idle_adds.is_empty()
+                            || target_adapter.last_peer_reply().is_some() || !traffic.idle_adds.is_empty()
                             || ledger.request_idle_deletion(Instant::now(), crate::fm::IdleDeleteTarget::FailedOpen).is_ok()
                             || !data_request(&endpoint, b"read\n").await?.contains("value=acknowledged")
                         { return Err("held failed-Open disposal published failure/cleanup or changed Primary serving".into()); }
                         release_disposal(&target, if provider { StatefulDown::CloseProvider } else { StatefulDown::CloseService })?;
                         let end = Instant::now() + Duration::from_secs(5);
-                        while target_adapter.peer_last_reply.is_none() {
+                        while target_adapter.last_peer_reply().is_none() {
                             peer_step(&launches[1], &mut target, &mut target_adapter, &target_link, None).await?;
                             if Instant::now() >= end { return Err("failed Open disposal/reply deadline".into()); }
                         }
@@ -5077,7 +4200,7 @@ pub(crate) mod report_tests {
                             || ledger.idle_deletion_status()["complete"] != terminal_deletion.is_some()
                             || ledger.idle_removal_status()["pending_remove"] != true
                             || ledger.idle_status()["state"] != "lost"
-                            || target_adapter.peer_command_error.is_some() || source_adapter.peer_command_error.is_some()
+                            || target_adapter.peer_command_error().is_some() || source_adapter.peer_command_error().is_some()
                             || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK open")).count() != 1
                             || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK close")).count() != if aborting { 0 } else if graceful { 1 } else { usize::from(!provider) }
                             || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK abort")).count() != usize::from(aborting)
@@ -5087,7 +4210,7 @@ pub(crate) mod report_tests {
                             target.snapshot(entity).committed.map(|state| (state.phase, state.fm_stage, state.local_deleted, state.peer_host_loss())),
                             target.retained_usage(), target.instance_disposal(),
                             ledger.idle_removal_status()["pending_remove"], ledger.idle_status()["state"],
-                            target_adapter.peer_command_error, source_adapter.peer_command_error)); }
+                            target_adapter.peer_command_error(), source_adapter.peer_command_error())); }
                         ledger.idle_removal_reply(0, traffic.idle_removals[1].clone())?;
                         let continued = data_request(&endpoint, b"write-more\n").await?;
                         if !continued.contains("committed=2 value=continued") || data_request(&endpoint, b"read\n").await? != continued
@@ -5151,7 +4274,7 @@ pub(crate) mod report_tests {
                         if serde_json::to_value(target.failed_open_deletion()).map_err(err)?
                                 != serde_json::to_value(Some(&proof)).map_err(err)?
                             || target.snapshot(entity).committed.is_none_or(|state| !state.local_deleted || state.phase != ra::Phase::Closed)
-                            || target.retained_usage() != 0 || target_adapter.peer_command_error.is_some()
+                            || target.retained_usage() != 0 || target_adapter.peer_command_error().is_some()
                             || !target_traffic.reports.is_empty()
                             || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK open")).count() != 1
                             || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK abort")).count() != 1
@@ -5232,7 +4355,7 @@ pub(crate) mod report_tests {
                         if serde_json::to_value(target.failed_registration_deletion()).map_err(err)?
                                 != serde_json::to_value(Some(&proof)).map_err(err)?
                             || target.snapshot(entity).committed.is_none_or(|state| !state.local_deleted || state.phase != ra::Phase::Closed)
-                            || target.retained_usage() != 0 || target_adapter.peer_command_error.is_some()
+                            || target.retained_usage() != 0 || target_adapter.peer_command_error().is_some()
                             || !target_traffic.reports.is_empty()
                             || target.activation().logs().iter().any(|line| line.contains("LOCAL_CALLBACK")
                                 || line.contains("LOCAL_DATA_PROVIDER acquired") || line.contains("LOCAL_RESOURCE acquired"))
@@ -5290,7 +4413,7 @@ pub(crate) mod report_tests {
                             receive(&launches[1], &mut target, &mut target_adapter, &target_fm_link).await?;
                             if Instant::now() >= end { return Err("pre-registration Delete ingress deadline".into()); }
                         }
-                        while !target_adapter.replies.iter().any(|work| matches!(work.effect, ra::Effect::DeleteReplicaReply(_))) {
+                        while !target_adapter.replies().iter().any(|work| matches!(work.effect, ra::Effect::DeleteReplicaReply(_))) {
                             target.drive().map_err(err)?;
                             target_adapter.capture(&mut target);
                             if Instant::now() >= end { return Err("pre-registration Delete effect deadline".into()); }
@@ -5350,7 +4473,7 @@ pub(crate) mod report_tests {
                         }
                         if target.retained_usage() != 0 || target.replica_absence().is_some() || target.instance_disposal().is_some()
                             || serde_json::to_value(target.pre_open_cancellation()).map_err(err)? != proof
-                            || target_adapter.peer_last_reply.is_some() || target_adapter.peer_command_error.is_some()
+                            || target_adapter.last_peer_reply().is_some() || target_adapter.peer_command_error().is_some()
                             || !target_traffic.reports.is_empty()
                             || target.activation().logs().iter().any(|line| line.contains("LOCAL_CALLBACK")
                                 || line.contains("LOCAL_DATA_PROVIDER acquired") || line.contains("LOCAL_RESOURCE acquired"))
@@ -5421,7 +4544,7 @@ pub(crate) mod report_tests {
                         let end = Instant::now() + Duration::from_secs(5);
                         loop {
                             peer_step(&launches[1], &mut target, &mut target_adapter, &target_link, Some(&target_fm_link)).await?;
-                            if !target_adapter.peer_commands.is_empty() { break; }
+                            if !target_adapter.peer_commands().is_empty() { break; }
                             if Instant::now() >= end { return Err("held original Create did not reach deleted destination".into()); }
                         }
                         for _ in 0..15 {
@@ -5432,7 +4555,7 @@ pub(crate) mod report_tests {
                         if target.snapshot(entity).committed.is_none_or(|state| state.open_token != 0
                                 || state.phase != ra::Phase::Closed || !state.local_deleted)
                             || target.retained_usage() != 0 || target.instance_disposal().is_some()
-                            || target_adapter.peer_command_error.is_some() || target_adapter.peer_last_reply.is_some()
+                            || target_adapter.peer_command_error().is_some() || target_adapter.last_peer_reply().is_some()
                             || !target_traffic.reports.is_empty()
                             || serde_json::to_value(target.replica_absence()).map_err(err)? != original_proof
                             || target.activation().logs().iter().any(|line| line.contains("LOCAL_CALLBACK create_replica")
@@ -5490,7 +4613,7 @@ pub(crate) mod report_tests {
                         }
                         let command = receive_peer(&launches[0], &mut source, &incoming.message)?
                             .ok_or("late peer reply capacity")?;
-                        source_adapter.peer_commands.push(command);
+                        source_adapter.track_peer_command(command)?;
                         if let Some(handoff) = incoming.handoff.as_mut() {
                             handoff.acknowledge();
                         }
@@ -5507,7 +4630,7 @@ pub(crate) mod report_tests {
                     &fm,
                     &fm_link,
                     &mut traffic,
-                    |_, adapter, _| adapter.peer_commands.is_empty(),
+                    |_, adapter, _| adapter.peer_commands().is_empty(),
                 )
                 .await?;
                 let current = source
@@ -5587,7 +4710,7 @@ pub(crate) mod report_tests {
                                 || closing.runtime.is_none() || target.retained_usage() != 1
                                 || target.instance_disposal().is_some() || target.replica_absence().is_some()
                                 || target_traffic.removed || !target_traffic.reports.is_empty()
-                                || target_adapter.peer_last_reply.is_some()
+                                || target_adapter.last_peer_reply().is_some()
                             {
                                 return Err("held registered Open completed deletion/creation or released ownership early".into());
                             }
@@ -5661,7 +4784,7 @@ pub(crate) mod report_tests {
                             }
                             until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
                                 &mut target_traffic, |node, adapter, _| adapter.replica_drained(node) && node.replica_loss().is_some()).await?;
-                            if target_adapter.peer_command_error.is_some()
+                            if target_adapter.peer_command_error().is_some()
                                 || serde_json::to_value(target.replica_loss()).map_err(err)? != original_loss
                                 || target.snapshot(entity).committed.is_none_or(|state| !state.local_deleted
                                     || state.phase != ra::Phase::Closed || state.open_token != closing.open_token)
@@ -5754,7 +4877,7 @@ pub(crate) mod report_tests {
                         if closed.phase != ra::Phase::Closed || !closed.local_deleted || target.retained_usage() != 0
                             || serde_json::to_value(target.instance_disposal()).map_err(err)?
                                 != serde_json::to_value(Some(&proof.disposal)).map_err(err)?
-                            || target_adapter.peer_command_error.is_some()
+                            || target_adapter.peer_command_error().is_some()
                             || target.activation().logs().iter().filter(|line| line.contains("LOCAL_CALLBACK open")).count() != 1
                             || target.activation().logs().iter().filter(|line| line.contains("LOCAL_CALLBACK close")).count() != usize::from(!opening)
                             || target.activation().logs().iter().filter(|line| line.contains("LOCAL_CALLBACK abort")).count() != usize::from(opening)
@@ -5764,7 +4887,7 @@ pub(crate) mod report_tests {
                         {
                             return Err("late peer/build traffic resurrected or reacquired the deleted Idle".into());
                         }
-                        if opening && (target_adapter.peer_last_reply.is_some()
+                        if opening && (target_adapter.last_peer_reply().is_some()
                             || !traffic.idle_adds.is_empty()
                             || !target.activation().logs().iter().any(|line| line.contains("LOCAL_OPEN released")))
                         {
@@ -5843,7 +4966,7 @@ pub(crate) mod report_tests {
             fm.send(add_primary_message(&body, &launches[0].generation).map_err(err)?).await?;
             let mut traffic = Traffic::default();
             until(&launches[0], &mut source, &mut source_adapter, &fm, &fm_link,
-                &mut traffic, |_, adapter, traffic| traffic.added && adapter.notification_pending.is_none()).await?;
+                &mut traffic, |_, adapter, traffic| traffic.added && adapter.notification_pending().is_none()).await?;
             let endpoint = traffic.add_reply.as_ref().ok_or("missing Primary reply")?
                 .replica.service_endpoint                .clone();
             let ready_end = Instant::now() + Duration::from_secs(2);
@@ -5883,7 +5006,7 @@ pub(crate) mod report_tests {
                         break;
                     }
                     if Instant::now() >= end {
-                        return Err(format!("peer Open deadline: {:?}, {:?}", source_adapter.peer_command_error, target_adapter.peer_command_error));
+                        return Err(format!("peer Open deadline: {:?}, {:?}", source_adapter.peer_command_error(), target_adapter.peer_command_error()));
                     }
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }

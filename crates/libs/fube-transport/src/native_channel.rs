@@ -1,4 +1,4 @@
-//! Operational, owned native channels for unsecured loopback development.
+//! Operational, owned native channels over plain TCP.
 //!
 //! This is the operational backend for [`crate::channel`], not an adapter around
 //! the retired legacy envelope-building APIs. Connect-time composition separates native
@@ -12,14 +12,14 @@
 //! and session/actor authorization above that engine.
 //! No listener, replication, TLS, reconnect or replay is supplied.
 //!
-//! Clear loopback is an explicit trust assumption, not authentication of local
-//! processes. Domain headers/body, including TimeoutHeader, remain caller-owned.
+//! Connections are unencrypted and unauthenticated. Domain headers/body,
+//! including TimeoutHeader, remain caller-owned.
 //! See `docs/transport/NativeChannel.md` for limits and qualification.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     mem::size_of,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     ops::Deref,
     sync::{Arc, Mutex, Weak},
 };
@@ -524,21 +524,19 @@ impl ExactSizeIterator for GatewayIngressSnapshot {}
 impl GatewayChannel {
     pub(crate) async fn connect_with_envelope(
         endpoint: SocketAddr,
+        local_ip: Option<IpAddr>,
         composition: ChannelComposition,
         limits: ChannelLimits,
         deadline: Instant,
         session_envelope: Arc<dyn SessionEnvelope>,
     ) -> Result<Self> {
         limits.validate()?;
-        if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
-            return Err(Error::InvalidInput(
-                "unsecured gateway requires explicit loopback endpoint",
-            ));
-        }
+        crate::endpoint::validate_tcp_endpoint(endpoint)?;
         check_deadline(deadline)?;
         let process_id = uuid::Uuid::new_v4().to_bytes_le();
-        let (stream, message) = raw_session::connect(
+        let (stream, message) = raw_session::connect_from(
             endpoint,
+            local_ip,
             ListenInstance::default(),
             MessageId {
                 guid: process_id,
@@ -563,7 +561,7 @@ impl GatewayChannel {
         )
     }
 
-    /// Publish exactly one established trusted-loopback socket.
+    /// Publish exactly one established plain-TCP socket.
     ///
     /// The session adapter must complete and validate its hello before calling.
     /// Actual endpoint/finite-limit/deadline checks are repeated here; callers
@@ -579,12 +577,10 @@ impl GatewayChannel {
     ) -> Result<Self> {
         limits.validate()?;
         let endpoint = stream.peer_addr()?;
-        if !endpoint.ip().is_loopback()
-            || endpoint.port() == 0
-            || !stream.local_addr()?.ip().is_loopback()
-            || process_id == [0; 16]
-        {
-            return Err(Error::InvalidInput("invalid established loopback session"));
+        crate::endpoint::validate_tcp_endpoint(endpoint)?;
+        crate::endpoint::validate_tcp_endpoint(stream.local_addr()?)?;
+        if process_id == [0; 16] {
+            return Err(Error::InvalidInput("invalid established TCP session"));
         }
         check_deadline(deadline)?;
         stream.set_nodelay(true)?;

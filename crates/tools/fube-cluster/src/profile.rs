@@ -9,7 +9,7 @@ use std::{
 };
 
 pub type Result<T> = std::result::Result<T, String>;
-pub const LIMIT: usize = 64 * 1024;
+pub const LIMIT: usize = fube_node::control::MAX_BODY_BYTES;
 pub const APPLICATION: &str = "fabric:/Cluster";
 pub const SERVICE: &str = "fabric:/Cluster/Service";
 pub const TYPE: &str = "ClusterStatelessType";

@@ -112,6 +112,7 @@ impl ReplicatorFactory {
                 incarnation: endpoint.actor_incarnation,
             },
             &endpoint.listen_address,
+            endpoint.advertised_ip,
             provider,
             replay,
             settings,

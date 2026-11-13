@@ -16,7 +16,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    net::{SocketAddr, TcpListener as StdListener, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, TcpListener as StdListener, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc as std_mpsc, Arc, Mutex, Weak,
@@ -317,10 +317,38 @@ impl PeerTransport {
     /// Binds the actual socket before starting an owned current-thread runtime.
     /// On return the listener is registered and ready, without a caller runtime.
     pub fn bind(address: &str, settings: Settings) -> Result<(Self, Incoming)> {
+        Self::bind_with_advertised_ip(address, None, settings)
+    }
+
+    /// Publish a concrete listener identity without changing its bound port.
+    pub fn bind_with_advertised_ip(
+        address: &str,
+        advertised_ip: Option<IpAddr>,
+        settings: Settings,
+    ) -> Result<(Self, Incoming)> {
         settings.validate()?;
+        if advertised_ip.is_some_and(|ip| ip.is_unspecified() || ip.is_multicast()) {
+            return Err(Error::InvalidInput("invalid advertised replication IP"));
+        }
         let listener = StdListener::bind(address)?;
+        let bound = listener.local_addr()?;
+        let advertised = match advertised_ip {
+            Some(ip)
+                if ip.is_ipv4() == bound.is_ipv4()
+                    && (bound.ip().is_unspecified() || ip == bound.ip()) =>
+            {
+                SocketAddr::new(ip, bound.port())
+            }
+            Some(_) => return Err(Error::InvalidInput("advertised IP does not match listener")),
+            None if bound.ip().is_unspecified() => {
+                return Err(Error::InvalidInput(
+                    "wildcard replication listener requires an advertised IP",
+                ));
+            }
+            None => bound,
+        };
         listener.set_nonblocking(true)?;
-        let address = listener.local_addr()?.to_string();
+        let address = advertised.to_string();
         let (in_data, data) = mpsc::channel(settings.queue_operations);
         let (in_control, control) = mpsc::channel(settings.control_messages);
         let (out_data, data_rx) = mpsc::channel(settings.queue_operations);

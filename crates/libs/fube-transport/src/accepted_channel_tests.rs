@@ -1,5 +1,5 @@
 use super::*;
-use crate::{accept_unsecured_loopback, native_demux::RequestPolicy, Endpoint};
+use crate::{accept_unsecured_tcp, native_demux::RequestPolicy, Endpoint};
 use tokio::net::TcpListener;
 
 fn server_composition() -> ChannelComposition {
@@ -42,9 +42,29 @@ fn initiating_hello(instance: &ListenInstance) -> Message {
 
 #[tokio::test]
 async fn accepted_native_endpoint_pair_preserves_roles_and_explicit_send_reply_authority() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    endpoint_pair("127.0.0.1".parse().unwrap(), None).await;
+}
+
+#[tokio::test]
+async fn nonloopback_native_endpoint_pair_preserves_roles_and_explicit_send_reply_authority() {
+    endpoint_pair(non_loopback_ip(), None).await;
+}
+
+#[tokio::test]
+async fn native_endpoint_binds_the_configured_source_ip_for_original_peer_association() {
+    endpoint_pair(
+        "127.0.0.1".parse().unwrap(),
+        Some("127.0.0.2".parse().unwrap()),
+    )
+    .await;
+}
+
+async fn endpoint_pair(ip: std::net::IpAddr, source_ip: Option<std::net::IpAddr>) {
+    let listener = TcpListener::bind(std::net::SocketAddr::new(ip, 0))
+        .await
+        .unwrap();
     let address = listener.local_addr().unwrap();
-    let endpoint = Endpoint::unsecured_loopback(
+    let endpoint = Endpoint::unsecured_tcp(
         address,
         ChannelComposition {
             outbound: independent_outbound,
@@ -61,10 +81,15 @@ async fn accepted_native_endpoint_pair_preserves_roles_and_explicit_send_reply_a
     )
     .unwrap()
     .channel_limits(limits());
+    let endpoint = if let Some(ip) = source_ip {
+        endpoint.local_ip(ip)
+    } else {
+        endpoint
+    };
     let (client, server) = tokio::join!(endpoint.connect(), async {
         let (stream, peer) = listener.accept().await.unwrap();
         (
-            accept_unsecured_loopback(stream, server_composition(), limits(), deadline())
+            accept_unsecured_tcp(stream, server_composition(), limits(), deadline())
                 .await
                 .unwrap(),
             peer,
@@ -76,6 +101,9 @@ async fn accepted_native_endpoint_pair_preserves_roles_and_explicit_send_reply_a
     let server_target = server.target().unwrap();
     assert_eq!(client_target.address, address);
     assert_eq!(server_target.address, peer);
+    if let Some(ip) = source_ip {
+        assert_eq!(peer.ip(), ip);
+    }
     assert_eq!(server.remote_instance(), ListenInstance::default());
     assert_eq!(client.remote_instance().address, address.to_string());
     assert_eq!(client.remote_instance().instance, 1);
@@ -170,7 +198,7 @@ async fn accepted_native_rejects_wrong_role_empty_identity_ipc_and_nonhello_with
     ] {
         let (stream, mut peer) = streams().await;
         let (result, ()) = tokio::join!(
-            accept_unsecured_loopback(stream, server_composition(), limits(), deadline()),
+            accept_unsecured_tcp(stream, server_composition(), limits(), deadline()),
             async {
                 read_message(&mut peer).await.unwrap();
                 write_message(&mut peer, &hello).await.unwrap();
@@ -197,7 +225,7 @@ async fn accepted_native_checks_limits_and_expired_deadline_before_any_hello() {
         } else if case == 1 {
             settings.max_frame_bytes = FIXED_HEADER_SIZE;
         }
-        let result = accept_unsecured_loopback(
+        let result = accept_unsecured_tcp(
             stream,
             server_composition(),
             settings,
@@ -230,7 +258,7 @@ async fn accepted_native_checks_limits_and_expired_deadline_before_any_hello() {
 async fn accepted_native_deadline_and_cancellation_dispose_stalled_unpublished_hello() {
     let (stream, mut peer) = streams().await;
     let budget = Duration::from_secs(60);
-    let mut accepting = Box::pin(accept_unsecured_loopback(
+    let mut accepting = Box::pin(accept_unsecured_tcp(
         stream,
         server_composition(),
         limits(),
@@ -253,7 +281,7 @@ async fn accepted_native_deadline_and_cancellation_dispose_stalled_unpublished_h
     );
 
     let (stream, mut peer) = streams().await;
-    let mut accepting = Box::pin(accept_unsecured_loopback(
+    let mut accepting = Box::pin(accept_unsecured_tcp(
         stream,
         server_composition(),
         limits(),
@@ -289,7 +317,7 @@ async fn accepted_native_hello_frame_limit_rejects_fixed_header_without_waiting_
     .encode()
     .unwrap();
     let (result, ()) = tokio::join!(
-        accept_unsecured_loopback(stream, server_composition(), settings, deadline()),
+        accept_unsecured_tcp(stream, server_composition(), settings, deadline()),
         async {
             read_message(&mut peer).await.unwrap();
             peer.write_all(&bytes[..FIXED_HEADER_SIZE]).await.unwrap();
@@ -318,7 +346,7 @@ async fn accepted_native_uses_actual_peer_identity_and_retains_native_envelope_a
         nonce: [0; 16],
     };
     let (channel, ()) = tokio::join!(
-        accept_unsecured_loopback(stream, server_composition(), limits(), deadline()),
+        accept_unsecured_tcp(stream, server_composition(), limits(), deadline()),
         async {
             read_message(&mut peer).await.unwrap();
             write_message(&mut peer, &initiating_hello(&advertised))

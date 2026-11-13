@@ -195,6 +195,8 @@ pub struct Admission {
 }
 #[derive(Debug, Clone)]
 pub struct Settings {
+    /// Rust execution-profile capability, not a native dynamic property.
+    pub allow_active_replica_delete: bool,
     pub max_entities: usize,
     pub max_outstanding: usize,
     pub max_command_bytes: usize,
@@ -220,6 +222,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            allow_active_replica_delete: false,
             max_entities: 32,
             max_outstanding: 64,
             max_command_bytes: 256 * 1024,

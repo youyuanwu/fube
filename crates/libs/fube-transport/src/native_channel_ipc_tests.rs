@@ -62,6 +62,34 @@ fn command(index: u32, expects: bool) -> Message {
 }
 
 #[tokio::test]
+async fn ipc_rejects_nonloopback_dial_and_accept_without_a_native_hello() {
+    let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::new(non_loopback_ip(), 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    assert!(matches!(
+        crate::native_ipc::connect_unsecured_loopback(
+            address,
+            composition(),
+            limits(),
+            deadline(),
+            "host"
+        )
+        .await,
+        Err(Error::InvalidInput("IPC requires loopback"))
+    ));
+    let (stream, peer) = tokio::join!(listener.accept(), TcpStream::connect(address));
+    let (stream, _) = stream.unwrap();
+    let mut peer = peer.unwrap();
+    assert!(matches!(
+        crate::native_ipc::accept_unsecured_loopback(stream, composition(), limits(), deadline())
+            .await,
+        Err(Error::InvalidInput("accepted IPC requires loopback"))
+    ));
+    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn accepted_ipc_owns_hello_identity_and_ids_without_bypassing_common_reply_guards() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();

@@ -197,14 +197,11 @@ async fn silent_establishment_is_deadline_bound() {
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
     assert!(matches!(
-        crate::Endpoint::unsecured_loopback(
-            address,
-            fixture_composition(GatewayProfile::Ordinary),
-        )
-        .unwrap()
-        .channel_limits(limits())
-        .connect_until(Instant::now() + Duration::from_millis(30))
-        .await,
+        crate::Endpoint::unsecured_tcp(address, fixture_composition(GatewayProfile::Ordinary),)
+            .unwrap()
+            .channel_limits(limits())
+            .connect_until(Instant::now() + Duration::from_millis(30))
+            .await,
         Err(Error::Timeout)
     ));
     peer.await.unwrap();

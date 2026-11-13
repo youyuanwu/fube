@@ -582,6 +582,22 @@ pub(super) fn transition(
             let body = request.replica.0;
             let stateful = matches!(work.kind, Kind::DeleteReplica { .. });
             if stateful {
+                // Native DeleteLocalReplica closes open active replicas too.
+                // Enable only exact completed 3/2 owners in the external profile.
+                let active_delete = config.allow_active_replica_delete
+                    && !request.deletion.0.force
+                    && current.is_some_and(|state| {
+                        (state.fm_primary || state.peer_creation.is_some())
+                            && state.body.service.target == 3
+                            && state.body.service.minimum == 2
+                            && state.body.service == body.service
+                            && state.body.unit.current == body.unit.current
+                            && state.body.replica.id == body.replica.id
+                            && body.replica.instance <= state.body.replica.instance
+                            && state.reconfiguration.as_ref().is_some_and(|configuration| {
+                                configuration.stage == ConfigurationStage::Complete
+                            })
+                    });
                 if current.is_some_and(|s| {
                     s.peer_creation.is_some()
                         && body.unit.current.older_than(s.body.unit.current)
@@ -596,6 +612,7 @@ pub(super) fn transition(
                     || body.service.partitions != 1
                     || !valid_stateful_sizes(&body.service)
                     || ((body.service.target != 1 || body.service.minimum != 1)
+                        && !active_delete
                         && current.is_none_or(|s| {
                             s.phase != Phase::Closed
                                 || s.reconfiguration
@@ -621,6 +638,7 @@ pub(super) fn transition(
                 }
                 if let Some(original) = current.filter(|state| state.peer_creation.is_some()) {
                     if original.body.replica.current_role != 2
+                        && !active_delete
                         && !(original.phase == Phase::Closed
                             && original.reconfiguration.as_ref().is_some_and(|c| {
                                 c.stage == ConfigurationStage::Retiring

@@ -102,6 +102,12 @@ fn owned_stateful_factory_registers_and_resolves_without_replica_lifecycle() {
     let mut options = fixture.options();
     options.profile = Profile::VolatileStatefulRegistration;
     options.lease_duration = Duration::from_secs(2);
+    options.node = Some(fube_hosting::local::NodeContext {
+        id: "a".into(),
+        instance: 7,
+        name: "container-node".into(),
+        ip: "192.0.2.11".parse().unwrap(),
+    });
     let mut owner = Activation::new(options).unwrap();
     owner.start(&fixture.package, "fabric:/Local", &[]).unwrap();
     owner
@@ -146,6 +152,9 @@ fn owned_stateful_factory_registers_and_resolves_without_replica_lifecycle() {
     let maps = fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
     assert!(!maps.contains("libFabricRuntime") && !maps.contains("libFabricCommon"));
     let environment = fs::read(format!("/proc/{pid}/environ")).unwrap();
+    assert!(environment
+        .split(|b| *b == 0)
+        .any(|item| item == b"Fabric_NodeIPOrFQDN=192.0.2.11"));
     assert!(!environment.split(|b| *b == 0).any(|item| {
         item.starts_with(b"LD_LIBRARY_PATH=") || item.starts_with(b"FabricConfigFileName=")
     }));
@@ -169,6 +178,9 @@ fn owned_stateful_factory_registers_and_resolves_without_replica_lifecycle() {
         "finite renewal must retain the original registered runtime"
     );
     let logs = owner.logs();
+    assert!(logs
+        .iter()
+        .any(|line| line.contains("LOCAL_NODE_IP 192.0.2.11")));
     assert!(logs
         .iter()
         .any(|line| line.contains("LOCAL_STATEFUL_REGISTERED")));

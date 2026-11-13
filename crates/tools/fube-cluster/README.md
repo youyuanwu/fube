@@ -6,6 +6,11 @@ existing local RA/Hosting/runtime. It supports only the fixed
 not native Federation interoperability, full M1, recovery, failover or a general
 service host.
 
+The reusable native wire, retained-effect/timer and semantic-ACK adapter lives
+in [`fube_node::control`](../../libs/fube-node/src/control/mod.rs). This launcher
+still owns profile admission, parent controls and physical cleanup. Sharing
+that adapter does not by itself provide a standalone container Node.
+
 An explicit `--stateful-singleton` variant admits the existing
 `hosting-local-app` volatile package and one fresh 1/1 Primary lifetime per node.
 The two nodes host independent singleton partitions, not two replicas or an HA

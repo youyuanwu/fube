@@ -96,6 +96,8 @@ repeated native SDK copy reliability is not claimed.
 - [Broader pure-Rust runtime design and capability tiers](docs/runtime/RustFabricRuntime.md)
 - [Current SF/mssf API alignment: per-method shape, values, completion and limits](docs/runtime/SfApiAlignment.md)
 - [Basic pure-Rust cluster design: FM, RA/Hosting, authority and qualification milestones](docs/cluster/PureRustCluster.md)
+- [Standalone external-FM Node runner: configuration, native control and lifecycle limits](crates/tools/fube-node-runner/README.md)
+- [Standalone external-FM Nodes: feature, configuration and usage](docs/cluster/ExternalFmContainerNode.md)
 - [Minimal native-free FM launcher: two owned nodes, explicit stateless placement and cleanup limits](docs/cluster/MinimalFmCluster.md)
 - [Rust node-side Hosting: implemented H1 registration model, native map and remaining integration gates](docs/cluster/RustHosting.md)
 - [Hosting factory registration and owned local node/RA events: APIs, gates and native evidence](docs/cluster/HostingRegistrationEvents.md)

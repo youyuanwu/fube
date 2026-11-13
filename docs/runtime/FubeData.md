@@ -49,6 +49,15 @@ have no FabricRuntime, FabricCommon, COM or native replicator dependency.
 See [crate exports](../../crates/libs/fube-data/src/lib.rs),
 [peer transport](../../crates/libs/fube-data/src/transport.rs).
 
+`ReplicationEndpointOptions::advertised_ip` optionally selects the IP published
+in the replication endpoint and native ListenInstance while preserving the
+actual bound port and replica/actor identity. A wildcard `listen_address`
+requires this concrete IP. Without it, concrete listeners retain their existing
+published address. Unspecified/multicast advertised IPs, address-family mismatches
+and a different IP on a concrete listener reject; port translation is not
+supported. This is normal public runtime construction, not a role or membership
+override, and does not establish container or remote-native qualification.
+
 The existing peer supervisor bounds accepted and initiating sessions together,
 including pending handshakes. Initiators send a zero nonce; acceptors send a
 fresh listen-side nonce. Connect and hello exchange share one absolute budget.

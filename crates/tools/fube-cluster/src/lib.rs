@@ -2,7 +2,7 @@ mod fm;
 mod interlock;
 mod node;
 mod profile;
-mod wire;
+pub(crate) use fube_node::control::wire;
 
 pub use fm::Command;
 pub use profile::Result;
@@ -286,7 +286,7 @@ impl Cluster {
                     .unwrap()
                     .command(format!("admit {} {}\n", launch.session, launch.capability).as_bytes())
                     .map_err(err)?;
-                let channel = fube_transport::Endpoint::unsecured_loopback(
+                let channel = fube_transport::Endpoint::unsecured_tcp(
                     metadata.address,
                     wire::composition(true).map_err(err)?,
                 )
