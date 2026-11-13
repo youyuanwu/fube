@@ -1,18 +1,19 @@
 //! Fresh, single-partition volatile Nodes under one externally owned FM.
-//! No reconnect, promotion, peer replacement or runtime/store adoption.
+//! Thin process/transport ownership around the cluster-tested Node control ingress.
+//! No reconnect, peer replacement or runtime/store adoption.
 #![forbid(unsafe_code)]
 
 pub mod config;
-mod policy;
 
 pub use config::{Config, Fm, Identity, Placement};
 use fube_hosting::local::{Activation, NodeContext, Options, Profile};
 use fube_local_host::manifest::Package;
 use fube_node::{
     control::{
+        ingress::{Admission, Ingress},
         peer_target,
         wire::{self, Link},
-        Adapter,
+        Adapter, LfumUploadState,
     },
     local::Node,
 };
@@ -70,7 +71,9 @@ struct Owner {
     node: Option<Node>,
     store: Option<Arc<Store>>,
     adapter: Adapter,
-    policy: policy::Policy,
+    ingress: Ingress,
+    upload: LfumUploadState,
+    description: Option<NodeDescription>,
     bootstrapped: bool,
     error: Option<String>,
 }
@@ -78,6 +81,7 @@ struct Owner {
 impl Owner {
     fn new(config: Config) -> Result<Self> {
         config.validate()?;
+        let ingress = config.ingress()?;
         Package::load_with_profile(
             &config.package,
             &config.application,
@@ -108,7 +112,9 @@ impl Owner {
             node: None,
             store: None,
             adapter: Adapter::default(),
-            policy: policy::Policy::default(),
+            ingress,
+            upload: LfumUploadState::default(),
+            description: None,
             bootstrapped: false,
             error: None,
         };
@@ -161,6 +167,14 @@ impl Owner {
             "replica_role": state.map(|state| state.body.replica.current_role),
             "local_configuration_complete": state.is_some_and(|state| state.reconfiguration.as_ref()
                 .is_some_and(|configuration| configuration.stage == ra::ConfigurationStage::Complete)),
+            "generations": self.node.as_ref().map(|node| {
+                let state = node.generation_state();
+                serde_json::json!({
+                    "receive": state.receive.generation,
+                    "send": state.send.generation,
+                    "upload_pending": state.upload_pending,
+                })
+            }),
             "service_endpoint": state.map(|state| &state.body.replica.service_endpoint),
             "replication_endpoint": state.map(|state| &state.body.replica.replication_endpoint),
             "pending_commands": self.node.as_ref().map_or(0, Node::pending_commands),
@@ -398,6 +412,7 @@ impl Owner {
         )
         .map_err(err)?;
         self.bootstrapped = true;
+        self.description = Some(up.node);
         self.status("running", None)?;
         emit(
             &mut std::io::stdout().lock(),
@@ -411,6 +426,23 @@ impl Owner {
             return Ok(());
         };
         node.drive().map_err(err)?;
+        if let Some(description) = &self.description {
+            tokio::select! {
+                biased;
+                reply = self.upload.receive() => {
+                    self.upload.complete(node, &self.config.fm.identity.native()?, reply, Instant::now())?;
+                }
+                _ = std::future::ready(()) => {}
+            }
+            if !stopping && self.error.is_none() {
+                self.upload.advance(
+                    node,
+                    description,
+                    self.fm.as_ref().filter(|link| Self::live(link)),
+                    Instant::now(),
+                )?;
+            }
+        }
         if !stopping
             && self.error.is_none()
             && (self.fm.as_ref().is_some_and(|link| !Self::live(link))
@@ -473,10 +505,9 @@ impl Owner {
                 }
             }
             if let Some(mut incoming) = peer.incoming.take() {
-                match self.policy.peer(
-                    &self.config,
-                    &peer.placement,
+                match self.ingress.peer(
                     node,
+                    &peer.placement.identity.native()?,
                     &incoming.message,
                     stopping,
                 )? {
@@ -511,18 +542,21 @@ impl Owner {
                 }
             }
             if let Some(mut incoming) = self.fm_incoming.take() {
+                if !stopping && self.ingress.generation(node, link, &mut incoming).await? {
+                    if let Some(handoff) = incoming.handoff.as_mut() {
+                        handoff.acknowledge();
+                    }
+                    return Ok(());
+                }
                 if self.adapter.reject_deprecated(node, &incoming.message)? {
                     if let Some(handoff) = incoming.handoff.as_mut() {
                         handoff.acknowledge();
                     }
                     return Ok(());
                 }
-                match self
-                    .policy
-                    .fm(&self.config, node, &incoming.message, stopping)?
-                {
-                    policy::Admission::Retained => self.fm_incoming = Some(incoming),
-                    policy::Admission::Submitted(acknowledgement) => {
+                match self.ingress.fm(node, &incoming.message, stopping)? {
+                    Admission::Retained => self.fm_incoming = Some(incoming),
+                    Admission::Submitted(acknowledgement) => {
                         if let Some(acknowledgement) = acknowledgement {
                             self.adapter.track_acknowledgement(acknowledgement)?;
                         }

@@ -5,8 +5,11 @@ user-supplied Failover Manager (FM). Three Node processes form **one volatile
 partition** with one Primary, two ActiveSecondaries and fixed target/minimum
 replica-set sizes **3/2**.
 
-The feature supports fresh, healthy startup, application use and owned shutdown.
-It is experimental: there is no automatic failover, replacement, reconnect or
+The feature supports fresh startup, application use, explicitly FM-driven
+Primary app-host failover and owned shutdown. The runner is a thin owner over
+the same [Node control ingress](../../crates/libs/fube-node/src/control/ingress.rs)
+used and tested by the local cluster, not a separate reliability implementation.
+It is experimental: there is no replacement-host orchestration, reconnect or
 restart recovery. The deliverable is the standalone process binary and its
 native reliability contract. Container images, networking and orchestration
 belong to the user; fube does not ship a production FM or a container test tier.
@@ -297,6 +300,7 @@ cat /run/fube/node1-session1/status.json
 | `registered`, `application_pid` | Actual local application registration/process observations. |
 | `replica_phase`, `replica_role` | Committed local replica state. |
 | `local_configuration_complete` | Local RA configuration completion, not the FM's receipt of its reply. |
+| `generations` | Admitted receive/send generations and pending native inventory upload; not restart readiness. |
 | `control_unknown`, `error` | Observed error/control uncertainty; not permission to promote or reconnect. |
 | `cleanup` | Final local cleanup outcome, including separately reported `pending_work`. |
 
@@ -344,9 +348,12 @@ lists the accepted actors/actions and delivery rules; the
 evidence. Node instance, RA replica instance, package-version instance and
 replication actor incarnation are different identity domains.
 
-Exact retries of the admitted creation/build/configuration/activation inputs
-stay on their original Channels. A successful socket write is not a semantic
-ACK, and a retry is not another Open or authority to choose a different Primary.
+Native FM/peer messages use shared topology, immutable-size and capability
+admission; the Node/RA owns retries and reconfiguration state. A successful
+socket write is not a semantic ACK, and a retry is not another Open or authority
+to choose a different Primary. No standalone-only frozen configuration limits
+the shared RA to its initial admission. Primary app-host failover still needs
+matched failure observations, valid history and separate PC/CC quorum evidence.
 Native retry defaults are unchanged. The shared bounded wire profile retains
 its 64-KiB frame/body cap, 16 headers with 4-KiB values, bounded decode budget
 and 32 local command/effect observation slots.
@@ -359,14 +366,15 @@ and 32 local command/effect observation slots.
 | Lost semantic reply on a surviving Channel | The FM retries the same admitted operation and matches the actual native completion. |
 | FM loss while the Primary can still serve | FM loss alone does not revoke the runtime lease or prove the Primary stopped. Writes remain subject to normal partition authority and actual quorum. |
 | Invalid configuration or unsupported intent | Explicit rejection/error; no successful no-op or widened authority. |
-| Resize, replacement, promotion, generation turnover or reconciliation | Not admitted by this profile. |
+| Verified Primary app-host loss | The external FM can drive shared native GetLSN/reconfiguration/Deactivate/Activate; it must await final completion before publishing the new Primary. |
+| Resize, replacement-host acquisition or restart reconciliation | Unsupported branches remain explicit shared Node/RA or supervisor gates; dispatch alone grants no authority. |
 | FM/Node restart or volatile state loss | No adoption, rejoin or data recovery. Tear down the old deployment before starting a fresh one. |
 
 The profile supports one immutable original three-Node, one-partition volatile
-3/2 service only. It does not provide persisted state, elections, failover,
-membership removal/replacement, rolling upgrades, multiple partitions or native
-FM/Federation interoperability. Existing local-launcher app-host repair features
-do not make those operations available in this profile.
+3/2 service only. It does not provide persisted state, elections, a production
+FM, rolling upgrades, multiple partitions or native FM/Federation interoperability.
+The shared native ingress does not expose the local launcher's replacement-host
+supervision, peer reconnection or runtime adoption.
 
 ## Process-level verification
 
@@ -374,7 +382,8 @@ The [integration tests](../../crates/tools/fube-node-runner/tests/standalone.rs)
 launch actual Node binaries and application children under a native fixture FM.
 They cover initial 3/2 startup/build/admission, singleton write denial, real
 write/readback, lost build/final-reply replay, writes before FM observation,
-generation/membership refusal, FM-loss retention and owned shutdown.
+generation/membership refusal, FM-loss retention, verified Primary app-host loss
+with real peer failover and continuing writes, and owned shutdown.
 
 ```sh
 cargo nextest run --locked --workspace --all-targets --all-features \

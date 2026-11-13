@@ -1,9 +1,11 @@
 //! One caller-driven FM/peer adapter per owned local Node.
 //!
 //! Transport writes, applied RA commands, semantic ACKs and physical cleanup
-//! remain separate. The composition retains profile admission and original
-//! Channels; this adapter retains bounded sends, timers and ACK observations.
+//! remain separate. Shared ingress owns capability admission and dispatch;
+//! compositions retain original Channels and process ownership. The adapter
+//! retains bounded sends, timers and ACK observations.
 
+pub mod ingress;
 pub mod wire;
 
 use crate::local::{FmWork, LocalDisposition, Node};
@@ -537,6 +539,13 @@ impl Adapter {
     ) -> Result<()> {
         self.capture(node);
         self.commands(node)?;
+        if let Some(link) = peer_link {
+            // Peer control follows the Node's FM send generation, not socket bootstrap.
+            link.advance_generation(&GenerationHeader {
+                number: node.generation_state().send,
+                for_fm_replica: false,
+            });
+        }
         if let (Some(link), Some(peer), Some(reply)) = (peer_link, peer, self.peer_replies.front())
         {
             let swap_unit = match &reply.effect {

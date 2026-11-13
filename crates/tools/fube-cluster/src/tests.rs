@@ -3604,7 +3604,7 @@ async fn immutable_configured_service_builds_initial_membership_without_resize()
                 assert_eq!(placement.body()?.service, service);
                 let mut resize = placement.body()?;
                 resize.service.minimum = if minimum == 1 { 2 } else { 1 };
-                assert!(placement.launch.check_service_sizes(&resize.unit, &resize.service).is_err());
+                assert!(placement.launch.profile.control_profile().check_service_sizes(&resize.unit, &resize.service).is_err());
             }
             let status = cluster.status();
             for (i, node) in status["nodes"].as_array().unwrap().iter().enumerate() {

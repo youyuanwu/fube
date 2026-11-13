@@ -27,6 +27,16 @@ pub enum ServiceProfile {
     },
 }
 impl ServiceProfile {
+    pub fn control_profile(self) -> fube_node::control::ingress::Profile {
+        use fube_node::control::ingress::Profile;
+        match self {
+            Self::Stateless => Profile::Stateless,
+            Self::StatefulSingleton => Profile::StatefulSingleton,
+            Self::StatefulPeerIdle => Profile::StatefulPeerIdle,
+            Self::StatefulThree => Profile::StatefulThree,
+            Self::Stateful { target, minimum } => Profile::Stateful { target, minimum },
+        }
+    }
     pub fn service(self) -> &'static str {
         match self {
             Self::Stateless => SERVICE,
@@ -37,40 +47,22 @@ impl ServiceProfile {
         }
     }
     pub fn stateful(self) -> bool {
-        self != Self::Stateless
+        self.control_profile().stateful()
     }
     pub fn peer_replicas(self) -> bool {
-        matches!(self, Self::StatefulPeerIdle | Self::StatefulThree)
-            || matches!(self, Self::Stateful { target, .. } if target > 1)
+        self.control_profile().peer_replicas()
     }
     pub fn configured_sizes(self) -> Option<(i32, i32)> {
-        match self {
-            Self::Stateful { target, minimum } => Some((target, minimum)),
-            _ => None,
-        }
+        self.control_profile().configured_sizes()
     }
     pub fn mesh_peers(self) -> bool {
-        matches!(self, Self::StatefulThree | Self::Stateful { .. })
+        self.control_profile().mesh_peers()
     }
     pub fn validate(self) -> Result<()> {
-        if let Some((target, minimum)) = self.configured_sizes() {
-            if minimum < 1
-                || target < minimum
-                || target as usize > fube_ra::entity::MAX_CONFIGURATION_REPLICAS
-            {
-                return Err("stateful sizes require 1 <= minimum <= target <= 64".into());
-            }
-        }
-        Ok(())
+        self.control_profile().validate()
     }
     pub fn node_count(self) -> usize {
-        if let Self::Stateful { target, .. } = self {
-            target as usize
-        } else if self == Self::StatefulThree {
-            3
-        } else {
-            2
-        }
+        self.control_profile().node_count()
     }
 }
 
@@ -238,21 +230,35 @@ pub struct Launch {
     pub peers: Vec<Peer>,
 }
 impl Launch {
-    pub fn check_service_sizes(&self, unit: &FailoverUnit, service: &Service) -> Result<()> {
-        if self
-            .profile
-            .configured_sizes()
-            .is_some_and(|(target, minimum)| {
-                unit.target != target
-                    || unit.minimum != minimum
-                    || service.target != target
-                    || service.minimum != minimum
-            })
-        {
-            return Err("replica-set settings are immutable for this service".into());
-        }
-        Ok(())
+    pub fn ingress(&self) -> Result<fube_node::control::ingress::Ingress> {
+        use fube_node::control::ingress::{Ingress, Placement};
+        Ingress::new(
+            self.profile.control_profile(),
+            self.placement == 1,
+            PartitionId {
+                guid: fube_transport::serialization::serde::Guid(
+                    uuid::Uuid::parse_str(&self.partition)
+                        .map_err(err)?
+                        .to_bytes_le(),
+                ),
+            },
+            self.fm.clone(),
+            Placement {
+                node: self.node.clone(),
+                replica: self.replica,
+                incarnation: self.incarnation,
+            },
+            self.peers
+                .iter()
+                .map(|peer| Placement {
+                    node: peer.node.clone(),
+                    replica: peer.replica,
+                    incarnation: peer.incarnation,
+                })
+                .collect(),
+        )
     }
+
     pub fn host_replacement_path(&self, replica: i64, instance: i64) -> PathBuf {
         self.directory
             .join(format!("repaired-host-{replica}-{instance}.json"))

@@ -17,6 +17,14 @@ bounded JSON commands, independent application contact and cleanup receipts.
 It uses the production local Node/RA/Hosting/runtime, memory store and common
 transport engine, not simulated application activation.
 
+FM/peer decoding, topology/capability admission and command dispatch live in
+[`fube-node::control::ingress`](../../crates/libs/fube-node/src/control/ingress.rs).
+Both this launcher and the standalone external-FM runner use that boundary;
+neither implements its own RA reconfiguration state machine. Launcher-specific
+parent control, host-replacement receipts and process/Channel ownership remain
+outside it. Backpressure retains the original incoming frame and unacknowledged
+handoff rather than closing the FM connection.
+
 ## Immutable configured initial membership
 
 The configured volatile profile is selected with

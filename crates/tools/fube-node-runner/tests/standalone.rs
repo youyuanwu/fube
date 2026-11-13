@@ -185,9 +185,11 @@ struct FmFixture {
     links: Vec<Option<Link>>,
     configurations: Vec<Config>,
     bootstrapped: [bool; 3],
+    uploaded: [bool; 3],
     primary: Option<AddPrimaryReply>,
     builds: Vec<AddReplicaReply>,
     configured: Vec<ConfigurationReply>,
+    losses: Vec<usize>,
     deleted: [bool; 3],
     hold_build: bool,
     held_build: Option<AddReplicaReply>,
@@ -233,9 +235,11 @@ impl FmFixture {
             links,
             configurations: fixture.configs.clone(),
             bootstrapped: [false; 3],
+            uploaded: [false; 3],
             primary: None,
             builds: vec![],
             configured: vec![],
+            losses: vec![],
             deleted: [false; 3],
             hold_build: false,
             held_build: None,
@@ -268,6 +272,23 @@ impl FmFixture {
             wire::predecode(&incoming.message).unwrap();
             let generation = self.configurations[index].generation().unwrap();
             match incoming.message.properties().unwrap().action.as_str() {
+                "LFUMUpload" => {
+                    let body = decode_lfum_upload(&incoming.message).unwrap();
+                    assert_eq!(body.generation, generation.number);
+                    assert!(body.units.0.is_empty() && !body.any_replica_found);
+                    incoming
+                        .reply
+                        .take()
+                        .unwrap()
+                        .reply(
+                            link.seal(lfum_upload_reply_message(&generation).unwrap())
+                                .unwrap(),
+                            wire::deadline(),
+                        )
+                        .await
+                        .unwrap();
+                    self.uploaded[index] = true;
+                }
                 "NodeUp" => {
                     let body = decode_node_up(&incoming.message).unwrap();
                     body.validate_fresh_stateless().unwrap();
@@ -291,10 +312,9 @@ impl FmFixture {
                     if body.last && body.replicas.0.is_empty() && body.dropped.0.is_empty() {
                         self.bootstrapped[index] = true;
                     } else {
-                        assert!(self.stopping, "no live reconciliation/recovery is admitted");
-                        assert!(body.replicas.0.is_empty());
-                        assert_eq!(body.dropped.0.len(), 1);
-                        let dropped = &body.dropped.0[0];
+                        assert!(!body.last && !body.from_fmm);
+                        assert_eq!(body.replicas.0.len() + body.dropped.0.len(), 1);
+                        let dropped = body.replicas.0.first().or(body.dropped.0.first()).unwrap();
                         let config = &self.configurations[index];
                         assert_eq!(dropped.unit.id, config.partition_id().unwrap());
                         assert_eq!(dropped.service, primary(config).service);
@@ -305,6 +325,9 @@ impl FmFixture {
                         assert_eq!(replica.instance, config.node.replica_instance);
                         assert!(!replica.up);
                         assert_eq!(replica.state, 3);
+                        if !self.stopping && !self.deleted[index] && !self.losses.contains(&index) {
+                            self.losses.push(index);
+                        }
                     }
                     link.send(replica_up_reply_message(&body, &generation).unwrap())
                         .await
@@ -469,6 +492,16 @@ async fn lost_fm_channel_preserves_original_writer_until_explicit_owned_shutdown
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_primary_failover_uses_cluster_tested_ra_after_verified_app_host_loss() {
+    journey(Fault::Failover).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_generation_handshake_and_empty_upload_resume_shared_control() {
+    journey(Fault::GenerationHandshake).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_wrong_generation_refuses_new_authority() {
     journey(Fault::Generation).await;
 }
@@ -479,7 +512,7 @@ async fn standalone_resize_refuses_changed_membership() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn standalone_promotion_refuses_another_primary() {
+async fn standalone_invalid_role_change_is_rejected_by_shared_ra() {
     journey(Fault::Promotion).await;
 }
 
@@ -496,6 +529,8 @@ enum Fault {
     Resize,
     Promotion,
     ForeignInstance,
+    Failover,
+    GenerationHandshake,
 }
 
 async fn journey(fault: Fault) {
@@ -510,9 +545,43 @@ async fn journey(fault: Fault) {
         fm.bootstrapped.iter().all(|ready| *ready)
     })
     .await;
+    if fault == Fault::GenerationHandshake {
+        for index in 0..3 {
+            let mut generation = fm.configurations[index].generation().unwrap();
+            generation.number.generation += 1;
+            let link = fm.links[index].as_ref().unwrap();
+            let reply = link
+                .request(generation_proposal_message(&generation).unwrap())
+                .await
+                .unwrap();
+            let reply = decode_generation_proposal_reply(&reply).unwrap();
+            assert_eq!(reply.error, 0);
+            assert_eq!(reply.proposed, generation.number);
+            fm.configurations[index].fm.generation += 1;
+            link.advance_generation(&generation);
+            fm.send(
+                index,
+                generation_update_message(&GenerationUpdate::default(), &generation).unwrap(),
+            )
+            .await;
+        }
+        fm.until(&mut fixture, |fm| {
+            fm.uploaded.iter().all(|uploaded| *uploaded)
+        })
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (0..3).any(|index| fixture.status(index)["generations"]["send"] != 2) {
+            assert!(
+                Instant::now() < deadline,
+                "generation completion: {}",
+                fixture.diagnostics()
+            );
+            fm.step().await;
+        }
+    }
     let selected = 1;
     let body = primary(&fixture.configs[selected]);
-    let generation = fixture.configs[selected].generation().unwrap();
+    let generation = fm.configurations[selected].generation().unwrap();
     fm.send(selected, add_primary_message(&body, &generation).unwrap())
         .await;
     fm.until(&mut fixture, |fm| fm.primary.is_some()).await;
@@ -616,13 +685,146 @@ async fn journey(fault: Fault) {
     .await;
     fm.until(&mut fixture, |fm| fm.configured.len() == 1).await;
     assert_eq!(fm.configured[0], original);
-    for config in &fixture.configs {
+    let mut deletion_bodies: Vec<_> = fixture
+        .configs
+        .iter()
+        .map(|config| AddInstance {
+            unit: completed.clone(),
+            service: body.service.clone(),
+            replica: configuration
+                .configuration
+                .replicas
+                .0
+                .iter()
+                .find(|replica| replica.node == config.node.identity.native().unwrap())
+                .unwrap()
+                .clone(),
+        })
+        .collect();
+    for (index, config) in fixture.configs.iter().enumerate() {
+        let status = fixture.status(index);
+        let address = config.node.address.to_string();
+        if status["service_endpoint"].as_str() == Some(&address)
+            || status["replication_endpoint"]
+                .as_str()
+                .and_then(|endpoint| endpoint.split('/').next())
+                == Some(&address)
+        {
+            // An application listener may reuse the released ephemeral RA port.
+            continue;
+        }
         assert!(
             TcpStream::connect(config.node.address).await.is_err(),
             "an established mesh must not accept duplicate/replacement sessions"
         );
     }
-    if fault != Fault::None {
+    if fault == Fault::Failover {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let state: Value =
+                serde_json::from_str(&application(&endpoint, "state").await).unwrap();
+            if state["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|peer| peer["applied"].as_i64().unwrap() >= 1)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "all original peers must apply before loss: {state}"
+            );
+            fm.step().await;
+        }
+        let lost_pid = pids[selected].as_u64().unwrap();
+        assert!(Command::new("kill")
+            .args(["-KILL", &lost_pid.to_string()])
+            .status()
+            .unwrap()
+            .success());
+        fm.until(&mut fixture, |fm| fm.losses.contains(&selected))
+            .await;
+        assert!(
+            TcpStream::connect(&endpoint).await.is_err(),
+            "lost Primary listener cannot survive"
+        );
+
+        let candidate = 0;
+        let mut failover = configuration.clone();
+        failover.configuration.unit = original.unit.clone();
+        failover.configuration.unit.previous = original.unit.current;
+        failover.configuration.unit.current.configuration += 0x1_0000_0001;
+        failover.configuration.replicas = original.replicas.clone();
+        for replica in &mut failover.configuration.replicas.0 {
+            replica.previous_role = replica.current_role;
+            if replica.node == fixture.configs[selected].node.identity.native().unwrap() {
+                replica.current_role = 1;
+                replica.up = false;
+                replica.state = 3;
+            } else if replica.node == fixture.configs[candidate].node.identity.native().unwrap() {
+                replica.current_role = 4;
+            }
+            replica.first_lsn = -1;
+            replica.last_lsn = -1;
+        }
+        fm.send(
+            candidate,
+            do_reconfiguration_message(&failover, &generation).unwrap(),
+        )
+        .await;
+        fm.until(&mut fixture, |fm| fm.configured.len() == 2).await;
+        let promoted = fm.configured[1].clone();
+        let new_primary = promoted
+            .replicas
+            .0
+            .iter()
+            .find(|replica| replica.current_role == 4)
+            .unwrap();
+        assert_eq!(
+            new_primary.node,
+            fixture.configs[candidate].node.identity.native().unwrap()
+        );
+        assert!(application(&new_primary.service_endpoint, "read")
+            .await
+            .contains("value=acknowledged"));
+        assert!(application(&new_primary.service_endpoint, "write-more")
+            .await
+            .starts_with("OK"));
+        assert!(application(&new_primary.service_endpoint, "read")
+            .await
+            .contains("value=continued"));
+        assert!(
+            TcpStream::connect(&endpoint).await.is_err(),
+            "lost Primary listener cannot survive"
+        );
+        fm.send(
+            candidate,
+            do_reconfiguration_message(&failover, &generation).unwrap(),
+        )
+        .await;
+        fm.until(&mut fixture, |fm| fm.configured.len() == 3).await;
+        assert_eq!(fm.configured[2], promoted);
+        for (index, deletion) in deletion_bodies.iter_mut().enumerate() {
+            if index != selected {
+                deletion.unit = promoted.unit.clone();
+                deletion.replica = promoted
+                    .replicas
+                    .0
+                    .iter()
+                    .find(|replica| {
+                        replica.node == fixture.configs[index].node.identity.native().unwrap()
+                    })
+                    .unwrap()
+                    .clone();
+            }
+        }
+    }
+    let refusal = !matches!(
+        fault,
+        Fault::None | Fault::Failover | Fault::GenerationHandshake
+    );
+    if refusal {
         if fault == Fault::LostFm {
             fm.links[selected].take().unwrap().close().await.unwrap();
         } else {
@@ -656,10 +858,9 @@ async fn journey(fault: Fault) {
         let expected = match fault {
             Fault::LostFm => "Channel",
             Fault::Generation => "generation",
-            Fault::Resize => "immutable 3/2",
-            Fault::Promotion => "unchanged-Primary",
-            Fault::ForeignInstance => "missing or duplicate original",
-            Fault::None => unreachable!(),
+            Fault::Resize => "immutable for this service",
+            Fault::Promotion | Fault::ForeignInstance => "only initial configured admission",
+            Fault::None | Fault::Failover | Fault::GenerationHandshake => unreachable!(),
         };
         assert!(
             fixture.status(selected)["error"]
@@ -683,24 +884,10 @@ async fn journey(fault: Fault) {
     }
     for (index, pid) in pids.iter().enumerate() {
         assert_eq!(&fixture.status(index)["application_pid"], pid);
-        if fault != Fault::None && index == selected {
+        if refusal && index == selected {
             continue;
         }
-        let replica = configuration
-            .configuration
-            .replicas
-            .0
-            .iter()
-            .find(|replica| replica.node == fixture.configs[index].node.identity.native().unwrap())
-            .unwrap();
-        let delete = DeleteReplica::new(
-            AddInstance {
-                unit: completed.clone(),
-                service: body.service.clone(),
-                replica: replica.clone(),
-            },
-            false,
-        );
+        let delete = DeleteReplica::new(deletion_bodies[index].clone(), false);
         fm.send(index, delete_replica_message(&delete, &generation).unwrap())
             .await;
     }
@@ -708,7 +895,7 @@ async fn journey(fault: Fault) {
         fm.deleted
             .iter()
             .enumerate()
-            .all(|(index, deleted)| *deleted || (fault != Fault::None && index == selected))
+            .all(|(index, deleted)| *deleted || (refusal && index == selected))
     })
     .await;
     fm.stopping = true;
@@ -726,7 +913,7 @@ async fn journey(fault: Fault) {
         link.close().await.unwrap();
     }
     let mut expected = [true; 3];
-    expected[selected] = fault == Fault::None;
+    expected[selected] = !refusal;
     fixture.finish(expected);
 }
 
