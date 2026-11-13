@@ -54,6 +54,95 @@ struct PeerConnection {
     dialed: bool,
 }
 
+type UploadRequest =
+    Pin<Box<dyn Future<Output = Result<Option<fube_transport::message::Message>>> + Send>>;
+
+struct LfumUploadState {
+    request: Option<UploadRequest>,
+    body: Option<LfumUpload>,
+    retry_at: Instant,
+}
+
+impl Default for LfumUploadState {
+    fn default() -> Self {
+        Self {
+            request: None,
+            body: None,
+            retry_at: Instant::now(),
+        }
+    }
+}
+
+impl LfumUploadState {
+    fn complete(
+        &mut self,
+        node: &Node,
+        source: &NodeInstance,
+        reply: Result<Option<fube_transport::message::Message>>,
+        now: Instant,
+    ) -> Result<()> {
+        self.request = None;
+        self.retry_at = now
+            + ticks(
+                node.native_config()
+                    .node(ra::NodeProperty::LfumUploadRetryIntervalTicks)
+                    .max(1),
+            );
+        if let Some(message) = reply? {
+            wire::predecode(&message)?;
+            let generation = decode_lfum_upload_reply(&message).map_err(err)?;
+            if node
+                .process_lfum_upload_reply(source, &generation)
+                .map_err(err)?
+            {
+                self.body = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn advance(
+        &mut self,
+        node: &Node,
+        description: &NodeDescription,
+        link: Option<&Link>,
+        now: Instant,
+    ) -> Result<()> {
+        let generations = node.generation_state();
+        if self.request.is_none()
+            && self
+                .body
+                .as_ref()
+                .is_some_and(|body| body.generation != generations.receive)
+        {
+            self.body = None;
+            self.retry_at = now;
+        }
+        if generations.upload_pending && self.body.is_none() && self.request.is_none() {
+            self.retry_at = now;
+        }
+        let Some(link) = link else { return Ok(()) };
+        if !generations.upload_pending || self.request.is_some() || now < self.retry_at {
+            return Ok(());
+        }
+        let Some(inventory) = node.lfum_inventory().map_err(err)? else {
+            return Ok(());
+        };
+        let body = self.body.get_or_insert_with(|| LfumUpload {
+            generation: inventory.generation,
+            node: description.clone(),
+            units: inventory.units,
+            any_replica_found: inventory.any_replica_found,
+        });
+        let request = lfum_upload_message(body).map_err(err)?;
+        let link = link.clone();
+        self.request = Some(Box::pin(
+            async move { link.request_optional(request).await },
+        ));
+        Ok(())
+    }
+}
+
 fn peer_target(effect: &ra::Effect) -> Option<&NodeInstance> {
     match effect {
         ra::Effect::PeerCreateReplica { target, .. }
@@ -1043,43 +1132,21 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut published_host_loss = false;
     let mut repair_requested = None;
     let mut repaired_hosts = Vec::new();
-    type UploadRequest =
-        Pin<Box<dyn Future<Output = Result<Option<fube_transport::message::Message>>> + Send>>;
-    let mut upload_request: Option<UploadRequest> = None;
-    let mut upload_body: Option<LfumUpload> = None;
-    let mut upload_retry_at = Instant::now();
+    let mut upload = LfumUploadState::default();
     if failure.is_none() {
         loop {
             // Owned stop remains independent of FM connectivity. Link loss is
             // not permission to stop an existing app or fake lifecycle replies.
             tokio::select! {
                 reply = async {
-                    match upload_request.as_mut() {
+                    match upload.request.as_mut() {
                         Some(request) => request.await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    upload_request = None;
-                    match reply {
-                        Ok(Some(message)) => {
-                            let processed = wire::predecode(&message).and_then(|()| {
-                                let generation = decode_lfum_upload_reply(&message).map_err(err)?;
-                                node.process_lfum_upload_reply(&launch.fm, &generation).map_err(err)
-                            });
-                            match processed {
-                                Ok(true) => upload_body = None,
-                                Ok(false) => {}
-                                Err(error) => adapter.error = Some(error),
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => adapter.error = Some(error),
+                    if let Err(error) = upload.complete(&node, &launch.fm, reply, Instant::now()) {
+                        adapter.error = Some(error);
                     }
-                    let ticks = node.native_config().node(ra::NodeProperty::LfumUploadRetryIntervalTicks).max(1);
-                    upload_retry_at = Instant::now() + Duration::new(
-                        ticks as u64 / 10_000_000,
-                        ((ticks as u64 % 10_000_000) * 100) as u32,
-                    );
                 }
                 control = control_line(&mut control) => {
                     match control {
@@ -1189,50 +1256,13 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 failure = Some(err(error));
                 break;
             }
-            let generations = node.generation_state();
-            if upload_request.is_none()
-                && upload_body
-                    .as_ref()
-                    .is_some_and(|body| body.generation != generations.receive)
-            {
-                upload_body = None;
-                upload_retry_at = Instant::now();
-            }
-            if generations.upload_pending && upload_body.is_none() && upload_request.is_none() {
-                upload_retry_at = Instant::now();
-            }
-            if generations.upload_pending
-                && link.is_some()
-                && adapter.error.is_none()
-                && upload_request.is_none()
-                && Instant::now() >= upload_retry_at
-            {
-                let inventory = node.lfum_inventory().map_err(err);
-                match inventory {
-                    Ok(Some(inventory)) => {
-                        let body = upload_body.get_or_insert_with(|| LfumUpload {
-                            generation: inventory.generation,
-                            node: up.node.clone(),
-                            units: inventory.units,
-                            any_replica_found: inventory.any_replica_found,
-                        });
-                        if let Some(owner) = &link {
-                            match lfum_upload_message(body) {
-                                Ok(request) => {
-                                    let owner = owner.clone();
-                                    upload_request = Some(Box::pin(async move {
-                                        owner.request_optional(request).await
-                                    }));
-                                }
-                                Err(error) => {
-                                    adapter.error = Some(err(error));
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => adapter.error = Some(error),
-                }
+            if let Err(error) = upload.advance(
+                &node,
+                &up.node,
+                link.as_ref().filter(|_| adapter.error.is_none()),
+                Instant::now(),
+            ) {
+                adapter.error = Some(error);
             }
             if adapter.error.is_some() {
                 if let Some(old) = link.take() {
@@ -1539,7 +1569,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
             }
         }
     }
-    drop(upload_request);
+    drop(upload);
     if let Some(link) = link.take() {
         let _ = link.close().await;
     }
@@ -3779,8 +3809,9 @@ pub(crate) mod report_tests {
                 | StatefulDown::DropProvider
                 | StatefulDown::ForceAbortProvider
         ) {
-            // Intentionally lose the first valid ACK; run the actual native-default timer.
-            let retry_end = Instant::now() + Duration::from_secs(35);
+            // The interval is checked above; fire its retained owner without wall-clock delay.
+            timer(adapter)?.due = Instant::now();
+            let retry_end = Instant::now() + Duration::from_secs(10);
             let before_retry = traffic.reports.len();
             while traffic.reports.len() == before_retry {
                 if Instant::now() >= retry_end {
@@ -3974,6 +4005,133 @@ pub(crate) mod report_tests {
     pub(crate) async fn run_reuse(launch: &Launch) -> Result<Result<()>> {
         run_case(launch, true).await
     }
+
+    async fn next_lfum(
+        upload: &mut LfumUploadState,
+        fm: &Link,
+    ) -> Result<
+        fube_transport::channel::IncomingMessage<fube_transport::native_channel::GatewayTarget>,
+    > {
+        let request = upload.request.as_mut().ok_or("missing LFUM request")?;
+        tokio::select! {
+            incoming = fm.receive(wire::deadline()) => incoming?.ok_or("missing LFUM upload".into()),
+            reply = request => Err(format!("LFUM request completed before FM received it: {reply:?}")),
+        }
+    }
+
+    pub(crate) async fn run_lfum_retry(launch: &Launch) -> Result<Result<()>> {
+        let (mut node, store) = create_node(launch).await?;
+        let mut adapter = Adapter::default();
+        let result = async {
+            node.start(&launch.package, APPLICATION, &[]).map_err(err)?;
+            let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
+            let up = NodeUp::fresh_stateless(
+                launch.name(),
+                "fube-cluster-local".into(),
+                listener.local_addr().map_err(err)?,
+                FabricVersionInstance::native_default(),
+            )
+            .map_err(err)?;
+            let (fm, link) = links(launch).await?;
+            let operation = async {
+                let mut generation = launch.generation.clone();
+                generation.number.generation += 1;
+                let proposal = node
+                    .process_generation_proposal(&launch.fm, &generation)
+                    .map_err(err)?;
+                if proposal.error != 0
+                    || node
+                        .process_generation_update(
+                            &launch.fm,
+                            &GenerationUpdate::default(),
+                            &generation,
+                        )
+                        .map_err(err)?
+                        != ra::GenerationUpdateOutcome::UploadRequired
+                {
+                    return Err("native generation did not require LFUM upload".into());
+                }
+                let mut upload = LfumUploadState::default();
+                let end = Instant::now() + Duration::from_secs(3);
+                while upload.request.is_none() {
+                    node.drive().map_err(err)?;
+                    upload.advance(&node, &up.node, Some(&link), Instant::now())?;
+                    if Instant::now() >= end {
+                        return Err("LFUM inventory read barrier deadline".into());
+                    }
+                    tokio::task::yield_now().await;
+                }
+                let mut first = next_lfum(&mut upload, &fm).await?;
+                let frozen = decode_lfum_upload(&first.message).map_err(err)?;
+                if let Some(handoff) = first.handoff.as_mut() {
+                    handoff.acknowledge();
+                }
+                drop(first);
+                let reply = upload.request.as_mut().unwrap().await?;
+                if reply.is_some() {
+                    return Err("lost LFUM reply unexpectedly completed".into());
+                }
+                let completed = Instant::now();
+                upload.complete(&node, &launch.fm, Ok(None), completed)?;
+                let due = upload.retry_at;
+                if due - completed
+                    != ticks(
+                        node.native_config()
+                            .node(ra::NodeProperty::LfumUploadRetryIntervalTicks),
+                    )
+                    || upload.body.as_ref() != Some(&frozen)
+                    || !node.generation_state().upload_pending
+                {
+                    return Err(
+                        "lost reply changed the frozen inventory or native retry interval".into(),
+                    );
+                }
+                upload.advance(&node, &up.node, Some(&link), due - Duration::from_nanos(1))?;
+                if upload.request.is_some() {
+                    return Err("LFUM retried before its native deadline".into());
+                }
+                upload.advance(&node, &up.node, Some(&link), due)?;
+                let mut retry = next_lfum(&mut upload, &fm).await?;
+                if decode_lfum_upload(&retry.message).map_err(err)? != frozen {
+                    return Err("LFUM retry changed the frozen upload".into());
+                }
+                retry
+                    .reply
+                    .take()
+                    .ok_or("LFUM retry missing reply authority")?
+                    .reply(
+                        fm.seal(lfum_upload_reply_message(&generation).map_err(err)?)?,
+                        wire::deadline(),
+                    )
+                    .await
+                    .map_err(err)?;
+                if let Some(handoff) = retry.handoff.as_mut() {
+                    handoff.acknowledge();
+                }
+                let reply = upload.request.as_mut().unwrap().await;
+                upload.complete(&node, &launch.fm, reply, Instant::now())?;
+                if node.generation_state().upload_pending
+                    || node.generation_state().send != generation.number
+                    || upload.body.is_some()
+                {
+                    return Err("matched LFUM reply did not settle the original upload".into());
+                }
+                upload.advance(&node, &up.node, Some(&link), due + Duration::from_secs(60))?;
+                if upload.request.is_some() {
+                    return Err("completed LFUM upload retried".into());
+                }
+                Ok(())
+            }
+            .await;
+            let fm_closed = fm.close().await;
+            let node_closed = link.close().await;
+            operation.and(fm_closed).and(node_closed)
+        }
+        .await;
+        cleanup(launch, &mut node, &store, &mut adapter).await?;
+        Ok(result)
+    }
+
     async fn exercise_stateful_tombstone(
         launch: &Launch,
         node: &mut Node,
@@ -4857,13 +5015,14 @@ pub(crate) mod report_tests {
                                 || target.instance_disposal().is_some() != graceful
                             { return Err("stale/non-dropped ACK completed the original terminal-report obligation".into()); }
                         }
-                        if graceful || dropping {
+                        if graceful || closing_loss {
                             if timer(&mut target_adapter)?.due.saturating_duration_since(Instant::now()) < Duration::from_secs(25) {
                                 return Err("Close/Drop did not retain the native 30-second report retry".into());
                             }
                             if provider && terminal_deletion.is_none() {
+                                timer(&mut target_adapter)?.due = Instant::now();
                                 let before = target_traffic.reports.len();
-                                let end = Instant::now() + Duration::from_secs(35);
+                                let end = Instant::now() + Duration::from_secs(10);
                                 while target_traffic.reports.len() == before {
                                     peer_step(&launches[0], &mut source, &mut source_adapter, &source_link, Some(&fm_link)).await
                                         .map_err(|error| format!("Close report retry source peer progress: {error}"))?;
@@ -5439,10 +5598,10 @@ pub(crate) mod report_tests {
                         if !continued.contains("committed=2 value=continued") {
                             return Err("held destination deletion blocked the Primary".into());
                         }
+                        let marker = if provider { "LOCAL_DATA_PROVIDER dispose begin" } else { "LOCAL_DISPOSE begin" };
                         if opening {
                             release_fixture_barrier(&target, "local-open.release")?;
                         }
-                        let marker = if provider { "LOCAL_DATA_PROVIDER dispose begin" } else { "LOCAL_DISPOSE begin" };
                         until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
                             &mut target_traffic, |node, _, _| node.activation().logs().iter().any(|line| line.contains(marker))).await?;
                         target_fm.send(delete_replica_message(&deleting, &launches[1].generation).map_err(err)?).await?;
@@ -5514,9 +5673,16 @@ pub(crate) mod report_tests {
                             return Ok(());
                         }
                         release_disposal(&target, if provider { StatefulDown::CloseProvider } else { StatefulDown::CloseService })?;
-                        until_with_budget(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
-                            &mut target_traffic, Duration::from_secs(if opening { 20 } else { 10 }),
-                            |node, adapter, traffic| traffic.removed
+                        if opening {
+                            until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
+                                &mut target_traffic, |node, _, _| node.activation().logs().iter()
+                                    .any(|line| line.contains("LOCAL_DISPOSE complete"))).await?;
+                            if target.snapshot(entity).committed.is_some_and(|state| state.phase == ra::Phase::Closing) {
+                                target.retry(request.unit.id.clone()).map_err(err)?;
+                            }
+                        }
+                        until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
+                            &mut target_traffic, |node, adapter, traffic| traffic.removed
                                 && adapter.replica_drained(node) && node.instance_disposal().is_some()).await?;
                         let profile = actual_profile(&target)?;
                         let proof = RetirementReceipt {
