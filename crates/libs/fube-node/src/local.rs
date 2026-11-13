@@ -411,6 +411,22 @@ pub struct Node {
     hold_replies: bool,
 }
 impl Node {
+    fn fm_primary_profile(&self) -> bool {
+        matches!(
+            self.activation.profile(),
+            h::local::Profile::VolatileStatefulFmPrimary
+                | h::local::Profile::VolatileStatefulExternalFm
+        )
+    }
+
+    fn peer_profile(&self) -> bool {
+        matches!(
+            self.activation.profile(),
+            h::local::Profile::VolatileStatefulLifecycle
+                | h::local::Profile::VolatileStatefulExternalFm
+        )
+    }
+
     /// Takes an unstarted Activation and creates its dedicated RA executor.
     /// The original lifetime gate is installed before process/session admission.
     pub fn new(
@@ -429,6 +445,8 @@ impl Node {
             return Err(Error::Unsupported);
         }
         settings.max_entities = 1;
+        settings.allow_active_replica_delete =
+            activation.profile() == h::local::Profile::VolatileStatefulExternalFm;
         settings.max_command_bytes = settings.max_command_bytes.min(BODY);
         settings.max_effects = settings.max_effects.min(SLOTS);
         settings.max_registration_lookups = settings.max_registration_lookups.min(SLOTS);
@@ -627,7 +645,7 @@ impl Node {
     }
     pub fn fm_work(&mut self, work: FmWork) -> Result<u64> {
         let stateless = self.activation.profile() == h::local::Profile::Stateless;
-        let peer_work = self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
+        let peer_work = self.peer_profile()
             && self.ra.peer().is_some()
             && matches!(
                 work,
@@ -642,10 +660,7 @@ impl Node {
                     | FmWork::RetryReport(_)
                     | FmWork::ReplicaUpReply(..)
             );
-        if !stateless
-            && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
-            && !peer_work
-        {
+        if !stateless && !self.fm_primary_profile() && !peer_work {
             return Err(Error::Unsupported);
         }
         if !stateless
@@ -730,7 +745,20 @@ impl Node {
                                 && incoming.unit.current.older_than(s.body.unit.current)
                         })
                 });
-                if peer_work && !stale_host {
+                // Whole-service teardown may delete an original active member.
+                // Legacy peer profiles still require their retirement/loss gates.
+                let external_active = self.activation.profile()
+                    == h::local::Profile::VolatileStatefulExternalFm
+                    && current.as_ref().is_some_and(|state| {
+                        matches!(state.body.replica.current_role, 3 | 4)
+                            && (state.fm_primary || state.peer_creation.is_some())
+                            && state.body.replica.node == incoming.replica.node
+                            && state.body.replica.id == incoming.replica.id
+                            && incoming.replica.instance <= state.body.replica.instance
+                            && state.body.unit.current == incoming.unit.current
+                            && state.body.service == incoming.service
+                    });
+                if peer_work && !stale_host && !external_active {
                     let eligible = match &current {
                         None => self.selected.is_none() || self.pending.iter().any(|pending| {
                             matches!(&pending.work, Work::Fm(FmWork::DeleteReplica(original, ..))
@@ -867,7 +895,7 @@ impl Node {
         Ok(self.ra.bind_peers(sources)?)
     }
     pub fn create_idle_on_peer(&mut self, replica: Replica) -> Result<u64> {
-        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+        if !self.fm_primary_profile()
             || !self.live.load(Ordering::SeqCst)
             || self.ra.generation_state().upload_pending
             || !self.ra.is_peer(&replica.node)
@@ -901,7 +929,7 @@ impl Node {
         self.control_idle_on_peer(true)
     }
     fn control_idle_on_peer(&mut self, remove: bool) -> Result<u64> {
-        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+        if !self.fm_primary_profile()
             || !self.live.load(Ordering::SeqCst)
             || self.ra.generation_state().upload_pending
             || self.ra.peer().is_none()
@@ -937,7 +965,7 @@ impl Node {
                 && state.body.replica.instance == base.replica.instance
                 && state.body.unit == base.unit
         });
-        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+        if !self.peer_profile()
             || !self.ra.is_peer(source)
             || generation.for_fm_replica
             || (!self.live.load(Ordering::SeqCst) && !retired_original)
@@ -1015,7 +1043,7 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if (self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+        if (!self.fm_primary_profile()
             && !self
                 .ra
                 .snapshot(body.unit.id.guid.0)
@@ -1155,7 +1183,7 @@ impl Node {
 
     /// Positive original-process exit and Applied Delete with drained local ownership.
     pub fn replica_loss(&self) -> Option<ReplicaLoss> {
-        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+        if !self.peer_profile()
             || self.ra.peer().is_none()
             || !self.ra.consumer_lifetime().is_accepting()
             || !self.quiescent()
@@ -1207,7 +1235,7 @@ impl Node {
     /// tombstone remains committed and all original local work is drained.
     pub fn replica_absence(&self) -> Option<ReplicaAbsence> {
         let proof = self.absence.as_ref()?;
-        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+        if !self.peer_profile()
             || self.ra.peer().is_none()
             || !self.live.load(Ordering::SeqCst)
             || !self.ra.consumer_lifetime().is_accepting()
@@ -1232,7 +1260,7 @@ impl Node {
     /// lookup offer and exact acquisition has drained without a RAP route.
     pub fn pre_open_cancellation(&self) -> Option<PreOpenCancellation> {
         let proof = self.pre_open.as_ref()?;
-        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+        if !self.peer_profile()
             || self.ra.peer().is_none()
             || !self.live.load(Ordering::SeqCst)
             || !self.ra.consumer_lifetime().is_accepting()
@@ -1385,7 +1413,7 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary {
+        if !self.fm_primary_profile() {
             return Err(Error::Unsupported);
         }
         self.admit_fm(source, generation)?;
@@ -1410,10 +1438,7 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
-            || !self.ra.is_peer(source)
-            || generation.for_fm_replica
-        {
+        if !self.peer_profile() || !self.ra.is_peer(source) || generation.for_fm_replica {
             return Err(Error::Unsupported);
         }
         self.admit_configuration(&body.configuration)?;
@@ -1492,8 +1517,8 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         self.admit_fm(source, generation)?;
-        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
-            && !(self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
+        if !self.fm_primary_profile()
+            && !(self.peer_profile()
                 && self.active_stateful_configuration(body.configuration.unit.id.guid.0))
         {
             return Err(Error::Unsupported);
@@ -1516,7 +1541,7 @@ impl Node {
             .snapshot(body.configuration.unit.id.guid.0)
             .committed
             .is_some_and(|s| s.swap.is_some());
-        if (!swapping && self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle)
+        if (!swapping && !self.peer_profile())
             || !self.ra.is_peer(source)
             || generation.for_fm_replica
         {
@@ -1535,10 +1560,7 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
-            || !self.ra.is_peer(source)
-            || generation.for_fm_replica
-        {
+        if !self.peer_profile() || !self.ra.is_peer(source) || generation.for_fm_replica {
             return Err(Error::Unsupported);
         }
         self.admit_configuration(&body.configuration)?;
@@ -1554,7 +1576,7 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if (self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+        if (!self.fm_primary_profile()
             && !self.active_stateful_configuration(body.unit.id.guid.0)
             && !self
                 .ra
@@ -1588,7 +1610,7 @@ impl Node {
             .committed
             .is_some_and(|s| s.swap.is_some());
         if (!swapping
-            && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            && !self.fm_primary_profile()
             && !self.active_stateful_configuration(body.unit.id.guid.0))
             || !self.ra.is_peer(source)
             || generation.for_fm_replica
@@ -1657,7 +1679,7 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<()> {
         self.admit_fm(source, generation)?;
-        if (self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+        if (!self.fm_primary_profile()
             && !self
                 .ra
                 .snapshot(body.unit.id.guid.0)
@@ -1900,8 +1922,8 @@ impl Node {
                     | ra::CloseMode::ForceAbort
             )
             || (mode == ra::CloseMode::Abort
-                && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
-                && !(self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
+                && !self.fm_primary_profile()
+                && !(self.peer_profile()
                     && self.ra.peer().is_some()
                     && self
                         .ra
@@ -2126,10 +2148,7 @@ impl Node {
             let command = self.build(&front.work);
             let pre_open = match &front.work {
                 Work::Fm(FmWork::DeleteReplica(body, ..))
-                    if self.activation.profile()
-                        == h::local::Profile::VolatileStatefulLifecycle
-                        && self.ra.peer().is_some()
-                        && self.route.is_none() =>
+                    if self.peer_profile() && self.ra.peer().is_some() && self.route.is_none() =>
                 {
                     self.ra
                         .snapshot(body.replica.0.unit.id.guid.0)
@@ -2239,7 +2258,7 @@ impl Node {
                     }
                 }
                 if result == Ok(ra::Disposition::Applied)
-                    && self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
+                    && self.peer_profile()
                     && self.ra.peer().is_some()
                     && self.route.is_none()
                 {
@@ -2307,7 +2326,7 @@ impl Node {
                 }
                 if result == Ok(ra::Disposition::Applied)
                     && self.absence.is_none()
-                    && self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
+                    && self.peer_profile()
                     && self.ra.peer().is_some()
                 {
                     if let Work::Fm(FmWork::DeleteReplica(body, ..)) = &front.work {
@@ -3043,7 +3062,7 @@ impl Node {
             && state.phase == ra::Phase::Opening
             && state.peer_creation.is_some()
             && state.close_token == 0
-            && self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
+            && self.peer_profile()
             && self.open_failure.is_none()
             && self.disposal.is_none();
         let witness = if closed || failed_open {

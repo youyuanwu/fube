@@ -43,6 +43,7 @@ pub enum NodeProperty {
 }
 
 pub struct NativeConfig {
+    pub(super) allow_active_replica_delete: bool,
     thresholds: [[AtomicI32; 4]; 5],
     notification: [AtomicI64; 4],
     node: [AtomicI64; 9],
@@ -75,6 +76,7 @@ impl NativeConfig {
             drop,
         ];
         Self {
+            allow_active_replica_delete: settings.allow_active_replica_delete,
             thresholds: std::array::from_fn(|s| {
                 let p = policies[s];
                 [p.warning, p.drop, p.restart, p.error].map(AtomicI32::new)

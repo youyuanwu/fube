@@ -1,6 +1,10 @@
 //! Reusable native connection configuration, without live session state.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::time::Instant;
 
@@ -20,6 +24,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Endpoint {
     address: SocketAddr,
+    local_ip: Option<IpAddr>,
     timeout: Duration,
     limits: ChannelLimits,
     composition: ChannelComposition,
@@ -44,10 +49,17 @@ impl Endpoint {
         validate_tcp_endpoint(address)?;
         Ok(Self {
             address,
+            local_ip: None,
             timeout: Duration::from_secs(30),
             limits: ChannelLimits::default(),
             composition,
         })
+    }
+
+    /// Select the actual outgoing interface, retaining an ephemeral source port.
+    pub fn local_ip(mut self, address: IpAddr) -> Self {
+        self.local_ip = Some(address);
+        self
     }
 
     /// Set the whole-establishment budget; validated before dialing.
@@ -83,6 +95,7 @@ impl Endpoint {
     ) -> Result<Channel> {
         let channel = Channel::connect_with_envelope(
             self.address,
+            self.local_ip,
             self.composition.clone(),
             self.limits,
             deadline,

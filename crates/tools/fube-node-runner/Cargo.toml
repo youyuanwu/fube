@@ -1,0 +1,21 @@
+[package]
+name = "fube-node-runner"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fube-node"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+fube-hosting = { path = "../../libs/fube-hosting" }
+fube-local-host = { path = "../../libs/fube-local-host" }
+fube-node = { path = "../../libs/fube-node" }
+fube-ra = { path = "../../libs/fube-ra" }
+fube-ra-store = { path = "../../libs/fube-ra-store" }
+fube-transport.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true

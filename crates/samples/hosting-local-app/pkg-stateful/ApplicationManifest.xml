@@ -1,10 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ApplicationManifest xmlns="http://schemas.microsoft.com/2011/01/fabric" ApplicationTypeName="HostingLocalStatefulApp" ApplicationTypeVersion="1.0">
-  <Parameters><Parameter Name="Arguments" DefaultValue="--stateful-register"/></Parameters>
+  <Parameters>
+    <Parameter Name="Arguments" DefaultValue="--stateful-register"/>
+    <Parameter Name="TargetReplicaSetSize" DefaultValue="1"/>
+    <Parameter Name="MinReplicaSetSize" DefaultValue="1"/>
+  </Parameters>
   <ServiceManifestImport><ServiceManifestRef ServiceManifestName="LocalService" ServiceManifestVersion="1.0"/></ServiceManifestImport>
   <DefaultServices>
     <Service Name="Singleton" ServicePackageActivationMode="SharedProcess">
-      <StatefulService ServiceTypeName="LocalStatefulType" TargetReplicaSetSize="1" MinReplicaSetSize="1"><SingletonPartition/></StatefulService>
+      <StatefulService ServiceTypeName="LocalStatefulType" TargetReplicaSetSize="[TargetReplicaSetSize]" MinReplicaSetSize="[MinReplicaSetSize]"><SingletonPartition/></StatefulService>
     </Service>
   </DefaultServices>
 </ApplicationManifest>

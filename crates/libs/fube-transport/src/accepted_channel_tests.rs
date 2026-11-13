@@ -42,15 +42,24 @@ fn initiating_hello(instance: &ListenInstance) -> Message {
 
 #[tokio::test]
 async fn accepted_native_endpoint_pair_preserves_roles_and_explicit_send_reply_authority() {
-    endpoint_pair("127.0.0.1".parse().unwrap()).await;
+    endpoint_pair("127.0.0.1".parse().unwrap(), None).await;
 }
 
 #[tokio::test]
 async fn nonloopback_native_endpoint_pair_preserves_roles_and_explicit_send_reply_authority() {
-    endpoint_pair(non_loopback_ip()).await;
+    endpoint_pair(non_loopback_ip(), None).await;
 }
 
-async fn endpoint_pair(ip: std::net::IpAddr) {
+#[tokio::test]
+async fn native_endpoint_binds_the_configured_source_ip_for_original_peer_association() {
+    endpoint_pair(
+        "127.0.0.1".parse().unwrap(),
+        Some("127.0.0.2".parse().unwrap()),
+    )
+    .await;
+}
+
+async fn endpoint_pair(ip: std::net::IpAddr, source_ip: Option<std::net::IpAddr>) {
     let listener = TcpListener::bind(std::net::SocketAddr::new(ip, 0))
         .await
         .unwrap();
@@ -72,6 +81,11 @@ async fn endpoint_pair(ip: std::net::IpAddr) {
     )
     .unwrap()
     .channel_limits(limits());
+    let endpoint = if let Some(ip) = source_ip {
+        endpoint.local_ip(ip)
+    } else {
+        endpoint
+    };
     let (client, server) = tokio::join!(endpoint.connect(), async {
         let (stream, peer) = listener.accept().await.unwrap();
         (
@@ -87,6 +101,9 @@ async fn endpoint_pair(ip: std::net::IpAddr) {
     let server_target = server.target().unwrap();
     assert_eq!(client_target.address, address);
     assert_eq!(server_target.address, peer);
+    if let Some(ip) = source_ip {
+        assert_eq!(peer.ip(), ip);
+    }
     assert_eq!(server.remote_instance(), ListenInstance::default());
     assert_eq!(client.remote_instance().address, address.to_string());
     assert_eq!(client.remote_instance().instance, 1);

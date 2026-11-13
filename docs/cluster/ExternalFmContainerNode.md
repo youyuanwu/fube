@@ -1,7 +1,7 @@
 # Standalone container Nodes with an external FM
 
-**Status: networking and shared control foundations implemented; standalone
-container profile remains proposed and unqualified.**
+**Status: standalone runner implemented with native-free process coverage;
+three-container/network-namespace qualification remains pending.**
 
 **Baseline:** `4847cb10e39ca0b0dbd76a96a8f2dfedbf6a93ff`, inspected 2026-11-13.
 
@@ -25,8 +25,17 @@ source/generation-bound Link previously private to the launcher. The local
 launcher consumes these shared implementations, not copied replacements.
 Its profile-specific inbound admission, parent/stdin supervision, package
 selection and physical-cleanup receipts remain in `fube-cluster`. The standalone
-runner, source-IP mesh association and three-container qualification remain
-unimplemented.
+runner and three-container qualification were not part of that extraction.
+
+**Standalone runner update (2026-11-13):**
+[`fube-node-runner`](../../crates/tools/fube-node-runner/README.md) now supplies
+the `fube-node --config` executable, immutable configuration, actual source-IP
+peer association, fresh native bootstrap, one original replica and signal-driven
+owned cleanup. Its explicit volatile 3/2 package profile accepts the initial
+Primary or peer-created Idle through normal native requests. A fixture FM
+selects the middle Node as Primary, builds/admit both original peers, writes
+real data, replays configuration and joins teardown in three separate Node
+processes. This is same-host process evidence, not container qualification.
 
 ## 1. Goal and agreed scope
 
@@ -122,9 +131,9 @@ client protocol. Neither FM nor RA proxies application data.
 
 ### Implementation boundaries
 
-- Add a thin runner package, provisionally `fube-node-runner`, producing a
-  `fube-node` binary. Names and configuration below are proposed, not commands
-  available today.
+- The thin `fube-node-runner` package produces the `fube-node` binary.
+  This runner is now implemented; its invocation and exact
+  configuration schema are in the linked launcher guide above.
 - Keep `fube_node::local::Node` as the local lifecycle owner. Extract the
   reusable supported wire dispatch and bounded effect/timer adapter from
   `fube-cluster` into a shared Node control module. The runner composes this
@@ -169,24 +178,25 @@ deployment directories, processes or admitted control work are acquired.
 | Local identity | Exact nonzero `NodeInstance`, human-readable name and container-visible node IP. |
 | FM authority | One exact FM `NodeInstance`, fixed generation/owner and numeric FM listener address. |
 | Peers | Exactly two distinct original `NodeInstance` values with numeric advertised RA listener addresses. Neither may equal the local Node or FM. All three Nodes must have distinct static IPv4 addresses so accepted peer sockets can be associated unambiguously. |
-| RA listener | Local bind socket and separately advertised reachable socket. |
+| RA listener | One concrete IPv4 socket used for both binding and publication. The runner does not need a separate advertised IP. |
 | Package | Local package path, application/service/type identity, package version and validated application parameters. No upload/ImageStore service is required. |
 | Service | One partition, volatile stateful, target/minimum 3/2, fixed service version. Native requests must match the admitted package and description. |
 | Local ownership | Private writable run directory; bounded startup/shutdown budgets and existing finite queue/message limits. |
 | Application endpoints | Explicit application and replication bind/advertise settings delivered through declared application configuration or arguments. |
 
-For example, Container A can bind RA, replication and application listeners to
-`0.0.0.0:19002`, `0.0.0.0:19003` and `0.0.0.0:19004`, advertising
-`10.42.0.11` with those ports. Containers B/C advertise their own private IPs.
+For example, Container A can bind RA, replication and application listeners
+directly to `10.42.0.11:19002`, `10.42.0.11:19003` and `10.42.0.11:19004`.
+Containers B/C bind/publish their own concrete private IPs.
 The application's Hosting/RAP/lease connection remains an independently chosen
 `127.0.0.1` socket inside each container.
 
 The first profile uses static IPv4 addresses reachable on a private container
 network, without host-port translation, a service VIP or load balancing between
 replica endpoints. DNS churn, NAT mapping and remote-host deployment
-qualification are deferred. Reject unspecified, multicast, zero-port and
-loopback advertised cross-container addresses; require advertised ports to match
-the bound listeners in this no-port-translation profile.
+qualification are deferred. Reject unspecified, multicast/broadcast and
+zero-port addresses. Container deployments need non-loopback addresses reachable
+by their peers. The same runner also accepts concrete loopback aliases for
+native-free same-host process testing; that is not cross-container evidence.
 
 The package/image is supplied by the user. Run without privileged mode, a
 Docker-socket mount, host networking or shared work directories. Use a private
@@ -338,11 +348,12 @@ successful no-ops.
 3. Each Node completes NodeUp/Ack and final empty ReplicaUp/Reply, constructs its
    RA with the fixed peer bindings, and starts its owned application. Hosting
    performs real runtime/type registration and finite lease establishment.
-4. The FM waits for fresh bootstrap and actual service-type registration on all
-   three original Nodes, processes/ACKs their notifications, then sends
-   AddPrimary to its selected initial node. It retains the result until matched
-   completion. The initial endpoint may be recorded internally, but is not yet
-   a ready three-replica service.
+4. After fresh Node bootstrap, FM may send AddPrimary for its known package/type
+   to any selected original placement. RA retains actual registration lookup,
+   Open and semantic completion. Process/ACK type notification/status work when
+   emitted; do not wait for a fabricated pre-create factory-ready notification.
+   The initial endpoint may be recorded internally, but is not yet a ready
+   three-replica service.
 5. The FM issues AddReplica for each other destination, one at a time in this
    initial profile. Wait for actual AddReplicaReply before the next build;
    CreateReplicaReply or local Idle readiness does not settle FM build.
@@ -405,6 +416,14 @@ completion with its independent local cleanup. On local termination signals,
 stop new admission, drive owned cleanup and report unresolved work explicitly;
 SIGTERM is not a fabricated FM acknowledgment. Do not report clean solely from
 process exit, a transport write or DeleteReplicaReply.
+
+The external profile alone enables normal active Delete for exact completed
+original 3/2 owners. Native `DeleteLocalReplica` uses Delete for an open
+non-force request as well as closed metadata; this reuses that Close/commit path,
+not a fabricated retirement transition. Existing local-profile gates remain.
+The runner's `cleanup.clean` reports positively joined local resources;
+`pending_work` separately exposes retained remote reporting obligations and is
+not converted into a native semantic ACK.
 
 The runner handles SIGTERM as the application supervisor and retains exact
 process/group cleanup. The orchestrator owns any outer hard-stop deadline and

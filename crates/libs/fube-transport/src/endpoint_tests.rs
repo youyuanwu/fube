@@ -116,6 +116,9 @@ async fn invalid_endpoint_settings_never_dial_and_connect_budget_includes_hello(
             max_operations: 0,
             ..limits()
         }),
+        endpoint.clone().local_ip("0.0.0.0".parse().unwrap()),
+        endpoint.clone().local_ip("224.0.0.1".parse().unwrap()),
+        endpoint.clone().local_ip("::1".parse().unwrap()),
     ] {
         assert!(matches!(
             invalid.connect().await,

@@ -8,11 +8,18 @@
 //! Canceling an established write future is not safe: owners must join it
 //! unless irreversibly disposing the entire socket.
 
-use std::{future::Future, io, net::SocketAddr, sync::Mutex, task::Poll, time::Duration};
+use std::{
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    sync::Mutex,
+    task::Poll,
+    time::Duration,
+};
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpSocket, TcpStream},
     sync::Notify,
     time::{timeout_at, Instant},
 };
@@ -171,11 +178,43 @@ pub async fn connect<T, F>(
 where
     F: FnOnce(&[u8], usize) -> Result<Admission<T>>,
 {
+    connect_from(endpoint, None, local, id, limits, deadline, admit).await
+}
+
+/// Select an optional local interface without renewing the establishment budget.
+pub async fn connect_from<T, F>(
+    endpoint: SocketAddr,
+    local_ip: Option<IpAddr>,
+    local: ListenInstance,
+    id: MessageId,
+    limits: Limits,
+    deadline: Instant,
+    admit: F,
+) -> Result<(TcpStream, Received<T>)>
+where
+    F: FnOnce(&[u8], usize) -> Result<Admission<T>>,
+{
     limits.validate()?;
     if Instant::now() >= deadline {
         return Err(Error::Timeout);
     }
-    let stream = timeout_at(deadline, TcpStream::connect(endpoint))
+    let connecting = async {
+        if let Some(ip) = local_ip {
+            if ip.is_unspecified() || ip.is_multicast() || ip.is_ipv4() != endpoint.is_ipv4() {
+                return Err(Error::InvalidInput("invalid local TCP interface"));
+            }
+            let socket = if ip.is_ipv4() {
+                TcpSocket::new_v4()?
+            } else {
+                TcpSocket::new_v6()?
+            };
+            socket.bind(SocketAddr::new(ip, 0))?;
+            Ok(socket.connect(endpoint).await?)
+        } else {
+            Ok(TcpStream::connect(endpoint).await?)
+        }
+    };
+    let stream = timeout_at(deadline, connecting)
         .await
         .map_err(|_| Error::Timeout)??;
     stream.set_nodelay(true)?;

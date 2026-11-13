@@ -20,6 +20,7 @@ pub enum Profile {
     VolatileStatefulLifecycle,
     VolatileStatefulPrimaryLifecycle,
     VolatileStatefulFmPrimary,
+    VolatileStatefulExternalFm,
 }
 
 #[derive(Debug)]
@@ -309,7 +310,8 @@ impl Package {
             Profile::VolatileStatefulRegistration
             | Profile::VolatileStatefulLifecycle
             | Profile::VolatileStatefulPrimaryLifecycle
-            | Profile::VolatileStatefulFmPrimary => ("StatefulService", "StatefulServiceType"),
+            | Profile::VolatileStatefulFmPrimary
+            | Profile::VolatileStatefulExternalFm => ("StatefulService", "StatefulServiceType"),
         };
         shape(
             service,
@@ -330,7 +332,8 @@ impl Package {
             Profile::VolatileStatefulRegistration
             | Profile::VolatileStatefulLifecycle
             | Profile::VolatileStatefulPrimaryLifecycle
-            | Profile::VolatileStatefulFmPrimary => &[
+            | Profile::VolatileStatefulFmPrimary
+            | Profile::VolatileStatefulExternalFm => &[
                 "ServiceTypeName",
                 "TargetReplicaSetSize",
                 "MinReplicaSetSize",
@@ -355,6 +358,11 @@ impl Package {
                 attr(description, "TargetReplicaSetSize", &params)? == "1"
                     && attr(description, "MinReplicaSetSize", &params)? == "1",
                 "only volatile stateful target/minimum=1/1 is supported",
+            )?,
+            Profile::VolatileStatefulExternalFm => require(
+                attr(description, "TargetReplicaSetSize", &params)? == "3"
+                    && attr(description, "MinReplicaSetSize", &params)? == "2",
+                "external-FM profile requires volatile target/minimum=3/2",
             )?,
         }
         shape(
@@ -391,7 +399,8 @@ impl Package {
             Profile::VolatileStatefulRegistration
             | Profile::VolatileStatefulLifecycle
             | Profile::VolatileStatefulPrimaryLifecycle
-            | Profile::VolatileStatefulFmPrimary => &["ServiceTypeName", "HasPersistedState"],
+            | Profile::VolatileStatefulFmPrimary
+            | Profile::VolatileStatefulExternalFm => &["ServiceTypeName", "HasPersistedState"],
         };
         shape(declared, type_kind, type_attributes, &[])?;
         if profile != Profile::Stateless {
@@ -522,7 +531,8 @@ impl Package {
             Profile::VolatileStatefulRegistration
             | Profile::VolatileStatefulLifecycle
             | Profile::VolatileStatefulPrimaryLifecycle
-            | Profile::VolatileStatefulFmPrimary => format!(
+            | Profile::VolatileStatefulFmPrimary
+            | Profile::VolatileStatefulExternalFm => format!(
                 r#"<StatefulServiceType ServiceTypeName="{}" HasPersistedState="false" />"#,
                 escape(&self.service_type)
             ),

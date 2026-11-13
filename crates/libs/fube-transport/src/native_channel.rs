@@ -19,7 +19,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     mem::size_of,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     ops::Deref,
     sync::{Arc, Mutex, Weak},
 };
@@ -524,6 +524,7 @@ impl ExactSizeIterator for GatewayIngressSnapshot {}
 impl GatewayChannel {
     pub(crate) async fn connect_with_envelope(
         endpoint: SocketAddr,
+        local_ip: Option<IpAddr>,
         composition: ChannelComposition,
         limits: ChannelLimits,
         deadline: Instant,
@@ -533,8 +534,9 @@ impl GatewayChannel {
         crate::endpoint::validate_tcp_endpoint(endpoint)?;
         check_deadline(deadline)?;
         let process_id = uuid::Uuid::new_v4().to_bytes_le();
-        let (stream, message) = raw_session::connect(
+        let (stream, message) = raw_session::connect_from(
             endpoint,
+            local_ip,
             ListenInstance::default(),
             MessageId {
                 guid: process_id,

@@ -16,7 +16,7 @@ use fube_runtime::{
 };
 use std::{
     io::Write,
-    net::TcpListener,
+    net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread::JoinHandle,
@@ -40,6 +40,10 @@ struct Arguments {
     stateful_lifecycle: bool,
     #[arg(long, requires = "stateful_lifecycle")]
     data_replicator: bool,
+    #[arg(long, requires = "data")]
+    replication_listen: Option<SocketAddr>,
+    #[arg(long, requires = "data")]
+    service_listen: Option<SocketAddr>,
     #[arg(long)]
     delay_ms: Option<u64>,
     #[arg(long)]
@@ -81,6 +85,8 @@ struct Mode {
     open_delay: u64,
     block_open: bool,
     fail_open: bool,
+    replication_listen: Option<SocketAddr>,
+    service_listen: Option<SocketAddr>,
 }
 struct Factory(Mode);
 struct StatefulFactory {
@@ -213,7 +219,12 @@ impl IStatefulServiceReplica for StatefulReplica {
                     provider,
                     None,
                     ReplicationEndpointOptions {
-                        listen_address: "127.0.0.1:0".into(),
+                        listen_address: self
+                            .resource
+                            .mode
+                            .replication_listen
+                            .unwrap_or_else(|| ([127, 0, 0, 1], 0).into())
+                            .to_string(),
                         advertised_ip: None,
                         actor_incarnation: uuid::Uuid::new_v4(),
                     },
@@ -225,12 +236,15 @@ impl IStatefulServiceReplica for StatefulReplica {
                 ));
                 *self.data.lock().unwrap() = Some(control.clone());
                 if self.resource.mode.primary {
-                    let service = PrimaryService::start(PrimaryState {
-                        native: native.clone(),
-                        partition,
-                        data: control.clone(),
-                        memory,
-                    })?;
+                    let service = PrimaryService::start(
+                        PrimaryState {
+                            native: native.clone(),
+                            partition,
+                            data: control.clone(),
+                            memory,
+                        },
+                        self.resource.mode.service_listen,
+                    )?;
                     marker(&format!(
                         "LOCAL_PRIMARY listening endpoint={}",
                         service.address
@@ -294,16 +308,19 @@ impl IStatefulServiceReplica for StatefulReplica {
                 }
                 let data = self.data.lock().unwrap().clone().expect("real data owner");
                 if self.primary.lock().unwrap().is_none() {
-                    let service = PrimaryService::start(PrimaryState {
-                        native: self
-                            .native
-                            .as_ref()
-                            .expect("real native integration")
-                            .clone(),
-                        partition: self.partition.lock().unwrap().clone().expect("partition"),
-                        data: data.clone(),
-                        memory: self.memory.lock().unwrap().clone().expect("provider"),
-                    })?;
+                    let service = PrimaryService::start(
+                        PrimaryState {
+                            native: self
+                                .native
+                                .as_ref()
+                                .expect("real native integration")
+                                .clone(),
+                            partition: self.partition.lock().unwrap().clone().expect("partition"),
+                            data: data.clone(),
+                            memory: self.memory.lock().unwrap().clone().expect("provider"),
+                        },
+                        self.resource.mode.service_listen,
+                    )?;
                     marker(&format!(
                         "LOCAL_PRIMARY listening endpoint={}",
                         service.address
@@ -658,8 +675,8 @@ impl PrimaryState {
     }
 }
 impl PrimaryService {
-    fn start(state: PrimaryState) -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+    fn start(state: PrimaryState, listen: Option<SocketAddr>) -> Result<Self> {
+        let listener = TcpListener::bind(listen.unwrap_or_else(|| ([127, 0, 0, 1], 0).into()))?;
         let address = listener.local_addr()?.to_string();
         listener.set_nonblocking(true)?;
         let stopped = Cancellation::default();
@@ -1065,6 +1082,8 @@ async fn main() {
         open_delay: args.open_delay_ms.unwrap_or(0),
         block_open: args.block_open,
         fail_open: args.fail_open,
+        replication_listen: args.replication_listen,
+        service_listen: args.service_listen,
     };
     let stateful_registration = args.stateful_register;
     let native = data_replicator.then(|| runtime.native_integration_provider());

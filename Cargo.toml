@@ -21,6 +21,7 @@ members = [
   "crates/samples/native-replicator-oracle",
   "crates/tools/fube-cli",
   "crates/tools/fube-cluster",
+  "crates/tools/fube-node-runner",
 ]
 
 [workspace.dependencies]
