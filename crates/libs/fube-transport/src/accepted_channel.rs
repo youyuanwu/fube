@@ -4,6 +4,7 @@ use tokio::{net::TcpStream, time::Instant};
 
 use crate::{
     connection::MAX_FRAME_TIME,
+    endpoint::validate_tcp_endpoint,
     message::{ListenInstance, Message, MessageId},
     native_channel::{NativeEnvelope, SessionEnvelope},
     native_demux::ChannelComposition,
@@ -14,10 +15,10 @@ use crate::{
     Channel, ChannelLimits, Error, Result,
 };
 
-/// Establish one accepted, explicitly trusted numeric-loopback native channel.
+/// Establish one accepted plain-TCP native channel.
 ///
 /// The caller owns listening and domain admission; [`crate::Endpoint`] owns
-/// dialing. Both actual socket endpoints must be loopback. A bounded native
+/// dialing. A bounded native
 /// ListenInstance exchange uses the accepted role (nonempty local nonce, empty
 /// initiating nonce), then publishes the existing common channel engine with
 /// exactly the supplied composition and limits. Advertised peer metadata is
@@ -26,9 +27,9 @@ use crate::{
 /// One absolute deadline covers hello and publication. Error or cancellation
 /// disposes the unpublished socket. An established channel retains the normal
 /// Channel shutdown/disposal ownership. This is not IPC: no host/PID identity
-/// is added or admitted. Loopback and hello are not authentication, FM/node
+/// is added or admitted. TCP and hello are not authentication, FM/node
 /// admission, semantic completion or service readiness.
-pub async fn accept_unsecured_loopback(
+pub async fn accept_unsecured_tcp(
     stream: TcpStream,
     composition: ChannelComposition,
     limits: ChannelLimits,
@@ -37,15 +38,8 @@ pub async fn accept_unsecured_loopback(
     limits.validate()?;
     let local_address = stream.local_addr()?;
     let peer = stream.peer_addr()?;
-    if !local_address.ip().is_loopback()
-        || local_address.port() == 0
-        || !peer.ip().is_loopback()
-        || peer.port() == 0
-    {
-        return Err(Error::InvalidInput(
-            "accepted native channel requires loopback",
-        ));
-    }
+    validate_tcp_endpoint(local_address)?;
+    validate_tcp_endpoint(peer)?;
     if Instant::now() >= deadline {
         return Err(Error::Timeout);
     }

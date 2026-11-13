@@ -35,7 +35,7 @@ async fn reusable_configuration_has_no_io_and_each_connect_keeps_actual_target_p
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let endpoint =
-        Endpoint::unsecured_loopback(address, fixture_composition(GatewayProfile::Notifications))
+        Endpoint::unsecured_tcp(address, fixture_composition(GatewayProfile::Notifications))
             .unwrap()
             .channel_limits(ChannelLimits {
                 max_history: 3,
@@ -109,8 +109,7 @@ async fn invalid_endpoint_settings_never_dial_and_connect_budget_includes_hello(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let endpoint =
-        Endpoint::unsecured_loopback(address, fixture_composition(GatewayProfile::Ordinary))
-            .unwrap();
+        Endpoint::unsecured_tcp(address, fixture_composition(GatewayProfile::Ordinary)).unwrap();
     for invalid in [
         endpoint.clone().connect_timeout(Duration::ZERO),
         endpoint.clone().channel_limits(ChannelLimits {
@@ -139,7 +138,7 @@ async fn invalid_endpoint_settings_never_dial_and_connect_budget_includes_hello(
 #[tokio::test]
 async fn publication_expiry_after_successful_hello_drops_unpublished_owner_and_joins() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = Endpoint::unsecured_loopback(
+    let endpoint = Endpoint::unsecured_tcp(
         listener.local_addr().unwrap(),
         fixture_composition(GatewayProfile::Ordinary),
     )

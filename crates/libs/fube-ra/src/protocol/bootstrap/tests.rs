@@ -416,7 +416,7 @@ fn explicit_profile_validation_rejects_recovery_upgrades_and_inactive_targets() 
     unsupported.activation_sequence = -1;
     assert!(unsupported.validate_fresh_activated(&version()).is_err());
     assert!(NodeUpAck::fresh_activated(version(), -1).is_err());
-    for address in ["0.0.0.0:1", "192.0.2.1:1", "127.0.0.1:0"] {
+    for address in ["0.0.0.0:1", "224.0.0.1:1", "127.0.0.1:0"] {
         assert!(NodeUp::fresh_stateless(
             "node".into(),
             "stateless".into(),
@@ -424,6 +424,22 @@ fn explicit_profile_validation_rejects_recovery_upgrades_and_inactive_targets() 
             version(),
         )
         .is_err());
+    }
+}
+
+#[test]
+fn fresh_node_up_preserves_container_addresses_through_native_serialization() {
+    for address in ["192.0.2.11:19002", "[2001:db8::11]:19002"] {
+        let address: SocketAddr = address.parse().unwrap();
+        let node =
+            NodeUp::fresh_stateless("node".into(), "stateful".into(), address, version()).unwrap();
+        let decoded = decode_node_up(&node_up_message(&node).unwrap()).unwrap();
+        assert_eq!(decoded.node.address, address.ip().to_string());
+        assert_eq!(
+            decoded.node.cluster_connection_port,
+            u32::from(address.port())
+        );
+        decoded.validate_fresh_stateless().unwrap();
     }
 }
 

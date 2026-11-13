@@ -214,6 +214,7 @@ impl IStatefulServiceReplica for StatefulReplica {
                     None,
                     ReplicationEndpointOptions {
                         listen_address: "127.0.0.1:0".into(),
+                        advertised_ip: None,
                         actor_incarnation: uuid::Uuid::new_v4(),
                     },
                     fube_data::Settings::default(),
@@ -1034,6 +1035,10 @@ async fn main() {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
     let runtime = Runtime::attach().await.expect("owned Hosting attach");
+    marker(&format!(
+        "LOCAL_NODE_IP {}",
+        runtime.node_context().ip_or_fqdn
+    ));
     if args.block_registration {
         let work =
             PathBuf::from(std::env::var_os("Fabric_Folder_App_Work").expect("owned work folder"));

@@ -984,7 +984,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         .map_err(err)?
         .map_err(err)?;
     drop(listener); // Exactly one original session; no reconnect listener.
-    let channel = fube_transport::accept_unsecured_loopback(
+    let channel = fube_transport::accept_unsecured_tcp(
         stream,
         wire::composition(false).map_err(err)?,
         wire::limits(),
@@ -1049,6 +1049,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         id: node_hex(&launch.node),
         instance: launch.node.instance,
         name: launch.name(),
+        ip: std::net::Ipv4Addr::LOCALHOST.into(),
     });
     let store = Arc::new(
         Store::new(Box::new(MemoryBackend::new()), Settings::default())
@@ -1600,15 +1601,13 @@ async fn dial_peer_to(launch: &Launch, peer: &Peer, address: &str) -> Result<Lin
     if !address.ip().is_loopback() || address.port() == 0 {
         return Err("peer requires original numeric loopback listener".into());
     }
-    let channel = fube_transport::Endpoint::unsecured_loopback(
-        address,
-        wire::peer_composition().map_err(err)?,
-    )
-    .map_err(err)?
-    .channel_limits(wire::limits())
-    .connect_until(wire::deadline())
-    .await
-    .map_err(err)?;
+    let channel =
+        fube_transport::Endpoint::unsecured_tcp(address, wire::peer_composition().map_err(err)?)
+            .map_err(err)?
+            .channel_limits(wire::limits())
+            .connect_until(wire::deadline())
+            .await
+            .map_err(err)?;
     Link::new(
         channel,
         launch.node.clone(),
@@ -1631,7 +1630,7 @@ async fn accept_peer_from(
     peer: &Peer,
     stream: tokio::net::TcpStream,
 ) -> Result<Link> {
-    let channel = fube_transport::accept_unsecured_loopback(
+    let channel = fube_transport::accept_unsecured_tcp(
         stream,
         wire::peer_composition().map_err(err)?,
         wire::limits(),
@@ -1822,6 +1821,7 @@ fn replace_replica_host(launch: &Launch, node: &mut Node) -> Result<HostReplacem
         id: node_hex(&launch.node),
         instance: launch.node.instance,
         name: launch.name(),
+        ip: std::net::Ipv4Addr::LOCALHOST.into(),
     });
     node.replace_lost_replica_host(Activation::new(options).map_err(err)?)
         .map_err(err)?;
@@ -2424,7 +2424,7 @@ pub(crate) mod report_tests {
 
     async fn links(launch: &Launch) -> Result<(Link, Link)> {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
-        let endpoint = fube_transport::Endpoint::unsecured_loopback(
+        let endpoint = fube_transport::Endpoint::unsecured_tcp(
             listener.local_addr().map_err(err)?,
             wire::composition(true).map_err(err)?,
         )
@@ -2432,7 +2432,7 @@ pub(crate) mod report_tests {
         .channel_limits(wire::limits());
         let (fm, node) = tokio::join!(endpoint.connect_until(wire::deadline()), async {
             let (stream, _) = listener.accept().await.map_err(err)?;
-            fube_transport::accept_unsecured_loopback(
+            fube_transport::accept_unsecured_tcp(
                 stream,
                 wire::composition(false).map_err(err)?,
                 wire::limits(),
@@ -4284,6 +4284,7 @@ pub(crate) mod report_tests {
             id: node_hex(&launch.node),
             instance: launch.node.instance,
             name: launch.name(),
+            ip: std::net::Ipv4Addr::LOCALHOST.into(),
         });
         let store = Arc::new(
             Store::new(Box::new(MemoryBackend::new()), Settings::default())

@@ -134,7 +134,7 @@ async fn stub_binding_never_grants_installed_policy_or_sends_an_extra_handshake(
         Err(Error::InvalidInput("test denies all submissions"))
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = Endpoint::unsecured_loopback(
+    let endpoint = Endpoint::unsecured_tcp(
         listener.local_addr().unwrap(),
         ChannelComposition {
             outbound: deny,

@@ -12,6 +12,7 @@ use fube_local_host::{
 };
 use fube_transport::serialization::serde::{Guid, ObjectArray, Pointer};
 use std::{
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -70,6 +71,7 @@ pub struct NodeContext {
     pub id: String,
     pub instance: u64,
     pub name: String,
+    pub ip: IpAddr,
 }
 impl Options {
     pub fn new(run_parent: PathBuf) -> Self {
@@ -141,6 +143,8 @@ impl Activation {
                 || node.instance == 0
                 || node.name.is_empty()
                 || node.name.len() > 128
+                || node.ip.is_unspecified()
+                || node.ip.is_multicast()
         }) {
             return Err(LocalError::InvalidOptions);
         }
@@ -313,6 +317,12 @@ impl Activation {
             host_id: host_id.clone(),
             code: code.clone(),
         });
+        let node_ip = self
+            .options
+            .node
+            .as_ref()
+            .map_or(IpAddr::V4(Ipv4Addr::LOCALHOST), |node| node.ip)
+            .to_string();
         let node = wire::StartReply {
             node_id: self
                 .options
@@ -332,7 +342,7 @@ impl Activation {
             node_type: "local".into(),
             client_address: "127.0.0.1:19000".into(),
             deployment: deployment.deployment.to_string_lossy().into(),
-            ip: "127.0.0.1".into(),
+            ip: node_ip.clone(),
             work: deployment.work.to_string_lossy().into(),
             initial_ttl: 0,
             application_directories: ObjectArray(vec![]),
@@ -400,7 +410,7 @@ impl Activation {
                 "Fabric_Folder_App_Temp",
                 deployment.application.join("temp"),
             )
-            .env("Fabric_NodeIPOrFQDN", "127.0.0.1")
+            .env("Fabric_NodeIPOrFQDN", node_ip)
             .current_dir(&deployment.working_directory);
         OwnedApp::start(&mut self.process, command)?;
         let pid = self.process.as_ref().expect("spawned child").pid();

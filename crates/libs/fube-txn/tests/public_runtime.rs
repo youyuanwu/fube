@@ -458,6 +458,7 @@ impl IStatefulServiceReplica for Replica {
                 self.native.clone(),
                 ReplicationEndpointOptions {
                     listen_address: "127.0.0.1:0".into(),
+                    advertised_ip: None,
                     actor_incarnation: uuid::Uuid::new_v4(),
                 },
                 self.settings.clone(),

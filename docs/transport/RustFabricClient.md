@@ -379,9 +379,13 @@ It does not borrow a `FabricClient` or
 notification session.
 Production upload uses no native SDK, COM library, HTTP gateway or subprocess.
 Only native `fabric:ImageStore`, canonical protocol **1.2**, and explicitly
-unsecured **numeric-loopback, nonzero-port** development gateways are supported;
-nonloopback and zero-port upload endpoints are deliberately rejected. There is no TLS, authentication,
+unsecured **numeric, nonzero-port** development gateways are supported;
+loopback and non-loopback addresses are accepted, while unspecified, multicast
+and zero-port destinations reject. There is no TLS, authentication,
 backend selection or v1.1 fallback.
+
+Non-loopback endpoint acceptance is a transport capability; it does not extend
+the historical deployed/native qualification to remote clusters.
 
 Build the thin CLI and put `target/debug` on your PATH, or invoke that binary
 directly:
@@ -1257,10 +1261,10 @@ Explicit close attempts deregistration under one deadline and awaits task/socket
 stop even on cleanup failure. Owner drop initiates shutdown; remote disconnect
 cleanup is eventual, not an immediate deregistration guarantee.
 
-**Notification endpoint policy:** `endpoint_clear(SocketAddr)` accepts only
-explicit numeric loopback/nonzero-port NamingGateway endpoints, matching the
-existing unsecured profile. Previously accepted
-non-loopback addresses now fail InvalidInput. No hostname/advertised-address
+**Notification endpoint policy:** `endpoint_clear(SocketAddr)` accepts
+explicit numeric unicast/nonzero-port NamingGateway endpoints, including
+non-loopback addresses. Unspecified, multicast and zero-port destinations fail
+InvalidInput. No hostname/advertised-address
 fallback, compatibility wrapper or TLS/claims/security expansion is supplied.
 The native session/filter API and error types otherwise remain unchanged.
 

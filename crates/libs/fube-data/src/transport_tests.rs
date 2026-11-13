@@ -46,6 +46,48 @@ fn dual_stack_peer_resolution_prefers_listener_family_without_dropping_single_fa
     assert!(peer_socket([], v4).is_err());
 }
 
+#[tokio::test]
+async fn wildcard_listener_advertises_concrete_identity_for_hello_and_bidirectional_packets() {
+    let ip = "127.0.0.2".parse().unwrap();
+    let (a, mut incoming_a) =
+        PeerTransport::bind_with_advertised_ip("0.0.0.0:0", Some(ip), Settings::default()).unwrap();
+    let (b, mut incoming_b) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    assert_eq!(a.address().parse::<SocketAddr>().unwrap().ip(), ip);
+    let a_endpoint = endpoint(a.address(), 1);
+    let b_endpoint = endpoint(b.address(), 2);
+    a.register_peer(&b_endpoint).unwrap();
+    b.register_peer(&a_endpoint).unwrap();
+    a.send(request(a.address(), 1, 2)).unwrap();
+    let packet = receive(incoming_b.recv_control()).await;
+    assert_eq!(packet.from, a_endpoint);
+    b.send(request(b.address(), 2, 1)).unwrap();
+    assert_eq!(receive(incoming_a.recv_control()).await.from, b_endpoint);
+    let mut socket = native_socket(a.address(), b.address()).await;
+    socket.shutdown().await.unwrap();
+    a.shutdown_checked().unwrap();
+    b.shutdown_checked().unwrap();
+}
+
+#[test]
+fn advertised_replication_ip_rejects_wildcard_multicast_and_mismatched_listeners() {
+    assert!(PeerTransport::bind("0.0.0.0:0", Settings::default()).is_err());
+    for (listen, advertised) in [
+        ("0.0.0.0:0", "0.0.0.0"),
+        ("0.0.0.0:0", "224.0.0.1"),
+        ("0.0.0.0:0", "::1"),
+        ("127.0.0.1:0", "127.0.0.2"),
+    ] {
+        assert!(matches!(
+            PeerTransport::bind_with_advertised_ip(
+                listen,
+                Some(advertised.parse().unwrap()),
+                Settings::default()
+            ),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_one_shared_address_actor_keeps_the_other_actor_socket_usable() {
     let (a, _incoming_a) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();

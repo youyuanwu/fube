@@ -178,7 +178,8 @@ impl NodeUp {
     ) -> Result<Self> {
         if name.is_empty()
             || node_type.is_empty()
-            || !address.ip().is_loopback()
+            || address.ip().is_unspecified()
+            || address.ip().is_multicast()
             || address.port() == 0
         {
             return Err(Error::InvalidInput("invalid fresh stateless node metadata"));

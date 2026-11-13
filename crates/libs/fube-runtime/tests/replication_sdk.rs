@@ -117,6 +117,7 @@ struct ControlCalls {
 }
 struct Factory {
     native: NativeIntegrationProvider,
+    endpoint: ReplicationEndpointOptions,
     provider: Arc<dyn IStateProvider>,
     replay: Option<Arc<dyn ReplayCheckpointProvider>>,
     created: Created,
@@ -126,6 +127,7 @@ struct Factory {
 }
 struct Replica {
     native: NativeRuntimeIntegration,
+    endpoint: ReplicationEndpointOptions,
     provider: Arc<dyn IStateProvider>,
     replay: Option<Arc<dyn ReplayCheckpointProvider>>,
     created: Created,
@@ -144,6 +146,7 @@ impl IStatefulServiceFactory for Factory {
     ) -> Result<Box<dyn IStatefulServiceReplica>> {
         Ok(Box::new(Replica {
             native: self.native.capture(partition, replica)?,
+            endpoint: self.endpoint.clone(),
             provider: self.provider.clone(),
             replay: self.replay.clone(),
             created: self.created.clone(),
@@ -162,10 +165,7 @@ impl IStatefulServiceReplica for Replica {
     ) -> ApiFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
             mode.validate()?;
-            let endpoint = ReplicationEndpointOptions {
-                listen_address: "127.0.0.1:0".into(),
-                actor_incarnation: uuid::Uuid::new_v4(),
-            };
+            let endpoint = self.endpoint.clone();
             let settings = Settings {
                 operation_bytes: 4096,
                 ..Settings::default()
@@ -264,6 +264,11 @@ async fn first_primary_provider_failure_faults_before_epoch_and_preserves_failed
             move |native| {
                 Box::new(Factory {
                     native,
+                    endpoint: ReplicationEndpointOptions {
+                        listen_address: "127.0.0.1:0".into(),
+                        advertised_ip: None,
+                        actor_incarnation: uuid::Uuid::new_v4(),
+                    },
                     provider: supplied,
                     replay: None,
                     created: Arc::new(Mutex::new(Some(send))),
@@ -462,6 +467,11 @@ impl Fixture {
             move |native| {
                 Box::new(Factory {
                     native,
+                    endpoint: ReplicationEndpointOptions {
+                        listen_address: "127.0.0.1:0".into(),
+                        advertised_ip: None,
+                        actor_incarnation: uuid::Uuid::new_v4(),
+                    },
                     provider: supplied,
                     replay: None,
                     created: Arc::new(Mutex::new(Some(send))),
@@ -551,6 +561,11 @@ async fn first_primary_samples_actual_nonempty_provider_tail_after_construction(
         let host = rap::Host::start(partition, 1, ReplicaRole::Primary, move |native| {
             Box::new(Factory {
                 native,
+                endpoint: ReplicationEndpointOptions {
+                    listen_address: "127.0.0.1:0".into(),
+                    advertised_ip: None,
+                    actor_incarnation: uuid::Uuid::new_v4(),
+                },
                 provider: supplied,
                 replay: None,
                 created: Arc::new(Mutex::new(Some(send))),
@@ -694,6 +709,62 @@ async fn admit(fixture: &Fixture, id: &str) -> ReplicationAdmission {
         .apply_replication(accepted.sequence_number, &payload)
         .unwrap();
     accepted
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_factory_advertises_wildcard_listener_without_changing_replica_identity() {
+    let partition = uuid::Uuid::new_v4();
+    let actor = uuid::Uuid::new_v4();
+    let advertised_ip = "127.0.0.2".parse().unwrap();
+    let (send, receive) = oneshot::channel();
+    let host = rap::Host::start(partition, 7, ReplicaRole::Primary, move |native| {
+        Box::new(Factory {
+            native,
+            endpoint: ReplicationEndpointOptions {
+                listen_address: "0.0.0.0:0".into(),
+                advertised_ip: Some(advertised_ip),
+                actor_incarnation: actor,
+            },
+            provider: StandardOnly::new(),
+            replay: None,
+            created: Arc::new(Mutex::new(Some(send))),
+            capabilities: None,
+            bootstrap: None,
+            control_calls: Arc::new(ControlCalls::default()),
+        })
+    })
+    .await;
+    let (fabric, _) = receive.await.unwrap();
+    let endpoint = fabric.endpoint();
+    assert_eq!(endpoint.actor.partition, partition);
+    assert_eq!(endpoint.actor.replica, 7);
+    assert_eq!(endpoint.actor.incarnation, actor);
+    assert_eq!(
+        endpoint
+            .address
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .ip(),
+        advertised_ip
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut socket = tokio::net::TcpStream::connect(&endpoint.address)
+            .await
+            .unwrap();
+        let hello = fube_transport::connection::read_message(&mut socket)
+            .await
+            .unwrap();
+        assert_eq!(
+            fube_transport::message::ListenInstance::decode(&hello.body)
+                .unwrap()
+                .address,
+            endpoint.address
+        );
+    })
+    .await
+    .unwrap();
+    drop(host);
+    assert!(fabric.snapshot().closed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

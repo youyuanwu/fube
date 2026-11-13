@@ -43,6 +43,7 @@ async fn exact_runtime_control_check_rejects_revocation_at_actual_lower_queued_m
                     None,
                     ReplicationEndpointOptions {
                         listen_address: "127.0.0.1:0".into(),
+                        advertised_ip: None,
                         actor_incarnation: actor,
                     },
                     Default::default(),

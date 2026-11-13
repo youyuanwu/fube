@@ -1,4 +1,4 @@
-//! **Operational for the explicit native loopback composition in
+//! **Operational for the explicit native TCP composition in
 //! [`native_channel`](crate::native_channel).**
 //!
 //! Bounded Rust-profile contracts for a shared native message/RPC

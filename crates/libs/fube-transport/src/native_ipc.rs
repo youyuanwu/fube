@@ -33,8 +33,11 @@ pub async fn connect_unsecured_loopback(
     deadline: Instant,
     host_id: &str,
 ) -> Result<GatewayChannel> {
+    if !endpoint.ip().is_loopback() {
+        return Err(Error::InvalidInput("IPC requires loopback"));
+    }
     let session = Arc::new(IpcSession::new(host_id, std::process::id())?);
-    Endpoint::unsecured_loopback(endpoint, composition)?
+    Endpoint::unsecured_tcp(endpoint, composition)?
         .channel_limits(limits)
         .connect_with_envelope_until(deadline, session)
         .await

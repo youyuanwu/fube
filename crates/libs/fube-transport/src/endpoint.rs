@@ -11,7 +11,7 @@ use crate::{
     Channel, ChannelLimits, Error, Result,
 };
 
-/// Explicitly trusted clear-loopback dial settings and immutable authorization.
+/// Plain-TCP dial settings and immutable protocol authorization.
 ///
 /// Construction, setters and cloning do no I/O. Each [`Self::connect`] creates a
 /// fresh owner, target, ID history and driver; cloning a [`Channel`] instead
@@ -25,21 +25,23 @@ pub struct Endpoint {
     composition: ChannelComposition,
 }
 
+pub(crate) fn validate_tcp_endpoint(address: SocketAddr) -> Result<()> {
+    if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+        return Err(Error::InvalidInput(
+            "TCP endpoint requires a unicast address and nonzero port",
+        ));
+    }
+    Ok(())
+}
+
 impl Endpoint {
-    /// Configure an explicit numeric nonzero-port loopback endpoint.
+    /// Configure an explicit numeric unicast endpoint with a nonzero port.
     ///
     /// No permissive policy is supplied: adapters choose their composition.
     /// The default connection budget is 30 seconds, independent of the
     /// started-frame watchdog and any typed client's operation defaults.
-    pub fn unsecured_loopback(
-        address: SocketAddr,
-        composition: ChannelComposition,
-    ) -> Result<Self> {
-        if !address.ip().is_loopback() || address.port() == 0 {
-            return Err(Error::InvalidInput(
-                "unsecured gateway requires explicit loopback endpoint",
-            ));
-        }
+    pub fn unsecured_tcp(address: SocketAddr, composition: ChannelComposition) -> Result<Self> {
+        validate_tcp_endpoint(address)?;
         Ok(Self {
             address,
             timeout: Duration::from_secs(30),

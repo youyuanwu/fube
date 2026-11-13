@@ -1,4 +1,4 @@
-//! Independently owned unsecured-loopback gateway notification sessions.
+//! Independently owned plain-TCP gateway notification sessions.
 use std::{
     collections::HashMap,
     fmt,
@@ -264,11 +264,11 @@ pub struct ServiceNotificationClient {
     gateway: GatewayDescription,
 }
 impl ServiceNotificationClient {
-    /// Configure notification-authorized clear-loopback transport locally, without I/O.
+    /// Configure notification-authorized plain-TCP transport without I/O.
     /// `Endpoint::connect` establishes transport, not a native notification session.
     pub fn endpoint_clear(endpoint: SocketAddr) -> Result<Endpoint> {
         Ok(
-            Endpoint::unsecured_loopback(endpoint, crate::channel_adapter::notifications()?)?
+            Endpoint::unsecured_tcp(endpoint, crate::channel_adapter::notifications()?)?
                 .channel_limits(notification_limits()),
         )
     }

@@ -139,11 +139,11 @@ pub struct FabricClient {
 }
 
 impl FabricClient {
-    /// Configure an ordinary clear-loopback connection without opening it.
+    /// Configure an ordinary plain-TCP connection without opening it.
     ///
     /// Authorization is installed by connection setup, not by stub binding.
     pub fn endpoint_clear(address: SocketAddr) -> Result<Endpoint> {
-        Endpoint::unsecured_loopback(address, channel_adapter::ordinary()?)
+        Endpoint::unsecured_tcp(address, channel_adapter::ordinary()?)
     }
 
     /// Bind locally to an established channel and its original target.
