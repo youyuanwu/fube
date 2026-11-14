@@ -3331,7 +3331,6 @@ impl Ledger {
                 i.reply.as_ref().is_some_and(|r| r.error == 0) && !i.cancelled && !i.unknown
             });
         if !self.placements[0].launch.profile.peer_replicas()
-            || self.generation_pending()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
             || self.placements[0].observed != Observed::Running

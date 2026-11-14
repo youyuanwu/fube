@@ -130,6 +130,36 @@ pub struct PeerCreation {
 }
 
 impl EntityState {
+    fn update_remote_configuration(&mut self, replica: Replica) {
+        let configuration = self.configuration.get_or_insert_with(|| Configuration {
+            unit: self.body.unit.clone(),
+            service: self.body.service.clone(),
+            replicas: fube_transport::serialization::serde::ObjectArray(vec![self
+                .body
+                .replica
+                .clone()]),
+        });
+        if let Some(previous) = configuration
+            .replicas
+            .0
+            .iter_mut()
+            .find(|previous| previous.node == replica.node)
+        {
+            *previous = replica;
+        } else {
+            configuration.replicas.0.push(replica);
+        }
+    }
+
+    fn remove_remote_configuration(&mut self, node: &NodeInstance) {
+        if let Some(configuration) = &mut self.configuration {
+            configuration
+                .replicas
+                .0
+                .retain(|replica| replica.node != *node);
+        }
+    }
+
     /// Original opened-peer lineage for admission, not cleanup or replacement proof.
     pub fn peer_opened_lifetime(&self) -> bool {
         self.peer_creation.as_ref().is_some_and(|peer| {
@@ -247,60 +277,6 @@ pub struct RemoteRemoval {
     pub fm_request: Option<Arc<RemoveReplica>>,
     pub result: Option<i64>,
     pub detail: ProxyErrorDetail,
-}
-
-pub(super) fn initial_idle_build(state: &EntityState) -> bool {
-    if state.reconfiguration.is_some()
-        || state.swap.is_some()
-        || state.progress_query.is_some()
-        || state.local_deleted
-        || state.cleanup_pending
-        || !state.body.service.stateful
-        || state.body.service.persisted
-        || state.body.unit.previous != Epoch::default()
-        || !valid_stateful_sizes(&state.body.service)
-        || !state.body.replica.up
-    {
-        return false;
-    }
-    if state.fm_primary {
-        state.phase == Phase::Ready
-            && state.peer_creation.is_none()
-            && state.body.replica.current_role == 4
-            && state.body.replica.state == 2
-            && state.primary_deactivation == Some((state.body.unit.current, 0))
-            && !state.remote_idles.is_empty()
-            && state.remote_idles.iter().all(|remote| {
-                remote.fm_request.is_some()
-                    && remote.removal.is_none()
-                    && !remote.creation_failed()
-                    && remote
-                        .build
-                        .as_ref()
-                        .is_none_or(|build| build.result.is_none_or(|error| error == 0))
-            })
-    } else {
-        matches!(state.phase, Phase::Opening | Phase::Ready)
-            && state.body.replica.current_role == 2
-            && state.body.replica.state == 1
-            && state.remote_idles.is_empty()
-            && state.peer_creation.as_ref().is_some_and(|peer| {
-                !peer.host_down
-                    && peer.registration_error.is_none()
-                    && peer.open_error.is_none()
-                    && peer.delete_operation == 0
-                    && peer.deactivation.epoch == state.body.unit.current
-                    && peer.deactivation.catchup_lsn == 0
-            })
-    }
-}
-
-pub fn continues_initial_idle_build(state: &EntityState, body: &AddReplica) -> bool {
-    initial_idle_build(state)
-        && state
-            .remote_idle(&body.replica.node)
-            .and_then(|remote| remote.fm_request.as_deref())
-            == Some(body)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -596,6 +572,7 @@ fn create_remote(
         }
         state.remote_idles.push(remote);
     }
+    state.update_remote_configuration(target.clone());
     Ok(lifecycle::changed(
         state,
         vec![Effect::PeerCreateReplica {
@@ -765,6 +742,11 @@ pub(super) fn complete_remote(
     }
     let mut state = current.clone();
     let succeeded = body.error == 0;
+    if succeeded {
+        state.update_remote_configuration(body.replica.clone());
+    } else {
+        state.remove_remote_configuration(source);
+    }
     state
         .remote_idle_mut(source)
         .expect("checked remote owner")
@@ -897,11 +879,19 @@ pub(super) fn complete_build(
     if event.error == 0 && remote.fm_request.is_some() {
         remote.ready = true;
     }
+    let mut description = remote
+        .reply
+        .as_ref()
+        .expect("opened remote")
+        .replica
+        .clone();
+    description.state = if event.error == 0 { 2 } else { 1 };
     let effects = remote
         .add_reply()
         .map(Effect::AddReplicaReply)
         .into_iter()
         .collect();
+    state.update_remote_configuration(description);
     Ok(lifecycle::changed(state, effects, false))
 }
 
@@ -971,6 +961,8 @@ pub(super) fn start_removal(
     let remote = state.remote_idle_mut(target).expect("checked remote");
     remote.ready = false;
     remote.removal = Some(removal);
+    let description = remote.removal.as_ref().expect("removal").replica.clone();
+    state.update_remote_configuration(description);
     Ok(lifecycle::changed(state, vec![effect], false))
 }
 
@@ -1079,6 +1071,7 @@ pub(super) fn remove_from_fm(
         let reply = remote
             .remove_reply()
             .expect("completed local creation cleanup");
+        state.remove_remote_configuration(&reply.replica.node);
         return Ok(lifecycle::changed(
             state,
             vec![Effect::RemoveReplicaReply(reply)],
@@ -1130,6 +1123,9 @@ pub(super) fn complete_removal(
         .expect("checked removal");
     removal.result = Some(event.error);
     removal.detail = event.detail;
+    if event.error == 0 {
+        state.remove_remote_configuration(&event.remote.node);
+    }
     let effects = state
         .remote_idle(&event.remote.node)
         .and_then(RemoteIdle::remove_reply)

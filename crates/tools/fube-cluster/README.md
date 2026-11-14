@@ -705,16 +705,22 @@ Inventory uses the current committed service description. Existing Primary data
 and original node/app/runtime ownership remain intact. During initial build the
 Primary reports its admitted remotes as InBuild/Ready according to committed
 build completion; each destination reports only its own InBuild Idle. PC/IC
-remain invalid. Exact AddReplica retries and build completions remain independent
-of upload ACKs, but new configuration intent waits for reconciliation. Both
+remain invalid. Ordinarily admitted control and build completions remain independent
+of upload ACKs. Automatic configuration waits for reconciliation; explicit
+configuration admission does not. Both
 launchers qualify this with a held real application copy operation and superseding
 generations, without reopening replicas. Retry qualification drives
 the shared upload state at explicit deadlines over real correlated Channels;
 separate process cases retain the original node/app/runtime owners. Each call is
 a bounded live-session round for stateless/independent singleton or bounded 3/2
 profiles; a later explicit call starts above the completed round's generation.
-This is not application-data upload, unknown-partition reconstruction, manual/failed
-builds, broader reconfiguration or planned-swap/repair inventory, nonempty NodeUp, full ReplicaUp
+The shared RA now reports its committed replica-store view without a
+build/failover lineage allowlist, retaining IC separately from CC and applying
+SF's previous/current-Primary reporting rules. Model/store tests include
+configured repair/removal, planned transfer, redirected failover and failed
+operations. These do not widen the test FM's bounded process generation rounds.
+This is not application-data upload, unknown-partition reconstruction,
+broader reconfiguration or planned-swap/repair process qualification, nonempty NodeUp, full ReplicaUp
 batching, FM/FMM recovery or durable restart. Replicated acceptance withholds
 correlated replies, renegotiates a newer generation, rejects the late stale
 completion and preserves all original owners, data and membership.
@@ -723,7 +729,8 @@ uploading the committed query-only/candidate/completed survivor views. GetLSN
 copies old CC to PC; Deactivate sets IC=CC and survivor Activate clears IC.
 Closed former-Primary metadata is canonical or omitted after deletion. Stale
 upload ACKs neither finish promotion nor change quorum authority. Planned swaps,
-repair, redirected/repeated failover inventory and restart remain separate gates.
+repair and redirected/repeated failover process overlap qualification and restart
+remain separate work.
 Initial-admission acceptance holds actual Secondary role completion across two
 generation updates. LFUM retains committed PC roles/epochs, Primary phase-4 IC
 and Secondary invalid IC; completion later clears PC/IC without changing the

@@ -465,6 +465,8 @@ pub(super) fn add_existing(
             // No application-upgrade table entry in this bounded profile.
             // Creation uses THIS resent request, not the old retained description.
             state.body = Arc::new(create_body(body.clone()));
+            state.configuration = None;
+            state.intermediate_configuration = None;
             state.phase = Phase::Opening;
             state.open_token = work.id;
             state.runtime = None;
@@ -682,6 +684,8 @@ pub(super) fn transition(
                 reconfiguration: None,
                 swap: None,
                 progress_query: None,
+                configuration: None,
+                intermediate_configuration: None,
                 // TryCreateFailoverUnit constructs from ID, consistency and
                 // service, NOT the incoming previous epoch/target/minimum.
                 body: Arc::new(AddInstance {

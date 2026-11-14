@@ -51,15 +51,14 @@ mod reconfiguration;
 #[path = "swap.rs"]
 mod swap;
 pub use peer::{
-    completed_primary_failover, continues_initial_idle_build, BuildCompletion, PeerCreation,
-    RemoteBuild, RemoteIdle, RemoteRemoval, RemovalCompletion,
+    completed_primary_failover, BuildCompletion, PeerCreation, RemoteBuild, RemoteIdle,
+    RemoteRemoval, RemovalCompletion,
 };
 pub use reconfiguration::{
-    initial_membership_configuration, replica_replacement_metadata, retired_configuration,
-    secondary_removal_in_progress, secondary_service, ConfigurationCompletion, ConfigurationStage,
-    Reconfiguration,
+    replica_replacement_metadata, retired_configuration, secondary_removal_in_progress,
+    secondary_service, ConfigurationCompletion, ConfigurationStage, Reconfiguration,
 };
-pub use swap::{continues_primary_failover, PrimarySwap, ProgressQuery, SwapStage};
+pub use swap::{PrimarySwap, ProgressQuery, SwapStage};
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -658,6 +657,10 @@ pub struct EntityState {
     pub reconfiguration: Option<Reconfiguration>,
     pub swap: Option<PrimarySwap>,
     pub progress_query: Option<ProgressQuery>,
+    /// Committed replica-store view, independent of retained operation history.
+    pub configuration: Option<Configuration>,
+    /// IC roles survive independently of subsequent CC descriptions.
+    pub intermediate_configuration: Option<Configuration>,
     pub phase: Phase,
     pub open_token: u64,
     /// Volatile retry bookkeeping; not a native disk record or durable outbox.
@@ -2257,6 +2260,8 @@ fn transition(
                     reconfiguration: None,
                     swap: None,
                     progress_query: None,
+                    configuration: None,
+                    intermediate_configuration: None,
                     phase: Phase::Opening,
                     open_token: work.id,
                     retry_attempts: 0,
@@ -2547,40 +2552,13 @@ async fn entity_worker(
             let mut effective_admission = admission.clone();
             effective_admission.node_activated = view.node.activation.activated;
             effective_admission.generation = view.generations.receive.clone();
-            if matches!(
-                work.kind,
-                Kind::CreateRemoteIdle
-                    | Kind::BuildRemoteIdle
-                    | Kind::RemoveRemoteIdle
-                    | Kind::AddReplica { .. }
-                    | Kind::RemoveReplica { .. }
-                    | Kind::DoReconfiguration { .. }
-                    | Kind::Deactivate { .. }
-                    | Kind::DeactivateReply { .. }
-                    | Kind::Activate { .. }
-                    | Kind::ActivateReply { .. }
-                    | Kind::RetryConfiguration
-            ) && view.generations.upload_pending
-                && !reconfiguration::continues_initial_membership(&work, committed.as_deref())
-                && !swap::continues_original_failover(&work, committed.as_deref())
-                && !(matches!(work.kind, Kind::AddReplica { .. })
-                    && committed.as_deref().is_some_and(|state| {
-                        from_slice::<AddReplica>(&work.bytes)
-                            .is_ok_and(|body| continues_initial_idle_build(state, &body))
-                    }))
-            {
-                Err(Failure::Unsupported(
-                    "peer control is gated during generation rebuild",
-                ))
-            } else {
-                transition(
-                    &work,
-                    committed.as_deref(),
-                    &effective_admission,
-                    &shared.config,
-                    &view.peers,
-                )
-            }
+            transition(
+                &work,
+                committed.as_deref(),
+                &effective_admission,
+                &shared.config,
+                &view.peers,
+            )
         } else {
             binding.map(|_| Transition::ignored(Disposition::IgnoredStale))
         };

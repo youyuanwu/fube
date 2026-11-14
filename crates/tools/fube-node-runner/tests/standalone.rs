@@ -868,6 +868,11 @@ async fn rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
 }
 
 async fn admitting_rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
+    hold_superseding_rollover(fm, fixture).await;
+    acknowledge_rollover(fm, fixture).await;
+}
+
+async fn hold_superseding_rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
     let before: Vec<_> = (0..3).map(|index| fixture.status(index)).collect();
     fm.hold_uploads = true;
     start_rollover(fm).await;
@@ -922,6 +927,9 @@ async fn admitting_rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
             before["local_configuration_complete"]
         );
     }
+}
+
+async fn acknowledge_rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
     fm.hold_uploads = false;
     for (index, mut incoming) in std::mem::take(&mut fm.held_uploads) {
         let link = fm.links[index].as_ref().unwrap();
@@ -1003,7 +1011,7 @@ async fn journey(fault: Fault) {
         assert!(fm.builds.is_empty());
         fm.initial_builds = Some(builds.clone());
         let authority = application(&endpoint, "read").await;
-        admitting_rollover(&mut fm, &mut fixture).await;
+        hold_superseding_rollover(&mut fm, &mut fixture).await;
         assert_eq!(application(&endpoint, "read").await, authority);
         let primary_upload = &fm.uploaded[selected].as_ref().unwrap().units.0[0];
         for index in [0, 2] {
@@ -1087,6 +1095,28 @@ async fn journey(fault: Fault) {
         do_reconfiguration_message(&configuration, &generation).unwrap(),
     )
     .await;
+    if fault == Fault::BuildingGenerationHandshake {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while fixture.status(selected)["local_configuration_stage"] != "Activate" {
+            assert!(
+                Instant::now() < deadline,
+                "configuration before LFUM ACK: {}",
+                fixture.diagnostics()
+            );
+            fm.step().await;
+        }
+        assert_eq!(
+            fixture.status(selected)["generations"]["upload_pending"],
+            true
+        );
+        assert!(fm.held_configuration.is_none());
+        acknowledge_rollover(&mut fm, &mut fixture).await;
+        fm.send(
+            selected,
+            do_reconfiguration_message(&configuration, &generation).unwrap(),
+        )
+        .await;
+    }
     if fault == Fault::AdmittingGenerationHandshake {
         let deadline = Instant::now() + Duration::from_secs(8);
         while [0, 2].iter().any(|index| {

@@ -6486,12 +6486,14 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
         source: survivor_peer(),
         generation: generation_header(admission().generation.generation),
     };
-    for incompatible in 0..2 {
+    for incompatible in 0..3 {
         let mut bad = reply.clone();
         if incompatible == 0 {
             bad.replica.replica.first_lsn = -1;
-        } else {
+        } else if incompatible == 1 {
             bad.deactivation.epoch.data_loss += 1;
+        } else {
+            bad.replica.unit.current.configuration += 1;
         }
         assert_eq!(
             run(&executor, lsn_reply(bad)).await,
@@ -6503,6 +6505,8 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
             SwapStage::GetLsn
         );
     }
+    let mut reply = reply;
+    reply.replica.unit.previous.configuration += 1;
     run(&executor, lsn_reply(reply)).await;
     let mut catchup = configured(&effects(&executor));
     assert_eq!(catchup.flags, 2);
@@ -6883,6 +6887,8 @@ async fn configured_failover_and_repair_track_every_survivor_and_commit_with_une
         let intent = failover_configuration(&original, &admission().local_node);
         run(&executor, reconfigure(intent.clone())).await;
         let actions = effects(&executor);
+        let frozen_failover =
+            capture_committed_lfum(&executor, &intent, Epoch::default(), true).await;
         assert_eq!(
             actions
                 .iter()
@@ -6921,6 +6927,15 @@ async fn configured_failover_and_repair_track_every_survivor_and_commit_with_une
         catchup.local.service_endpoint = "127.0.0.1:12349".into();
         run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
         let mut actions = effects(&executor);
+        let mut deactivating = intent.clone();
+        deactivating
+            .replicas
+            .0
+            .iter_mut()
+            .find(|replica| replica.node == admission().local_node)
+            .unwrap()
+            .service_endpoint = "127.0.0.1:12349".into();
+        capture_committed_lfum(&executor, &deactivating, intent.unit.current, true).await;
         for remote in intent.replicas.0.iter().filter(|r| r.current_role == 3) {
             let ack = Command::DeactivateReply {
                 source: remote.node.clone(),
@@ -6990,6 +7005,13 @@ async fn configured_failover_and_repair_track_every_survivor_and_commit_with_une
         assert_eq!(state(&executor).body.service, original.body.service);
         assert_eq!(state(&executor).runtime, original.runtime);
         let promoted = state(&executor);
+        capture_committed_lfum(
+            &executor,
+            &promoted.swap.as_ref().unwrap().body,
+            Epoch::default(),
+            true,
+        )
+        .await;
         let mut fresh = intent
             .replicas
             .0
@@ -7015,6 +7037,9 @@ async fn configured_failover_and_repair_track_every_survivor_and_commit_with_une
             effects(&executor).as_slice(),
             [Effect::PeerCreateReplica { .. }]
         ));
+        let mut building = promoted.swap.as_ref().unwrap().body.clone();
+        building.replicas.0.push(fresh.clone());
+        capture_committed_lfum(&executor, &building, Epoch::default(), true).await;
         fresh.replication_endpoint = "127.0.0.1:12350".into();
         run(
             &executor,
@@ -7081,6 +7106,7 @@ async fn configured_failover_and_repair_track_every_survivor_and_commit_with_une
         ticket.wait(WAIT).await.unwrap();
         let catchup = configured(&effects(&executor));
         assert_eq!(catchup.flags, 2);
+        capture_committed_lfum(&executor, &repair, Epoch::default(), true).await;
         assert_eq!(
             catchup
                 .replicas
@@ -7092,6 +7118,7 @@ async fn configured_failover_and_repair_track_every_survivor_and_commit_with_une
         );
         run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
         let mut actions = effects(&executor);
+        capture_committed_lfum(&executor, &repair, repair.unit.current, true).await;
         for remote in repair.replicas.0.iter().filter(|r| r.previous_role == 3) {
             assert!(!actions
                 .iter()
@@ -7202,6 +7229,13 @@ async fn configured_failover_and_repair_track_every_survivor_and_commit_with_une
         );
         assert_eq!(state(&executor).body.service, original.body.service);
         assert_eq!(state(&executor).runtime, original.runtime);
+        let mut stable = repair.clone();
+        stable.unit.previous = Epoch::default();
+        for replica in &mut stable.replicas.0 {
+            replica.previous_role = 1;
+        }
+        capture_committed_lfum(&executor, &stable, Epoch::default(), true).await;
+        assert_eq!(frozen_failover.units.0[0].unit, intent.unit);
         run(&executor, reconfigure(repair)).await;
         assert_eq!(effects(&executor), completed);
         finish(&store, &executor).await;
@@ -7268,6 +7302,11 @@ async fn configured_failover_selects_history_before_lsn_and_redirects_without_pr
                 );
                 assert_eq!(state(&executor).body.replica.current_role, 3);
                 assert_eq!(state(&executor).body.unit, intent.unit);
+                let mut expected = intent.clone();
+                for replica in &mut expected.replicas.0 {
+                    replica.current_role = replica.previous_role;
+                }
+                capture_committed_lfum(&executor, &expected, Epoch::default(), false).await;
                 assert_eq!(
                     run(
                         &executor,
@@ -8650,6 +8689,7 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
             }
             ticket.wait(WAIT).await.unwrap();
             let response = effects(&executor);
+            capture_committed_lfum(&executor, &body, body.unit.current, false).await;
             assert!(matches!(
                 response.as_slice(),
                 [Effect::PeerDeactivateReply { .. }]
@@ -8662,13 +8702,14 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
                     source: peer_source(),
                     generation: generation_header(admission().generation.generation),
                     body: Box::new(Activate {
-                        configuration: body,
+                        configuration: body.clone(),
                         deactivation: history.clone(),
                     }),
                 },
             )
             .await;
             let completion = configured(&effects(&executor));
+            capture_committed_lfum(&executor, &body, Epoch::default(), false).await;
             let (entered, release) = hooks.pause(false);
             let ticket = executor
                 .submit(Command::CompleteConfiguration(Box::new(completion)))
@@ -8677,6 +8718,16 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
             assert!(effects(&executor).is_empty());
             release.send(()).unwrap();
             ticket.wait(WAIT).await.unwrap();
+            let mut stable = body.clone();
+            stable.unit.previous = Epoch::default();
+            stable
+                .replicas
+                .0
+                .retain(|replica| replica.current_role >= 3);
+            for replica in &mut stable.replicas.0 {
+                replica.previous_role = 1;
+            }
+            capture_committed_lfum(&executor, &stable, Epoch::default(), false).await;
             assert!(matches!(
                 effects(&executor).as_slice(),
                 [Effect::PeerActivateReply { .. }]
@@ -8706,6 +8757,16 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
                 .node
                 .clone();
             let next = failover_configuration(&current, &candidate);
+            let mut queried = current.reconfiguration.as_ref().unwrap().request.clone();
+            queried.unit = next.unit.clone();
+            queried.unit.previous = current.body.unit.current;
+            queried
+                .replicas
+                .0
+                .retain(|replica| replica.current_role >= 3);
+            for replica in &mut queried.replicas.0 {
+                replica.previous_role = replica.current_role;
+            }
             run(
                 &executor,
                 Command::GetLsn {
@@ -8725,6 +8786,7 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
             )
             .await;
             let progress = status_completion(&effects(&executor));
+            capture_committed_lfum(&executor, &queried, Epoch::default(), false).await;
             run(&executor, Command::CompleteStatus(Box::new(progress))).await;
             assert!(
                 matches!(effects(&executor).as_slice(), [Effect::PeerGetLsnReply { body, .. }] if body.deactivation == history)
@@ -8913,7 +8975,58 @@ async fn secondary_lfum_reports_full_committed_membership_without_primary_author
 }
 
 #[tokio::test]
-async fn lfum_keeps_failed_build_and_configuration_explicitly_gated() {
+async fn lfum_reports_admitted_manual_creation_and_omits_aborted_remote_creation() {
+    for fm_owned in [false, true] {
+        let (store, executor, _) = setup(WAIT).await;
+        executor.bind_peer(peer_source()).unwrap();
+        make_ready(&executor, &primary_body()).await;
+        let original = state(&executor);
+        let mut expected = Configuration {
+            unit: original.body.unit.clone(),
+            service: original.body.service.clone(),
+            replicas: fube_transport::serialization::serde::ObjectArray(vec![original
+                .body
+                .replica
+                .clone()]),
+        };
+        let frozen = capture_committed_lfum(&executor, &expected, Epoch::default(), true).await;
+        let request = fm_idle_request(&original);
+        run(
+            &executor,
+            if fm_owned {
+                fm_add_idle(request.clone())
+            } else {
+                Command::CreateRemoteIdle {
+                    unit: request.unit.id.clone(),
+                    replica: request.replica.clone(),
+                }
+            },
+        )
+        .await;
+        effects(&executor);
+        expected.replicas.0.push(request.replica.clone());
+        capture_committed_lfum(&executor, &expected, Epoch::default(), true).await;
+        run(
+            &executor,
+            peer_opened(CreateReplicaReply {
+                unit: request.unit,
+                replica: request.replica,
+                error: -991,
+            }),
+        )
+        .await;
+        effects(&executor);
+        expected.replicas.0.pop();
+        capture_committed_lfum(&executor, &expected, Epoch::default(), true).await;
+        assert_eq!(frozen.units.0[0].replicas.0.len(), 1);
+        assert_eq!(state(&executor).runtime, original.runtime);
+        assert_eq!(state(&executor).open_token, original.open_token);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn lfum_reports_failed_build_and_configuration_without_changing_their_outcome() {
     for reconfiguring in [false, true] {
         let (store, executor, _) = setup(WAIT).await;
         if reconfiguring {
@@ -8956,17 +9069,16 @@ async fn lfum_keeps_failed_build_and_configuration_explicitly_gated() {
         executor
             .process_generation_update(&source, &GenerationUpdate::default(), &generation_header(8))
             .unwrap();
-        tokio::time::timeout(WAIT, async {
-            loop {
-                if let Err(error) = executor.lfum_inventory() {
-                    assert!(matches!(error, Failure::Unsupported(_)));
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        let inventory = wait_lfum(&executor).await;
+        let mut expected = before.configuration.clone().unwrap();
+        let local = expected
+            .replicas
+            .0
+            .iter_mut()
+            .find(|replica| replica.node == before.body.replica.node)
+            .unwrap();
+        *local = before.body.replica.clone();
+        assert_failover_lfum(&inventory, &expected, Epoch::default(), true);
         assert!(executor.generation_state().upload_pending);
         assert_eq!(
             executor.generation_state().send,
@@ -9017,6 +9129,23 @@ fn assert_failover_lfum(
         assert_eq!(info.replicas.0.iter().filter(|r|
             r.description == description && r.intermediate_role == intermediate_role).count(), 1);
     }
+}
+
+async fn capture_committed_lfum(
+    executor: &Executor,
+    expected: &Configuration,
+    intermediate: Epoch,
+    primary: bool,
+) -> LfumInventory {
+    start_lfum(executor, admission().generation.generation);
+    let inventory = wait_lfum(executor).await;
+    assert_failover_lfum(&inventory, expected, intermediate, primary);
+    assert_eq!(
+        executor.take_lfum_inventory().unwrap(),
+        Some(inventory.clone())
+    );
+    assert!(executor.generation_state().upload_pending);
+    inventory
 }
 
 #[tokio::test]
@@ -9366,13 +9495,13 @@ async fn queried_failover_survivor_lfum_copies_old_cc_to_pc_and_clears_ic_on_act
 }
 
 #[tokio::test]
-async fn failover_lfum_keeps_other_sizes_and_failed_rap_states_gated() {
+async fn failover_lfum_reports_other_sizes_and_failed_rap_states() {
     for (target, minimum, failed) in [(4, 2, false), (3, 3, false), (3, 2, true)] {
         let (store, executor, _) = setup(WAIT).await;
         active_configured_survivor(&executor, target, minimum).await;
         let original = state(&executor);
         let intent = failover_configuration(&original, &admission().local_node);
-        run(&executor, reconfigure(intent)).await;
+        run(&executor, reconfigure(intent.clone())).await;
         let actions = effects(&executor);
         if failed {
             let mut completion = status_completion(&actions);
@@ -9382,17 +9511,8 @@ async fn failover_lfum_keeps_other_sizes_and_failed_rap_states_gated() {
         }
         let before = state(&executor);
         start_lfum(&executor, 8);
-        tokio::time::timeout(WAIT, async {
-            loop {
-                if let Err(error) = executor.lfum_inventory() {
-                    assert!(matches!(error, Failure::Unsupported(_)));
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        let inventory = wait_lfum(&executor).await;
+        assert_failover_lfum(&inventory, &intent, Epoch::default(), true);
         assert_eq!(state(&executor), before);
         assert_eq!(
             executor.generation_state().send,
@@ -9449,7 +9569,7 @@ async fn closed_replicated_primary_lfum_is_canonical_until_its_deleted_entry_is_
 }
 
 #[tokio::test]
-async fn initial_idle_build_lfum_preserves_sf_states_and_only_retries_original_intent() {
+async fn initial_idle_build_lfum_preserves_sf_states_and_allows_normal_removal_before_ack() {
     let (store, executor, _) = setup(WAIT).await;
     executor.bind_peer(peer_source()).unwrap();
     make_ready(&executor, &primary_body()).await;
@@ -9517,18 +9637,6 @@ async fn initial_idle_build_lfum_preserves_sf_states_and_only_retries_original_i
         executor.submit(retry(changed)).unwrap().wait(WAIT).await,
         Err(Failure::Unsupported(_))
     ));
-    assert!(matches!(
-        executor
-            .submit(Command::RemoveReplica {
-                body: Box::new(request.clone()),
-                source: source.clone(),
-                generation: generation_header(8),
-            })
-            .unwrap()
-            .wait(WAIT)
-            .await,
-        Err(Failure::Unsupported(_))
-    ));
     begin(9);
     let building = wait_lfum(&executor).await;
     assert_eq!(
@@ -9574,6 +9682,40 @@ async fn initial_idle_build_lfum_preserves_sf_states_and_only_retries_original_i
     assert_eq!(state(&executor).usage, primary.usage);
     assert_eq!(state(&executor).runtime, primary.runtime);
     assert!(state(&executor).reconfiguration.is_none());
+    run(
+        &executor,
+        Command::RemoveReplica {
+            body: Box::new(request),
+            source: source.clone(),
+            generation: generation_header(10),
+        },
+    )
+    .await;
+    let removal = effects(&executor)
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::RemoveIdle { body, replica, .. } => Some((body, replica)),
+            _ => None,
+        })
+        .unwrap();
+    begin(11);
+    let dropping = wait_lfum(&executor).await;
+    assert_eq!(dropping.units.0[0].replicas.0[1].description.state, 3);
+    assert_eq!(ready.units.0[0].replicas.0[1].description.state, 2);
+    run(
+        &executor,
+        Command::CompleteRemoval(Box::new(BuildCompletion {
+            unit: removal.0.unit.clone(),
+            local: removal.0.replica.clone(),
+            remote: *removal.1,
+            error: 0,
+            detail: ProxyErrorDetail::default(),
+        })),
+    )
+    .await;
+    effects(&executor);
+    begin(12);
+    assert_eq!(wait_lfum(&executor).await.units.0[0].replicas.0.len(), 1);
     finish(&store, &executor).await;
 }
 
@@ -10497,6 +10639,7 @@ async fn planned_swap_demote_commit_and_original_progress_precede_peer_continuat
         }
         run(&executor, reconfigure(intent.clone())).await;
         let mut demoted = configured(&effects(&executor));
+        capture_committed_lfum(&executor, &intent, Epoch::default(), true).await;
         demoted.error = -99;
         run(
             &executor,
@@ -10504,6 +10647,7 @@ async fn planned_swap_demote_commit_and_original_progress_precede_peer_continuat
         )
         .await;
         assert!(effects(&executor).is_empty());
+        capture_committed_lfum(&executor, &intent, Epoch::default(), true).await;
         run(
             &executor,
             Command::RetryConfiguration(intent.unit.id.clone()),
@@ -10543,6 +10687,16 @@ async fn planned_swap_demote_commit_and_original_progress_precede_peer_continuat
         );
         assert_eq!(state(&executor).runtime, before.runtime);
         assert_eq!(state(&executor).usage, before.usage);
+        let mut reported = intent.clone();
+        let local = reported
+            .replicas
+            .0
+            .iter_mut()
+            .find(|replica| replica.node == admission().local_node)
+            .unwrap();
+        local.service_endpoint.clear();
+        local.state = 1;
+        capture_committed_lfum(&executor, &reported, Epoch::default(), false).await;
         run(&executor, reconfigure(intent)).await;
         assert_eq!(effects(&executor), forwarded);
         finish(&store, &executor).await;
@@ -10609,6 +10763,7 @@ async fn planned_swap_candidate_requires_both_lsn_results_endpoint_commit_and_fi
         };
         run(&executor, continue_swap()).await;
         let actions = effects(&executor);
+        capture_committed_lfum(&executor, &intent, Epoch::default(), true).await;
         assert!(actions
             .iter()
             .any(|e| matches!(e, Effect::QueryReplicaStatus { .. })));
@@ -10721,6 +10876,13 @@ async fn planned_swap_candidate_requires_both_lsn_results_endpoint_commit_and_fi
                 _ => None,
             })
             .unwrap();
+        capture_committed_lfum(
+            &executor,
+            &activate.configuration,
+            activate.configuration.unit.current,
+            true,
+        )
+        .await;
         let mut stable = activate.configuration.clone();
         stable.unit.previous = Epoch::default();
         for r in &mut stable.replicas.0 {

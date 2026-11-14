@@ -92,8 +92,14 @@ the original Primary app host, holds the candidate's real Primary callback and
 public replicator final-configuration call, and rolls generation while those
 original operations remain pending. It checks query-only survivor PC, candidate
 phase-4 IC and completed survivor metadata before continuing nonempty data.
-Manual/failed builds, failed RAP states, other interrupted reconfiguration,
-planned swaps, repair, redirected/repeated failover inventory and restart recovery remain gated.
+Shared RA inventory no longer has a build/failover lineage allowlist or an
+upload-pending peer-control gate. Committed configuration and independent IC
+roles also cover existing repair/removal, planned transfer, redirected failover
+and failed-operation states in model/store tests, without enabling new runtime
+operations. The copy-barrier process case admits initial configuration before
+the current upload ACK and resumes its exact peer work afterward.
+Broader process overlap qualification, nonempty startup/FMM and restart remain
+separate work.
 Each accepted generation update owns fresh inventory work. Shared Node upload
 owners retain independent correlated requests, frozen retries and completion,
 including multiple uploads in the same generation. Diagnostic `pending_uploads`

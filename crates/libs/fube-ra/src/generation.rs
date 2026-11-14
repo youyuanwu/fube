@@ -33,7 +33,6 @@ pub(super) struct LfumSnapshot {
     entries: BTreeMap<EntityId, bool>,
     remaining: usize,
     units: BTreeMap<EntityId, FailoverUnitInfo>,
-    error: Option<Failure>,
     claimed: bool,
 }
 
@@ -45,7 +44,6 @@ impl LfumSnapshot {
             remaining: entries.len(),
             entries,
             units: BTreeMap::new(),
-            error: None,
             claimed: false,
         }
     }
@@ -54,141 +52,115 @@ impl LfumSnapshot {
         if self.entries.get(&id) != Some(&true) {
             return;
         }
-        match configuration(state) {
-            Ok(Some(info)) => {
-                self.units.insert(id, info);
-            }
-            Ok(None) => {}
-            Err(error) => self.error = Some(error),
+        if let Some(info) = configuration(state) {
+            self.units.insert(id, info);
         }
         self.remaining -= 1;
     }
 
-    fn inventory(&self, upload: u64) -> Result<Option<LfumInventory>> {
-        if let Some(error) = &self.error {
-            return Err(error.clone());
-        }
-        Ok((self.remaining == 0).then(|| LfumInventory {
+    fn inventory(&self, upload: u64) -> Option<LfumInventory> {
+        (self.remaining == 0).then(|| LfumInventory {
             upload,
             generation: self.generation.clone(),
             units: ObjectArray(self.units.values().cloned().collect()),
             any_replica_found: !self.entries.is_empty(),
-        }))
+        })
     }
 }
 
-fn configuration(state: Option<&EntityState>) -> Result<Option<FailoverUnitInfo>> {
-    let Some(state) = state.filter(|state| !state.local_deleted) else {
-        return Ok(None);
-    };
-    let replicated = !state.remote_idles.is_empty()
-        || state.peer_creation.is_some()
-        || state.reconfiguration.is_some()
-        || state.swap.is_some();
+fn configuration(state: Option<&EntityState>) -> Option<FailoverUnitInfo> {
+    let state = state.filter(|state| !state.local_deleted)?;
     let dropped = state.phase == Phase::Closed || state.body.replica.state == 3;
-    let mut intermediate = Epoch::default();
+    let intermediate = state
+        .intermediate_configuration
+        .as_ref()
+        .map_or(Epoch::default(), |configuration| configuration.unit.current);
     let replicas = if dropped {
         vec![lifecycle::dropped_description(state)]
-    } else if let Some((configuration, ic)) = swap::lfum_configuration(state) {
-        intermediate = ic;
-        configuration.replicas.0
-    } else if peer::initial_idle_build(state) {
-        let mut replicas = vec![state.body.replica.clone()];
-        for remote in &state.remote_idles {
-            let mut description = remote.reply.as_ref().map_or_else(
-                || remote.body.replica.0.replica.clone(),
-                |reply| reply.replica.clone(),
-            );
-            // SF's Primary tracks build completion; the local Idle remains IB.
-            description.state = if remote.ready { 2 } else { 1 };
-            replicas.push(description);
-        }
-        replicas
-    } else if replicated {
-        let config = state
-            .reconfiguration
-            .as_ref()
-            .filter(|c| {
-                c.stage == ConfigurationStage::Complete
-                    || reconfiguration::initial_membership_configuration(state).is_some()
-            })
-            .ok_or(Failure::Unsupported(
-                "LFUM upload requires completed membership or initial Secondary admission",
-            ))?;
-        let membership = if config.stage == ConfigurationStage::Complete {
-            reconfiguration::stable(&config.request)
-        } else {
-            // SF retains PC during catch-up; Primary phase 4 also reports IC=CC.
-            if state.fm_primary
-                && matches!(
-                    config.stage,
-                    ConfigurationStage::Activate | ConfigurationStage::End
-                )
-            {
-                intermediate = state.body.unit.current;
-            }
-            config.request.clone()
-        };
-        if state.phase != Phase::Ready
-            || state.swap.is_some()
-            || state.progress_query.is_some()
-            || membership.unit != state.body.unit
-            || membership.replicas.0.len() != state.body.service.target as usize
-            || membership
-                .replicas
-                .0
-                .iter()
-                .any(|r| !r.up || r.state != 2 || !matches!(r.current_role, 3 | 4))
-            || state.remote_idles.iter().any(|r| {
-                !r.ready
-                    || r.removal.is_some()
-                    || !membership
-                        .replicas
-                        .0
-                        .iter()
-                        .any(|member| member.node == r.target)
-            })
-        {
-            return Err(Failure::Unsupported(
-                "LFUM upload requires full healthy peer membership without recovery",
-            ));
-        }
-        // Admitted membership, not the original Idle creation/build reply,
-        // owns remote roles and epochs. Preserve the actual local endpoints.
-        membership
-            .replicas
-            .0
-            .into_iter()
-            .map(|r| {
-                if r.node == state.body.replica.node {
-                    state.body.replica.clone()
-                } else {
-                    r
-                }
-            })
-            .collect()
     } else {
-        vec![state.body.replica.clone()]
+        state.configuration.as_ref().map_or_else(
+            || vec![state.body.replica.clone()],
+            |configuration| {
+                configuration
+                    .replicas
+                    .0
+                    .iter()
+                    .map(|replica| {
+                        if replica.node == state.body.replica.node {
+                            state.body.replica.clone()
+                        } else {
+                            replica.clone()
+                        }
+                    })
+                    .collect()
+            },
+        )
     };
-    Ok(Some(FailoverUnitInfo {
+    let reconfiguring = state.reconfiguration.as_ref().is_some_and(|configuration| {
+        matches!(
+            configuration.stage,
+            ConfigurationStage::Catchup
+                | ConfigurationStage::Deactivate
+                | ConfigurationStage::Activate
+                | ConfigurationStage::End
+        ) && configuration.request.unit == state.body.unit
+    }) || state.swap.as_ref().is_some_and(|swap| {
+        matches!(
+            swap.stage,
+            SwapStage::Demote
+                | SwapStage::GetLsn
+                | SwapStage::Catchup
+                | SwapStage::Deactivate
+                | SwapStage::Activate
+                | SwapStage::End
+        ) && swap.body.unit == state.body.unit
+    });
+    let local = &state.body.replica;
+    let report_from_primary = !dropped
+        && local.up
+        && matches!(local.state, 0..=2)
+        && !(state.runtime.is_none() && local.state == 0)
+        && (local.previous_role == 4 || local.current_role == 4)
+        && (reconfiguring || (local.current_role == 4 && local.state != 0));
+    Some(FailoverUnitInfo {
         service: state.body.service.clone(),
         unit: state.body.unit.clone(),
         intermediate,
-        report_from_primary: !dropped
-            && state.body.replica.up
-            && state.body.replica.current_role == 4
-            && matches!(state.body.replica.state, 1 | 2),
+        report_from_primary,
         replicas: ObjectArray(
             replicas
                 .into_iter()
                 .map(|mut description| {
                     description.first_lsn = -1;
                     description.last_lsn = -1;
-                    let intermediate_role = if intermediate == Epoch::default() {
+                    let intermediate_role = if dropped {
                         1
                     } else {
-                        description.current_role
+                        state
+                            .intermediate_configuration
+                            .as_ref()
+                            .and_then(|configuration| {
+                                configuration.replicas.0.iter().find(|replica| {
+                                    replica.node == description.node
+                                        && replica.id == description.id
+                                        && replica.instance == description.instance
+                                })
+                            })
+                            .map_or(1, |replica| replica.current_role)
                     };
+                    if description.node == local.node && !dropped {
+                        if local.up
+                            && ((report_from_primary && description.state == 0)
+                                || (!report_from_primary
+                                    && description.state == 2
+                                    && (description.previous_role == 4 || intermediate_role == 4)))
+                        {
+                            description.state = 1;
+                        }
+                        if state.runtime.is_none() && local.up && description.state == 0 {
+                            description.up = false;
+                        }
+                    }
                     ReplicaInfo {
                         description,
                         intermediate_role,
@@ -197,7 +169,7 @@ fn configuration(state: Option<&EntityState>) -> Result<Option<FailoverUnitInfo>
                 .collect(),
         ),
         local_deleted: false,
-    }))
+    })
 }
 
 impl GenerationState {
@@ -304,11 +276,10 @@ impl Executor {
     pub fn lfum_inventory(&self) -> Result<Option<LfumInventory>> {
         let mut view = lock(&self.shared.view);
         self.prepare_lfum(&mut view)?;
-        view.lfum
+        Ok(view
+            .lfum
             .last_key_value()
-            .map(|(upload, snapshot)| snapshot.inventory(*upload))
-            .transpose()
-            .map(Option::flatten)
+            .and_then(|(upload, snapshot)| snapshot.inventory(*upload)))
     }
 
     /// Transfer each completed update's inventory to one request/retry owner.
@@ -317,7 +288,7 @@ impl Executor {
         self.prepare_lfum(&mut view)?;
         for (upload, snapshot) in &mut view.lfum {
             if !snapshot.claimed {
-                if let Some(inventory) = snapshot.inventory(*upload)? {
+                if let Some(inventory) = snapshot.inventory(*upload) {
                     snapshot.claimed = true;
                     return Ok(Some(inventory));
                 }
