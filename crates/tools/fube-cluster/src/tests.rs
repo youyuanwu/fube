@@ -11,7 +11,7 @@ use std::{
 fn generation_round_retries_restarts_and_stops_before_upload_completion() {
     use fm::{GenerationHandshake, GenerationPhase, GenerationWork};
     let initial = launches()[0].generation.number.clone();
-    let mut round = GenerationHandshake::new(&initial).unwrap();
+    let mut round = GenerationHandshake::new(&initial, 2).unwrap();
     let first = round.number.clone();
     let now = Instant::now();
     assert!(matches!(
@@ -96,6 +96,68 @@ fn generation_round_retries_restarts_and_stops_before_upload_completion() {
     let before = round.number.clone();
     assert!(round.reject(&exhausted).is_err());
     assert_eq!(round.number, before);
+}
+
+#[test]
+fn replicated_lfum_reconciles_every_original_node_and_rejects_partial_or_stale_membership() {
+    let mut ledger = configured_ledger(3, 2);
+    for (i, placement) in ledger.placements.iter_mut().enumerate() {
+        placement.node_description = Some(NodeDescription {
+            name: format!("node{i}"),
+            ..NodeDescription::default()
+        });
+    }
+    ledger.begin_generation().unwrap();
+    let generation = ledger.generation.as_ref().unwrap().number.clone();
+    for index in 0..3 {
+        ledger.generation.as_mut().unwrap().proposal_reply(index, &GenerationProposalReply {
+            proposed: generation.clone(), current: generation.clone(), error: 0,
+        }).unwrap();
+    }
+    let configuration = ledger.configuration.as_ref().unwrap().reply.as_ref().unwrap().clone();
+    for index in 0..3 {
+        let upload = LfumUpload {
+            generation: generation.clone(),
+            node: ledger.placements[index].node_description.clone().unwrap(),
+            units: ObjectArray(vec![FailoverUnitInfo {
+                service: ledger.placements[index].body().unwrap().service,
+                unit: configuration.unit.clone(),
+                report_from_primary: index == 0,
+                replicas: ObjectArray(configuration.replicas.0.iter().cloned().map(|description| ReplicaInfo {
+                    description, intermediate_role: 1,
+                }).collect()),
+                ..FailoverUnitInfo::default()
+            }]),
+            any_replica_found: true,
+        };
+        let mut stale = upload.clone();
+        stale.generation.generation -= 1;
+        ledger.lfum_upload(index, stale).unwrap();
+        assert!(ledger.generation.as_ref().unwrap().uploads[index].is_none());
+        for mutation in 0..8 {
+            let mut bad = upload.clone();
+            let info = &mut bad.units.0[0];
+            match mutation {
+                0 => { info.replicas.0.pop(); }
+                1 => info.replicas.0[1] = info.replicas.0[0].clone(),
+                2 => info.replicas.0[1].description.instance += 1,
+                3 => info.replicas.0[1].description.current_role = 2,
+                4 => info.replicas.0[1].description.last_lsn = 123,
+                5 => info.unit.current.configuration += 1,
+                6 => info.report_from_primary = !info.report_from_primary,
+                _ => bad.node.name.push_str("-foreign"),
+            }
+            assert!(ledger.lfum_upload(index, bad).is_err());
+            assert!(ledger.generation.as_ref().unwrap().uploads[index].is_none());
+        }
+        ledger.lfum_upload(index, upload.clone()).unwrap();
+        assert_eq!(ledger.generation_pending(), index != 2);
+        let mut duplicate = upload.clone();
+        duplicate.units.0.clear();
+        ledger.lfum_upload(index, duplicate).unwrap();
+        assert_eq!(ledger.generation.as_ref().unwrap().uploads[index], Some(upload));
+    }
+    assert!(!ledger.generation_pending());
 }
 
 #[test]
@@ -1188,7 +1250,12 @@ fn idle_replacement_requires_both_semantic_barriers_and_original_disposal() {
         if missing != 3 { ledger.retirement(1, proof.clone(), 555).unwrap(); }
         if missing == 4 { ledger.lost(0, "Primary owner lost".into()); }
         if missing == 5 { ledger.lost(1, "destination owner lost".into()); }
-        if missing == 7 { ledger.begin_generation().unwrap(); }
+        if missing == 7 {
+            assert!(ledger.begin_generation().is_err());
+            ledger.generation = Some(fm::GenerationHandshake::new(
+                &ledger.placements[0].launch.generation.number, ledger.placements.len(),
+            ).unwrap());
+        }
         if missing < 8 {
             let before = ledger.status();
             assert!(ledger.request_idle_replacement(now).is_err(), "missing gate {missing}");
@@ -6014,11 +6081,113 @@ async fn real_generation_upload_uses_correlated_replies_and_resumes_new_generati
 }
 
 #[tokio::test]
-async fn lfum_lost_reply_retries_the_frozen_upload_without_generation_update() {
+async fn lfum_overlapping_updates_keep_independent_retries_and_resume_backpressure() {
     let fixture = Fixture::new("lfum-lost-reply");
     let mut cluster = Cluster::new(fixture.config()).unwrap();
     cluster.prepare().unwrap();
     let result = node::report_tests::run_lfum_retry(&cluster.ledger.placements[0].launch).await;
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn real_replicated_lfum_preserves_membership_data_owners_and_new_generation_control() {
+    let fixture = Fixture::new("replicated-lfum");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::Stateful { target: 3, minimum: 2 };
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    if let Err(error) = cluster.start().await {
+        let cleanup = cluster.shutdown().await;
+        panic!("replicated LFUM startup: {error}; cleanup={cleanup}");
+    }
+    let result = peer_idle_catch(async {
+        assert!(cluster.begin_generation_handshake().is_err());
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        until(&mut cluster, |c| c.ledger.result("primary")["state"] == "complete").await;
+        let endpoint = cluster.ledger.placements[0].endpoint.clone().ok_or("missing Primary endpoint")?;
+        until(&mut cluster, |_| data_contact(&endpoint, b"read\n").starts_with("OK ")).await;
+        assert!(data_contact(&endpoint, b"write\n").contains("committed=1 value=acknowledged"));
+        until(&mut cluster, |c| c.status()["nodes"].as_array().unwrap().iter().all(|n|
+            n["retained_work"]["local_replica"]["configuration"]["stage"] == "Complete")).await;
+        let before = cluster.status();
+        let members = cluster.ledger.configuration.as_ref().unwrap().reply.clone().unwrap();
+        cluster.begin_generation_handshake()?;
+        for _ in 0..2 {
+            for index in 0..3 { cluster.retry_generation(index).await?; }
+        }
+        let mut held = vec![];
+        for index in 0..3 {
+            loop {
+                let mut incoming = cluster.children[index].link.as_ref().unwrap().receive(wire::deadline()).await?
+                    .ok_or("missing replicated LFUM upload")?;
+                if incoming.message.properties().map_err(err)?.action == "LFUMUpload" {
+                    if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+                    held.push(incoming);
+                    break;
+                }
+                cluster.receive_message(index, incoming).await?;
+            }
+        }
+        let frozen = decode_lfum_upload(&held[0].message).map_err(err)?;
+        assert_eq!(frozen.units.0[0].replicas.0.len(), 3);
+        // Withhold the first semantic reply, supersede the round, then deliver
+        // that old correlated reply. It cannot acknowledge the new inventory.
+        cluster.ledger.generation.as_mut().unwrap().reject(&frozen.generation)?;
+        for _ in 0..2 {
+            for index in 0..3 { cluster.retry_generation(index).await?; }
+        }
+        let next = cluster.ledger.generation.as_ref().unwrap().number.clone();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while cluster.status()["nodes"][0]["retained_work"]["generations"]["receive"] != json!(next) {
+            assert!(Instant::now() < deadline, "new receive generation: {}", cluster.status());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for (index, mut incoming) in held.into_iter().enumerate() {
+            incoming.reply.take().ok_or("missing held LFUM reply authority")?.reply(
+                cluster.children[index].link.as_ref().unwrap().seal(lfum_upload_reply_message(&GenerationHeader {
+                    number: frozen.generation.clone(), for_fm_replica: false,
+                }).map_err(err)?)?, wire::deadline(),
+            ).await.map_err(err)?;
+        }
+        assert!(cluster.ledger.generation.as_ref().unwrap().uploads[0].is_none());
+        assert_eq!(cluster.status()["nodes"][0]["retained_work"]["generations"]["send"],
+            before["nodes"][0]["retained_work"]["generations"]["send"]);
+        until(&mut cluster, |c| !c.ledger.generation_pending()
+            && c.status()["nodes"].as_array().unwrap().iter().all(|n|
+                n["retained_work"]["generations"]["upload_pending"] == false)).await;
+        let round = cluster.ledger.generation.as_ref().unwrap();
+        assert_eq!(round.uploads.len(), 3);
+        assert_eq!(round.uploads[0].as_ref().unwrap().units, frozen.units);
+        for (index, upload) in round.uploads.iter().enumerate() {
+            let upload = upload.as_ref().unwrap();
+            assert!(upload.any_replica_found);
+            assert_eq!(upload.units.0[0].unit, members.unit);
+            assert_eq!(upload.units.0[0].replicas.0.len(), 3);
+            assert_eq!(upload.units.0[0].report_from_primary, index == 0);
+        }
+        // A replay under the new generation exercises shared control admission,
+        // without granting new membership or invoking another application Open.
+        let replay = cluster.ledger.configuration.as_ref().unwrap().body.clone();
+        cluster.send_configuration(&replay).await?;
+        let message = hold_peer_loss_frame(&mut cluster, 0, "DoReconfigurationReply", Duration::from_secs(8)).await?;
+        let (reply, owner) = decode_do_reconfiguration_reply(&message).map_err(err)?;
+        assert_eq!(reply, members);
+        assert_eq!(owner, Owner::Fm);
+        let continued = data_contact(&endpoint, b"write-more\n");
+        assert!(continued.contains("committed=2 value=continued"), "{continued}");
+        assert_eq!(data_contact(&endpoint, b"read\n"), continued);
+        let after = cluster.status();
+        for (old, new) in before["nodes"].as_array().unwrap().iter().zip(after["nodes"].as_array().unwrap()) {
+            for field in ["node_pid", "app_pid", "runtime_root"] {
+                assert_eq!(new[field], old[field]);
+            }
+            assert_eq!(new["retained_work"]["app_observation"]["opens"], 1);
+            assert_eq!(new["retained_work"]["local_replica"], old["retained_work"]["local_replica"]);
+        }
+        Ok::<(), String>(())
+    }).await;
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
     result.unwrap().unwrap();

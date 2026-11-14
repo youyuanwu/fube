@@ -205,20 +205,20 @@ pub(crate) enum GenerationWork {
 pub(crate) struct GenerationHandshake {
     pub number: GenerationNumber,
     pub phase: GenerationPhase,
-    proposed: [bool; 2],
-    pub updates_sent: [bool; 2],
-    pub uploads: [Option<LfumUpload>; 2],
-    retry_at: [Instant; 2],
+    proposed: Vec<bool>,
+    pub updates_sent: Vec<bool>,
+    pub uploads: Vec<Option<LfumUpload>>,
+    retry_at: Vec<Instant>,
 }
 impl GenerationHandshake {
-    pub fn new(current: &GenerationNumber) -> Result<Self> {
+    pub fn new(current: &GenerationNumber, nodes: usize) -> Result<Self> {
         Ok(Self {
             number: Self::successor(current, current.owner)?,
             phase: GenerationPhase::Proposing,
-            proposed: [false; 2],
-            updates_sent: [false; 2],
-            uploads: [None, None],
-            retry_at: [Instant::now(); 2],
+            proposed: vec![false; nodes],
+            updates_sent: vec![false; nodes],
+            uploads: vec![None; nodes],
+            retry_at: vec![Instant::now(); nodes],
         })
     }
     fn successor(current: &GenerationNumber, owner: [u8; 16]) -> Result<GenerationNumber> {
@@ -234,10 +234,10 @@ impl GenerationHandshake {
         let next = Self::successor(current, self.number.owner)?;
         self.number = next;
         self.phase = GenerationPhase::Proposing;
-        self.proposed = [false; 2];
-        self.updates_sent = [false; 2];
-        self.uploads = [None, None];
-        self.retry_at = [Instant::now(); 2];
+        self.proposed.fill(false);
+        self.updates_sent.fill(false);
+        self.uploads.fill(None);
+        self.retry_at.fill(Instant::now());
         Ok(())
     }
     pub fn proposal_reply(&mut self, index: usize, body: &GenerationProposalReply) -> Result<()> {
@@ -256,7 +256,7 @@ impl GenerationHandshake {
         self.proposed[index] = true;
         if self.proposed.iter().all(|accepted| *accepted) {
             self.phase = GenerationPhase::AwaitingUpload;
-            self.retry_at = [Instant::now(); 2];
+            self.retry_at.fill(Instant::now());
         }
         Ok(())
     }
@@ -1009,7 +1009,7 @@ impl Ledger {
             number: body.generation.clone(),
             for_fm_replica: false,
         };
-        let Some(round) = &mut self.generation else {
+        let Some(round) = &self.generation else {
             // Native ready FM acknowledges delayed uploads without rebuilding.
             return Ok(header);
         };
@@ -1017,6 +1017,15 @@ impl Ledger {
             || body.generation != round.number
             || round.uploads[index].is_some()
         {
+            return Ok(header);
+        }
+        if placement.launch.profile.peer_replicas() {
+            self.validate_peer_lfum(index, &body)?;
+            let round = self.generation.as_mut().expect("owned generation round");
+            round.uploads[index] = Some(body);
+            if round.uploads.iter().all(Option::is_some) {
+                round.phase = GenerationPhase::Complete;
+            }
             return Ok(header);
         }
         if placement.node_description.as_ref() != Some(&body.node)
@@ -1055,6 +1064,7 @@ impl Ledger {
                 return Err("LFUM replica state does not match the known original lifetime".into());
             }
         }
+        let round = self.generation.as_mut().expect("owned generation round");
         round.uploads[index] = Some(body);
         if round.uploads.iter().all(Option::is_some) {
             round.phase = GenerationPhase::Complete;
@@ -1062,9 +1072,66 @@ impl Ledger {
         Ok(header)
     }
 
+    fn validate_peer_lfum(&self, index: usize, body: &LfumUpload) -> Result<()> {
+        let placement = &self.placements[index];
+        let configuration = self
+            .configuration
+            .as_ref()
+            .and_then(|c| c.reply.as_ref())
+            .ok_or("LFUM upload requires a completed test configuration")?;
+        if placement.node_description.as_ref() != Some(&body.node)
+            || !body.any_replica_found
+            || body.units.0.len() != 1
+        {
+            return Err("LFUM node/inventory does not match the admitted peer profile".into());
+        }
+        let info = &body.units.0[0];
+        if info.service != placement.body()?.service
+            || info.unit != configuration.unit
+            || info.intermediate != Epoch::default()
+            || info.local_deleted
+            || info.report_from_primary
+                != placement
+                    .ready_replica
+                    .as_ref()
+                    .is_some_and(|r| r.current_role == 4)
+            || info.replicas.0.len() != configuration.replicas.0.len()
+        {
+            return Err("LFUM report changed the completed test configuration".into());
+        }
+        for expected in &configuration.replicas.0 {
+            let mut expected = expected.clone();
+            expected.first_lsn = -1;
+            expected.last_lsn = -1;
+            if info
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.description == expected && r.intermediate_role == 1)
+                .count()
+                != 1
+            {
+                return Err("LFUM report changed or omitted a known peer replica".into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn begin_generation(&mut self) -> Result<()> {
-        if self.placements.len() != 2
-            || self.configuration.is_some()
+        let peer = self.placements[0].launch.profile.peer_replicas();
+        let stable_peer = self.configuration.as_ref().is_some_and(|c| {
+            c.body.configuration.service.target == 3
+                && c.body.configuration.service.minimum == 2
+                && c.reply
+                    .as_ref()
+                    .is_some_and(|r| r.error == 0 && r.replicas.0.len() == self.placements.len())
+                && !c.unknown
+        });
+        if (peer && !stable_peer)
+            || self.swap.is_some()
+            || self.repair.is_some()
+            || self.idle_removal.is_some()
+            || self.idle_deletion.is_some()
             || self.generation.is_some()
             || self.placements.iter().any(|placement| {
                 placement.bootstrap != Bootstrap::Admitted
@@ -1076,12 +1143,15 @@ impl Ledger {
                     || placement.pending.is_some()
                     || placement.node_control.is_some()
                     || placement.service_update.is_some()
+                    || (peer
+                        && (placement.observed != Observed::Running || placement.loss_reported))
             })
         {
-            return Err("generation handshake requires two admitted idle control sessions".into());
+            return Err("generation handshake requires admitted idle control sessions and stable membership".into());
         }
         self.generation = Some(GenerationHandshake::new(
             &self.placements[0].launch.generation.number,
+            self.placements.len(),
         )?);
         Ok(())
     }

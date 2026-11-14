@@ -10,7 +10,7 @@ pub mod wire;
 
 use crate::local::{FmWork, LocalDisposition, Node};
 use fube_ra::{entity as ra, protocol::*};
-use std::{collections::VecDeque, future::Future, pin::Pin, time::Duration};
+use std::{collections::VecDeque, future::Future, pin::Pin, task::Poll, time::Duration};
 use tokio::time::Instant;
 use wire::Link;
 
@@ -56,52 +56,68 @@ pub enum SemanticAck {
 type UploadRequest =
     Pin<Box<dyn Future<Output = Result<Option<fube_transport::message::Message>>> + Send>>;
 
-pub struct LfumUploadState {
+struct LfumRequest {
+    upload: u64,
     request: Option<UploadRequest>,
-    body: Option<LfumUpload>,
+    body: LfumUpload,
     retry_at: Instant,
 }
 
-impl Default for LfumUploadState {
-    fn default() -> Self {
-        Self {
-            request: None,
-            body: None,
-            retry_at: Instant::now(),
-        }
-    }
+#[derive(Default)]
+pub struct LfumUploadState {
+    uploads: Vec<LfumRequest>,
 }
 
 impl LfumUploadState {
     pub fn is_in_flight(&self) -> bool {
-        self.request.is_some()
+        self.uploads.iter().any(|upload| upload.request.is_some())
     }
 
-    pub fn retry_at(&self) -> Instant {
-        self.retry_at
+    pub fn retry_at(&self, upload: u64) -> Option<Instant> {
+        self.uploads
+            .iter()
+            .find(|request| request.upload == upload)
+            .map(|request| request.retry_at)
     }
 
-    pub fn frozen_body(&self) -> Option<&LfumUpload> {
-        self.body.as_ref()
+    pub fn frozen_body(&self, upload: u64) -> Option<&LfumUpload> {
+        self.uploads
+            .iter()
+            .find(|request| request.upload == upload)
+            .map(|request| &request.body)
     }
 
-    /// Poll the original request, or wait while none is in flight.
-    pub async fn receive(&mut self) -> Result<Option<fube_transport::message::Message>> {
-        match self.request.as_mut() {
-            Some(request) => request.await,
-            None => std::future::pending().await,
-        }
+    /// Poll original requests independently, or wait while none is in flight.
+    pub async fn receive(&mut self) -> (u64, Result<Option<fube_transport::message::Message>>) {
+        std::future::poll_fn(|context| {
+            for upload in &mut self.uploads {
+                if let Some(request) = &mut upload.request {
+                    if let Poll::Ready(reply) = request.as_mut().poll(context) {
+                        return Poll::Ready((upload.upload, reply));
+                    }
+                }
+            }
+            Poll::Pending
+        })
+        .await
     }
 
     pub fn complete(
         &mut self,
         node: &Node,
         source: &NodeInstance,
-        reply: Result<Option<fube_transport::message::Message>>,
+        completed: (u64, Result<Option<fube_transport::message::Message>>),
         now: Instant,
     ) -> Result<()> {
-        self.request = None;
-        self.retry_at = now
+        let (upload, reply) = completed;
+        let index = self
+            .uploads
+            .iter()
+            .position(|request| request.upload == upload)
+            .ok_or("LFUM completion has no original request owner")?;
+        let request = &mut self.uploads[index];
+        request.request = None;
+        request.retry_at = now
             + ticks(
                 node.native_config()
                     .node(ra::NodeProperty::LfumUploadRetryIntervalTicks)
@@ -110,12 +126,9 @@ impl LfumUploadState {
         if let Some(message) = reply? {
             wire::predecode(&message)?;
             let generation = decode_lfum_upload_reply(&message).map_err(err)?;
-            if node
-                .process_lfum_upload_reply(source, &generation)
-                .map_err(err)?
-            {
-                self.body = None;
-            }
+            node.complete_lfum_upload(upload, source, &generation)
+                .map_err(err)?;
+            self.uploads.remove(index);
         }
         Ok(())
     }
@@ -127,37 +140,30 @@ impl LfumUploadState {
         link: Option<&Link>,
         now: Instant,
     ) -> Result<()> {
-        let generations = node.generation_state();
-        if self.request.is_none()
-            && self
-                .body
-                .as_ref()
-                .is_some_and(|body| body.generation != generations.receive)
-        {
-            self.body = None;
-            self.retry_at = now;
-        }
-        if generations.upload_pending && self.body.is_none() && self.request.is_none() {
-            self.retry_at = now;
-        }
         let Some(link) = link else { return Ok(()) };
-        if !generations.upload_pending || self.request.is_some() || now < self.retry_at {
-            return Ok(());
+        while let Some(inventory) = node.take_lfum_inventory().map_err(err)? {
+            self.uploads.push(LfumRequest {
+                upload: inventory.upload,
+                body: LfumUpload {
+                    generation: inventory.generation,
+                    node: description.clone(),
+                    units: inventory.units,
+                    any_replica_found: inventory.any_replica_found,
+                },
+                request: None,
+                retry_at: now,
+            });
         }
-        let Some(inventory) = node.lfum_inventory().map_err(err)? else {
-            return Ok(());
-        };
-        let body = self.body.get_or_insert_with(|| LfumUpload {
-            generation: inventory.generation,
-            node: description.clone(),
-            units: inventory.units,
-            any_replica_found: inventory.any_replica_found,
-        });
-        let request = lfum_upload_message(body).map_err(err)?;
-        let link = link.clone();
-        self.request = Some(Box::pin(
-            async move { link.request_optional(request).await },
-        ));
+        for upload in &mut self.uploads {
+            if upload.request.is_some() || now < upload.retry_at {
+                continue;
+            }
+            let request = lfum_upload_message(&upload.body).map_err(err)?;
+            let link = link.clone();
+            upload.request = Some(Box::pin(
+                async move { link.request_optional(request).await },
+            ));
+        }
         Ok(())
     }
 }

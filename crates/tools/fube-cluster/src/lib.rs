@@ -896,12 +896,9 @@ impl Cluster {
         }
     }
     /// Begin one live-session ordinary-FM inventory reconciliation. New
-    /// mutations remain gated until both native LFUM uploads are processed.
+    /// mutations remain gated until all native LFUM uploads are processed.
     pub fn begin_generation_handshake(&mut self) -> Result<Value> {
-        if self.config.profile.peer_replicas() {
-            return Err("peer-idle profile is bound to the original fixed generation".into());
-        }
-        if self.finished.is_some() || self.children.len() != 2 {
+        if self.finished.is_some() || self.children.len() != self.config.profile.node_count() {
             return Err("generation handshake requires the original running cluster".into());
         }
         self.ledger.begin_generation()?;

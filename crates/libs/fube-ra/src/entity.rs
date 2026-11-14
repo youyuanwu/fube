@@ -474,7 +474,7 @@ pub enum Command {
 }
 enum Kind {
     GetLfum {
-        generation: GenerationNumber,
+        upload: u64,
     },
     GetLsn {
         source: NodeInstance,
@@ -886,7 +886,8 @@ struct View {
     peers: Vec<NodeInstance>,
     generations: GenerationState,
     generations_touched: bool,
-    lfum: Option<generation::LfumSnapshot>,
+    lfum: BTreeMap<u64, generation::LfumSnapshot>,
+    lfum_sequence: u64,
     statuses: Option<LocalStatusConsumer>,
     entities: BTreeMap<EntityId, Snapshot>,
     effects: VecDeque<Dispatched>,
@@ -2683,10 +2684,10 @@ async fn entity_worker(
                 Err(error)
             }
         };
-        if let Kind::GetLfum { generation } = &work.kind {
+        if let Kind::GetLfum { upload } = &work.kind {
             if result.is_ok() {
-                if let Some(snapshot) = &mut view.lfum {
-                    snapshot.complete(generation, work.entity, committed.as_deref());
+                if let Some(snapshot) = view.lfum.get_mut(upload) {
+                    snapshot.complete(work.entity, committed.as_deref());
                 }
             }
         }

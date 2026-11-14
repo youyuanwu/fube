@@ -132,7 +132,7 @@ fn secondary_transition(body: &Configuration, old: &EntityState) -> bool {
                         == old.body.unit.current.configuration & !0xffff_ffff
             }))
 }
-fn stable(request: &Configuration) -> Configuration {
+pub(super) fn stable(request: &Configuration) -> Configuration {
     let mut body = request.clone();
     body.unit.previous = Epoch::default();
     for replica in &mut body.replicas.0 {

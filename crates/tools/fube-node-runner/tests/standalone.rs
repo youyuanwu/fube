@@ -185,7 +185,7 @@ struct FmFixture {
     links: Vec<Option<Link>>,
     configurations: Vec<Config>,
     bootstrapped: [bool; 3],
-    uploaded: [bool; 3],
+    uploaded: [Option<LfumUpload>; 3],
     primary: Option<AddPrimaryReply>,
     builds: Vec<AddReplicaReply>,
     configured: Vec<ConfigurationReply>,
@@ -235,7 +235,7 @@ impl FmFixture {
             links,
             configurations: fixture.configs.clone(),
             bootstrapped: [false; 3],
-            uploaded: [false; 3],
+            uploaded: [None, None, None],
             primary: None,
             builds: vec![],
             configured: vec![],
@@ -275,7 +275,39 @@ impl FmFixture {
                 "LFUMUpload" => {
                     let body = decode_lfum_upload(&incoming.message).unwrap();
                     assert_eq!(body.generation, generation.number);
-                    assert!(body.units.0.is_empty() && !body.any_replica_found);
+                    if let Some(configuration) = self.configured.last() {
+                        assert!(body.any_replica_found);
+                        assert_eq!(body.units.0.len(), 1);
+                        let info = &body.units.0[0];
+                        assert_eq!(info.unit, configuration.unit);
+                        assert_eq!(info.service, primary(&self.configurations[index]).service);
+                        assert_eq!(info.intermediate, Epoch::default());
+                        assert!(!info.local_deleted);
+                        assert_eq!(info.replicas.0.len(), configuration.replicas.0.len());
+                        assert_eq!(
+                            info.report_from_primary,
+                            configuration.replicas.0.iter().any(|r| r.node
+                                == self.configurations[index].node.identity.native().unwrap()
+                                && r.current_role == 4)
+                        );
+                        for expected in &configuration.replicas.0 {
+                            let mut expected = expected.clone();
+                            expected.first_lsn = -1;
+                            expected.last_lsn = -1;
+                            assert_eq!(
+                                info.replicas
+                                    .0
+                                    .iter()
+                                    .filter(
+                                        |r| r.description == expected && r.intermediate_role == 1
+                                    )
+                                    .count(),
+                                1
+                            );
+                        }
+                    } else {
+                        assert!(body.units.0.is_empty() && !body.any_replica_found);
+                    }
                     incoming
                         .reply
                         .take()
@@ -287,7 +319,7 @@ impl FmFixture {
                         )
                         .await
                         .unwrap();
-                    self.uploaded[index] = true;
+                    self.uploaded[index] = Some(body);
                 }
                 "NodeUp" => {
                     let body = decode_node_up(&incoming.message).unwrap();
@@ -502,6 +534,11 @@ async fn standalone_generation_handshake_and_empty_upload_resume_shared_control(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_generation_rollover_preserves_live_replicated_membership_and_data() {
+    journey(Fault::ReplicatedGenerationHandshake).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_wrong_generation_refuses_new_authority() {
     journey(Fault::Generation).await;
 }
@@ -531,6 +568,44 @@ enum Fault {
     ForeignInstance,
     Failover,
     GenerationHandshake,
+    ReplicatedGenerationHandshake,
+}
+
+async fn rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
+    fm.uploaded.fill(None);
+    for index in 0..3 {
+        let mut generation = fm.configurations[index].generation().unwrap();
+        generation.number.generation += 1;
+        let link = fm.links[index].as_ref().unwrap();
+        let reply = link
+            .request(generation_proposal_message(&generation).unwrap())
+            .await
+            .unwrap();
+        let reply = decode_generation_proposal_reply(&reply).unwrap();
+        assert_eq!(reply.error, 0);
+        assert_eq!(reply.proposed, generation.number);
+        assert_eq!(reply.current, generation.number);
+        fm.configurations[index].fm.generation += 1;
+        link.advance_generation(&generation);
+        fm.send(
+            index,
+            generation_update_message(&GenerationUpdate::default(), &generation).unwrap(),
+        )
+        .await;
+    }
+    fm.until(fixture, |fm| fm.uploaded.iter().all(Option::is_some))
+        .await;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while (0..3).any(|index| {
+        fixture.status(index)["generations"]["send"] != fm.configurations[index].fm.generation
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "generation completion: {}",
+            fixture.diagnostics()
+        );
+        fm.step().await;
+    }
 }
 
 async fn journey(fault: Fault) {
@@ -546,42 +621,11 @@ async fn journey(fault: Fault) {
     })
     .await;
     if fault == Fault::GenerationHandshake {
-        for index in 0..3 {
-            let mut generation = fm.configurations[index].generation().unwrap();
-            generation.number.generation += 1;
-            let link = fm.links[index].as_ref().unwrap();
-            let reply = link
-                .request(generation_proposal_message(&generation).unwrap())
-                .await
-                .unwrap();
-            let reply = decode_generation_proposal_reply(&reply).unwrap();
-            assert_eq!(reply.error, 0);
-            assert_eq!(reply.proposed, generation.number);
-            fm.configurations[index].fm.generation += 1;
-            link.advance_generation(&generation);
-            fm.send(
-                index,
-                generation_update_message(&GenerationUpdate::default(), &generation).unwrap(),
-            )
-            .await;
-        }
-        fm.until(&mut fixture, |fm| {
-            fm.uploaded.iter().all(|uploaded| *uploaded)
-        })
-        .await;
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while (0..3).any(|index| fixture.status(index)["generations"]["send"] != 2) {
-            assert!(
-                Instant::now() < deadline,
-                "generation completion: {}",
-                fixture.diagnostics()
-            );
-            fm.step().await;
-        }
+        rollover(&mut fm, &mut fixture).await;
     }
     let selected = 1;
     let body = primary(&fixture.configs[selected]);
-    let generation = fm.configurations[selected].generation().unwrap();
+    let mut generation = fm.configurations[selected].generation().unwrap();
     fm.send(selected, add_primary_message(&body, &generation).unwrap())
         .await;
     fm.until(&mut fixture, |fm| fm.primary.is_some()).await;
@@ -685,6 +729,23 @@ async fn journey(fault: Fault) {
     .await;
     fm.until(&mut fixture, |fm| fm.configured.len() == 1).await;
     assert_eq!(fm.configured[0], original);
+    if fault == Fault::ReplicatedGenerationHandshake {
+        rollover(&mut fm, &mut fixture).await;
+        generation = fm.configurations[selected].generation().unwrap();
+        assert!(application(&endpoint, "read")
+            .await
+            .contains("value=acknowledged"));
+        assert!(application(&endpoint, "write-more")
+            .await
+            .contains("committed=2 value=continued"));
+        fm.send(
+            selected,
+            do_reconfiguration_message(&configuration, &generation).unwrap(),
+        )
+        .await;
+        fm.until(&mut fixture, |fm| fm.configured.len() == 2).await;
+        assert_eq!(fm.configured[1], original);
+    }
     let mut deletion_bodies: Vec<_> = fixture
         .configs
         .iter()
@@ -822,7 +883,10 @@ async fn journey(fault: Fault) {
     }
     let refusal = !matches!(
         fault,
-        Fault::None | Fault::Failover | Fault::GenerationHandshake
+        Fault::None
+            | Fault::Failover
+            | Fault::GenerationHandshake
+            | Fault::ReplicatedGenerationHandshake
     );
     if refusal {
         if fault == Fault::LostFm {
@@ -860,7 +924,10 @@ async fn journey(fault: Fault) {
             Fault::Generation => "generation",
             Fault::Resize => "immutable for this service",
             Fault::Promotion | Fault::ForeignInstance => "only initial configured admission",
-            Fault::None | Fault::Failover | Fault::GenerationHandshake => unreachable!(),
+            Fault::None
+            | Fault::Failover
+            | Fault::GenerationHandshake
+            | Fault::ReplicatedGenerationHandshake => unreachable!(),
         };
         assert!(
             fixture.status(selected)["error"]

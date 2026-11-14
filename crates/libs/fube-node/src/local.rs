@@ -1115,6 +1115,20 @@ impl Node {
     pub fn lfum_inventory(&self) -> Result<Option<ra::LfumInventory>> {
         Ok(self.ra.lfum_inventory()?)
     }
+    pub fn take_lfum_inventory(&self) -> Result<Option<ra::LfumInventory>> {
+        Ok(self.ra.take_lfum_inventory()?)
+    }
+    pub fn pending_lfum_uploads(&self) -> usize {
+        self.ra.pending_lfum_uploads()
+    }
+    pub fn complete_lfum_upload(
+        &self,
+        upload: u64,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<bool> {
+        Ok(self.ra.complete_lfum_upload(upload, source, generation)?)
+    }
     pub fn process_lfum_upload_reply(
         &self,
         source: &NodeInstance,

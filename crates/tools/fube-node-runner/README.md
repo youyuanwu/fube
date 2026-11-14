@@ -50,7 +50,15 @@ Secondary through real GetLSN/Deactivate/Activate, verifies retained data and
 new acknowledged writes, and replays the final reconfiguration.
 Another case advances the ordinary-FM generation through correlated proposal,
 empty live-session LFUM upload and semantic completion before placement/build.
-It does not qualify nonempty peer-configuration inventory or restart recovery.
+A live 3/2 case uploads every member's full committed peer configuration,
+continues acknowledged writes on the original owners and replays native control
+under the new generation. Shared RA owns inventory and completion; the fixture
+FM only validates and acknowledges known test membership. In-flight build,
+reconfiguration, swap/repair inventory and restart recovery remain gated.
+Each accepted generation update owns fresh inventory work. Shared Node upload
+owners retain independent correlated requests, frozen retries and completion,
+including multiple uploads in the same generation. Diagnostic `pending_uploads`
+counts them separately from the current-generation `upload_pending` flag.
 
 ```sh
 cargo build --locked --workspace --bins --examples --all-features

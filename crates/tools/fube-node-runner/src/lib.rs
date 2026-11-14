@@ -173,6 +173,7 @@ impl Owner {
                     "receive": state.receive.generation,
                     "send": state.send.generation,
                     "upload_pending": state.upload_pending,
+                    "pending_uploads": node.pending_lfum_uploads(),
                 })
             }),
             "service_endpoint": state.map(|state| &state.body.replica.service_endpoint),
@@ -542,11 +543,20 @@ impl Owner {
                 }
             }
             if let Some(mut incoming) = self.fm_incoming.take() {
-                if !stopping && self.ingress.generation(node, link, &mut incoming).await? {
-                    if let Some(handoff) = incoming.handoff.as_mut() {
-                        handoff.acknowledge();
+                if !stopping {
+                    if let Some(admission) =
+                        self.ingress.generation(node, link, &mut incoming).await?
+                    {
+                        match admission {
+                            Admission::Retained => self.fm_incoming = Some(incoming),
+                            Admission::Submitted(_) => {
+                                if let Some(handoff) = incoming.handoff.as_mut() {
+                                    handoff.acknowledge();
+                                }
+                            }
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
                 }
                 if self.adapter.reject_deprecated(node, &incoming.message)? {
                     if let Some(handoff) = incoming.handoff.as_mut() {
@@ -689,10 +699,9 @@ impl Owner {
         }
         let pending_work = self.adapter.pending()
             + self.adapter.semantic_pending()
-            + self
-                .node
-                .as_ref()
-                .map_or(0, |node| node.external_pending().len());
+            + self.node.as_ref().map_or(0, |node| {
+                node.external_pending().len() + node.pending_lfum_uploads()
+            });
         Outcome {
             clean: node_result.is_ok() && store_closed && channels_closed && self.error.is_none(),
             activation_acquired: self.node.is_some(),

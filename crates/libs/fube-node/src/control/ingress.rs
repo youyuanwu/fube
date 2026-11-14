@@ -72,7 +72,8 @@ pub struct Placement {
 }
 
 pub enum Admission {
-    /// Keep the original incoming frame and its unacknowledged handoff.
+    /// Keep the original incoming frame until admission can retry.
+    /// Generation ingress may release its transport handoff so replies can drain.
     Retained,
     Submitted(Option<(u64, SemanticAck)>),
 }
@@ -472,7 +473,7 @@ impl Ingress {
         node: &Node,
         link: &wire::Link,
         incoming: &mut IncomingMessage<GatewayTarget>,
-    ) -> Result<bool> {
+    ) -> Result<Option<Admission>> {
         let message = &incoming.message;
         match message.properties().map_err(err)?.action.as_str() {
             "GenerationProposal" => {
@@ -493,10 +494,19 @@ impl Ingress {
             "GenerationUpdate" => {
                 wire::predecode(message)?;
                 let (body, header) = decode_generation_update(message).map_err(err)?;
-                match node
-                    .process_generation_update(&self.fm, &body, &header)
-                    .map_err(err)?
-                {
+                let outcome = match node.process_generation_update(&self.fm, &body, &header) {
+                    Ok(outcome) => outcome,
+                    Err(Error::Ra(ra::Failure::Capacity)) => {
+                        // The retained frame has a bounded local owner. Holding
+                        // transport here would block the LFUM replies that free capacity.
+                        if let Some(handoff) = incoming.handoff.as_mut() {
+                            handoff.acknowledge();
+                        }
+                        return Ok(Some(Admission::Retained));
+                    }
+                    Err(error) => return Err(err(error)),
+                };
+                match outcome {
                     ra::GenerationUpdateOutcome::Rejected(proposed) => {
                         link.send(generation_update_reject_message(&proposed).map_err(err)?)
                             .await?;
@@ -505,8 +515,8 @@ impl Ingress {
                     _ => {}
                 }
             }
-            _ => return Ok(false),
+            _ => return Ok(None),
         }
-        Ok(true)
+        Ok(Some(Admission::Submitted(None)))
     }
 }

@@ -483,8 +483,8 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 }
                 if let Some(mut incoming) = fm_incoming.take() {
                     let received = match ingress.generation(&node, current, &mut incoming).await {
-                        Ok(true) => Ok(Admission::Submitted(None)),
-                        Ok(false) => match adapter.reject_deprecated(&node, &incoming.message) {
+                        Ok(Some(admission)) => Ok(admission),
+                        Ok(None) => match adapter.reject_deprecated(&node, &incoming.message) {
                             Ok(true) => Ok(Admission::Submitted(None)),
                             Ok(false) => ingress.fm(&mut node, &incoming.message, false),
                             Err(error) => Err(error),
@@ -661,7 +661,8 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     });
                 let observation = serde_json::json!({
                     "deployment":launch.deployment, "session":launch.session,
-                    "node_pid":std::process::id(), "external_pending":node.external_pending().len(),
+                    "node_pid":std::process::id(),
+                    "external_pending":node.external_pending().len() + node.pending_lfum_uploads(),
                     "adapter_pending":adapter.pending(), "commands":node.pending_commands(),
                     "semantic_pending":adapter.semantic_pending(),
                     "staged_status":format!("{:?}", node.pending_status()),
@@ -692,7 +693,8 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     "generations": {
                         "proposed":generations.proposed, "receive":generations.receive,
                         "send":generations.send, "upload_pending":generations.upload_pending,
-                        "upload_supported":!launch.profile.peer_replicas(),
+                        "pending_uploads":node.pending_lfum_uploads(),
+                        "upload_supported":true,
                     },
                 });
                 if let Err(error) =
@@ -1174,7 +1176,7 @@ async fn cleanup(
         original_activation_cleaned: true,
         executor_closed: true,
         store_closed: true,
-        external_pending: node.external_pending().len(),
+        external_pending: node.external_pending().len() + node.pending_lfum_uploads(),
         adapter_pending: adapter.pending(),
         semantic_pending: adapter.semantic_pending(),
     })
@@ -2806,7 +2808,7 @@ pub(crate) mod report_tests {
     }
 
     pub(crate) async fn run_lfum_retry(launch: &Launch) -> Result<Result<()>> {
-        let (mut node, store) = create_node(launch).await?;
+        let (mut node, store) = create_node_with_capacity(launch, 2).await?;
         let mut adapter = Adapter::default();
         let result = async {
             node.start(&launch.package, APPLICATION, &[]).map_err(err)?;
@@ -2852,21 +2854,112 @@ pub(crate) mod report_tests {
                 if let Some(handoff) = first.handoff.as_mut() {
                     handoff.acknowledge();
                 }
+                node.process_generation_update(
+                    &launch.fm,
+                    &GenerationUpdate::default(),
+                    &generation,
+                )
+                .map_err(err)?;
+                upload.advance(&node, &up.node, Some(&link), Instant::now())?;
+                let mut second = next_lfum(&mut upload, &fm).await?;
+                if decode_lfum_upload(&second.message).map_err(err)? != frozen {
+                    return Err(
+                        "same-generation update changed an unchanged committed inventory".into(),
+                    );
+                }
+                if let Some(handoff) = second.handoff.as_mut() {
+                    handoff.acknowledge();
+                }
+                fm.send(
+                    generation_update_message(&GenerationUpdate::default(), &generation)
+                        .map_err(err)?,
+                )
+                .await?;
+                let mut retained = link
+                    .receive(wire::deadline())
+                    .await?
+                    .ok_or("missing retained generation update")?;
+                let ingress = launch.ingress()?;
+                let before = node.generation_state();
+                if !matches!(
+                    ingress.generation(&node, &link, &mut retained).await?,
+                    Some(Admission::Retained)
+                ) || node.generation_state() != before
+                {
+                    return Err(
+                        "generation capacity did not retain the original frame and state".into(),
+                    );
+                }
+                second
+                    .reply
+                    .take()
+                    .ok_or("second LFUM upload missing reply authority")?
+                    .reply(
+                        fm.seal(lfum_upload_reply_message(&generation).map_err(err)?)?,
+                        wire::deadline(),
+                    )
+                    .await
+                    .map_err(err)?;
+                if let Some(handoff) = second.handoff.as_mut() {
+                    handoff.acknowledge();
+                }
+                let completed = upload.receive().await;
+                let second_upload = completed.0;
+                upload.complete(&node, &launch.fm, completed, Instant::now())?;
+                if node.generation_state().upload_pending
+                    || node.pending_lfum_uploads() != 1
+                    || upload.frozen_body(second_upload).is_some()
+                    || !upload.is_in_flight()
+                {
+                    return Err("one same-generation reply canceled another owned upload".into());
+                }
+                if !matches!(
+                    ingress.generation(&node, &link, &mut retained).await?,
+                    Some(Admission::Submitted(None))
+                ) {
+                    return Err(
+                        "retained generation update did not resume after its owned reply".into(),
+                    );
+                }
+                if let Some(handoff) = retained.handoff.as_mut() {
+                    handoff.acknowledge();
+                }
+                upload.advance(&node, &up.node, Some(&link), Instant::now())?;
+                let mut resumed = next_lfum(&mut upload, &fm).await?;
+                resumed
+                    .reply
+                    .take()
+                    .ok_or("resumed LFUM upload missing reply authority")?
+                    .reply(
+                        fm.seal(lfum_upload_reply_message(&generation).map_err(err)?)?,
+                        wire::deadline(),
+                    )
+                    .await
+                    .map_err(err)?;
+                if let Some(handoff) = resumed.handoff.as_mut() {
+                    handoff.acknowledge();
+                }
+                let completed = upload.receive().await;
+                upload.complete(&node, &launch.fm, completed, Instant::now())?;
                 drop(first);
-                let reply = upload.receive().await?;
+                let (owned_upload, reply) = upload.receive().await;
+                let reply = reply?;
                 if reply.is_some() {
                     return Err("lost LFUM reply unexpectedly completed".into());
                 }
                 let completed = Instant::now();
-                upload.complete(&node, &launch.fm, Ok(None), completed)?;
-                let due = upload.retry_at();
+                upload.complete(&node, &launch.fm, (owned_upload, Ok(None)), completed)?;
+                let due = upload
+                    .retry_at(owned_upload)
+                    .ok_or("lost LFUM request owner")?;
                 if due - completed
                     != ticks(
                         node.native_config()
                             .node(ra::NodeProperty::LfumUploadRetryIntervalTicks),
                     )
-                    || upload.frozen_body() != Some(&frozen)
-                    || !node.generation_state().upload_pending
+                    || upload.frozen_body(owned_upload) != Some(&frozen)
+                    || node.generation_state().upload_pending
+                    || node.pending_lfum_uploads() != 1
                 {
                     return Err(
                         "lost reply changed the frozen inventory or native retry interval".into(),
@@ -2898,7 +2991,8 @@ pub(crate) mod report_tests {
                 upload.complete(&node, &launch.fm, reply, Instant::now())?;
                 if node.generation_state().upload_pending
                     || node.generation_state().send != generation.number
-                    || upload.frozen_body().is_some()
+                    || upload.frozen_body(owned_upload).is_some()
+                    || node.pending_lfum_uploads() != 0
                 {
                     return Err("matched LFUM reply did not settle the original upload".into());
                 }
@@ -3049,6 +3143,13 @@ pub(crate) mod report_tests {
         Ok(result)
     }
     async fn create_node(launch: &Launch) -> Result<(Node, Arc<Store>)> {
+        create_node_with_capacity(launch, 32).await
+    }
+
+    async fn create_node_with_capacity(
+        launch: &Launch,
+        maximum: usize,
+    ) -> Result<(Node, Arc<Store>)> {
         private_dir(&launch.directory)?;
         private_dir(&launch.directory.join("hosting"))?;
         let mut options = Options::new(launch.directory.join("hosting"));
@@ -3090,7 +3191,7 @@ pub(crate) mod report_tests {
                 fabric_upgrading: false,
             },
             ra::Settings {
-                max_outstanding: 32,
+                max_outstanding: maximum,
                 max_service_types: 1,
                 notification_batch_count: 1,
                 notification_batch_bytes: LIMIT,

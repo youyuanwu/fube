@@ -300,7 +300,7 @@ cat /run/fube/node1-session1/status.json
 | `registered`, `application_pid` | Actual local application registration/process observations. |
 | `replica_phase`, `replica_role` | Committed local replica state. |
 | `local_configuration_complete` | Local RA configuration completion, not the FM's receipt of its reply. |
-| `generations` | Admitted receive/send generations and pending native inventory upload; not restart readiness. |
+| `generations` | Admitted receive/send generations, current-generation `upload_pending` readiness and separate `pending_uploads` ownership count; not restart readiness. |
 | `control_unknown`, `error` | Observed error/control uncertainty; not permission to promote or reconnect. |
 | `cleanup` | Final local cleanup outcome, including separately reported `pending_work`. |
 
@@ -358,6 +358,16 @@ Native retry defaults are unchanged. The shared bounded wire profile retains
 its 64-KiB frame/body cap, 16 headers with 4-KiB values, bounded decode budget
 and 32 local command/effect observation slots.
 
+Ordinary-FM generation rollover also supports a stable, fully admitted 3/2
+configuration on the original live sessions. Each Node uploads its complete
+committed membership with cleared LSNs; only the Primary marks its inventory
+as a Primary report. A matching correlated LFUM reply advances send generation,
+without reopening replicas or changing application authority. Every accepted
+update owns a fresh snapshot; retries preserve only their own frozen upload,
+and replies retire only their original request, including stale-generation
+replies. In-flight build,
+reconfiguration, swap/repair inventory and restart reconciliation remain gated.
+
 ## Failure behavior and limits
 
 | Event or operation | Behavior |
@@ -383,7 +393,8 @@ launch actual Node binaries and application children under a native fixture FM.
 They cover initial 3/2 startup/build/admission, singleton write denial, real
 write/readback, lost build/final-reply replay, writes before FM observation,
 generation/membership refusal, FM-loss retention, verified Primary app-host loss
-with real peer failover and continuing writes, and owned shutdown.
+with real peer failover and continuing writes, stable replicated generation
+rollover with full membership/data preservation, and owned shutdown.
 
 ```sh
 cargo nextest run --locked --workspace --all-targets --all-features \

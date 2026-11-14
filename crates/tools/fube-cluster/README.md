@@ -122,8 +122,9 @@ Secondary, not both; missing members never restore the historical singleton
 quorum. Source-bound process tests also lose/replay build and final configuration
 replies, preserve all original owners/one Open each and verify independent
 three-child cleanup. The bounded Primary app-host failover and explicit repair
-below are supported; planned transfer, general replacement/retirement,
-generation upload, data loss and node/runtime adoption remain gated for this profile.
+below are supported, as is generation upload from stable completed membership;
+planned transfer, general replacement/retirement, in-flight configuration upload,
+data loss and node/runtime adoption remain gated for this profile.
 See [source mapping and limits](../../../docs/cluster/MinimalFmCluster.md#healthy-three-replica-service).
 
 Once that original 3/2 configuration is complete, a matching native terminal
@@ -680,23 +681,30 @@ deployment and FMM remain gated.
 
 The programmatic `Cluster::begin_generation_handshake()` starts the bounded
 ordinary-FM GenerationProposal/Reply and GenerationUpdate/Reject round.
-It requires two admitted nodes without pending lifecycle/control requests.
+It requires admitted nodes without pending lifecycle/control requests:
+two stateless/independent singleton sessions, or stable completed 3/2 membership.
 This is opt-in, not a CLI command or a change to default bootstrap. Proposed,
 receive and send generations remain distinct; only receive changes on a
 matching Update. The round waits at `awaiting_upload`, `complete=false`:
 the RA queues per-entity committed-inventory reads, then sends native correlated
 LFUMUpload/Reply on the same session. Only a reply matching current receive
-generation advances send generation. FM retains both exact original inventories
-in `generation_handshake.uploads`; both processed reports set `phase=complete`,
+generation advances send generation. The test FM validates and retains every
+exact original inventory in `generation_handshake.uploads`; all processed reports set `phase=complete`,
 `complete=true` and allow new-generation mutations/service updates.
 Lost replies retry the frozen metadata after the native 30-second interval,
-without blocking owner shutdown or reopening replicas. Existing Primary data
+without blocking owner shutdown or reopening replicas. Repeated accepted
+GenerationUpdate messages start fresh snapshots and independent upload owners,
+even for the same generation; a sibling ACK cannot cancel their sends/retries.
+Inventory uses the current committed service description. Existing Primary data
 and original node/app/runtime ownership remain intact. Retry qualification drives
 the shared upload state at explicit deadlines over real correlated Channels;
 separate process cases retain the original node/app/runtime owners. This is one live-session
-round for stateless/independent singleton profiles, not application-data upload,
-unknown-partition reconstruction, peer-profile upload, nonempty NodeUp,
-full ReplicaUp batching, FM/FMM recovery or durable restart.
+round for stateless/independent singleton or stable 3/2 profiles, not
+application-data upload, unknown-partition reconstruction, in-flight
+build/reconfiguration or swap/repair inventory, nonempty NodeUp, full ReplicaUp
+batching, FM/FMM recovery or durable restart. Replicated acceptance withholds
+correlated replies, renegotiates a newer generation, rejects the late stale
+completion and preserves all original owners, data and membership.
 See the [source mapping and remaining gates](../../../docs/cluster/MinimalFmCluster.md#live-session-lfum-upload).
 
 Native NodeUp/Ack and the final empty ReplicaUp/Reply precede RA construction.
