@@ -464,7 +464,7 @@ impl Ingress {
             Ok(id) => Ok(Some(id)),
             Err(Error::Capacity) => Ok(None),
             Err(Error::Busy) if action == "CreateReplica" => Ok(None),
-            Err(error) => Err(err(error)),
+            Err(error) => Err(format!("{action}: {}", err(error))),
         }
     }
 

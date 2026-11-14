@@ -549,8 +549,12 @@ impl Activation {
         if self.started.is_none() {
             return Err(LocalError::NotStarted);
         }
-        if let Some(error) = &self.failure {
-            return Err(error.clone());
+        if let Some(error) = self.failure.clone() {
+            // A failed session can precede the owned child's observable exit.
+            if self.process.is_some() {
+                self.observe_process_exit()?;
+            }
+            return Err(error);
         }
         if self.stopping {
             return Err(Error::ObjectClosed.into());
@@ -824,6 +828,60 @@ impl Drop for Activation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_registration_failure_does_not_hide_later_owned_process_exit() {
+        let parent = std::env::temp_dir().join(format!(
+            "hosting-failed-registration-exit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let input = parent.join("input");
+        std::fs::create_dir_all(input.join("LocalService/Code")).unwrap();
+        std::fs::write(
+            input.join("ApplicationManifest.xml"),
+            include_str!("../../../samples/hosting-local-app/pkg/ApplicationManifest.xml"),
+        )
+        .unwrap();
+        std::fs::write(
+            input.join("LocalService/ServiceManifest.xml"),
+            include_str!("../../../samples/hosting-local-app/pkg/LocalService/ServiceManifest.xml"),
+        )
+        .unwrap();
+        std::fs::copy(
+            "/bin/sleep",
+            input.join("LocalService/Code/hosting-local-app"),
+        )
+        .unwrap();
+        let mut owner = Activation::new(Options::new(parent.clone())).unwrap();
+        owner
+            .start(
+                &input,
+                "fabric:/Local",
+                &[("Arguments".into(), "30".into())],
+            )
+            .unwrap();
+        owner.server.as_mut().unwrap().stop().unwrap();
+        assert_eq!(owner.poll_registration(), Err(LocalError::SessionLost));
+        assert!(!owner.process_status().unwrap().exit_observed);
+        let pid = owner.process_status().unwrap().pid;
+        assert!(Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !owner.process_status().unwrap().exit_observed && Instant::now() < deadline {
+            assert_eq!(owner.poll_registration(), Err(LocalError::SessionLost));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let exit_observed = owner.process_status().unwrap().exit_observed;
+        assert!(owner.terminate().unwrap());
+        std::fs::remove_dir_all(parent).unwrap();
+        assert!(
+            exit_observed,
+            "cached registration failure hid the original child's exit"
+        );
+    }
+
     #[test]
     fn failed_physical_cleanup_preserves_process_root_and_exact_final_for_retry() {
         for application_first in [false, true] {
