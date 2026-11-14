@@ -1,177 +1,16 @@
 # Rust RA port and SQLite state-store design
 
-**Status: proposed RA design. The [P1 store seam](RaStore.md) and
-[protocol/bounded P2 foundation](RaProtocolFoundation.md) and
-[native-derived stateless removal/close](RaStatelessRemoval.md), opening and
-[stateless Drop/FM-resend replacement](RaStatelessReplacement.md) are implemented;
-full P2 infrastructure, P3–P5 and RA/runtime recovery are not.**
+**Status: implemented store/executor and bounded live reliability profiles;
+full RA, restart recovery and native interoperability are not qualified.**
 
-The separate [local volatile stateful lifecycle slice](HostingLocalActivation.md#opt-in-volatile-stateful-local-lifecycle)
-now drives real Idle Open/Close through committed RA effects and existing Rust
-RAP. Idle remains InBuild, not a primary or serving Ready. Trusted local
-authorization is not a ported FM/peer handler; P4 choreography, data/copy/quorum
-evidence and stateful recovery remain unsupported.
-An opt-in real-data fixture now connects that same local path to the existing
-`fube-data` engine through normal public construction, verifying denied Idle
-writes and joined cleanup without widening RA authorization or completing P4.
-A distinct [trusted-local initial Primary slice](HostingLocalActivation.md#opt-in-initial-singleton-primary-lifecycle)
-now authorizes one fresh volatile 1/1 lifetime through committed existing RAP
-Open, with exact Ready completion, an acknowledged public write/readback and
-joined Close/lease-loss cleanup. It does not promote/adopt the Idle lifetime,
-implement FM AddPrimary/peer handlers or complete P4/M2.
-A later [fresh stateful FM control increment](MinimalFmCluster.md#initial-stateful-fm-control)
-now enables native-shaped AddPrimary/Reply with source-derived commit, initial
-deactivation, duplicate/stale and retry semantics over actual FM/RA channels.
-Normal FM DeleteReplica/Reply now closes that original volatile lifetime with
-source-derived epoch/ReplicaId checks, canonical dropped replies, native retry
-and separately joined disposal/accounting proof. DoReconfiguration, peer control,
-recovery and complete P4/M2 remain gated.
-The [unexpected singleton loss slice](MinimalFmCluster.md#unexpected-singleton-app-host-loss)
-now delivers AppHostDown's ReplicaDown-stage/dropped-list ReplicaUp and its
-processed-list acknowledgment, including native closed-FT deletion afterward.
-The [graceful singleton Close slice](MinimalFmCluster.md#graceful-singleton-close-reporting)
-now uses the same native Down-stage/report/ACK path after real RAP disposal and
-committed Close, keeping original disposal proof independent.
-The [normal singleton Drop slice](MinimalFmCluster.md#normal-singleton-drop-reporting)
-now reports through native ReplicaDropped stage with dropped-description ACK
-checks, without relabeling closing/closed Down lifetimes.
-The [singleton lifecycle completion](MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation)
-adds Abort/ForceAbort reporting, closed-AddPrimary delivery, native force Delete
-and missing/closed tombstone handling, plus explicitly authorized fresh
-recreation after normal deletion joins original disposal/accounting proof.
-FM records terminal loss as lost volatile state, not recovery/reuse;
-broader stateful choreography remains staged.
-A separate [peer-created Idle increment](MinimalFmCluster.md#peer-created-idle-replica-stage-4-increment)
-now connects an original Primary RA to one destination RA for the same
-partition. Native CreateReplica/Reply opens a real volatile Idle with its
-replication endpoint, not a built or active replica. A separate explicit
-build now copies real nonempty state and continues replication through RAP
-and application ACKs. Explicit Primary-side Idle removal now uses RAP's native
-cancellation/retry/tombstone semantics, separately from failed-build retry cleanup
-and remote deletion. FM AddReplica/Reply now owns original-Idle creation/build;
-FM RemoveReplica/Reply clears pending-remove only after original RAP removal.
-Separate FM DeleteReplica/Reply now deletes the already-opened abandoned
-destination Idle, joining original disposal/accounting proof independently of
-Primary pending-remove; it grants no replacement lifetime.
-An original unanswered FM Add can also delete a never-created destination:
-the native missing-FT tombstone/reply joins a distinct applied-Delete absence
-proof, never a fabricated runtime disposal receipt.
-Normal Delete also drains the original registered in-flight Idle Open through
-RAP cancellation/retry, joining genuine disposal proof rather than absence.
-Pre-registration Opening instead joins a distinct applied-Delete/pre-Open
-cancellation proof after all original lookup/acquisition ownership drains.
-An original definitive pre-Open registration failure now uses closed Delete
-and distinct applied-failure/Delete/drained-ownership proof, retaining its Add error.
-Terminal runtime Open failure now uses closed Delete without RAP Close,
-joining actual Abort/disposal, Applied failure/Delete and exact usage-release
-lineage while retaining its failed Add error.
-Unexpected app-host loss of the original opened destination now reports
-ReplicaDown-stage/dropped-list ReplicaUp and joins the processed ACK with
-closed metadata deletion, never disposal or independent Primary removal.
-That original open origin now survives committed normal Close/Drop so AppHostDown
-can supersede in-flight RAP cleanup without trusting late Close replies.
-Successful normal Close now reports through the same native down-stage
-metadata path, retaining genuine disposal/accounting proof separately.
-Normal Drop of that original opened Idle now reports through ReplicaDropped
-stage with dropped-description ACKs and the same independent cleanup boundaries.
-Normal non-force Abort of that original opened Idle now uses real RAP Abort
-and the same dropped-stage reporting, without ForceAbort admission or reuse.
-The [original-session Delete subprofile](MinimalFmCluster.md#complete-original-session-destination-delete-contract)
-now covers normal/force and opening/closing/closed/failed/absent/lost targets,
-including Delete-error ForceAbort, independently proved host loss and retained
-cleanup history after app exit. Missing ownership remains unproved/unknown;
-no deletion outcome authorizes replacement.
-An [explicit fresh-Idle replacement slice](MinimalFmCluster.md#explicit-fresh-idle-replacement)
-now authorizes one successor after original successful FM build, Primary
-Remove completion and normal destination Delete joined with genuine disposal.
-It preserves predecessor history, recopies real state and continues replication
-on the original node/app sessions. It grants no active membership, host-loss
-replacement, second successor or recovery.
-The [same-Primary configuration increment](MinimalFmCluster.md#same-primary-active-configuration-stage-5-increment)
-now admits one successfully built Idle as ActiveSecondary through actual native
-DoReconfiguration/Reply, Activate/Reply and RAP catch-up/final configuration.
-The current two-member and previous singleton quorums remain separate; real
-Secondary loss cannot acknowledge a new write from the previous singleton.
-The [healthy configured-Secondary extension](MinimalFmCluster.md#healthy-configured-secondary-retirement-and-replacement)
-now retires the original Secondary through 2-to-1 catch-up, Deactivate/real
-Close and final configuration, then allows explicit Delete/disposal-backed
-fresh replacement and reactivation. The [healthy planned transfer](MinimalFmCluster.md#healthy-planned-primary-transfer)
-now adds old-Primary demotion, peer continuation, real GetLSN/promotion/catch-up,
-peer activation and final endpoint publication without another Open.
-Loss-driven quorum reduction, general automatic failover, restart and broader
-reconfiguration remain gated.
-The [live-session LFUM upload](MinimalFmCluster.md#live-session-lfum-upload)
-now completes one ordinary-FM generation round on the original stateless,
-independent singleton, stable fully admitted 3/2 sessions, or original healthy
-same-Primary Secondary admission after each RA commits its configuration request.
-The immutable 3/2 profile also uploads original FM-owned Idle creation/build
-after participating RAs commit their creation requests: Primary remote build
-states and each destination's local InBuild Idle remain distinct, with invalid
-PC/IC, exact existing-build retries and no new authority.
-The first original 3/2 Primary app-host failover also uploads committed candidate,
-query-only survivor and completed/deleted views, preserving SF CopyCCToPC and
-Deactivate/Activate IC transitions without admitting repair or new authority.
-Shared RA inventory is now a generic projection of committed configuration and
-independently retained IC roles, including existing repair/removal, planned
-transfer, redirected failover and failed-operation states in model/store tests.
-There is no upload-pending peer-control gate: ordinary generation, epoch,
-identity and operation validation remains authoritative. Both process launchers
-admit initial configuration before the current build-upload ACK, then resume its
-peer work after send-generation advancement without changing the frozen inventory.
-Both launchers also qualify the first explicit post-failover 3/2 repair:
-fresh replica Open's registration lookup demands shared Node/Hosting activation,
-repair configuration commits before build-upload ACK, and fresh Secondary role
-completion may precede a subsequent LFUM ACK. Final RAP completion and quorum
-remain separate; no replacement-host command or LFUM authority is introduced.
-Per-entity read barriers precede correlated
-inventory upload; only the matching reply advances RA send generation.
-This is metadata reconciliation with the surviving FM, not runtime adoption,
-broader interrupted reconfiguration/swap/repeated-repair process qualification, nonempty NodeUp reconciliation
-or durable restart.
-The [healthy three-replica profile](MinimalFmCluster.md#healthy-three-replica-service)
-now builds two independently owned Idles and admits 1P+2S at 3/2 through native
-same-Primary reconfiguration. Each activation ACK commits separately before
-final RAP/FM completion. Nonempty copy, continuing replication, reply replay,
-majority/no-majority writes and all three original cleanup owners have bounded
-native-free acceptance; broader three-member reconfiguration/recovery remains gated.
-The [bounded Primary app-host failover](MinimalFmCluster.md#three-replica-primary-app-host-failover)
-now promotes original node2 after the matched loss of node1's Primary, using
-both surviving members' real progress/history, separate PC/CC obligations,
-S/S metadata Deactivate, peer activation and final RAP/FM completion. Nonempty
-data continues on original owners; neither a disconnected FM link nor a missing
-survivor authorizes promotion, data loss, quorum fallback or replacement.
-After explicit fresh-owner repair restores 1P+2S, [repeated live-session
-failover/repair](MinimalFmCluster.md#repeated-live-session-primary-failover-and-repair)
-uses latest committed membership, refreshed deactivation history and strictly
-newer replica incarnations. Three process cycles include promotion of a rebuilt
-replica and two replacements on one live Node/RA. Repair remains explicit;
-overlapping recovery, whole-node/FM failure and data loss remain gated.
-The [immutable configured initial-membership profile](MinimalFmCluster.md#immutable-configured-initial-membership)
-now carries creation-time target/minimum unchanged through Primary Open, generic
-Idle build and full initial Secondary admission, without service-size updates.
-Real-process qualification includes even/odd targets and different minima up to
-five replicas; a finite 64-member resource ceiling and existing byte budgets
-remain. [Configured Primary failover](MinimalFmCluster.md#immutable-configured-primary-failover)
-now adds per-replica history/progress, separate PC/CC read quorums, native
-history-first candidate selection/ChangeConfiguration, per-survivor
-Deactivate/Activate commit barriers and final RAP/FM completion at unchanged
-sizes. Native's deprecated ChangeConfigurationReply is explicitly rejected,
-not a progress gate. [Explicit configured repair](MinimalFmCluster.md#immutable-configured-primary-repair)
-now restores one lost member at unchanged sizes through fresh-owner copy and
-per-survivor Deactivate/Activate commits, enabling repeated live-session
-failover/repair. [Standalone Secondary-loss repair](MinimalFmCluster.md#standalone-secondary-app-host-loss-repair)
-now removes one dropped Secondary under minimum/quorum rules before explicit
-fresh-owner copy/readmission, preserving the healthy Primary and unchanged sizes.
-[Primary loss during pending Secondary removal](MinimalFmCluster.md#primary-loss-during-secondary-removal)
-can now supersede removal before replacement, retaining original PC/CC and
-quorum/history obligations. [Sequential restoration](MinimalFmCluster.md#sequential-restoration-after-supersession)
-then explicitly repairs those two known placements through one-member
-copy/admission cycles until the unchanged target is restored. At minimum,
-Ready-Idle-first restoration rebuilds the already-removed placement before
-combined removal/admission; live 4/3 qualification retains minimum three and
-the actual PC/CC quorum rules without requiring a new spare node.
-Resize, broader partial admission, general multi-loss repair, spare-node placement and broader
-interrupted transition recovery remain gated; named-profile repair is retained.
+| Area | Current implementation and evidence |
+|---|---|
+| Store and execution | [P1 store seam](RaStore.md), [bounded entity/protocol foundation](RaProtocolFoundation.md), commit-before-effects and per-entity serialization. Memory/SQLite contract tests do not enable durable RA restart. |
+| Lifecycle and node coordination | Stateless and volatile stateful Open/Close/Drop/Abort, native FM creation/deletion/reporting, explicit fresh recreation and bounded node-wide coordination. Semantic replies and original physical disposal/accounting remain separate. |
+| Replication and reconfiguration | Real public runtime/data-replicator Open, Idle copy/build, active admission, configured Primary failover, explicit repair and supported removal supersession. [Process profiles](MinimalFmCluster.md) retain separate PC/CC quorum/history obligations and exact incarnation/retry fences. Healthy planned transfer is limited to the two-member profile. |
+| Hosting restoration | Shared Node/Hosting activates an installed-package fresh volatile host for a committed Open's registration lookup after predecessor cleanup. Successful forced cleanup is allowed; diagnostic history is bounded independently of lifetime replacements. Surviving Node/RA/store/Channels are retained; lost runtime/data is not adopted. |
+| Ordinary-FM LFUM | Generic committed inventory, separate PC/IC/CC views and independently owned uploads/retries. Model/store coverage is broader than the bounded real-process stable/build/admission/first-failover/first-repair generation rounds. See [current LFUM status](MinimalFmCluster.md#live-session-lfum-upload) and the [alignment plan](#lfum-alignment-plan). |
+| Unsupported recovery/ownership | Nonempty startup reconciliation, full initial ReplicaUp batching/final ACK, durable RA restart, FM/FMM rebuild and FM-service execution remain gated. Broader deployment/upgrade and original C++ handler/interoperability qualification are separate work. |
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's
@@ -226,7 +65,7 @@ implementation uses bundled SQLite through `tokio-rusqlite`.
 ## 2. Native implementation baseline
 
 Native source references pin Service Fabric revision
-`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`, inspected 2026-10-29. They describe
+`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`. They describe
 source behavior, not a claim that the pinned SF 11.8.121.4 qualification binaries
 were built from that revision.
 
@@ -631,19 +470,19 @@ codecs have bounded handler/helper coverage, not complete native contracts;
 19 FM-boundary actions remain unselected, alongside broader branches of the
 selected handlers.
 
-Stage 1 is now implemented for the bounded volatile 1/1 FM profile; see
+Stage 1 is implemented for the bounded volatile 1/1 FM profile; see
 [its supported paths and evidence limits](MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation).
 This does not qualify every native handler branch or complete P4/M2.
 
-| Stage | Remaining scope | Completion gate |
+| Stage | Status and remaining scope | Completion gate |
 |---|---|---|
-| 1. Finish singleton lifecycle | Abort/ForceAbort reporting, closed-AddPrimary handling and remaining DeleteReplica branches, then explicitly authorized fresh-lifetime recreation. | Preserve native close/report/ACK semantics and exact original accounting. Reporting and metadata completion cannot substitute for disposal proof or relabel lost volatile data as recovered empty state. |
+| 1. Finish singleton lifecycle | Implemented for the bounded volatile 1/1 profile: Abort/ForceAbort reporting, closed-AddPrimary handling, supported DeleteReplica branches and explicitly authorized fresh-lifetime recreation. Broader lifecycle profiles remain separate. | Preserve native close/report/ACK semantics and exact original accounting. Reporting and metadata completion cannot substitute for disposal proof or relabel lost volatile data as recovered empty state. |
 | 2. Complete node-wide coordination | Bounded implementation: broader P2 multi-entity execution; NodeActivateRequest/Reply, NodeDeactivateRequest/Reply, NodeUpdateServiceRequest/Reply, ServiceTypeEnabled/Disabled and their replies, existing registration notifications and complete ReportLoad codecs/forwarding. ReplicaEndpointUpdated/Reply codecs and helper integrate with bounded planned-swap publication in stage 5. | Preserve sequence/version checks and action-specific completion barriers. Deactivation replies follow required replica closure, not admission; ReportLoad remains best-effort without an invented per-report ACK. Keep one FT per deployed Node; qualify multiple FTs in RA model/store tests. |
-| 3. Complete ordinary-FM generation and upload | GenerationProposal/Reply, GenerationUpdate/Reject and live-session LFUMUpload/Reply are implemented. Shared RA inventory generically projects committed replica-store descriptions and separate IC roles, including existing repair/removal, planned transfer, redirected failover and failed-operation states in model/store tests. There is no LFUM lineage/size allowlist or upload-pending control gate. Process generation rounds cover original stateless/independent singleton and original 3/2 stable/build/admission/first-failover/first-explicit-repair sessions; both launchers admit initial and repair configuration before build-upload ACK, and fresh repair-Secondary completion can precede a later ACK. Remaining: broader process overlap qualification, nonempty NodeUp/NodeUpAck reconciliation, full ReplicaUp/Reply batching/final-upload handling, FMM/FM-service handling and full FM rebuild. | Preserve proposed/receive/send generations, per-entity commit barriers and ordinary control validation. Only matching semantic completion advances send/readiness; snapshots never grant authority. Keep restart serving disabled until stage 6. |
+| 3. Complete ordinary-FM generation and upload | Core live-session handshake/inventory/upload is implemented. Remaining overlap qualification and distinct startup/reporting work follow the [LFUM alignment plan](#lfum-alignment-plan); [current evidence](MinimalFmCluster.md#live-session-lfum-upload) distinguishes shared RA coverage from test-FM/process admission. FM/FMM rebuild belongs to stage 7, not this live-session completion claim. | Preserve proposed/receive/send generations, per-entity commit barriers and independent upload ownership. Only a reply matching current receive advances send generation; neither upload ACK nor startup/report ACK grants runtime authority. Keep restart serving disabled until stage 6. |
 | 4. Build and remove remote replicas | Bounded original two-node volatile Idle creation, nonempty copy/continuing replication, FM Add/build, pending/failed/opened Primary removal and same-lifetime retry/replay are implemented. The [original-session destination Delete contract](MinimalFmCluster.md#complete-original-session-destination-delete-contract) covers normal/force and opening/closing/closed/failed/absent/lost targets and separate original cleanup proofs. Close/Drop/Abort and host-loss reporting retain native stage/ACK distinctions. [Explicit fresh replacement](MinimalFmCluster.md#explicit-fresh-idle-replacement) now rebuilds one successor after original successful build, Primary removal and normal Delete/disposal. Remaining: broader replacement/lifecycle/report profiles, active configuration/reconfiguration/removal and native interoperability qualification. | Copy completion grants no active membership or serving; AddReplicaReply completes FM build and Ready/Idle is not ActiveSecondary. Only RemoveReplicaReply clears Primary pending-remove. Destination Delete independently joins its semantic reply with original cleanup evidence. Neither metadata/report ACK nor cleanup proof authorizes a successor: the bounded replacement requires a separate explicit FM request and destination-local disposal/drain admission. Original history and stale-incarnation fences survive replacement. |
 | 5. Implement reconfiguration | Immutable configured initial admission and [Primary app-host failover](MinimalFmCluster.md#immutable-configured-primary-failover) now use per-member GetLSN/history, separate PC/CC read quorums, history-first selection, ChangeConfiguration and per-survivor Deactivate/Activate commits before final RAP/FM completion. [Explicit configured repair](MinimalFmCluster.md#immutable-configured-primary-repair) restores one missing member at unchanged sizes and enables repeated live-session failover/repair. [Standalone Secondary-loss repair](MinimalFmCluster.md#standalone-secondary-app-host-loss-repair) preserves the healthy Primary and native minimum/history rules through committed removal and fresh readmission. [Pre-replacement Primary-loss supersession](MinimalFmCluster.md#primary-loss-during-secondary-removal) retains original PC/CC during pending Secondary removal; [sequential restoration](MinimalFmCluster.md#sequential-restoration-after-supersession) repairs its two known losses through partial/full admission, including Ready-Idle-first combined removal/admission at minimum. Named profiles retain healthy two-member retirement/replacement/planned transfer and [explicit 3/2 repair](MinimalFmCluster.md#post-failover-third-replica-repair) with [repeated cycles](MinimalFmCluster.md#repeated-live-session-primary-failover-and-repair). Remaining: general multi-loss repair, spare-node placement, broader interrupted recovery/supersession, swap abort/reverse transfer and DatalossReport. | Preserve native phase ordering, separate previous/current quorum obligations, catch-up/cancellation, old-primary fencing and endpoint publication. The deprecated ChangeConfigurationReply is rejected, never an RA progress gate. Repair retains original Node/RA/store/Channels and physically retires predecessor owners; it neither adopts lost runtimes nor recovers persisted state. Current source-stream and native-free evidence is not complete original-handler/interoperability qualification. |
 | 6. Enable durable RA restart | P5 loading/fixups, crash-window reconciliation, fresh incarnation and recovery with the original FM surviving. | Historical records cannot restore Primary authority. Prove predecessor fencing; rebuild volatile replicas from eligible survivors with valid history/quorum evidence or report data loss. |
-| 7. Add FMM ownership/rebuild | Independent FM/FMM readiness and generation domains, owner-specific uploads, GFUMTransfer and FM-service replica handling. | Supply matching FM/FMM/common-layer counterparts and required FM-service functionality. Ordinary FM acknowledgments cannot stand in for FMM; this does not authorize transparent FM restart. |
+| 7. Add FM/FMM ownership and rebuild | Ordinary FM rebuild over accepted reports, independent FM/FMM readiness and generation domains, owner-specific uploads, GFUMTransfer and FM-service replica handling. | Supply matching FM/FMM/common-layer counterparts and required FM-service functionality. Ordinary FM acknowledgments cannot stand in for FMM; this does not authorize transparent FM restart. |
 | 8. Finish upgrades and catalog closure | Application/fabric upgrade and cancellation pairs, real Hosting/version adapters, remaining supported profiles and legacy/deprecated behavior. Resolve the PartitionNotification endpoint gap. | Every catalog entry needs its exact implementation or source-defined rejection/no-op behavior and evidence. Do not invent a successful handler to conceal a missing counterpart. |
 
 Every enabled exchange requires bidirectional native codec evidence,
@@ -673,19 +512,39 @@ captured original hosts, once per monitor; termination is not closure proof.
 Status work keeps native five-second minimum starts, 30-second retries,
 current-sequence acknowledgments and independent history cleanup.
 
-The first stage-3 increment implements the ordinary-FM generation handshake;
-see [its opt-in execution and upload gate](MinimalFmCluster.md#ordinary-fm-generation-handshake-stage-3-increment).
-Proposal preprocessing retains the highest proposed generation independently
-of receive/send and replies through the original correlated request context.
-GenerationUpdate accepts only the current proposal, drops below-receive traffic
-and otherwise rejects with the native proposed-generation body. Entity workers
-read the current receive generation under the publication lock; private/unknown
-commits remain owned and cannot become inventory or upload success. The
-live-session LFUM increment now queues snapshot jobs behind each captured
-entity's admitted work and retains the aggregated inventory for correlated
-upload/retry. Only the matched current-generation reply advances send generation;
-an `upload_pending` flag or transport receipt is not completion. The local
-FM-service epoch/ForceAbort branch and FMM domain remain capability-gated.
+#### LFUM alignment plan
+
+Source baseline: Service Fabric
+`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`. The
+[current contract/source map](MinimalFmCluster.md#live-session-lfum-upload) is
+the implementation reference; this table tracks remaining work, not release
+history. **Next shared-launcher increment: repeated repair generation rollover,
+then interruption of already-supported removal/repair transitions.**
+
+SF queues inventory reads over the owner's entity set, rather than enabling
+LFUM one reconfiguration lineage at a time. Keep that generic shared RA path.
+Extend the test FM only to validate known identities and admitted intent; do not
+move RA policy, reconstruction or writer selection into either launcher.
+
+| Work item | Prerequisite and scope | Completion gate |
+|---|---|---|
+| Contract closure (alongside A/B) | Preserve generic reads and independent uploads; close remaining common-layer scheduling/closing gaps against SF before claiming complete LFUM parity. Fube uses the configured retry base interval; SF additionally applies configurable additive jitter. | Port/qualify the native retry-delay bounds without resampling the body or weakening request ownership. Test accepted snapshot/upload work during closing and failed/unknown commit barriers. Retain explicit unsupported transport/restart profiles rather than implying native Federation recovery. |
+| A. Repeated/interrupted live-session repair (next) | Reuse supported fixed-size failover/repair and removal-supersession paths. Extend bounded test-FM generation admission beyond first repair; qualify local cluster and standalone 3/2 where the underlying transition is already supported. | Roll generation during a later build and configuration, retain older uploads across supersession, and deliver stale/duplicate/lost replies. Check committed PC/IC/CC, fresh replica identity and frozen retries; no duplicate host activation or old-runtime adoption. Preserve survivor data/owners and prove actual quorum/no-quorum writes after completion. |
+| B. Transfer and candidate-redirection overlaps | Local cluster planned transfer is currently one healthy two-member 2/1 swap; its test FM does not admit generation rounds there. Qualify that profile first. Standalone remains fixed 3/2: source-align and qualify shared three-member planned transfer before adding its LFUM overlap. Candidate redirection likewise requires the underlying launcher/profile support, not just inventory support. | Verify demotion/continuation, GetLSN, catch-up, activation and final RAP barriers at their committed phases. Completed demotion reports the previous Primary correctly; redirection reverts CC roles to PC. ACK cannot finish transfer or make FM's final configuration ready; preserve separate native early-endpoint publication semantics and old-writer fencing. |
+| C. Ordinary-FM initial discovery/reporting | Distinct from live-session LFUM. Implement the shared pending-replica-upload owner and full processed/dropped ReplicaUp batching/final-ACK join together with nonempty NodeUpAck entity processing. Use model/store entities first; do not enable deployed restart/reopen by exposing these handlers. | Apply node activation/version/upgrade checks and all owner-entity jobs before node readiness. Process both reply lists successfully before consuming IsLast; stale incarnation or failed/private commit cannot clear the wrong obligation. Retry pending/final reports independently; report ACK is neither physical disposal nor serving authority. |
+| D. Recovery and FM ownership (separate tracks) | Stage 6 supplies RA load/fixups, fresh incarnation and predecessor fencing. Stage 7 supplies ordinary FM rebuild and independent FMM/FM-service domains with real counterparts. An FM rebuild over surviving live RAs does not inherently require RA restart; enabling either restart path requires its own recovery qualification. | FM processes accepted reports before ACK and suppresses ACK on processing failure; echoed stale/already-ready replies do not replace current inventory. Preserve owner-specific generations/readiness, valid history/quorum and data-loss handling. Neither LFUM nor GFUM permits saved-Primary resurrection or transparent runtime adoption. |
+
+For each increment, update the source-derived scenario mapping and run the
+shared model/store tests plus real-process acceptance for each admitted
+launcher/profile. Cover accepted work completing while RA begins closing,
+multi-entity barriers, failed/unknown commits, capacity and independent cleanup
+where applicable. Use public runtime/data-replicator contracts for application
+barriers, not engine-specific hooks. Codec/schema/helper evidence, normalized
+original C++ handler traces and native FM/Federation interoperability are
+different evidence tiers: close missing native evidence alongside each enabled
+contract, rather than treating the final process test as full SF parity.
+
+#### Supported replica choreography
 
 The endpoint helper preserves the native separation from FM message state.
 Its timeout and pending/completed/reset behavior now integrate with real RAP
@@ -693,8 +552,7 @@ endpoint updates and FM replies in the bounded planned-Primary-transfer path.
 Native invariants still require active reconfiguration; ordinary singleton Open
 does not fabricate a reconfiguration to publish a fresh endpoint.
 
-Replica support is prioritized through a bounded stage-4 increment before
-remaining stage-3 upload work. The
+The bounded stage-4
 [peer Idle profile](MinimalFmCluster.md#peer-created-idle-replica-stage-4-increment)
 uses fresh startup and the original fixed FM generation. Primary RA issues
 CreateReplica to the exact original peer; destination RA commits before
@@ -711,8 +569,9 @@ build success. Primary/FM bookkeeping becomes Ready/Idle, while the actual
 destination remains Idle/InBuild. Lost replies retry/replay the original
 request/result without another Open/build; creation failures require cleanup,
 ordinary build errors retain pending retry, and Close/removal fence late success.
-No active membership, catch-up quorum or quorum change is inferred. LFUM/restart/FMM,
-broader peer recreation and promotion remain gated. Explicit `Cluster::remove_idle_replica()`
+No active membership, catch-up quorum or quorum change is inferred from Idle
+build. Restart/FMM remain gated; LFUM coverage follows its separate plan above.
+Explicit `Cluster::remove_idle_replica()`
 now abandons that opened original Idle through
 ReplicatorRemoveIdleReplica/Reply, fencing late build completion and retaining
 terminal incarnation tombstones. Failed-build retries instead use RAP's

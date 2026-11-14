@@ -75,44 +75,32 @@ lost-reply replay, refusal and owned shutdown. A separate case kills the exact
 Primary application, waits for its native loss report, promotes an original
 Secondary through real GetLSN/Deactivate/Activate, verifies retained data and
 new acknowledged writes, and replays the final reconfiguration.
-Another case advances the ordinary-FM generation through correlated proposal,
-empty live-session LFUM upload and semantic completion before placement/build.
-A live 3/2 case uploads every member's full committed peer configuration,
-continues acknowledged writes on the original owners and replays native control
-under the new generation. Shared RA owns inventory and completion; the fixture
-FM only validates and acknowledges known test membership. An additional case
-holds actual Secondary role completion during original same-Primary admission,
-rolls generation twice and rejects stale upload completion before finishing the
-original configuration. Its inventory retains PC and Primary phase-4 IC while
-the Secondary reports invalid IC, following local SF. Another case holds an actual
-copy-stream operation before application ACK during original 3/2 Idle build,
-rolls generation twice and finishes the original build/admission on unchanged
-owners. The Primary reports its admitted build set; each destination reports only
-its own InBuild Idle, without PC/IC or new serving authority. Another case loses
-the original Primary app host, holds the candidate's real Primary callback and
-public replicator final-configuration call, and rolls generation while those
-original operations remain pending. It checks query-only survivor PC, candidate
-phase-4 IC and completed survivor metadata before continuing nonempty data.
-The repair case then uses normal FM AddReplica/peer CreateReplica to demand a
-fresh app host after the original lifetime's metadata deletion and physical
-cleanup. It holds repair build uploads across superseding generations, admits
-configuration before LFUM ACK, and resumes exact peer retries afterward.
-Another rollover holds the fresh Secondary callback; its completion before ACK
-does not alter the frozen inventory or finish the independently held final RAP
-operation. Replays acquire no second host, and the fresh replica supplies quorum
-after the other original Secondary is lost.
-Shared RA inventory no longer has a build/failover lineage allowlist or an
-upload-pending peer-control gate. Committed configuration and independent IC
-roles also cover existing repair/removal, planned transfer, redirected failover
-and failed-operation states in model/store tests, without enabling new runtime
-operations. The copy-barrier process case admits initial configuration before
-the current upload ACK and resumes its exact peer work afterward.
-Broader process overlap qualification, nonempty startup/FMM and restart remain
-separate work.
-Each accepted generation update owns fresh inventory work. Shared Node upload
-owners retain independent correlated requests, frozen retries and completion,
-including multiple uploads in the same generation. Diagnostic `pending_uploads`
-counts them separately from the current-generation `upload_pending` flag.
+
+#### LFUM qualification
+
+| Standalone live-session profile | Current process evidence |
+|---|---|
+| Empty pre-placement and stable original 3/2 | Correlated proposal/update/upload/reply, full committed member inventory, acknowledged data on original owners and new-generation control/replay. |
+| Original Idle build and same-Primary admission | Public copy/Secondary role barriers, superseding generations and stale replies. Initial configuration can be admitted before build-upload ACK; exact peer retries resume after send advancement without another Open or mutated inventory. |
+| First original Primary app-host failover | Real Primary role and public IPrimaryReplicator final-configuration barriers. Query-only survivor PC, candidate phase-4 IC and completed survivor views are checked before continuing nonempty data. |
+| First explicit post-failover repair | Normal AddReplica/CreateReplica demands shared Hosting activation after predecessor cleanup. Repair configuration and fresh Secondary completion can precede ACK, but cannot finish held final RAP work. Exact replays activate no second host; the fresh member supplies quorum after another survivor loss. |
+
+Shared RA owns generic committed inventory and independent PC/IC/CC views,
+without a lineage allowlist or upload-pending peer-control gate. The fixture FM
+only validates known membership and explicit intent. Each accepted update owns
+fresh reads; Node retains independent correlated requests and frozen retries,
+including same-generation uploads. Diagnostic `pending_uploads` counts all such
+owners separately from current-generation `upload_pending`; only a reply
+matching current receive advances send generation.
+
+See the [shared current contract/source map](../../../docs/cluster/MinimalFmCluster.md#live-session-lfum-upload)
+and [LFUM alignment plan](../../../docs/cluster/RustRaPort.md#lfum-alignment-plan).
+Repeated/interrupted repair is the next common-launcher qualification. Planned
+transfer currently supports only the two-member local-cluster runtime profile,
+not standalone 3/2; broader RA model/store inventory coverage does not change that.
+Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,
+FM/FMM rebuild and restart remain gated. Native-free acceptance is not complete
+original C++ handler or native FM/Federation interoperability evidence.
 
 ```sh
 cargo build --locked --workspace --bins --examples --all-features

@@ -557,10 +557,10 @@ endpoint publication remains gated until stage-5 reconfiguration. Codec/model/
 native-free results are not complete C++ handler traces, native FM interoperability,
 general multi-FT deployment or complete P2/P4/M2 parity.
 
-## Ordinary-FM generation handshake (stage-3 increment)
+## Ordinary-FM generation handshake
 
-The ordinary-FM proposal/reply and update/reject paths are enabled on the
-original bounded session. Proposal is a consuming correlated request, not a
+The ordinary-FM proposal/reply and update/reject paths are implemented on
+admitted live sessions. Proposal is a consuming correlated request, not a
 one-way notification; all four native factories are high priority. Proposal
 and Update carry GenerationHeader, while Reply and Reject do not. Preprocessing
 retains the highest proposal even before owner readiness; a non-open RA returns
@@ -574,76 +574,69 @@ An unmatched Update sends the native proposed-generation rejection; messages
 below receive are ignored. The generation/publication lock also protects
 locked-entity admission. Already-running commits retain their original
 operation/fence; definite failure and uncertainty cannot publish private state
-or fabricate an uploaded inventory. The live-session LFUM increment below now
-completes inventory upload without granting new serving/restart authority.
+or fabricate an uploaded inventory.
 
-Programmatic `Cluster::begin_generation_handshake()` opts the two original,
-admitted nodes into a bounded FM round only when lifecycle/control requests
-are not pending. It is not a new CLI command and does not change default
-startup. The FM retries proposals and pending updates, restarting negotiation
-above a higher proposal or qualifying rejection. Retry timing uses native
-five-/ten-second defaults; dynamic FM rebuild configuration and Federation
-broadcast membership are not enabled. The round remains `awaiting_upload`,
-`complete=false`, with mutations/service updates gated until both original
-nodes' LFUM inventories are processed.
-Existing replicas are not reopened or relabeled as recovered; independent
-owner shutdown and real application access remain available.
+Programmatic `Cluster::begin_generation_handshake()` starts a bounded test-FM
+round for the profiles listed below; it is not a CLI command or a startup/rebuild
+API. The FM retries proposals and pending updates and negotiates above a higher
+proposal or qualifying rejection, using native five-/ten-second defaults.
+It remains `awaiting_upload`, `complete=false` until all expected Node inventories
+are processed. Its default orchestration defers unrelated mutations/service
+updates, but explicitly tested initial/repair configuration can be admitted
+before upload ACK. This harness restriction is not an RA upload-pending control
+gate. Independent owner shutdown and real application access remain available.
+A completed round permits a later explicit round above its negotiated generation.
 
 Generation-control messages and correlated LFUM replies have their own native
 admission; ordinary traffic uses the current receive-generation lower bound.
-This is not a fully rebuilt FM or native Federation interoperability.
-Focused model/store tests cover stale and duplicate traffic, reordered
-proposals, definite/unknown commits and queued entity admission. Real nodes
-exercise correlated replies, rejection, renegotiation and independent sibling access.
-Bidirectional native codecs and native ordering/admission helpers are separate
-from the still-required complete C++ handler traces and interoperability gates.
+Outgoing peer messages use send generation, so exact admitted retries may resume
+after matching upload completion. This neither reopens replicas nor grants new
+serving authority. Dynamic rebuild configuration, Federation broadcast membership
+and full FM rebuild are not implemented by this harness.
 
 ### Live-session LFUM upload
 
-`Cluster::begin_generation_handshake()` now continues through ordinary-FM
-LFUMUpload/Reply on the same admitted stateless or independent volatile
-singleton sessions, a stable fully admitted three-member 3/2 service, or the
-original healthy 3/2 same-Primary Secondary admission after every participating
-RA has committed its configuration request.
-The immutable 3/2 profile also supports original FM-owned Idle creation/build
-after the Primary commits its AddReplica requests and each participating RA
-commits its CreateReplica request, without waiting for Open/copy/build completion.
-The first original 3/2 Primary app-host failover is also supported with both
-original healthy survivors and unchanged 3/2 sizes, including committed GetLSN,
-catch-up, Deactivate, Activate and final RAP completion phases.
-The first explicit post-failover 3/2 repair also supports generation rollover
-after fresh Idle creation/build and during its same-Primary configuration.
-LFUM is the local failover-unit map: this uploads replica
-metadata, not application data, a database backup or a new runtime lifetime.
-The shared RA now projects its committed replica-store view generically, rather
-than recognizing an original build/admission/first-failover lineage. Configuration
-transitions commit PC/CC descriptions and a separate IC snapshot; queued inventory
-reads do not reconstruct those roles from retained operation history. Creation,
-build and removal update that same view. Failed operations remain reportable
-without becoming successful or acquiring serving authority.
-Model/store tests cover configured repair/removal, planned transfer, redirected
-failover and failed RAP/build states. The test FM's generation-round admission
-and process qualification remain limited to the scenarios above, including
-the first explicit post-failover repair; this does not
-enable broader startup, FMM, runtime recovery or restart protocols.
+**Current status:** ordinary-FM generation, committed inventory and correlated
+LFUMUpload/Reply are implemented in shared RA/Node. LFUM is the local
+failover-unit map: it reports metadata, not application data, a database backup
+or a new runtime lifetime. The external runner owns transport/processes; the
+test FM validates known identities and explicit intent, not unknown membership
+reconstruction or writer election.
+
+| Evidence/profile | Current coverage | Boundary |
+|---|---|---|
+| Shared RA model/store | Generic committed replica-store descriptions and separately committed IC roles; configured repair/removal, planned transfer, candidate redirection and failed RAP/build states. Multi-entity reads, definite/unknown commits, deletion and overlapping upload ownership are tested. | No LFUM lineage/size allowlist or upload-pending control gate. Ordinary runtime/profile admission still applies. This is not complete native handler execution. |
+| Local-cluster live sessions | Stateless/independent volatile singleton rounds; original 3/2 stable membership, FM-owned Idle build, same-Primary admission, first Primary app-host failover and first explicit post-failover repair. | Participating build/configuration requests must be committed. Failover requires the two original healthy survivors; broader generation-round admission is not enabled merely because ordinary repair supports later cycles. |
+| Standalone real Node binaries | Empty pre-placement upload and the same 3/2 stable/build/admission/first-failover/first-repair overlaps over real native-shaped Channels. | Fixed three-Node 3/2 deployment; no nonempty startup/rejoin or reconnect. Planned transfer is currently a separate two-member local-cluster runtime profile, not standalone 3/2 support. |
+| Native evidence | Bidirectional native-stream/schema and source-derived helper evidence in the [protocol oracle](../../tests/ra_protocol/README.md) and [C14 contract](NativeRaProtocol.md). | Full original C++ handler traces and native FM/Federation interoperability remain unqualified; passing process tests is not full SF parity. |
+
+The remaining dependency plan is maintained in
+[RustRaPort.md](RustRaPort.md#lfum-alignment-plan). Repeated/interrupted repair is
+the next common-launcher increment. Transfer requires profile-specific runtime
+and test-FM admission; NodeUp/ReplicaUp discovery and FM/FMM/restart are separate
+protocol/recovery tracks.
 
 Pinned SF revision `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the boundaries:
 
 | Source | Preserved contract |
 |---|---|
-| `ra/GenerationStateManager.cpp:83-98,359-455` | Each accepted update captures the ordinary-FM entity set and AnyReplicaFound, then queues fresh reads behind each entity's admitted work. Aggregate only after all jobs finish; no private or uncertain commit is sampled. |
+| `ra/GenerationStateManager.cpp:23-40,136-180,245-287,295-355` | Separate proposed/receive/send generations and receive lower-bound admission. Validate Update against proposed under the generation lock; the local FM-service epoch branch is distinct. Only current-receive LFUM reply advances send; NodeUpAck seeds its owner's generation state separately. |
+| `ra/GenerationStateManager.cpp:359-455` | Capture the owner's entity set and AnyReplicaFound, queue fresh per-entity reads and aggregate only after all jobs finish. Ordinary FM excludes the FM-service FT; FMM selects its separate set. Accepted work may finish while RA begins closing. Fube's private/uncertain commit barrier must not expose an uncommitted view. |
 | `ra/FailoverUnit.cpp:3999-4134`; `ra/Replica.cpp:217-230`; `ra/ReconfigurationAgent.cpp:4345-4357` | Omit locally deleted replicas, retain canonical dropped descriptions for closed replicas, clear reported LSNs and preserve local-map AnyReplicaFound independently of the emitted list. Singleton intermediate epoch/role remain invalid/None. |
-| `ra/FailoverUnit.cpp:3376-3424,3999-4125` | Completed membership clears previous/intermediate epochs and roles. A stable replicated inventory includes local and remote descriptions, clears every LSN and sets report-from-Primary only for the local current Primary. |
+| `ra/FailoverUnit.cpp:3376-3424,3999-4125` | Completion clears previous/intermediate epochs and roles and removes obsolete non-CC members; SF retains eligible up/Ready Idle replicas. Stable inventory includes local/remote descriptions, clears every LSN and reports from Primary only for the local current Primary. |
 | `ra/FailoverUnit.cpp:315-505,3999-4125`; `ra/ReconfigurationAgent.cpp:4027-4088` | Initial-build inventory reports admitted replica descriptions without waiting for build completion. The Primary changes its remote Idle from InBuild to Ready only on matching successful build completion; the destination still reports its own local InBuild Idle. |
 | `ra/FailoverUnit.cpp:937-1085,1737-1745,2596-2623,2703-2757` | Initial same-Primary admission retains the committed PC epoch/roles. Catch-up has invalid IC; Primary phase 4 sets IC=CC and IC roles to current roles. Secondary Activate clears IC while retaining PC until its RAP completion. |
-| `ra/FailoverUnit.cpp:624-642,937-1085,2596-2623,2703-2757,3376-3441` | A GetLSN-only survivor copies its old CC to PC without learning the new membership. Phase 3 sets IC=CC on Primary/Deactivate recipients; Activate clears the survivor IC. Local completion clears PC/IC and removes replicas outside CC. |
+| `ra/FailoverUnit.cpp:624-642,937-1085,2596-2623,2703-2757,3376-3441` | A GetLSN-only survivor copies its old CC to PC without learning the new membership. Phase 3 sets IC=CC on Primary/Deactivate recipients; Activate clears the survivor IC. Local completion clears PC/IC and removes obsolete non-CC members under the reset rules above. |
 | `ra/FailoverUnit.cpp:519-620` | A GetLSN reply carries the survivor's own PC, which can differ from the candidate's PC after interrupted removal. Progress admission does not require that PC to echo the request or adopt it as candidate membership; current epoch and replica identity remain checked. |
 | `ra/FailoverUnit.cpp:2910-2930,3543-3575,4057-4088`; `ra/ReconfigurationState.cpp:162-169` | Candidate redirection reverts every CC role to PC without promoting the candidate. A completed demotion is no longer an active Primary reconfiguration: its previous-Primary local Ready description reports InBuild and not report-from-Primary until activation completes. |
 | `common/LFUMMessageBody.h:18-61`; `common/RSMessage.cpp:181-182` | Body order is generation, full NodeDescription, FailoverUnitInfo vector, AnyReplicaFound. High-priority FM request has no GenerationHeader; the high-priority RA reply is bodyless and carries the echoed generation. |
-| `common/RALFUMUploadOperation.cpp:14-39`; `common/FailoverConfig.h:30` | A consuming correlated request owns the frozen upload. Timeout retains that body for a new request after the native 30-second retry interval; node drive and owner shutdown remain independent. |
-| `fm/RebuildContext.cpp:389-486`; `fm/FailoverManager.cpp:2620-2647` | Process inventory before acknowledgment. A duplicate/already-ready or different-generation upload receives its echoed reply without replacing accepted inventory or completing a different round. |
-| `ra/GenerationStateManager.cpp:318-337` | Only a reply equal to current receive generation advances send generation. An older in-flight reply cannot finish a superseding round. |
+| `common/RALFUMUploadOperation.cpp:14-39`; `common/SendReceiveToFMOperation.cpp:149-160`; `common/FailoverConfig.h:30,37` | A consuming correlated request owns the frozen upload. Native retry delay is base interval plus bounded additive jitter (defaults: 30 seconds and factor 0.3), never a resampled inventory. Fube retains the configured base interval but has not ported jitter; scheduling parity remains in the plan. Node drive and owner shutdown remain independent. |
+| `fm/RebuildContext.cpp:389-486`; `fm/FailoverManager.cpp:2620-2647` | Consume inventory only for active matching generation and pending Node incarnation. Process reports/node state before ACK; processing failure suppresses ACK. Duplicate/nonpending, different-generation or already-ready uploads can receive an echoed reply without replacing current inventory or completing another round. |
 | `ra/ReconfigurationAgent.cpp:2244-2298`; `ra/ServiceTypeRegistrationWrapper.cpp:283-297`; `Hosting2/FabricRuntimeManager.cpp:181-229` | Fresh replica creation admits Open; its service-type lookup demands Hosting activation. Neither a cluster StartNode API nor LFUM completion supplies a replacement host or replica authority. |
+| `ra/NodeUpAckProcessor.cpp:37-154`; `ra/Node.PendingReplicaUploadStateProcessor.cpp:46-168` | Initial discovery is a separate owner-specific node lifecycle: version/activation and per-FT NodeUpAck processing precede readiness and pending-replica upload. Retry/final ReplicaUp state is not LFUM generation completion. |
+| `ra/ReplicaUpMessageBuilder.cpp:21-50`; `ra/ReconfigurationAgent.cpp:3268-3334` | Batch normal/dropped reports and compute IsLast from pending entities. Process both ACK lists before final-upload completion; consume the last flag only while RA remains open and group processing succeeds. This full protocol is still planned in fube. |
+
+#### Upload ownership and authority
 
 Each accepted `GenerationUpdate`, including a repeat with the same generation,
 owns fresh per-entity read jobs and a distinct upload operation. The shared Node
@@ -654,6 +647,10 @@ same-generation reply can advance send generation while sibling uploads remain
 owned. `generations.pending_uploads` counts those obligations separately from
 the current-generation `upload_pending` readiness flag.
 
+The Node schedules missing-reply retries from the configured base interval
+(default 30 seconds). SF's additive retry jitter is not implemented; the plan
+tracks that gap separately from frozen-body/request ownership correctness.
+
 The RA uses its current committed service description, not the historical
 reconfiguration request, without widening the Node profile's service-update
 admission. Concurrent uploads are bounded by RA `max_outstanding`. Capacity
@@ -661,137 +658,67 @@ retains the original generation-update frame without advancing receive; only
 its transport handoff is released so the upload replies that free capacity can
 still arrive. This is not a semantic ACK or successful RA admission.
 
-For the bounded initial P/P plus I/S admission, the shared RA derives inventory
-from the committed phase, not the prospective RAP result:
+#### Committed phase inventory
+
+Configuration transitions commit PC (previous), CC (current) and a separate
+IC (intermediate) snapshot. Inventory reads that view, not a prospective RAP
+result or retained historical request. Creation/build/removal update the same
+view; failed operations remain reportable without becoming successful.
 
 | Committed phase | Previous epoch/roles | Intermediate epoch/roles |
 |---|---|---|
-| Primary catch-up | Retained from the admitted request | Invalid/None |
-| Primary Activate or final RAP End pending | Retained from the admitted request | Current epoch/current roles |
-| Secondary RAP Activate completion pending | Retained from the admitted request | Invalid/None |
-| Completed local configuration | Invalid/None | Invalid/None |
-
-Every reported LSN is cleared, and local identity/endpoints remain those of the
-committed local replica. A failed final commit reports the preceding committed
-phase; an uncertain commit continues to block its queued inventory read.
-Upload completion does not gate peer control. Existing source, receive-generation,
-epoch, identity and supported-operation checks still govern every command.
-Generation completion neither finishes reconfiguration nor grants or revokes
-application access: runtime authority and actual configuration quorum remain
-independent. Each upload freezes its own phase metadata even if later local
-commits advance the reconfiguration.
-
-For the first original 3/2 Primary app-host failover:
-
-| Committed phase | Previous epoch/roles | Intermediate epoch/roles |
-|---|---|---|
-| Candidate GetLSN or catch-up | Admitted failover PC | Invalid/None |
-| GetLSN-only survivor | Old CC copied to PC; remote CC still the old membership | Invalid/None |
-| Candidate Deactivate, Activate or final RAP End pending | Admitted failover PC | Current epoch/current roles |
+| Initial Idle build | Invalid/None | Invalid/None |
+| Same-Primary admission/repair catch-up | Retained from admitted configuration | Invalid/None |
+| Same-Primary Primary Activate/final RAP End pending | Retained from admitted configuration | Current epoch/current roles |
+| Candidate GetLSN/catch-up | Admitted failover PC | Invalid/None |
+| GetLSN-only survivor | Old CC copied to PC; CC remains its old membership | Invalid/None |
+| Candidate Deactivate/Activate/final RAP End pending | Admitted failover PC | Current epoch/current roles |
 | Survivor Deactivate committed | Admitted failover PC | Current epoch/current roles |
-| Survivor RAP Activate pending | Admitted failover PC | Invalid/None |
-| Local failover complete | Invalid/None; dropped former Primary removed from membership | Invalid/None |
+| Secondary/survivor RAP Activate pending | Retained admitted PC | Invalid/None |
+| Local configuration complete | Invalid/None; obsolete non-CC members removed | Invalid/None |
 
-Closed replicated FTs report only canonical dropped local metadata before deletion;
-deleted entries are omitted without erasing AnyReplicaFound. This closed-FT rule
-precedes live-membership checks, as in SF. A query-only survivor must not report
-the candidate's prospective configuration or mark the former Primary down before
-learning that membership. The candidate reports from Primary according to its
-committed RA role, not an upload ACK or application readiness.
-There is no upload-pending control gate or LFUM-specific continuation exception.
-Unsupported runtime transitions remain rejected by their ordinary handlers.
-Runtime/RAP completion, endpoint publication and actual quorum authority keep
-their original owners and are independent of LFUM completion.
+The Primary reports admitted remote Idle build states; each destination reports
+only its own local InBuild Idle. All LSNs are cleared. Identity/endpoints and
+current/previous-Primary reporting follow committed local state, including
+demoted-Primary InBuild reporting. Closed FTs report canonical dropped local
+metadata; deleted entries are omitted without clearing the captured
+AnyReplicaFound. A query-only survivor cannot report the candidate's prospective
+membership.
 
-The bounded surviving FM reconciles reports against its exact original node,
-partition, service, configuration and replica ownership; it does not reconstruct
-unknown partitions or elect writers from reports. This FM is a test harness,
-not a production FM or a reliability implementation.
-`generation_handshake.uploads` retains each accepted inventory. All processed
-uploads set `phase=complete`, `complete=true`, allowing ordinary control/service updates in
-the new generation. An individual RA keeps its upload pending until its own
-matching semantic reply; transport receipt and diagnostic observation files
-cannot substitute for that reply. A lost reply replays the same inventory even
-after FM has completed the round.
-A subsequent explicit handshake may start after the previous round completes;
-its proposal is above the last negotiated generation, not the bootstrap seed.
-This does not restart the FM, reconnect Channels or reconstruct unknown state.
+A failed final commit leaves the preceding committed phase reportable; an
+uncertain commit blocks its queued read. Later configuration changes cannot
+mutate a frozen upload. Source, receive generation, epoch, identity and ordinary
+operation checks remain authoritative, without an LFUM-specific continuation
+exception. Upload ACK neither finishes reconfiguration nor grants/revokes
+application access. RAP completion, native endpoint publication and actual
+PC/CC quorum retain their separate owners.
 
-Model/store tests cover multi-entity barriers, failed/unknown private commits,
-empty maps versus deleted-only maps, exact/stale/FMM replies and duplicate FM
-receipts. Original-process acceptance covers empty/nonempty inventories,
-renegotiation, resumed new-generation Add/Delete and continuing nonempty Primary
-data on the original app/runtime owners. A shared upload-state/Channel test
-overlaps same-generation requests, retains
-a further update on capacity, and consumes an actual correlated reply while
-that frame is retained. It then loses another request's reply, checks the native
-retry deadline and fires that deadline explicitly, preserving its frozen
-inventory even after a sibling ACK advanced send generation, without a
-wall-clock wait.
-Initial-build inventories have invalid PC/IC and None previous/intermediate
-roles. The Primary reports itself plus its admitted remote Idles, using committed
-creation replies for endpoints; each destination reports only its own local Idle.
-Build completions keep their original owners and can finish before the upload
-ACK; they do not mutate a frozen upload. The test FM defers automatic initial
-configuration until reconciliation, but an explicitly requested configuration
-uses ordinary admission rather than an LFUM-specific gate.
-Stable 3/2 process acceptance uploads all three members' complete configurations,
-withholds the original correlated replies, supersedes the generation and delivers
-those stale replies before accepting the new inventories. Original Node/app/runtime
-owners, roles, endpoints, data and new-generation control remain intact. Shared
-RA tests cover actual final membership commits, definite failure/unknown outcomes,
-Primary/Secondary inventory and immutable snapshots after later local changes.
-The standalone process tests exercise the same stable replicated upload path.
-Additional local-cluster and standalone cases hold the real application
-Secondary role callback, leaving Primary Activate and Secondary RAP completion
-pending. They roll generation twice, consume stale correlated replies without
-advancing send, validate the complete PC/IC inventories, then release the
-original callbacks and finish the original configuration. Data, read authority
-and original owners are preserved. The local-cluster case additionally loses
-both Secondaries and proves that a new write cannot use the old singleton vote.
-Both launchers also hold an actual application copy-stream operation before
-application apply/ACK, roll generation twice and consume stale replies. The
-local-cluster case completes both builds while the new upload remains unacknowledged;
-both cases then admit the new initial configuration before current upload
-acknowledgment. Old outgoing peer generations may be rejected until send generation
-advances; exact native retries resume that same configuration afterward. Both finish
-the original 3/2 admission and replicate writes without another Open/provider
-acquisition or replacement owner. The barrier uses public application streams,
-not an engine-specific data-replicator hook.
-Both launchers also lose the exact original Primary app host and hold genuine
-Primary role completion and final RAP configuration completion on the surviving
-candidate. The latter barrier delegates the public IPrimaryReplicator interface;
-it is not a data-engine hook or an FM reply barrier. The tests upload query-only
-and phase-4/completed survivor views, supersede generations, consume stale replies,
-finish the original failover and continue nonempty data on original owners.
-S/S activation need not call the unchanged application role callback. RA tests
-independently cover its Deactivate/Activate IC transitions and private failed/unknown
-final commits. The local-cluster journey then loses the final Secondary and proves
-that a new write cannot bypass the unchanged quorum.
-Both launchers also repair the first lost Primary through ordinary AddReplica
-and peer CreateReplica, without a process-owner replacement command. Shared
-Node/Hosting provisions the fresh host only for the committed replica Open's
-registration lookup, after old-owner cleanup. With repair build uploads held
-across superseding generations, FM explicitly admits the repair configuration
-and the Primary commits Deactivate before upload acknowledgment. Exact retries
-resume after send-generation advancement. A second overlap holds genuine fresh
-Secondary role completion, reports Primary phase-4 IC and Secondary invalid IC,
-then lets the Secondary finish before the current LFUM ACK. Frozen inventories
-do not change. ACKs still cannot finish the separately held final RAP operation.
-Both journeys preserve survivor owners and continue nonempty replication using
-the fresh replica after the other original Secondary is lost. The local journey
-then loses the fresh Secondary too and proves a new write cannot acknowledge
-with the Primary's vote alone.
-FM-channel loss during an owned upload leaves it pending
-without advancing send generation or shutting down the original serving app.
-Native-stream/schema-adapter evidence adds six cases:
-169 bidirectional cases, 84 types/255 fields, 173 bundle files and 49 actual
-native truncation rejections. Full C++ handler traces/interoperability,
-nonempty NodeUp reconciliation, full ReplicaUp batching/final upload, interrupted
-peer-configuration process upload outside these original build/admission/failover
-slices and first explicit post-failover repair, planned-swap/repeated-repair
-process inventory, FM/FMM rebuild and durable
-restart remain unqualified.
+#### Test-FM completion and process qualification
+
+`generation_handshake.uploads` retains accepted inventories. Only processing all
+expected inventories sets the harness round `phase=complete`, `complete=true`.
+Each RA separately waits for its matching semantic reply to advance send.
+Transport receipt and diagnostic files are not that reply; a lost reply retries
+the original inventory even after the FM round completes.
+
+The existing tests are maintained in
+[shared RA model/store tests](../../crates/libs/fube-ra/tests/entity.rs),
+[shared Node upload ownership](../../crates/libs/fube-node/src/control/mod.rs),
+[local-cluster acceptance](../../crates/tools/fube-cluster/src/tests.rs) and
+[standalone acceptance](../../crates/tools/fube-node-runner/tests/standalone.rs).
+The covered invariants are:
+
+| Qualification | Current checks |
+|---|---|
+| Read/commit and ownership | Multi-entity ordering, definite/unknown commits, empty/deleted-only maps, same-generation independent uploads and stale/FMM replies. Capacity retains an unadmitted frame without advancing receive while existing correlated replies can still free ownership. Lost-reply retry deadlines are driven explicitly. |
+| Stable/build/admission overlaps (both launchers) | Held/superseding uploads, real public copy/role callbacks, initial configuration before build-upload ACK and exact peer retries afterward. Original owners and acknowledged data survive; completion cannot mutate frozen inventory. |
+| First failover/repair overlaps (both launchers) | Query-only survivor PC and phase-4 IC; real Primary/Secondary role and final public IPrimaryReplicator barriers. Repair Open demands fresh shared Hosting activation after old-owner cleanup. Repair configuration and local Secondary completion can precede ACK, but final RAP work remains independent. |
+| Application authority | Nonempty replication after completion, fresh repaired-member quorum after another survivor loss, and local-cluster rejection of a new write with Primary alone. FM-channel loss keeps the owned upload pending without advancing send or treating the surviving app as recovered/shut down. |
+
+Nonempty NodeUp reconciliation, full ReplicaUp batching/final ACK, later/interrupted
+repair and transfer/redirection process overlaps, FM/FMM rebuild and durable RA
+restart remain unqualified. Broader ordinary reconfiguration/restoration tests
+do not imply LFUM overlap qualification for those journeys.
 
 ## Healthy three-replica service
 

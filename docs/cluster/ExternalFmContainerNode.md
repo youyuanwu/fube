@@ -364,45 +364,33 @@ Native retry defaults are unchanged. The shared bounded wire profile retains
 its 64-KiB frame/body cap, 16 headers with 4-KiB values, bounded decode budget
 and 32 local command/effect observation slots.
 
-Ordinary-FM generation rollover supports stable, fully admitted 3/2 membership
-and original FM-owned Idle creation/build after participating RAs commit their
-creation requests, or original healthy same-Primary Secondary admission once all participating
-RAs have committed their configuration requests. It also supports the first
-original 3/2 Primary app-host failover with both original healthy survivors.
-The first explicit post-failover repair is also qualified in both launchers:
-ordinary replica creation demands a fresh host, and repair configuration may
-commit Deactivate while its build uploads still await ACK. Exact retries resume
-after send-generation advancement. Further rollover during the fresh Secondary's
-held role callback reports Primary phase-4 IC and Secondary invalid IC; the
-Secondary may finish before LFUM ACK without mutating the frozen upload or
-finishing the separately held final RAP operation.
-Each Node uploads its committed local view with cleared LSNs and SF's
-current/previous-Primary reporting rules. A matching correlated LFUM reply advances send generation,
-without reopening replicas or changing application authority. Every accepted
-update owns a fresh snapshot; retries preserve only their own frozen upload,
-and replies retire only their original request, including stale-generation
-replies. During admission, committed PC epochs/roles are retained; Primary phase 4
-reports IC=CC/current roles while the activating Secondary reports invalid IC.
-Local completion clears PC/IC independently of upload completion. Matching
-configuration continuations retain their owners; generation rollover does not
-change runtime access or quorum authority. During initial build, the Primary
-reports its known remote Idles as InBuild until each matching build completes;
-each destination reports only its own InBuild Idle. PC/IC remain invalid.
-Ordinarily admitted control and build completions may progress before upload
-acknowledgment without changing frozen inventory. Both launchers qualify new
-initial configuration admission before that ACK; outgoing peer retries resume
-after send-generation advancement. During failover, a GetLSN-only
-survivor reports old CC copied to PC, not the prospective new membership.
-Deactivate reports IC=CC; survivor Activate clears IC, and local completion clears
-PC/IC and removes the dropped former Primary. The closed former Primary reports
-canonical local dropped metadata or omits its deleted entry.
-The shared RA has no LFUM-specific lineage/size allowlist or upload-pending
-peer-control gate. Its committed replica-store projection also covers existing
-repair/removal, planned transfer, redirection and failed-operation states in
-model/store tests. Beyond the first explicit repair above, this does not widen
-this runner's deployment/runtime profile or qualify those additional overlaps
-in real standalone processes.
-Nonempty startup, full ReplicaUp reconciliation, FMM and restart remain gated.
+### Ordinary-FM LFUM status
+
+Real-process generation rollover is qualified for empty pre-placement inventory,
+original 3/2 stable membership, FM-owned Idle build, same-Primary admission,
+first Primary app-host failover with the two original healthy survivors, and
+first explicit post-failover repair. Participating build/configuration requests
+must be committed. This is live-session metadata reconciliation, not startup
+recovery or a production FM rebuild.
+
+Shared RA projects generic committed replica-store and independent PC/IC/CC
+state, clears reported LSNs and follows SF current/previous-Primary rules.
+Every accepted update owns fresh reads and an independent frozen upload/retry;
+a stale reply retires only its original request, and only a reply equal to
+current receive advances send generation. There is no upload-pending control
+gate: admitted build/configuration and local Secondary completion can progress
+before ACK. LFUM cannot finish final RAP work, grant quorum authority or activate
+a host. Fresh repair activation instead follows the committed Open lookup and
+predecessor cleanup in shared Node/Hosting.
+
+The [current LFUM contract and evidence](MinimalFmCluster.md#live-session-lfum-upload)
+is shared with the local cluster. The [alignment plan](RustRaPort.md#lfum-alignment-plan)
+prioritizes repeated/interrupted repair overlaps. Shared model/store coverage of
+transfer/redirection does not enable standalone planned transfer: that runtime
+path is currently two-member only, while this profile is fixed 3/2.
+Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,
+FM/FMM rebuild and restart remain gated; native handler/interoperability evidence
+remains incomplete.
 
 ## Failure behavior and limits
 
