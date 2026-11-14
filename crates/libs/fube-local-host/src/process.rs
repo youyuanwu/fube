@@ -436,7 +436,8 @@ impl Drop for OwnedApp {
 }
 
 fn require_stat(fields: &[&str]) -> Result<()> {
-    if fields.len() == 3 && fields[2].parse::<u32>().is_ok() {
+    // Linux can emit pgrp=-1 while an exiting task loses its signal state.
+    if fields.len() == 3 && fields[2].parse::<i32>().is_ok() {
         Ok(())
     } else {
         Err(HostError("invalid proc process group fields".into()))
@@ -445,6 +446,19 @@ fn require_stat(fields: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proc_scan_accepts_exiting_task_group_sentinel_but_rejects_malformed_fields() {
+        require_stat(&["R", "0", "-1"]).unwrap();
+        require_stat(&["S", "1", "1234"]).unwrap();
+        for fields in [
+            &["R", "0"][..],
+            &["R", "0", "not-a-group"][..],
+            &["R", "0", "2147483648"][..],
+        ] {
+            assert!(require_stat(fields).is_err());
+        }
+    }
 
     #[test]
     fn proc_scan_skips_disappeared_entries_but_propagates_real_io_failures() {

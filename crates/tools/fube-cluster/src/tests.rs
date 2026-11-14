@@ -2967,6 +2967,49 @@ async fn fm_add_idle_copies_real_state_and_recovers_lost_reply_without_resurrect
 }
 
 #[tokio::test]
+async fn fm_can_remove_ready_idle_without_waiting_for_open_telemetry() {
+    let fixture = Fixture::new("fm-ready-idle-remove");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::StatefulPeerIdle;
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.ledger = peer_idle_ledger();
+    cluster.peer_idle_requested = true;
+    for (index, placement) in cluster.ledger.placements.iter_mut().enumerate() {
+        placement.launch.directory = fixture.root.join(format!("node{index}"));
+    }
+    let launch = cluster.ledger.placements[0].launch.clone();
+    let (fm, node) = node::report_tests::links(&launch).await.unwrap();
+    for placement in &cluster.ledger.placements {
+        cluster.children.push(ChildOwner {
+            launch: placement.launch.clone(),
+            process: None,
+            link: (placement.launch.node == launch.node).then(|| fm.clone()),
+            metadata: None,
+        });
+    }
+    let add = cluster.ledger.request_idle(Instant::now()).unwrap();
+    let mut replica = add.replica.clone();
+    replica.state = 2;
+    replica.replication_endpoint = "127.0.0.1:12346".into();
+    cluster.ledger.idle_reply(0, AddReplicaReply {
+        unit: add.unit, replica: replica.clone(), error: 0,
+    }).unwrap();
+    assert_eq!(cluster.ledger.idle_status()["ready"], true);
+    assert_eq!(cluster.status()["peer_idle"]["state"], "pending");
+    let result = cluster.remove_idle_replica_via_fm().await;
+    if result.is_ok() {
+        let mut incoming = node.receive(wire::deadline()).await.unwrap().unwrap();
+        let (body, _) = decode_remove_replica(&incoming.message).unwrap();
+        assert_eq!(body.replica, replica);
+        if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+        assert_eq!(cluster.ledger.idle_removal_status()["pending_remove"], true);
+    }
+    node.close().await.unwrap();
+    assert_eq!(cluster.shutdown().await["clean"], true);
+    assert_eq!(result.unwrap()["state"], "pending");
+}
+
+#[tokio::test]
 async fn fm_can_cancel_original_pending_add_without_waiting_for_open_telemetry() {
     let fixture = Fixture::new("fm-pending-create-cancel");
     let mut config = fixture.config();
@@ -4403,7 +4446,7 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
             let node_pids = cluster.status()["nodes"].as_array().unwrap().iter()
                 .map(|n| n["node_pid"].clone()).collect::<Vec<_>>();
             let mut predecessors = Vec::new();
-            let mut old_requests = Vec::new();
+            let mut old_requests: Vec<(usize, DoReconfiguration)> = Vec::new();
             let mut epoch = cluster.ledger.placements[0].body()?.unit.current;
             for cycle in 0..3 {
                 let lost = cluster.ledger.primary_index();
@@ -4415,6 +4458,17 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
                     .map(|(i, p)| (i, p.profile.clone().unwrap())).collect::<Vec<_>>();
                 assert!(std::process::Command::new("kill").args(["-KILL", &profile.app_pid.to_string()])
                     .status().map_err(err)?.success());
+                if cycle == 2 {
+                    let end = Instant::now() + Duration::from_secs(8);
+                    while cluster.status()["nodes"][lost]["retained_work"]["local_replica"]["phase"] != "Closed" {
+                        assert!(Instant::now() < end, "late reconfiguration loss deadline");
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    for (index, body) in old_requests.iter().filter(|(index, _)| *index == lost) {
+                        let link = cluster.children[*index].link.as_ref().unwrap();
+                        link.send(do_reconfiguration_message(body, &link.generation()).map_err(err)?).await?;
+                    }
+                }
                 until(&mut cluster, |c| c.ledger.failed_primary_index() == Some(lost)
                     && c.ledger.swap.as_ref().is_some_and(|s| s.reply.is_some())
                     && c.ledger.placements[lost].status()["native_replica_deleted"] == true

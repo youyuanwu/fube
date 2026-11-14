@@ -1562,9 +1562,25 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         self.admit_fm(source, generation)?;
+        // Host loss must not turn a former Primary's old FM work into link loss.
+        let closed_replay = self.peer_profile()
+            && self
+                .ra
+                .snapshot(body.configuration.unit.id.guid.0)
+                .committed
+                .is_some_and(|state| {
+                    state.phase == ra::Phase::Closed
+                        && state.fm_primary
+                        && !state
+                            .body
+                            .unit
+                            .current
+                            .older_than(body.configuration.unit.current)
+                });
         if !self.fm_primary_profile()
             && !(self.peer_profile()
                 && self.active_stateful_configuration(body.configuration.unit.id.guid.0))
+            && !closed_replay
         {
             return Err(Error::Unsupported);
         }

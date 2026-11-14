@@ -1224,7 +1224,7 @@ pub(crate) mod report_tests {
         statuses: Vec<(bool, ServiceTypeUpdate)>,
     }
 
-    async fn links(launch: &Launch) -> Result<(Link, Link)> {
+    pub(crate) async fn links(launch: &Launch) -> Result<(Link, Link)> {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
         let endpoint = fube_transport::Endpoint::unsecured_tcp(
             listener.local_addr().map_err(err)?,

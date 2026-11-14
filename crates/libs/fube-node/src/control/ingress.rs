@@ -380,7 +380,7 @@ impl Ingress {
         match result {
             Ok(id) => Ok(Admission::Submitted(acknowledgement.map(|ack| (id, ack)))),
             Err(Error::Capacity) => Ok(Admission::Retained),
-            Err(error) => Err(err(error)),
+            Err(error) => Err(format!("{action}: {}", err(error))),
         }
     }
 
