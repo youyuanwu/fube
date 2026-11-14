@@ -301,7 +301,7 @@ cat /run/fube/node1-session1/status.json
 | `replica_phase`, `replica_role` | Committed local replica state. |
 | `local_configuration_complete` | Local RA configuration completion, not the FM's receipt of its reply. |
 | `generations` | Admitted receive/send generations, current-generation `upload_pending` readiness and separate `pending_uploads` ownership count; not restart readiness. |
-| `control_unknown`, `error` | Observed error/control uncertainty; not permission to promote or reconnect. |
+| `control_unknown`, `control_error`, `error` | Retained session loss or other failure; not permission to promote or reconnect. |
 | `cleanup` | Final local cleanup outcome, including separately reported `pending_work`. |
 
 Process running, bootstrap complete, registration, replica readiness and
@@ -315,14 +315,19 @@ For healthy whole-deployment teardown:
    non-force `DeleteReplica` for each exact original member using the completed
    native identities and epoch, and consume the actual replies.
 2. Send SIGTERM or SIGINT to each original runner through the process supervisor.
-   The runner drives owned Close/Drop, application/group reaping, Hosting-root
+   Signals may arrive independently. The runner drives ordinary native Close
+   (or continues an already accepted close/deletion), application/group reaping, Hosting-root
    cleanup, RA/executor/store close and original Channel disposal/join.
 3. Observe process exit and final status. Exit code zero requires clean local
-   shutdown with no observed startup/control/cleanup error. An error produces
-   a failure exit even when physical resources were subsequently cleaned.
+   shutdown with no startup, protocol/authority or cleanup failure. Original
+   Channel loss is retained separately in `control_unknown` and
+   `cleanup.control_error`; it does not prevent explicit local shutdown from
+   succeeding. Other failures still produce a failure exit even when physical
+   resources were subsequently cleaned.
 
 `cleanup.clean` means positively joined **local resources**, not acknowledgment
-of all remote reporting work. `cleanup.pending_work` reports those remaining
+of native deletion, healthy control or all remote reporting work. A successful
+shutdown does not clear prior control uncertainty. `cleanup.pending_work` reports those remaining
 obligations separately. Neither a transport write, `DeleteReplicaReply` nor a
 termination signal is by itself proof of complete physical cleanup. An outer
 forced kill is not graceful provider disposal.

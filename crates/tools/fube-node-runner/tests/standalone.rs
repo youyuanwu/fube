@@ -137,14 +137,36 @@ impl Fixture {
         )
     }
 
-    fn terminate(&mut self) {
-        for child in &self.children {
-            assert!(Command::new("kill")
-                .args(["-TERM", &child.pid().to_string()])
-                .status()
-                .unwrap()
-                .success());
+    async fn stop_node(&mut self, fm: &mut FmFixture, index: usize) {
+        assert!(Command::new("kill")
+            .args(["-TERM", &self.children[index].pid().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while self.children[index].observed_exit().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "Node shutdown: {}",
+                self.diagnostics()
+            );
+            fm.step().await;
         }
+        assert_eq!(self.status(index)["stage"], "stopped");
+    }
+
+    async fn await_control_loss(&mut self, fm: &mut FmFixture, index: usize) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !self.status(index)["control_error"].is_string() {
+            assert!(
+                Instant::now() < deadline,
+                "peer loss observation: {}",
+                self.diagnostics()
+            );
+            self.children[index].check_alive().unwrap();
+            fm.step().await;
+        }
+        assert_eq!(self.status(index)["control_unknown"], true);
     }
 
     fn finish(mut self, expected_clean: [bool; 3]) {
@@ -211,6 +233,7 @@ struct FmFixture {
     hold_uploads: bool,
     held_uploads: Vec<(usize, IncomingMessage<GatewayTarget>)>,
     stopping: bool,
+    expected_loss: Option<usize>,
 }
 
 impl FmFixture {
@@ -264,6 +287,7 @@ impl FmFixture {
             hold_uploads: false,
             held_uploads: vec![],
             stopping: false,
+            expected_loss: None,
         }
     }
 
@@ -277,7 +301,11 @@ impl FmFixture {
                 .await
             {
                 Ok(incoming) => incoming,
-                Err(error) if self.deleted[index] || self.stopping => {
+                Err(error)
+                    if self.deleted[index]
+                        || self.stopping
+                        || self.expected_loss == Some(index) =>
+                {
                     eprintln!("original Node Channel closed during owned teardown: {error}");
                     self.links[index].take().unwrap().close().await.unwrap();
                     continue;
@@ -592,8 +620,18 @@ async fn standalone_generation_rollover_during_secondary_admission_preserves_sf_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_loss_before_deletion_retains_uncertainty_but_allows_local_node_close() {
+    journey(Fault::LostPeer).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_wrong_generation_refuses_new_authority() {
     journey(Fault::Generation).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_stale_generation_is_not_mistaken_for_channel_loss() {
+    journey(Fault::StaleGeneration).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -615,7 +653,9 @@ async fn standalone_foreign_instance_refuses_replacement() {
 enum Fault {
     None,
     LostFm,
+    LostPeer,
     Generation,
+    StaleGeneration,
     Resize,
     Promotion,
     ForeignInstance,
@@ -1051,6 +1091,31 @@ async fn journey(fault: Fault) {
             }
         }
     }
+    if fault == Fault::LostPeer {
+        fm.stopping = true;
+        fixture.stop_node(&mut fm, 0).await;
+        fixture.await_control_loss(&mut fm, selected).await;
+        fixture.await_control_loss(&mut fm, 2).await;
+        for index in [selected, 2] {
+            let status = fixture.status(index);
+            assert_eq!(status["application_pid"], pids[index]);
+            assert_eq!(status["stage"], "running");
+            assert!(status["error"].as_str().unwrap().contains("peer"));
+            assert!(TcpStream::connect(fixture.configs[index].node.address)
+                .await
+                .is_err());
+        }
+        for index in [selected, 2] {
+            fixture.stop_node(&mut fm, index).await;
+            let status = fixture.status(index);
+            assert_eq!(status["control_unknown"], true);
+            assert!(status["cleanup"]["control_error"].is_string());
+            assert_eq!(status["cleanup"]["error"], Value::Null);
+        }
+        assert_eq!(fm.deleted, [false; 3], "node Close is not native deletion");
+        fixture.finish([true; 3]);
+        return;
+    }
     let refusal = !matches!(
         fault,
         Fault::None
@@ -1067,6 +1132,10 @@ async fn journey(fault: Fault) {
             let mut header = generation.clone();
             match fault {
                 Fault::Generation => header.number.generation += 1,
+                Fault::StaleGeneration => {
+                    header.number.generation -= 1;
+                    fm.expected_loss = Some(selected);
+                }
                 Fault::Resize => invalid.configuration.unit.target = 4,
                 Fault::Promotion => {
                     invalid.configuration.replicas.0[0].current_role = 3;
@@ -1093,13 +1162,15 @@ async fn journey(fault: Fault) {
         let expected = match fault {
             Fault::LostFm => "Channel",
             Fault::Generation => "generation",
+            Fault::StaleGeneration => "foreign/stale/duplicate",
             Fault::Resize => "immutable for this service",
             Fault::Promotion | Fault::ForeignInstance => "only initial configured admission",
             Fault::None
+            | Fault::LostPeer
             | Fault::Failover
             | Fault::GenerationHandshake
-            | Fault::ReplicatedGenerationHandshake => unreachable!(),
-            Fault::AdmittingGenerationHandshake => unreachable!(),
+            | Fault::ReplicatedGenerationHandshake
+            | Fault::AdmittingGenerationHandshake => unreachable!(),
         };
         assert!(
             fixture.status(selected)["error"]
@@ -1138,21 +1209,27 @@ async fn journey(fault: Fault) {
     })
     .await;
     fm.stopping = true;
-    fixture.terminate();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while (0..3).any(|index| fixture.status(index)["stage"] != "stopped") {
-        assert!(
-            Instant::now() < deadline,
-            "Node shutdown: {}",
-            fixture.diagnostics()
-        );
-        fm.step().await;
+    fixture.stop_node(&mut fm, 0).await;
+    fixture.await_control_loss(&mut fm, selected).await;
+    fixture.await_control_loss(&mut fm, 2).await;
+    for index in [selected, 2] {
+        fixture.stop_node(&mut fm, index).await;
+        assert_eq!(fixture.status(index)["control_unknown"], true);
+        assert!(fixture.status(index)["cleanup"]["control_error"].is_string());
     }
     for link in fm.links.iter().flatten() {
         link.close().await.unwrap();
     }
     let mut expected = [true; 3];
-    expected[selected] = !refusal;
+    expected[selected] = !refusal || fault == Fault::LostFm;
+    if fault == Fault::LostFm {
+        let status = fixture.status(selected);
+        assert!(status["cleanup"]["control_error"]
+            .as_str()
+            .unwrap()
+            .contains("FM Channel"));
+        assert_eq!(status["cleanup"]["error"], Value::Null);
+    }
     fixture.finish(expected);
 }
 
