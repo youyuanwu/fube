@@ -686,8 +686,9 @@ It requires admitted nodes without pending lifecycle/control requests:
 two stateless/independent singleton sessions, stable completed 3/2 membership,
 original FM-owned Idle creation/build in the immutable 3/2 profile after each
 participating RA commits its creation request,
-or the original healthy same-Primary Secondary admission after each RA commits
-its configuration request.
+the original healthy same-Primary Secondary admission after each RA commits
+its configuration request, or the first original 3/2 Primary app-host failover
+with both original healthy survivors.
 This is opt-in, not a CLI command or a change to default bootstrap. Proposed,
 receive and send generations remain distinct; only receive changes on a
 matching Update. The round waits at `awaiting_upload`, `complete=false`:
@@ -709,13 +710,20 @@ of upload ACKs, but new configuration intent waits for reconciliation. Both
 launchers qualify this with a held real application copy operation and superseding
 generations, without reopening replicas. Retry qualification drives
 the shared upload state at explicit deadlines over real correlated Channels;
-separate process cases retain the original node/app/runtime owners. This is one live-session
-round for stateless/independent singleton or bounded 3/2 profiles, not
-application-data upload, unknown-partition reconstruction, in-flight
-builds, broader reconfiguration or swap/repair inventory, nonempty NodeUp, full ReplicaUp
+separate process cases retain the original node/app/runtime owners. Each call is
+a bounded live-session round for stateless/independent singleton or bounded 3/2
+profiles; a later explicit call starts above the completed round's generation.
+This is not application-data upload, unknown-partition reconstruction, manual/failed
+builds, broader reconfiguration or planned-swap/repair inventory, nonempty NodeUp, full ReplicaUp
 batching, FM/FMM recovery or durable restart. Replicated acceptance withholds
 correlated replies, renegotiates a newer generation, rejects the late stale
 completion and preserves all original owners, data and membership.
+First-failover acceptance holds real Primary role and final RAP completion while
+uploading the committed query-only/candidate/completed survivor views. GetLSN
+copies old CC to PC; Deactivate sets IC=CC and survivor Activate clears IC.
+Closed former-Primary metadata is canonical or omitted after deletion. Stale
+upload ACKs neither finish promotion nor change quorum authority. Planned swaps,
+repair, redirected/repeated failover inventory and restart remain separate gates.
 Initial-admission acceptance holds actual Secondary role completion across two
 generation updates. LFUM retains committed PC roles/epochs, Primary phase-4 IC
 and Secondary invalid IC; completion later clears PC/IC without changing the

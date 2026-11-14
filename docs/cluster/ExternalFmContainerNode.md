@@ -366,8 +366,9 @@ and 32 local command/effect observation slots.
 Ordinary-FM generation rollover supports stable, fully admitted 3/2 membership
 and original FM-owned Idle creation/build after participating RAs commit their
 creation requests, or original healthy same-Primary Secondary admission once all participating
-RAs have committed their configuration requests. Each Node uploads its complete
-committed membership with cleared LSNs; only the Primary marks its inventory
+RAs have committed their configuration requests. It also supports the first
+original 3/2 Primary app-host failover with both original healthy survivors.
+Each Node uploads its committed local view with cleared LSNs; only the Primary marks its inventory
 as a Primary report. A matching correlated LFUM reply advances send generation,
 without reopening replicas or changing application authority. Every accepted
 update owns a fresh snapshot; retries preserve only their own frozen upload,
@@ -380,8 +381,15 @@ change runtime access or quorum authority. During initial build, the Primary
 reports its known remote Idles as InBuild until each matching build completes;
 each destination reports only its own InBuild Idle. PC/IC remain invalid.
 Exact original AddReplica retries and build completions may progress before
-upload acknowledgment without changing frozen inventory. Manual/failed builds, other interrupted
-reconfigurations, swap/repair inventory and restart reconciliation remain gated.
+upload acknowledgment without changing frozen inventory. During failover, a GetLSN-only
+survivor reports old CC copied to PC, not the prospective new membership.
+Deactivate reports IC=CC; survivor Activate clears IC, and local completion clears
+PC/IC and removes the dropped former Primary. The closed former Primary reports
+canonical local dropped metadata or omits its deleted entry. Exact original
+failover continuations may progress during upload, without granting new runtime
+or quorum authority. Manual/failed builds, failed RAP states, other interrupted
+reconfigurations, planned swaps, repair, redirected/repeated failover inventory
+and restart reconciliation remain gated.
 
 ## Failure behavior and limits
 

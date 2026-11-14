@@ -43,6 +43,178 @@ pub struct ProgressQuery {
     pub error: i64,
 }
 
+fn original_membership(state: &EntityState) -> Option<&Reconfiguration> {
+    state.reconfiguration.as_ref().filter(|config| {
+        config.stage == ConfigurationStage::Complete
+            && config.error == 0
+            && !config.secondary_loss
+            && config.history.is_empty()
+            && config.request.service.target == 3
+            && config.request.service.minimum == 2
+            && config.request.replicas.0.len() == 3
+            && config.request.replicas.0.iter().all(|r| {
+                r.up && r.state == 2 && matches!((r.previous_role, r.current_role), (4, 4) | (2, 3))
+            })
+    })
+}
+
+fn original_failover_intent(state: &EntityState, body: &Configuration) -> bool {
+    original_membership(state).is_some_and(|original| {
+        body.unit.previous == original.request.unit.current
+            && body.unit.current.data_loss == body.unit.previous.data_loss
+            && body
+                .unit
+                .current
+                .configuration
+                .checked_sub(body.unit.previous.configuration)
+                == Some(0x1_0000_0001)
+            && body.replicas.0.iter().all(|r| {
+                if r.previous_role == 4 {
+                    r.current_role == 1 && !r.up && r.state == 3
+                } else {
+                    r.previous_role == 3 && matches!(r.current_role, 3 | 4) && r.up && r.state == 2
+                }
+            })
+            && validate_failover(body, state).is_ok()
+    })
+}
+
+fn original_failover(state: &EntityState) -> bool {
+    let Some(original) = original_membership(state) else {
+        return false;
+    };
+    if state.phase != Phase::Ready
+        || state.local_deleted
+        || state.runtime.is_none()
+        || state.body.service.target != 3
+        || state.body.service.minimum != 2
+    {
+        return false;
+    }
+    if let Some(swap) = &state.swap {
+        swap.failover
+            && swap.error == 0
+            && swap.change.is_none()
+            && matches!(
+                swap.stage,
+                SwapStage::GetLsn
+                    | SwapStage::Catchup
+                    | SwapStage::Deactivate
+                    | SwapStage::Deactivated
+                    | SwapStage::Activate
+                    | SwapStage::Secondary
+                    | SwapStage::End
+                    | SwapStage::Complete
+            )
+            && original_failover_intent(state, &swap.intent)
+            && state.body.unit == swap.body.unit
+    } else {
+        state.progress_query.as_ref().is_some_and(|query| {
+            query.error == 0
+                && query.request.unit == state.body.unit
+                && query.request.unit.previous == original.request.unit.current
+                && query.request.unit.current.data_loss == query.request.unit.previous.data_loss
+                && query
+                    .request
+                    .unit
+                    .current
+                    .configuration
+                    .checked_sub(query.request.unit.previous.configuration)
+                    == Some(0x1_0000_0001)
+                && original
+                    .request
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == query.source && r.current_role == 3)
+        })
+    }
+}
+
+pub(super) fn lfum_configuration(state: &EntityState) -> Option<(Configuration, Epoch)> {
+    if !original_failover(state) {
+        return None;
+    }
+    let mut intermediate = Epoch::default();
+    let mut body = if let Some(swap) = &state.swap {
+        if matches!(
+            swap.stage,
+            SwapStage::Deactivate | SwapStage::Deactivated | SwapStage::Activate | SwapStage::End
+        ) {
+            intermediate = state.body.unit.current;
+        }
+        swap.body.clone()
+    } else {
+        // SF ProcessGetLSNMessage copies CC to PC without learning a new CC.
+        let mut body = original_membership(state)?.request.clone();
+        body.unit = state.body.unit.clone();
+        for replica in &mut body.replicas.0 {
+            replica.previous_role = replica.current_role;
+        }
+        body
+    };
+    body.service = state.body.service.clone();
+    let local = body
+        .replicas
+        .0
+        .iter_mut()
+        .find(|r| r.node == state.body.replica.node)?;
+    *local = state.body.replica.clone();
+    Some((body, intermediate))
+}
+
+pub fn continues_primary_failover(state: &EntityState, body: &Configuration) -> bool {
+    if !original_failover(state) {
+        return false;
+    }
+    if let Some(swap) = &state.swap {
+        body.unit == swap.intent.unit
+            && body.service == swap.intent.service
+            && body.replicas.0.len() == swap.intent.replicas.0.len()
+            && body.replicas.0.iter().all(|r| {
+                replica(&swap.intent, &r.node).is_ok_and(|expected| same_replica(r, expected))
+            })
+    } else {
+        state.progress_query.as_ref().is_some_and(|query| {
+            query.reply.is_some()
+                && body.unit == query.request.unit
+                && original_failover_intent(state, body)
+                && body
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == query.source && r.current_role == 4)
+        })
+    }
+}
+
+pub(super) fn continues_original_failover(
+    work: &Submission,
+    current: Option<&EntityState>,
+) -> bool {
+    let Some(state) = current.filter(|state| original_failover(state)) else {
+        return false;
+    };
+    match work.kind {
+        Kind::DoReconfiguration { .. } => {
+            from_slice::<DoReconfiguration>(&work.bytes).is_ok_and(|body| {
+                state
+                    .swap
+                    .as_ref()
+                    .is_some_and(|swap| body.configuration == swap.intent)
+            })
+        }
+        Kind::Deactivate { .. } => from_slice::<Deactivate>(&work.bytes)
+            .is_ok_and(|body| continues_primary_failover(state, &body.configuration)),
+        Kind::Activate { .. } => from_slice::<Activate>(&work.bytes)
+            .is_ok_and(|body| continues_primary_failover(state, &body.configuration)),
+        Kind::DeactivateReply { .. } | Kind::ActivateReply { .. } | Kind::RetryConfiguration => {
+            true
+        }
+        _ => false,
+    }
+}
+
 fn deactivation(state: &EntityState) -> Result<ReplicaDeactivationInfo> {
     state
         .primary_deactivation

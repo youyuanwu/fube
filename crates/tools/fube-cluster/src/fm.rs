@@ -210,6 +210,7 @@ pub(crate) struct GenerationHandshake {
     pub uploads: Vec<Option<LfumUpload>>,
     initial_membership: Option<Configuration>,
     initial_builds: Option<Vec<AddReplica>>,
+    failover: Option<Configuration>,
     retry_at: Vec<Instant>,
 }
 impl GenerationHandshake {
@@ -222,6 +223,7 @@ impl GenerationHandshake {
             uploads: vec![None; nodes],
             initial_membership: None,
             initial_builds: None,
+            failover: None,
             retry_at: vec![Instant::now(); nodes],
         })
     }
@@ -592,7 +594,7 @@ impl Ledger {
             .is_some();
         if (!configured
             && self.placements[0].launch.profile != crate::ServiceProfile::StatefulThree)
-            || self.generation.is_some()
+            || self.generation_pending()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
             || self
@@ -1077,6 +1079,13 @@ impl Ledger {
     }
 
     fn validate_peer_lfum(&self, index: usize, body: &LfumUpload) -> Result<()> {
+        if let Some(intent) = self
+            .generation
+            .as_ref()
+            .and_then(|round| round.failover.as_ref())
+        {
+            return self.validate_failover_lfum(index, body, intent);
+        }
         if let Some(builds) = self
             .generation
             .as_ref()
@@ -1228,6 +1237,131 @@ impl Ledger {
         Ok(())
     }
 
+    fn validate_failover_lfum(
+        &self,
+        index: usize,
+        body: &LfumUpload,
+        intent: &Configuration,
+    ) -> Result<()> {
+        let placement = &self.placements[index];
+        let original = self
+            .configuration
+            .as_ref()
+            .and_then(|c| c.reply.as_ref())
+            .ok_or("missing original test membership")?;
+        if placement.node_description.as_ref() != Some(&body.node)
+            || !body.any_replica_found
+            || body.units.0.len() > 1
+        {
+            return Err("LFUM failover node/map does not match the original session".into());
+        }
+        let lost = intent
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.previous_role == 4)
+            .ok_or("missing original lost Primary")?;
+        if placement.launch.node == lost.node {
+            if let Some(info) = body.units.0.first() {
+                let expected = original
+                    .replicas
+                    .0
+                    .iter()
+                    .find(|r| r.node == lost.node)
+                    .ok_or("missing original Primary identity")?;
+                if info.service != intent.service
+                    || info.unit != original.unit
+                    || info.intermediate != Epoch::default()
+                    || info.report_from_primary
+                    || info.local_deleted
+                    || info.replicas.0.len() != 1
+                    || info.replicas.0[0].intermediate_role != 1
+                    || info.replicas.0[0].description != dropped_replica(expected)
+                {
+                    return Err("closed former Primary must report canonical dropped metadata or omit its deleted entry".into());
+                }
+            }
+            return Ok(());
+        }
+        let info = body
+            .units
+            .0
+            .first()
+            .ok_or("missing surviving failover inventory")?;
+        let mut expected = Configuration {
+            unit: original.unit.clone(),
+            service: intent.service.clone(),
+            replicas: original.replicas.clone(),
+        };
+        let query = info.unit == intent.unit
+            && info
+                .replicas
+                .0
+                .iter()
+                .any(|r| r.description.node == lost.node && r.description.current_role == 4);
+        let mut complete = intent.unit.clone();
+        complete.previous = Epoch::default();
+        let transitioning = info.unit == intent.unit && !query;
+        if query {
+            expected.unit = intent.unit.clone();
+            for r in &mut expected.replicas.0 {
+                r.previous_role = r.current_role;
+            }
+        } else if transitioning || info.unit == complete {
+            expected = intent.clone();
+            if !transitioning {
+                expected.unit = complete;
+                expected.replicas.0.retain(|r| r.current_role >= 3);
+                for r in &mut expected.replicas.0 {
+                    r.previous_role = 1;
+                }
+            }
+        }
+        let primary = expected
+            .replicas
+            .0
+            .iter()
+            .any(|r| r.node == placement.launch.node && r.current_role == 4);
+        if info.service != expected.service
+            || info.unit != expected.unit
+            || info.local_deleted
+            || info.report_from_primary != primary
+            || info.replicas.0.len() != expected.replicas.0.len()
+            || (info.intermediate != Epoch::default()
+                && !(transitioning && info.intermediate == intent.unit.current))
+        {
+            return Err("LFUM report changed the known original failover phase".into());
+        }
+        for mut expected in expected.replicas.0 {
+            expected.first_lsn = -1;
+            expected.last_lsn = -1;
+            let mut matching = info
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.description.node == expected.node);
+            let actual = matching.next().ok_or("missing original failover member")?;
+            if expected.current_role == 4 && expected.node != lost.node && !query {
+                // Role completion may publish a new service endpoint; replication identity stays fixed.
+                expected.service_endpoint = actual.description.service_endpoint.clone();
+            }
+            let intermediate_role = if info.intermediate == Epoch::default() {
+                1
+            } else {
+                expected.current_role
+            };
+            if matching.next().is_some()
+                || actual.description != expected
+                || actual.intermediate_role != intermediate_role
+            {
+                return Err(
+                    "LFUM report changed an original failover replica or its phase roles".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn begin_generation(&mut self) -> Result<()> {
         let peer = self.placements[0].launch.profile.peer_replicas();
         let stable_peer = self.configuration.as_ref().is_some_and(|c| {
@@ -1267,43 +1401,112 @@ impl Ledger {
                     && idle.reply.as_ref().is_none_or(|reply| reply.error == 0)
             }))
         .then(|| self.idles.iter().map(|idle| idle.body.clone()).collect());
-        if (peer && !stable_peer && initial_membership.is_none() && initial_builds.is_none())
-            || self.swap.is_some()
+        let failover = self
+            .swap
+            .as_ref()
+            .filter(|swap| {
+                !swap.unknown
+                    && self.configuration_history.is_empty()
+                    && self.repair_history.is_empty()
+                    && self.candidate_changes.is_empty()
+                    && self.restoration.is_none()
+                    && self
+                        .configuration
+                        .as_ref()
+                        .and_then(|c| c.reply.as_ref())
+                        .is_some_and(|original| {
+                            original.replicas.0.len() == 3
+                                && swap.body.configuration.unit.previous == original.unit.current
+                                && swap.body.configuration.unit.current.data_loss
+                                    == original.unit.current.data_loss
+                                && swap
+                                    .body
+                                    .configuration
+                                    .unit
+                                    .current
+                                    .configuration
+                                    .checked_sub(original.unit.current.configuration)
+                                    == Some(0x1_0000_0001)
+                        })
+                    && swap.body.configuration.service.target == 3
+                    && swap.body.configuration.service.minimum == 2
+                    && swap.body.configuration.replicas.0.len() == 3
+                    && swap
+                        .body
+                        .configuration
+                        .replicas
+                        .0
+                        .iter()
+                        .filter(|r| !r.up)
+                        .count()
+                        == 1
+                    && swap.body.configuration.replicas.0.iter().any(|r| {
+                        r.previous_role == 4
+                            && r.current_role == 1
+                            && !r.up
+                            && r.state == 3
+                            && self
+                                .placements
+                                .iter()
+                                .any(|p| p.launch.node == r.node && p.loss_reported)
+                    })
+            })
+            .map(|swap| swap.body.configuration.clone());
+        if (peer
+            && !stable_peer
+            && initial_membership.is_none()
+            && initial_builds.is_none()
+            && failover.is_none())
+            || (self.swap.is_some() && failover.is_none())
             || self.repair.is_some()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
-            || self.generation.is_some()
+            || self
+                .generation
+                .as_ref()
+                .is_some_and(|round| round.phase != GenerationPhase::Complete)
             || self
                 .placements
                 .iter()
                 .enumerate()
                 .any(|(index, placement)| {
+                    let lost_primary = failover.as_ref().is_some_and(|intent| {
+                        intent.replicas.0.iter().any(|r| {
+                            r.node == placement.launch.node && r.previous_role == 4 && !r.up
+                        })
+                    });
                     placement.bootstrap != Bootstrap::Admitted
                         || !placement.link_alive
-                        || matches!(
-                            placement.observed,
-                            Observed::Lost | Observed::Unknown | Observed::Error
-                        )
+                        || (!lost_primary
+                            && matches!(
+                                placement.observed,
+                                Observed::Lost | Observed::Unknown | Observed::Error
+                            ))
                         || placement.pending.is_some()
                         || placement.node_control.is_some()
                         || placement.service_update.is_some()
                         || (peer
-                            && ((placement.observed != Observed::Running
+                            && ((!lost_primary
+                                && placement.observed != Observed::Running
                                 && !((initial_membership.is_some() || initial_builds.is_some())
                                     && index != 0
                                     && placement.observed == Observed::Absent))
-                                || placement.loss_reported))
+                                || (placement.loss_reported && !lost_primary)))
                 })
         {
             return Err("generation handshake requires admitted sessions and stable or initial build/admitting membership".into());
         }
-        self.generation = Some(GenerationHandshake::new(
-            &self.placements[0].launch.generation.number,
-            self.placements.len(),
-        )?);
+        let current = self
+            .generation
+            .as_ref()
+            .map_or(&self.placements[0].launch.generation.number, |round| {
+                &round.number
+            });
+        self.generation = Some(GenerationHandshake::new(current, self.placements.len())?);
         let round = self.generation.as_mut().expect("owned round");
         round.initial_membership = initial_membership;
         round.initial_builds = initial_builds;
+        round.failover = failover;
         Ok(())
     }
     pub fn report(&mut self, index: usize, body: &ReplicaUp) -> Result<Option<ReplicaUp>> {
