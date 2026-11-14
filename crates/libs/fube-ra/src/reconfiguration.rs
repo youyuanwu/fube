@@ -31,6 +31,84 @@ pub struct ConfigurationCompletion {
     pub error: i64,
 }
 
+pub fn initial_membership_configuration(state: &EntityState) -> Option<&Reconfiguration> {
+    let config = state.reconfiguration.as_ref()?;
+    (state.phase == Phase::Ready
+        && state.swap.is_none()
+        && state.progress_query.is_none()
+        && !config.secondary_loss
+        && config.history.is_empty()
+        && config.error == 0
+        && valid_stateful_sizes(&state.body.service)
+        && config.request.unit.current == state.body.unit.current
+        && config.request.unit.target == state.body.service.target
+        && config.request.unit.minimum == state.body.service.minimum
+        && config.request.replicas.0.len() == state.body.service.target as usize
+        && config.request.replicas.0.len() >= 2
+        && config.request.replicas.0.iter().all(|r| {
+            r.up && r.state == 2
+                && if r.node == state.body.replica.node {
+                    if state.fm_primary {
+                        (r.previous_role, r.current_role) == (4, 4)
+                    } else {
+                        (r.previous_role, r.current_role) == (2, 3)
+                    }
+                } else {
+                    matches!((r.previous_role, r.current_role), (4, 4) | (2, 3))
+                }
+        })
+        && config
+            .request
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.current_role == 4)
+            .count()
+            == 1
+        && state.remote_idles.iter().all(|remote| {
+            remote.ready
+                && remote.fm_request.is_some()
+                && remote.removal.is_none()
+                && config.request.replicas.0.iter().any(|r| {
+                    r.node == remote.target
+                        && r.id == remote.body.replica.0.replica.id
+                        && r.instance == remote.body.replica.0.replica.instance
+                })
+        })
+        && if state.fm_primary {
+            matches!(
+                config.stage,
+                ConfigurationStage::Catchup
+                    | ConfigurationStage::Activate
+                    | ConfigurationStage::End
+                    | ConfigurationStage::Complete
+            )
+        } else {
+            matches!(
+                config.stage,
+                ConfigurationStage::Secondary | ConfigurationStage::Complete
+            )
+        })
+    .then_some(config)
+}
+
+pub(super) fn continues_initial_membership(
+    work: &Submission,
+    current: Option<&EntityState>,
+) -> bool {
+    let Some(config) = current.and_then(initial_membership_configuration) else {
+        return false;
+    };
+    match work.kind {
+        Kind::DoReconfiguration { .. } => from_slice::<DoReconfiguration>(&work.bytes)
+            .is_ok_and(|body| body.configuration == config.request),
+        Kind::Activate { .. } => from_slice::<Activate>(&work.bytes)
+            .is_ok_and(|body| body.configuration == config.request),
+        Kind::ActivateReply { .. } | Kind::RetryConfiguration => true,
+        _ => false,
+    }
+}
+
 pub fn secondary_service(old: &Service, new: &Service) -> bool {
     let mut expected = old.clone();
     expected.target = if old.target == 1 { 2 } else { 1 };

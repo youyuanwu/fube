@@ -55,8 +55,9 @@ pub use peer::{
     RemoteRemoval, RemovalCompletion,
 };
 pub use reconfiguration::{
-    replica_replacement_metadata, retired_configuration, secondary_removal_in_progress,
-    secondary_service, ConfigurationCompletion, ConfigurationStage, Reconfiguration,
+    initial_membership_configuration, replica_replacement_metadata, retired_configuration,
+    secondary_removal_in_progress, secondary_service, ConfigurationCompletion, ConfigurationStage,
+    Reconfiguration,
 };
 pub use swap::{PrimarySwap, ProgressQuery, SwapStage};
 
@@ -2560,6 +2561,7 @@ async fn entity_worker(
                     | Kind::ActivateReply { .. }
                     | Kind::RetryConfiguration
             ) && view.generations.upload_pending
+                && !reconfiguration::continues_initial_membership(&work, committed.as_deref())
             {
                 Err(Failure::Unsupported(
                     "peer control is gated during generation rebuild",

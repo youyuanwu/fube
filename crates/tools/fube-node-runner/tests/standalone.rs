@@ -3,7 +3,10 @@ use fube_local_host::process::OwnedApp;
 use fube_node::control::wire::{self, Link};
 use fube_node_runner::{Config, Fm, Identity, Placement};
 use fube_ra::protocol::*;
-use fube_transport::{message::Message, serialization::serde::ObjectArray};
+use fube_transport::{
+    channel::IncomingMessage, message::Message, native_channel::GatewayTarget,
+    serialization::serde::ObjectArray,
+};
 use serde_json::Value;
 use std::{
     fs,
@@ -116,6 +119,15 @@ impl Fixture {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
 
+    fn work(&self, index: usize) -> PathBuf {
+        let roots: Vec<_> = fs::read_dir(self.configs[index].run_directory.join("hosting"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(roots.len(), 1);
+        roots[0].join("deployment/HostingLocalStatefulApp_App1/work")
+    }
+
     fn diagnostics(&self) -> String {
         format!(
             "root={:?}, status={:?}, logs={:?}",
@@ -195,6 +207,9 @@ struct FmFixture {
     held_build: Option<AddReplicaReply>,
     hold_configuration: bool,
     held_configuration: Option<ConfigurationReply>,
+    initial_membership: Option<Configuration>,
+    hold_uploads: bool,
+    held_uploads: Vec<(usize, IncomingMessage<GatewayTarget>)>,
     stopping: bool,
 }
 
@@ -245,6 +260,9 @@ impl FmFixture {
             held_build: None,
             hold_configuration: false,
             held_configuration: None,
+            initial_membership: None,
+            hold_uploads: false,
+            held_uploads: vec![],
             stopping: false,
         }
     }
@@ -275,13 +293,31 @@ impl FmFixture {
                 "LFUMUpload" => {
                     let body = decode_lfum_upload(&incoming.message).unwrap();
                     assert_eq!(body.generation, generation.number);
-                    if let Some(configuration) = self.configured.last() {
+                    let expected = self.initial_membership.clone().or_else(|| {
+                        self.configured.last().map(|configuration| Configuration {
+                            unit: configuration.unit.clone(),
+                            service: primary(&self.configurations[index]).service,
+                            replicas: configuration.replicas.clone(),
+                        })
+                    });
+                    if let Some(configuration) = expected {
                         assert!(body.any_replica_found);
                         assert_eq!(body.units.0.len(), 1);
                         let info = &body.units.0[0];
                         assert_eq!(info.unit, configuration.unit);
                         assert_eq!(info.service, primary(&self.configurations[index]).service);
-                        assert_eq!(info.intermediate, Epoch::default());
+                        let primary = configuration.replicas.0.iter().any(|r| {
+                            r.node == self.configurations[index].node.identity.native().unwrap()
+                                && r.current_role == 4
+                        });
+                        assert_eq!(
+                            info.intermediate,
+                            if self.initial_membership.is_some() && primary {
+                                configuration.unit.current
+                            } else {
+                                Epoch::default()
+                            }
+                        );
                         assert!(!info.local_deleted);
                         assert_eq!(info.replicas.0.len(), configuration.replicas.0.len());
                         assert_eq!(
@@ -294,19 +330,31 @@ impl FmFixture {
                             let mut expected = expected.clone();
                             expected.first_lsn = -1;
                             expected.last_lsn = -1;
+                            let intermediate_role = if info.intermediate == Epoch::default() {
+                                1
+                            } else {
+                                expected.current_role
+                            };
                             assert_eq!(
                                 info.replicas
                                     .0
                                     .iter()
-                                    .filter(
-                                        |r| r.description == expected && r.intermediate_role == 1
-                                    )
+                                    .filter(|r| r.description == expected
+                                        && r.intermediate_role == intermediate_role)
                                     .count(),
                                 1
                             );
                         }
                     } else {
                         assert!(body.units.0.is_empty() && !body.any_replica_found);
+                    }
+                    if self.hold_uploads {
+                        if let Some(handoff) = incoming.handoff.as_mut() {
+                            handoff.acknowledge();
+                        }
+                        self.held_uploads.push((index, incoming));
+                        self.uploaded[index] = Some(body);
+                        continue;
                     }
                     incoming
                         .reply
@@ -539,6 +587,11 @@ async fn standalone_generation_rollover_preserves_live_replicated_membership_and
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_generation_rollover_during_secondary_admission_preserves_sf_inventory() {
+    journey(Fault::AdmittingGenerationHandshake).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_wrong_generation_refuses_new_authority() {
     journey(Fault::Generation).await;
 }
@@ -569,9 +622,10 @@ enum Fault {
     Failover,
     GenerationHandshake,
     ReplicatedGenerationHandshake,
+    AdmittingGenerationHandshake,
 }
 
-async fn rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
+async fn start_rollover(fm: &mut FmFixture) {
     fm.uploaded.fill(None);
     for index in 0..3 {
         let mut generation = fm.configurations[index].generation().unwrap();
@@ -593,6 +647,9 @@ async fn rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
         )
         .await;
     }
+}
+
+async fn finish_rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
     fm.until(fixture, |fm| fm.uploaded.iter().all(Option::is_some))
         .await;
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -606,6 +663,80 @@ async fn rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
         );
         fm.step().await;
     }
+}
+
+async fn rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
+    start_rollover(fm).await;
+    finish_rollover(fm, fixture).await;
+}
+
+async fn admitting_rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
+    fm.hold_uploads = true;
+    start_rollover(fm).await;
+    fm.until(fixture, |fm| fm.uploaded.iter().all(Option::is_some))
+        .await;
+    let frozen = fm.uploaded.clone();
+    let old = std::mem::take(&mut fm.held_uploads);
+    start_rollover(fm).await;
+    fm.until(fixture, |fm| fm.uploaded.iter().all(Option::is_some))
+        .await;
+    for (before, after) in frozen.iter().zip(&fm.uploaded) {
+        assert_eq!(
+            before.as_ref().unwrap().units,
+            after.as_ref().unwrap().units
+        );
+    }
+    for (index, mut incoming) in old {
+        let body = decode_lfum_upload(&incoming.message).unwrap();
+        let header = GenerationHeader {
+            number: body.generation,
+            for_fm_replica: false,
+        };
+        let link = fm.links[index].as_ref().unwrap();
+        incoming
+            .reply
+            .take()
+            .unwrap()
+            .reply(
+                link.seal(lfum_upload_reply_message(&header).unwrap())
+                    .unwrap(),
+                wire::deadline(),
+            )
+            .await
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while (0..3).any(|i| fixture.status(i)["generations"]["pending_uploads"] != 1) {
+        assert!(
+            Instant::now() < deadline,
+            "stale upload completion: {}",
+            fixture.diagnostics()
+        );
+        fm.step().await;
+    }
+    for index in 0..3 {
+        assert_eq!(fixture.status(index)["generations"]["send"], 1);
+        assert_eq!(fixture.status(index)["local_configuration_complete"], false);
+    }
+    fm.hold_uploads = false;
+    for (index, mut incoming) in std::mem::take(&mut fm.held_uploads) {
+        let link = fm.links[index].as_ref().unwrap();
+        incoming
+            .reply
+            .take()
+            .unwrap()
+            .reply(
+                link.seal(
+                    lfum_upload_reply_message(&fm.configurations[index].generation().unwrap())
+                        .unwrap(),
+                )
+                .unwrap(),
+                wire::deadline(),
+            )
+            .await
+            .unwrap();
+    }
+    finish_rollover(fm, fixture).await;
 }
 
 async fn journey(fault: Fault) {
@@ -693,14 +824,53 @@ async fn journey(fault: Fault) {
         },
         phase0_duration: i64::MAX,
     };
+    if fault == Fault::AdmittingGenerationHandshake {
+        for index in [0, 2] {
+            fs::write(
+                fixture.work(index).join("local-secondary-role.block"),
+                b"hold role",
+            )
+            .unwrap();
+        }
+        fm.initial_membership = Some(configuration.configuration.clone());
+    }
     fm.hold_configuration = true;
     fm.send(
         selected,
         do_reconfiguration_message(&configuration, &generation).unwrap(),
     )
     .await;
+    if fault == Fault::AdmittingGenerationHandshake {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while [0, 2].iter().any(|index| {
+            !fixture
+                .work(*index)
+                .join("local-secondary-role.held")
+                .exists()
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "Secondary role barriers: {}",
+                fixture.diagnostics()
+            );
+            fm.step().await;
+        }
+        assert!(fm.held_configuration.is_none());
+        let authority = application(&endpoint, "read").await;
+        admitting_rollover(&mut fm, &mut fixture).await;
+        assert_eq!(application(&endpoint, "read").await, authority);
+        generation = fm.configurations[selected].generation().unwrap();
+        for index in [0, 2] {
+            fs::write(
+                fixture.work(index).join("local-secondary-role.release"),
+                b"release role",
+            )
+            .unwrap();
+        }
+    }
     fm.until(&mut fixture, |fm| fm.held_configuration.is_some())
         .await;
+    fm.initial_membership = None;
     assert!(
         fm.configured.is_empty(),
         "FM create/publication is still pending"
@@ -887,6 +1057,7 @@ async fn journey(fault: Fault) {
             | Fault::Failover
             | Fault::GenerationHandshake
             | Fault::ReplicatedGenerationHandshake
+            | Fault::AdmittingGenerationHandshake
     );
     if refusal {
         if fault == Fault::LostFm {
@@ -928,6 +1099,7 @@ async fn journey(fault: Fault) {
             | Fault::Failover
             | Fault::GenerationHandshake
             | Fault::ReplicatedGenerationHandshake => unreachable!(),
+            Fault::AdmittingGenerationHandshake => unreachable!(),
         };
         assert!(
             fixture.status(selected)["error"]

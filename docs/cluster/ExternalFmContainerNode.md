@@ -358,15 +358,20 @@ Native retry defaults are unchanged. The shared bounded wire profile retains
 its 64-KiB frame/body cap, 16 headers with 4-KiB values, bounded decode budget
 and 32 local command/effect observation slots.
 
-Ordinary-FM generation rollover also supports a stable, fully admitted 3/2
-configuration on the original live sessions. Each Node uploads its complete
+Ordinary-FM generation rollover supports stable, fully admitted 3/2 membership
+and original healthy same-Primary Secondary admission once all participating
+RAs have committed their configuration requests. Each Node uploads its complete
 committed membership with cleared LSNs; only the Primary marks its inventory
 as a Primary report. A matching correlated LFUM reply advances send generation,
 without reopening replicas or changing application authority. Every accepted
 update owns a fresh snapshot; retries preserve only their own frozen upload,
 and replies retire only their original request, including stale-generation
-replies. In-flight build,
-reconfiguration, swap/repair inventory and restart reconciliation remain gated.
+replies. During admission, committed PC epochs/roles are retained; Primary phase 4
+reports IC=CC/current roles while the activating Secondary reports invalid IC.
+Local completion clears PC/IC independently of upload completion. Matching
+configuration continuations retain their owners; generation rollover does not
+change runtime access or quorum authority. In-flight builds, other interrupted
+reconfigurations, swap/repair inventory and restart reconciliation remain gated.
 
 ## Failure behavior and limits
 
@@ -394,7 +399,8 @@ They cover initial 3/2 startup/build/admission, singleton write denial, real
 write/readback, lost build/final-reply replay, writes before FM observation,
 generation/membership refusal, FM-loss retention, verified Primary app-host loss
 with real peer failover and continuing writes, stable replicated generation
-rollover with full membership/data preservation, and owned shutdown.
+rollover, generation rollover during held Secondary admission with SF phase
+inventory and stale replies, full membership/data preservation, and owned shutdown.
 
 ```sh
 cargo nextest run --locked --workspace --all-targets --all-features \

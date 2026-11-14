@@ -208,6 +208,7 @@ pub(crate) struct GenerationHandshake {
     proposed: Vec<bool>,
     pub updates_sent: Vec<bool>,
     pub uploads: Vec<Option<LfumUpload>>,
+    initial_membership: Option<Configuration>,
     retry_at: Vec<Instant>,
 }
 impl GenerationHandshake {
@@ -218,6 +219,7 @@ impl GenerationHandshake {
             proposed: vec![false; nodes],
             updates_sent: vec![false; nodes],
             uploads: vec![None; nodes],
+            initial_membership: None,
             retry_at: vec![Instant::now(); nodes],
         })
     }
@@ -1074,11 +1076,14 @@ impl Ledger {
 
     fn validate_peer_lfum(&self, index: usize, body: &LfumUpload) -> Result<()> {
         let placement = &self.placements[index];
+        let initial = self
+            .generation
+            .as_ref()
+            .and_then(|round| round.initial_membership.as_ref());
         let configuration = self
             .configuration
             .as_ref()
-            .and_then(|c| c.reply.as_ref())
-            .ok_or("LFUM upload requires a completed test configuration")?;
+            .ok_or("LFUM upload requires a known test configuration")?;
         if placement.node_description.as_ref() != Some(&body.node)
             || !body.any_replica_found
             || body.units.0.len() != 1
@@ -1086,28 +1091,50 @@ impl Ledger {
             return Err("LFUM node/inventory does not match the admitted peer profile".into());
         }
         let info = &body.units.0[0];
-        if info.service != placement.body()?.service
-            || info.unit != configuration.unit
-            || info.intermediate != Epoch::default()
-            || info.local_deleted
-            || info.report_from_primary
-                != placement
-                    .ready_replica
-                    .as_ref()
-                    .is_some_and(|r| r.current_role == 4)
-            || info.replicas.0.len() != configuration.replicas.0.len()
-        {
-            return Err("LFUM report changed the completed test configuration".into());
+        let request = initial.unwrap_or(&configuration.body.configuration);
+        let in_progress = initial.is_some() && info.unit == request.unit;
+        let mut unit = request.unit.clone();
+        if !in_progress {
+            unit.previous = Epoch::default();
         }
-        for expected in &configuration.replicas.0 {
+        let primary = request
+            .replicas
+            .0
+            .iter()
+            .any(|r| r.node == placement.launch.node && r.current_role == 4);
+        if (initial.is_none() && configuration.reply.is_none())
+            || info.service
+                != if initial.is_some() {
+                    request.service.clone()
+                } else {
+                    placement.body()?.service
+                }
+            || info.unit != unit
+            || (info.intermediate != Epoch::default()
+                && !(in_progress && primary && info.intermediate == unit.current))
+            || info.local_deleted
+            || info.report_from_primary != primary
+            || info.replicas.0.len() != request.replicas.0.len()
+        {
+            return Err("LFUM report changed the known test configuration".into());
+        }
+        for expected in &request.replicas.0 {
             let mut expected = expected.clone();
+            if !in_progress {
+                expected.previous_role = 1;
+            }
             expected.first_lsn = -1;
             expected.last_lsn = -1;
+            let intermediate_role = if info.intermediate == Epoch::default() {
+                1
+            } else {
+                expected.current_role
+            };
             if info
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.description == expected && r.intermediate_role == 1)
+                .filter(|r| r.description == expected && r.intermediate_role == intermediate_role)
                 .count()
                 != 1
             {
@@ -1127,32 +1154,61 @@ impl Ledger {
                     .is_some_and(|r| r.error == 0 && r.replicas.0.len() == self.placements.len())
                 && !c.unknown
         });
-        if (peer && !stable_peer)
+        let initial_membership = self
+            .configuration
+            .as_ref()
+            .filter(|c| {
+                c.reply.is_none()
+                    && !c.unknown
+                    && self.configuration_history.is_empty()
+                    && c.body.configuration.service.target == 3
+                    && c.body.configuration.service.minimum == 2
+                    && self.idles.len() + 1 == self.placements.len()
+                    && self.idles.iter().all(|idle| {
+                        !idle.cancelled
+                            && !idle.unknown
+                            && idle.reply.as_ref().is_some_and(|reply| reply.error == 0)
+                    })
+            })
+            .map(|c| c.body.configuration.clone());
+        if (peer && !stable_peer && initial_membership.is_none())
             || self.swap.is_some()
             || self.repair.is_some()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
             || self.generation.is_some()
-            || self.placements.iter().any(|placement| {
-                placement.bootstrap != Bootstrap::Admitted
-                    || !placement.link_alive
-                    || matches!(
-                        placement.observed,
-                        Observed::Lost | Observed::Unknown | Observed::Error
-                    )
-                    || placement.pending.is_some()
-                    || placement.node_control.is_some()
-                    || placement.service_update.is_some()
-                    || (peer
-                        && (placement.observed != Observed::Running || placement.loss_reported))
-            })
+            || self
+                .placements
+                .iter()
+                .enumerate()
+                .any(|(index, placement)| {
+                    placement.bootstrap != Bootstrap::Admitted
+                        || !placement.link_alive
+                        || matches!(
+                            placement.observed,
+                            Observed::Lost | Observed::Unknown | Observed::Error
+                        )
+                        || placement.pending.is_some()
+                        || placement.node_control.is_some()
+                        || placement.service_update.is_some()
+                        || (peer
+                            && ((placement.observed != Observed::Running
+                                && !(initial_membership.is_some()
+                                    && index != 0
+                                    && placement.observed == Observed::Absent))
+                                || placement.loss_reported))
+                })
         {
-            return Err("generation handshake requires admitted idle control sessions and stable membership".into());
+            return Err("generation handshake requires admitted sessions and stable or initial admitting membership".into());
         }
         self.generation = Some(GenerationHandshake::new(
             &self.placements[0].launch.generation.number,
             self.placements.len(),
         )?);
+        self.generation
+            .as_mut()
+            .expect("owned round")
+            .initial_membership = initial_membership;
         Ok(())
     }
     pub fn report(&mut self, index: usize, body: &ReplicaUp) -> Result<Option<ReplicaUp>> {

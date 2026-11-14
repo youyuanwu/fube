@@ -86,21 +86,38 @@ fn configuration(state: Option<&EntityState>) -> Result<Option<FailoverUnitInfo>
         || state.reconfiguration.is_some()
         || state.swap.is_some();
     let dropped = state.phase == Phase::Closed || state.body.replica.state == 3;
+    let mut intermediate = Epoch::default();
     let replicas = if replicated {
         let config = state
             .reconfiguration
             .as_ref()
-            .filter(|c| c.stage == ConfigurationStage::Complete)
+            .filter(|c| {
+                c.stage == ConfigurationStage::Complete
+                    || reconfiguration::initial_membership_configuration(state).is_some()
+            })
             .ok_or(Failure::Unsupported(
-                "LFUM upload requires completed peer configuration",
+                "LFUM upload requires completed membership or initial Secondary admission",
             ))?;
-        let stable = reconfiguration::stable(&config.request);
+        let membership = if config.stage == ConfigurationStage::Complete {
+            reconfiguration::stable(&config.request)
+        } else {
+            // SF retains PC during catch-up; Primary phase 4 also reports IC=CC.
+            if state.fm_primary
+                && matches!(
+                    config.stage,
+                    ConfigurationStage::Activate | ConfigurationStage::End
+                )
+            {
+                intermediate = state.body.unit.current;
+            }
+            config.request.clone()
+        };
         if state.phase != Phase::Ready
             || state.swap.is_some()
             || state.progress_query.is_some()
-            || stable.unit != state.body.unit
-            || stable.replicas.0.len() != state.body.service.target as usize
-            || stable
+            || membership.unit != state.body.unit
+            || membership.replicas.0.len() != state.body.service.target as usize
+            || membership
                 .replicas
                 .0
                 .iter()
@@ -108,7 +125,7 @@ fn configuration(state: Option<&EntityState>) -> Result<Option<FailoverUnitInfo>
             || state.remote_idles.iter().any(|r| {
                 !r.ready
                     || r.removal.is_some()
-                    || !stable
+                    || !membership
                         .replicas
                         .0
                         .iter()
@@ -116,12 +133,12 @@ fn configuration(state: Option<&EntityState>) -> Result<Option<FailoverUnitInfo>
             })
         {
             return Err(Failure::Unsupported(
-                "LFUM upload requires stable full peer membership without recovery",
+                "LFUM upload requires full healthy peer membership without recovery",
             ));
         }
-        // Completed membership, not the original Idle creation/build reply,
+        // Admitted membership, not the original Idle creation/build reply,
         // owns remote roles and epochs. Preserve the actual local endpoints.
-        stable
+        membership
             .replicas
             .0
             .into_iter()
@@ -141,7 +158,7 @@ fn configuration(state: Option<&EntityState>) -> Result<Option<FailoverUnitInfo>
     Ok(Some(FailoverUnitInfo {
         service: state.body.service.clone(),
         unit: state.body.unit.clone(),
-        intermediate: Epoch::default(),
+        intermediate,
         report_from_primary: !dropped
             && state.body.replica.up
             && state.body.replica.current_role == 4
@@ -152,9 +169,14 @@ fn configuration(state: Option<&EntityState>) -> Result<Option<FailoverUnitInfo>
                 .map(|mut description| {
                     description.first_lsn = -1;
                     description.last_lsn = -1;
+                    let intermediate_role = if intermediate == Epoch::default() {
+                        1
+                    } else {
+                        description.current_role
+                    };
                     ReplicaInfo {
                         description,
-                        intermediate_role: 1,
+                        intermediate_role,
                     }
                 })
                 .collect(),

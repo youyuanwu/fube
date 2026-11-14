@@ -122,8 +122,9 @@ Secondary, not both; missing members never restore the historical singleton
 quorum. Source-bound process tests also lose/replay build and final configuration
 replies, preserve all original owners/one Open each and verify independent
 three-child cleanup. The bounded Primary app-host failover and explicit repair
-below are supported, as is generation upload from stable completed membership;
-planned transfer, general replacement/retirement, in-flight configuration upload,
+below are supported, as is generation upload from stable completed membership
+or original healthy same-Primary Secondary admission;
+planned transfer, general replacement/retirement, broader in-flight configuration upload,
 data loss and node/runtime adoption remain gated for this profile.
 See [source mapping and limits](../../../docs/cluster/MinimalFmCluster.md#healthy-three-replica-service).
 
@@ -682,7 +683,9 @@ deployment and FMM remain gated.
 The programmatic `Cluster::begin_generation_handshake()` starts the bounded
 ordinary-FM GenerationProposal/Reply and GenerationUpdate/Reject round.
 It requires admitted nodes without pending lifecycle/control requests:
-two stateless/independent singleton sessions, or stable completed 3/2 membership.
+two stateless/independent singleton sessions, stable completed 3/2 membership,
+or the original healthy same-Primary Secondary admission after each RA commits
+its configuration request.
 This is opt-in, not a CLI command or a change to default bootstrap. Proposed,
 receive and send generations remain distinct; only receive changes on a
 matching Update. The round waits at `awaiting_upload`, `complete=false`:
@@ -699,12 +702,17 @@ Inventory uses the current committed service description. Existing Primary data
 and original node/app/runtime ownership remain intact. Retry qualification drives
 the shared upload state at explicit deadlines over real correlated Channels;
 separate process cases retain the original node/app/runtime owners. This is one live-session
-round for stateless/independent singleton or stable 3/2 profiles, not
+round for stateless/independent singleton or bounded 3/2 profiles, not
 application-data upload, unknown-partition reconstruction, in-flight
-build/reconfiguration or swap/repair inventory, nonempty NodeUp, full ReplicaUp
+builds, broader reconfiguration or swap/repair inventory, nonempty NodeUp, full ReplicaUp
 batching, FM/FMM recovery or durable restart. Replicated acceptance withholds
 correlated replies, renegotiates a newer generation, rejects the late stale
 completion and preserves all original owners, data and membership.
+Initial-admission acceptance holds actual Secondary role completion across two
+generation updates. LFUM retains committed PC roles/epochs, Primary phase-4 IC
+and Secondary invalid IC; completion later clears PC/IC without changing the
+frozen uploads. The test FM only validates known inventory and does not infer a
+writer or finish reconfiguration from an upload.
 See the [source mapping and remaining gates](../../../docs/cluster/MinimalFmCluster.md#live-session-lfum-upload).
 
 Native NodeUp/Ack and the final empty ReplicaUp/Reply precede RA construction.

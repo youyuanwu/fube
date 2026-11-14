@@ -6777,6 +6777,20 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
 }
 
 async fn active_configured_survivor(executor: &Executor, target: i32, minimum: i32) {
+    let completion = activating_configured_survivor(executor, target, minimum).await;
+    run(
+        executor,
+        Command::CompleteConfiguration(Box::new(completion)),
+    )
+    .await;
+    effects(executor);
+}
+
+async fn activating_configured_survivor(
+    executor: &Executor,
+    target: i32,
+    minimum: i32,
+) -> ConfigurationCompletion {
     let peers: Vec<_> = std::iter::once(peer_source())
         .chain((0..target - 2).map(|i| NodeInstance {
             id: [20 + i as u8; 16],
@@ -6834,13 +6848,7 @@ async fn active_configured_survivor(executor: &Executor, target: i32, minimum: i
         },
     )
     .await;
-    let completion = configured(&effects(executor));
-    run(
-        executor,
-        Command::CompleteConfiguration(Box::new(completion)),
-    )
-    .await;
-    effects(executor);
+    configured(&effects(executor))
 }
 
 fn failover_progress(
@@ -8793,17 +8801,10 @@ async fn replicated_lfum_waits_for_final_membership_commit_and_clears_all_lsn() 
         release.send(()).unwrap();
         if fail {
             assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
-            tokio::time::timeout(WAIT, async {
-                loop {
-                    if let Err(error) = executor.lfum_inventory() {
-                        assert!(matches!(error, Failure::Unsupported(_)));
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            let retained = wait_lfum(&executor).await;
+            assert_eq!(retained.units.0[0].unit, before.body.unit);
+            assert_eq!(retained.units.0[0].intermediate, before.body.unit.current);
+            assert_eq!(state(&executor), before);
             assert!(executor.generation_state().upload_pending);
             assert_eq!(
                 executor.generation_state().send,
@@ -8912,13 +8913,15 @@ async fn secondary_lfum_reports_full_committed_membership_without_primary_author
 }
 
 #[tokio::test]
-async fn lfum_keeps_idle_build_and_interrupted_configuration_explicitly_gated() {
+async fn lfum_keeps_unconfigured_idle_build_and_failed_configuration_explicitly_gated() {
     for reconfiguring in [false, true] {
         let (store, executor, _) = setup(WAIT).await;
         let config = built_three_idles(&executor).await;
         if reconfiguring {
             run(&executor, reconfigure(config)).await;
-            effects(&executor);
+            let mut failed = configured(&effects(&executor));
+            failed.error = -991;
+            run(&executor, Command::CompleteConfiguration(Box::new(failed))).await;
         }
         let before = state(&executor);
         let source = admission().fm_source;
@@ -8951,6 +8954,207 @@ async fn lfum_keeps_idle_build_and_interrupted_configuration_explicitly_gated() 
             .is_err());
         finish(&store, &executor).await;
     }
+}
+
+#[tokio::test]
+async fn initial_membership_lfum_reports_sf_phase_epochs_and_continues_before_upload_ack() {
+    let (store, executor, _) = setup(WAIT).await;
+    let config = built_three_idles(&executor).await;
+    run(&executor, reconfigure(config.clone())).await;
+    let catchup = configured(&effects(&executor));
+    let original = state(&executor);
+    let source = admission().fm_source;
+    let begin = |number| {
+        let header = generation_header(number);
+        executor
+            .process_generation_proposal(&source, &header)
+            .unwrap();
+        executor
+            .process_generation_update(&source, &GenerationUpdate::default(), &header)
+            .unwrap();
+    };
+    begin(8);
+    let catchup_inventory = wait_lfum(&executor).await;
+    assert_eq!(
+        executor.take_lfum_inventory().unwrap(),
+        Some(catchup_inventory.clone())
+    );
+    assert_eq!(catchup_inventory.units.0[0].unit, config.unit);
+    assert_eq!(catchup_inventory.units.0[0].intermediate, Epoch::default());
+    for replica in &catchup_inventory.units.0[0].replicas.0 {
+        assert_eq!(replica.intermediate_role, 1);
+        assert!(matches!(replica.description.previous_role, 2 | 4));
+        assert_eq!(
+            (replica.description.first_lsn, replica.description.last_lsn),
+            (-1, -1)
+        );
+    }
+    run(
+        &executor,
+        Command::RetryConfiguration(config.unit.id.clone()),
+    )
+    .await;
+    let retried = configured(&effects(&executor));
+    assert_eq!(retried.unit, catchup.unit);
+    assert_eq!(retried.replicas, catchup.replicas);
+    assert_eq!(retried.flags, catchup.flags);
+    let mut unrelated = config.clone();
+    unrelated.unit.current.configuration += 1;
+    let rejected = executor
+        .submit(Command::DoReconfiguration {
+            body: Box::new(DoReconfiguration {
+                configuration: unrelated,
+                phase0_duration: i64::MAX,
+            }),
+            source: source.clone(),
+            generation: generation_header(8),
+        })
+        .unwrap();
+    assert!(matches!(
+        rejected.wait(WAIT).await,
+        Err(Failure::Unsupported(_))
+    ));
+    assert_eq!(state(&executor), original);
+    assert!(effects(&executor).is_empty());
+    run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+    assert_eq!(
+        state(&executor).reconfiguration.as_ref().unwrap().stage,
+        ConfigurationStage::Activate
+    );
+    effects(&executor);
+    begin(8);
+    let activating = wait_lfum(&executor).await;
+    assert_eq!(
+        executor.take_lfum_inventory().unwrap(),
+        Some(activating.clone())
+    );
+    assert_eq!(activating.units.0[0].intermediate, config.unit.current);
+    assert!(activating.units.0[0].report_from_primary);
+    for replica in &activating.units.0[0].replicas.0 {
+        assert_eq!(replica.intermediate_role, replica.description.current_role);
+    }
+    for replica in config.replicas.0.iter().skip(1) {
+        let mut unit = config.unit.clone();
+        unit.previous = Epoch::default();
+        let mut replica = replica.clone();
+        replica.previous_role = 1;
+        run(
+            &executor,
+            Command::ActivateReply {
+                source: replica.node.clone(),
+                body: Box::new(ActivateReply {
+                    unit,
+                    replica,
+                    error: 0,
+                }),
+                generation: generation_header(8),
+            },
+        )
+        .await;
+    }
+    let completion = configured(&effects(&executor));
+    assert_eq!(
+        state(&executor).reconfiguration.as_ref().unwrap().stage,
+        ConfigurationStage::End
+    );
+    begin(9);
+    let ending = wait_lfum(&executor).await;
+    assert_eq!(
+        executor.take_lfum_inventory().unwrap(),
+        Some(ending.clone())
+    );
+    assert_eq!(ending.units, activating.units);
+    run(
+        &executor,
+        Command::CompleteConfiguration(Box::new(completion)),
+    )
+    .await;
+    effects(&executor);
+    begin(9);
+    let completed = wait_lfum(&executor).await;
+    assert_eq!(
+        executor.take_lfum_inventory().unwrap(),
+        Some(completed.clone())
+    );
+    assert_eq!(completed.units.0[0].unit.previous, Epoch::default());
+    assert_eq!(completed.units.0[0].intermediate, Epoch::default());
+    assert!(completed.units.0[0]
+        .replicas
+        .0
+        .iter()
+        .all(|r| r.description.previous_role == 1 && r.intermediate_role == 1));
+    assert_eq!(catchup_inventory.units.0[0].intermediate, Epoch::default());
+    assert_eq!(state(&executor).runtime, original.runtime);
+    assert_eq!(state(&executor).usage, original.usage);
+    for inventory in [catchup_inventory, activating] {
+        assert!(!executor
+            .complete_lfum_upload(inventory.upload, &source, &generation_header(8))
+            .unwrap());
+        assert_eq!(
+            executor.generation_state().send,
+            generation_header(7).number
+        );
+    }
+    for inventory in [ending, completed] {
+        assert!(executor
+            .complete_lfum_upload(inventory.upload, &source, &generation_header(9))
+            .unwrap());
+    }
+    assert_eq!(executor.pending_lfum_uploads(), 0);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn activating_secondary_lfum_retains_pc_but_not_ic_until_its_rap_commit() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let completion = activating_configured_survivor(&executor, 3, 2).await;
+    let before = state(&executor);
+    let source = admission().fm_source;
+    let header = generation_header(8);
+    executor
+        .process_generation_proposal(&source, &header)
+        .unwrap();
+    executor
+        .process_generation_update(&source, &GenerationUpdate::default(), &header)
+        .unwrap();
+    let inventory = wait_lfum(&executor).await;
+    assert!(!inventory.units.0[0].report_from_primary);
+    assert_eq!(inventory.units.0[0].unit, before.body.unit);
+    assert_eq!(inventory.units.0[0].intermediate, Epoch::default());
+    assert!(inventory.units.0[0]
+        .replicas
+        .0
+        .iter()
+        .all(|r| r.intermediate_role == 1));
+    assert_eq!(
+        executor.take_lfum_inventory().unwrap(),
+        Some(inventory.clone())
+    );
+    let (entered, release) = hooks.pause(false);
+    let ticket = executor
+        .submit(Command::CompleteConfiguration(Box::new(completion)))
+        .unwrap();
+    entered.await.unwrap();
+    executor
+        .process_generation_update(&source, &GenerationUpdate::default(), &header)
+        .unwrap();
+    assert!(executor.lfum_inventory().unwrap().is_none());
+    assert_eq!(state(&executor), before);
+    release.send(()).unwrap();
+    ticket.wait(WAIT).await.unwrap();
+    effects(&executor);
+    let completed = wait_lfum(&executor).await;
+    assert_eq!(completed.units.0[0].unit.previous, Epoch::default());
+    assert_eq!(completed.units.0[0].intermediate, Epoch::default());
+    assert!(completed.units.0[0]
+        .replicas
+        .0
+        .iter()
+        .all(|r| r.description.previous_role == 1 && r.intermediate_role == 1));
+    assert_ne!(completed.units, inventory.units);
+    assert_eq!(state(&executor).runtime, before.runtime);
+    assert_eq!(state(&executor).usage, before.usage);
+    finish(&store, &executor).await;
 }
 
 #[tokio::test]

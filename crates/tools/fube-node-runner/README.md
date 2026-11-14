@@ -53,8 +53,12 @@ empty live-session LFUM upload and semantic completion before placement/build.
 A live 3/2 case uploads every member's full committed peer configuration,
 continues acknowledged writes on the original owners and replays native control
 under the new generation. Shared RA owns inventory and completion; the fixture
-FM only validates and acknowledges known test membership. In-flight build,
-reconfiguration, swap/repair inventory and restart recovery remain gated.
+FM only validates and acknowledges known test membership. An additional case
+holds actual Secondary role completion during original same-Primary admission,
+rolls generation twice and rejects stale upload completion before finishing the
+original configuration. Its inventory retains PC and Primary phase-4 IC while
+the Secondary reports invalid IC, following local SF. In-flight builds, other
+interrupted reconfiguration, swap/repair inventory and restart recovery remain gated.
 Each accepted generation update owns fresh inventory work. Shared Node upload
 owners retain independent correlated requests, frozen retries and completion,
 including multiple uploads in the same generation. Diagnostic `pending_uploads`

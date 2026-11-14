@@ -1685,19 +1685,20 @@ impl Node {
         ))
     }
     fn admit_configuration(&self, body: &Configuration) -> Result<()> {
+        let current = self.ra.snapshot(body.unit.id.guid.0).committed;
+        let continuing = current
+            .as_deref()
+            .and_then(ra::initial_membership_configuration)
+            .is_some_and(|config| config.request == *body);
         if !self.live.load(Ordering::SeqCst)
-            || self.ra.generation_state().upload_pending
+            || (self.ra.generation_state().upload_pending && !continuing)
             || !self.ra.consumer_lifetime().is_accepting()
             || !(2..=ra::MAX_CONFIGURATION_REPLICAS).contains(&body.replicas.0.len())
             || to_vec(body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
         {
             return Err(Error::Unsupported);
         }
-        let current = self
-            .ra
-            .snapshot(body.unit.id.guid.0)
-            .committed
-            .ok_or(Error::Unsupported)?;
+        let current = current.ok_or(Error::Unsupported)?;
         if current.body.unit.id != body.unit.id
             || current.body.unit.consistency != body.unit.consistency
             || (!body.unit.current.older_than(current.body.unit.current)
