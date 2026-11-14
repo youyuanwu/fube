@@ -368,8 +368,8 @@ and 32 local command/effect observation slots.
 
 Real-process generation rollover is qualified for empty pre-placement inventory,
 original 3/2 stable membership, FM-owned Idle build, same-Primary admission,
-first Primary app-host failover with the two original healthy survivors, and
-first explicit post-failover repair. Participating build/configuration requests
+and two successive Primary app-host failover/explicit-repair cycles, including
+promotion of a repaired replica. Participating build/configuration requests
 must be committed. This is live-session metadata reconciliation, not startup
 recovery or a production FM rebuild.
 
@@ -385,7 +385,9 @@ predecessor cleanup in shared Node/Hosting.
 
 The [current LFUM contract and evidence](MinimalFmCluster.md#live-session-lfum-upload)
 is shared with the local cluster. The [alignment plan](RustRaPort.md#lfum-alignment-plan)
-prioritizes repeated/interrupted repair overlaps. Shared model/store coverage of
+prioritizes interrupted removal/repair overlaps. Each repeated failover round
+uses the latest completed membership and known fresh replica identities, not
+the original configuration. Shared model/store coverage of
 transfer/redirection does not enable standalone planned transfer: that runtime
 path is currently two-member only, while this profile is fixed 3/2.
 Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,

@@ -84,6 +84,7 @@ new acknowledged writes, and replays the final reconfiguration.
 | Original Idle build and same-Primary admission | Public copy/Secondary role barriers, superseding generations and stale replies. Initial configuration can be admitted before build-upload ACK; exact peer retries resume after send advancement without another Open or mutated inventory. |
 | First original Primary app-host failover | Real Primary role and public IPrimaryReplicator final-configuration barriers. Query-only survivor PC, candidate phase-4 IC and completed survivor views are checked before continuing nonempty data. |
 | First explicit post-failover repair | Normal AddReplica/CreateReplica demands shared Hosting activation after predecessor cleanup. Repair configuration and fresh Secondary completion can precede ACK, but cannot finish held final RAP work. Exact replays activate no second host; the fresh member supplies quorum after another survivor loss. |
+| Second live failover/repair cycle | Promote the repaired replica and repair the next lost Primary. Freeze the latest completed membership/fresh identities for superseding uploads during actual promotion/final RAP, build and Secondary activation. Survivors retain their owners/data; a new write uses the second repaired member's actual quorum. |
 
 Shared RA owns generic committed inventory and independent PC/IC/CC views,
 without a lineage allowlist or upload-pending peer-control gate. The fixture FM
@@ -95,7 +96,7 @@ matching current receive advances send generation.
 
 See the [shared current contract/source map](../../../docs/cluster/MinimalFmCluster.md#live-session-lfum-upload)
 and [LFUM alignment plan](../../../docs/cluster/RustRaPort.md#lfum-alignment-plan).
-Repeated/interrupted repair is the next common-launcher qualification. Planned
+Interrupted removal/repair is the next common-launcher qualification. Planned
 transfer currently supports only the two-member local-cluster runtime profile,
 not standalone 3/2; broader RA model/store inventory coverage does not change that.
 Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,

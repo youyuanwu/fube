@@ -260,6 +260,7 @@ struct FmFixture {
     initial_membership: Option<Configuration>,
     initial_builds: Option<Vec<AddReplica>>,
     failover: Option<Configuration>,
+    failover_previous: Option<ConfigurationReply>,
     failover_ending: bool,
     repair_previous: Option<ConfigurationReply>,
     repair_build: Option<AddReplica>,
@@ -321,6 +322,7 @@ impl FmFixture {
             initial_membership: None,
             initial_builds: None,
             failover: None,
+            failover_previous: None,
             failover_ending: false,
             repair_previous: None,
             repair_build: None,
@@ -429,7 +431,8 @@ impl FmFixture {
                                     }
                                     body
                                 } else {
-                                    let mut replicas = self.configured[0].replicas.clone();
+                                    let mut replicas =
+                                        self.failover_previous.as_ref().unwrap().replicas.clone();
                                     for r in &mut replicas.0 {
                                         r.previous_role = r.current_role;
                                     }
@@ -477,13 +480,10 @@ impl FmFixture {
                         assert!(body.any_replica_found);
                         assert!(body.units.0.len() <= 1);
                         if let Some(info) = body.units.0.first() {
-                            let original = self.configured[0]
-                                .replicas
-                                .0
-                                .iter()
-                                .find(|r| r.node == node)
-                                .unwrap();
-                            assert_eq!(info.unit, self.configured[0].unit);
+                            let previous = self.failover_previous.as_ref().unwrap();
+                            let original =
+                                previous.replicas.0.iter().find(|r| r.node == node).unwrap();
+                            assert_eq!(info.unit, previous.unit);
                             assert_eq!(info.service, primary(&self.configurations[index]).service);
                             assert!(!info.report_from_primary && !info.local_deleted);
                             assert_eq!(info.intermediate, Epoch::default());
@@ -867,6 +867,11 @@ async fn standalone_repair_lfum_activates_fresh_host_and_preserves_quorum() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_repeated_failover_and_repair_lfum_preserves_latest_membership_and_quorum() {
+    journey(Fault::RepeatedRepairGenerationHandshake).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_restores_a_fresh_original_replica_before_repeated_primary_failover() {
     journey(Fault::Restore).await;
 }
@@ -951,6 +956,7 @@ enum Fault {
     BuildingGenerationHandshake,
     FailoverGenerationHandshake,
     RepairGenerationHandshake,
+    RepeatedRepairGenerationHandshake,
 }
 
 async fn start_rollover(fm: &mut FmFixture) {
@@ -1316,9 +1322,15 @@ async fn repair_with_lfum(
     )
     .await;
     fm.until(fixture, |fm| fm.deleted[destination]).await;
-    assert_eq!(fixture.status(destination)["host_replacement_count"], 0);
-    let next = fixture
-        .configs
+    let replacement_count = owners[destination]["host_replacement_count"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        fixture.status(destination)["host_replacement_count"],
+        replacement_count
+    );
+    let next = fm
+        .configurations
         .iter()
         .map(|config| config.node.replica_id.max(config.node.replica_instance))
         .max()
@@ -1341,7 +1353,24 @@ async fn repair_with_lfum(
         add_replica_message(&build, &generation).unwrap(),
     )
     .await;
-    fm.until(fixture, |fm| fm.held_build.is_some()).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut retry_at = Instant::now() + Duration::from_millis(250);
+    while fm.held_build.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "repair build: {}",
+            fixture.diagnostics()
+        );
+        fm.step().await;
+        if Instant::now() >= retry_at {
+            fm.send(
+                primary_index,
+                add_replica_message(&build, &generation).unwrap(),
+            )
+            .await;
+            retry_at = Instant::now() + Duration::from_millis(250);
+        }
+    }
     let built = fm.held_build.take().unwrap();
     fm.hold_build = false;
     assert_eq!(built.replica.id, next);
@@ -1355,7 +1384,7 @@ async fn repair_with_lfum(
     assert_ne!(fresh["runtime_root"], owners[destination]["runtime_root"]);
     assert!(!PathBuf::from(owners[destination]["runtime_root"].as_str().unwrap()).exists());
     assert!(!PathBuf::from(format!("/proc/{}", owners[destination]["application_pid"])).exists());
-    assert_eq!(fresh["host_replacement_count"], 1);
+    assert_eq!(fresh["host_replacement_count"], replacement_count + 1);
     fm.retired_replicas.push((
         destination,
         predecessor.replica.id,
@@ -1537,7 +1566,7 @@ async fn repair_with_lfum(
     assert_eq!(fm.configured.last().unwrap(), &repaired);
     let after = fixture.status(destination);
     assert_eq!(after["host_replacement"], fresh["host_replacement"]);
-    assert_eq!(after["host_replacement_count"], 1);
+    assert_eq!(after["host_replacement_count"], replacement_count + 1);
     assert_eq!(after["application_pid"], fresh["application_pid"]);
     for (index, owner) in owners.iter().enumerate() {
         if index != destination {
@@ -1559,16 +1588,9 @@ async fn repair_with_lfum(
     assert!(application(endpoint, "read")
         .await
         .contains("committed=2 value=continued"));
-    let pid = owners[survivor]["application_pid"].as_u64().unwrap();
-    assert!(Command::new("kill")
-        .args(["-KILL", &pid.to_string()])
-        .status()
-        .unwrap()
-        .success());
-    fm.until(fixture, |fm| fm.losses.contains(&survivor)).await;
-    assert!(application(endpoint, "write-final")
-        .await
-        .contains("committed=3 value=final"));
+    fm.repair_previous = None;
+    fm.repair_build = None;
+    fm.repair_membership = None;
     repaired
 }
 
@@ -1855,6 +1877,7 @@ async fn journey(fault: Fault) {
             | Fault::RestoreRepeated
             | Fault::FailoverGenerationHandshake
             | Fault::RepairGenerationHandshake
+            | Fault::RepeatedRepairGenerationHandshake
     ) {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -1917,6 +1940,7 @@ async fn journey(fault: Fault) {
         }
         if fault == Fault::FailoverGenerationHandshake {
             fm.failover = Some(failover.configuration.clone());
+            fm.failover_previous = Some(original.clone());
         }
         fm.send(
             candidate,
@@ -1971,6 +1995,7 @@ async fn journey(fault: Fault) {
         }
         fm.until(&mut fixture, |fm| fm.configured.len() == 2).await;
         fm.failover = None;
+        fm.failover_previous = None;
         let promoted = fm.configured[1].clone();
         let new_primary = promoted
             .replicas
@@ -2016,8 +2041,11 @@ async fn journey(fault: Fault) {
                     .clone();
             }
         }
-        if fault == Fault::RepairGenerationHandshake {
-            let repaired = repair_with_lfum(
+        if matches!(
+            fault,
+            Fault::RepairGenerationHandshake | Fault::RepeatedRepairGenerationHandshake
+        ) {
+            let mut repaired = repair_with_lfum(
                 &mut fm,
                 &mut fixture,
                 selected,
@@ -2028,6 +2056,139 @@ async fn journey(fault: Fault) {
             .await;
             generation = fm.configurations[candidate].generation().unwrap();
             pids[selected] = fixture.status(selected)["application_pid"].clone();
+            let mut repaired_primary = candidate;
+            if fault == Fault::RepeatedRepairGenerationHandshake {
+                for barrier in ["local-primary-role", "local-current-configuration"] {
+                    fs::write(
+                        fixture.work(selected).join(format!("{barrier}.block")),
+                        b"hold repeated failover",
+                    )
+                    .unwrap();
+                }
+                let predecessor = AddInstance {
+                    unit: repaired.unit.clone(),
+                    service: body.service.clone(),
+                    replica: repaired
+                        .replicas
+                        .0
+                        .iter()
+                        .find(|r| {
+                            r.node == fixture.configs[candidate].node.identity.native().unwrap()
+                        })
+                        .unwrap()
+                        .clone(),
+                };
+                let old = fixture.status(candidate);
+                let pid = old["application_pid"].as_u64().unwrap();
+                assert!(Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status()
+                    .unwrap()
+                    .success());
+                fm.until(&mut fixture, |fm| fm.losses.contains(&candidate))
+                    .await;
+                let mut request = Configuration {
+                    unit: repaired.unit.clone(),
+                    service: body.service.clone(),
+                    replicas: repaired.replicas.clone(),
+                };
+                request.unit.previous = request.unit.current;
+                request.unit.current.configuration += 0x1_0000_0001;
+                for replica in &mut request.replicas.0 {
+                    replica.previous_role = replica.current_role;
+                    if replica.node == predecessor.replica.node {
+                        replica.current_role = 1;
+                        replica.up = false;
+                        replica.state = 3;
+                    } else if replica.node
+                        == fixture.configs[selected].node.identity.native().unwrap()
+                    {
+                        replica.current_role = 4;
+                    }
+                    replica.first_lsn = -1;
+                    replica.last_lsn = -1;
+                }
+                fm.failover = Some(request.clone());
+                fm.failover_previous = Some(repaired.clone());
+                fm.failover_ending = false;
+                let replies = fm.configured.len();
+                fm.send(
+                    selected,
+                    do_reconfiguration_message(
+                        &DoReconfiguration {
+                            configuration: request.clone(),
+                            phase0_duration: i64::MAX,
+                        },
+                        &generation,
+                    )
+                    .unwrap(),
+                )
+                .await;
+                until_node(&mut fm, &fixture, selected, |_| {
+                    fixture
+                        .work(selected)
+                        .join("local-primary-role.held")
+                        .exists()
+                })
+                .await;
+                admitting_rollover(&mut fm, &mut fixture).await;
+                assert_eq!(fm.configured.len(), replies);
+                fs::write(
+                    fixture.work(selected).join("local-primary-role.release"),
+                    b"finish repeated promotion",
+                )
+                .unwrap();
+                until_node(&mut fm, &fixture, selected, |_| {
+                    fixture
+                        .work(selected)
+                        .join("local-current-configuration.held")
+                        .exists()
+                })
+                .await;
+                until_node(&mut fm, &fixture, 2, |status| {
+                    status["replica_epoch"]["configuration"] == request.unit.current.configuration
+                        && status["local_configuration_complete"] == true
+                })
+                .await;
+                fm.failover_ending = true;
+                admitting_rollover(&mut fm, &mut fixture).await;
+                assert_eq!(fm.configured.len(), replies);
+                fs::write(
+                    fixture
+                        .work(selected)
+                        .join("local-current-configuration.release"),
+                    b"finish repeated RAP",
+                )
+                .unwrap();
+                fm.until(&mut fixture, |fm| fm.configured.len() == replies + 1)
+                    .await;
+                fm.failover = None;
+                fm.failover_previous = None;
+                fm.failover_ending = false;
+                let promoted = fm.configured.last().unwrap().clone();
+                for suffix in ["block", "held", "release"] {
+                    fs::remove_file(
+                        fixture
+                            .work(selected)
+                            .join(format!("local-current-configuration.{suffix}")),
+                    )
+                    .unwrap();
+                }
+                repaired = repair_with_lfum(
+                    &mut fm,
+                    &mut fixture,
+                    candidate,
+                    selected,
+                    &promoted,
+                    &predecessor,
+                )
+                .await;
+                pids[candidate] = fixture.status(candidate)["application_pid"].clone();
+                repaired_primary = selected;
+                generation = fm.configurations[selected].generation().unwrap();
+                assert_eq!(fixture.status(selected)["host_replacement_count"], 1);
+                assert_eq!(fixture.status(candidate)["host_replacement_count"], 1);
+            }
             for (index, deletion) in deletion_bodies.iter_mut().enumerate() {
                 deletion.unit = repaired.unit.clone();
                 deletion.replica = repaired
@@ -2038,6 +2199,41 @@ async fn journey(fault: Fault) {
                     .unwrap()
                     .clone();
             }
+            let survivor = (0..3).find(|i| *i != selected && *i != candidate).unwrap();
+            let pid = fixture.status(survivor)["application_pid"]
+                .as_u64()
+                .unwrap();
+            assert!(Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status()
+                .unwrap()
+                .success());
+            fm.until(&mut fixture, |fm| fm.losses.contains(&survivor))
+                .await;
+            let endpoint = &repaired
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.current_role == 4)
+                .unwrap()
+                .service_endpoint;
+            assert_eq!(
+                repaired
+                    .replicas
+                    .0
+                    .iter()
+                    .find(|r| r.current_role == 4)
+                    .unwrap()
+                    .node,
+                fixture.configs[repaired_primary]
+                    .node
+                    .identity
+                    .native()
+                    .unwrap()
+            );
+            assert!(application(endpoint, "write-final")
+                .await
+                .contains("committed=3 value=final"));
         }
         if matches!(
             fault,
@@ -2238,6 +2434,7 @@ async fn journey(fault: Fault) {
             | Fault::BuildingGenerationHandshake
             | Fault::FailoverGenerationHandshake
             | Fault::RepairGenerationHandshake
+            | Fault::RepeatedRepairGenerationHandshake
     );
     if refusal {
         if fault == Fault::LostFm {
@@ -2291,7 +2488,8 @@ async fn journey(fault: Fault) {
             | Fault::AdmittingGenerationHandshake
             | Fault::BuildingGenerationHandshake
             | Fault::FailoverGenerationHandshake
-            | Fault::RepairGenerationHandshake => unreachable!(),
+            | Fault::RepairGenerationHandshake
+            | Fault::RepeatedRepairGenerationHandshake => unreachable!(),
         };
         assert!(
             fixture.status(selected)["error"]
