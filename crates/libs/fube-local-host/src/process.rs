@@ -43,6 +43,7 @@ pub struct OwnedApp {
     dropped_logs: Arc<AtomicU64>,
     termination_requested: bool,
     exit_observed: bool,
+    cleanup_forced: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,7 @@ pub struct ProcessStatus {
     pub pid: u32,
     pub termination_requested: bool,
     pub exit_observed: bool,
+    pub cleanup_forced: bool,
     pub group_drained: bool,
     pub reaped: bool,
     pub dropped_log_records: u64,
@@ -215,6 +217,7 @@ impl OwnedApp {
             dropped_logs: Arc::default(),
             termination_requested: false,
             exit_observed: false,
+            cleanup_forced: false,
         });
         let owned = slot.as_mut().expect("stored owned child");
         for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
@@ -259,6 +262,7 @@ impl OwnedApp {
             pid: self.pid(),
             termination_requested: self.termination_requested,
             exit_observed: self.exit_observed,
+            cleanup_forced: self.cleanup_forced,
             group_drained: self.group_cleaned,
             reaped: self.reaped,
             dropped_log_records: self.dropped_logs(),
@@ -384,6 +388,7 @@ impl OwnedApp {
             // leader's identity reserved even if it exited during a callback.
             let _ = self.observed_exit()?;
             let mut running = self.group_running(deadline)?;
+            self.cleanup_forced |= running;
             // Always signal while ownership is reserved, including when the
             // leader is a zombie: a helper may fork/exit during the proc scan.
             if unsafe { libc::kill(-(self.pid() as i32), libc::SIGKILL) } != 0 {
@@ -395,6 +400,7 @@ impl OwnedApp {
             self.termination_requested = true;
             while self.group_running(deadline)? {
                 running = true;
+                self.cleanup_forced = true;
                 if unsafe { libc::kill(-(self.pid() as i32), libc::SIGKILL) } != 0 {
                     let error = std::io::Error::last_os_error();
                     if error.raw_os_error() != Some(libc::ESRCH) {
@@ -503,12 +509,14 @@ mod tests {
             dropped_logs: Arc::default(),
             termination_requested: false,
             exit_observed: false,
+            cleanup_forced: false,
         };
         let result = owned.cleanup().unwrap();
         assert_eq!(result["forced"], true);
         assert_eq!(result["reaped"], true);
         assert_eq!(unsafe { libc::kill(owned.pid() as i32, 0) }, -1);
         assert_eq!(owned.cleanup().unwrap()["forced"], false);
+        assert!(owned.status().cleanup_forced);
     }
 
     #[test]
@@ -524,6 +532,7 @@ mod tests {
             dropped_logs: Arc::default(),
             termination_requested: false,
             exit_observed: false,
+            cleanup_forced: false,
         };
         assert!(owned
             .wait_exit(Instant::now() + Duration::from_secs(2))
@@ -554,6 +563,7 @@ mod tests {
                 dropped_logs: Arc::default(),
                 termination_requested: false,
                 exit_observed: false,
+                cleanup_forced: false,
             };
             // A directly waitable test helper joins the same owned group. This
             // permits independent reap/assertions without becoming a subreaper.

@@ -360,6 +360,10 @@ pub struct ReplicaHostReplacement {
     pub new_host: String,
     pub old_app_pid: u32,
     pub old_runtime_root: PathBuf,
+    pub old_app_reaped: bool,
+    pub old_group_drained: bool,
+    pub old_root_removed: bool,
+    pub old_cleanup_forced: bool,
     pub app_pid: u32,
     pub runtime_root: PathBuf,
 }
@@ -619,6 +623,9 @@ impl Node {
             Err(h::local::LocalError::Busy) => false,
             Err(error) => return Err(error.into()),
         };
+        if self.activation.cleanup_status().forced {
+            return Err(Error::Unsupported);
+        }
         Ok(cleaned && self.quiescent() && self.commands.is_empty() && self.receipts.is_empty())
     }
 
@@ -1062,6 +1069,7 @@ impl Node {
         {
             return Err(Error::Unsupported);
         }
+
         if let Some(current) = current.as_ref().filter(|state| {
             state.phase == ra::Phase::Closed && base.replica.instance > state.body.replica.instance
         }) {
@@ -2672,6 +2680,7 @@ impl Node {
             || self.last_error.is_some()
             || self.rejected_reply.is_some()
             || !self.usage.is_empty()
+            || self.host_replacements.len() >= SLOTS
         {
             return Err(Error::Unsupported);
         }
@@ -2684,6 +2693,9 @@ impl Node {
             Err(h::local::LocalError::Busy) => false,
             Err(error) => return Err(error.into()),
         };
+        if self.activation.cleanup_status().forced {
+            return Err(Error::Unsupported);
+        }
         if !cleaned || !self.activation.deliveries_drained() {
             return Ok(false);
         }
@@ -2693,8 +2705,13 @@ impl Node {
             .ok_or(Error::Protocol)?
             .host_id
             .clone();
-        let old_app_pid = self.activation.process_status().ok_or(Error::Protocol)?.pid;
+        let old_process = self.activation.process_status().ok_or(Error::Protocol)?;
+        let old_app_pid = old_process.pid;
         let old_runtime_root = self.activation.root().ok_or(Error::Protocol)?.to_owned();
+        let old_root_removed = !old_runtime_root.exists();
+        if !old_process.reaped || !old_process.group_drained || !old_root_removed {
+            return Err(Error::Unsupported);
+        }
         let profile = if self.activation.profile() == h::local::Profile::VolatileStatefulExternalFm
         {
             h::local::Profile::VolatileStatefulExternalFm
@@ -2723,6 +2740,10 @@ impl Node {
             old_host,
             old_app_pid,
             old_runtime_root,
+            old_app_reaped: old_process.reaped,
+            old_group_drained: old_process.group_drained,
+            old_root_removed,
+            old_cleanup_forced: old_process.cleanup_forced,
             new_host: self
                 .activation
                 .identity()
