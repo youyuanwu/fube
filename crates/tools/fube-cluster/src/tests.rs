@@ -343,6 +343,115 @@ fn failover_lfum_validates_original_phase_views_without_finishing_promotion() {
 }
 
 #[test]
+fn repair_lfum_validates_fresh_lifetimes_and_phase_roles_without_completing_repair() {
+    let mut ledger = configured_ledger(3, 2);
+    for (index, placement) in ledger.placements.iter_mut().enumerate() {
+        placement.node_description = Some(NodeDescription { name: format!("node{index}"), ..NodeDescription::default() });
+    }
+    ledger.report(0, &stateful_loss_report(&ledger.placements[0])).unwrap();
+    let failover = ledger.start_primary_failover(Instant::now()).unwrap().unwrap();
+    let mut previous = ConfigurationReply { unit: failover.configuration.unit, replicas: failover.configuration.replicas, error: 0 };
+    previous.unit.previous = Epoch::default();
+    previous.replicas.0.retain(|r| r.current_role >= 3);
+    for r in &mut previous.replicas.0 {
+        r.previous_role = 1;
+        r.first_lsn = 1;
+        r.last_lsn = 8;
+        if r.current_role == 4 { r.service_endpoint = "127.0.0.1:12349".into(); }
+    }
+    ledger.configuration_reply(1, previous.clone()).unwrap();
+    let old = ledger.placements[0].body().unwrap();
+    ledger.reply(0, AddInstanceReply { unit: old.unit, replica: dropped_replica(&old.replica), error: 0 }, true).unwrap();
+    ledger.begin_primary_repair(Instant::now()).unwrap();
+    assert!(ledger.begin_generation().is_err());
+    let repair = ledger.repair.as_mut().unwrap();
+    let build = repair.build.body.clone();
+    repair.host_requested = true;
+    let mut profile = repair.old_profile.clone();
+    profile.app_pid += 100;
+    profile.runtime_root = profile.runtime_root.parent().unwrap().join("repair-host");
+    let receipt = HostReplacementReceipt {
+        deployment: ledger.placements[0].launch.deployment.clone(), session: ledger.placements[0].launch.session.clone(),
+        node_pid: 123, predecessor: repair.old_profile.clone(), profile,
+        old_host: uuid::Uuid::new_v4().to_string(), new_host: uuid::Uuid::new_v4().to_string(),
+    };
+    ledger.repaired_host(&receipt, 123).unwrap();
+    let mut built = AddReplicaReply { unit: build.unit.clone(), replica: build.replica.clone(), error: 0 };
+    built.replica.state = 2;
+    built.replica.replication_endpoint = "127.0.0.1:12350".into();
+    let mut request: Option<Configuration> = None;
+    for phase in 0..3 {
+        ledger.begin_generation().unwrap();
+        let generation = ledger.generation.as_ref().unwrap().number.clone();
+        for index in 0..3 {
+            ledger.generation.as_mut().unwrap().proposal_reply(index, &GenerationProposalReply {
+                proposed: generation.clone(), current: generation.clone(), error: 0,
+            }).unwrap();
+        }
+        for index in 0..3 {
+            let mut config = Configuration { unit: previous.unit.clone(), service: build.service.clone(), replicas: previous.replicas.clone() };
+            if let Some(request) = &request {
+                config = request.clone();
+                if phase == 2 || index == 2 {
+                    config.unit.previous = Epoch::default();
+                    for r in &mut config.replicas.0 { r.previous_role = 1; }
+                }
+            } else {
+                if index == 0 { config.replicas.0.clear(); }
+                if index != 2 {
+                    let mut replica = built.replica.clone();
+                    if index == 0 { replica.state = 1; }
+                    config.replicas.0.push(replica);
+                }
+            }
+            let intermediate = if phase == 1 && index == 1 { config.unit.current } else { Epoch::default() };
+            let upload = LfumUpload {
+                generation: generation.clone(), node: ledger.placements[index].node_description.clone().unwrap(),
+                any_replica_found: true,
+                units: ObjectArray(vec![FailoverUnitInfo {
+                    service: config.service, unit: config.unit, intermediate, report_from_primary: index == 1,
+                    replicas: ObjectArray(config.replicas.0.into_iter().map(|mut description| {
+                        description.first_lsn = -1; description.last_lsn = -1;
+                        ReplicaInfo { intermediate_role: if intermediate == Epoch::default() { 1 } else { description.current_role }, description }
+                    }).collect()), local_deleted: false,
+                }]),
+            };
+            for mutation in 0..8 {
+                let mut bad = upload.clone();
+                let info = &mut bad.units.0[0];
+                match mutation {
+                    0 => info.replicas.0[0].description.instance += 1,
+                    1 => info.replicas.0[0].description.last_lsn = 123,
+                    2 => { info.replicas.0.pop(); }
+                    3 => info.replicas.0[0].intermediate_role = 2,
+                    4 => info.report_from_primary = !info.report_from_primary,
+                    5 => info.unit.current.configuration += 5,
+                    6 => info.service.minimum = 1,
+                    _ => bad.node.name.push_str("-foreign"),
+                }
+                assert!(ledger.lfum_upload(index, bad).is_err(), "phase={phase}, node={index}, mutation={mutation}");
+            }
+            let mut stale = upload.clone();
+            stale.generation.generation -= 1;
+            ledger.lfum_upload(index, stale).unwrap();
+            assert!(ledger.generation.as_ref().unwrap().uploads[index].is_none());
+            ledger.lfum_upload(index, upload.clone()).unwrap();
+            let mut duplicate = upload.clone();
+            duplicate.units.0.clear();
+            ledger.lfum_upload(index, duplicate).unwrap();
+            assert_eq!(ledger.generation.as_ref().unwrap().uploads[index], Some(upload));
+            assert_eq!(ledger.repair_status()["ready"], false);
+        }
+        assert!(!ledger.generation_pending());
+        if phase == 0 {
+            assert_eq!(ledger.repair_status()["built"], false);
+            ledger.idle_reply(1, built.clone()).unwrap();
+            request = Some(ledger.start_repair_configuration(Instant::now()).unwrap().unwrap().configuration);
+        }
+    }
+}
+
+#[test]
 fn generation_rebuild_gates_mutations_without_relabeling_existing_serving_state() {
     let mut ledger = ledger();
     ledger.accept(command("a", "create", Some(1))).unwrap();
@@ -6330,6 +6439,168 @@ async fn lfum_overlapping_updates_keep_independent_retries_and_resume_backpressu
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
     result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn real_lfum_during_primary_repair_activates_fresh_host_and_preserves_quorum() {
+    let fixture = Fixture::new("repair-lfum");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::Stateful { target: 3, minimum: 2 };
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.start().await.unwrap();
+    let mut releases = vec![];
+    let result = peer_idle_catch(async {
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+        let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+        until(&mut cluster, |c| (1..3).all(|i|
+            c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 1)).await;
+        let owners = cluster.status();
+        let old = cluster.ledger.placements[0].profile.clone().unwrap();
+        assert!(std::process::Command::new("kill").args(["-KILL", &old.app_pid.to_string()]).status().map_err(err)?.success());
+        until(&mut cluster, |c| c.ledger.swap.as_ref().is_some_and(|s| s.reply.is_some())
+            && c.ledger.placements[0].status()["native_replica_deleted"] == true).await;
+        let promoted = cluster.ledger.placements[1].endpoint.clone().unwrap();
+        assert!(data_contact(&promoted, b"read\n").contains("committed=1 value=acknowledged"));
+        cluster.repair_primary_replica().await?;
+        let incoming = hold_peer_loss_frame(&mut cluster, 1, "AddReplicaReply", Duration::from_secs(30)).await?;
+        let (built, _) = decode_add_replica_reply(&incoming).map_err(err)?;
+        let fresh = cluster.ledger.placements[0].profile.clone().unwrap();
+        assert_ne!(fresh.app_pid, old.app_pid);
+        assert_ne!(fresh.runtime_root, old.runtime_root);
+        assert!(!old.runtime_root.exists());
+        assert!(!Path::new(&format!("/proc/{}", old.app_pid)).exists());
+        let secondary_work = fresh.runtime_root.join("deployment/HostingLocalStatefulApp_App1/work");
+        let primary_work = cluster.ledger.placements[1].profile.as_ref().unwrap().runtime_root
+            .join("deployment/HostingLocalStatefulApp_App1/work");
+        for (work, barrier) in [(&secondary_work, "local-secondary-role"), (&primary_work, "local-current-configuration")] {
+            fs::write(work.join(format!("{barrier}.block")), b"hold actual repair").map_err(err)?;
+            releases.push(work.join(format!("{barrier}.release")));
+        }
+        let build_uploads = hold_superseding_lfum(&mut cluster).await?;
+        let frozen_build = build_uploads.iter().map(|incoming| decode_lfum_upload(&incoming.message))
+            .collect::<std::result::Result<Vec<_>, _>>().map_err(err)?;
+        assert_eq!(frozen_build[0].units.0[0].replicas.0.len(), 1);
+        assert_eq!(frozen_build[1].units.0[0].replicas.0.len(), 3);
+        assert_eq!(frozen_build[2].units.0[0].replicas.0.len(), 2);
+        assert_eq!((frozen_build[0].units.0[0].replicas.0[0].description.current_role,
+            frozen_build[0].units.0[0].replicas.0[0].description.state), (2, 1));
+        cluster.ledger.idle_reply(1, built.clone())?;
+        until(&mut cluster, |c|
+            c.status()["nodes"][1]["retained_work"]["local_replica"]["configuration"]["stage"] == "Deactivate").await;
+        let request = cluster.ledger.repair.as_ref().unwrap().configuration.as_ref().unwrap().body.clone();
+        assert_eq!(cluster.status()["nodes"][1]["retained_work"]["generations"]["upload_pending"], true);
+        assert_eq!(cluster.ledger.repair_status()["ready"], false);
+        for (index, incoming) in build_uploads.into_iter().enumerate() {
+            assert_eq!(decode_lfum_upload(&incoming.message).map_err(err)?, frozen_build[index]);
+            cluster.receive_message(index, incoming).await?;
+        }
+        until(&mut cluster, |c| !c.ledger.generation_pending()
+            && c.status()["nodes"].as_array().unwrap().iter().all(|n|
+                n["retained_work"]["generations"]["upload_pending"] == false)).await;
+        cluster.send_configuration(&request).await?;
+        until(&mut cluster, |c| secondary_work.join("local-secondary-role.held").exists()
+            && c.status()["nodes"][1]["retained_work"]["local_replica"]["configuration"]["stage"] == "Activate").await;
+        let activating = hold_superseding_lfum(&mut cluster).await?;
+        let frozen = activating.iter().map(|incoming| decode_lfum_upload(&incoming.message))
+            .collect::<std::result::Result<Vec<_>, _>>().map_err(err)?;
+        assert_eq!(frozen[1].units.0[0].unit, request.configuration.unit);
+        assert_eq!(frozen[1].units.0[0].intermediate, request.configuration.unit.current);
+        assert_eq!(frozen[0].units.0[0].unit, request.configuration.unit);
+        assert_eq!(frozen[0].units.0[0].intermediate, Epoch::default());
+        fs::write(&releases[0], b"finish Secondary role before LFUM ACK").map_err(err)?;
+        until(&mut cluster, |c| c.status()["nodes"][0]["retained_work"]["local_replica"]["configuration"]["stage"] == "Complete").await;
+        assert_eq!(cluster.status()["nodes"][0]["retained_work"]["generations"]["upload_pending"], true);
+        assert_eq!(cluster.ledger.repair_status()["ready"], false);
+        for (index, incoming) in activating.into_iter().enumerate() {
+            assert_eq!(decode_lfum_upload(&incoming.message).map_err(err)?, frozen[index]);
+            cluster.receive_message(index, incoming).await?;
+        }
+        until(&mut cluster, |c| !c.ledger.generation_pending()
+            && c.status()["nodes"].as_array().unwrap().iter().all(|n|
+                n["retained_work"]["generations"]["upload_pending"] == false)).await;
+        cluster.send_configuration(&request).await?;
+        until(&mut cluster, |c| primary_work.join("local-current-configuration.held").exists()
+            && c.status()["nodes"][1]["retained_work"]["local_replica"]["configuration"]["stage"] == "End").await;
+        assert_eq!(cluster.ledger.repair_status()["ready"], false);
+        fs::write(&releases[1], b"finish final repair RAP").map_err(err)?;
+        until(&mut cluster, |c| c.ledger.repair_status()["ready"] == true).await;
+        let after = cluster.status();
+        for index in 0..3 {
+            assert_eq!(after["nodes"][index]["node_pid"], owners["nodes"][index]["node_pid"]);
+            assert_eq!(after["nodes"][index]["retained_work"]["app_observation"]["opens"], 1);
+            assert_eq!(after["nodes"][index]["retained_work"]["app_observation"]["provider_acquisitions"], 1);
+            if index != 0 {
+                for field in ["app_pid", "runtime_root"] {
+                    assert_eq!(after["nodes"][index][field], owners["nodes"][index][field]);
+                }
+            }
+        }
+        let retry = cluster.ledger.repair.as_ref().unwrap().build.body.clone();
+        cluster.send_idle(&retry).await?;
+        cluster.send_configuration(&request).await?;
+        for _ in 0..10 { cluster.drive().await; }
+        assert_eq!(cluster.ledger.placements[0].profile.as_ref(), Some(&fresh));
+        let pid = cluster.ledger.placements[2].profile.as_ref().unwrap().app_pid;
+        assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+        until(&mut cluster, |c| c.ledger.placements[2].loss_reported).await;
+        assert!(data_contact(&promoted, b"write-more\n").contains("committed=2 value=continued"));
+        until(&mut cluster, |c| c.status()["nodes"][0]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 2).await;
+        assert!(std::process::Command::new("kill").args(["-KILL", &fresh.app_pid.to_string()]).status().map_err(err)?.success());
+        until(&mut cluster, |c| c.ledger.placements[0].loss_reported).await;
+        let mut pending = TcpStream::connect(&promoted).map_err(err)?;
+        pending.set_read_timeout(Some(Duration::from_millis(250))).map_err(err)?;
+        pending.write_all(b"write-final\n").map_err(err)?;
+        until(&mut cluster, |c| c.status()["nodes"][1]["retained_work"]["app_observation"]["primary_last_admitted"] == 3).await;
+        let mut bytes = [0; 1024];
+        assert!(matches!(pending.read(&mut bytes), Err(ref error)
+            if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)));
+        assert_eq!(cluster.status()["nodes"][1]["retained_work"]["app_observation"]["primary_last_acknowledged"], 2);
+        Ok::<(), String>(())
+    }).await;
+    for path in &releases {
+        if path.parent().is_some_and(Path::exists) { fs::write(path, b"release repair").unwrap(); }
+    }
+    if !matches!(&result, Ok(Ok(()))) { eprintln!("REPAIR_LFUM_STATUS {}", cluster.status()); }
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
+}
+
+async fn hold_superseding_lfum(cluster: &mut Cluster) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
+    let before = cluster.status();
+    cluster.begin_generation_handshake()?;
+    for _ in 0..2 { for index in 0..3 { cluster.retry_generation(index).await?; } }
+    let old = hold_lfum_uploads(cluster).await?;
+    let frozen = old.iter().map(|incoming| decode_lfum_upload(&incoming.message))
+        .collect::<std::result::Result<Vec<_>, _>>().map_err(err)?;
+    cluster.ledger.generation.as_mut().unwrap().reject(&frozen[0].generation)?;
+    for _ in 0..2 { for index in 0..3 { cluster.retry_generation(index).await?; } }
+    let current = hold_lfum_uploads(cluster).await?;
+    for (index, mut incoming) in old.into_iter().enumerate() {
+        assert_eq!(decode_lfum_upload(&current[index].message).map_err(err)?.units, frozen[index].units);
+        incoming.reply.take().ok_or("missing repair LFUM reply")?.reply(
+            cluster.children[index].link.as_ref().unwrap().seal(lfum_upload_reply_message(&GenerationHeader {
+                number: frozen[index].generation.clone(), for_fm_replica: false,
+            }).map_err(err)?)?, wire::deadline(),
+        ).await.map_err(err)?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while cluster.status()["nodes"].as_array().unwrap().iter().any(|n|
+        n["retained_work"]["generations"]["pending_uploads"] != 1)
+    {
+        assert!(Instant::now() < deadline, "stale repair LFUM reply: {}", cluster.status());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let after = cluster.status();
+    for index in 0..3 {
+        assert_eq!(after["nodes"][index]["retained_work"]["generations"]["send"],
+            before["nodes"][index]["retained_work"]["generations"]["send"]);
+        assert_eq!(after["nodes"][index]["retained_work"]["generations"]["upload_pending"], true);
+    }
+    Ok(current)
 }
 
 #[tokio::test]

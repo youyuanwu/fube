@@ -233,6 +233,10 @@ struct FmFixture {
     initial_builds: Option<Vec<AddReplica>>,
     failover: Option<Configuration>,
     failover_ending: bool,
+    repair_previous: Option<ConfigurationReply>,
+    repair_build: Option<AddReplica>,
+    repair_membership: Option<Configuration>,
+    retired_replicas: Vec<(usize, i64, i64)>,
     hold_uploads: bool,
     held_uploads: Vec<(usize, IncomingMessage<GatewayTarget>)>,
     stopping: bool,
@@ -290,6 +294,10 @@ impl FmFixture {
             initial_builds: None,
             failover: None,
             failover_ending: false,
+            repair_previous: None,
+            repair_build: None,
+            repair_membership: None,
+            retired_replicas: vec![],
             hold_uploads: false,
             held_uploads: vec![],
             stopping: false,
@@ -336,35 +344,74 @@ impl FmFixture {
                             .any(|r| r.node == node && r.previous_role == 4)
                     });
                     let expected = self
-                        .failover
+                        .repair_build
                         .as_ref()
-                        .map(|intent| {
-                            if intent
+                        .map(|build| {
+                            let previous = self.repair_previous.as_ref().unwrap();
+                            if let Some(request) = &self.repair_membership {
+                                let mut complete = request.unit.clone();
+                                complete.previous = Epoch::default();
+                                if body.units.0[0].unit == request.unit {
+                                    return request.clone();
+                                }
+                                if body.units.0[0].unit == complete {
+                                    let mut configuration = request.clone();
+                                    configuration.unit = complete;
+                                    for r in &mut configuration.replicas.0 {
+                                        r.previous_role = 1;
+                                    }
+                                    return configuration;
+                                }
+                            }
+                            let primary = previous
                                 .replicas
                                 .0
                                 .iter()
-                                .any(|r| r.node == node && r.current_role == 4)
-                            {
-                                intent.clone()
-                            } else if self.failover_ending {
-                                let mut body = intent.clone();
-                                body.unit.previous = Epoch::default();
-                                body.replicas.0.retain(|r| r.current_role >= 3);
-                                for r in &mut body.replicas.0 {
-                                    r.previous_role = 1;
-                                }
-                                body
+                                .any(|r| r.node == node && r.current_role == 4);
+                            let fresh = build.replica.node == node;
+                            let mut replicas = if fresh {
+                                vec![]
                             } else {
-                                let mut replicas = self.configured[0].replicas.clone();
-                                for r in &mut replicas.0 {
-                                    r.previous_role = r.current_role;
-                                }
-                                Configuration {
-                                    unit: intent.unit.clone(),
-                                    service: intent.service.clone(),
-                                    replicas,
-                                }
+                                previous.replicas.0.clone()
+                            };
+                            if primary || fresh {
+                                replicas.push(build.replica.clone());
                             }
+                            Configuration {
+                                unit: previous.unit.clone(),
+                                service: build.service.clone(),
+                                replicas: ObjectArray(replicas),
+                            }
+                        })
+                        .or_else(|| {
+                            self.failover.as_ref().map(|intent| {
+                                if intent
+                                    .replicas
+                                    .0
+                                    .iter()
+                                    .any(|r| r.node == node && r.current_role == 4)
+                                {
+                                    intent.clone()
+                                } else if self.failover_ending {
+                                    let mut body = intent.clone();
+                                    body.unit.previous = Epoch::default();
+                                    body.replicas.0.retain(|r| r.current_role >= 3);
+                                    for r in &mut body.replicas.0 {
+                                        r.previous_role = 1;
+                                    }
+                                    body
+                                } else {
+                                    let mut replicas = self.configured[0].replicas.clone();
+                                    for r in &mut replicas.0 {
+                                        r.previous_role = r.current_role;
+                                    }
+                                    Configuration {
+                                        unit: intent.unit.clone(),
+                                        service: intent.service.clone(),
+                                        replicas,
+                                    }
+                                }
+                            })
                         })
                         .or_else(|| {
                             self.initial_builds.as_ref().map(|builds| {
@@ -439,7 +486,12 @@ impl FmFixture {
                         });
                         assert_eq!(
                             info.intermediate,
-                            if (self.initial_membership.is_some() || self.failover_ending)
+                            if (self.initial_membership.is_some()
+                                || self.failover_ending
+                                || self
+                                    .repair_membership
+                                    .as_ref()
+                                    .is_some_and(|request| info.unit == request.unit))
                                 && primary
                             {
                                 configuration.unit.current
@@ -487,6 +539,24 @@ impl FmFixture {
                                     .unwrap()
                                     .description;
                                 assert!(!actual.replication_endpoint.is_empty());
+                                expected.replication_endpoint = actual.replication_endpoint.clone();
+                            }
+                            if self.repair_build.as_ref().is_some_and(|build| {
+                                build.replica.node == expected.node && expected.current_role == 2
+                            }) {
+                                let actual = &info
+                                    .replicas
+                                    .0
+                                    .iter()
+                                    .find(|r| r.description.node == expected.node)
+                                    .unwrap()
+                                    .description;
+                                assert!(matches!(actual.state, 1 | 2));
+                                if expected.node == node {
+                                    assert_eq!(actual.state, 1);
+                                }
+                                assert!(!actual.replication_endpoint.is_empty());
+                                expected.state = actual.state;
                                 expected.replication_endpoint = actual.replication_endpoint.clone();
                             }
                             let intermediate_role = if info.intermediate == Epoch::default() {
@@ -560,11 +630,20 @@ impl FmFixture {
                         assert_eq!(dropped.replicas.0.len(), 1);
                         let replica = &dropped.replicas.0[0].description;
                         assert_eq!(replica.node, config.node.identity.native().unwrap());
-                        assert_eq!(replica.id, config.node.replica_id);
-                        assert_eq!(replica.instance, config.node.replica_instance);
+                        let retired =
+                            self.retired_replicas
+                                .contains(&(index, replica.id, replica.instance));
+                        if !retired {
+                            assert_eq!(replica.id, config.node.replica_id);
+                            assert_eq!(replica.instance, config.node.replica_instance);
+                        }
                         assert!(!replica.up);
                         assert_eq!(replica.state, 3);
-                        if !self.stopping && !self.deleted[index] && !self.losses.contains(&index) {
+                        if !retired
+                            && !self.stopping
+                            && !self.deleted[index]
+                            && !self.losses.contains(&index)
+                        {
                             self.losses.push(index);
                         }
                     }
@@ -755,6 +834,11 @@ async fn standalone_generation_rollover_during_primary_failover_preserves_sf_inv
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_repair_lfum_activates_fresh_host_and_preserves_quorum() {
+    journey(Fault::RepairGenerationHandshake).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_generation_handshake_and_empty_upload_resume_shared_control() {
     journey(Fault::GenerationHandshake).await;
 }
@@ -820,6 +904,7 @@ enum Fault {
     AdmittingGenerationHandshake,
     BuildingGenerationHandshake,
     FailoverGenerationHandshake,
+    RepairGenerationHandshake,
 }
 
 async fn start_rollover(fm: &mut FmFixture) {
@@ -951,6 +1036,296 @@ async fn acknowledge_rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
     finish_rollover(fm, fixture).await;
 }
 
+async fn until_node(
+    fm: &mut FmFixture,
+    fixture: &Fixture,
+    index: usize,
+    condition: impl Fn(&Value) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !condition(&fixture.status(index)) {
+        assert!(
+            Instant::now() < deadline,
+            "Node progress: {}",
+            fixture.diagnostics()
+        );
+        fm.step().await;
+    }
+}
+
+async fn repair_with_lfum(
+    fm: &mut FmFixture,
+    fixture: &mut Fixture,
+    destination: usize,
+    primary_index: usize,
+    previous: &ConfigurationReply,
+    predecessor: &AddInstance,
+) -> ConfigurationReply {
+    let owners: Vec<_> = (0..3).map(|i| fixture.status(i)).collect();
+    let mut generation = fm.configurations[primary_index].generation().unwrap();
+    fm.send(
+        destination,
+        delete_replica_message(&DeleteReplica::new(predecessor.clone(), false), &generation)
+            .unwrap(),
+    )
+    .await;
+    fm.until(fixture, |fm| fm.deleted[destination]).await;
+    assert_eq!(fixture.status(destination)["host_replacement_count"], 0);
+    let next = fixture
+        .configs
+        .iter()
+        .map(|config| config.node.replica_id.max(config.node.replica_instance))
+        .max()
+        .unwrap()
+        + 1;
+    let mut build = predecessor.clone();
+    build.unit = previous.unit.clone();
+    build.replica = Replica {
+        node: fixture.configs[destination].node.identity.native().unwrap(),
+        id: next,
+        instance: next,
+        current_role: 2,
+        state: 1,
+        version: build.service.version.clone(),
+        ..Replica::default()
+    };
+    fm.hold_build = true;
+    fm.send(
+        primary_index,
+        add_replica_message(&build, &generation).unwrap(),
+    )
+    .await;
+    fm.until(fixture, |fm| fm.held_build.is_some()).await;
+    let built = fm.held_build.take().unwrap();
+    fm.hold_build = false;
+    assert_eq!(built.replica.id, next);
+    assert_eq!(built.replica.instance, next);
+    assert_eq!(built.replica.state, 2);
+    let fresh = fixture.status(destination);
+    assert_ne!(
+        fresh["application_pid"],
+        owners[destination]["application_pid"]
+    );
+    assert_ne!(fresh["runtime_root"], owners[destination]["runtime_root"]);
+    assert!(!PathBuf::from(owners[destination]["runtime_root"].as_str().unwrap()).exists());
+    assert!(!PathBuf::from(format!("/proc/{}", owners[destination]["application_pid"])).exists());
+    assert_eq!(fresh["host_replacement_count"], 1);
+    fm.retired_replicas.push((
+        destination,
+        predecessor.replica.id,
+        predecessor.replica.instance,
+    ));
+    fm.configurations[destination].node.replica_id = next;
+    fm.configurations[destination].node.replica_instance = next;
+    fm.deleted[destination] = false;
+    fm.losses.retain(|i| *i != destination);
+    let secondary_work = fixture.work(destination);
+    let primary_work = fixture.work(primary_index);
+    fs::write(
+        secondary_work.join("local-secondary-role.block"),
+        b"hold repair role",
+    )
+    .unwrap();
+    fs::write(
+        primary_work.join("local-current-configuration.block"),
+        b"hold final repair RAP",
+    )
+    .unwrap();
+    fm.repair_previous = Some(previous.clone());
+    fm.repair_build = Some(build.clone());
+    until_node(fm, fixture, destination, |status| {
+        status["replica_id"] == next
+            && status["replica_phase"] == "Ready"
+            && status["local_configuration_complete"] == false
+    })
+    .await;
+    for index in 0..3 {
+        if index != destination {
+            until_node(fm, fixture, index, |status| {
+                status["replica_epoch"]["configuration"] == previous.unit.current.configuration
+                    && status["local_configuration_complete"] == true
+            })
+            .await;
+        }
+    }
+    hold_superseding_rollover(fm, fixture).await;
+    let frozen_build = fm.uploaded.clone();
+    let survivor = (0..3)
+        .find(|i| *i != destination && *i != primary_index)
+        .unwrap();
+    assert_eq!(
+        frozen_build[destination].as_ref().unwrap().units.0[0]
+            .replicas
+            .0
+            .len(),
+        1
+    );
+    assert_eq!(
+        frozen_build[primary_index].as_ref().unwrap().units.0[0]
+            .replicas
+            .0
+            .len(),
+        3
+    );
+    assert_eq!(
+        frozen_build[survivor].as_ref().unwrap().units.0[0]
+            .replicas
+            .0
+            .len(),
+        2
+    );
+    let mut request = Configuration {
+        unit: previous.unit.clone(),
+        service: build.service.clone(),
+        replicas: previous.replicas.clone(),
+    };
+    request.unit.previous = previous.unit.current;
+    request.unit.current.configuration += 1;
+    for r in &mut request.replicas.0 {
+        r.previous_role = r.current_role;
+    }
+    let mut replica = built.replica.clone();
+    replica.previous_role = 2;
+    replica.current_role = 3;
+    request.replicas.0.push(replica);
+    let configuration = DoReconfiguration {
+        configuration: request.clone(),
+        phase0_duration: i64::MAX,
+    };
+    fm.repair_membership = Some(request.clone());
+    generation = fm.configurations[primary_index].generation().unwrap();
+    let completed_before = fm.configured.len();
+    fm.send(
+        primary_index,
+        do_reconfiguration_message(&configuration, &generation).unwrap(),
+    )
+    .await;
+    until_node(fm, fixture, primary_index, |status| {
+        status["local_configuration_stage"] == "Deactivate"
+    })
+    .await;
+    assert_eq!(
+        fixture.status(primary_index)["generations"]["upload_pending"],
+        true
+    );
+    assert_eq!(fm.configured.len(), completed_before);
+    assert_eq!(fm.uploaded, frozen_build);
+    acknowledge_rollover(fm, fixture).await;
+    fm.send(
+        primary_index,
+        do_reconfiguration_message(&configuration, &generation).unwrap(),
+    )
+    .await;
+    until_node(fm, fixture, primary_index, |status| {
+        status["local_configuration_stage"] == "Activate"
+            && secondary_work.join("local-secondary-role.held").exists()
+    })
+    .await;
+    until_node(fm, fixture, survivor, |status| {
+        status["replica_epoch"]["configuration"] == request.unit.current.configuration
+            && status["local_configuration_complete"] == true
+    })
+    .await;
+    hold_superseding_rollover(fm, fixture).await;
+    let frozen = fm.uploaded.clone();
+    assert_eq!(
+        frozen[primary_index].as_ref().unwrap().units.0[0].intermediate,
+        request.unit.current
+    );
+    assert_eq!(
+        frozen[destination].as_ref().unwrap().units.0[0].intermediate,
+        Epoch::default()
+    );
+    fs::write(
+        secondary_work.join("local-secondary-role.release"),
+        b"finish Secondary before LFUM ACK",
+    )
+    .unwrap();
+    until_node(fm, fixture, destination, |status| {
+        status["local_configuration_complete"] == true
+    })
+    .await;
+    assert_eq!(
+        fixture.status(destination)["generations"]["upload_pending"],
+        true
+    );
+    assert_eq!(fm.configured.len(), completed_before);
+    assert_eq!(fm.uploaded, frozen);
+    acknowledge_rollover(fm, fixture).await;
+    generation = fm.configurations[primary_index].generation().unwrap();
+    fm.send(
+        primary_index,
+        do_reconfiguration_message(&configuration, &generation).unwrap(),
+    )
+    .await;
+    until_node(fm, fixture, primary_index, |status| {
+        status["local_configuration_stage"] == "End"
+            && primary_work
+                .join("local-current-configuration.held")
+                .exists()
+    })
+    .await;
+    assert_eq!(fm.configured.len(), completed_before);
+    fs::write(
+        primary_work.join("local-current-configuration.release"),
+        b"finish final repair RAP",
+    )
+    .unwrap();
+    fm.until(fixture, |fm| fm.configured.len() == completed_before + 1)
+        .await;
+    let repaired = fm.configured.last().unwrap().clone();
+    assert_eq!(repaired.replicas.0.len(), 3);
+    assert_eq!(repaired.unit.previous, Epoch::default());
+    fm.send(
+        primary_index,
+        add_replica_message(&build, &generation).unwrap(),
+    )
+    .await;
+    fm.send(
+        primary_index,
+        do_reconfiguration_message(&configuration, &generation).unwrap(),
+    )
+    .await;
+    fm.until(fixture, |fm| fm.configured.len() == completed_before + 2)
+        .await;
+    assert_eq!(fm.configured.last().unwrap(), &repaired);
+    let after = fixture.status(destination);
+    assert_eq!(after["host_replacement"], fresh["host_replacement"]);
+    assert_eq!(after["host_replacement_count"], 1);
+    assert_eq!(after["application_pid"], fresh["application_pid"]);
+    for (index, owner) in owners.iter().enumerate() {
+        if index != destination {
+            assert_eq!(
+                fixture.status(index)["application_pid"],
+                owner["application_pid"]
+            );
+            assert_eq!(fixture.status(index)["runtime_root"], owner["runtime_root"]);
+        }
+        assert_eq!(fixture.status(index)["control_unknown"], false);
+    }
+    let endpoint = &repaired
+        .replicas
+        .0
+        .iter()
+        .find(|r| r.current_role == 4)
+        .unwrap()
+        .service_endpoint;
+    assert!(application(endpoint, "read")
+        .await
+        .contains("committed=2 value=continued"));
+    let pid = owners[survivor]["application_pid"].as_u64().unwrap();
+    assert!(Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    fm.until(fixture, |fm| fm.losses.contains(&survivor)).await;
+    assert!(application(endpoint, "write-final")
+        .await
+        .contains("committed=3 value=final"));
+    repaired
+}
+
 async fn journey(fault: Fault) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else {
@@ -980,7 +1355,7 @@ async fn journey(fault: Fault) {
         .service_endpoint
         .clone();
     assert!(!application(&endpoint, "write").await.starts_with("OK"));
-    let pids: Vec<_> = (0..3)
+    let mut pids: Vec<_> = (0..3)
         .map(|index| fixture.status(index)["application_pid"].clone())
         .collect();
     if fault == Fault::BuildingGenerationHandshake {
@@ -1226,7 +1601,10 @@ async fn journey(fault: Fault) {
             "an established mesh must not accept duplicate/replacement sessions"
         );
     }
-    if matches!(fault, Fault::Failover | Fault::FailoverGenerationHandshake) {
+    if matches!(
+        fault,
+        Fault::Failover | Fault::FailoverGenerationHandshake | Fault::RepairGenerationHandshake
+    ) {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let state: Value =
@@ -1386,6 +1764,29 @@ async fn journey(fault: Fault) {
                     .clone();
             }
         }
+        if fault == Fault::RepairGenerationHandshake {
+            let repaired = repair_with_lfum(
+                &mut fm,
+                &mut fixture,
+                selected,
+                candidate,
+                &promoted,
+                &deletion_bodies[selected],
+            )
+            .await;
+            generation = fm.configurations[candidate].generation().unwrap();
+            pids[selected] = fixture.status(selected)["application_pid"].clone();
+            for (index, deletion) in deletion_bodies.iter_mut().enumerate() {
+                deletion.unit = repaired.unit.clone();
+                deletion.replica = repaired
+                    .replicas
+                    .0
+                    .iter()
+                    .find(|r| r.node == fixture.configs[index].node.identity.native().unwrap())
+                    .unwrap()
+                    .clone();
+            }
+        }
     }
     if fault == Fault::LostPeer {
         fm.stopping = true;
@@ -1421,6 +1822,7 @@ async fn journey(fault: Fault) {
             | Fault::AdmittingGenerationHandshake
             | Fault::BuildingGenerationHandshake
             | Fault::FailoverGenerationHandshake
+            | Fault::RepairGenerationHandshake
     );
     if refusal {
         if fault == Fault::LostFm {
@@ -1470,7 +1872,8 @@ async fn journey(fault: Fault) {
             | Fault::ReplicatedGenerationHandshake
             | Fault::AdmittingGenerationHandshake
             | Fault::BuildingGenerationHandshake
-            | Fault::FailoverGenerationHandshake => unreachable!(),
+            | Fault::FailoverGenerationHandshake
+            | Fault::RepairGenerationHandshake => unreachable!(),
         };
         assert!(
             fixture.status(selected)["error"]

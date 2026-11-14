@@ -590,6 +590,7 @@ impl Cluster {
                 if owner != Owner::Fm || !self.config.profile.peer_replicas() {
                     return Err("AddReplicaReply requires the original peer-idle FM profile".into());
                 }
+                self.read_repair_host()?;
                 self.ledger.idle_reply(index, body)?;
             }
             "RemoveReplicaReply" => {
@@ -751,7 +752,7 @@ impl Cluster {
             return Err("Primary repair requires the original running configured cluster".into());
         }
         if self.ledger.begin_primary_repair(Instant::now())? {
-            self.request_repair_host()?;
+            self.request_repair_build().await?;
         }
         Ok(self.ledger.repair_status())
     }
@@ -776,35 +777,20 @@ impl Cluster {
         Ok(self.ledger.repair_status())
     }
 
-    fn request_repair_host(&mut self) -> Result<()> {
+    async fn request_repair_build(&mut self) -> Result<()> {
         let destination = self
             .ledger
             .repair_destination_index()
             .ok_or("missing failed replica")?;
-        let predecessor = &self
+        let body = self
             .ledger
             .repair
             .as_ref()
             .expect("repair")
-            .predecessor
-            .replica;
-        let child = &mut self.children[destination];
-        let result = child
-            .process
-            .as_mut()
-            .ok_or("missing original Node owner")?
-            .command(
-                format!(
-                    "replace-host {} {} {} {}\n",
-                    child.launch.session,
-                    child.launch.capability,
-                    predecessor.id,
-                    predecessor.instance
-                )
-                .as_bytes(),
-            )
-            .map_err(err);
-        if let Err(error) = result {
+            .build
+            .body
+            .clone();
+        if let Err(error) = self.send_idle(&body).await {
             self.ledger.lost(destination, error.clone());
             return Err(error);
         }
@@ -812,23 +798,7 @@ impl Cluster {
         Ok(())
     }
 
-    async fn advance_repair(&mut self) -> Result<()> {
-        if self
-            .ledger
-            .repair
-            .as_ref()
-            .is_some_and(|r| r.removal.as_ref().is_some_and(|c| c.reply.is_none()) || r.unknown)
-        {
-            return Ok(());
-        }
-        if self
-            .ledger
-            .repair
-            .as_ref()
-            .is_some_and(|r| !r.host_requested)
-        {
-            self.request_repair_host()?;
-        }
+    fn read_repair_host(&mut self) -> Result<()> {
         if self
             .ledger
             .repair
@@ -869,18 +839,30 @@ impl Cluster {
                         .as_mut()
                         .ok_or("missing node metadata")?
                         .profile = Some(receipt.profile);
-                    let body = self
-                        .ledger
-                        .repair
-                        .as_ref()
-                        .expect("repair")
-                        .build
-                        .body
-                        .clone();
-                    self.send_idle(&body).await?;
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn advance_repair(&mut self) -> Result<()> {
+        if self
+            .ledger
+            .repair
+            .as_ref()
+            .is_some_and(|r| r.removal.as_ref().is_some_and(|c| c.reply.is_none()) || r.unknown)
+        {
+            return Ok(());
+        }
+        if self
+            .ledger
+            .repair
+            .as_ref()
+            .is_some_and(|r| !r.host_requested)
+        {
+            self.request_repair_build().await?;
+        }
+        self.read_repair_host()?;
         if let Some(body) = self.ledger.start_repair_configuration(Instant::now())? {
             self.send_configuration(&body).await?;
         }

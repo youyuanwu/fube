@@ -689,6 +689,8 @@ participating RA commits its creation request,
 the original healthy same-Primary Secondary admission after each RA commits
 its configuration request, or the first original 3/2 Primary app-host failover
 with both original healthy survivors.
+The first explicit post-failover 3/2 repair also uploads committed fresh-build
+and same-Primary configuration views.
 This is opt-in, not a CLI command or a change to default bootstrap. Proposed,
 receive and send generations remain distinct; only receive changes on a
 matching Update. The round waits at `awaiting_upload`, `complete=false`:
@@ -718,9 +720,13 @@ The shared RA now reports its committed replica-store view without a
 build/failover lineage allowlist, retaining IC separately from CC and applying
 SF's previous/current-Primary reporting rules. Model/store tests include
 configured repair/removal, planned transfer, redirected failover and failed
-operations. These do not widen the test FM's bounded process generation rounds.
+operations. The first explicit 3/2 Primary repair is now also qualified in both
+launchers: ordinary replica creation demands shared Node/Hosting activation,
+configuration commits before held build-upload ACKs, and fresh Secondary role
+completion can precede a later LFUM ACK without changing frozen inventory.
+Final RAP completion, membership and quorum retain their independent owners.
 This is not application-data upload, unknown-partition reconstruction,
-broader reconfiguration or planned-swap/repair process qualification, nonempty NodeUp, full ReplicaUp
+broader reconfiguration or planned-swap/repeated-repair process qualification, nonempty NodeUp, full ReplicaUp
 batching, FM/FMM recovery or durable restart. Replicated acceptance withholds
 correlated replies, renegotiates a newer generation, rejects the late stale
 completion and preserves all original owners, data and membership.
@@ -729,7 +735,7 @@ uploading the committed query-only/candidate/completed survivor views. GetLSN
 copies old CC to PC; Deactivate sets IC=CC and survivor Activate clears IC.
 Closed former-Primary metadata is canonical or omitted after deletion. Stale
 upload ACKs neither finish promotion nor change quorum authority. Planned swaps,
-repair and redirected/repeated failover process overlap qualification and restart
+repeated repair and redirected/repeated failover process overlap qualification and restart
 remain separate work.
 Initial-admission acceptance holds actual Secondary role completion across two
 generation updates. LFUM retains committed PC roles/epochs, Primary phase-4 IC

@@ -12,7 +12,7 @@ use fube_transport::serialization::serde::{from_slice_with_budget, to_vec, Objec
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -351,6 +351,39 @@ pub struct ReplicaLoss {
     pub host: String,
     pub app_pid: u32,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaHostReplacement {
+    #[serde(with = "disposal_body")]
+    pub predecessor: AddInstance,
+    pub old_host: String,
+    pub new_host: String,
+    pub old_app_pid: u32,
+    pub old_runtime_root: PathBuf,
+    pub app_pid: u32,
+    pub runtime_root: PathBuf,
+}
+struct ActivationPlan {
+    package: PathBuf,
+    application: String,
+    parameters: Vec<(String, String)>,
+}
+fn lost_replica_metadata(state: &ra::EntityState) -> bool {
+    (state.fm_primary
+        || state
+            .peer_creation
+            .as_ref()
+            .is_some_and(|p| p.host_down && p.delete_operation != 0))
+        && state.phase == ra::Phase::Closed
+        && state.local_deleted
+        && state.cleanup_pending
+        && state.fm_stage == ra::FmStage::None
+        && (!state.fm_primary || state.primary_deactivation == Some((Epoch::default(), -2)))
+        && state.runtime.is_none()
+        && state.usage.is_none()
+        && state.registration_lookups.is_empty()
+        && ra::replica_replacement_metadata(state)
+}
 fn pre_open_cancelled(state: &ra::EntityState, creation: u64) -> bool {
     state.phase == ra::Phase::Closed
         && state.local_deleted
@@ -438,6 +471,9 @@ pub struct Node {
     open_failure: Option<OpenFailureWitness>,
     failed_open: Option<FailedOpenDeletion>,
     host_predecessors: Vec<Arc<AddInstance>>,
+    activation_plan: Option<ActivationPlan>,
+    activation_predecessor: Option<Arc<AddInstance>>,
+    host_replacements: Vec<ReplicaHostReplacement>,
     #[cfg(feature = "qualification")]
     hold_replies: bool,
 }
@@ -521,6 +557,9 @@ impl Node {
             open_failure: None,
             failed_open: None,
             host_predecessors: Vec::new(),
+            activation_plan: None,
+            activation_predecessor: None,
+            host_replacements: Vec::new(),
             #[cfg(feature = "qualification")]
             hold_replies: false,
         })
@@ -535,10 +574,18 @@ impl Node {
             return Err(Error::OwnerLost);
         }
         self.activation.start(package, application, parameters)?;
+        self.activation_plan = Some(ActivationPlan {
+            package: package.to_owned(),
+            application: application.to_owned(),
+            parameters: parameters.to_owned(),
+        });
         Ok(())
     }
     pub fn activation(&self) -> &Activation {
         &self.activation
+    }
+    pub fn host_replacements(&self) -> &[ReplicaHostReplacement] {
+        &self.host_replacements
     }
     pub fn retire_lost_primary_host(&mut self) -> Result<bool> {
         self.retire_lost_replica_host()
@@ -555,21 +602,9 @@ impl Node {
             self.activation.profile(),
             h::local::Profile::VolatileStatefulFmPrimary
                 | h::local::Profile::VolatileStatefulLifecycle
+                | h::local::Profile::VolatileStatefulExternalFm
         ) || snapshot.fenced
-            || (!state.fm_primary
-                && !state
-                    .peer_creation
-                    .as_ref()
-                    .is_some_and(|p| p.host_down && p.delete_operation != 0))
-            || state.phase != ra::Phase::Closed
-            || !state.local_deleted
-            || !state.cleanup_pending
-            || state.fm_stage != ra::FmStage::None
-            || (state.fm_primary && state.primary_deactivation != Some((Epoch::default(), -2)))
-            || state.runtime.is_some()
-            || state.usage.is_some()
-            || !state.registration_lookups.is_empty()
-            || !ra::replica_replacement_metadata(&state)
+            || !lost_replica_metadata(&state)
             || self.last_error.is_some()
             || self.rejected_reply.is_some()
         {
@@ -985,7 +1020,32 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         let base = &body.replica.0;
-        let current = self.ra.snapshot(base.unit.id.guid.0).committed;
+        let snapshot = self.ra.snapshot(base.unit.id.guid.0);
+        let current = snapshot.committed;
+        let lost_host = !snapshot.fenced
+            && self.activation_plan.is_some()
+            && self
+                .activation
+                .process_status()
+                .is_some_and(|p| p.exit_observed)
+            && current.as_ref().is_some_and(|state| {
+                lost_replica_metadata(state)
+                    && base.replica.id > state.body.replica.id
+                    && base.replica.instance > state.body.replica.instance
+            });
+        let activating = self.activation_predecessor.is_some()
+            && current.as_ref().is_some_and(|state| {
+                state.phase == ra::Phase::Opening
+                    && state.body.unit == base.unit
+                    && state.body.service == base.service
+                    && state.body.replica.node == base.replica.node
+                    && state.body.replica.id == base.replica.id
+                    && state.body.replica.instance == base.replica.instance
+                    && state
+                        .peer_creation
+                        .as_ref()
+                        .is_some_and(|p| p.source == *source)
+            });
         let retired_original = current.as_ref().is_some_and(|state| {
             state.phase == ra::Phase::Closed
                 && state.local_deleted
@@ -994,10 +1054,10 @@ impl Node {
                 && state.body.replica.instance == base.replica.instance
                 && state.body.unit == base.unit
         });
-        if !self.peer_profile()
+        if (!self.peer_profile() && !(self.fm_primary_profile() && (lost_host || activating)))
             || !self.ra.is_peer(source)
             || generation.for_fm_replica
-            || (!self.live.load(Ordering::SeqCst) && !retired_original)
+            || (!self.live.load(Ordering::SeqCst) && !retired_original && !activating)
             || !self.ra.consumer_lifetime().is_accepting()
         {
             return Err(Error::Unsupported);
@@ -1019,16 +1079,19 @@ impl Node {
             if !current.local_deleted
                 || current.fm_stage != ra::FmStage::None
                 || base.replica.id <= current.body.replica.id
-                || self
-                    .activation
-                    .session_status()?
-                    .is_none_or(|session| !session.connected)
-                || self
-                    .activation
-                    .process_status()
-                    .is_none_or(|process| process.exit_observed)
+                || (!lost_host
+                    && (self
+                        .activation
+                        .session_status()?
+                        .is_none_or(|session| !session.connected)
+                        || self
+                            .activation
+                            .process_status()
+                            .is_none_or(|process| process.exit_observed)))
                 || (!admitted_retry
-                    && ((self.host_predecessors.is_empty() && self.instance_disposal().is_none())
+                    && ((!lost_host
+                        && self.host_predecessors.is_empty()
+                        && self.instance_disposal().is_none())
                         || !self.quiescent()
                         || !self.commands.is_empty()
                         || self
@@ -1052,11 +1115,21 @@ impl Node {
             return Err(Error::Unsupported);
         }
         let selected = base.clone();
+        let predecessor =
+            lost_host.then(|| current.as_ref().expect("closed predecessor").body.clone());
         let id = self.enqueue(Work::PeerCreate(
             Arc::new(body),
             source.clone(),
             generation.clone(),
         ))?;
+        if !generation
+            .number
+            .older_than(&self.ra.generation_state().receive)
+        {
+            if let Some(predecessor) = predecessor {
+                self.activation_predecessor = Some(predecessor);
+            }
+        }
         if self.selected.is_none()
             && !generation
                 .number
@@ -1575,10 +1648,23 @@ impl Node {
                             .current
                             .older_than(body.configuration.unit.current)
                 });
+        let retained_configuration =
+            self.ra
+                .snapshot(body.configuration.unit.id.guid.0)
+                .committed
+                .is_some_and(|state| {
+                    state.phase == ra::Phase::Ready
+                        && state.fm_primary
+                        && state.body.replica.current_role == 4
+                        && state.reconfiguration.as_ref().is_some_and(|configuration| {
+                            configuration.request == body.configuration
+                        })
+                });
         if !self.fm_primary_profile()
             && !(self.peer_profile()
                 && self.active_stateful_configuration(body.configuration.unit.id.guid.0))
             && !closed_replay
+            && !retained_configuration
         {
             return Err(Error::Unsupported);
         }
@@ -1756,6 +1842,9 @@ impl Node {
                         && self.selected.as_ref().is_none_or(|selected| {
                             body.unit != selected.unit || body.service != selected.service
                         })
+                        && current
+                            .remote_idle(&body.replica.node)
+                            .is_none_or(|remote| remote.fm_request.as_deref() != Some(body))
                 })
             || to_vec(&body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
         {
@@ -2551,13 +2640,107 @@ impl Node {
             }
         }
     }
+    fn activate_for_registration(
+        &mut self,
+        token: u64,
+        lookup: u64,
+        body: &AddInstance,
+    ) -> Result<bool> {
+        let Some(predecessor) = self.activation_predecessor.clone() else {
+            return Ok(true);
+        };
+        let snapshot = self.ra.snapshot(body.unit.id.guid.0);
+        if snapshot.fenced
+            || snapshot.committed.as_ref().is_none_or(|state| {
+                state.phase != ra::Phase::Opening
+                    || state.open_token != token
+                    || state
+                        .registration_lookups
+                        .get(&lookup)
+                        .is_none_or(|(issued, _)| *issued != token)
+                    || state.body.replica.id != body.replica.id
+                    || state.body.replica.instance != body.replica.instance
+                    || state.body.service != body.service
+                    || state.runtime.is_some()
+                    || state.usage.is_some()
+            })
+            || body.unit.id != predecessor.unit.id
+            || body.service != predecessor.service
+            || body.replica.node != predecessor.replica.node
+            || body.replica.id <= predecessor.replica.id
+            || body.replica.instance <= predecessor.replica.instance
+            || self.last_error.is_some()
+            || self.rejected_reply.is_some()
+            || !self.usage.is_empty()
+        {
+            return Err(Error::Unsupported);
+        }
+        if self.activation.observe_process_exit()?.is_none() {
+            return Err(Error::Unsupported);
+        }
+        self.stop_admission();
+        let cleaned = match self.activation.terminate() {
+            Ok(cleaned) => cleaned,
+            Err(h::local::LocalError::Busy) => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !cleaned || !self.activation.deliveries_drained() {
+            return Ok(false);
+        }
+        let old_host = self
+            .activation
+            .identity()
+            .ok_or(Error::Protocol)?
+            .host_id
+            .clone();
+        let old_app_pid = self.activation.process_status().ok_or(Error::Protocol)?.pid;
+        let old_runtime_root = self.activation.root().ok_or(Error::Protocol)?.to_owned();
+        let profile = if self.activation.profile() == h::local::Profile::VolatileStatefulExternalFm
+        {
+            h::local::Profile::VolatileStatefulExternalFm
+        } else {
+            h::local::Profile::VolatileStatefulLifecycle
+        };
+        let mut activation = self.activation.successor(profile)?;
+        let live = Arc::new(AtomicBool::new(true));
+        activation.bind_consumer(Arc::new(Gate {
+            live: live.clone(),
+            ra: self.ra.consumer_lifetime(),
+        }))?;
+        self.activation = activation;
+        self.live = live;
+        self.route = None;
+        self.held_reply = None;
+        self.selected = Some(body.clone());
+        self.package_registration.registered = false;
+        self.host_predecessors.push(predecessor.clone());
+        self.activation_predecessor = None;
+        let plan = self.activation_plan.as_ref().ok_or(Error::Unsupported)?;
+        self.activation
+            .start(&plan.package, &plan.application, &plan.parameters)?;
+        self.host_replacements.push(ReplicaHostReplacement {
+            predecessor: (*predecessor).clone(),
+            old_host,
+            old_app_pid,
+            old_runtime_root,
+            new_host: self
+                .activation
+                .identity()
+                .ok_or(Error::Protocol)?
+                .host_id
+                .clone(),
+            app_pid: self.activation.process_status().ok_or(Error::Protocol)?.pid,
+            runtime_root: self.activation.root().ok_or(Error::Protocol)?.to_owned(),
+        });
+        Ok(true)
+    }
     fn lookup(
         &mut self,
         token: u64,
         lookup: u64,
         body: &AddInstance,
         usage: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.usage.iter().any(|u| u.lookup == lookup) {
             return Err(Error::Protocol);
         }
@@ -2565,14 +2748,14 @@ impl Node {
             return Err(Error::Capacity);
         }
         // An issued lookup can outlive Delete; complete its explicit failure to drain RA.
-        let retired_lookup = self.activation.cleanup_status().logical_retired
+        let retired_lookup = (self.activation.cleanup_status().logical_retired
+            || self.activation_predecessor.is_some())
             && self
                 .ra
                 .snapshot(body.unit.id.guid.0)
                 .committed
                 .is_some_and(|state| {
-                    state.phase == ra::Phase::Closed
-                        && state.local_deleted
+                    matches!(state.phase, ra::Phase::Closing | ra::Phase::Closed)
                         && state.runtime.is_none()
                         && state
                             .registration_lookups
@@ -2587,7 +2770,10 @@ impl Node {
                 error: ra::HOSTING_SERVICE_TYPE_NOT_REGISTERED,
                 ..Default::default()
             }))?;
-            return Ok(());
+            return Ok(true);
+        }
+        if !self.activate_for_registration(token, lookup, body)? {
+            return Ok(false);
         }
         let premise = self.activation.premise().ok_or(Error::Protocol)?;
         let result = self.activation.lookup_registration(&h::LookupRequest {
@@ -2623,6 +2809,21 @@ impl Node {
                         != body.service.service_type
                 {
                     return Err(Error::Protocol);
+                }
+                // A registration can arrive before readiness or outlive its host.
+                match self.activation.poll_registration() {
+                    Ok(true) => {}
+                    Ok(false)
+                    | Err(
+                        h::local::LocalError::ProcessExited(_)
+                        | h::local::LocalError::SessionLost
+                        | h::local::LocalError::RegistrationTimeout,
+                    ) => {
+                        event.error = ra::HOSTING_SERVICE_TYPE_NOT_REGISTERED;
+                        self.enqueue(Work::Registered(event))?;
+                        return Ok(true);
+                    }
+                    Err(error) => return Err(error.into()),
                 }
                 event.registration = ra::RuntimeRegistration {
                     service_type: service_type(&registration.type_instance.service_type),
@@ -2673,7 +2874,7 @@ impl Node {
         // Capacity was reserved before increment; no fallible operation between
         // the acquisition and placing its frozen completion in owned escrow.
         self.enqueue(Work::Registered(event))?;
-        Ok(())
+        Ok(true)
     }
     fn effect(&mut self) -> Result<()> {
         let Some(dispatch) = self.effects.front().cloned() else {
@@ -2736,7 +2937,9 @@ impl Node {
                 }) {
                     self.disposal = None;
                 }
-                self.lookup(*token, *lookup, body, *usage)?;
+                if !self.lookup(*token, *lookup, body, *usage)? {
+                    return Ok(());
+                }
                 LocalDisposition::LocalResponse
             }
             ra::Effect::UpdateConfiguration {

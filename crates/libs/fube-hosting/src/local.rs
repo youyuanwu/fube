@@ -470,6 +470,24 @@ impl Activation {
     pub fn cleanup_status(&self) -> CleanupStatus {
         self.cleanup
     }
+    pub fn successor(&self, profile: Profile) -> LocalResult<Self> {
+        if !self.cleanup.directory_released
+            || !self.producers_stopped()
+            || !self.deliveries_drained()
+            || self
+                .process_status()
+                .is_none_or(|p| !p.reaped || !p.group_drained)
+            || !matches!(
+                profile,
+                Profile::VolatileStatefulLifecycle | Profile::VolatileStatefulExternalFm
+            )
+        {
+            return Err(LocalError::Busy);
+        }
+        let mut options = self.options.clone();
+        options.profile = profile;
+        Self::new(options)
+    }
     pub fn residency(&self) -> &Residency {
         &self.residency
     }

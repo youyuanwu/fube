@@ -211,7 +211,13 @@ pub(crate) struct GenerationHandshake {
     initial_membership: Option<Configuration>,
     initial_builds: Option<Vec<AddReplica>>,
     failover: Option<Configuration>,
+    repair: Option<RepairInventory>,
     retry_at: Vec<Instant>,
+}
+struct RepairInventory {
+    previous: ConfigurationReply,
+    build: AddReplica,
+    configuration: Option<Configuration>,
 }
 impl GenerationHandshake {
     pub fn new(current: &GenerationNumber, nodes: usize) -> Result<Self> {
@@ -224,6 +230,7 @@ impl GenerationHandshake {
             initial_membership: None,
             initial_builds: None,
             failover: None,
+            repair: None,
             retry_at: vec![Instant::now(); nodes],
         })
     }
@@ -1079,6 +1086,13 @@ impl Ledger {
     }
 
     fn validate_peer_lfum(&self, index: usize, body: &LfumUpload) -> Result<()> {
+        if let Some(repair) = self
+            .generation
+            .as_ref()
+            .and_then(|round| round.repair.as_ref())
+        {
+            return self.validate_repair_lfum(index, body, repair);
+        }
         if let Some(intent) = self
             .generation
             .as_ref()
@@ -1362,6 +1376,100 @@ impl Ledger {
         Ok(())
     }
 
+    fn validate_repair_lfum(
+        &self,
+        index: usize,
+        body: &LfumUpload,
+        repair: &RepairInventory,
+    ) -> Result<()> {
+        let placement = &self.placements[index];
+        if placement.node_description.as_ref() != Some(&body.node)
+            || !body.any_replica_found
+            || body.units.0.len() != 1
+        {
+            return Err("LFUM repair requires the known live Node inventory".into());
+        }
+        let info = &body.units.0[0];
+        let mut expected = Configuration {
+            unit: repair.previous.unit.clone(),
+            service: repair.build.service.clone(),
+            replicas: repair.previous.replicas.clone(),
+        };
+        let primary = expected
+            .replicas
+            .0
+            .iter()
+            .any(|r| r.node == placement.launch.node && r.current_role == 4);
+        let fresh = placement.launch.node == repair.build.replica.node;
+        let mut transitioning = false;
+        if let Some(request) = &repair.configuration {
+            let mut complete = request.unit.clone();
+            complete.previous = Epoch::default();
+            if info.unit == request.unit || info.unit == complete {
+                transitioning = info.unit == request.unit;
+                expected = request.clone();
+                if !transitioning {
+                    expected.unit = complete;
+                    for r in &mut expected.replicas.0 {
+                        r.previous_role = 1;
+                    }
+                }
+            }
+        }
+        let building = expected.unit == repair.previous.unit;
+        if building {
+            if fresh {
+                expected.replicas.0.clear();
+            }
+            if primary || fresh {
+                expected.replicas.0.push(repair.build.replica.clone());
+            }
+        }
+        if info.unit != expected.unit
+            || info.service != expected.service
+            || info.local_deleted
+            || info.report_from_primary != primary
+            || info.replicas.0.len() != expected.replicas.0.len()
+            || (info.intermediate != Epoch::default()
+                && !(transitioning && !fresh && info.intermediate == expected.unit.current))
+        {
+            return Err("LFUM repair changed the admitted membership or phase".into());
+        }
+        for mut expected in expected.replicas.0 {
+            expected.first_lsn = -1;
+            expected.last_lsn = -1;
+            let mut matching = info
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.description.node == expected.node);
+            let actual = matching.next().ok_or("missing known repair replica")?;
+            if building && expected.node == repair.build.replica.node {
+                if !matches!(actual.description.state, 1 | 2)
+                    || (fresh && actual.description.state != 1)
+                    || actual.description.replication_endpoint.is_empty()
+                    || !actual.description.service_endpoint.is_empty()
+                {
+                    return Err("LFUM repair build must remain an InBuild/Ready Idle".into());
+                }
+                expected.state = actual.description.state;
+                expected.replication_endpoint = actual.description.replication_endpoint.clone();
+            }
+            if matching.next().is_some()
+                || actual.description != expected
+                || actual.intermediate_role
+                    != if info.intermediate == Epoch::default() {
+                        1
+                    } else {
+                        expected.current_role
+                    }
+            {
+                return Err("LFUM repair changed a known replica lifetime or its roles".into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn begin_generation(&mut self) -> Result<()> {
         let peer = self.placements[0].launch.profile.peer_replicas();
         let stable_peer = self.configuration.as_ref().is_some_and(|c| {
@@ -1445,20 +1553,56 @@ impl Ledger {
                             && r.current_role == 1
                             && !r.up
                             && r.state == 3
-                            && self
-                                .placements
-                                .iter()
-                                .any(|p| p.launch.node == r.node && p.loss_reported)
+                            && self.placements.iter().any(|p| {
+                                p.launch.node == r.node
+                                    && (p.loss_reported
+                                        || self.repair.as_ref().is_some_and(|repair| {
+                                            repair.predecessor.replica.node == r.node
+                                        }))
+                            })
                     })
             })
             .map(|swap| swap.body.configuration.clone());
+        let repair = self
+            .repair
+            .as_ref()
+            .filter(|r| {
+                !r.unknown
+                    && r.profile.is_some()
+                    && r.host_requested
+                    && r.removal.is_none()
+                    && r.base.is_none()
+                    && r.build.body.service.target == 3
+                    && r.build.body.service.minimum == 2
+                    && r.build.reply.as_ref().is_none_or(|reply| reply.error == 0)
+                    && r.configuration.as_ref().is_none_or(|c| !c.unknown)
+                    && failover.is_some()
+                    && self
+                        .swap
+                        .as_ref()
+                        .and_then(|s| s.reply.as_ref())
+                        .is_some_and(|reply| reply.error == 0 && reply.replicas.0.len() == 2)
+            })
+            .map(|r| RepairInventory {
+                previous: self
+                    .swap
+                    .as_ref()
+                    .and_then(|s| s.reply.clone())
+                    .expect("completed repair base"),
+                build: r.build.body.clone(),
+                configuration: r
+                    .configuration
+                    .as_ref()
+                    .map(|c| c.body.configuration.clone()),
+            });
         if (peer
             && !stable_peer
             && initial_membership.is_none()
             && initial_builds.is_none()
-            && failover.is_none())
-            || (self.swap.is_some() && failover.is_none())
-            || self.repair.is_some()
+            && failover.is_none()
+            && repair.is_none())
+            || (self.swap.is_some() && failover.is_none() && repair.is_none())
+            || (self.repair.is_some() && repair.is_none())
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
             || self
@@ -1470,11 +1614,12 @@ impl Ledger {
                 .iter()
                 .enumerate()
                 .any(|(index, placement)| {
-                    let lost_primary = failover.as_ref().is_some_and(|intent| {
-                        intent.replicas.0.iter().any(|r| {
-                            r.node == placement.launch.node && r.previous_role == 4 && !r.up
-                        })
-                    });
+                    let lost_primary = repair.is_none()
+                        && failover.as_ref().is_some_and(|intent| {
+                            intent.replicas.0.iter().any(|r| {
+                                r.node == placement.launch.node && r.previous_role == 4 && !r.up
+                            })
+                        });
                     placement.bootstrap != Bootstrap::Admitted
                         || !placement.link_alive
                         || (!lost_primary
@@ -1490,7 +1635,10 @@ impl Ledger {
                                 && placement.observed != Observed::Running
                                 && !((initial_membership.is_some() || initial_builds.is_some())
                                     && index != 0
-                                    && placement.observed == Observed::Absent))
+                                    && placement.observed == Observed::Absent)
+                                && !(repair.as_ref().is_some_and(|r| {
+                                    r.build.replica.node == placement.launch.node
+                                }) && placement.observed == Observed::Pending))
                                 || (placement.loss_reported && !lost_primary)))
                 })
         {
@@ -1507,6 +1655,7 @@ impl Ledger {
         round.initial_membership = initial_membership;
         round.initial_builds = initial_builds;
         round.failover = failover;
+        round.repair = repair;
         Ok(())
     }
     pub fn report(&mut self, index: usize, body: &ReplicaUp) -> Result<Option<ReplicaUp>> {
