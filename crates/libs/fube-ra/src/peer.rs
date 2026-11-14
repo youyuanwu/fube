@@ -249,6 +249,60 @@ pub struct RemoteRemoval {
     pub detail: ProxyErrorDetail,
 }
 
+pub(super) fn initial_idle_build(state: &EntityState) -> bool {
+    if state.reconfiguration.is_some()
+        || state.swap.is_some()
+        || state.progress_query.is_some()
+        || state.local_deleted
+        || state.cleanup_pending
+        || !state.body.service.stateful
+        || state.body.service.persisted
+        || state.body.unit.previous != Epoch::default()
+        || !valid_stateful_sizes(&state.body.service)
+        || !state.body.replica.up
+    {
+        return false;
+    }
+    if state.fm_primary {
+        state.phase == Phase::Ready
+            && state.peer_creation.is_none()
+            && state.body.replica.current_role == 4
+            && state.body.replica.state == 2
+            && state.primary_deactivation == Some((state.body.unit.current, 0))
+            && !state.remote_idles.is_empty()
+            && state.remote_idles.iter().all(|remote| {
+                remote.fm_request.is_some()
+                    && remote.removal.is_none()
+                    && !remote.creation_failed()
+                    && remote
+                        .build
+                        .as_ref()
+                        .is_none_or(|build| build.result.is_none_or(|error| error == 0))
+            })
+    } else {
+        matches!(state.phase, Phase::Opening | Phase::Ready)
+            && state.body.replica.current_role == 2
+            && state.body.replica.state == 1
+            && state.remote_idles.is_empty()
+            && state.peer_creation.as_ref().is_some_and(|peer| {
+                !peer.host_down
+                    && peer.registration_error.is_none()
+                    && peer.open_error.is_none()
+                    && peer.delete_operation == 0
+                    && peer.deactivation.epoch == state.body.unit.current
+                    && peer.deactivation.catchup_lsn == 0
+            })
+    }
+}
+
+pub fn continues_initial_idle_build(state: &EntityState, body: &AddReplica) -> bool {
+    initial_idle_build(state)
+        && state
+            .remote_idle(&body.replica.node)
+            .and_then(|remote| remote.fm_request.as_deref())
+            == Some(body)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuildCompletion {
     pub unit: FailoverUnit,

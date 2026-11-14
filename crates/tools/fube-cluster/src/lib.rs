@@ -708,6 +708,7 @@ impl Cluster {
     }
     async fn advance_initial_membership(&mut self) -> Result<()> {
         if self.config.profile.configured_sizes().is_none()
+            || self.ledger.generation_pending()
             || self.children.len() <= 1
             || self.ledger.configuration.is_some()
             || self.ledger.placements[0].observed != fm::Observed::Running

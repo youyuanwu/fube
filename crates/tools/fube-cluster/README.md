@@ -684,6 +684,8 @@ The programmatic `Cluster::begin_generation_handshake()` starts the bounded
 ordinary-FM GenerationProposal/Reply and GenerationUpdate/Reject round.
 It requires admitted nodes without pending lifecycle/control requests:
 two stateless/independent singleton sessions, stable completed 3/2 membership,
+original FM-owned Idle creation/build in the immutable 3/2 profile after each
+participating RA commits its creation request,
 or the original healthy same-Primary Secondary admission after each RA commits
 its configuration request.
 This is opt-in, not a CLI command or a change to default bootstrap. Proposed,
@@ -699,7 +701,13 @@ without blocking owner shutdown or reopening replicas. Repeated accepted
 GenerationUpdate messages start fresh snapshots and independent upload owners,
 even for the same generation; a sibling ACK cannot cancel their sends/retries.
 Inventory uses the current committed service description. Existing Primary data
-and original node/app/runtime ownership remain intact. Retry qualification drives
+and original node/app/runtime ownership remain intact. During initial build the
+Primary reports its admitted remotes as InBuild/Ready according to committed
+build completion; each destination reports only its own InBuild Idle. PC/IC
+remain invalid. Exact AddReplica retries and build completions remain independent
+of upload ACKs, but new configuration intent waits for reconciliation. Both
+launchers qualify this with a held real application copy operation and superseding
+generations, without reopening replicas. Retry qualification drives
 the shared upload state at explicit deadlines over real correlated Channels;
 separate process cases retain the original node/app/runtime owners. This is one live-session
 round for stateless/independent singleton or bounded 3/2 profiles, not

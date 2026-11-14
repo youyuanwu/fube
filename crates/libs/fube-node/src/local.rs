@@ -1470,7 +1470,12 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        self.admit_remote_control(&body, source, generation)?;
+        let continuing = self
+            .ra
+            .snapshot(body.unit.id.guid.0)
+            .committed
+            .is_some_and(|state| ra::continues_initial_idle_build(&state, &body));
+        self.admit_remote_control(&body, source, generation, continuing)?;
         self.enqueue(Work::AddReplica(
             Arc::new(body),
             source.clone(),
@@ -1727,7 +1732,7 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        self.admit_remote_control(&body, source, generation)?;
+        self.admit_remote_control(&body, source, generation, false)?;
         self.enqueue(Work::RemoveReplica(
             Arc::new(body),
             source.clone(),
@@ -1739,6 +1744,7 @@ impl Node {
         body: &AddInstance,
         source: &NodeInstance,
         generation: &GenerationHeader,
+        continuing: bool,
     ) -> Result<()> {
         self.admit_fm(source, generation)?;
         if (!self.fm_primary_profile()
@@ -1752,7 +1758,7 @@ impl Node {
                         && ra::completed_primary_failover(&s)
                 }))
             || !self.live.load(Ordering::SeqCst)
-            || self.ra.generation_state().upload_pending
+            || (self.ra.generation_state().upload_pending && !continuing)
             || !self.ra.is_peer(&body.replica.node)
             || self
                 .ra

@@ -83,7 +83,11 @@ FM only validates and acknowledges known test membership. An additional case
 holds actual Secondary role completion during original same-Primary admission,
 rolls generation twice and rejects stale upload completion before finishing the
 original configuration. Its inventory retains PC and Primary phase-4 IC while
-the Secondary reports invalid IC, following local SF. In-flight builds, other
+the Secondary reports invalid IC, following local SF. Another case holds an actual
+copy-stream operation before application ACK during original 3/2 Idle build,
+rolls generation twice and finishes the original build/admission on unchanged
+owners. The Primary reports its admitted build set; each destination reports only
+its own InBuild Idle, without PC/IC or new serving authority. Manual/failed builds, other
 interrupted reconfiguration, swap/repair inventory and restart recovery remain gated.
 Each accepted generation update owns fresh inventory work. Shared Node upload
 owners retain independent correlated requests, frozen retries and completion,

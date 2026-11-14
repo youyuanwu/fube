@@ -51,8 +51,8 @@ mod reconfiguration;
 #[path = "swap.rs"]
 mod swap;
 pub use peer::{
-    completed_primary_failover, BuildCompletion, PeerCreation, RemoteBuild, RemoteIdle,
-    RemoteRemoval, RemovalCompletion,
+    completed_primary_failover, continues_initial_idle_build, BuildCompletion, PeerCreation,
+    RemoteBuild, RemoteIdle, RemoteRemoval, RemovalCompletion,
 };
 pub use reconfiguration::{
     initial_membership_configuration, replica_replacement_metadata, retired_configuration,
@@ -2562,6 +2562,11 @@ async fn entity_worker(
                     | Kind::RetryConfiguration
             ) && view.generations.upload_pending
                 && !reconfiguration::continues_initial_membership(&work, committed.as_deref())
+                && !(matches!(work.kind, Kind::AddReplica { .. })
+                    && committed.as_deref().is_some_and(|state| {
+                        from_slice::<AddReplica>(&work.bytes)
+                            .is_ok_and(|body| continues_initial_idle_build(state, &body))
+                    }))
             {
                 Err(Failure::Unsupported(
                     "peer control is gated during generation rebuild",

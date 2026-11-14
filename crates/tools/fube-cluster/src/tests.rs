@@ -209,6 +209,68 @@ fn admitting_lfum_validates_sf_phase_roles_without_completing_configuration() {
 }
 
 #[test]
+fn building_lfum_validates_original_idle_states_without_finishing_build_or_configuration() {
+    let mut ledger = initial_configured_ledger(3, 2);
+    for (index, placement) in ledger.placements.iter_mut().enumerate() {
+        placement.node_description = Some(NodeDescription { name: format!("node{index}"), ..NodeDescription::default() });
+    }
+    assert!(ledger.begin_generation().is_err());
+    let builds: Vec<_> = (1..3).map(|destination|
+        ledger.request_idle_on(destination, Instant::now()).unwrap()).collect();
+    ledger.begin_generation().unwrap();
+    let generation = ledger.generation.as_ref().unwrap().number.clone();
+    for index in 0..3 {
+        ledger.generation.as_mut().unwrap().proposal_reply(index, &GenerationProposalReply {
+            proposed: generation.clone(), current: generation.clone(), error: 0,
+        }).unwrap();
+    }
+    assert!(ledger.request_configuration(Instant::now()).is_err());
+    let primary = ledger.placements[0].ready_replica.clone().unwrap();
+    let mut replicas = vec![primary];
+    replicas.extend(builds.iter().map(|build| build.replica.clone()));
+    for index in 0..3 {
+        let body = LfumUpload {
+            generation: generation.clone(),
+            node: ledger.placements[index].node_description.clone().unwrap(),
+            any_replica_found: true,
+            units: ObjectArray(vec![FailoverUnitInfo {
+                service: builds[0].service.clone(), unit: builds[0].unit.clone(),
+                report_from_primary: index == 0,
+                replicas: ObjectArray(replicas.iter().filter(|r|
+                    index == 0 || r.node == ledger.placements[index].launch.node
+                ).cloned().map(|description| ReplicaInfo { description, intermediate_role: 1 }).collect()),
+                ..FailoverUnitInfo::default()
+            }]),
+        };
+        for mutation in 0..7 {
+            let mut bad = body.clone();
+            let info = &mut bad.units.0[0];
+            match mutation {
+                0 => info.replicas.0[0].description.instance += 1,
+                1 => info.replicas.0[0].description.last_lsn = 12,
+                2 => info.replicas.0[0].description.current_role = 3,
+                3 => info.replicas.0[0].description.state = 3,
+                4 => info.replicas.0[0].intermediate_role = 2,
+                5 => info.report_from_primary = !info.report_from_primary,
+                _ => info.unit.current.configuration += 1,
+            }
+            assert!(ledger.lfum_upload(index, bad).is_err());
+        }
+        ledger.lfum_upload(index, body).unwrap();
+    }
+    assert!(!ledger.generation_pending());
+    assert!(ledger.configuration.is_none());
+    assert!(ledger.idles.iter().all(|idle| idle.reply.is_none()));
+    for build in builds {
+        let mut replica = build.replica;
+        replica.state = 2;
+        replica.replication_endpoint = "127.0.0.1:12346".into();
+        ledger.idle_reply(0, AddReplicaReply { unit: build.unit, replica, error: 0 }).unwrap();
+    }
+    assert!(ledger.request_configuration(Instant::now()).is_ok());
+}
+
+#[test]
 fn generation_rebuild_gates_mutations_without_relabeling_existing_serving_state() {
     let mut ledger = ledger();
     ledger.accept(command("a", "create", Some(1))).unwrap();
@@ -433,7 +495,7 @@ fn configured_three_ledger() -> Ledger {
     ledger
 }
 
-fn configured_ledger(target: i32, minimum: i32) -> Ledger {
+fn initial_configured_ledger(target: i32, minimum: i32) -> Ledger {
     let template = launches()[0].clone();
     let mut launches: Vec<_> = (1..=target as u8).map(|placement| {
         let mut launch = template.clone();
@@ -465,6 +527,11 @@ fn configured_ledger(target: i32, minimum: i32) -> Ledger {
     }
     ledger.accept(command("primary", "create", Some(1))).unwrap();
     ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+    ledger
+}
+
+fn configured_ledger(target: i32, minimum: i32) -> Ledger {
+    let mut ledger = initial_configured_ledger(target, minimum);
     for destination in 1..target as usize {
         let body = ledger.request_idle_on(destination, Instant::now()).unwrap();
         let mut replica = body.replica;
@@ -6188,6 +6255,109 @@ async fn lfum_overlapping_updates_keep_independent_retries_and_resume_backpressu
     let mut cluster = Cluster::new(fixture.config()).unwrap();
     cluster.prepare().unwrap();
     let result = node::report_tests::run_lfum_retry(&cluster.ledger.placements[0].launch).await;
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn real_lfum_during_idle_build_preserves_sf_inventory_copy_and_original_owners() {
+    let fixture = Fixture::new("building-lfum");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::Stateful { target: 3, minimum: 2 };
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.start().await.unwrap();
+    let mut barriers = vec![];
+    let result = peer_idle_catch(async {
+        for index in 1..3 {
+            let profile = cluster.children[index].metadata.as_ref().unwrap().profile.as_ref().unwrap();
+            let work = profile.runtime_root.join("deployment/HostingLocalStatefulApp_App1/work");
+            fs::write(work.join("local-copy.block"), b"hold actual copy").map_err(err)?;
+            barriers.push(work);
+        }
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running
+            && barriers[0].join("local-copy.held").exists()).await;
+        cluster.add_idle_replica_on(3).await?;
+        until(&mut cluster, |_| barriers.iter().all(|work| work.join("local-copy.held").exists())).await;
+        let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        let authority = data_contact(&endpoint, b"read\n");
+        let owners = cluster.status();
+        let requests: Vec<_> = cluster.ledger.idles.iter().map(|idle| idle.body.clone()).collect();
+        assert!(cluster.ledger.idles.iter().all(|idle| idle.reply.is_none()));
+        cluster.begin_generation_handshake()?;
+        for _ in 0..2 { for index in 0..3 { cluster.retry_generation(index).await?; } }
+        let held = hold_lfum_uploads(&mut cluster).await?;
+        let frozen_bodies = held.iter().map(|incoming| decode_lfum_upload(&incoming.message))
+            .collect::<std::result::Result<Vec<_>, _>>().map_err(err)?;
+        let frozen = frozen_bodies[0].clone();
+        assert_eq!(frozen.units.0[0].replicas.0.len(), 3);
+        for (index, incoming) in held.iter().enumerate() {
+            let body = decode_lfum_upload(&incoming.message).map_err(err)?;
+            let info = &body.units.0[0];
+            assert_eq!(info.intermediate, Epoch::default());
+            assert_eq!(info.report_from_primary, index == 0);
+            assert!(info.replicas.0.iter().all(|r| r.intermediate_role == 1
+                && r.description.first_lsn == -1 && r.description.last_lsn == -1));
+            if index != 0 {
+                assert_eq!(info.replicas.0.len(), 1);
+                let local = &info.replicas.0[0].description;
+                assert_eq!((local.current_role, local.state), (2, 1));
+                assert!(frozen.units.0[0].replicas.0.iter().any(|r| r.description == *local));
+            }
+        }
+        cluster.ledger.generation.as_mut().unwrap().reject(&frozen.generation)?;
+        for _ in 0..2 { for index in 0..3 { cluster.retry_generation(index).await?; } }
+        let current = hold_lfum_uploads(&mut cluster).await?;
+        for (index, mut incoming) in held.into_iter().enumerate() {
+            incoming.reply.take().ok_or("missing build LFUM reply")?.reply(
+                cluster.children[index].link.as_ref().unwrap().seal(lfum_upload_reply_message(&GenerationHeader {
+                    number: frozen.generation.clone(), for_fm_replica: false,
+                }).map_err(err)?)?, wire::deadline(),
+            ).await.map_err(err)?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while cluster.status()["nodes"].as_array().unwrap().iter().any(|n|
+            n["retained_work"]["generations"]["pending_uploads"] != 1)
+        {
+            assert!(Instant::now() < deadline, "stale build LFUM reply: {}", cluster.status());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for node in cluster.status()["nodes"].as_array().unwrap() {
+            assert_eq!(node["retained_work"]["generations"]["send"],
+                owners["nodes"][0]["retained_work"]["generations"]["send"]);
+        }
+        for request in &requests { cluster.send_idle(request).await?; }
+        assert!(cluster.activate_idle_replica().await.is_err());
+        fs::write(barriers[0].join("local-copy.release"), b"finish first copy").map_err(err)?;
+        until(&mut cluster, |c| c.ledger.idles.iter().filter(|idle| idle.reply.is_some()).count() == 1).await;
+        assert!(cluster.ledger.configuration.is_none());
+        fs::write(barriers[1].join("local-copy.release"), b"finish second copy").map_err(err)?;
+        until(&mut cluster, |c| c.ledger.idle_status()["ready"] == true).await;
+        assert!(cluster.ledger.configuration.is_none());
+        assert_eq!(data_contact(&endpoint, b"read\n"), authority);
+        for (index, incoming) in current.into_iter().enumerate() {
+            assert_eq!(decode_lfum_upload(&incoming.message).map_err(err)?.units,
+                frozen_bodies[index].units);
+            cluster.receive_message(index, incoming).await?;
+        }
+        until(&mut cluster, |c| !c.ledger.generation_pending()
+            && c.status()["nodes"].as_array().unwrap().iter().all(|n|
+                n["retained_work"]["generations"]["upload_pending"] == false)).await;
+        until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+        assert!(data_contact(&endpoint, b"write\n").contains("committed=1 value=acknowledged"));
+        until(&mut cluster, |c| (1..3).all(|i|
+            c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 1)).await;
+        let after = cluster.status();
+        for (old, new) in owners["nodes"].as_array().unwrap().iter().zip(after["nodes"].as_array().unwrap()) {
+            for field in ["node_pid", "app_pid", "runtime_root"] { assert_eq!(old[field], new[field]); }
+            assert_eq!(new["retained_work"]["app_observation"]["opens"], 1);
+            assert_eq!(new["retained_work"]["app_observation"]["provider_acquisitions"], 1);
+        }
+        Ok::<(), String>(())
+    }).await;
+    for work in &barriers { fs::write(work.join("local-copy.release"), b"release copy").unwrap(); }
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
     result.unwrap().unwrap();
