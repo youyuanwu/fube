@@ -216,7 +216,7 @@ impl Owner {
             "application_pid": self.node.as_ref().and_then(|node| node.activation().process_status()).map(|process| process.pid),
             "runtime_root": self.node.as_ref().and_then(|node| node.activation().root()),
             "host_replacement": self.node.as_ref().and_then(|node| node.host_replacements().last()),
-            "host_replacement_count": self.node.as_ref().map_or(0, |node| node.host_replacements().len()),
+            "host_replacement_count": self.node.as_ref().map_or(0, Node::host_replacement_count),
             "retired_applications": self.node.as_ref().map(|node| node.host_replacements().iter().map(|replacement|
                 serde_json::json!({
                     "pid": replacement.old_app_pid, "host_id": replacement.old_host,

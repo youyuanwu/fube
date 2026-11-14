@@ -21,6 +21,7 @@ use std::{
 };
 
 const SLOTS: usize = 32;
+const MAX_HOST_REPLACEMENT_HISTORY: usize = 32;
 const BODY: usize = 64 * 1024;
 // Includes native RAP's runtime/remote/flags wrapper, RA normalization and full
 // transport headers/CRC. Never acquire usage for an unsendable near-limit Add.
@@ -478,6 +479,7 @@ pub struct Node {
     activation_plan: Option<ActivationPlan>,
     activation_predecessor: Option<Arc<AddInstance>>,
     host_replacements: Vec<ReplicaHostReplacement>,
+    host_replacement_count: usize,
     #[cfg(feature = "qualification")]
     hold_replies: bool,
 }
@@ -564,6 +566,7 @@ impl Node {
             activation_plan: None,
             activation_predecessor: None,
             host_replacements: Vec::new(),
+            host_replacement_count: 0,
             #[cfg(feature = "qualification")]
             hold_replies: false,
         })
@@ -588,8 +591,12 @@ impl Node {
     pub fn activation(&self) -> &Activation {
         &self.activation
     }
+    /// Latest physical replacement observations; older diagnostics may be evicted.
     pub fn host_replacements(&self) -> &[ReplicaHostReplacement] {
         &self.host_replacements
+    }
+    pub fn host_replacement_count(&self) -> usize {
+        self.host_replacement_count
     }
     pub fn retire_lost_primary_host(&mut self) -> Result<bool> {
         self.retire_lost_replica_host()
@@ -623,9 +630,6 @@ impl Node {
             Err(h::local::LocalError::Busy) => false,
             Err(error) => return Err(error.into()),
         };
-        if self.activation.cleanup_status().forced {
-            return Err(Error::Unsupported);
-        }
         Ok(cleaned && self.quiescent() && self.commands.is_empty() && self.receipts.is_empty())
     }
 
@@ -2680,22 +2684,22 @@ impl Node {
             || self.last_error.is_some()
             || self.rejected_reply.is_some()
             || !self.usage.is_empty()
-            || self.host_replacements.len() >= SLOTS
         {
             return Err(Error::Unsupported);
         }
         if self.activation.observe_process_exit()?.is_none() {
             return Err(Error::Unsupported);
         }
+        let replacement_count = self
+            .host_replacement_count
+            .checked_add(1)
+            .ok_or(Error::Capacity)?;
         self.stop_admission();
         let cleaned = match self.activation.terminate() {
             Ok(cleaned) => cleaned,
             Err(h::local::LocalError::Busy) => false,
             Err(error) => return Err(error.into()),
         };
-        if self.activation.cleanup_status().forced {
-            return Err(Error::Unsupported);
-        }
         if !cleaned || !self.activation.deliveries_drained() {
             return Ok(false);
         }
@@ -2735,6 +2739,9 @@ impl Node {
         let plan = self.activation_plan.as_ref().ok_or(Error::Unsupported)?;
         self.activation
             .start(&plan.package, &plan.application, &plan.parameters)?;
+        if self.host_replacements.len() == MAX_HOST_REPLACEMENT_HISTORY {
+            self.host_replacements.remove(0);
+        }
         self.host_replacements.push(ReplicaHostReplacement {
             predecessor: (*predecessor).clone(),
             old_host,
@@ -2753,6 +2760,7 @@ impl Node {
             app_pid: self.activation.process_status().ok_or(Error::Protocol)?.pid,
             runtime_root: self.activation.root().ok_or(Error::Protocol)?.to_owned(),
         });
+        self.host_replacement_count = replacement_count;
         Ok(true)
     }
     fn lookup(
