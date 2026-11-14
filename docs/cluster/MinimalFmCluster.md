@@ -611,6 +611,8 @@ commits its CreateReplica request, without waiting for Open/copy/build completio
 The first original 3/2 Primary app-host failover is also supported with both
 original healthy survivors and unchanged 3/2 sizes, including committed GetLSN,
 catch-up, Deactivate, Activate and final RAP completion phases.
+The first explicit post-failover 3/2 repair also supports generation rollover
+after fresh Idle creation/build and during its same-Primary configuration.
 LFUM is the local failover-unit map: this uploads replica
 metadata, not application data, a database backup or a new runtime lifetime.
 The shared RA now projects its committed replica-store view generically, rather
@@ -621,7 +623,8 @@ build and removal update that same view. Failed operations remain reportable
 without becoming successful or acquiring serving authority.
 Model/store tests cover configured repair/removal, planned transfer, redirected
 failover and failed RAP/build states. The test FM's generation-round admission
-and process qualification remain limited to the scenarios above; this does not
+and process qualification remain limited to the scenarios above, including
+the first explicit post-failover repair; this does not
 enable broader startup, FMM, runtime recovery or restart protocols.
 
 Pinned SF revision `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the boundaries:
@@ -640,6 +643,7 @@ Pinned SF revision `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the bounda
 | `common/RALFUMUploadOperation.cpp:14-39`; `common/FailoverConfig.h:30` | A consuming correlated request owns the frozen upload. Timeout retains that body for a new request after the native 30-second retry interval; node drive and owner shutdown remain independent. |
 | `fm/RebuildContext.cpp:389-486`; `fm/FailoverManager.cpp:2620-2647` | Process inventory before acknowledgment. A duplicate/already-ready or different-generation upload receives its echoed reply without replacing accepted inventory or completing a different round. |
 | `ra/GenerationStateManager.cpp:318-337` | Only a reply equal to current receive generation advances send generation. An older in-flight reply cannot finish a superseding round. |
+| `ra/ReconfigurationAgent.cpp:2244-2298`; `ra/ServiceTypeRegistrationWrapper.cpp:283-297`; `Hosting2/FabricRuntimeManager.cpp:181-229` | Fresh replica creation admits Open; its service-type lookup demands Hosting activation. Neither a cluster StartNode API nor LFUM completion supplies a replacement host or replica authority. |
 
 Each accepted `GenerationUpdate`, including a repeat with the same generation,
 owns fresh per-entity read jobs and a distinct upload operation. The shared Node
@@ -764,6 +768,20 @@ S/S activation need not call the unchanged application role callback. RA tests
 independently cover its Deactivate/Activate IC transitions and private failed/unknown
 final commits. The local-cluster journey then loses the final Secondary and proves
 that a new write cannot bypass the unchanged quorum.
+Both launchers also repair the first lost Primary through ordinary AddReplica
+and peer CreateReplica, without a process-owner replacement command. Shared
+Node/Hosting provisions the fresh host only for the committed replica Open's
+registration lookup, after old-owner cleanup. With repair build uploads held
+across superseding generations, FM explicitly admits the repair configuration
+and the Primary commits Deactivate before upload acknowledgment. Exact retries
+resume after send-generation advancement. A second overlap holds genuine fresh
+Secondary role completion, reports Primary phase-4 IC and Secondary invalid IC,
+then lets the Secondary finish before the current LFUM ACK. Frozen inventories
+do not change. ACKs still cannot finish the separately held final RAP operation.
+Both journeys preserve survivor owners and continue nonempty replication using
+the fresh replica after the other original Secondary is lost. The local journey
+then loses the fresh Secondary too and proves a new write cannot acknowledge
+with the Primary's vote alone.
 FM-channel loss during an owned upload leaves it pending
 without advancing send generation or shutting down the original serving app.
 Native-stream/schema-adapter evidence adds six cases:
@@ -771,7 +789,8 @@ Native-stream/schema-adapter evidence adds six cases:
 native truncation rejections. Full C++ handler traces/interoperability,
 nonempty NodeUp reconciliation, full ReplicaUp batching/final upload, interrupted
 peer-configuration process upload outside these original build/admission/failover
-slices, planned-swap/repair process inventory, FM/FMM rebuild and durable
+slices and first explicit post-failover repair, planned-swap/repeated-repair
+process inventory, FM/FMM rebuild and durable
 restart remain unqualified.
 
 ## Healthy three-replica service
@@ -916,7 +935,10 @@ Original node1's Node/RA, in-memory store, generation and peer Channels remain
 alive. Node independently requires actual original app-process exit, committed
 Closed/deleted metadata, drained reporting/commands/lookups and exact acquisition
 release. It explicitly reaps/drains the original process owner and terminates
-its Hosting activation before replacing it. The original host gate remains
+its Hosting activation before replacing it. Ordinary FM AddReplica and peer
+CreateReplica supply the fresh identity and commit the new Idle Open; that
+Open's registration lookup triggers shared Node/Hosting activation. There is
+no preceding launcher `replace-host` command in the repair path. The original host gate remains
 revoked; a new gate, host identity, app process, Hosting root and runtime
 registration are created. The launcher checks the exact original-node receipt
 and independent old PID/root absence. A loss-report ACK, dropped metadata or
@@ -944,6 +966,7 @@ matching native DoReconfigurationReply complete repair.
 |---|---|
 | `fm/FailoverUnit.cpp:718-739`; `fm/Replica.cpp:555-585` | Reuse a dropped placement only with a new replica identity/incarnation and reset build/endpoint metadata. The fixed profile uses a deterministic monotonic allocator, not native wall-clock allocation. |
 | `ra/FailoverUnit.cpp:5487-5523`; `ra/ReconfigurationAgent.cpp:2244-2324` | A lost volatile replica is dropped, not recovered from local state. A newer incarnation creates a fresh local Idle after the old lifetime is closed. |
+| `ra/ServiceTypeRegistrationWrapper.cpp:283-339`; `ra/FailoverUnit.cpp:5143-5195`; `Hosting2/FabricRuntimeManager.cpp:181-229` | Replica Open's service-type registration lookup demands Hosting activation, then waits for registration and actual usage acquisition before RAP Open. Registration visible before readiness or after host exit remains a retryable not-registered completion, not new authority. The local port reactivates the already installed package, not a general native download/deployment manager. |
 | `ra/ReconfigurationAgent.cpp:1855-2038`; `ra/FailoverUnit.cpp:315-363` | The current Primary owns peer creation, real build and native semantic completion; unchanged current epoch during Idle build. |
 | `ra/FailoverUnit.cpp:736-818,2596-2637,3091-3124` | Real catch-up and separate PC/CC obligations; the native phase-3 skip currently requires equal memberships. |
 | `ra/ReconfigurationAgent.cpp:2590-2682`; `ra/FailoverUnit.cpp:929-958,2703-2873,3164-3272` | S/S Deactivate changes metadata/history without Close, followed by activation and final runtime/RA/FM completion. |

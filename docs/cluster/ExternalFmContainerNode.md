@@ -6,10 +6,10 @@ partition** with one Primary, two ActiveSecondaries and fixed target/minimum
 replica-set sizes **3/2**.
 
 The feature supports fresh startup, application use, explicitly FM-driven
-Primary app-host failover and owned shutdown. The runner is a thin owner over
+Primary app-host failover, fresh-Secondary repair and owned shutdown. The runner is a thin owner over
 the same [Node control ingress](../../crates/libs/fube-node/src/control/ingress.rs)
 used and tested by the local cluster, not a separate reliability implementation.
-It is experimental: there is no replacement-host orchestration, reconnect or
+It is experimental: there is no runner-specific replacement-host orchestration, reconnect or
 restart recovery. The deliverable is the standalone process binary and its
 native reliability contract. Container images, networking and orchestration
 belong to the user; fube does not ship a production FM or a container test tier.
@@ -298,7 +298,8 @@ cat /run/fube/node1-session1/status.json
 | `control_bootstrapped` | The original fresh bootstrap completed. |
 | `fm_connected`, `peers_connected` | Original control-connection observations. |
 | `registered`, `application_pid` | Actual local application registration/process observations. |
-| `replica_phase`, `replica_role` | Committed local replica state. |
+| `runtime_root`, `host_replacement`, `host_replacement_count` | Actual current Hosting root and latest shared-Node old/new host cleanup/provisioning observation; not replica admission or serving authority. |
+| `replica_phase`, `replica_role`, `replica_id`, `replica_instance`, `replica_epoch` | Committed local replica state and identity. |
 | `local_configuration_stage`, `local_configuration_complete` | Committed local RA configuration phase/completion, not the FM's receipt of its reply. |
 | `generations` | Admitted receive/send generations, current-generation `upload_pending` readiness and separate `pending_uploads` ownership count; not restart readiness. |
 | `control_unknown`, `control_error`, `error` | Retained session loss or other failure; not permission to promote or reconnect. |
@@ -368,6 +369,13 @@ and original FM-owned Idle creation/build after participating RAs commit their
 creation requests, or original healthy same-Primary Secondary admission once all participating
 RAs have committed their configuration requests. It also supports the first
 original 3/2 Primary app-host failover with both original healthy survivors.
+The first explicit post-failover repair is also qualified in both launchers:
+ordinary replica creation demands a fresh host, and repair configuration may
+commit Deactivate while its build uploads still await ACK. Exact retries resume
+after send-generation advancement. Further rollover during the fresh Secondary's
+held role callback reports Primary phase-4 IC and Secondary invalid IC; the
+Secondary may finish before LFUM ACK without mutating the frozen upload or
+finishing the separately held final RAP operation.
 Each Node uploads its committed local view with cleared LSNs and SF's
 current/previous-Primary reporting rules. A matching correlated LFUM reply advances send generation,
 without reopening replicas or changing application authority. Every accepted
@@ -391,8 +399,9 @@ canonical local dropped metadata or omits its deleted entry.
 The shared RA has no LFUM-specific lineage/size allowlist or upload-pending
 peer-control gate. Its committed replica-store projection also covers existing
 repair/removal, planned transfer, redirection and failed-operation states in
-model/store tests. This does not widen this runner's deployment/runtime profile
-or qualify those additional overlaps in real standalone processes.
+model/store tests. Beyond the first explicit repair above, this does not widen
+this runner's deployment/runtime profile or qualify those additional overlaps
+in real standalone processes.
 Nonempty startup, full ReplicaUp reconciliation, FMM and restart remain gated.
 
 ## Failure behavior and limits
@@ -404,14 +413,16 @@ Nonempty startup, full ReplicaUp reconciliation, FMM and restart remain gated.
 | FM loss while the Primary can still serve | FM loss alone does not revoke the runtime lease or prove the Primary stopped. Writes remain subject to normal partition authority and actual quorum. |
 | Invalid configuration or unsupported intent | Explicit rejection/error; no successful no-op or widened authority. |
 | Verified Primary app-host loss | The external FM can drive shared native GetLSN/reconfiguration/Deactivate/Activate; it must await final completion before publishing the new Primary. |
-| Resize, replacement-host acquisition or restart reconciliation | Unsupported branches remain explicit shared Node/RA or supervisor gates; dispatch alone grants no authority. |
+| Explicit fresh replica creation after processed app-host loss/deletion | The committed Open's registration lookup demands shared Node/Hosting activation after old-owner cleanup. FM separately owns build/configuration; LFUM never starts a host or authorizes membership. |
+| Resize, arbitrary host restart or restart reconciliation | Unsupported branches remain explicit shared Node/RA or supervisor gates; dispatch alone grants no authority. |
 | FM/Node restart or volatile state loss | No adoption, rejoin or data recovery. Tear down the old deployment before starting a fresh one. |
 
 The profile supports one immutable original three-Node, one-partition volatile
 3/2 service only. It does not provide persisted state, elections, a production
 FM, rolling upgrades, multiple partitions or native FM/Federation interoperability.
 The shared native ingress does not expose the local launcher's replacement-host
-supervision, peer reconnection or runtime adoption.
+command, peer reconnection or runtime adoption. It reactivates only the installed
+package for an admitted fresh volatile replica, not native download/deployment management.
 
 ## Process-level verification
 
@@ -422,7 +433,9 @@ write/readback, lost build/final-reply replay, writes before FM observation,
 generation/membership refusal, FM-loss retention, verified Primary app-host loss
 with real peer failover and continuing writes, stable replicated generation
 rollover, generation rollover during held real copy/build and Secondary admission with SF phase
-inventory and stale replies, full membership/data preservation, and owned shutdown.
+inventory and stale replies, demand-driven fresh-host repair with configuration
+admission before LFUM ACK and held Secondary/final-RAP completion, full
+membership/data preservation, and owned shutdown.
 
 ```sh
 cargo nextest run --locked --workspace --all-targets --all-features \

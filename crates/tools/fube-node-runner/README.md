@@ -13,9 +13,10 @@ machine: retries, epochs, roles and completion belong to the shared Node/RA.
 
 This is experimental. Native-free tests exercise three separate Node binaries,
 real runtime/replicator construction, copy/build, application replication,
-lost-reply replay, no-data-loss Primary app-host failover and owned shutdown.
-No native FM/Federation interoperability, replacement-host orchestration,
-reconnect, resize or restart recovery is claimed.
+lost-reply replay, no-data-loss Primary app-host failover, explicit fresh-Secondary
+repair and owned shutdown. Repair uses shared Node/Hosting activation driven by
+the committed fresh replica Open's registration lookup, not a runner command.
+No native FM/Federation interoperability, reconnect, resize or restart recovery is claimed.
 The [process integration tests](tests/standalone.rs) also lose the original FM
 Channel, verify continuing acknowledged writes on the same Primary, and require
 explicit shutdown with retained control uncertainty. Staggered shutdown is
@@ -92,6 +93,14 @@ the original Primary app host, holds the candidate's real Primary callback and
 public replicator final-configuration call, and rolls generation while those
 original operations remain pending. It checks query-only survivor PC, candidate
 phase-4 IC and completed survivor metadata before continuing nonempty data.
+The repair case then uses normal FM AddReplica/peer CreateReplica to demand a
+fresh app host after the original lifetime's metadata deletion and physical
+cleanup. It holds repair build uploads across superseding generations, admits
+configuration before LFUM ACK, and resumes exact peer retries afterward.
+Another rollover holds the fresh Secondary callback; its completion before ACK
+does not alter the frozen inventory or finish the independently held final RAP
+operation. Replays acquire no second host, and the fresh replica supplies quorum
+after the other original Secondary is lost.
 Shared RA inventory no longer has a build/failover lineage allowlist or an
 upload-pending peer-control gate. Committed configuration and independent IC
 roles also cover existing repair/removal, planned transfer, redirected failover
@@ -268,7 +277,8 @@ commit barriers and callback completion. Capacity retains the original incoming
 frame without acknowledging admission, in both launchers.
 
 Unsupported native branches still reject explicitly. The runner does not expose
-the local launcher's owned replacement-host control or invent an external FM,
+the local launcher's owned replacement-host control: fresh-host provisioning
+belongs to shared Node/Hosting after admitted replica creation. It does not invent an external FM,
 spare placement, reconnect or restart protocol. The deprecated
 ChangeConfigurationReply remains explicitly logged/rejected by the shared
 adapter, never a progress gate. Definite rejected control produces a failed

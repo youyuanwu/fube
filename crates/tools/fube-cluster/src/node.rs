@@ -276,6 +276,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut published_host_loss = false;
     let mut repair_requested = None;
     let mut repaired_hosts = Vec::new();
+    let mut published_host_replacements = 0;
     let mut upload = LfumUploadState::default();
     let mut fm_incoming = None;
     if failure.is_none() {
@@ -570,6 +571,46 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         published_retirement = Some(lifetime);
                     }
                 }
+            }
+            for replacement in &node.host_replacements()[published_host_replacements..] {
+                let predecessor = metadata
+                    .profile
+                    .clone()
+                    .ok_or("missing predecessor profile")?;
+                if predecessor.app_pid != replacement.old_app_pid
+                    || predecessor.runtime_root != replacement.old_runtime_root
+                {
+                    failure = Some("host activation changed the predecessor observation".into());
+                    break;
+                }
+                let profile = actual_profile(&node)?;
+                let receipt = HostReplacementReceipt {
+                    deployment: launch.deployment.clone(),
+                    session: launch.session.clone(),
+                    node_pid: std::process::id(),
+                    predecessor,
+                    profile: profile.clone(),
+                    old_host: replacement.old_host.clone(),
+                    new_host: replacement.new_host.clone(),
+                };
+                let identity = (
+                    replacement.predecessor.replica.id,
+                    replacement.predecessor.replica.instance,
+                );
+                if let Err(error) = write_json(
+                    &launch.host_replacement_path(identity.0, identity.1),
+                    &receipt,
+                ) {
+                    failure = Some(error);
+                    break;
+                }
+                metadata.profile = Some(profile);
+                repaired_hosts.push(identity);
+                published_host_replacements += 1;
+                published_host_loss = false;
+            }
+            if failure.is_some() {
+                break;
             }
             if let Some(identity) = repair_requested.filter(|_| adapter.replica_drained(&node)) {
                 match node.retire_lost_replica_host() {
