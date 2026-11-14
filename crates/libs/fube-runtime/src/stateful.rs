@@ -93,6 +93,8 @@ pub(crate) struct Registry {
     configuration_reply_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
     #[cfg(test)]
     remote_reply_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
+    #[cfg(test)]
+    build_cleanup_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
 }
 #[cfg(test)]
 #[derive(Default)]
@@ -157,6 +159,8 @@ impl Registry {
             configuration_reply_hook: Mutex::new(None),
             #[cfg(test)]
             remote_reply_hook: Mutex::new(None),
+            #[cfg(test)]
+            build_cleanup_hook: Mutex::new(None),
         }
     }
     #[cfg(test)]
@@ -176,6 +180,30 @@ impl Registry {
         let hook = Arc::new(OpenAdmissionHook::default());
         *self.remote_reply_hook.lock().unwrap() = Some(hook.clone());
         hook
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_build_cleanup(&self) -> Arc<OpenAdmissionHook> {
+        let hook = Arc::new(OpenAdmissionHook::default());
+        *self.build_cleanup_hook.lock().unwrap() = Some(hook.clone());
+        hook
+    }
+    #[cfg(test)]
+    async fn hold_build_cleanup(&self) {
+        let hook = self.build_cleanup_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.release.notified().await;
+        }
+    }
+    #[cfg(test)]
+    pub(crate) async fn run_build_retry(
+        &self,
+        id: [u8; 16],
+        request: w::ProxyRequest,
+    ) -> Result<()> {
+        let unit = self.get(id).ok_or(Error::Closed)?;
+        self.control(&unit, "ReplicatorBuildIdleReplica", request)
+            .await
     }
     #[cfg(test)]
     async fn hold_remote_reply(&self) {

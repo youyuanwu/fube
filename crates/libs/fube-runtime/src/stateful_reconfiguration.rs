@@ -113,7 +113,7 @@ impl Registry {
                 Ok(())
             }
             "ReplicatorBuildIdleReplica" => self.build(unit, request).await,
-            "ReplicatorRemoveIdleReplica" => self.remove(unit, request, true).await,
+            "ReplicatorRemoveIdleReplica" => self.remove(unit, request, true, None).await,
             "CancelCatchupReplicaSet" => self.cancel_catch_up(unit, request).await,
             "UpdateConfiguration" => self.reconfigure(unit, request).await,
             "ReplicatorGetStatus" | "ReplicatorUpdateEpochAndGetStatus" => {
@@ -1031,12 +1031,14 @@ impl Registry {
                         && !old.busy
                         && !matches!(old.phase, RemotePhase::Dropped | RemotePhase::Retryable)
                 })
-                .map(|old| old.descriptor.clone())
+                .map(|old| (old.descriptor.clone(), old.sequence))
         };
-        if let Some(old) = replacement {
+        if let Some((old, sequence)) = replacement {
+            #[cfg(test)]
+            self.hold_build_cleanup().await;
             let mut cleanup = request;
             cleanup.remote.0[0] = old;
-            self.remove(unit, cleanup, false).await?;
+            self.remove(unit, cleanup, false, Some(sequence)).await?;
             #[cfg(test)]
             self.hold_remote_reply().await;
             return Ok(());
@@ -1217,6 +1219,7 @@ impl Registry {
         unit: &Arc<Unit>,
         request: w::ProxyRequest,
         emit_reply: bool,
+        expected_sequence: Option<u64>,
     ) -> Result<()> {
         let descriptor = request.remote.0[0].clone();
         let info = information(&descriptor, false)?;
@@ -1224,6 +1227,15 @@ impl Registry {
         let (sequence, cancel, absent) = {
             let mut state = unit.state.lock().unwrap();
             if stale(&state.request, &request) {
+                return Ok(());
+            }
+            // A queued Build retry cannot clean up a later remote operation.
+            if expected_sequence.is_some_and(|expected| {
+                state
+                    .remotes
+                    .get(&info.node_id)
+                    .is_none_or(|remote| remote.sequence != expected)
+            }) {
                 return Ok(());
             }
             if !state.valid.load(Ordering::Acquire)
