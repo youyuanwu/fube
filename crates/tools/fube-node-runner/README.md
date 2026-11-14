@@ -3,13 +3,19 @@
 `fube-node` runs one Linux Node/RA/Hosting owner and its application child without
 the local FM launcher's parent/stdin contract. An external FM owns the native
 reliability exchanges. The execution profile is one fresh volatile partition,
-three original Nodes, immutable target/minimum **3/2**, and one initial
-unchanged-Primary admission.
+three original Nodes and immutable target/minimum **3/2**.
+
+The runner is a thin process/transport owner over
+[`fube_node::control::ingress`](../../libs/fube-node/src/control/ingress.rs).
+The local cluster uses that same native FM/peer dispatch, topology checks and
+capability admission. There is no standalone-only creation/configuration state
+machine: retries, epochs, roles and completion belong to the shared Node/RA.
 
 This is experimental. Native-free tests exercise three separate Node binaries,
 real runtime/replicator construction, copy/build, application replication,
-lost-reply replay and owned shutdown. No native FM/Federation interoperability,
-failover, replacement, reconnect, resize or restart recovery is claimed.
+lost-reply replay, no-data-loss Primary app-host failover and owned shutdown.
+No native FM/Federation interoperability, replacement-host orchestration,
+reconnect, resize or restart recovery is claimed.
 The [process integration tests](tests/standalone.rs) also lose the original FM
 Channel, verify continuing acknowledged writes on the same Primary, and require
 explicit shutdown with an honest failed-control outcome.
@@ -38,7 +44,25 @@ The crate-local integration tests launch three actual `fube-node` processes
 with separate run directories and concrete loopback-alias IPs. A native fixture
 FM selects the middle Node as Primary and drives the real application children
 through bootstrap, copy/build, 3/2 admission, acknowledged writes/readback,
-lost-reply replay, refusal and owned shutdown.
+lost-reply replay, refusal and owned shutdown. A separate case kills the exact
+Primary application, waits for its native loss report, promotes an original
+Secondary through real GetLSN/Deactivate/Activate, verifies retained data and
+new acknowledged writes, and replays the final reconfiguration.
+Another case advances the ordinary-FM generation through correlated proposal,
+empty live-session LFUM upload and semantic completion before placement/build.
+A live 3/2 case uploads every member's full committed peer configuration,
+continues acknowledged writes on the original owners and replays native control
+under the new generation. Shared RA owns inventory and completion; the fixture
+FM only validates and acknowledges known test membership. An additional case
+holds actual Secondary role completion during original same-Primary admission,
+rolls generation twice and rejects stale upload completion before finishing the
+original configuration. Its inventory retains PC and Primary phase-4 IC while
+the Secondary reports invalid IC, following local SF. In-flight builds, other
+interrupted reconfiguration, swap/repair inventory and restart recovery remain gated.
+Each accepted generation update owns fresh inventory work. Shared Node upload
+owners retain independent correlated requests, frozen retries and completion,
+including multiple uploads in the same generation. Diagnostic `pending_uploads`
+counts them separately from the current-generation `upload_pending` flag.
 
 ```sh
 cargo build --locked --workspace --bins --examples --all-features
@@ -115,10 +139,10 @@ Its default target/minimum parameters remain 1/1 for existing local fixtures;
 the explicit overrides select 3/2 here. A custom application supplies its own
 declared parameters, listeners and client protocol.
 
-Node IDs are nonzero hexadecimal numbers, not UUIDs. Node/replica instances,
-replica IDs, generation and package-version instance are fixed for the
-deployment. Every Node has the same deployment, partition, generation and
-service/package facts, but its own local placement, peer pair and run directory.
+Node IDs are nonzero hexadecimal numbers, not UUIDs. Configuration supplies the
+original Node/replica instances, replica IDs, bootstrap generation and
+package-version instance. Every Node has the same deployment, partition, initial
+generation and service/package facts, but its own local placement, peer pair and run directory.
 The FM may select any original placement as Primary; no node number or
 application role flag selects it.
 
@@ -157,10 +181,17 @@ Bootstrap correlation and semantic one-way replies are different mechanisms:
 |---|---|
 | NodeUp / NodeUpAck | FM=11 / RS=13, high priority. Ordinary correlated request/reply; the ACK carries generation. |
 | ReplicaUp / ReplicaUpReply | FM=11 / RA=12, high priority. Semantic one-way exchange; reply carries generation. |
-| AddPrimary, AddReplica, DoReconfiguration, DeleteReplica and their replies | Requests RA=12, replies FM=11, high priority. One-way; requests carry generation. |
-| CreateReplica/Reply, Activate/Reply | RA=12, high priority, one-way, each carrying generation. |
+| AddPrimary, AddReplica, RemoveReplica, DoReconfiguration, DeleteReplica and their replies | Requests RA=12, replies FM=11, high priority. One-way; requests carry generation. |
+| CreateReplica/Reply, GetLSN/Reply, Deactivate/Reply, Activate/Reply | RA=12, high priority, one-way, each carrying generation. |
 | ServiceTypeNotification/Reply, ServiceTypeEnabled/Disabled and their replies | FM=11 outbound reports / RA=12 ACKs, normal priority, one-way; ACKs carry generation. |
 | ReplicaEndpointUpdated/Reply | FM=11 / RA=12, normal priority, one-way; reply carries generation. |
+
+Generation negotiation, node activation/deactivation, service updates and load
+forwarding also use the shared control path. Dispatch is not unconditional
+capability admission: the Node/RA and owned Hosting profile retain their
+existing unsupported-operation, inventory, lifecycle and recovery gates.
+Ordinary FM commands require the Node's admitted receive generation; changing
+the configured header without the native generation handshake grants nothing.
 
 Use the [native reliability catalog](../../../docs/cluster/NativeRaProtocol.md)
 for field order, object scopes, headers and codec evidence. Preserve complete
@@ -177,7 +208,7 @@ different identity domains; do not substitute one for another.
 | AddReplica / reply | Ask that Primary to build each original destination. Wait for its actual reply, not CreateReplicaReply or local Idle readiness. |
 | DoReconfiguration / reply | Admit all three exact live Ready identities with P/P and I/S roles, unchanged service description and data-loss epoch. Every required peer commit and final RAP completion precedes the final native reply. |
 | Service-type notification/status and matching replies | Process and ACK actual native work when emitted. These are not a mandatory pre-placement factory-ready handshake. |
-| ReplicaUp / reply | Match the real processed-report semantics. A report never authorizes this profile's deferred failover/replacement operations. |
+| ReplicaUp / reply | Match the real processed-report semantics. A verified app-host loss can inform explicit FM failover intent; report ACKs are not physical disposal or replacement-host authority. |
 | Endpoint-updated reply, when applicable | Match the exact native local lifetime; registration/listeners do not constitute client-ready publication. |
 | Normal DeleteReplica / reply | Tear down the whole service through exact per-member deletion. Local physical cleanup is a separate observation. Force deletion is not admitted. |
 
@@ -187,18 +218,20 @@ not wait for a fabricated pre-create Ready notification. ServiceTypeNotification
 is emitted for actual FT/type association, not as a prerequisite to creating
 that first FT.
 
-The runner admits CreateReplica/Reply and Activate/Reply from original peers
-for this initial flow. It freezes creation/build/configuration/activation inputs
-on successful local admission so retries cannot become another lifetime,
-configuration or Primary choice. Node/RA still performs native source, epoch,
-runtime, commit and callback checks. Capacity retains the original incoming
-frame without acknowledging admission; a socket write is not a semantic ACK.
+After initial admission, an external FM may drive the same supported native
+reconfiguration as the local cluster. Primary failover requires an actual
+matched app-host loss and eligible surviving history/quorums, not a lost FM
+connection. The shared ingress fixes configured sizes at 3/2 and original peer
+bindings; the Node/RA enforces exact epochs, replica lifetimes, runtime authority,
+commit barriers and callback completion. Capacity retains the original incoming
+frame without acknowledging admission, in both launchers.
 
-Other operations reject explicitly: generation turnover/LFUM reconciliation,
-GetLSN/promotion, peer DoReconfiguration continuation, deactivation/retirement,
-RemoveReplica, resizing, service updates and replacement. The deprecated
-ChangeConfigurationReply is explicitly logged/rejected by the shared adapter,
-not used as a progress gate.
+Unsupported native branches still reject explicitly. The runner does not expose
+the local launcher's owned replacement-host control or invent an external FM,
+spare placement, reconnect or restart protocol. The deprecated
+ChangeConfigurationReply remains explicitly logged/rejected by the shared
+adapter, never a progress gate. Definite rejected control produces a failed
+command receipt without blocking unrelated cleanup; uncertain work stays owned.
 
 Limits remain the shared bounded profile: 64-KiB native frame/body cap,
 16 headers/4-KiB header values, four-times-body decode budget, 32 local command/

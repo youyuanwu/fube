@@ -116,6 +116,31 @@ fn absolute(path: &Path) -> bool {
 }
 
 impl Config {
+    pub fn ingress(&self) -> Result<fube_node::control::ingress::Ingress> {
+        use fube_node::control::ingress::{Ingress, Placement as ControlPlacement, Profile};
+        let placement = |value: &Placement| -> Result<ControlPlacement> {
+            Ok(ControlPlacement {
+                node: value.identity.native()?,
+                replica: value.replica_id,
+                incarnation: value.replica_instance,
+            })
+        };
+        Ingress::new(
+            Profile::Stateful {
+                target: 3,
+                minimum: 2,
+            },
+            true,
+            self.partition_id()?,
+            self.fm.identity.native()?,
+            placement(&self.node)?,
+            self.peers
+                .iter()
+                .map(placement)
+                .collect::<Result<Vec<_>>>()?,
+        )
+    }
+
     pub fn read(path: &Path) -> Result<Self> {
         if !fs::symlink_metadata(path).map_err(err)?.is_file() {
             return Err("configuration must be a regular file".into());
@@ -159,7 +184,7 @@ impl Config {
         address(self.fm.address)?;
         if self.fm.generation <= 0 || self.peers.len() != 2 {
             return Err(
-                "healthy 3/2 profile requires one fixed FM generation and two peers".into(),
+                "volatile 3/2 profile requires an initial FM generation and two peers".into(),
             );
         }
         let mut ids = BTreeSet::from([fm.id]);

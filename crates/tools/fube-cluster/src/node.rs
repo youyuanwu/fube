@@ -4,10 +4,14 @@ use crate::{
 };
 use fube_hosting::local::{Activation, NodeContext, Options};
 #[cfg(test)]
+use fube_node::control::SemanticAck;
+#[cfg(test)]
 use fube_node::control::{ticks, Escrow};
+#[cfg(test)]
+use fube_node::local::FmWork;
 use fube_node::{
-    control::{peer_target, Adapter, LfumUploadState, SemanticAck},
-    local::{FmWork, Node},
+    control::{ingress::Admission, peer_target, Adapter, LfumUploadState},
+    local::Node,
 };
 use fube_ra::{entity as ra, protocol::*};
 use fube_ra_store::{MemoryBackend, Settings, Store};
@@ -88,6 +92,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     if unsafe { libc::getppid() } as u32 != launch.parent_pid {
         return Err("internal node requires original launcher parent".into());
     }
+    let ingress = launch.ingress()?;
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
     let address = listener.local_addr().map_err(err)?;
     let mut peer_listeners = vec![];
@@ -272,6 +277,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut repair_requested = None;
     let mut repaired_hosts = Vec::new();
     let mut upload = LfumUploadState::default();
+    let mut fm_incoming = None;
     if failure.is_none() {
         loop {
             // Owned stop remains independent of FM connectivity. Link loss is
@@ -436,7 +442,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         }
                     }
                     if let Some(incoming) = &mut connection.incoming {
-                        match receive_peer_from(launch, peer, &mut node, &incoming.message) {
+                        match ingress.peer(&mut node, &peer.node, &incoming.message, false) {
                             Ok(Some(id)) => {
                                 adapter.track_peer_command(id)?;
                                 if let Some(handoff) = incoming.handoff.as_mut() {
@@ -463,45 +469,41 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 if adapter.acknowledgements().len() == 32 {
                     continue;
                 }
-                match current
-                    .receive(Instant::now() + Duration::from_millis(1))
-                    .await
-                {
-                    Ok(Some(mut incoming)) => {
-                        let received =
-                            match receive_generation(launch, &node, current, &mut incoming).await {
-                                Ok(true) => Ok(None),
-                                Ok(false) => {
-                                    match adapter.reject_deprecated(&node, &incoming.message) {
-                                        Ok(true) => Ok(None),
-                                        Ok(false) => {
-                                            receive_command(launch, &mut node, &incoming.message)
-                                        }
-                                        Err(error) => Err(error),
-                                    }
-                                }
-                                Err(error) => Err(error),
-                            };
-                        match received {
-                            Ok(acknowledgement) => {
-                                if let Some(acknowledgement) = acknowledgement {
-                                    adapter.track_acknowledgement(acknowledgement)?;
-                                }
-                                if let Some(handoff) = incoming.handoff.as_mut() {
-                                    handoff.acknowledge();
-                                }
-                            }
-                            Err(error) => {
-                                adapter.record_error(error);
-                                current.channel.dispose();
-                            }
+                if fm_incoming.is_none() {
+                    match current
+                        .receive(Instant::now() + Duration::from_millis(1))
+                        .await
+                    {
+                        Ok(incoming) => fm_incoming = incoming,
+                        Err(error) => {
+                            adapter.record_error(error);
+                            current.channel.dispose();
                         }
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        adapter.record_error(error);
-                        if let Some(old) = link.take() {
-                            let _ = old.close().await;
+                }
+                if let Some(mut incoming) = fm_incoming.take() {
+                    let received = match ingress.generation(&node, current, &mut incoming).await {
+                        Ok(Some(admission)) => Ok(admission),
+                        Ok(None) => match adapter.reject_deprecated(&node, &incoming.message) {
+                            Ok(true) => Ok(Admission::Submitted(None)),
+                            Ok(false) => ingress.fm(&mut node, &incoming.message, false),
+                            Err(error) => Err(error),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    match received {
+                        Ok(Admission::Retained) => fm_incoming = Some(incoming),
+                        Ok(Admission::Submitted(acknowledgement)) => {
+                            if let Some(acknowledgement) = acknowledgement {
+                                adapter.track_acknowledgement(acknowledgement)?;
+                            }
+                            if let Some(handoff) = incoming.handoff.as_mut() {
+                                handoff.acknowledge();
+                            }
+                        }
+                        Err(error) => {
+                            adapter.record_error(error);
+                            current.channel.dispose();
                         }
                     }
                 }
@@ -659,7 +661,8 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     });
                 let observation = serde_json::json!({
                     "deployment":launch.deployment, "session":launch.session,
-                    "node_pid":std::process::id(), "external_pending":node.external_pending().len(),
+                    "node_pid":std::process::id(),
+                    "external_pending":node.external_pending().len() + node.pending_lfum_uploads(),
                     "adapter_pending":adapter.pending(), "commands":node.pending_commands(),
                     "semantic_pending":adapter.semantic_pending(),
                     "staged_status":format!("{:?}", node.pending_status()),
@@ -690,7 +693,8 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     "generations": {
                         "proposed":generations.proposed, "receive":generations.receive,
                         "send":generations.send, "upload_pending":generations.upload_pending,
-                        "upload_supported":!launch.profile.peer_replicas(),
+                        "pending_uploads":node.pending_lfum_uploads(),
+                        "upload_supported":true,
                     },
                 });
                 if let Err(error) =
@@ -802,141 +806,12 @@ fn receive_peer(
     node: &mut Node,
     message: &fube_transport::message::Message,
 ) -> Result<Option<u64>> {
-    receive_peer_from(
-        launch,
-        launch.peers.first().ok_or("unbound peer ingress")?,
+    launch.ingress()?.peer(
         node,
+        &launch.peers.first().ok_or("unbound peer ingress")?.node,
         message,
+        false,
     )
-}
-fn receive_peer_from(
-    launch: &Launch,
-    peer: &Peer,
-    node: &mut Node,
-    message: &fube_transport::message::Message,
-) -> Result<Option<u64>> {
-    wire::predecode(message)?;
-    let action = message.properties().map_err(err)?.action;
-    let result = match action.as_str() {
-        "DoReconfiguration" if launch.placement == 2 => {
-            let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
-            node.continue_swap_from_peer(body, &peer.node, &generation)
-        }
-        "GetLSN" => {
-            let (body, generation) = decode_get_lsn(message).map_err(err)?;
-            node.get_lsn_from_peer(body, &peer.node, &generation)
-        }
-        "GetLSNReply" => {
-            let (body, generation) = decode_get_lsn_reply(message).map_err(err)?;
-            node.get_lsn_reply_from_peer(body, &peer.node, &generation)
-        }
-        "Deactivate" if launch.placement == 2 || launch.profile.mesh_peers() => {
-            let (body, generation) = decode_deactivate(message).map_err(err)?;
-            launch.check_service_sizes(&body.configuration.unit, &body.configuration.service)?;
-            node.deactivate_replica_from_peer(body, &peer.node, &generation)
-        }
-        "DeactivateReply" if launch.placement == 1 || launch.profile.mesh_peers() => {
-            let (body, generation) = decode_deactivate_reply(message).map_err(err)?;
-            fixed_idle_target(
-                launch,
-                &body.unit.id,
-                &body.replica,
-                &peer.node,
-                peer.replica,
-                peer.incarnation,
-            )?;
-            node.deactivate_reply_from_peer(body, &peer.node, &generation)
-        }
-        "Activate" => {
-            let (body, generation) = decode_activate(message).map_err(err)?;
-            launch.check_service_sizes(&body.configuration.unit, &body.configuration.service)?;
-            node.activate_replica_from_peer(body, &peer.node, &generation)
-        }
-        "ActivateReply" => {
-            let (body, generation) = decode_activate_reply(message).map_err(err)?;
-            fixed_idle_target(
-                launch,
-                &body.unit.id,
-                &body.replica,
-                &peer.node,
-                peer.replica,
-                peer.incarnation,
-            )?;
-            node.activate_reply_from_peer(body, &peer.node, &generation)
-        }
-        "CreateReplica" if launch.placement != 1 || launch.profile.mesh_peers() => {
-            let (body, generation) = decode_create_replica(message).map_err(err)?;
-            launch.check_service_sizes(&body.replica.0.unit, &body.replica.0.service)?;
-            fixed_idle_target(
-                launch,
-                &body.replica.0.unit.id,
-                &body.replica.0.replica,
-                &launch.node,
-                launch.replica,
-                launch.incarnation,
-            )?;
-            node.create_replica_from_peer(body, &peer.node, &generation)
-        }
-        "CreateReplicaReply" if launch.placement == 1 || launch.profile.mesh_peers() => {
-            let (body, generation) = decode_create_replica_reply(message).map_err(err)?;
-            fixed_idle_target(
-                launch,
-                &body.unit.id,
-                &body.replica,
-                &peer.node,
-                peer.replica,
-                peer.incarnation,
-            )?;
-            node.create_replica_reply_from_peer(body, &peer.node, &generation)
-        }
-        _ => return Err("unsupported peer action for original placement".into()),
-    };
-    match result {
-        Ok(id) => Ok(Some(id)),
-        Err(fube_node::local::Error::Capacity) => Ok(None),
-        Err(fube_node::local::Error::Busy) if action == "CreateReplica" => Ok(None),
-        Err(error) => Err(err(error)),
-    }
-}
-
-fn fixed_peer_target(
-    launch: &Launch,
-    partition: &PartitionId,
-    replica: &Replica,
-    node: &NodeInstance,
-    id: i64,
-    instance: i64,
-) -> Result<()> {
-    if partition.guid.0
-        != uuid::Uuid::parse_str(&launch.partition)
-            .map_err(err)?
-            .to_bytes_le()
-        || &replica.node != node
-        || replica.id != id
-        || replica.instance != instance
-    {
-        return Err("peer body is outside the original fixed partition/replica topology".into());
-    }
-    Ok(())
-}
-
-fn fixed_idle_target(
-    launch: &Launch,
-    partition: &PartitionId,
-    replica: &Replica,
-    node: &NodeInstance,
-    id: i64,
-    instance: i64,
-) -> Result<()> {
-    let expected = if (replica.id, replica.instance) == (id, instance) {
-        (id, instance)
-    } else if launch.profile.mesh_peers() && replica.id > id && replica.instance > instance {
-        // The live RA validates the exact current or freshly admitted incarnation.
-        (replica.id, replica.instance)
-    } else {
-        launch.idle_successor()?
-    };
-    fixed_peer_target(launch, partition, replica, node, expected.0, expected.1)
 }
 
 fn replace_replica_host(launch: &Launch, node: &mut Node) -> Result<HostReplacementReceipt> {
@@ -1183,222 +1058,16 @@ fn publish_failed_open(
     Ok(())
 }
 
+#[cfg(test)]
 fn receive_command(
     launch: &Launch,
     node: &mut Node,
     message: &fube_transport::message::Message,
 ) -> Result<Option<(u64, SemanticAck)>> {
-    wire::predecode(message)?;
-    match message.properties().map_err(err)?.action.as_str() {
-        "ServiceTypeEnabledReply" | "ServiceTypeDisabledReply" => {
-            let enabled = message.properties().map_err(err)?.action == "ServiceTypeEnabledReply";
-            let (body, generation) = if enabled {
-                decode_service_type_enabled_reply(message)
-            } else {
-                decode_service_type_disabled_reply(message)
-            }
-            .map_err(err)?;
-            node.fm_work(FmWork::TypeStatusReply(
-                enabled,
-                body,
-                launch.fm.clone(),
-                generation,
-            ))
-            .map_err(err)?;
-        }
-        "NodeActivateRequest" => {
-            let (body, generation) = decode_node_activate_request(message).map_err(err)?;
-            node.fm_work(FmWork::NodeActivate(body, launch.fm.clone(), generation))
-                .map_err(err)?;
-        }
-        "NodeDeactivateRequest" => {
-            let (body, generation) = decode_node_deactivate_request(message).map_err(err)?;
-            node.fm_work(FmWork::NodeDeactivate(body, launch.fm.clone(), generation))
-                .map_err(err)?;
-        }
-        "NodeUpdateServiceRequest" => {
-            let (body, generation) = decode_node_update_service_request(message).map_err(err)?;
-            node.fm_work(FmWork::NodeUpdateService(
-                Box::new(body),
-                launch.fm.clone(),
-                generation,
-            ))
-            .map_err(err)?;
-        }
-        "AddInstance" => {
-            let (body, generation) = decode_add_instance(message).map_err(err)?;
-            node.add_from_fm(body, &launch.fm, &generation)
-                .map_err(err)?;
-        }
-        "AddPrimary" => {
-            let (body, generation) = decode_add_primary(message).map_err(err)?;
-            launch.check_service_sizes(&body.unit, &body.service)?;
-            node.add_primary_from_fm(body, &launch.fm, &generation)
-                .map_err(err)?;
-        }
-        "DoReconfiguration" => {
-            if !launch.profile.peer_replicas()
-                || (launch.placement != 1
-                    && !launch.profile.mesh_peers()
-                    && launch.profile.configured_sizes().is_none())
-            {
-                return Err("DoReconfiguration requires the original coordinating Primary".into());
-            }
-            let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
-            launch.check_service_sizes(&body.configuration.unit, &body.configuration.service)?;
-            node.reconfigure_from_fm(body, &launch.fm, &generation)
-                .map_err(err)?;
-        }
-        "ReplicaEndpointUpdatedReply" => {
-            let (body, generation) = decode_replica_endpoint_updated_reply(message).map_err(err)?;
-            node.endpoint_reply_from_fm(body, &launch.fm, &generation)
-                .map_err(err)?;
-        }
-        "AddReplica" | "RemoveReplica" => {
-            let removing = message.properties().map_err(err)?.action == "RemoveReplica";
-            let (body, generation) = if removing {
-                decode_remove_replica(message)
-            } else {
-                decode_add_replica(message)
-            }
-            .map_err(err)?;
-            launch.check_service_sizes(&body.unit, &body.service)?;
-            let peer = launch
-                .peers
-                .iter()
-                .find(|peer| peer.node == body.replica.node)
-                .filter(|_| launch.placement == 1 || launch.profile.mesh_peers())
-                .ok_or("replica control requires the original coordinating Primary")?;
-            fixed_idle_target(
-                launch,
-                &body.unit.id,
-                &body.replica,
-                &peer.node,
-                peer.replica,
-                peer.incarnation,
-            )?;
-            if removing {
-                node.remove_replica_from_fm(body, &launch.fm, &generation)
-            } else {
-                node.add_replica_from_fm(body, &launch.fm, &generation)
-            }
-            .map_err(err)?;
-        }
-        "RemoveInstance" => {
-            let (body, generation) = decode_remove_instance(message).map_err(err)?;
-            node.fm_work(FmWork::Remove(
-                Box::new(body),
-                launch.fm.clone(),
-                generation,
-            ))
-            .map_err(err)?;
-        }
-        "DeleteReplica" => {
-            let (body, generation) = decode_delete_replica(message).map_err(err)?;
-            if launch.profile == ServiceProfile::StatefulPeerIdle && launch.placement == 2 {
-                let incoming = &body.replica.0;
-                // Native Delete matches ReplicaId, not FM's potentially older instance.
-                let (id, expected_instance) = if incoming.replica.id == launch.replica {
-                    (launch.replica, launch.incarnation)
-                } else {
-                    launch.idle_successor()?
-                };
-                let instance = if incoming.replica.instance < expected_instance
-                    && node
-                        .snapshot(incoming.unit.id.guid.0)
-                        .committed
-                        .is_some_and(|state| state.peer_creation.is_some())
-                {
-                    incoming.replica.instance
-                } else {
-                    expected_instance
-                };
-                fixed_peer_target(
-                    launch,
-                    &body.replica.0.unit.id,
-                    &body.replica.0.replica,
-                    &launch.node,
-                    id,
-                    instance,
-                )?;
-            }
-            node.fm_work(FmWork::DeleteReplica(
-                Box::new(body),
-                launch.fm.clone(),
-                generation,
-            ))
-            .map_err(err)?;
-        }
-        "ReplicaUpReply" => {
-            let (body, generation) = decode_replica_up_reply(message).map_err(err)?;
-            let id = node
-                .fm_work(FmWork::ReplicaUpReply(
-                    body.clone(),
-                    launch.fm.clone(),
-                    generation,
-                ))
-                .map_err(err)?;
-            return Ok(Some((id, SemanticAck::Report(body))));
-        }
-        "ServiceTypeNotificationReply" => {
-            let (body, generation) =
-                decode_service_type_notification_reply(message).map_err(err)?;
-            let id = node
-                .fm_work(FmWork::ServiceTypeReply(
-                    body.clone(),
-                    launch.fm.clone(),
-                    generation,
-                ))
-                .map_err(err)?;
-            return Ok(Some((id, SemanticAck::Notification(body))));
-        }
-        _ => return Err("unsupported command".into()),
+    match launch.ingress()?.fm(node, message, false)? {
+        Admission::Submitted(acknowledgement) => Ok(acknowledgement),
+        Admission::Retained => Err("Capacity".into()),
     }
-    Ok(None)
-}
-async fn receive_generation(
-    launch: &Launch,
-    node: &Node,
-    link: &Link,
-    incoming: &mut fube_transport::channel::IncomingMessage<
-        fube_transport::native_channel::GatewayTarget,
-    >,
-) -> Result<bool> {
-    let message = &incoming.message;
-    match message.properties().map_err(err)?.action.as_str() {
-        "GenerationProposal" => {
-            wire::predecode(message)?;
-            let header = decode_generation_proposal(message).map_err(err)?;
-            let body = node
-                .process_generation_proposal(&launch.fm, &header)
-                .map_err(err)?;
-            let reply = generation_proposal_reply_message(&body).map_err(err)?;
-            incoming
-                .reply
-                .take()
-                .ok_or("GenerationProposal missing consuming request context")?
-                .reply(link.seal(reply)?, wire::deadline())
-                .await
-                .map_err(err)?;
-        }
-        "GenerationUpdate" => {
-            wire::predecode(message)?;
-            let (body, header) = decode_generation_update(message).map_err(err)?;
-            match node
-                .process_generation_update(&launch.fm, &body, &header)
-                .map_err(err)?
-            {
-                ra::GenerationUpdateOutcome::Rejected(proposed) => {
-                    link.send(generation_update_reject_message(&proposed).map_err(err)?)
-                        .await?;
-                }
-                ra::GenerationUpdateOutcome::UploadRequired => link.advance_generation(&header),
-                _ => {}
-            }
-        }
-        _ => return Ok(false),
-    }
-    Ok(true)
 }
 async fn cleanup(
     launch: &Launch,
@@ -1507,7 +1176,7 @@ async fn cleanup(
         original_activation_cleaned: true,
         executor_closed: true,
         store_closed: true,
-        external_pending: node.external_pending().len(),
+        external_pending: node.external_pending().len() + node.pending_lfum_uploads(),
         adapter_pending: adapter.pending(),
         semantic_pending: adapter.semantic_pending(),
     })
@@ -1555,7 +1224,7 @@ pub(crate) mod report_tests {
         statuses: Vec<(bool, ServiceTypeUpdate)>,
     }
 
-    async fn links(launch: &Launch) -> Result<(Link, Link)> {
+    pub(crate) async fn links(launch: &Launch) -> Result<(Link, Link)> {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
         let endpoint = fube_transport::Endpoint::unsecured_tcp(
             listener.local_addr().map_err(err)?,
@@ -3139,7 +2808,7 @@ pub(crate) mod report_tests {
     }
 
     pub(crate) async fn run_lfum_retry(launch: &Launch) -> Result<Result<()>> {
-        let (mut node, store) = create_node(launch).await?;
+        let (mut node, store) = create_node_with_capacity(launch, 2).await?;
         let mut adapter = Adapter::default();
         let result = async {
             node.start(&launch.package, APPLICATION, &[]).map_err(err)?;
@@ -3185,21 +2854,112 @@ pub(crate) mod report_tests {
                 if let Some(handoff) = first.handoff.as_mut() {
                     handoff.acknowledge();
                 }
+                node.process_generation_update(
+                    &launch.fm,
+                    &GenerationUpdate::default(),
+                    &generation,
+                )
+                .map_err(err)?;
+                upload.advance(&node, &up.node, Some(&link), Instant::now())?;
+                let mut second = next_lfum(&mut upload, &fm).await?;
+                if decode_lfum_upload(&second.message).map_err(err)? != frozen {
+                    return Err(
+                        "same-generation update changed an unchanged committed inventory".into(),
+                    );
+                }
+                if let Some(handoff) = second.handoff.as_mut() {
+                    handoff.acknowledge();
+                }
+                fm.send(
+                    generation_update_message(&GenerationUpdate::default(), &generation)
+                        .map_err(err)?,
+                )
+                .await?;
+                let mut retained = link
+                    .receive(wire::deadline())
+                    .await?
+                    .ok_or("missing retained generation update")?;
+                let ingress = launch.ingress()?;
+                let before = node.generation_state();
+                if !matches!(
+                    ingress.generation(&node, &link, &mut retained).await?,
+                    Some(Admission::Retained)
+                ) || node.generation_state() != before
+                {
+                    return Err(
+                        "generation capacity did not retain the original frame and state".into(),
+                    );
+                }
+                second
+                    .reply
+                    .take()
+                    .ok_or("second LFUM upload missing reply authority")?
+                    .reply(
+                        fm.seal(lfum_upload_reply_message(&generation).map_err(err)?)?,
+                        wire::deadline(),
+                    )
+                    .await
+                    .map_err(err)?;
+                if let Some(handoff) = second.handoff.as_mut() {
+                    handoff.acknowledge();
+                }
+                let completed = upload.receive().await;
+                let second_upload = completed.0;
+                upload.complete(&node, &launch.fm, completed, Instant::now())?;
+                if node.generation_state().upload_pending
+                    || node.pending_lfum_uploads() != 1
+                    || upload.frozen_body(second_upload).is_some()
+                    || !upload.is_in_flight()
+                {
+                    return Err("one same-generation reply canceled another owned upload".into());
+                }
+                if !matches!(
+                    ingress.generation(&node, &link, &mut retained).await?,
+                    Some(Admission::Submitted(None))
+                ) {
+                    return Err(
+                        "retained generation update did not resume after its owned reply".into(),
+                    );
+                }
+                if let Some(handoff) = retained.handoff.as_mut() {
+                    handoff.acknowledge();
+                }
+                upload.advance(&node, &up.node, Some(&link), Instant::now())?;
+                let mut resumed = next_lfum(&mut upload, &fm).await?;
+                resumed
+                    .reply
+                    .take()
+                    .ok_or("resumed LFUM upload missing reply authority")?
+                    .reply(
+                        fm.seal(lfum_upload_reply_message(&generation).map_err(err)?)?,
+                        wire::deadline(),
+                    )
+                    .await
+                    .map_err(err)?;
+                if let Some(handoff) = resumed.handoff.as_mut() {
+                    handoff.acknowledge();
+                }
+                let completed = upload.receive().await;
+                upload.complete(&node, &launch.fm, completed, Instant::now())?;
                 drop(first);
-                let reply = upload.receive().await?;
+                let (owned_upload, reply) = upload.receive().await;
+                let reply = reply?;
                 if reply.is_some() {
                     return Err("lost LFUM reply unexpectedly completed".into());
                 }
                 let completed = Instant::now();
-                upload.complete(&node, &launch.fm, Ok(None), completed)?;
-                let due = upload.retry_at();
+                upload.complete(&node, &launch.fm, (owned_upload, Ok(None)), completed)?;
+                let due = upload
+                    .retry_at(owned_upload)
+                    .ok_or("lost LFUM request owner")?;
                 if due - completed
                     != ticks(
                         node.native_config()
                             .node(ra::NodeProperty::LfumUploadRetryIntervalTicks),
                     )
-                    || upload.frozen_body() != Some(&frozen)
-                    || !node.generation_state().upload_pending
+                    || upload.frozen_body(owned_upload) != Some(&frozen)
+                    || node.generation_state().upload_pending
+                    || node.pending_lfum_uploads() != 1
                 {
                     return Err(
                         "lost reply changed the frozen inventory or native retry interval".into(),
@@ -3231,7 +2991,8 @@ pub(crate) mod report_tests {
                 upload.complete(&node, &launch.fm, reply, Instant::now())?;
                 if node.generation_state().upload_pending
                     || node.generation_state().send != generation.number
-                    || upload.frozen_body().is_some()
+                    || upload.frozen_body(owned_upload).is_some()
+                    || node.pending_lfum_uploads() != 0
                 {
                     return Err("matched LFUM reply did not settle the original upload".into());
                 }
@@ -3382,6 +3143,13 @@ pub(crate) mod report_tests {
         Ok(result)
     }
     async fn create_node(launch: &Launch) -> Result<(Node, Arc<Store>)> {
+        create_node_with_capacity(launch, 32).await
+    }
+
+    async fn create_node_with_capacity(
+        launch: &Launch,
+        maximum: usize,
+    ) -> Result<(Node, Arc<Store>)> {
         private_dir(&launch.directory)?;
         private_dir(&launch.directory.join("hosting"))?;
         let mut options = Options::new(launch.directory.join("hosting"));
@@ -3423,7 +3191,7 @@ pub(crate) mod report_tests {
                 fabric_upgrading: false,
             },
             ra::Settings {
-                max_outstanding: 32,
+                max_outstanding: maximum,
                 max_service_types: 1,
                 notification_batch_count: 1,
                 notification_batch_bytes: LIMIT,

@@ -191,6 +191,37 @@ enum Work {
     Retry(PartitionId, bool),
     RetryDescription(PartitionId),
 }
+impl Work {
+    fn native_control(&self) -> bool {
+        matches!(
+            self,
+            Self::GetLsn(..)
+                | Self::GetLsnReply(..)
+                | Self::EndpointAck(..)
+                | Self::Reconfigure(..)
+                | Self::Deactivate(..)
+                | Self::Deactivated(..)
+                | Self::Activate(..)
+                | Self::Activated(..)
+                | Self::PeerCreate(..)
+                | Self::PeerReply(..)
+                | Self::Add(..)
+                | Self::AddPrimary(..)
+                | Self::AddReplica(..)
+                | Self::RemoveReplica(..)
+                | Self::Fm(
+                    FmWork::TypeStatusReply(..)
+                        | FmWork::NodeActivate(..)
+                        | FmWork::NodeDeactivate(..)
+                        | FmWork::NodeUpdateService(..)
+                        | FmWork::Remove(..)
+                        | FmWork::DeleteReplica(..)
+                        | FmWork::ReplicaUpReply(..)
+                        | FmWork::ServiceTypeReply(..)
+                )
+        )
+    }
+}
 /// Narrow network adapter commands. The adapter owns the admitted session;
 /// source/generation are still validated here and by the RA. Captured work is
 /// never semantic acknowledgement.
@@ -1084,6 +1115,20 @@ impl Node {
     pub fn lfum_inventory(&self) -> Result<Option<ra::LfumInventory>> {
         Ok(self.ra.lfum_inventory()?)
     }
+    pub fn take_lfum_inventory(&self) -> Result<Option<ra::LfumInventory>> {
+        Ok(self.ra.take_lfum_inventory()?)
+    }
+    pub fn pending_lfum_uploads(&self) -> usize {
+        self.ra.pending_lfum_uploads()
+    }
+    pub fn complete_lfum_upload(
+        &self,
+        upload: u64,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<bool> {
+        Ok(self.ra.complete_lfum_upload(upload, source, generation)?)
+    }
     pub fn process_lfum_upload_reply(
         &self,
         source: &NodeInstance,
@@ -1517,9 +1562,25 @@ impl Node {
         generation: &GenerationHeader,
     ) -> Result<u64> {
         self.admit_fm(source, generation)?;
+        // Host loss must not turn a former Primary's old FM work into link loss.
+        let closed_replay = self.peer_profile()
+            && self
+                .ra
+                .snapshot(body.configuration.unit.id.guid.0)
+                .committed
+                .is_some_and(|state| {
+                    state.phase == ra::Phase::Closed
+                        && state.fm_primary
+                        && !state
+                            .body
+                            .unit
+                            .current
+                            .older_than(body.configuration.unit.current)
+                });
         if !self.fm_primary_profile()
             && !(self.peer_profile()
                 && self.active_stateful_configuration(body.configuration.unit.id.guid.0))
+            && !closed_replay
         {
             return Err(Error::Unsupported);
         }
@@ -1624,19 +1685,20 @@ impl Node {
         ))
     }
     fn admit_configuration(&self, body: &Configuration) -> Result<()> {
+        let current = self.ra.snapshot(body.unit.id.guid.0).committed;
+        let continuing = current
+            .as_deref()
+            .and_then(ra::initial_membership_configuration)
+            .is_some_and(|config| config.request == *body);
         if !self.live.load(Ordering::SeqCst)
-            || self.ra.generation_state().upload_pending
+            || (self.ra.generation_state().upload_pending && !continuing)
             || !self.ra.consumer_lifetime().is_accepting()
             || !(2..=ra::MAX_CONFIGURATION_REPLICAS).contains(&body.replicas.0.len())
             || to_vec(body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
         {
             return Err(Error::Unsupported);
         }
-        let current = self
-            .ra
-            .snapshot(body.unit.id.guid.0)
-            .committed
-            .ok_or(Error::Unsupported)?;
+        let current = current.ok_or(Error::Unsupported)?;
         if current.body.unit.id != body.unit.id
             || current.body.unit.consistency != body.unit.consistency
             || (!body.unit.current.older_than(current.body.unit.current)
@@ -2171,6 +2233,16 @@ impl Node {
                     pending.pre_open = pre_open;
                 }
                 Err(ra::Failure::Capacity) => return Ok(()),
+                Err(error @ (ra::Failure::Admission(_) | ra::Failure::Unsupported(_)))
+                    if front.work.native_control() =>
+                {
+                    let front = self.pending.pop_front().unwrap();
+                    self.commands.push_back(CommandReceipt {
+                        id: front.id,
+                        result: Err(error),
+                    });
+                    return Ok(());
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -2178,17 +2250,23 @@ impl Node {
         match front.ticket.as_ref().unwrap().observation() {
             ra::TicketObservation::OwnerLost => return Err(Error::OwnerLost),
             ra::TicketObservation::Status(ra::Status::Complete(result)) => {
-                // Peer commands own no acquired registration offer. Report their
-                // definite failure without stranding unrelated cleanup callbacks.
+                // Rejected native control owns no acquired registration offer.
+                // Surface failure without stranding unrelated cleanup callbacks.
                 if let Err(error) = &result {
-                    if matches!(
-                        front.work,
-                        Work::PeerIdle(..)
-                            | Work::PeerCreate(..)
-                            | Work::PeerReply(..)
-                            | Work::BuildIdle(..)
-                            | Work::RemoveIdle(..)
-                    ) {
+                    if (front.work.native_control()
+                        && matches!(
+                            error,
+                            ra::Failure::Admission(_) | ra::Failure::Unsupported(_)
+                        ))
+                        || matches!(
+                            front.work,
+                            Work::PeerIdle(..)
+                                | Work::PeerCreate(..)
+                                | Work::PeerReply(..)
+                                | Work::BuildIdle(..)
+                                | Work::RemoveIdle(..)
+                        )
+                    {
                         let front = self.pending.pop_front().unwrap();
                         self.commands.push_back(CommandReceipt {
                             id: front.id,
@@ -3230,4 +3308,133 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
         Ok(())
     })
     .map_err(|_| Error::Protocol)
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::*;
+    use crate::control::{
+        ingress::{Admission, Ingress, Placement, Profile},
+        SemanticAck,
+    };
+    use fube_hosting::local::Options;
+    use fube_ra_store::{Settings as StoreSettings, Store};
+
+    async fn drain_control(node: &mut Node) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !node.quiescent() || node.pending_commands() != 0 {
+            assert!(Instant::now() < deadline, "shared ingress did not drain");
+            node.pending().unwrap();
+            for receipt in node.take_command_receipts() {
+                receipt.result.unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fm_capacity_retains_semantic_ack_and_rejects_unadmitted_generation_before_mutation() {
+        let local = Placement {
+            node: NodeInstance {
+                id: [1; 16],
+                instance: 1,
+            },
+            replica: 10,
+            incarnation: 1,
+        };
+        let fm = NodeInstance {
+            id: [2; 16],
+            instance: 1,
+        };
+        let generation = GenerationHeader {
+            number: GenerationNumber {
+                owner: fm.id,
+                generation: 1,
+            },
+            for_fm_replica: false,
+        };
+        let store = Arc::new(Store::memory(StoreSettings::default()).await.unwrap());
+        let mut node = Node::new(
+            Activation::new(Options::new(std::env::temp_dir())).unwrap(),
+            store.clone(),
+            ra::Admission {
+                local_node: local.node.clone(),
+                fm_source: fm.clone(),
+                generation: generation.number.clone(),
+                owner_ready: true,
+                node_open: true,
+                node_activated: true,
+                fabric_upgrading: false,
+            },
+            ra::Settings::default(),
+        )
+        .unwrap();
+        let ingress = Ingress::new(
+            Profile::Stateless,
+            true,
+            PartitionId::default(),
+            fm,
+            local,
+            vec![],
+        )
+        .unwrap();
+        let mut foreign = AddInstance::default();
+        foreign.unit.id.guid.0[0] = 1;
+        let message = add_instance_message(&foreign, &generation).unwrap();
+        assert!(
+            matches!(ingress.fm(&mut node, &message, false), Err(error) if error.contains("partition is outside"))
+        );
+        foreign.unit.id = PartitionId::default();
+        foreign.replica.node = NodeInstance {
+            id: [1; 16],
+            instance: 1,
+        };
+        foreign.replica.id = 11;
+        foreign.replica.instance = 1;
+        let message = add_instance_message(&foreign, &generation).unwrap();
+        assert!(
+            matches!(ingress.fm(&mut node, &message, false), Err(error) if error.contains("initial replica is outside"))
+        );
+        assert_eq!(node.pending_commands(), 0);
+        let reply = service_type_enabled_reply_message(
+            &ServiceTypeUpdateReply { sequence: 1 },
+            &generation,
+        )
+        .unwrap();
+        for _ in 0..32 {
+            assert!(matches!(
+                ingress.fm(&mut node, &reply, false).unwrap(),
+                Admission::Submitted(None)
+            ));
+        }
+        let body = ServiceTypeNotification::default();
+        let acknowledgement = service_type_notification_reply_message(&body, &generation).unwrap();
+        assert!(matches!(
+            ingress.fm(&mut node, &acknowledgement, false).unwrap(),
+            Admission::Retained
+        ));
+        assert_eq!(node.pending_commands(), 32);
+        for case in 0..3 {
+            let mut foreign = generation.clone();
+            match case {
+                0 => foreign.number.generation += 1,
+                1 => foreign.number.owner = [99; 16],
+                _ => foreign.for_fm_replica = true,
+            }
+            let invalid = service_type_notification_reply_message(&body, &foreign).unwrap();
+            assert!(ingress.fm(&mut node, &invalid, false).is_err());
+        }
+        assert_eq!(node.pending_commands(), 32);
+        drain_control(&mut node).await;
+        match ingress.fm(&mut node, &acknowledgement, false).unwrap() {
+            Admission::Submitted(Some((_, SemanticAck::Notification(actual)))) => {
+                assert_eq!(actual, body)
+            }
+            _ => panic!("retry must admit the original semantic acknowledgement"),
+        }
+        drain_control(&mut node).await;
+        assert!(node.terminate().unwrap());
+        node.close_executor(Duration::from_secs(3)).await.unwrap();
+        assert!(store.close().await.unwrap().is_clean());
+    }
 }

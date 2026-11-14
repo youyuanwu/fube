@@ -295,6 +295,30 @@ impl IStatefulServiceReplica for StatefulReplica {
                 ));
             }
             marker(&format!("LOCAL_CALLBACK role {role:?}"));
+            if role == ReplicaRole::ActiveSecondary
+                && self
+                    .resource
+                    .resource
+                    .with_file_name("local-secondary-role.block")
+                    .exists()
+            {
+                let release = self
+                    .resource
+                    .resource
+                    .with_file_name("local-secondary-role.release");
+                std::fs::write(
+                    release.with_file_name("local-secondary-role.held"),
+                    b"Secondary role",
+                )
+                .expect("publish fixture Secondary role barrier");
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while !release.exists() {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .expect("bounded fixture Secondary role barrier timed out");
+            }
             if role == ReplicaRole::IdleSecondary && self.resource.mode.fail_open {
                 marker("LOCAL_OPEN failed");
                 return Err(Error::Remote {

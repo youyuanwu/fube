@@ -15,12 +15,14 @@ pub enum GenerationUpdateOutcome {
     IgnoredStale,
     IgnoredNotReady,
     Rejected(GenerationNumber),
-    /// Receive advanced; the owned per-entity snapshot must complete before upload.
+    /// Update accepted; its owned per-entity snapshot must complete before upload.
     UploadRequired,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LfumInventory {
+    /// Local upload ownership, not a native wire field or generation.
+    pub upload: u64,
     pub generation: GenerationNumber,
     pub units: ObjectArray<Vec<FailoverUnitInfo>>,
     pub any_replica_found: bool,
@@ -32,6 +34,7 @@ pub(super) struct LfumSnapshot {
     remaining: usize,
     units: BTreeMap<EntityId, FailoverUnitInfo>,
     error: Option<Failure>,
+    claimed: bool,
 }
 
 impl LfumSnapshot {
@@ -43,16 +46,12 @@ impl LfumSnapshot {
             entries,
             units: BTreeMap::new(),
             error: None,
+            claimed: false,
         }
     }
 
-    pub(super) fn complete(
-        &mut self,
-        generation: &GenerationNumber,
-        id: EntityId,
-        state: Option<&EntityState>,
-    ) {
-        if generation != &self.generation || self.entries.get(&id) != Some(&true) {
+    pub(super) fn complete(&mut self, id: EntityId, state: Option<&EntityState>) {
+        if self.entries.get(&id) != Some(&true) {
             return;
         }
         match configuration(state) {
@@ -64,44 +63,124 @@ impl LfumSnapshot {
         }
         self.remaining -= 1;
     }
+
+    fn inventory(&self, upload: u64) -> Result<Option<LfumInventory>> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        Ok((self.remaining == 0).then(|| LfumInventory {
+            upload,
+            generation: self.generation.clone(),
+            units: ObjectArray(self.units.values().cloned().collect()),
+            any_replica_found: !self.entries.is_empty(),
+        }))
+    }
 }
 
 fn configuration(state: Option<&EntityState>) -> Result<Option<FailoverUnitInfo>> {
     let Some(state) = state.filter(|state| !state.local_deleted) else {
         return Ok(None);
     };
-    // The deployed upload profile excludes peer topology/reconfiguration. Do
-    // not silently omit remote replicas or invent intermediate configuration.
-    if !state.remote_idles.is_empty()
+    let replicated = !state.remote_idles.is_empty()
         || state.peer_creation.is_some()
         || state.reconfiguration.is_some()
-        || state.swap.is_some()
-    {
-        return Err(Failure::Unsupported(
-            "peer/reconfiguration LFUM upload is gated",
-        ));
-    }
+        || state.swap.is_some();
     let dropped = state.phase == Phase::Closed || state.body.replica.state == 3;
-    let replica = if dropped {
-        lifecycle::dropped_description(state)
+    let mut intermediate = Epoch::default();
+    let replicas = if replicated {
+        let config = state
+            .reconfiguration
+            .as_ref()
+            .filter(|c| {
+                c.stage == ConfigurationStage::Complete
+                    || reconfiguration::initial_membership_configuration(state).is_some()
+            })
+            .ok_or(Failure::Unsupported(
+                "LFUM upload requires completed membership or initial Secondary admission",
+            ))?;
+        let membership = if config.stage == ConfigurationStage::Complete {
+            reconfiguration::stable(&config.request)
+        } else {
+            // SF retains PC during catch-up; Primary phase 4 also reports IC=CC.
+            if state.fm_primary
+                && matches!(
+                    config.stage,
+                    ConfigurationStage::Activate | ConfigurationStage::End
+                )
+            {
+                intermediate = state.body.unit.current;
+            }
+            config.request.clone()
+        };
+        if state.phase != Phase::Ready
+            || state.swap.is_some()
+            || state.progress_query.is_some()
+            || membership.unit != state.body.unit
+            || membership.replicas.0.len() != state.body.service.target as usize
+            || membership
+                .replicas
+                .0
+                .iter()
+                .any(|r| !r.up || r.state != 2 || !matches!(r.current_role, 3 | 4))
+            || state.remote_idles.iter().any(|r| {
+                !r.ready
+                    || r.removal.is_some()
+                    || !membership
+                        .replicas
+                        .0
+                        .iter()
+                        .any(|member| member.node == r.target)
+            })
+        {
+            return Err(Failure::Unsupported(
+                "LFUM upload requires full healthy peer membership without recovery",
+            ));
+        }
+        // Admitted membership, not the original Idle creation/build reply,
+        // owns remote roles and epochs. Preserve the actual local endpoints.
+        membership
+            .replicas
+            .0
+            .into_iter()
+            .map(|r| {
+                if r.node == state.body.replica.node {
+                    state.body.replica.clone()
+                } else {
+                    r
+                }
+            })
+            .collect()
+    } else if dropped {
+        vec![lifecycle::dropped_description(state)]
     } else {
-        let mut replica = state.body.replica.clone();
-        replica.first_lsn = -1;
-        replica.last_lsn = -1;
-        replica
+        vec![state.body.replica.clone()]
     };
     Ok(Some(FailoverUnitInfo {
         service: state.body.service.clone(),
         unit: state.body.unit.clone(),
-        intermediate: Epoch::default(),
+        intermediate,
         report_from_primary: !dropped
-            && replica.up
-            && replica.current_role == 4
-            && matches!(replica.state, 1 | 2),
-        replicas: ObjectArray(vec![ReplicaInfo {
-            description: replica,
-            intermediate_role: 1,
-        }]),
+            && state.body.replica.up
+            && state.body.replica.current_role == 4
+            && matches!(state.body.replica.state, 1 | 2),
+        replicas: ObjectArray(
+            replicas
+                .into_iter()
+                .map(|mut description| {
+                    description.first_lsn = -1;
+                    description.last_lsn = -1;
+                    let intermediate_role = if intermediate == Epoch::default() {
+                        1
+                    } else {
+                        description.current_role
+                    };
+                    ReplicaInfo {
+                        description,
+                        intermediate_role,
+                    }
+                })
+                .collect(),
+        ),
         local_deleted: false,
     }))
 }
@@ -193,66 +272,81 @@ impl Executor {
                 "local FM-service generation update requires FMM support",
             ));
         }
-        if !view.generations.upload_pending
-            || view
-                .lfum
-                .as_ref()
-                .is_none_or(|snapshot| snapshot.generation != header.number)
-        {
-            view.lfum = Some(LfumSnapshot::new(
-                header.number.clone(),
-                view.entities.keys().copied(),
-            ));
+        if view.lfum.len() >= self.shared.settings.max_outstanding {
+            return Err(Failure::Capacity);
         }
+        let upload = view.lfum_sequence.checked_add(1).ok_or(Failure::Capacity)?;
+        let snapshot = LfumSnapshot::new(header.number.clone(), view.entities.keys().copied());
+        view.lfum.insert(upload, snapshot);
+        view.lfum_sequence = upload;
         view.generations.receive = header.number.clone();
         view.generations.upload_pending = true;
         Ok(GenerationUpdateOutcome::UploadRequired)
     }
 
-    /// Enqueue read jobs behind already admitted entity work. A private or
-    /// uncertain commit cannot be sampled through the published map.
+    /// Observe the newest update's inventory without claiming its upload.
+    /// Read jobs wait behind admitted work, including private/uncertain commits.
     pub fn lfum_inventory(&self) -> Result<Option<LfumInventory>> {
         let mut view = lock(&self.shared.view);
+        self.prepare_lfum(&mut view)?;
+        view.lfum
+            .last_key_value()
+            .map(|(upload, snapshot)| snapshot.inventory(*upload))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Transfer each completed update's inventory to one request/retry owner.
+    pub fn take_lfum_inventory(&self) -> Result<Option<LfumInventory>> {
+        let mut view = lock(&self.shared.view);
+        self.prepare_lfum(&mut view)?;
+        for (upload, snapshot) in &mut view.lfum {
+            if !snapshot.claimed {
+                if let Some(inventory) = snapshot.inventory(*upload)? {
+                    snapshot.claimed = true;
+                    return Ok(Some(inventory));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn pending_lfum_uploads(&self) -> usize {
+        lock(&self.shared.view).lfum.len()
+    }
+
+    fn prepare_lfum(&self, view: &mut View) -> Result<()> {
         if !view.accepting {
             return Err(Failure::Closed);
         }
         loop {
-            let Some(snapshot) = &view.lfum else {
-                return Ok(None);
+            let next = view.lfum.iter().find_map(|(upload, snapshot)| {
+                snapshot
+                    .entries
+                    .iter()
+                    .find_map(|(id, queued)| (!queued).then_some((*upload, *id)))
+            });
+            let Some((upload, id)) = next else {
+                return Ok(());
             };
-            if let Some(error) = &snapshot.error {
-                return Err(error.clone());
-            }
-            let generation = snapshot.generation.clone();
-            let Some(id) = snapshot
-                .entries
-                .iter()
-                .find_map(|(id, queued)| (!queued).then_some(*id))
-            else {
-                return Ok((snapshot.remaining == 0).then(|| LfumInventory {
-                    generation,
-                    units: ObjectArray(snapshot.units.values().cloned().collect()),
-                    any_replica_found: !snapshot.entries.is_empty(),
-                }));
-            };
-            match self.enqueue_locked(
-                id,
-                Kind::GetLfum {
-                    generation: generation.clone(),
-                },
-                to_vec(&generation),
-                &mut view,
-            ) {
+            match self.enqueue_locked(id, Kind::GetLfum { upload }, to_vec(&upload), view) {
                 Ok(_) => {
-                    *view.lfum.as_mut().unwrap().entries.get_mut(&id).unwrap() = true;
+                    *view
+                        .lfum
+                        .get_mut(&upload)
+                        .unwrap()
+                        .entries
+                        .get_mut(&id)
+                        .unwrap() = true;
                 }
-                Err(Failure::Capacity) => return Ok(None),
+                Err(Failure::Capacity) => return Ok(()),
                 Err(error) => return Err(error),
             }
         }
     }
 
-    /// Only a consuming LFUM request operation may deliver this acknowledgment.
+    /// Native generation-state callback; tracked request owners use
+    /// `complete_lfum_upload` to also retire their own upload.
     pub fn process_lfum_upload_reply(
         &self,
         source: &NodeInstance,
@@ -263,20 +357,42 @@ impl Executor {
         if !view.accepting {
             return Err(Failure::Closed);
         }
-        if header.number != view.generations.receive {
-            return Ok(false);
+        Ok(Self::acknowledge_lfum(&mut view, header))
+    }
+
+    /// A correlated semantic reply ends its upload even when its generation is
+    /// now stale. Other same-generation requests retain independent ownership.
+    pub fn complete_lfum_upload(
+        &self,
+        upload: u64,
+        source: &NodeInstance,
+        header: &GenerationHeader,
+    ) -> Result<bool> {
+        self.admit_generation(source, header)?;
+        let mut view = lock(&self.shared.view);
+        if !view.accepting {
+            return Err(Failure::Closed);
         }
-        if view.lfum.as_ref().is_none_or(|snapshot| {
-            snapshot.generation != header.number
-                || snapshot.remaining != 0
-                || snapshot.error.is_some()
-        }) {
+        if view
+            .lfum
+            .get(&upload)
+            .is_none_or(|snapshot| !snapshot.claimed)
+        {
             return Err(Failure::Admission(
-                "LFUM acknowledgment precedes owned snapshot completion",
+                "LFUM reply requires an owned completed upload",
             ));
+        }
+        let advanced = Self::acknowledge_lfum(&mut view, header);
+        view.lfum.remove(&upload);
+        Ok(advanced)
+    }
+
+    fn acknowledge_lfum(view: &mut View, header: &GenerationHeader) -> bool {
+        if header.number != view.generations.receive {
+            return false;
         }
         view.generations.send = header.number.clone();
         view.generations.upload_pending = false;
-        Ok(true)
+        true
     }
 }

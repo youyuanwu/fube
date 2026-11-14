@@ -3,8 +3,8 @@
 //! over Activation's owned session; this original prepared-registration owner
 //! retains its distinct readiness/capability gates.
 //! [`control`] supplies reusable native FM/peer wire and retained-effect
-//! adapters; the composition still owns profile admission and network/process
-//! lifetimes. It is not a standalone node executable or an FM.
+//! adapters and shared capability admission/dispatch. Compositions own
+//! network/process lifetimes. It is not a standalone node executable or an FM.
 //! Hosting has no dependency on this crate, RA, runtime or test-host.
 #![forbid(unsafe_code)]
 pub mod control;

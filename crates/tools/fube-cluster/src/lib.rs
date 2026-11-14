@@ -896,12 +896,9 @@ impl Cluster {
         }
     }
     /// Begin one live-session ordinary-FM inventory reconciliation. New
-    /// mutations remain gated until both native LFUM uploads are processed.
+    /// mutations remain gated until all native LFUM uploads are processed.
     pub fn begin_generation_handshake(&mut self) -> Result<Value> {
-        if self.config.profile.peer_replicas() {
-            return Err("peer-idle profile is bound to the original fixed generation".into());
-        }
-        if self.finished.is_some() || self.children.len() != 2 {
+        if self.finished.is_some() || self.children.len() != self.config.profile.node_count() {
             return Err("generation handshake requires the original running cluster".into());
         }
         self.ledger.begin_generation()?;
@@ -1418,7 +1415,7 @@ impl Cluster {
         }
         Ok(json!({"state":"pending","kind":"peer_idle_removal","built":false,"serving":false}))
     }
-    /// FM retires pending/failed creation or removes the opened/lost Idle's replication session.
+    /// FM retires original creation or removes the opened/lost Idle's replication session.
     /// Only RemoveReplicaReply clears pending_remove, never destination deletion.
     pub async fn remove_idle_replica_via_fm(&mut self) -> Result<Value> {
         if self.finished.is_some()
@@ -1432,16 +1429,13 @@ impl Cluster {
             return Ok(current);
         }
         if self.ledger.idle_removal.is_none()
-            && self.status()["peer_idle"]["state"] != "open"
             && !matches!(
                 self.ledger.idle_status()["state"].as_str(),
-                Some("pending" | "failed" | "lost")
+                Some("pending" | "ready" | "failed" | "lost")
             )
+            && self.status()["peer_idle"]["state"] != "open"
         {
-            return Err(
-                "FM removal requires original pending/failed FM creation or an opened/lost Idle"
-                    .into(),
-            );
+            return Err("FM removal requires original FM creation or an opened/lost Idle".into());
         }
         let body = self.ledger.request_idle_removal(Instant::now())?;
         if let Err(error) = self.send_idle_removal(&body).await {
