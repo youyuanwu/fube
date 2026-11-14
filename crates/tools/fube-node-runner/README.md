@@ -18,7 +18,8 @@ No native FM/Federation interoperability, replacement-host orchestration,
 reconnect, resize or restart recovery is claimed.
 The [process integration tests](tests/standalone.rs) also lose the original FM
 Channel, verify continuing acknowledged writes on the same Primary, and require
-explicit shutdown with an honest failed-control outcome.
+explicit shutdown with retained control uncertainty. Staggered shutdown is
+qualified both after native deletion and after a peer exits before deletion.
 
 ## Build and run
 
@@ -37,6 +38,31 @@ The user supplies a trusted minimal ExeHost package supported by
 volatile stateful default sizes 3/2. Existing local package profiles retain their
 1/1 checks. Hosting still owns actual process/registration/usage/lease cleanup;
 running inside an OCI container does not enable native SF container activation.
+
+### Independent node shutdown
+
+SIGTERM/SIGINT initiates native ordinary `Close`, not service deletion or a new
+Drop. An already accepted close/deletion continues in its original mode. The
+runner observes local completion, then separately reaps its owned application
+and joins the executor, store and original Channels. Other nodes do not have
+to receive their shutdown signals together.
+
+Loss of an original Channel retains `control_unknown` and a diagnostic
+`control_error`, refuses new control intent, and never reconnects or promotes.
+The original owner remains alive until explicitly stopped; connectivity loss
+does not revoke a surviving writer. Successful local shutdown does not clear
+that uncertainty. `cleanup.clean` and exit code zero mean owned local shutdown
+succeeded, not that control remained healthy, FM deletion was acknowledged,
+pending remote reports completed, or the deployment is recoverable.
+`cleanup.control_error` retains the lost-session diagnostic separately from
+`cleanup.error`. Startup, protocol/authority validation and local cleanup errors
+still produce a failure exit, even if physical resources were subsequently
+reaped. Protocol/limit failures are not classified as ordinary disconnection.
+
+This follows the native distinction between local RA close and Federation
+connection health; it does not implement Federation `Depart`, membership or
+lease recovery. Source baseline `3988b451`: `ReconfigurationAgent::Close`,
+`CloseAllReplicas` and `SiteNode::OnConnectionFault`.
 
 ### Process-binary tests
 
@@ -268,13 +294,15 @@ This follows pinned SF `ReconfigurationAgent.cpp:776-834,2239-2242`
 deletion uses Delete and the existing Close/commit path, not fake disposal or
 healthy-membership resizing.
 
-Local signals stop new lifecycle admission and drive owned Drop/Close cleanup;
+Local signals stop new lifecycle admission and drive ordinary native Close,
+continuing an already accepted close/deletion rather than changing its mode;
 they are not fabricated native FM Delete replies. Cleanup checks original
 application/group reaping, Hosting-root removal, RA quiescence/executor close,
 memory-store close and original Channel disposal/join. `cleanup.clean` reports
 joined **local resources**, not acknowledgment of retained remote reporting
-work; `pending_work` is reported separately. An observed control/startup/cleanup
-error produces failure status/exit even if physical cleanup subsequently joins.
+work; `pending_work` is reported separately. Lost-session diagnostics remain in
+`control_unknown` and `cleanup.control_error` even after successful local shutdown.
+Startup, protocol/authority and cleanup errors still produce a failure exit.
 
 The run directory and final status are retained for the operator. Restart is
 unsupported: verify teardown of every old application/Node before a fresh

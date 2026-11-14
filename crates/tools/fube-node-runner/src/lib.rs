@@ -47,6 +47,7 @@ fn emit(writer: &mut impl Write, value: &serde_json::Value) -> Result<()> {
 
 #[derive(Debug, Serialize)]
 pub struct Outcome {
+    /// Owned local shutdown succeeded; this is not evidence of healthy control.
     pub clean: bool,
     pub activation_acquired: bool,
     pub application_cleaned: bool,
@@ -55,12 +56,15 @@ pub struct Outcome {
     pub channels_closed: bool,
     pub pending_work: usize,
     pub error: Option<String>,
+    /// Original-session uncertainty survives successful local cleanup.
+    pub control_error: Option<String>,
 }
 
 struct Peer {
     placement: Placement,
     link: Option<Link>,
     incoming: Option<Incoming>,
+    loss: Option<String>,
 }
 
 struct Owner {
@@ -68,6 +72,7 @@ struct Owner {
     peers: Vec<Peer>,
     fm: Option<Link>,
     fm_incoming: Option<Incoming>,
+    fm_loss: Option<String>,
     node: Option<Node>,
     store: Option<Arc<Store>>,
     adapter: Adapter,
@@ -102,6 +107,7 @@ impl Owner {
                 placement,
                 link: None,
                 incoming: None,
+                loss: None,
             })
             .collect();
         let owner = Self {
@@ -109,6 +115,7 @@ impl Owner {
             peers,
             fm: None,
             fm_incoming: None,
+            fm_loss: None,
             node: None,
             store: None,
             adapter: Adapter::default(),
@@ -141,6 +148,37 @@ impl Owner {
         link.channel.target().is_ok()
     }
 
+    fn control_error(&self) -> Option<&str> {
+        self.fm_loss
+            .as_deref()
+            .or_else(|| self.peers.iter().find_map(|peer| peer.loss.as_deref()))
+    }
+
+    fn observe_channels(&mut self, stopping: bool) -> Result<()> {
+        if let Some(error) = self
+            .fm
+            .as_ref()
+            .and_then(|link| link.channel.terminal_error())
+        {
+            channel_loss(&mut self.fm_loss, "FM", error, stopping)?;
+        }
+        for peer in &mut self.peers {
+            if let Some(error) = peer
+                .link
+                .as_ref()
+                .and_then(|link| link.channel.terminal_error())
+            {
+                channel_loss(
+                    &mut peer.loss,
+                    &format!("peer {}", peer.placement.identity.id),
+                    error,
+                    stopping,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn status(&self, stage: &str, outcome: Option<&Outcome>) -> Result<()> {
         let snapshot = self.node.as_ref().map(|node| {
             node.snapshot(
@@ -158,7 +196,8 @@ impl Owner {
             "schema_version": 1, "protocol_profile": "external-fm-volatile-three-v1",
             "deployment": self.config.deployment, "node": self.config.node.identity,
             "name": self.config.name, "address": self.config.node.address, "stage": stage,
-            "control_bootstrapped": self.bootstrapped, "control_unknown": self.error.is_some(),
+            "control_bootstrapped": self.bootstrapped,
+            "control_unknown": self.error.is_some() || self.control_error().is_some(),
             "fm_connected": self.fm.as_ref().is_some_and(Self::live),
             "peers_connected": self.peers.iter().filter(|peer| peer.link.as_ref().is_some_and(Self::live)).count(),
             "application_pid": self.node.as_ref().and_then(|node| node.activation().process_status()).map(|process| process.pid),
@@ -182,7 +221,8 @@ impl Owner {
             "adapter_pending": self.adapter.pending(), "semantic_pending": self.adapter.semantic_pending(),
             "adapter_error": self.adapter.error(), "peer_error": self.adapter.peer_error(),
             "peer_command_error": self.adapter.peer_command_error(),
-            "error": self.error, "cleanup": outcome,
+            "control_error": self.control_error(),
+            "error": self.error.as_deref().or(self.control_error()), "cleanup": outcome,
         });
         let bytes = serde_json::to_vec(&status).map_err(err)?;
         if bytes.len() > fube_node::control::MAX_BODY_BYTES {
@@ -427,6 +467,9 @@ impl Owner {
             return Ok(());
         };
         node.drive().map_err(err)?;
+        self.observe_channels(stopping)?;
+        let control_unknown = self.error.is_some() || self.control_error().is_some();
+        let node = self.node.as_mut().expect("retained Node");
         if let Some(description) = &self.description {
             tokio::select! {
                 biased;
@@ -435,7 +478,7 @@ impl Owner {
                 }
                 _ = std::future::ready(()) => {}
             }
-            if !stopping && self.error.is_none() {
+            if !stopping && !control_unknown {
                 self.upload.advance(
                     node,
                     description,
@@ -443,16 +486,6 @@ impl Owner {
                     Instant::now(),
                 )?;
             }
-        }
-        if !stopping
-            && self.error.is_none()
-            && (self.fm.as_ref().is_some_and(|link| !Self::live(link))
-                || self
-                    .peers
-                    .iter()
-                    .any(|peer| peer.link.as_ref().is_some_and(|link| !Self::live(link))))
-        {
-            return Err("an original control Channel is terminal; reconnect is unsupported".into());
         }
         self.adapter.capture(node);
         let target = self
@@ -472,14 +505,16 @@ impl Owner {
             .advance_with_peer(
                 node,
                 self.fm.as_ref().filter(|link| Self::live(link)),
-                selected.and_then(|index| self.peers[index].link.as_ref()),
+                selected
+                    .and_then(|index| self.peers[index].link.as_ref())
+                    .filter(|link| Self::live(link)),
                 selected
                     .map(|index| self.peers[index].placement.identity.native())
                     .transpose()?
                     .as_ref(),
             )
             .await?;
-        if self.error.is_some() && !stopping {
+        if control_unknown && !stopping {
             return Ok(());
         }
         for peer in &mut self.peers {
@@ -491,18 +526,23 @@ impl Owner {
             }
             if peer.incoming.is_none() {
                 match link
-                    .receive(Instant::now() + Duration::from_millis(1))
+                    .receive_checked(Instant::now() + Duration::from_millis(1))
                     .await
                 {
                     Ok(incoming) => peer.incoming = incoming,
-                    Err(error) if stopping => {
-                        emit(
-                            &mut std::io::stderr().lock(),
-                            &serde_json::json!({"event": "peer_closed_during_shutdown", "error": error}),
+                    Err(wire::ReceiveError::Transport(error)) => {
+                        channel_loss(
+                            &mut peer.loss,
+                            &format!("peer {}", peer.placement.identity.id),
+                            error,
+                            stopping,
                         )?;
+                        if !stopping {
+                            return Ok(());
+                        }
                         continue;
                     }
-                    Err(error) => return Err(format!("original peer Channel lost: {error}")),
+                    Err(wire::ReceiveError::Invalid(error)) => return Err(error),
                 }
             }
             if let Some(mut incoming) = peer.incoming.take() {
@@ -528,18 +568,15 @@ impl Owner {
         if let Some(link) = self.fm.as_ref().filter(|link| Self::live(link)) {
             if self.fm_incoming.is_none() {
                 match link
-                    .receive(Instant::now() + Duration::from_millis(1))
+                    .receive_checked(Instant::now() + Duration::from_millis(1))
                     .await
                 {
                     Ok(incoming) => self.fm_incoming = incoming,
-                    Err(error) if stopping => {
-                        emit(
-                            &mut std::io::stderr().lock(),
-                            &serde_json::json!({"event": "fm_closed_during_shutdown", "error": error}),
-                        )?;
+                    Err(wire::ReceiveError::Transport(error)) => {
+                        channel_loss(&mut self.fm_loss, "FM", error, stopping)?;
                         return Ok(());
                     }
-                    Err(error) => return Err(format!("original FM Channel lost: {error}")),
+                    Err(wire::ReceiveError::Invalid(error)) => return Err(error),
                 }
             }
             if let Some(mut incoming) = self.fm_incoming.take() {
@@ -599,7 +636,7 @@ impl Owner {
                     break
                 }
                 Some(state) if !requested && state.phase != ra::Phase::Closing => {
-                    node.close(partition.clone(), ra::CloseMode::Drop)
+                    node.close(partition.clone(), ra::CloseMode::Close)
                         .map_err(err)?;
                     requested = true;
                 }
@@ -680,6 +717,9 @@ impl Owner {
         } else {
             true
         };
+        if let Err(error) = self.observe_channels(true) {
+            self.fail(error);
+        }
         let mut channels_closed = true;
         for link in self
             .fm
@@ -711,8 +751,34 @@ impl Owner {
             channels_closed,
             pending_work,
             error: self.error.clone(),
+            control_error: self.control_error().map(str::to_owned),
         }
     }
+}
+
+fn channel_loss(
+    retained: &mut Option<String>,
+    name: &str,
+    error: fube_transport::Error,
+    stopping: bool,
+) -> Result<()> {
+    if !matches!(
+        error,
+        fube_transport::Error::Io(_) | fube_transport::Error::Closed
+    ) {
+        return Err(format!("original {name} Channel failed: {error:?}"));
+    }
+    if retained.is_none() {
+        let error = format!("original {name} Channel lost: {error:?}");
+        emit(
+            &mut std::io::stderr().lock(),
+            &serde_json::json!({
+                "event": "control_unknown", "stopping": stopping, "error": error
+            }),
+        )?;
+        *retained = Some(error);
+    }
+    Ok(())
 }
 
 /// Run once. Losing an admitted session never reconnects or grants promotion;

@@ -515,25 +515,59 @@ impl Link {
         Ok(Some(reply))
     }
     pub async fn receive(&self, until: Instant) -> Result<Option<IncomingMessage<GatewayTarget>>> {
-        match self.channel.receiver().map_err(err)?.receive(until).await {
+        self.receive_checked(until)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    /// Preserve transport causes separately from native-envelope validation failures.
+    pub async fn receive_checked(
+        &self,
+        until: Instant,
+    ) -> std::result::Result<Option<IncomingMessage<GatewayTarget>>, ReceiveError> {
+        match self
+            .channel
+            .receiver()
+            .map_err(|error| {
+                ReceiveError::Transport(self.channel.terminal_error().unwrap_or(error))
+            })?
+            .receive(until)
+            .await
+        {
             Ok(incoming) => {
                 if !Arc::ptr_eq(&incoming.source, &self.target) {
                     self.channel.dispose();
-                    return Err("foreign Channel source capability".into());
+                    return Err(ReceiveError::Invalid(
+                        "foreign Channel source capability".into(),
+                    ));
                 }
                 if let Err(error) = self.validate(&incoming.message) {
                     self.channel.dispose();
-                    return Err(error);
+                    return Err(ReceiveError::Invalid(error));
                 }
                 Ok(Some(incoming))
             }
             Err(fube_transport::Error::Timeout) => Ok(None),
-            Err(error) => Err(err(error)),
+            Err(error) => Err(ReceiveError::Transport(
+                self.channel.terminal_error().unwrap_or(error),
+            )),
         }
     }
     pub async fn close(&self) -> Result<()> {
         self.channel.dispose();
         self.channel.closed(deadline()).await.map_err(err)
+    }
+}
+#[derive(Debug)]
+pub enum ReceiveError {
+    Transport(fube_transport::Error),
+    Invalid(String),
+}
+impl std::fmt::Display for ReceiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(f, "{error:?}"),
+            Self::Invalid(error) => f.write_str(error),
+        }
     }
 }
 fn validate_source(message: &Message, local: &NodeInstance, remote: &NodeInstance) -> Result<()> {
