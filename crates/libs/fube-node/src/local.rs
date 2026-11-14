@@ -1694,7 +1694,10 @@ impl Node {
         let continuing = current
             .as_deref()
             .and_then(ra::initial_membership_configuration)
-            .is_some_and(|config| config.request == *body);
+            .is_some_and(|config| config.request == *body)
+            || current
+                .as_deref()
+                .is_some_and(|state| ra::continues_primary_failover(state, body));
         if !self.live.load(Ordering::SeqCst)
             || (self.ra.generation_state().upload_pending && !continuing)
             || !self.ra.consumer_lifetime().is_accepting()

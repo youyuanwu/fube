@@ -59,7 +59,7 @@ pub use reconfiguration::{
     secondary_removal_in_progress, secondary_service, ConfigurationCompletion, ConfigurationStage,
     Reconfiguration,
 };
-pub use swap::{PrimarySwap, ProgressQuery, SwapStage};
+pub use swap::{continues_primary_failover, PrimarySwap, ProgressQuery, SwapStage};
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -2562,6 +2562,7 @@ async fn entity_worker(
                     | Kind::RetryConfiguration
             ) && view.generations.upload_pending
                 && !reconfiguration::continues_initial_membership(&work, committed.as_deref())
+                && !swap::continues_original_failover(&work, committed.as_deref())
                 && !(matches!(work.kind, Kind::AddReplica { .. })
                     && committed.as_deref().is_some_and(|state| {
                         from_slice::<AddReplica>(&work.bytes)

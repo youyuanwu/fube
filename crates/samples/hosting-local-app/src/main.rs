@@ -109,6 +109,10 @@ struct ObservedProvider {
     block_dispose: bool,
     primary: bool,
 }
+struct ObservedReplicator {
+    inner: Arc<RuntimeReplicator>,
+    resource: PathBuf,
+}
 struct PrimaryService {
     address: String,
     stopped: Cancellation,
@@ -251,7 +255,10 @@ impl IStatefulServiceReplica for StatefulReplica {
                     ));
                     *self.primary.lock().unwrap() = Some(service);
                 }
-                Box::new((*control).clone())
+                Box::new(ObservedReplicator {
+                    inner: control,
+                    resource: self.resource.resource.clone(),
+                })
             } else {
                 Box::new(LocalControl(Mutex::new(None)))
             };
@@ -295,29 +302,33 @@ impl IStatefulServiceReplica for StatefulReplica {
                 ));
             }
             marker(&format!("LOCAL_CALLBACK role {role:?}"));
-            if role == ReplicaRole::ActiveSecondary
-                && self
+            let barrier = match role {
+                ReplicaRole::Primary => Some("local-primary-role"),
+                ReplicaRole::ActiveSecondary => Some("local-secondary-role"),
+                _ => None,
+            };
+            if let Some(barrier) = barrier.filter(|name| {
+                self.resource
                     .resource
-                    .resource
-                    .with_file_name("local-secondary-role.block")
+                    .with_file_name(format!("{name}.block"))
                     .exists()
-            {
+            }) {
                 let release = self
                     .resource
                     .resource
-                    .with_file_name("local-secondary-role.release");
+                    .with_file_name(format!("{barrier}.release"));
                 std::fs::write(
-                    release.with_file_name("local-secondary-role.held"),
-                    b"Secondary role",
+                    release.with_file_name(format!("{barrier}.held")),
+                    b"application role",
                 )
-                .expect("publish fixture Secondary role barrier");
+                .expect("publish fixture role barrier");
                 tokio::time::timeout(Duration::from_secs(30), async {
                     while !release.exists() {
                         tokio::time::sleep(Duration::from_millis(2)).await;
                     }
                 })
                 .await
-                .expect("bounded fixture Secondary role barrier timed out");
+                .expect("bounded fixture role barrier timed out");
             }
             if role == ReplicaRole::IdleSecondary && self.resource.mode.fail_open {
                 marker("LOCAL_OPEN failed");
@@ -504,6 +515,90 @@ impl StatefulReplica {
             assert_eq!(error.kind(), fube_runtime::ErrorKind::ObjectClosed);
             marker("LOCAL_DATA retired");
         }
+    }
+}
+impl IReplicator for ObservedReplicator {
+    fn open(&self, cancel: Cancellation) -> ApiFuture<'_, String> {
+        self.inner.open(cancel)
+    }
+    fn change_role(
+        &self,
+        epoch: Epoch,
+        role: ReplicaRole,
+        cancel: Cancellation,
+    ) -> ApiFuture<'_, ()> {
+        self.inner.change_role(epoch, role, cancel)
+    }
+    fn update_epoch(&self, epoch: Epoch, cancel: Cancellation) -> ApiFuture<'_, ()> {
+        self.inner.update_epoch(epoch, cancel)
+    }
+    fn get_current_progress(&self) -> Result<i64> {
+        self.inner.get_current_progress()
+    }
+    fn get_catch_up_capability(&self) -> Result<i64> {
+        self.inner.get_catch_up_capability()
+    }
+    fn close(&self, cancel: Cancellation) -> ApiFuture<'_, ()> {
+        self.inner.close(cancel)
+    }
+    fn abort(&self) {
+        self.inner.abort();
+    }
+}
+impl IPrimaryReplicator for ObservedReplicator {
+    fn on_data_loss(&self, cancel: Cancellation) -> ApiFuture<'_, bool> {
+        self.inner.on_data_loss(cancel)
+    }
+    fn update_catch_up_replica_set_configuration(
+        &self,
+        current: ReplicaSetConfig,
+        previous: ReplicaSetConfig,
+    ) -> Result<()> {
+        self.inner
+            .update_catch_up_replica_set_configuration(current, previous)
+    }
+    fn update_current_replica_set_configuration(&self, current: ReplicaSetConfig) -> Result<()> {
+        if self
+            .resource
+            .with_file_name("local-current-configuration.block")
+            .exists()
+        {
+            let release = self
+                .resource
+                .with_file_name("local-current-configuration.release");
+            std::fs::write(
+                release.with_file_name("local-current-configuration.held"),
+                b"original current configuration",
+            )
+            .expect("publish fixture configuration barrier");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !release.exists() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::Protocol(
+                        "bounded fixture configuration barrier timed out",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        self.inner.update_current_replica_set_configuration(current)
+    }
+    fn wait_for_catch_up_quorum(
+        &self,
+        mode: ReplicaSetQuorumMode,
+        cancel: Cancellation,
+    ) -> ApiFuture<'_, ()> {
+        self.inner.wait_for_catch_up_quorum(mode, cancel)
+    }
+    fn build_replica(
+        &self,
+        replica: ReplicaInformation,
+        cancel: Cancellation,
+    ) -> ApiFuture<'_, ()> {
+        self.inner.build_replica(replica, cancel)
+    }
+    fn remove_replica(&self, replica: i64) -> Result<()> {
+        self.inner.remove_replica(replica)
     }
 }
 impl IStateProvider for ObservedProvider {

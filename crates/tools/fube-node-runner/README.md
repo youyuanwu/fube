@@ -87,8 +87,13 @@ the Secondary reports invalid IC, following local SF. Another case holds an actu
 copy-stream operation before application ACK during original 3/2 Idle build,
 rolls generation twice and finishes the original build/admission on unchanged
 owners. The Primary reports its admitted build set; each destination reports only
-its own InBuild Idle, without PC/IC or new serving authority. Manual/failed builds, other
-interrupted reconfiguration, swap/repair inventory and restart recovery remain gated.
+its own InBuild Idle, without PC/IC or new serving authority. Another case loses
+the original Primary app host, holds the candidate's real Primary callback and
+public replicator final-configuration call, and rolls generation while those
+original operations remain pending. It checks query-only survivor PC, candidate
+phase-4 IC and completed survivor metadata before continuing nonempty data.
+Manual/failed builds, failed RAP states, other interrupted reconfiguration,
+planned swaps, repair, redirected/repeated failover inventory and restart recovery remain gated.
 Each accepted generation update owns fresh inventory work. Shared Node upload
 owners retain independent correlated requests, frozen retries and completion,
 including multiple uploads in the same generation. Diagnostic `pending_uploads`

@@ -8981,6 +8981,473 @@ async fn lfum_keeps_failed_build_and_configuration_explicitly_gated() {
     }
 }
 
+fn start_lfum(executor: &Executor, number: i64) {
+    let source = admission().fm_source;
+    let header = generation_header(number);
+    executor
+        .process_generation_proposal(&source, &header)
+        .unwrap();
+    executor
+        .process_generation_update(&source, &GenerationUpdate::default(), &header)
+        .unwrap();
+}
+
+fn assert_failover_lfum(
+    inventory: &LfumInventory,
+    expected: &Configuration,
+    ic: Epoch,
+    primary: bool,
+) {
+    assert!(inventory.any_replica_found);
+    assert_eq!(inventory.units.0.len(), 1);
+    let info = &inventory.units.0[0];
+    assert_eq!(info.service, expected.service);
+    assert_eq!(info.unit, expected.unit);
+    assert_eq!(info.intermediate, ic);
+    assert_eq!(info.report_from_primary, primary);
+    assert_eq!(info.replicas.0.len(), expected.replicas.0.len());
+    for mut description in expected.replicas.0.clone() {
+        description.first_lsn = -1;
+        description.last_lsn = -1;
+        let intermediate_role = if ic == Epoch::default() {
+            1
+        } else {
+            description.current_role
+        };
+        assert_eq!(info.replicas.0.iter().filter(|r|
+            r.description == description && r.intermediate_role == intermediate_role).count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn original_primary_failover_lfum_preserves_sf_phases_and_final_commit_barriers() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(40)
+        } else {
+            WAIT
+        })
+        .await;
+        active_configured_survivor(&executor, 3, 2).await;
+        let original = state(&executor);
+        let intent = failover_configuration(&original, &admission().local_node);
+        run(&executor, reconfigure(intent.clone())).await;
+        let actions = effects(&executor);
+        start_lfum(&executor, 8);
+        let first = wait_lfum(&executor).await;
+        assert_failover_lfum(&first, &intent, Epoch::default(), true);
+        assert_eq!(executor.take_lfum_inventory().unwrap(), Some(first.clone()));
+        run(
+            &executor,
+            Command::RetryConfiguration(intent.unit.id.clone()),
+        )
+        .await;
+        assert_eq!(effects(&executor), actions);
+        let mut unrelated = intent.clone();
+        unrelated.unit.current.configuration += 1;
+        assert!(matches!(
+            executor
+                .submit(Command::DoReconfiguration {
+                    body: Box::new(DoReconfiguration {
+                        configuration: unrelated,
+                        phase0_duration: i64::MAX
+                    }),
+                    source: admission().fm_source,
+                    generation: generation_header(8),
+                })
+                .unwrap()
+                .wait(WAIT)
+                .await,
+            Err(Failure::Unsupported(_))
+        ));
+        run(
+            &executor,
+            Command::CompleteStatus(Box::new(status_completion(&actions))),
+        )
+        .await;
+        effects(&executor);
+        let remote = intent
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.up && r.current_role == 3)
+            .unwrap();
+        let mut progress = failover_progress(
+            &intent,
+            remote,
+            original
+                .peer_creation
+                .as_ref()
+                .unwrap()
+                .deactivation
+                .clone(),
+            8,
+        );
+        if let Command::GetLsnReply { generation, .. } = &mut progress {
+            *generation = generation_header(8);
+        }
+        run(&executor, progress).await;
+        let mut catchup = configured(&effects(&executor));
+        start_lfum(&executor, 9);
+        assert_failover_lfum(&wait_lfum(&executor).await, &intent, Epoch::default(), true);
+        executor.take_lfum_inventory().unwrap().unwrap();
+        catchup.local.service_endpoint = "127.0.0.1:12349".into();
+        let mut expected = intent.clone();
+        expected
+            .replicas
+            .0
+            .iter_mut()
+            .find(|r| r.node == admission().local_node)
+            .unwrap()
+            .service_endpoint = catchup.local.service_endpoint.clone();
+        run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::PeerDeactivate { .. }]
+        ));
+        start_lfum(&executor, 10);
+        assert_failover_lfum(
+            &wait_lfum(&executor).await,
+            &expected,
+            intent.unit.current,
+            true,
+        );
+        executor.take_lfum_inventory().unwrap().unwrap();
+        run(
+            &executor,
+            Command::DeactivateReply {
+                source: remote.node.clone(),
+                generation: generation_header(10),
+                body: Box::new(DeactivateReply {
+                    unit: intent.unit.clone(),
+                    replica: Replica {
+                        node: remote.node.clone(),
+                        id: remote.id,
+                        instance: remote.instance,
+                        up: false,
+                        state: 3,
+                        ..Replica::default()
+                    },
+                    error: 0,
+                }),
+            },
+        )
+        .await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::PeerActivate { .. }]
+        ));
+        start_lfum(&executor, 11);
+        assert_failover_lfum(
+            &wait_lfum(&executor).await,
+            &expected,
+            intent.unit.current,
+            true,
+        );
+        executor.take_lfum_inventory().unwrap().unwrap();
+        let mut unit = intent.unit.clone();
+        unit.previous = Epoch::default();
+        let mut replica = remote.clone();
+        replica.previous_role = 1;
+        replica.first_lsn = 1;
+        replica.last_lsn = 8;
+        run(
+            &executor,
+            Command::ActivateReply {
+                source: remote.node.clone(),
+                generation: generation_header(11),
+                body: Box::new(ActivateReply {
+                    unit,
+                    replica,
+                    error: 0,
+                }),
+            },
+        )
+        .await;
+        let completion = configured(&effects(&executor));
+        assert_eq!(completion.flags, 1);
+        start_lfum(&executor, 12);
+        assert_failover_lfum(
+            &wait_lfum(&executor).await,
+            &expected,
+            intent.unit.current,
+            true,
+        );
+        executor.take_lfum_inventory().unwrap().unwrap();
+        let before = state(&executor);
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::CompleteConfiguration(Box::new(completion.clone())))
+            .unwrap();
+        entered.await.unwrap();
+        start_lfum(&executor, 13);
+        assert!(executor.lfum_inventory().unwrap().is_none());
+        assert_eq!(state(&executor), before);
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.lfum_inventory().unwrap().is_none());
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        if !fail {
+            expected.unit.previous = Epoch::default();
+            expected.replicas.0.retain(|r| r.current_role >= 3);
+            for r in &mut expected.replicas.0 {
+                r.previous_role = 1;
+            }
+        }
+        let inventory = wait_lfum(&executor).await;
+        assert_failover_lfum(
+            &inventory,
+            &expected,
+            if fail {
+                intent.unit.current
+            } else {
+                Epoch::default()
+            },
+            true,
+        );
+        assert!(!executor
+            .complete_lfum_upload(first.upload, &admission().fm_source, &generation_header(8))
+            .unwrap());
+        assert_eq!(
+            executor.generation_state().send,
+            generation_header(7).number
+        );
+        assert_eq!(state(&executor).runtime, original.runtime);
+        assert_eq!(state(&executor).usage, original.usage);
+        assert_eq!(state(&executor).open_token, original.open_token);
+        if fail {
+            effects(&executor);
+            run(
+                &executor,
+                Command::CompleteConfiguration(Box::new(completion)),
+            )
+            .await;
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn queried_failover_survivor_lfum_copies_old_cc_to_pc_and_clears_ic_on_activate() {
+    let (store, executor, _) = setup(WAIT).await;
+    active_configured_survivor(&executor, 3, 2).await;
+    let original = state(&executor);
+    let candidate = original
+        .reconfiguration
+        .as_ref()
+        .unwrap()
+        .request
+        .replicas
+        .0[2]
+        .node
+        .clone();
+    let mut intent = failover_configuration(&original, &candidate);
+    let query = AddInstance {
+        unit: intent.unit.clone(),
+        service: intent.service.clone(),
+        replica: Replica {
+            node: original.body.replica.node.clone(),
+            id: original.body.replica.id,
+            instance: original.body.replica.instance,
+            ..Replica::default()
+        },
+    };
+    run(
+        &executor,
+        Command::GetLsn {
+            source: candidate.clone(),
+            body: Box::new(query),
+            generation: generation_header(7),
+        },
+    )
+    .await;
+    let completion = status_completion(&effects(&executor));
+    let mut queried = original.reconfiguration.as_ref().unwrap().request.clone();
+    queried.unit = intent.unit.clone();
+    for r in &mut queried.replicas.0 {
+        r.previous_role = r.current_role;
+    }
+    start_lfum(&executor, 8);
+    assert_failover_lfum(
+        &wait_lfum(&executor).await,
+        &queried,
+        Epoch::default(),
+        false,
+    );
+    executor.take_lfum_inventory().unwrap().unwrap();
+    run(&executor, Command::CompleteStatus(Box::new(completion))).await;
+    effects(&executor);
+    for r in &mut intent.replicas.0 {
+        if r.up {
+            r.first_lsn = 1;
+            r.last_lsn = 8;
+        }
+        if r.current_role == 4 {
+            r.service_endpoint = "127.0.0.1:12349".into();
+        }
+    }
+    let history = ReplicaDeactivationInfo {
+        epoch: intent.unit.current,
+        catchup_lsn: 8,
+    };
+    run(
+        &executor,
+        Command::Deactivate {
+            source: candidate.clone(),
+            generation: generation_header(8),
+            body: Box::new(Deactivate {
+                configuration: intent.clone(),
+                force: false,
+                deactivation: history.clone(),
+            }),
+        },
+    )
+    .await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::PeerDeactivateReply { .. }]
+    ));
+    start_lfum(&executor, 9);
+    assert_failover_lfum(
+        &wait_lfum(&executor).await,
+        &intent,
+        intent.unit.current,
+        false,
+    );
+    executor.take_lfum_inventory().unwrap().unwrap();
+    run(
+        &executor,
+        Command::Activate {
+            source: candidate,
+            generation: generation_header(9),
+            body: Box::new(Activate {
+                configuration: intent.clone(),
+                deactivation: history,
+            }),
+        },
+    )
+    .await;
+    let completion = configured(&effects(&executor));
+    start_lfum(&executor, 10);
+    assert_failover_lfum(
+        &wait_lfum(&executor).await,
+        &intent,
+        Epoch::default(),
+        false,
+    );
+    executor.take_lfum_inventory().unwrap().unwrap();
+    run(
+        &executor,
+        Command::CompleteConfiguration(Box::new(completion)),
+    )
+    .await;
+    effects(&executor);
+    intent.unit.previous = Epoch::default();
+    intent.replicas.0.retain(|r| r.current_role >= 3);
+    for r in &mut intent.replicas.0 {
+        r.previous_role = 1;
+    }
+    start_lfum(&executor, 11);
+    assert_failover_lfum(
+        &wait_lfum(&executor).await,
+        &intent,
+        Epoch::default(),
+        false,
+    );
+    assert_eq!(state(&executor).runtime, original.runtime);
+    assert_eq!(state(&executor).usage, original.usage);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn failover_lfum_keeps_other_sizes_and_failed_rap_states_gated() {
+    for (target, minimum, failed) in [(4, 2, false), (3, 3, false), (3, 2, true)] {
+        let (store, executor, _) = setup(WAIT).await;
+        active_configured_survivor(&executor, target, minimum).await;
+        let original = state(&executor);
+        let intent = failover_configuration(&original, &admission().local_node);
+        run(&executor, reconfigure(intent)).await;
+        let actions = effects(&executor);
+        if failed {
+            let mut completion = status_completion(&actions);
+            completion.error = -991;
+            run(&executor, Command::CompleteStatus(Box::new(completion))).await;
+            effects(&executor);
+        }
+        let before = state(&executor);
+        start_lfum(&executor, 8);
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if let Err(error) = executor.lfum_inventory() {
+                    assert!(matches!(error, Failure::Unsupported(_)));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state(&executor), before);
+        assert_eq!(
+            executor.generation_state().send,
+            generation_header(7).number
+        );
+        assert!(executor.generation_state().upload_pending);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn closed_replicated_primary_lfum_is_canonical_until_its_deleted_entry_is_omitted() {
+    let (store, executor, _) = setup(WAIT).await;
+    let config = built_three_idles(&executor).await;
+    complete_primary_activation(&executor, &config).await;
+    let before = state(&executor);
+    run(
+        &executor,
+        Command::HostDown(Box::new(HostDown {
+            unit: before.body.unit.id.clone(),
+            host: before.runtime.as_ref().unwrap().host.clone(),
+        })),
+    )
+    .await;
+    effects(&executor);
+    run(&executor, Command::RetryReport(before.body.unit.id.clone())).await;
+    let report = effects(&executor)
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::ReplicaUp(body) => Some(body),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(state(&executor).phase, Phase::Closed);
+    start_lfum(&executor, 8);
+    let inventory = wait_lfum(&executor).await;
+    assert!(!inventory.units.0[0].report_from_primary);
+    assert_eq!(inventory.units.0[0].replicas.0.len(), 1);
+    assert_eq!(inventory.units.0[0], report.dropped.0[0]);
+    run(
+        &executor,
+        Command::ReplicaUpReply {
+            body: report,
+            source: admission().fm_source,
+            generation: generation_header(8),
+        },
+    )
+    .await;
+    effects(&executor);
+    start_lfum(&executor, 9);
+    let inventory = wait_lfum(&executor).await;
+    assert!(inventory.any_replica_found && inventory.units.0.is_empty());
+    finish(&store, &executor).await;
+}
+
 #[tokio::test]
 async fn initial_idle_build_lfum_preserves_sf_states_and_only_retries_original_intent() {
     let (store, executor, _) = setup(WAIT).await;
@@ -9973,26 +10440,33 @@ async fn complete_primary_activation(executor: &Executor, config: &Configuration
     )
     .await;
     effects(executor);
-    let mut unit = config.unit.clone();
-    unit.previous = Epoch::default();
-    let mut replica = config.replicas.0[1].clone();
-    replica.previous_role = 1;
-    run(
-        executor,
-        Command::ActivateReply {
-            body: Box::new(ActivateReply {
-                unit,
-                replica,
-                error: 0,
-            }),
-            source: peer_source(),
-            generation: GenerationHeader {
-                number: admission().generation,
-                for_fm_replica: false,
+    for replica in config
+        .replicas
+        .0
+        .iter()
+        .filter(|r| r.node != admission().local_node)
+    {
+        let mut unit = config.unit.clone();
+        unit.previous = Epoch::default();
+        let mut replica = replica.clone();
+        replica.previous_role = 1;
+        run(
+            executor,
+            Command::ActivateReply {
+                source: replica.node.clone(),
+                body: Box::new(ActivateReply {
+                    unit,
+                    replica,
+                    error: 0,
+                }),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
             },
-        },
-    )
-    .await;
+        )
+        .await;
+    }
     let completion = configured(&effects(executor));
     run(
         executor,

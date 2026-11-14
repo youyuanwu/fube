@@ -87,7 +87,12 @@ fn configuration(state: Option<&EntityState>) -> Result<Option<FailoverUnitInfo>
         || state.swap.is_some();
     let dropped = state.phase == Phase::Closed || state.body.replica.state == 3;
     let mut intermediate = Epoch::default();
-    let replicas = if peer::initial_idle_build(state) {
+    let replicas = if dropped {
+        vec![lifecycle::dropped_description(state)]
+    } else if let Some((configuration, ic)) = swap::lfum_configuration(state) {
+        intermediate = ic;
+        configuration.replicas.0
+    } else if peer::initial_idle_build(state) {
         let mut replicas = vec![state.body.replica.clone()];
         for remote in &state.remote_idles {
             let mut description = remote.reply.as_ref().map_or_else(
@@ -162,8 +167,6 @@ fn configuration(state: Option<&EntityState>) -> Result<Option<FailoverUnitInfo>
                 }
             })
             .collect()
-    } else if dropped {
-        vec![lifecycle::dropped_description(state)]
     } else {
         vec![state.body.replica.clone()]
     };
