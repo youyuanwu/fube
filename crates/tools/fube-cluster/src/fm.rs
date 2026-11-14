@@ -210,9 +210,13 @@ pub(crate) struct GenerationHandshake {
     pub uploads: Vec<Option<LfumUpload>>,
     initial_membership: Option<Configuration>,
     initial_builds: Option<Vec<AddReplica>>,
-    failover: Option<Configuration>,
+    failover: Option<FailoverInventory>,
     repair: Option<RepairInventory>,
     retry_at: Vec<Instant>,
+}
+struct FailoverInventory {
+    previous: ConfigurationReply,
+    configuration: Configuration,
 }
 struct RepairInventory {
     previous: ConfigurationReply,
@@ -1093,12 +1097,12 @@ impl Ledger {
         {
             return self.validate_repair_lfum(index, body, repair);
         }
-        if let Some(intent) = self
+        if let Some(failover) = self
             .generation
             .as_ref()
             .and_then(|round| round.failover.as_ref())
         {
-            return self.validate_failover_lfum(index, body, intent);
+            return self.validate_failover_lfum(index, body, failover);
         }
         if let Some(builds) = self
             .generation
@@ -1255,14 +1259,11 @@ impl Ledger {
         &self,
         index: usize,
         body: &LfumUpload,
-        intent: &Configuration,
+        failover: &FailoverInventory,
     ) -> Result<()> {
         let placement = &self.placements[index];
-        let original = self
-            .configuration
-            .as_ref()
-            .and_then(|c| c.reply.as_ref())
-            .ok_or("missing original test membership")?;
+        let original = &failover.previous;
+        let intent = &failover.configuration;
         if placement.node_description.as_ref() != Some(&body.node)
             || !body.any_replica_found
             || body.units.0.len() > 1
@@ -1509,60 +1510,64 @@ impl Ledger {
                     && idle.reply.as_ref().is_none_or(|reply| reply.error == 0)
             }))
         .then(|| self.idles.iter().map(|idle| idle.body.clone()).collect());
-        let failover = self
-            .swap
-            .as_ref()
-            .filter(|swap| {
-                !swap.unknown
-                    && self.configuration_history.is_empty()
-                    && self.repair_history.is_empty()
-                    && self.candidate_changes.is_empty()
-                    && self.restoration.is_none()
-                    && self
-                        .configuration
-                        .as_ref()
-                        .and_then(|c| c.reply.as_ref())
-                        .is_some_and(|original| {
-                            original.replicas.0.len() == 3
-                                && swap.body.configuration.unit.previous == original.unit.current
-                                && swap.body.configuration.unit.current.data_loss
-                                    == original.unit.current.data_loss
-                                && swap
-                                    .body
-                                    .configuration
-                                    .unit
-                                    .current
-                                    .configuration
-                                    .checked_sub(original.unit.current.configuration)
-                                    == Some(0x1_0000_0001)
+        let failover = self.swap.as_ref().and_then(|swap| {
+            let previous = match self.repair_history.last() {
+                Some(repair) => repair.configuration.as_ref().filter(|_| {
+                    repair.removal.is_none()
+                        && repair.base.is_none()
+                        && repair.superseded_by.is_none()
+                }),
+                None => self.configuration.as_ref(),
+            }?;
+            // Host loss invalidates observations, not completed membership.
+            let original = previous.reply.as_ref()?;
+            (!swap.unknown
+                && self.configuration_history.is_empty()
+                && self.candidate_changes.is_empty()
+                && self.restoration.is_none()
+                && original.error == 0
+                && original.replicas.0.len() == 3
+                && swap.body.configuration.unit.previous == original.unit.current
+                && swap.body.configuration.unit.current.data_loss
+                    == original.unit.current.data_loss
+                && swap
+                    .body
+                    .configuration
+                    .unit
+                    .current
+                    .configuration
+                    .checked_sub(original.unit.current.configuration)
+                    == Some(0x1_0000_0001)
+                && swap.body.configuration.service.target == 3
+                && swap.body.configuration.service.minimum == 2
+                && swap.body.configuration.replicas.0.len() == 3
+                && swap
+                    .body
+                    .configuration
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|r| !r.up)
+                    .count()
+                    == 1
+                && swap.body.configuration.replicas.0.iter().any(|r| {
+                    r.previous_role == 4
+                        && r.current_role == 1
+                        && !r.up
+                        && r.state == 3
+                        && self.placements.iter().any(|p| {
+                            p.launch.node == r.node
+                                && (p.loss_reported
+                                    || self.repair.as_ref().is_some_and(|repair| {
+                                        repair.predecessor.replica.node == r.node
+                                    }))
                         })
-                    && swap.body.configuration.service.target == 3
-                    && swap.body.configuration.service.minimum == 2
-                    && swap.body.configuration.replicas.0.len() == 3
-                    && swap
-                        .body
-                        .configuration
-                        .replicas
-                        .0
-                        .iter()
-                        .filter(|r| !r.up)
-                        .count()
-                        == 1
-                    && swap.body.configuration.replicas.0.iter().any(|r| {
-                        r.previous_role == 4
-                            && r.current_role == 1
-                            && !r.up
-                            && r.state == 3
-                            && self.placements.iter().any(|p| {
-                                p.launch.node == r.node
-                                    && (p.loss_reported
-                                        || self.repair.as_ref().is_some_and(|repair| {
-                                            repair.predecessor.replica.node == r.node
-                                        }))
-                            })
-                    })
+                }))
+            .then(|| FailoverInventory {
+                previous: original.clone(),
+                configuration: swap.body.configuration.clone(),
             })
-            .map(|swap| swap.body.configuration.clone());
+        });
         let repair = self
             .repair
             .as_ref()
@@ -1615,8 +1620,8 @@ impl Ledger {
                 .enumerate()
                 .any(|(index, placement)| {
                     let lost_primary = repair.is_none()
-                        && failover.as_ref().is_some_and(|intent| {
-                            intent.replicas.0.iter().any(|r| {
+                        && failover.as_ref().is_some_and(|inventory| {
+                            inventory.configuration.replicas.0.iter().any(|r| {
                                 r.node == placement.launch.node && r.previous_role == 4 && !r.up
                             })
                         });
@@ -3122,7 +3127,7 @@ impl Ledger {
         let destination = self
             .failed_primary_index()
             .ok_or("missing failed Primary placement")?;
-        if self.generation.is_some()
+        if self.generation_pending()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
             || !self.placements[destination].loss_reported
