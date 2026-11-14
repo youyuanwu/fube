@@ -298,7 +298,7 @@ cat /run/fube/node1-session1/status.json
 | `control_bootstrapped` | The original fresh bootstrap completed. |
 | `fm_connected`, `peers_connected` | Original control-connection observations. |
 | `registered`, `application_pid` | Actual local application registration/process observations. |
-| `runtime_root`, `host_replacement`, `host_replacement_count` | Actual current Hosting root and latest shared-Node old/new host cleanup/provisioning observation; not replica admission or serving authority. |
+| `runtime_root`, `host_replacement`, `host_replacement_count`, `retired_applications` | Actual current Hosting root, latest shared-Node cleanup/provisioning observation, lifetime replacement count and latest 32 retired-host observations. History bounds do not limit restoration or grant serving authority. |
 | `replica_phase`, `replica_role`, `replica_id`, `replica_instance`, `replica_epoch` | Committed local replica state and identity. |
 | `local_configuration_stage`, `local_configuration_complete` | Committed local RA configuration phase/completion, not the FM's receipt of its reply. |
 | `generations` | Admitted receive/send generations, current-generation `upload_pending` readiness and separate `pending_uploads` ownership count; not restart readiness. |
@@ -423,6 +423,9 @@ FM, rolling upgrades, multiple partitions or native FM/Federation interoperabili
 The shared native ingress does not expose the local launcher's replacement-host
 command, peer reconnection or runtime adoption. It reactivates only the installed
 package for an admitted fresh volatile replica, not native download/deployment management.
+Successful forced predecessor cleanup is recorded, not a restoration veto.
+Actual child reap, process-group drain and root removal must still be proven
+before acquiring a fresh host; failed cleanup supplies no authority.
 
 ## Process-level verification
 

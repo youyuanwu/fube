@@ -276,7 +276,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut published_host_loss = false;
     let mut repair_requested = None;
     let mut repaired_hosts = Vec::new();
-    let mut published_host_replacements = 0;
+    let mut published_host_replacements: usize = 0;
     let mut upload = LfumUploadState::default();
     let mut fm_incoming = None;
     if failure.is_none() {
@@ -572,7 +572,12 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     }
                 }
             }
-            for replacement in &node.host_replacements()[published_host_replacements..] {
+            let first_retained = node.host_replacement_count() - node.host_replacements().len();
+            let Some(start) = published_host_replacements.checked_sub(first_retained) else {
+                failure = Some("host replacement observation fell behind retained history".into());
+                break;
+            };
+            for replacement in &node.host_replacements()[start..] {
                 let predecessor = metadata
                     .profile
                     .clone()

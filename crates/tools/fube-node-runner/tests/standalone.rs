@@ -11,8 +11,9 @@ use serde_json::Value;
 use std::{
     fs,
     net::{Ipv4Addr, SocketAddrV4},
+    os::unix::process::{CommandExt, ExitStatusExt},
     path::PathBuf,
-    process::Command,
+    process::{Child, Command, Stdio},
     time::Duration,
 };
 use tokio::{
@@ -27,6 +28,30 @@ struct Fixture {
     root: PathBuf,
     configs: Vec<Config>,
     children: Vec<OwnedApp>,
+}
+
+struct GroupHelper(Child);
+impl GroupHelper {
+    fn join(pid: u64) -> Self {
+        Self(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(i32::try_from(pid).unwrap())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+}
+impl Drop for GroupHelper {
+    fn drop(&mut self) {
+        if self.0.try_wait().unwrap().is_none() {
+            self.0.kill().unwrap();
+        }
+        self.0.wait().unwrap();
+    }
 }
 
 fn reserve(ip: Ipv4Addr) -> SocketAddrV4 {
@@ -847,6 +872,16 @@ async fn standalone_restores_a_fresh_original_replica_before_repeated_primary_fa
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_restores_after_forced_predecessor_group_cleanup() {
+    journey(Fault::RestoreForced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_restoration_outlives_bounded_diagnostic_history() {
+    journey(Fault::RestoreRepeated).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_generation_handshake_and_empty_upload_resume_shared_control() {
     journey(Fault::GenerationHandshake).await;
 }
@@ -908,6 +943,8 @@ enum Fault {
     ForeignInstance,
     Failover,
     Restore,
+    RestoreForced,
+    RestoreRepeated,
     GenerationHandshake,
     ReplicatedGenerationHandshake,
     AdmittingGenerationHandshake,
@@ -1052,9 +1089,11 @@ async fn restore_original(
     completed: &ConfigurationReply,
     destination: usize,
     primary_node: usize,
+    forced: bool,
 ) -> ConfigurationReply {
     let generation = fm.configurations[primary_node].generation().unwrap();
     let old_pid = fixture.status(destination)["application_pid"].clone();
+    fm.deleted[destination] = false;
     fm.send(
         destination,
         delete_replica_message(&DeleteReplica::new(predecessor.clone(), false), &generation)
@@ -1089,23 +1128,57 @@ async fn restore_original(
         service: predecessor.service.clone(),
         replica,
     };
-    let builds = fm.builds.len();
     fm.send(
         primary_node,
         add_replica_message(&request, &generation).unwrap(),
     )
     .await;
-    fm.until(fixture, |fm| fm.builds.len() == builds + 1).await;
-    let built = fm.builds.last().unwrap().clone();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut retry_at = Instant::now() + Duration::from_millis(250);
+    let built = loop {
+        if let Some(built) = fm.builds.iter().rev().find(|built| {
+            built.unit == request.unit && built.replica.id == next && built.replica.instance == next
+        }) {
+            break built.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh replica build: {}",
+            fixture.diagnostics()
+        );
+        fm.step().await;
+        if Instant::now() >= retry_at {
+            fm.send(
+                primary_node,
+                add_replica_message(&request, &generation).unwrap(),
+            )
+            .await;
+            retry_at = Instant::now() + Duration::from_millis(250);
+        }
+    };
     assert_eq!(built.replica.id, next);
     assert_eq!(built.replica.instance, next);
+    until_node(fm, fixture, destination, |status| {
+        status["replica_id"] == next
+    })
+    .await;
     let status = fixture.status(destination);
+    let retired = status["retired_applications"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
     assert_ne!(status["application_pid"], old_pid);
-    assert_eq!(status["retired_applications"][0]["pid"], old_pid);
+    assert_eq!(retired["pid"], old_pid);
     for field in ["reaped", "group_drained", "root_removed"] {
-        assert_eq!(status["retired_applications"][0][field], true, "{status}");
+        assert_eq!(retired[field], true, "{status}");
     }
-    assert_eq!(status["retired_applications"][0]["forced"], false);
+    assert_eq!(retired["forced"], forced);
+    fm.retired_replicas.push((
+        destination,
+        predecessor.replica.id,
+        predecessor.replica.instance,
+    ));
     let mut unit = completed.unit.clone();
     unit.previous = unit.current;
     unit.current.configuration += 1;
@@ -1140,6 +1213,73 @@ async fn restore_original(
     fm.losses.retain(|lost| *lost != destination);
     fm.deleted[destination] = false;
     completed
+}
+
+async fn remove_lost_secondary(
+    fixture: &mut Fixture,
+    fm: &mut FmFixture,
+    completed: &ConfigurationReply,
+    service: &Service,
+    destination: usize,
+    primary_node: usize,
+) -> (AddInstance, ConfigurationReply) {
+    let predecessor = AddInstance {
+        unit: completed.unit.clone(),
+        service: service.clone(),
+        replica: completed
+            .replicas
+            .0
+            .iter()
+            .find(|replica| {
+                replica.node == fixture.configs[destination].node.identity.native().unwrap()
+            })
+            .unwrap()
+            .clone(),
+    };
+    let pid = fixture.status(destination)["application_pid"]
+        .as_u64()
+        .unwrap();
+    assert!(Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    fm.until(fixture, |fm| fm.losses.contains(&destination))
+        .await;
+    let mut configuration = Configuration {
+        unit: completed.unit.clone(),
+        service: service.clone(),
+        replicas: completed.replicas.clone(),
+    };
+    configuration.unit.previous = configuration.unit.current;
+    configuration.unit.current.configuration += 1;
+    for replica in &mut configuration.replicas.0 {
+        replica.previous_role = replica.current_role;
+        if replica.node == predecessor.replica.node {
+            replica.current_role = 1;
+            replica.up = false;
+            replica.state = 3;
+        }
+    }
+    let generation = fm.configurations[primary_node].generation().unwrap();
+    let replies = fm.configured.len();
+    fm.send(
+        primary_node,
+        do_reconfiguration_message(
+            &DoReconfiguration {
+                configuration,
+                phase0_duration: i64::MAX,
+            },
+            &generation,
+        )
+        .unwrap(),
+    )
+    .await;
+    fm.until(fixture, |fm| fm.configured.len() == replies + 1)
+        .await;
+    let removed = fm.configured.last().unwrap().clone();
+    assert_eq!(removed.replicas.0.len(), 2);
+    (predecessor, removed)
 }
 
 async fn until_node(
@@ -1711,6 +1851,8 @@ async fn journey(fault: Fault) {
         fault,
         Fault::Failover
             | Fault::Restore
+            | Fault::RestoreForced
+            | Fault::RestoreRepeated
             | Fault::FailoverGenerationHandshake
             | Fault::RepairGenerationHandshake
     ) {
@@ -1743,6 +1885,7 @@ async fn journey(fault: Fault) {
             }
         }
         let lost_pid = pids[selected].as_u64().unwrap();
+        let mut helper = (fault == Fault::RestoreForced).then(|| GroupHelper::join(lost_pid));
         assert!(Command::new("kill")
             .args(["-KILL", &lost_pid.to_string()])
             .status()
@@ -1896,16 +2039,62 @@ async fn journey(fault: Fault) {
                     .clone();
             }
         }
-        if fault == Fault::Restore {
-            let restored = restore_original(
+        if matches!(
+            fault,
+            Fault::Restore | Fault::RestoreForced | Fault::RestoreRepeated
+        ) {
+            let mut retired_pids = vec![pids[selected].clone()];
+            let mut restored = restore_original(
                 &mut fixture,
                 &mut fm,
                 &deletion_bodies[selected],
                 &promoted,
                 selected,
                 candidate,
+                fault == Fault::RestoreForced,
             )
             .await;
+            if let Some(helper) = helper.as_mut() {
+                assert_eq!(helper.0.wait().unwrap().signal(), Some(9));
+            }
+            if fault == Fault::RestoreRepeated {
+                for cycle in 1..33 {
+                    retired_pids.push(fixture.status(selected)["application_pid"].clone());
+                    let (old, removed) = remove_lost_secondary(
+                        &mut fixture,
+                        &mut fm,
+                        &restored,
+                        &configuration.configuration.service,
+                        selected,
+                        candidate,
+                    )
+                    .await;
+                    restored = restore_original(
+                        &mut fixture,
+                        &mut fm,
+                        &old,
+                        &removed,
+                        selected,
+                        candidate,
+                        false,
+                    )
+                    .await;
+                    assert_eq!(
+                        fixture.status(selected)["host_replacement_count"],
+                        cycle + 1
+                    );
+                    assert_eq!(fixture.status(selected)["control_unknown"], false);
+                }
+                let status = fixture.status(selected);
+                assert_eq!(status["host_replacement_count"], 33);
+                let retained: Vec<_> = status["retired_applications"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|application| application["pid"].clone())
+                    .collect();
+                assert_eq!(retained, retired_pids[1..]);
+            }
             let endpoint = restored
                 .replicas
                 .0
@@ -2041,6 +2230,8 @@ async fn journey(fault: Fault) {
         Fault::None
             | Fault::Failover
             | Fault::Restore
+            | Fault::RestoreForced
+            | Fault::RestoreRepeated
             | Fault::GenerationHandshake
             | Fault::ReplicatedGenerationHandshake
             | Fault::AdmittingGenerationHandshake
@@ -2093,6 +2284,8 @@ async fn journey(fault: Fault) {
             | Fault::LostPeer
             | Fault::Failover
             | Fault::Restore
+            | Fault::RestoreForced
+            | Fault::RestoreRepeated
             | Fault::GenerationHandshake
             | Fault::ReplicatedGenerationHandshake
             | Fault::AdmittingGenerationHandshake
@@ -2121,7 +2314,11 @@ async fn journey(fault: Fault) {
             .contains("value=continued"));
     }
     for (index, pid) in pids.iter().enumerate() {
-        if fault != Fault::Restore || index != selected {
+        if !matches!(
+            fault,
+            Fault::Restore | Fault::RestoreForced | Fault::RestoreRepeated
+        ) || index != selected
+        {
             assert_eq!(&fixture.status(index)["application_pid"], pid);
         }
         if refusal && index == selected {

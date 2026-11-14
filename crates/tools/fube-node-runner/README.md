@@ -294,15 +294,19 @@ The committed Open's registration lookup drives shared Node/Hosting activation.
 That owner drains original native/IPC work, positively reaps the exited
 application and drains its owned group/root, then replaces only the Activation.
 The runner retains the original Node/RA/store and FM/peer Channels but does not
-intercept creation to launch a host. Forced predecessor cleanup rejects
-restoration; a new host gets a fresh consumer gate rather than reviving the old session.
+intercept creation to launch a host. Forced predecessor cleanup remains recorded
+but does not reject restoration once exact process/group/root cleanup succeeds;
+failed or incomplete cleanup still blocks acquisition. A new host gets a fresh
+consumer gate rather than reviving the old session.
 
 The external FM drives actual `AddReplica` copy/build and same-Primary P/P, S/S,
 I/S admission with unchanged sizes and data-loss epoch. Native final completion
 is required before claiming restored membership. `status.json` retains bounded
-`retired_applications` physical evidence and reports current replica identity
+`retired_applications` physical evidence for the latest 32 replacements and reports current replica identity
 and local configuration membership; these diagnostics are not restart-adoption
-authority. No host restarts merely because a replica was normally deleted.
+authority. `host_replacement_count` counts every replacement, independently of
+retained diagnostic history; restoration does not stop at that history bound.
+No host restarts merely because a replica was normally deleted.
 
 Native baseline `3988b451`: `AppHostClosedProcessor`,
 `CanReopenDownReplica`, `FailoverUnit::CreateReplica` and `Replica::Reuse`.
