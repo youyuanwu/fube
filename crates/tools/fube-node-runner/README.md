@@ -284,6 +284,29 @@ ChangeConfigurationReply remains explicitly logged/rejected by the shared
 adapter, never a progress gate. Definite rejected control produces a failed
 command receipt without blocking unrelated cleanup; uncertain work stays owned.
 
+### Original-node replica restoration
+
+A fresh native peer `CreateReplica` can restore an app-host-lost volatile
+placement after the exact old replica's normal deletion. Shared RA's existing
+replacement-history predicate validates the source/generation, service, epoch,
+deactivation history and newer replica ID/instance before any acquisition.
+The committed Open's registration lookup drives shared Node/Hosting activation.
+That owner drains original native/IPC work, positively reaps the exited
+application and drains its owned group/root, then replaces only the Activation.
+The runner retains the original Node/RA/store and FM/peer Channels but does not
+intercept creation to launch a host. Forced predecessor cleanup rejects
+restoration; a new host gets a fresh consumer gate rather than reviving the old session.
+
+The external FM drives actual `AddReplica` copy/build and same-Primary P/P, S/S,
+I/S admission with unchanged sizes and data-loss epoch. Native final completion
+is required before claiming restored membership. `status.json` retains bounded
+`retired_applications` physical evidence and reports current replica identity
+and local configuration membership; these diagnostics are not restart-adoption
+authority. No host restarts merely because a replica was normally deleted.
+
+Native baseline `3988b451`: `AppHostClosedProcessor`,
+`CanReopenDownReplica`, `FailoverUnit::CreateReplica` and `Replica::Reuse`.
+
 Limits remain the shared bounded profile: 64-KiB native frame/body cap,
 16 headers/4-KiB header values, four-times-body decode budget, 32 local command/
 effect observation slots, and finite per-Channel reservations from

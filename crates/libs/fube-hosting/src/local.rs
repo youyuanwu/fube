@@ -96,6 +96,7 @@ pub struct LaunchIdentity {
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CleanupStatus {
+    pub forced: bool,
     pub authority_revoked: bool,
     pub logical_retired: bool,
     pub declarations_removed: bool,
@@ -743,7 +744,12 @@ impl Activation {
             }
         }
         if let Some(process) = &mut self.process {
-            process.cleanup_with_budget(self.options.cleanup_budget)?;
+            let result = process.cleanup_with_budget(self.options.cleanup_budget);
+            self.cleanup.forced |= process.status().cleanup_forced;
+            let result = result?;
+            self.cleanup.forced |= result["forced"].as_bool().ok_or_else(|| {
+                LocalError::Mechanics("missing owned process cleanup result".into())
+            })?;
         }
         if let (Some(server), Some(lease)) = (&self.server, &self.lease) {
             let status = server.status(lease)?;

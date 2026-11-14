@@ -67,6 +67,19 @@ struct Peer {
     loss: Option<String>,
 }
 
+fn activation(config: &Config) -> Result<Activation> {
+    let mut options = Options::new(config.run_directory.join("hosting"));
+    options.profile = Profile::VolatileStatefulExternalFm;
+    options.node = Some(NodeContext {
+        id: config.node.identity.id.clone(),
+        instance: config.node.identity.instance,
+        name: config.name.clone(),
+        ip: (*config.node.address.ip()).into(),
+    });
+    options.service_package_version_instance = Some(config.package_version_instance);
+    Activation::new(options).map_err(err)
+}
+
 struct Owner {
     config: Config,
     peers: Vec<Peer>,
@@ -204,6 +217,12 @@ impl Owner {
             "runtime_root": self.node.as_ref().and_then(|node| node.activation().root()),
             "host_replacement": self.node.as_ref().and_then(|node| node.host_replacements().last()),
             "host_replacement_count": self.node.as_ref().map_or(0, |node| node.host_replacements().len()),
+            "retired_applications": self.node.as_ref().map(|node| node.host_replacements().iter().map(|replacement|
+                serde_json::json!({
+                    "pid": replacement.old_app_pid, "host_id": replacement.old_host,
+                    "reaped": replacement.old_app_reaped, "group_drained": replacement.old_group_drained,
+                    "root_removed": replacement.old_root_removed, "forced": replacement.old_cleanup_forced,
+                })).collect::<Vec<_>>()).unwrap_or_default(),
             "replica_id": state.map(|state| state.body.replica.id),
             "replica_instance": state.map(|state| state.body.replica.instance),
             "replica_epoch": state.map(|state| state.body.unit.current),
@@ -214,6 +233,8 @@ impl Owner {
                 .is_some_and(|configuration| configuration.stage == ra::ConfigurationStage::Complete)),
             "local_configuration_stage": state.and_then(|state| state.reconfiguration.as_ref())
                 .map(|configuration| format!("{:?}", configuration.stage)),
+            "configuration_members": state.and_then(|state| state.reconfiguration.as_ref())
+                .map(|configuration| configuration.request.replicas.0.iter().filter(|replica| replica.current_role >= 3).count()),
             "generations": self.node.as_ref().map(|node| {
                 let state = node.generation_state();
                 serde_json::json!({
@@ -409,22 +430,13 @@ impl Owner {
         if let Some(handoff) = incoming.handoff.as_mut() {
             handoff.acknowledge();
         }
-        let mut options = Options::new(self.config.run_directory.join("hosting"));
-        options.profile = Profile::VolatileStatefulExternalFm;
-        options.node = Some(NodeContext {
-            id: self.config.node.identity.id.clone(),
-            instance: local.instance,
-            name: self.config.name.clone(),
-            ip: (*self.config.node.address.ip()).into(),
-        });
-        options.service_package_version_instance = Some(self.config.package_version_instance);
         self.store = Some(Arc::new(
             Store::new(Box::new(MemoryBackend::new()), Settings::default())
                 .await
                 .map_err(err)?,
         ));
         let node = Node::new(
-            Activation::new(options).map_err(err)?,
+            activation(&self.config)?,
             self.store.as_ref().expect("original memory store").clone(),
             ra::Admission {
                 local_node: local,
