@@ -928,7 +928,6 @@ impl Node {
     pub fn create_idle_on_peer(&mut self, replica: Replica) -> Result<u64> {
         if !self.fm_primary_profile()
             || !self.live.load(Ordering::SeqCst)
-            || self.ra.generation_state().upload_pending
             || !self.ra.is_peer(&replica.node)
         {
             return Err(Error::Unsupported);
@@ -962,7 +961,6 @@ impl Node {
     fn control_idle_on_peer(&mut self, remove: bool) -> Result<u64> {
         if !self.fm_primary_profile()
             || !self.live.load(Ordering::SeqCst)
-            || self.ra.generation_state().upload_pending
             || self.ra.peer().is_none()
         {
             return Err(Error::Unsupported);
@@ -1470,12 +1468,7 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        let continuing = self
-            .ra
-            .snapshot(body.unit.id.guid.0)
-            .committed
-            .is_some_and(|state| ra::continues_initial_idle_build(&state, &body));
-        self.admit_remote_control(&body, source, generation, continuing)?;
+        self.admit_remote_control(&body, source, generation)?;
         self.enqueue(Work::AddReplica(
             Arc::new(body),
             source.clone(),
@@ -1691,15 +1684,7 @@ impl Node {
     }
     fn admit_configuration(&self, body: &Configuration) -> Result<()> {
         let current = self.ra.snapshot(body.unit.id.guid.0).committed;
-        let continuing = current
-            .as_deref()
-            .and_then(ra::initial_membership_configuration)
-            .is_some_and(|config| config.request == *body)
-            || current
-                .as_deref()
-                .is_some_and(|state| ra::continues_primary_failover(state, body));
         if !self.live.load(Ordering::SeqCst)
-            || (self.ra.generation_state().upload_pending && !continuing)
             || !self.ra.consumer_lifetime().is_accepting()
             || !(2..=ra::MAX_CONFIGURATION_REPLICAS).contains(&body.replicas.0.len())
             || to_vec(body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
@@ -1735,7 +1720,7 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        self.admit_remote_control(&body, source, generation, false)?;
+        self.admit_remote_control(&body, source, generation)?;
         self.enqueue(Work::RemoveReplica(
             Arc::new(body),
             source.clone(),
@@ -1747,7 +1732,6 @@ impl Node {
         body: &AddInstance,
         source: &NodeInstance,
         generation: &GenerationHeader,
-        continuing: bool,
     ) -> Result<()> {
         self.admit_fm(source, generation)?;
         if (!self.fm_primary_profile()
@@ -1761,7 +1745,6 @@ impl Node {
                         && ra::completed_primary_failover(&s)
                 }))
             || !self.live.load(Ordering::SeqCst)
-            || (self.ra.generation_state().upload_pending && !continuing)
             || !self.ra.is_peer(&body.replica.node)
             || self
                 .ra

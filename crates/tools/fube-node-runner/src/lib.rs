@@ -206,6 +206,8 @@ impl Owner {
             "replica_role": state.map(|state| state.body.replica.current_role),
             "local_configuration_complete": state.is_some_and(|state| state.reconfiguration.as_ref()
                 .is_some_and(|configuration| configuration.stage == ra::ConfigurationStage::Complete)),
+            "local_configuration_stage": state.and_then(|state| state.reconfiguration.as_ref())
+                .map(|configuration| format!("{:?}", configuration.stage)),
             "generations": self.node.as_ref().map(|node| {
                 let state = node.generation_state();
                 serde_json::json!({

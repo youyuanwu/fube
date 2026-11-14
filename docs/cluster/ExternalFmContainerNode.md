@@ -299,7 +299,7 @@ cat /run/fube/node1-session1/status.json
 | `fm_connected`, `peers_connected` | Original control-connection observations. |
 | `registered`, `application_pid` | Actual local application registration/process observations. |
 | `replica_phase`, `replica_role` | Committed local replica state. |
-| `local_configuration_complete` | Local RA configuration completion, not the FM's receipt of its reply. |
+| `local_configuration_stage`, `local_configuration_complete` | Committed local RA configuration phase/completion, not the FM's receipt of its reply. |
 | `generations` | Admitted receive/send generations, current-generation `upload_pending` readiness and separate `pending_uploads` ownership count; not restart readiness. |
 | `control_unknown`, `control_error`, `error` | Retained session loss or other failure; not permission to promote or reconnect. |
 | `cleanup` | Final local cleanup outcome, including separately reported `pending_work`. |
@@ -368,8 +368,8 @@ and original FM-owned Idle creation/build after participating RAs commit their
 creation requests, or original healthy same-Primary Secondary admission once all participating
 RAs have committed their configuration requests. It also supports the first
 original 3/2 Primary app-host failover with both original healthy survivors.
-Each Node uploads its committed local view with cleared LSNs; only the Primary marks its inventory
-as a Primary report. A matching correlated LFUM reply advances send generation,
+Each Node uploads its committed local view with cleared LSNs and SF's
+current/previous-Primary reporting rules. A matching correlated LFUM reply advances send generation,
 without reopening replicas or changing application authority. Every accepted
 update owns a fresh snapshot; retries preserve only their own frozen upload,
 and replies retire only their original request, including stale-generation
@@ -380,16 +380,20 @@ configuration continuations retain their owners; generation rollover does not
 change runtime access or quorum authority. During initial build, the Primary
 reports its known remote Idles as InBuild until each matching build completes;
 each destination reports only its own InBuild Idle. PC/IC remain invalid.
-Exact original AddReplica retries and build completions may progress before
-upload acknowledgment without changing frozen inventory. During failover, a GetLSN-only
+Ordinarily admitted control and build completions may progress before upload
+acknowledgment without changing frozen inventory. Both launchers qualify new
+initial configuration admission before that ACK; outgoing peer retries resume
+after send-generation advancement. During failover, a GetLSN-only
 survivor reports old CC copied to PC, not the prospective new membership.
 Deactivate reports IC=CC; survivor Activate clears IC, and local completion clears
 PC/IC and removes the dropped former Primary. The closed former Primary reports
-canonical local dropped metadata or omits its deleted entry. Exact original
-failover continuations may progress during upload, without granting new runtime
-or quorum authority. Manual/failed builds, failed RAP states, other interrupted
-reconfigurations, planned swaps, repair, redirected/repeated failover inventory
-and restart reconciliation remain gated.
+canonical local dropped metadata or omits its deleted entry.
+The shared RA has no LFUM-specific lineage/size allowlist or upload-pending
+peer-control gate. Its committed replica-store projection also covers existing
+repair/removal, planned transfer, redirection and failed-operation states in
+model/store tests. This does not widen this runner's deployment/runtime profile
+or qualify those additional overlaps in real standalone processes.
+Nonempty startup, full ReplicaUp reconciliation, FMM and restart remain gated.
 
 ## Failure behavior and limits
 

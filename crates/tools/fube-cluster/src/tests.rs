@@ -6539,6 +6539,12 @@ async fn real_lfum_during_idle_build_preserves_sf_inventory_copy_and_original_ow
         until(&mut cluster, |c| c.ledger.idle_status()["ready"] == true).await;
         assert!(cluster.ledger.configuration.is_none());
         assert_eq!(data_contact(&endpoint, b"read\n"), authority);
+        cluster.activate_idle_replica().await?;
+        let admission = cluster.ledger.configuration.as_ref().unwrap().body.clone();
+        until(&mut cluster, |c|
+            c.status()["nodes"][0]["retained_work"]["local_replica"]["configuration"]["stage"] == "Activate").await;
+        assert!(cluster.ledger.configuration.as_ref().unwrap().reply.is_none());
+        assert_eq!(cluster.status()["nodes"][0]["retained_work"]["generations"]["upload_pending"], true);
         for (index, incoming) in current.into_iter().enumerate() {
             assert_eq!(decode_lfum_upload(&incoming.message).map_err(err)?.units,
                 frozen_bodies[index].units);
@@ -6547,6 +6553,7 @@ async fn real_lfum_during_idle_build_preserves_sf_inventory_copy_and_original_ow
         until(&mut cluster, |c| !c.ledger.generation_pending()
             && c.status()["nodes"].as_array().unwrap().iter().all(|n|
                 n["retained_work"]["generations"]["upload_pending"] == false)).await;
+        cluster.send_configuration(&admission).await?;
         until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
         assert!(data_contact(&endpoint, b"write\n").contains("committed=1 value=acknowledged"));
         until(&mut cluster, |c| (1..3).all(|i|
