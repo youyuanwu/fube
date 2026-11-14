@@ -358,6 +358,63 @@ async fn idle_removal_before_build_is_idempotent_and_suppresses_delayed_build() 
 }
 
 #[tokio::test]
+async fn captured_retry_cleanup_cannot_repeat_or_remove_a_rebuilt_remote() {
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let open = request(&h, 2, 1, 43);
+    h.send("ReplicaOpen", &open).await;
+    h.receive("ReplicaOpenReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    let mut idle = peer(&open.local, 2);
+    idle.current_role = 2;
+    let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle]);
+    h.send("ReplicatorBuildIdleReplica", &build).await;
+    let first: ProxyReply =
+        from_slice(&h.receive("ReplicatorBuildIdleReplicaReply").await.body).unwrap();
+    assert_eq!(first.error.error, -993);
+    h.engine
+        .shared
+        .stateful
+        .wait_remote_idle([2; 16], [2; 16])
+        .await;
+    let hook = h.engine.shared.stateful.pause_build_cleanup();
+    let shared = h.engine.shared.clone();
+    let captured = build.clone();
+    let pending =
+        tokio::spawn(async move { shared.stateful.run_build_retry([2; 16], captured).await });
+    tokio::time::timeout(Duration::from_secs(1), hook.reached.notified())
+        .await
+        .unwrap();
+    h.send("ReplicatorBuildIdleReplica", &build).await;
+    wait_event(&calls, "remove", 1).await;
+    h.engine
+        .shared
+        .stateful
+        .wait_remote_idle([2; 16], [2; 16])
+        .await;
+    assert_eq!(
+        *calls.removals.lock().unwrap(),
+        [crate::ReplicaRemoval::BuildRetryCleanup]
+    );
+    h.send("ReplicatorBuildIdleReplica", &build).await;
+    let rebuilt: ProxyReply =
+        from_slice(&h.receive("ReplicatorBuildIdleReplicaReply").await.body).unwrap();
+    assert_eq!(rebuilt.error.error, 0);
+    h.engine
+        .shared
+        .stateful
+        .wait_remote_idle([2; 16], [2; 16])
+        .await;
+    hook.release.notify_one();
+    pending.await.unwrap().unwrap();
+    assert_eq!(
+        *calls.removals.lock().unwrap(),
+        [crate::ReplicaRemoval::BuildRetryCleanup]
+    );
+    assert_eq!(calls.builds.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn replicator_absence_completes_retry_cleanup_and_terminal_idle_removal() {
     for mode in [43, 44] {
         let mut h = Harness::new().await;
