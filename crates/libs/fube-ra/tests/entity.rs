@@ -8913,16 +8913,41 @@ async fn secondary_lfum_reports_full_committed_membership_without_primary_author
 }
 
 #[tokio::test]
-async fn lfum_keeps_unconfigured_idle_build_and_failed_configuration_explicitly_gated() {
+async fn lfum_keeps_failed_build_and_configuration_explicitly_gated() {
     for reconfiguring in [false, true] {
         let (store, executor, _) = setup(WAIT).await;
-        let config = built_three_idles(&executor).await;
         if reconfiguring {
+            let config = built_three_idles(&executor).await;
             run(&executor, reconfigure(config)).await;
             let mut failed = configured(&effects(&executor));
             failed.error = -991;
             run(&executor, Command::CompleteConfiguration(Box::new(failed))).await;
+        } else {
+            executor.bind_peer(peer_source()).unwrap();
+            make_ready(&executor, &primary_body()).await;
+            let primary = state(&executor);
+            let request = fm_idle_request(&primary);
+            run(&executor, fm_add_idle(request.clone())).await;
+            let mut opened = CreateReplicaReply {
+                unit: request.unit,
+                replica: request.replica,
+                error: 0,
+            };
+            opened.replica.replication_endpoint = "127.0.0.1:12346".into();
+            run(&executor, peer_opened(opened.clone())).await;
+            run(
+                &executor,
+                Command::CompleteBuild(Box::new(BuildCompletion {
+                    unit: primary.body.unit.clone(),
+                    local: primary.body.replica.clone(),
+                    remote: opened.replica,
+                    error: -991,
+                    detail: ProxyErrorDetail::default(),
+                })),
+            )
+            .await;
         }
+        effects(&executor);
         let before = state(&executor);
         let source = admission().fm_source;
         executor
@@ -8952,6 +8977,199 @@ async fn lfum_keeps_unconfigured_idle_build_and_failed_configuration_explicitly_
         assert!(executor
             .complete_lfum_upload(0, &source, &generation_header(8))
             .is_err());
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn initial_idle_build_lfum_preserves_sf_states_and_only_retries_original_intent() {
+    let (store, executor, _) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    make_ready(&executor, &primary_body()).await;
+    let primary = state(&executor);
+    let request = fm_idle_request(&primary);
+    run(&executor, fm_add_idle(request.clone())).await;
+    effects(&executor);
+    let source = admission().fm_source;
+    let begin = |number| {
+        executor
+            .process_generation_proposal(&source, &generation_header(number))
+            .unwrap();
+        executor
+            .process_generation_update(
+                &source,
+                &GenerationUpdate::default(),
+                &generation_header(number),
+            )
+            .unwrap();
+    };
+    begin(8);
+    let creating = wait_lfum(&executor).await;
+    assert_eq!(creating.units.0[0].replicas.0.len(), 2);
+    assert_eq!(
+        creating.units.0[0].replicas.0[1].description,
+        request.replica
+    );
+    assert!(creating.units.0[0].report_from_primary);
+    assert_eq!(
+        executor.take_lfum_inventory().unwrap(),
+        Some(creating.clone())
+    );
+    let mut opened = CreateReplicaReply {
+        unit: request.unit.clone(),
+        replica: request.replica.clone(),
+        error: 0,
+    };
+    opened.replica.replication_endpoint = "127.0.0.1:12346".into();
+    run(
+        &executor,
+        Command::CreateReplicaReply {
+            body: Box::new(opened.clone()),
+            source: peer_source(),
+            generation: generation_header(8),
+        },
+    )
+    .await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::BuildIdle { .. }]
+    ));
+    let retry = |body| Command::AddReplica {
+        body: Box::new(body),
+        source: source.clone(),
+        generation: generation_header(8),
+    };
+    run(&executor, retry(request.clone())).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::BuildIdle { .. }]
+    ));
+    let mut changed = request.clone();
+    changed.replica.instance += 1;
+    assert!(matches!(
+        executor.submit(retry(changed)).unwrap().wait(WAIT).await,
+        Err(Failure::Unsupported(_))
+    ));
+    assert!(matches!(
+        executor
+            .submit(Command::RemoveReplica {
+                body: Box::new(request.clone()),
+                source: source.clone(),
+                generation: generation_header(8),
+            })
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    begin(9);
+    let building = wait_lfum(&executor).await;
+    assert_eq!(
+        building.units.0[0].replicas.0[1].description,
+        opened.replica
+    );
+    run(
+        &executor,
+        Command::CompleteBuild(Box::new(BuildCompletion {
+            unit: primary.body.unit.clone(),
+            local: primary.body.replica.clone(),
+            remote: opened.replica.clone(),
+            error: 0,
+            detail: ProxyErrorDetail::default(),
+        })),
+    )
+    .await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::AddReplicaReply(body)] if body.replica.state == 2)
+    );
+    assert_eq!(executor.lfum_inventory().unwrap(), Some(building));
+    assert!(!executor
+        .complete_lfum_upload(creating.upload, &source, &generation_header(8))
+        .unwrap());
+    assert_eq!(
+        executor.generation_state().send,
+        generation_header(7).number
+    );
+    begin(10);
+    let ready = wait_lfum(&executor).await;
+    let mut expected = opened.replica;
+    expected.state = 2;
+    assert_eq!(ready.units.0[0].replicas.0[1].description, expected);
+    assert_eq!(ready.units.0[0].intermediate, Epoch::default());
+    assert!(ready.units.0[0]
+        .replicas
+        .0
+        .iter()
+        .all(|r| r.intermediate_role == 1
+            && r.description.first_lsn == -1
+            && r.description.last_lsn == -1));
+    assert_eq!(state(&executor).open_token, primary.open_token);
+    assert_eq!(state(&executor).usage, primary.usage);
+    assert_eq!(state(&executor).runtime, primary.runtime);
+    assert!(state(&executor).reconfiguration.is_none());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn initial_idle_lfum_reads_wait_for_private_open_and_never_promote_the_idle() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(40)
+        } else {
+            WAIT
+        })
+        .await;
+        executor.bind_peer(peer_source()).unwrap();
+        let request = peer_request();
+        let creation = run(&executor, peer_create(request.clone())).await;
+        assert_eq!(creation, Disposition::Applied);
+        effects(&executor);
+        let before = state(&executor);
+        registered(&executor, &request.replica.0, before.open_token).await;
+        let before = state(&executor);
+        effects(&executor);
+        let mut completion = complete(&before.body, before.open_token);
+        completion.replica.service_endpoint.clear();
+        completion.replica.replication_endpoint = "127.0.0.1:12345".into();
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::CompleteOpen(Box::new(completion)))
+            .unwrap();
+        entered.await.unwrap();
+        let source = admission().fm_source;
+        executor
+            .process_generation_proposal(&source, &generation_header(8))
+            .unwrap();
+        executor
+            .process_generation_update(&source, &GenerationUpdate::default(), &generation_header(8))
+            .unwrap();
+        assert!(executor.lfum_inventory().unwrap().is_none());
+        assert_eq!(state(&executor), before);
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.lfum_inventory().unwrap().is_none());
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        let inventory = wait_lfum(&executor).await;
+        let info = &inventory.units.0[0];
+        assert!(!info.report_from_primary);
+        assert_eq!(info.replicas.0.len(), 1);
+        assert_eq!(
+            info.replicas.0[0].description,
+            state(&executor).body.replica
+        );
+        assert_eq!(info.replicas.0[0].description.current_role, 2);
+        assert_eq!(info.replicas.0[0].description.state, 1);
+        assert_eq!(info.replicas.0[0].intermediate_role, 1);
+        assert_eq!(state(&executor).open_token, before.open_token);
+        if fail {
+            assert_eq!(state(&executor), before);
+        }
         finish(&store, &executor).await;
     }
 }

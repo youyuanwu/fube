@@ -440,6 +440,11 @@ impl IStatefulServiceReplica for StatefulReplica {
                         data,
                         self.memory.lock().unwrap().clone().expect("real provider"),
                         true,
+                        self.resource
+                            .resource
+                            .with_file_name("local-copy.block")
+                            .exists()
+                            .then(|| self.resource.resource.with_file_name("local-copy.release")),
                     )?);
                 }
             }
@@ -453,6 +458,7 @@ impl IStatefulServiceReplica for StatefulReplica {
                     self.data.lock().unwrap().clone().expect("real replicator"),
                     self.memory.lock().unwrap().clone().expect("real provider"),
                     false,
+                    None,
                 )?;
                 *self.secondary.lock().unwrap() = Some(pump);
             }
@@ -811,6 +817,7 @@ impl SecondaryPump {
         data: Arc<RuntimeReplicator>,
         memory: Arc<MemoryProvider>,
         copying: bool,
+        mut copy_barrier: Option<PathBuf>,
     ) -> Result<Self> {
         let state = data.get_state_replicator();
         let mut streams = vec![];
@@ -850,6 +857,22 @@ impl SecondaryPump {
                                     item = stream.get_operation(stop.clone()) => item?,
                                 };
                                 let Some(operation) = operation else { break };
+                                if copying {
+                                    if let Some(release) = copy_barrier.take() {
+                                        std::fs::write(
+                                            release.with_file_name("local-copy.held"),
+                                            b"unacknowledged copy operation",
+                                        ).expect("publish fixture copy barrier");
+                                        tokio::select! {
+                                            _ = stop.cancelled() => return Ok(()),
+                                            result = tokio::time::timeout(Duration::from_secs(30), async {
+                                                while !release.exists() {
+                                                    tokio::time::sleep(Duration::from_millis(2)).await;
+                                                }
+                                            }) => result.expect("bounded fixture copy barrier timed out"),
+                                        }
+                                    }
+                                }
                                 native.status()?;
                                 apply_secondary(&memory, operation.as_ref(), copying)?;
                                 if !memory.snapshot().copy_in_progress {

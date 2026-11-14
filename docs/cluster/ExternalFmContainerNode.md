@@ -364,7 +364,8 @@ its 64-KiB frame/body cap, 16 headers with 4-KiB values, bounded decode budget
 and 32 local command/effect observation slots.
 
 Ordinary-FM generation rollover supports stable, fully admitted 3/2 membership
-and original healthy same-Primary Secondary admission once all participating
+and original FM-owned Idle creation/build after participating RAs commit their
+creation requests, or original healthy same-Primary Secondary admission once all participating
 RAs have committed their configuration requests. Each Node uploads its complete
 committed membership with cleared LSNs; only the Primary marks its inventory
 as a Primary report. A matching correlated LFUM reply advances send generation,
@@ -375,7 +376,11 @@ replies. During admission, committed PC epochs/roles are retained; Primary phase
 reports IC=CC/current roles while the activating Secondary reports invalid IC.
 Local completion clears PC/IC independently of upload completion. Matching
 configuration continuations retain their owners; generation rollover does not
-change runtime access or quorum authority. In-flight builds, other interrupted
+change runtime access or quorum authority. During initial build, the Primary
+reports its known remote Idles as InBuild until each matching build completes;
+each destination reports only its own InBuild Idle. PC/IC remain invalid.
+Exact original AddReplica retries and build completions may progress before
+upload acknowledgment without changing frozen inventory. Manual/failed builds, other interrupted
 reconfigurations, swap/repair inventory and restart reconciliation remain gated.
 
 ## Failure behavior and limits
@@ -404,7 +409,7 @@ They cover initial 3/2 startup/build/admission, singleton write denial, real
 write/readback, lost build/final-reply replay, writes before FM observation,
 generation/membership refusal, FM-loss retention, verified Primary app-host loss
 with real peer failover and continuing writes, stable replicated generation
-rollover, generation rollover during held Secondary admission with SF phase
+rollover, generation rollover during held real copy/build and Secondary admission with SF phase
 inventory and stale replies, full membership/data preservation, and owned shutdown.
 
 ```sh

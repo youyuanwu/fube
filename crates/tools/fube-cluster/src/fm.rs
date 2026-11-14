@@ -209,6 +209,7 @@ pub(crate) struct GenerationHandshake {
     pub updates_sent: Vec<bool>,
     pub uploads: Vec<Option<LfumUpload>>,
     initial_membership: Option<Configuration>,
+    initial_builds: Option<Vec<AddReplica>>,
     retry_at: Vec<Instant>,
 }
 impl GenerationHandshake {
@@ -220,6 +221,7 @@ impl GenerationHandshake {
             updates_sent: vec![false; nodes],
             uploads: vec![None; nodes],
             initial_membership: None,
+            initial_builds: None,
             retry_at: vec![Instant::now(); nodes],
         })
     }
@@ -1075,6 +1077,13 @@ impl Ledger {
     }
 
     fn validate_peer_lfum(&self, index: usize, body: &LfumUpload) -> Result<()> {
+        if let Some(builds) = self
+            .generation
+            .as_ref()
+            .and_then(|round| round.initial_builds.as_ref())
+        {
+            return self.validate_build_lfum(index, body, builds);
+        }
         let placement = &self.placements[index];
         let initial = self
             .generation
@@ -1144,6 +1153,81 @@ impl Ledger {
         Ok(())
     }
 
+    fn validate_build_lfum(
+        &self,
+        index: usize,
+        body: &LfumUpload,
+        builds: &[AddReplica],
+    ) -> Result<()> {
+        let placement = &self.placements[index];
+        let primary = &self.placements[0];
+        let expected = primary.body()?;
+        if placement.node_description.as_ref() != Some(&body.node)
+            || !body.any_replica_found
+            || body.units.0.len() != 1
+        {
+            return Err("LFUM build inventory requires the original participating RA".into());
+        }
+        let info = &body.units.0[0];
+        if info.service != expected.service
+            || info.unit != expected.unit
+            || info.intermediate != Epoch::default()
+            || info.local_deleted
+            || info.report_from_primary != (index == 0)
+            || info.replicas.0.len() != if index == 0 { builds.len() + 1 } else { 1 }
+        {
+            return Err("LFUM build inventory changed the original FT or build set".into());
+        }
+        let mut replicas = vec![];
+        if index == 0 {
+            replicas.push(
+                primary
+                    .ready_replica
+                    .clone()
+                    .ok_or("missing test Primary")?,
+            );
+        }
+        replicas.extend(
+            builds
+                .iter()
+                .filter(|build| index == 0 || build.replica.node == placement.launch.node)
+                .map(|build| build.replica.clone()),
+        );
+        for mut expected in replicas {
+            expected.first_lsn = -1;
+            expected.last_lsn = -1;
+            let mut matching = info
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.description.node == expected.node);
+            let replica = matching.next().ok_or("missing original build replica")?;
+            if matching.next().is_some() {
+                return Err("duplicate build replica".into());
+            }
+            let actual = &replica.description;
+            exact_replica(&expected, actual, false)?;
+            if replica.intermediate_role != 1
+                || !actual.up
+                || actual.first_lsn != -1
+                || actual.last_lsn != -1
+                || if expected.current_role == 4 {
+                    *actual != expected
+                } else {
+                    !actual.service_endpoint.is_empty()
+                        || !matches!(actual.state, 1 | 2)
+                        || (index != 0 && actual.state != 1)
+                        || (actual.state == 2 && actual.replication_endpoint.is_empty())
+                }
+            {
+                return Err(format!(
+                    "LFUM build state is not an original InBuild/Ready Idle: expected {expected:?}, got {replica:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn begin_generation(&mut self) -> Result<()> {
         let peer = self.placements[0].launch.profile.peer_replicas();
         let stable_peer = self.configuration.as_ref().is_some_and(|c| {
@@ -1171,7 +1255,19 @@ impl Ledger {
                     })
             })
             .map(|c| c.body.configuration.clone());
-        if (peer && !stable_peer && initial_membership.is_none())
+        let initial_builds = (peer
+            && self.configuration.is_none()
+            && self.configuration_history.is_empty()
+            && self.placements[0].body()?.service.target == 3
+            && self.placements[0].body()?.service.minimum == 2
+            && self.idles.len() + 1 == self.placements.len()
+            && self.idles.iter().all(|idle| {
+                !idle.cancelled
+                    && !idle.unknown
+                    && idle.reply.as_ref().is_none_or(|reply| reply.error == 0)
+            }))
+        .then(|| self.idles.iter().map(|idle| idle.body.clone()).collect());
+        if (peer && !stable_peer && initial_membership.is_none() && initial_builds.is_none())
             || self.swap.is_some()
             || self.repair.is_some()
             || self.idle_removal.is_some()
@@ -1193,22 +1289,21 @@ impl Ledger {
                         || placement.service_update.is_some()
                         || (peer
                             && ((placement.observed != Observed::Running
-                                && !(initial_membership.is_some()
+                                && !((initial_membership.is_some() || initial_builds.is_some())
                                     && index != 0
                                     && placement.observed == Observed::Absent))
                                 || placement.loss_reported))
                 })
         {
-            return Err("generation handshake requires admitted sessions and stable or initial admitting membership".into());
+            return Err("generation handshake requires admitted sessions and stable or initial build/admitting membership".into());
         }
         self.generation = Some(GenerationHandshake::new(
             &self.placements[0].launch.generation.number,
             self.placements.len(),
         )?);
-        self.generation
-            .as_mut()
-            .expect("owned round")
-            .initial_membership = initial_membership;
+        let round = self.generation.as_mut().expect("owned round");
+        round.initial_membership = initial_membership;
+        round.initial_builds = initial_builds;
         Ok(())
     }
     pub fn report(&mut self, index: usize, body: &ReplicaUp) -> Result<Option<ReplicaUp>> {
@@ -2984,7 +3079,7 @@ impl Ledger {
             || self.placements.iter().any(|p| p.loss_reported)
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
-            || self.generation.is_some()
+            || self.generation_pending()
             || self.placements[0].observed != Observed::Running
             || self
                 .placements
@@ -3033,7 +3128,7 @@ impl Ledger {
                 i.reply.as_ref().is_some_and(|r| r.error == 0) && !i.cancelled && !i.unknown
             });
         if !self.placements[0].launch.profile.peer_replicas()
-            || self.generation.is_some()
+            || self.generation_pending()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
             || self.placements[0].observed != Observed::Running
@@ -3793,6 +3888,9 @@ impl Ledger {
         Ok(())
     }
     pub fn idle_retry(&mut self, index: usize, now: Instant) -> Option<AddReplica> {
+        let generation_blocks = self.generation.as_ref().is_some_and(|round| {
+            round.phase != GenerationPhase::Complete && round.initial_builds.is_none()
+        });
         let primary = self.primary_index();
         if let Some(repair) = &mut self.repair {
             if index != primary
@@ -3813,7 +3911,7 @@ impl Ledger {
                 && action_retry_due(i.started, i.last, now)
         })?;
         if index != 0
-            || self.generation.is_some()
+            || generation_blocks
             || idle.cancelled
             || idle.unknown
             || idle.reply.is_some()

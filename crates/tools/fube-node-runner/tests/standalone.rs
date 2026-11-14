@@ -230,6 +230,7 @@ struct FmFixture {
     hold_configuration: bool,
     held_configuration: Option<ConfigurationReply>,
     initial_membership: Option<Configuration>,
+    initial_builds: Option<Vec<AddReplica>>,
     hold_uploads: bool,
     held_uploads: Vec<(usize, IncomingMessage<GatewayTarget>)>,
     stopping: bool,
@@ -284,6 +285,7 @@ impl FmFixture {
             hold_configuration: false,
             held_configuration: None,
             initial_membership: None,
+            initial_builds: None,
             hold_uploads: false,
             held_uploads: vec![],
             stopping: false,
@@ -321,13 +323,38 @@ impl FmFixture {
                 "LFUMUpload" => {
                     let body = decode_lfum_upload(&incoming.message).unwrap();
                     assert_eq!(body.generation, generation.number);
-                    let expected = self.initial_membership.clone().or_else(|| {
-                        self.configured.last().map(|configuration| Configuration {
-                            unit: configuration.unit.clone(),
-                            service: primary(&self.configurations[index]).service,
-                            replicas: configuration.replicas.clone(),
+                    let expected = self
+                        .initial_builds
+                        .as_ref()
+                        .map(|builds| {
+                            let primary = &self.primary.as_ref().unwrap().replica;
+                            let node = self.configurations[index].node.identity.native().unwrap();
+                            let mut replicas = vec![];
+                            if primary.node == node {
+                                replicas.push(primary.clone());
+                            }
+                            replicas.extend(
+                                builds
+                                    .iter()
+                                    .filter(|build| {
+                                        primary.node == node || build.replica.node == node
+                                    })
+                                    .map(|build| build.replica.clone()),
+                            );
+                            Configuration {
+                                unit: builds[0].unit.clone(),
+                                service: builds[0].service.clone(),
+                                replicas: ObjectArray(replicas),
+                            }
                         })
-                    });
+                        .or_else(|| self.initial_membership.clone())
+                        .or_else(|| {
+                            self.configured.last().map(|configuration| Configuration {
+                                unit: configuration.unit.clone(),
+                                service: primary(&self.configurations[index]).service,
+                                replicas: configuration.replicas.clone(),
+                            })
+                        });
                     if let Some(configuration) = expected {
                         assert!(body.any_replica_found);
                         assert_eq!(body.units.0.len(), 1);
@@ -358,6 +385,17 @@ impl FmFixture {
                             let mut expected = expected.clone();
                             expected.first_lsn = -1;
                             expected.last_lsn = -1;
+                            if self.initial_builds.is_some() && expected.current_role == 2 {
+                                let actual = &info
+                                    .replicas
+                                    .0
+                                    .iter()
+                                    .find(|r| r.description.node == expected.node)
+                                    .unwrap()
+                                    .description;
+                                assert!(!actual.replication_endpoint.is_empty());
+                                expected.replication_endpoint = actual.replication_endpoint.clone();
+                            }
                             let intermediate_role = if info.intermediate == Epoch::default() {
                                 1
                             } else {
@@ -574,6 +612,20 @@ fn primary(config: &Config) -> AddPrimary {
     body
 }
 
+fn idle_request(primary: &AddPrimary, config: &Config) -> AddReplica {
+    let mut body = primary.clone();
+    body.replica = Replica {
+        node: config.node.identity.native().unwrap(),
+        id: config.node.replica_id,
+        instance: config.node.replica_instance,
+        current_role: 2,
+        state: 1,
+        version: primary.service.version.clone(),
+        ..Replica::default()
+    };
+    body
+}
+
 async fn application(address: &str, request: &str) -> String {
     tokio::time::timeout(Duration::from_secs(2), async {
         let mut socket = TcpStream::connect(address)
@@ -625,6 +677,11 @@ async fn peer_loss_before_deletion_retains_uncertainty_but_allows_local_node_clo
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_generation_rollover_during_idle_build_preserves_sf_inventory() {
+    journey(Fault::BuildingGenerationHandshake).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_wrong_generation_refuses_new_authority() {
     journey(Fault::Generation).await;
 }
@@ -663,6 +720,7 @@ enum Fault {
     GenerationHandshake,
     ReplicatedGenerationHandshake,
     AdmittingGenerationHandshake,
+    BuildingGenerationHandshake,
 }
 
 async fn start_rollover(fm: &mut FmFixture) {
@@ -811,39 +869,82 @@ async fn journey(fault: Fault) {
     let pids: Vec<_> = (0..3)
         .map(|index| fixture.status(index)["application_pid"].clone())
         .collect();
-    for destination in [0, 2] {
-        let mut build = body.clone();
-        let placement = &fixture.configs[destination].node;
-        build.replica = Replica {
-            node: placement.identity.native().unwrap(),
-            id: placement.replica_id,
-            instance: placement.replica_instance,
-            current_role: 2,
-            state: 1,
-            version: body.service.version.clone(),
-            ..Replica::default()
-        };
-        let before = fm.builds.len();
-        fm.hold_build = true;
-        fm.send(selected, add_replica_message(&build, &generation).unwrap())
-            .await;
-        fm.until(&mut fixture, |fm| fm.held_build.is_some()).await;
-        assert_eq!(
-            fm.builds.len(),
-            before,
-            "lost reply cannot complete FM build"
-        );
-        let original = fm.held_build.take().unwrap();
-        fm.hold_build = false;
-        fm.send(selected, add_replica_message(&build, &generation).unwrap())
-            .await;
-        fm.until(&mut fixture, |fm| fm.builds.len() > before).await;
-        assert_eq!(fm.builds.last().unwrap(), &original);
-        assert!(
-            original.replica.service_endpoint.is_empty(),
-            "Idle is not a published writer"
-        );
-        assert!(!application(&endpoint, "write").await.starts_with("OK"));
+    if fault == Fault::BuildingGenerationHandshake {
+        let mut builds = vec![];
+        for destination in [0, 2] {
+            fs::write(
+                fixture.work(destination).join("local-copy.block"),
+                b"hold actual copy",
+            )
+            .unwrap();
+            let build = idle_request(&body, &fixture.configs[destination]);
+            fm.send(selected, add_replica_message(&build, &generation).unwrap())
+                .await;
+            builds.push(build);
+        }
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while [0, 2]
+            .iter()
+            .any(|index| !fixture.work(*index).join("local-copy.held").exists())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "copy barriers: {}",
+                fixture.diagnostics()
+            );
+            fm.step().await;
+        }
+        assert!(fm.builds.is_empty());
+        fm.initial_builds = Some(builds.clone());
+        let authority = application(&endpoint, "read").await;
+        admitting_rollover(&mut fm, &mut fixture).await;
+        assert_eq!(application(&endpoint, "read").await, authority);
+        let primary_upload = &fm.uploaded[selected].as_ref().unwrap().units.0[0];
+        for index in [0, 2] {
+            let idle = &fm.uploaded[index].as_ref().unwrap().units.0[0].replicas.0[0];
+            assert_eq!(
+                (idle.description.current_role, idle.description.state),
+                (2, 1)
+            );
+            assert!(primary_upload.replicas.0.contains(idle));
+        }
+        assert!(fm.builds.is_empty() && fm.configured.is_empty());
+        fm.initial_builds = None;
+        generation = fm.configurations[selected].generation().unwrap();
+        for destination in [0, 2] {
+            fs::write(
+                fixture.work(destination).join("local-copy.release"),
+                b"finish actual copy",
+            )
+            .unwrap();
+        }
+        fm.until(&mut fixture, |fm| fm.builds.len() == 2).await;
+        assert_eq!(fm.builds.len(), 2);
+    } else {
+        for destination in [0, 2] {
+            let build = idle_request(&body, &fixture.configs[destination]);
+            let before = fm.builds.len();
+            fm.hold_build = true;
+            fm.send(selected, add_replica_message(&build, &generation).unwrap())
+                .await;
+            fm.until(&mut fixture, |fm| fm.held_build.is_some()).await;
+            assert_eq!(
+                fm.builds.len(),
+                before,
+                "lost reply cannot complete FM build"
+            );
+            let original = fm.held_build.take().unwrap();
+            fm.hold_build = false;
+            fm.send(selected, add_replica_message(&build, &generation).unwrap())
+                .await;
+            fm.until(&mut fixture, |fm| fm.builds.len() > before).await;
+            assert_eq!(fm.builds.last().unwrap(), &original);
+            assert!(
+                original.replica.service_endpoint.is_empty(),
+                "Idle is not a published writer"
+            );
+            assert!(!application(&endpoint, "write").await.starts_with("OK"));
+        }
     }
     let mut replicas = vec![fm.primary.as_ref().unwrap().replica.clone()];
     replicas[0].previous_role = 4;
@@ -1123,6 +1224,7 @@ async fn journey(fault: Fault) {
             | Fault::GenerationHandshake
             | Fault::ReplicatedGenerationHandshake
             | Fault::AdmittingGenerationHandshake
+            | Fault::BuildingGenerationHandshake
     );
     if refusal {
         if fault == Fault::LostFm {
@@ -1170,7 +1272,8 @@ async fn journey(fault: Fault) {
             | Fault::Failover
             | Fault::GenerationHandshake
             | Fault::ReplicatedGenerationHandshake
-            | Fault::AdmittingGenerationHandshake => unreachable!(),
+            | Fault::AdmittingGenerationHandshake
+            | Fault::BuildingGenerationHandshake => unreachable!(),
         };
         assert!(
             fixture.status(selected)["error"]

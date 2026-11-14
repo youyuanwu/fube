@@ -87,7 +87,19 @@ fn configuration(state: Option<&EntityState>) -> Result<Option<FailoverUnitInfo>
         || state.swap.is_some();
     let dropped = state.phase == Phase::Closed || state.body.replica.state == 3;
     let mut intermediate = Epoch::default();
-    let replicas = if replicated {
+    let replicas = if peer::initial_idle_build(state) {
+        let mut replicas = vec![state.body.replica.clone()];
+        for remote in &state.remote_idles {
+            let mut description = remote.reply.as_ref().map_or_else(
+                || remote.body.replica.0.replica.clone(),
+                |reply| reply.replica.clone(),
+            );
+            // SF's Primary tracks build completion; the local Idle remains IB.
+            description.state = if remote.ready { 2 } else { 1 };
+            replicas.push(description);
+        }
+        replicas
+    } else if replicated {
         let config = state
             .reconfiguration
             .as_ref()
