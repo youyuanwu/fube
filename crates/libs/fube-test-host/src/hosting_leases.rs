@@ -7,8 +7,8 @@ use fube_hosting::{ipc, wire};
 use fube_transport::{
     connection::{read_message, write_message},
     message::{Message, MessageId},
-    serialization::serde::{from_slice, to_vec, ObjectArray, Pointer},
 };
+use fubst::serde::{from_slice, to_vec, ObjectArray, Pointer};
 use std::{
     collections::HashMap,
     path::Path,

@@ -14,8 +14,8 @@ use fube_transport::{
     native_channel::{
         ChannelLimits, GatewayChannel, GatewayReceiver, GatewayTarget, RequestCancellation,
     },
-    serialization::serde::{to_vec, CountedValues, ObjectArray, Pointer},
 };
+use fubst::serde::{to_vec, CountedValues, ObjectArray, Pointer};
 use tokio::{
     sync::{mpsc, oneshot, Notify},
     task::JoinHandle,
@@ -70,6 +70,12 @@ impl std::error::Error for NotificationError {
 impl From<Error> for NotificationError {
     fn from(error: Error) -> Self {
         Self::Common(error)
+    }
+}
+
+impl From<fubst::Error> for NotificationError {
+    fn from(error: fubst::Error) -> Self {
+        Self::Common(error.into())
     }
 }
 
@@ -788,7 +794,7 @@ async fn run(
                 let body=to_vec(&wire::Unregister {client:&session.id,id:cleanup.id});
                 let result=(match body {
                     Ok(body)=>request(&session.channel,&session.target,"UnregisterServiceNotificationFilterRequest",body,cleanup.deadline,wire::decode_unregistered).await,
-                    Err(error)=>Err(error),
+                    Err(error)=>Err(error.into()),
                 }).map_err(|error|session.receiver.common_error(error));
                 if result.is_ok() { session.state.lock().unwrap().filters.remove(&cleanup.id); }
                 if let Some(complete)=cleanup.complete { let _=complete.send(result.clone()); }

@@ -2095,7 +2095,7 @@ async fn physical_terminate_during_open_keeps_exact_drop_cleanup_after_serving_w
 #[tokio::test]
 async fn production_reply_adapter_preserves_stale_failed_and_native_nonfull_equality_admission() {
     use fube_node::local::rap;
-    use fube_transport::serialization::serde::{from_slice, to_vec};
+    use fubst::serde::{from_slice, to_vec};
     let fixture = Fixture::new();
     let (mut node, store) = fixture.node("--block-dispose").await;
     until(&mut node, |n| n.package_registration().registered).await;
@@ -2214,7 +2214,7 @@ async fn production_reply_adapter_preserves_stale_failed_and_native_nonfull_equa
 #[tokio::test]
 async fn production_reply_adapter_rejects_malformed_and_foreign_session_without_losing_cleanup() {
     use fube_node::local::rap;
-    use fube_transport::serialization::serde::{to_vec, ObjectArray};
+    use fubst::serde::{to_vec, ObjectArray};
     for foreign in [false, true] {
         let fixture = Fixture::new();
         let other_fixture = Fixture::new();

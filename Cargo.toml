@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/libs/fube-core",
+  "crates/libs/fubst",
   "crates/libs/fube-transport",
   "crates/libs/fube-client",
   "crates/libs/fube-test-host",
@@ -27,6 +28,7 @@ members = [
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
 fube-core = { path = "./crates/libs/fube-core" }
+fubst = { path = "./crates/libs/fubst" }
 fube-transport = { path = "./crates/libs/fube-transport" }
 fube-client = { path = "./crates/libs/fube-client" }
 fube-runtime = { path = "./crates/libs/fube-runtime" }

@@ -12,6 +12,7 @@ qualification = []
 fube-local-host = { path = "../fube-local-host" }
 uuid.workspace = true
 fube-transport.workspace = true
+fubst.workspace = true
 serde.workspace = true
 tokio.workspace = true
 

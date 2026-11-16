@@ -130,7 +130,7 @@ mod tests {
         query_protocol::{encode_query, tests::assert_request},
         Paging,
     };
-    use fube_transport::serialization::{serde::from_slice, Encoder};
+    use fubst::{serde::from_slice, Encoder};
     use std::num::NonZeroU64;
 
     // ServiceModel/ServiceReplicaQueryResult.h FABRIC_FIELDS_09.
@@ -142,7 +142,7 @@ mod tests {
         role: i64,
         status: i64,
         health: i64,
-    ) -> Result<()> {
+    ) -> fubst::Result<()> {
         e.i64(kind);
         e.i64(replica_id);
         e.i64(role);
@@ -154,7 +154,7 @@ mod tests {
         Ok(())
     }
 
-    fn fields(e: &mut Encoder, kind: i64, id: i64, suffix: bool) -> Result<()> {
+    fn fields(e: &mut Encoder, kind: i64, id: i64, suffix: bool) -> fubst::Result<()> {
         base(
             e,
             kind,
@@ -170,7 +170,7 @@ mod tests {
         Ok(())
     }
 
-    fn decode_fields(fields: impl FnOnce(&mut Encoder) -> Result<()>) -> Result<Replica> {
+    fn decode_fields(fields: impl FnOnce(&mut Encoder) -> fubst::Result<()>) -> Result<Replica> {
         let mut e = Encoder::new();
         e.object(fields)?;
         ReplicaQueryParameters::validate_record(from_slice(&e.finish())?)

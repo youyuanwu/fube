@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 // Source: shared/serialization/src/FabricSerializableStream.cpp:2181-2232
 // at Service Fabric 3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d.
-use fube_transport::serialization::{
+use fubst::{
     serde::{from_slice, from_slice_with_budget, to_vec, UInt32Array},
     Decoder, Encoder, MAX_COLLECTION_COUNT,
 };
@@ -49,7 +49,7 @@ fn counts_extents_overflow_truncation_and_allocation_are_checked() {
     let bytes = encoder.finish();
     assert!(
         from_slice_with_budget::<UInt32Array<Vec<u32>>>(&bytes, &mut |_| {
-            Err(fube_transport::Error::ResourceLimit("test"))
+            Err(fubst::Error::ResourceLimit("test"))
         })
         .is_err()
     );

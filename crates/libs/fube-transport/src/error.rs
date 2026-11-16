@@ -68,21 +68,53 @@ impl From<io::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl From<fubst::Error> for Error {
+    fn from(value: fubst::Error) -> Self {
+        match value {
+            fubst::Error::Protocol(message) => Self::Protocol(message),
+            fubst::Error::InvalidInput(message) => Self::InvalidInput(message),
+            fubst::Error::ResourceLimit(resource) => Self::ResourceLimit(resource),
+        }
+    }
+}
+
 impl serde::ser::Error for Error {
-    fn custom<T: fmt::Display>(_: T) -> Self {
-        Self::InvalidInput("invalid native Serde value")
+    fn custom<T: fmt::Display>(message: T) -> Self {
+        <fubst::Error as serde::ser::Error>::custom(message).into()
     }
 }
 
 impl serde::de::Error for Error {
-    fn custom<T: fmt::Display>(_: T) -> Self {
-        Self::Protocol("invalid native Serde value")
+    fn custom<T: fmt::Display>(message: T) -> Self {
+        <fubst::Error as serde::de::Error>::custom(message).into()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codec_failures_preserve_transport_error_categories_and_budget_cause() {
+        use fubst::serde::{from_slice, from_slice_with_budget, to_vec};
+
+        assert!(matches!(
+            to_vec(&1u8).map_err(Error::from),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            from_slice::<String>(&[0xff]).map_err(Error::from),
+            Err(Error::Protocol(_))
+        ));
+        let bytes = to_vec("value").unwrap();
+        let result = from_slice_with_budget::<String>(&bytes, &mut |_| {
+            Err(fubst::Error::ResourceLimit("caller reservation"))
+        });
+        assert!(matches!(
+            result.map_err(Error::from),
+            Err(Error::ResourceLimit("caller reservation"))
+        ));
+    }
 
     #[test]
     fn cloned_errors_preserve_io_and_native_failure_details() {

@@ -1391,16 +1391,18 @@ explicitly. General native forward compatibility is not claimed.
 
 ### 4.1 Native Serde payloads
 
-`fube_transport::serialization::serde` provides `to_vec` / `from_slice` over
-the existing bounded native codec, not a JSON, bincode or postcard encoding.
+The transport-independent `fubst` crate owns the bounded native
+`Encoder` / `Decoder` and Serde adapters. `fubst::serde` provides
+`to_vec` / `from_slice`, not a JSON, bincode or postcard encoding.
 Ordered native-shaped models use ordinary Serde derives and explicit field
-adapters without parallel wire records:
+adapters without parallel wire records. Codec calls return `fubst::Error`;
+transport-facing APIs convert these into the corresponding
+`fube_transport::Error` category. TCP framing and transport message/header
+schemas remain in `fube-transport`:
 
 ```rust
-use fube_transport::{
-    message::ListenInstance,
-    serialization::serde::{from_slice, to_vec},
-};
+use fube_transport::message::ListenInstance;
+use fubst::serde::{from_slice, to_vec};
 
 let value = ListenInstance {
     address: "node".into(), instance: 7, nonce: [0; 16],
@@ -1415,7 +1417,7 @@ assert_eq!(from_slice::<ListenInstance>(&bytes).unwrap(), value);
 | Named struct / multi-field tuple struct | One ordered native object. Fields follow declaration order; field names/renames do not appear on the wire. |
 | Newtype struct | Transparent; `struct Wrapper(T)` does **not** add an object. Use a named one-field struct when an object wrapper is required. |
 | `Guid([u8; 16])` | Native GUID metadata and Windows field-order bytes, e.g. `Uuid::to_bytes_le()`, not UUID network order or byte-array metadata. |
-| `#[serde(with = "fube_transport::serialization::serde::guid")]` | The same explicit GUID mapping on an existing `[u8; 16]` field, without a parallel record or changing its public type. |
+| `#[serde(with = "fubst::serde::guid")]` | The same explicit GUID mapping on an existing `[u8; 16]` field, without a parallel record or changing its public type. |
 | `ByteArray<T>` | Native byte-array metadata; encode Vec/slice/array bytes, decode `ByteArray<Vec<u8>>`. |
 | `ObjectArray<T>` | Native object-array metadata even when empty; encode a Vec/slice of struct-shaped elements, decode `ObjectArray<Vec<Row>>`. |
 | `EmptyObjectArray` | A required object-array slot that must have zero elements; rejects nonempty arrays and wrong metadata. |
@@ -1631,7 +1633,7 @@ See the [backend contract and compiling example][native-serde],
 [transport payloads][serde-messages], [query DTOs][serde-query],
 [health reply declaration][serde-health] and [list validation][serde-lists].
 
-[native-serde]: ../../crates/libs/fube-transport/src/serialization/serde.rs
+[native-serde]: ../../crates/libs/fubst/src/serde.rs
 [serde-messages]: ../../crates/libs/fube-transport/src/message.rs#L12-L123
 [serde-query]: ../../crates/libs/fube-client/src/query_protocol.rs
 [serde-health]: ../../crates/libs/fube-client/src/health_protocol.rs

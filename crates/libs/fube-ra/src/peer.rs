@@ -134,10 +134,7 @@ impl EntityState {
         let configuration = self.configuration.get_or_insert_with(|| Configuration {
             unit: self.body.unit.clone(),
             service: self.body.service.clone(),
-            replicas: fube_transport::serialization::serde::ObjectArray(vec![self
-                .body
-                .replica
-                .clone()]),
+            replicas: fubst::serde::ObjectArray(vec![self.body.replica.clone()]),
         });
         if let Some(previous) = configuration
             .replicas

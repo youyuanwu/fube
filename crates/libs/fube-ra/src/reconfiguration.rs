@@ -1,5 +1,5 @@
 use super::*;
-use fube_transport::serialization::serde::ObjectArray;
+use fubst::serde::ObjectArray;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigurationStage {

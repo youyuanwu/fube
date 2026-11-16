@@ -12,9 +12,9 @@ use fube_transport::{
     native_demux::{
         ActorDemux, ActorRegistration, ChannelComposition, OutboundKind, RequestPolicy,
     },
-    serialization::serde::{from_slice_with_budget, to_vec},
     Channel, ChannelLimits, Error as TransportError, Result as TransportResult,
 };
+use fubst::serde::{from_slice_with_budget, to_vec};
 use serde::{de::DeserializeOwned, Deserialize};
 use std::{
     collections::{HashSet, VecDeque},
@@ -1181,12 +1181,12 @@ async fn write_fenced<W: AsyncWrite + Unpin>(
 }
 fn decode<T: DeserializeOwned>(bytes: &[u8], limit: usize) -> TransportResult<T> {
     let mut left = limit;
-    from_slice_with_budget(bytes, &mut |capacity| {
+    Ok(from_slice_with_budget(bytes, &mut |capacity| {
         left = left
             .checked_sub(capacity)
-            .ok_or(protocol("Hosting decode budget"))?;
+            .ok_or(fubst::Error::Protocol("Hosting decode budget"))?;
         Ok(())
-    })
+    })?)
 }
 fn unique_headers(message: &Message) -> TransportResult<()> {
     for kind in [
@@ -1900,10 +1900,10 @@ mod fence_tests {
             ip: "127.0.0.1".into(),
             work: "/tmp".into(),
             initial_ttl: 0,
-            application_directories: fube_transport::serialization::serde::ObjectArray(vec![]),
-            node_directories: fube_transport::serialization::serde::ObjectArray(vec![]),
-            application_log: fube_transport::serialization::serde::Pointer(None),
-            system_log: fube_transport::serialization::serde::Pointer(None),
+            application_directories: fubst::serde::ObjectArray(vec![]),
+            node_directories: fubst::serde::ObjectArray(vec![]),
+            application_log: fubst::serde::Pointer(None),
+            system_log: fubst::serde::Pointer(None),
         };
         let admission = Admission {
             deadlines: RequestDeadlines::Propagated,
@@ -1925,7 +1925,7 @@ mod fence_tests {
                             name: "Pkg".into(),
                         },
                         activation: wire::Activation {
-                            guid: fube_transport::serialization::serde::Guid([0; 16]),
+                            guid: fubst::serde::Guid([0; 16]),
                             mode: 0,
                         },
                         public_id: String::new(),
@@ -2041,7 +2041,7 @@ mod fence_tests {
                 )
                 .unwrap();
                 assert_eq!(
-                    fube_transport::serialization::serde::from_slice::<wire::ErrorReply>(&response)
+                    fubst::serde::from_slice::<wire::ErrorReply>(&response)
                         .unwrap()
                         .error,
                     0

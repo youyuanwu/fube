@@ -4,7 +4,7 @@ use crate::profile::{
     PreOpenCancellationReceipt, Result, RetirementReceipt,
 };
 use fube_ra::protocol::*;
-use fube_transport::serialization::serde::ObjectArray;
+use fubst::serde::ObjectArray;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::SocketAddr;

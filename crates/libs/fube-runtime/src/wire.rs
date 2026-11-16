@@ -1,6 +1,6 @@
 //! Private source-corresponding hosting records. Native source baseline:
 //! 3988b451, Hosting2 and ServiceModel FABRIC_FIELDS declarations.
-use fube_transport::serialization::serde::{ByteArray, Guid, ObjectArray, Pointer};
+use fubst::serde::{ByteArray, Guid, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,7 +261,7 @@ pub struct Service {
     pub standby_keep: i64,
     pub activation_mode: i64,
     pub dns: String,
-    pub scaling: fube_transport::serialization::serde::EmptyObjectArray,
+    pub scaling: fubst::serde::EmptyObjectArray,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequest {
@@ -365,7 +365,7 @@ pub struct LoadDescription {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadBody {
-    pub legacy: fube_transport::serialization::serde::EmptyObjectArray,
+    pub legacy: fubst::serde::EmptyObjectArray,
     pub reports: ObjectArray<Vec<LoadDescription>>,
     pub time: i64,
 }
@@ -391,11 +391,11 @@ pub enum HealthEntity {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attributes {
-    pub values: fube_transport::serialization::serde::EmptyObjectArray,
+    pub values: fubst::serde::EmptyObjectArray,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityHealth {
-    pub entity: Pointer<fube_transport::serialization::serde::NativeEnum<HealthEntity>>,
+    pub entity: Pointer<fubst::serde::NativeEnum<HealthEntity>>,
     pub source: String,
     pub property: String,
     pub ttl: i64,
@@ -409,7 +409,7 @@ pub struct EntityHealth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthBody {
     pub reports: ObjectArray<Vec<EntityHealth>>,
-    pub streams: fube_transport::serialization::serde::EmptyObjectArray,
+    pub streams: fubst::serde::EmptyObjectArray,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResult {
@@ -435,7 +435,7 @@ pub struct HealthReply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fube_transport::serialization::serde::{from_slice, to_vec};
+    use fubst::serde::{from_slice, to_vec};
     #[test]
     fn start_reply_recursive_maps_and_pointers_and_all_truncations() {
         let reply = StartReply {

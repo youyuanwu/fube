@@ -29,7 +29,7 @@ enum Shape {
     WrongEvaluationField,
 }
 
-fn event(e: &mut Encoder, shape: Shape) -> fube_transport::Result<()> {
+fn event(e: &mut Encoder, shape: Shape) -> fubst::Result<()> {
     e.string("health-model-owner")?;
     e.string("fixture-property")?;
     e.i64(i64::MAX);
@@ -56,7 +56,7 @@ fn event(e: &mut Encoder, shape: Shape) -> fube_transport::Result<()> {
     Ok(())
 }
 
-fn health(e: &mut Encoder, shape: Shape) -> fube_transport::Result<()> {
+fn health(e: &mut Encoder, shape: Shape) -> fubst::Result<()> {
     e.string("Node_Å😀")?;
     let entries = if matches!(shape, Shape::Empty) {
         vec![]

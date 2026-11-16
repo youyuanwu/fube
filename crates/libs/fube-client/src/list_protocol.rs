@@ -86,16 +86,18 @@ fn validate_list_health(value: HealthState) -> Result<HealthState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fube_transport::serialization::{serde::from_fields, Decoder, Encoder};
+    use fubst::{serde::from_fields, Decoder, Encoder};
 
-    fn application(decoder: &mut Decoder<'_>) -> Result<Application> {
-        ApplicationQueryParameters::validate_record(from_fields::<Application>(decoder)?)
+    fn application(bytes: &[u8]) -> Result<Application> {
+        let value = Decoder::new(bytes).object(from_fields::<Application>)?;
+        ApplicationQueryParameters::validate_record(value)
     }
-    fn service(decoder: &mut Decoder<'_>) -> Result<Service> {
-        ServiceQueryParameters::validate_record(from_fields::<Service>(decoder)?)
+    fn service(bytes: &[u8]) -> Result<Service> {
+        let value = Decoder::new(bytes).object(from_fields::<Service>)?;
+        ServiceQueryParameters::validate_record(value)
     }
 
-    fn application_base(e: &mut Encoder) -> Result<()> {
+    fn application_base(e: &mut Encoder) -> fubst::Result<()> {
         uri(e)?;
         e.string("Type")?;
         e.string("1")?;
@@ -104,7 +106,7 @@ mod tests {
         empty_map(e)
     }
 
-    fn service_base(e: &mut Encoder) -> Result<()> {
+    fn service_base(e: &mut Encoder) -> fubst::Result<()> {
         e.i64(1);
         uri(e)?;
         e.string("Type")?;
@@ -114,7 +116,7 @@ mod tests {
         Ok(())
     }
 
-    fn uri(e: &mut Encoder) -> Result<()> {
+    fn uri(e: &mut Encoder) -> fubst::Result<()> {
         e.object(|e| {
             e.i64(1);
             e.string("fabric")?;
@@ -130,7 +132,7 @@ mod tests {
         })
     }
 
-    fn empty_map(e: &mut Encoder) -> Result<()> {
+    fn empty_map(e: &mut Encoder) -> fubst::Result<()> {
         e.object_array::<()>(&[], |_, _| Ok(()))
     }
 
@@ -152,10 +154,7 @@ mod tests {
             })
             .unwrap();
             let bytes = e.finish();
-            assert!(matches!(
-                Decoder::new(&bytes).object(application),
-                Err(Error::Protocol(_))
-            ));
+            assert!(matches!(application(&bytes), Err(Error::Protocol(_))));
         }
         for position in 0..2 {
             let mut e = Encoder::new();
@@ -168,10 +167,7 @@ mod tests {
             })
             .unwrap();
             let bytes = e.finish();
-            assert!(matches!(
-                Decoder::new(&bytes).object(service),
-                Err(Error::Protocol(_))
-            ));
+            assert!(matches!(service(&bytes), Err(Error::Protocol(_))));
         }
     }
 
@@ -188,7 +184,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            Decoder::new(&e.finish()).object(application),
+            application(&e.finish()),
             Err(Error::Protocol(
                 "nonempty deprecated application upgrade parameters"
             ))
@@ -209,9 +205,6 @@ mod tests {
         let count = bytes.len() - 11;
         assert_eq!(bytes[count - 1], 0x8d);
         bytes[count] = 20;
-        assert!(matches!(
-            Decoder::new(&bytes).object(application),
-            Err(Error::Protocol(_))
-        ));
+        assert!(matches!(application(&bytes), Err(Error::Protocol(_))));
     }
 }

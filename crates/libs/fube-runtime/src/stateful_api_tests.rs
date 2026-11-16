@@ -216,7 +216,7 @@ fn idle_secondary_and_native_public_access_values() {
 
 #[test]
 fn empty_typed_remote_vector_preserves_original_stateless_encoding() {
-    use fube_transport::serialization::serde::{to_vec, EmptyObjectArray, ObjectArray};
+    use fubst::serde::{to_vec, EmptyObjectArray, ObjectArray};
     use serde::Serialize;
     #[derive(Serialize)]
     struct Old {

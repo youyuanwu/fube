@@ -115,7 +115,7 @@ mod tests {
         query_protocol::{encode_query, tests::assert_request},
         Paging,
     };
-    use fube_transport::serialization::{
+    use fubst::{
         serde::{from_fields, from_slice, to_vec},
         Decoder, Encoder,
     };
@@ -123,7 +123,7 @@ mod tests {
 
     // ServiceModel/DeployedApplicationQueryResult.h FABRIC_FIELDS_07: the
     // application name is std::wstring, unlike ApplicationQueryResult's URI.
-    fn fields(e: &mut Encoder, count: usize, status: i64, health: i64) -> Result<()> {
+    fn fields(e: &mut Encoder, count: usize, status: i64, health: i64) -> fubst::Result<()> {
         for field in 0..count {
             match field {
                 0 => e.string("fabric:/应用")?,
@@ -330,7 +330,7 @@ mod tests {
         bytes[count] = 20;
         assert!(matches!(
             Decoder::new(&bytes).object(from_fields::<DeployedApplication>),
-            Err(Error::Protocol(_))
+            Err(fubst::Error::Protocol(_))
         ));
     }
 

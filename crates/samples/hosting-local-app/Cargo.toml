@@ -12,6 +12,7 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+fubst.workspace = true
 fube-hosting = { path = "../../libs/fube-hosting" }
 fube-node = { path = "../../libs/fube-node", features = ["qualification"] }
 fube-ra = { path = "../../libs/fube-ra" }

@@ -1,8 +1,6 @@
 use super::*;
 use crate::{notification_protocol::*, resolution_protocol::*, NodeId};
-use fube_transport::serialization::serde::{
-    CountedStrings, CountedValues, Guid, ObjectArray, Pointer,
-};
+use fubst::serde::{CountedStrings, CountedValues, Guid, ObjectArray, Pointer};
 
 #[test]
 fn prospective_rehash_and_range_copy_peaks_are_reserved_before_clone() {
@@ -205,7 +203,7 @@ fn reservation_growth_is_atomic_shared_and_released() {
 
 #[tokio::test]
 async fn derived_page_decoding_and_conversion_share_preallocation_budget() {
-    use fube_transport::serialization::serde::to_vec;
+    use fubst::serde::to_vec;
 
     let address = "opaque中🦀".repeat(1000);
     let mut value = page(1, &[(1, 1)], &[(1, 2)]);
@@ -282,7 +280,7 @@ async fn derived_page_decoding_and_conversion_share_preallocation_budget() {
 
 #[test]
 fn serde_quota_bridge_preserves_scoped_failures_without_relabeling_protocol_errors() {
-    let body = fube_transport::serialization::serde::to_vec(&PageBody {
+    let body = fubst::serde::to_vec(&PageBody {
         page: Pointer(Some(page(1, &[(1, 1)], &[]))),
     })
     .unwrap();

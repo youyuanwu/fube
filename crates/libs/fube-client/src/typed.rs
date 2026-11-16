@@ -72,7 +72,7 @@ pub type ClientResult<T> = std::result::Result<T, ClientError<DomainFailure>>;
 pub const CLIENT_SLOT_BYTES: usize = 4 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
-// Array framing is checked before allocating (serialization.rs:397-409).
+// fubst checks array framing before allocating.
 // Even null native pointer slots occupy their enclosing 12-byte object. The
 // two larger records have required, non-optional minimum extents as documented
 // above; absent version suffixes do not remove those fields/embedded objects.
@@ -344,8 +344,7 @@ fn domain_failure(reply: &Message) -> Result<()> {
         #[serde(deserialize_with = "crate::native::trailing_default::deserialize")]
         diagnostic: String,
     }
-    let Failure { code, diagnostic } =
-        fube_transport::serialization::serde::from_slice(&reply.body)?;
+    let Failure { code, diagnostic } = fubst::serde::from_slice(&reply.body)?;
     if code == 0 {
         return Err(Error::Protocol(
             "operation failure has no nonzero error code",
@@ -946,7 +945,7 @@ mod tests {
             body,
         };
         *channel.result.lock().unwrap() = Some(Ok(failure(
-            fube_transport::serialization::serde::to_vec(&Failure {
+            fubst::serde::to_vec(&Failure {
                 code: -456,
                 diagnostic: "domain".into(),
             })
@@ -1022,7 +1021,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_allocating_lengths_are_rejected_before_unbounded_decode() {
-        use fube_transport::serialization::{serde::to_vec, Encoder, MAX_STRING_UNITS};
+        use fubst::{serde::to_vec, Encoder, MAX_STRING_UNITS};
         #[derive(serde::Serialize)]
         struct Instance(NodeId, u64);
         #[derive(serde::Serialize)]

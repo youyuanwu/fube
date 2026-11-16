@@ -1,8 +1,6 @@
 #![allow(dead_code)]
 use fube_ra::protocol::*;
-use fube_transport::serialization::serde::{
-    ByteArray, Derived, Guid, NativeEnum, ObjectArray, Pointer,
-};
+use fubst::serde::{ByteArray, Derived, Guid, NativeEnum, ObjectArray, Pointer};
 
 pub trait Rich {
     fn rich(&mut self, counter: &mut i32);

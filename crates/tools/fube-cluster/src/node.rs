@@ -1125,7 +1125,7 @@ async fn cleanup(
     let root = node.activation().root().map(Path::to_path_buf);
     let end = Instant::now() + Duration::from_secs(20);
     let partition = PartitionId {
-        guid: fube_transport::serialization::serde::Guid(
+        guid: fubst::serde::Guid(
             uuid::Uuid::parse_str(&launch.partition)
                 .map_err(err)?
                 .to_bytes_le(),
@@ -1871,10 +1871,10 @@ pub(crate) mod report_tests {
         assert!(node.instance_disposal().is_none());
         // Actual predecessor requests/ACKs over the same original Channel.
         let old_report = ReplicaUp {
-            dropped: fube_transport::serialization::serde::ObjectArray(vec![FailoverUnitInfo {
+            dropped: fubst::serde::ObjectArray(vec![FailoverUnitInfo {
                 unit: body.unit.clone(),
                 service: body.service.clone(),
-                replicas: fube_transport::serialization::serde::ObjectArray(vec![ReplicaInfo {
+                replicas: fubst::serde::ObjectArray(vec![ReplicaInfo {
                     description: Replica {
                         state: 3,
                         up: false,
@@ -2021,7 +2021,7 @@ pub(crate) mod report_tests {
         }
         let mut service = body.service.clone();
         service.update_version = 1;
-        service.metrics = fube_transport::serialization::serde::ObjectArray(vec![Metric {
+        service.metrics = fubst::serde::ObjectArray(vec![Metric {
             name: "LocalWork".into(),
             weight: 1,
             primary: 0,

@@ -1,0 +1,12 @@
+[package]
+name = "fubst"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded Service Fabric native serialization and Serde codec"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+bitflags.workspace = true

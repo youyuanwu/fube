@@ -13,10 +13,8 @@ mod process;
 mod tests;
 mod wire;
 
-use fube_transport::{
-    message::{ListenInstance, Message},
-    serialization::serde::{from_slice, to_vec, EmptyObjectArray, Pointer},
-};
+use fube_transport::message::{ListenInstance, Message};
+use fubst::serde::{from_slice, to_vec, EmptyObjectArray, Pointer};
 use serde_json::json;
 use std::{
     fmt,
@@ -62,6 +60,11 @@ impl From<std::io::Error> for HostError {
 }
 impl From<fube_transport::Error> for HostError {
     fn from(value: fube_transport::Error) -> Self {
+        Self(value.to_string())
+    }
+}
+impl From<fubst::Error> for HostError {
+    fn from(value: fubst::Error) -> Self {
         Self(value.to_string())
     }
 }

@@ -1,4 +1,4 @@
-use fube_transport::serialization::{
+use fubst::{
     serde::{from_slice, to_vec, CountedValues, Pointer},
     Encoder, MAX_COLLECTION_COUNT,
 };

@@ -3,10 +3,8 @@ use crate::{Error, Result};
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 pub(crate) mod tests;
-use fube_transport::{
-    connection::deadline_after,
-    serialization::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer},
-};
+use fube_transport::connection::deadline_after;
+use fubst::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer};
 use std::{
     collections::{HashMap, HashSet},
     sync::{

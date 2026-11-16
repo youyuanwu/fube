@@ -22,7 +22,6 @@ pub mod native_demux;
 pub mod native_ipc;
 pub mod raw_session;
 pub mod routing;
-pub mod serialization;
 
 pub use accepted_channel::accept_unsecured_tcp;
 pub use endpoint::Endpoint;

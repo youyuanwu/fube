@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 use crate::{Error, Result};
-use fube_transport::serialization::serde::Guid;
+use fubst::serde::Guid;
 
 use crate::wire::*;
 

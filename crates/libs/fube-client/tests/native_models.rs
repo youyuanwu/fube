@@ -3,14 +3,14 @@
 
 use fube_client::*;
 use fube_transport::message::{ListenInstance, MessageId};
-use fube_transport::serialization::{
+use fubst::{
     serde::{from_slice, to_vec, ByteArray, ObjectArray, Pointer},
     Encoder, MAX_COLLECTION_COUNT,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-fn uri_fields(e: &mut Encoder, case: usize) -> Result<()> {
+fn uri_fields(e: &mut Encoder, case: usize) -> fubst::Result<()> {
     e.i64(if case == 1 { 0 } else { 1 });
     e.string(if case == 2 { "http" } else { "fabric" })?;
     e.string(if case == 3 { "authority" } else { "" })?;
@@ -112,7 +112,7 @@ fn naming_uri_validates_components_after_structural_decode_in_every_context() {
         assert!(
             matches!(
                 from_slice::<NamingUri>(&e.finish()),
-                Err(Error::Protocol(_))
+                Err(fubst::Error::Protocol(_))
             ),
             "{case}"
         );
@@ -136,7 +136,7 @@ fn node_ids_and_timestamps_map_directly_without_guid_or_datetime_conversion() {
     for length in [0, 15, 17] {
         assert!(matches!(
             from_slice::<NodeId>(&to_vec(&ByteArray(vec![0; length])).unwrap()),
-            Err(Error::Protocol(_))
+            Err(fubst::Error::Protocol(_))
         ));
     }
     for ticks in [i64::MIN, -1, 0, 1, i64::MAX] {
@@ -161,7 +161,7 @@ fn service_fields(
     persisted: bool,
     health: i64,
     suffix: usize,
-) -> Result<()> {
+) -> fubst::Result<()> {
     e.i64(kind);
     e.object(|e| uri_fields(e, 0))?;
     e.string("ServiceType")?;
@@ -231,7 +231,7 @@ fn services_reject_unknown_native_kind_status_and_malformed_present_suffixes() {
         e.object(|e| service_fields(e, kind, false, 1, 2)).unwrap();
         assert!(matches!(
             from_slice::<Service>(&e.finish()),
-            Err(Error::Protocol(_))
+            Err(fubst::Error::Protocol(_))
         ));
     }
     for status in [-1, 6, 99, i64::MAX] {
@@ -244,7 +244,7 @@ fn services_reject_unknown_native_kind_status_and_malformed_present_suffixes() {
         .unwrap();
         assert!(matches!(
             from_slice::<Service>(&e.finish()),
-            Err(Error::Protocol(_))
+            Err(fubst::Error::Protocol(_))
         ));
     }
     for suffix in 0..=1 {
@@ -256,7 +256,7 @@ fn services_reject_unknown_native_kind_status_and_malformed_present_suffixes() {
         .unwrap();
         assert!(matches!(
             from_slice::<Service>(&e.finish()),
-            Err(Error::Protocol(_))
+            Err(fubst::Error::Protocol(_))
         ));
     }
     let mut e = Encoder::new();
@@ -269,7 +269,7 @@ fn services_reject_unknown_native_kind_status_and_malformed_present_suffixes() {
     bytes[status_payload] = 0x80;
     assert!(matches!(
         from_slice::<Service>(&bytes),
-        Err(Error::Protocol(_))
+        Err(fubst::Error::Protocol(_))
     ));
 }
 
@@ -359,7 +359,7 @@ fn application_fields(
     e: &mut Encoder,
     parameters: &[(String, String)],
     suffix: usize,
-) -> Result<()> {
+) -> fubst::Result<()> {
     e.object(|e| uri_fields(e, 0))?;
     e.string("Type")?;
     e.string("1")?;
@@ -455,7 +455,7 @@ fn application_maps_reject_duplicate_keys_and_retain_collection_bounds() {
         .unwrap();
         assert!(matches!(
             from_slice::<Application>(&e.finish()),
-            Err(Error::Protocol(_))
+            Err(fubst::Error::Protocol(_))
         ));
     }
     let parameters: Vec<(String, String)> = (0..MAX_COLLECTION_COUNT)
@@ -489,7 +489,7 @@ fn event() -> HealthEvent {
     }
 }
 
-fn event_fields(e: &mut Encoder) -> Result<()> {
+fn event_fields(e: &mut Encoder) -> fubst::Result<()> {
     e.string("source")?;
     e.string("property")?;
     e.i64(i64::MAX);
@@ -564,7 +564,7 @@ fn direct_health_collection_mappings_retain_bounds_and_required_pointers() {
         .unwrap();
     assert!(matches!(
         from_slice::<NodeHealth>(&bytes.finish()),
-        Err(Error::Protocol(_))
+        Err(fubst::Error::Protocol(_))
     ));
     let evaluation = HealthEvaluation::Event(EventHealthEvaluation {
         description: String::new(),
@@ -582,7 +582,10 @@ fn direct_health_collection_mappings_retain_bounds_and_required_pointers() {
         unhealthy_evaluations: vec![evaluation; MAX_COLLECTION_COUNT + 1],
         ..at_limit
     };
-    assert!(matches!(to_vec(&over_limit), Err(Error::InvalidInput(_))));
+    assert!(matches!(
+        to_vec(&over_limit),
+        Err(fubst::Error::InvalidInput(_))
+    ));
 }
 
 #[test]

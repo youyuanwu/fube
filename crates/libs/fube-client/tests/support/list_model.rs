@@ -69,7 +69,7 @@ impl Shape {
     }
 }
 
-fn uri(e: &mut Encoder, s: &Shape) -> fube_transport::Result<()> {
+fn uri(e: &mut Encoder, s: &Shape) -> fubst::Result<()> {
     e.object(|e| {
         e.i64(s.uri_type);
         e.string("fabric")?;
@@ -86,7 +86,7 @@ fn uri(e: &mut Encoder, s: &Shape) -> fube_transport::Result<()> {
     })
 }
 
-fn record(e: &mut Encoder, s: &Shape) -> fube_transport::Result<()> {
+fn record(e: &mut Encoder, s: &Shape) -> fubst::Result<()> {
     if s.service {
         e.i64(s.kind);
     }
@@ -672,7 +672,7 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
         ApplicationListFilter::DefinitionKind({
             let mut encoder = Encoder::new();
             encoder.u32(8);
-            fube_transport::serialization::serde::from_slice(&encoder.finish()).unwrap()
+            fubst::serde::from_slice(&encoder.finish()).unwrap()
         }),
     ] {
         assert!(matches!(

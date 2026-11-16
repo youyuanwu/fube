@@ -1,11 +1,11 @@
 //! Field mappings over the generic bounded codec; no domain policy belongs here.
 
-use fube_transport::serialization::serde::{NativeEnum, ObjectArray, Pointer};
+use fubst::serde::{NativeEnum, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod untagged {
     use super::*;
-    use fube_transport::serialization::serde::Untagged;
+    use fubst::serde::Untagged;
 
     pub fn deserialize<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -57,7 +57,7 @@ pub(crate) mod string_pointer {
 
 pub(crate) mod guid {
     use super::*;
-    use fube_transport::serialization::serde::Guid;
+    use fubst::serde::Guid;
 
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -88,7 +88,7 @@ pub(crate) mod object_array {
 
 pub(crate) mod trailing_default {
     use super::*;
-    use fube_transport::serialization::serde::Trailing;
+    use fubst::serde::Trailing;
 
     pub fn deserialize<'de, T: Deserialize<'de> + Default, D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -133,7 +133,7 @@ pub(crate) mod string_map {
 
 pub(crate) mod derived_guid {
     use super::*;
-    use fube_transport::serialization::serde::Derived;
+    use fubst::serde::Derived;
 
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,

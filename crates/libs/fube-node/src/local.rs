@@ -8,7 +8,7 @@ use super::{command, service_type, version};
 use fube_hosting::{self as h, ipc, local::Activation};
 use fube_ra::{entity as ra, protocol::*};
 use fube_ra_store::KeyValueStore;
-use fube_transport::serialization::serde::{from_slice_with_budget, to_vec, ObjectArray};
+use fubst::serde::{from_slice_with_budget, to_vec, ObjectArray};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -2923,7 +2923,7 @@ impl Node {
                 for unit in units {
                     self.enqueue(Work::Fm(FmWork::CloseNodeUnit(
                         PartitionId {
-                            guid: fube_transport::serialization::serde::Guid(*unit),
+                            guid: fubst::serde::Guid(*unit),
                         },
                         *sequence,
                     )))?;
@@ -2940,7 +2940,7 @@ impl Node {
                 for unit in units {
                     self.enqueue(Work::Fm(FmWork::UpdateNodeUnit(
                         PartitionId {
-                            guid: fube_transport::serialization::serde::Guid(*unit),
+                            guid: fubst::serde::Guid(*unit),
                         },
                         *work,
                         body.clone(),
@@ -3531,7 +3531,7 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     from_slice_with_budget(bytes, &mut |capacity| {
         budget = budget
             .checked_sub(capacity)
-            .ok_or(fube_transport::Error::ResourceLimit("local RAP decode"))?;
+            .ok_or(fubst::Error::ResourceLimit("local RAP decode"))?;
         Ok(())
     })
     .map_err(|_| Error::Protocol)

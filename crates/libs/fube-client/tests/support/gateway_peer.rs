@@ -2,11 +2,11 @@
 use fube_transport::{
     connection::{read_message, write_message},
     message::{Header, ListenInstance, Message, MessageId},
-    serialization::Encoder,
 };
+use fubst::Encoder;
 use tokio::net::{TcpListener, TcpStream};
 
-pub fn body(fields: impl FnOnce(&mut Encoder) -> fube_transport::Result<()>) -> Vec<u8> {
+pub fn body(fields: impl FnOnce(&mut Encoder) -> fubst::Result<()>) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.object(fields).unwrap();
     encoder.finish()

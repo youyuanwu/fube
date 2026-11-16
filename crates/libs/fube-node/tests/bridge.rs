@@ -10,8 +10,8 @@ use fube_ra_store::{
 use fube_transport::{
     connection::{read_message, write_message},
     message::{Header, ListenInstance, Message, MessageId, EXPECTS_REPLY, IPC},
-    serialization::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer},
 };
+use fubst::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer};
 use serde::Serialize;
 use std::{
     sync::{

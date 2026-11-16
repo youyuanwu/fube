@@ -3,9 +3,9 @@
 use fube_transport::{
     connection::{read_message, write_message},
     message::MessageId,
-    serialization::Decoder,
     Error, Result,
 };
+use fubst::Decoder;
 use serde::Serialize;
 use std::{
     collections::HashMap,

@@ -3,8 +3,8 @@ use super::*;
 use fube_transport::{
     connection::{read_message, write_message},
     message::{Header, ListenInstance, Message, MessageId},
-    serialization::serde::{ObjectArray, Pointer},
 };
+use fubst::serde::{ObjectArray, Pointer};
 use std::{io::Write, process::Stdio};
 use tokio::{net::TcpListener, process::Command};
 
@@ -720,9 +720,7 @@ async fn scenario(mode: &str, expected: i32) {
                 if mode_owned.starts_with("stateful-blocked-final-") {
                     open.local.id = 100;
                     open.service.initialization =
-                        fube_transport::serialization::serde::ByteArray(vec![match mode_owned
-                            .as_str()
-                        {
+                        fubst::serde::ByteArray(vec![match mode_owned.as_str() {
                             "stateful-blocked-final-service-close" => 232,
                             "stateful-blocked-final-service-failed-open" => 233,
                             "stateful-blocked-final-replicator-close" => 234,

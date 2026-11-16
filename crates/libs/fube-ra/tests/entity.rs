@@ -1326,7 +1326,7 @@ async fn node_deactivation_waits_for_all_original_entities_and_stale_activation_
         executor
             .submit(Command::CloseForNodeDeactivation {
                 unit: PartitionId {
-                    guid: fube_transport::serialization::serde::Guid(*unit),
+                    guid: fubst::serde::Guid(*unit),
                 },
                 sequence: *sequence,
             })
@@ -3975,7 +3975,7 @@ async fn peer_normal_closes_do_not_supersede_or_relabel_closing_and_closed_lifet
 
 #[tokio::test]
 async fn peer_drop_and_abort_ack_requires_dropped_state_before_first_retry() {
-    use fube_transport::serialization::serde::ObjectArray;
+    use fubst::serde::ObjectArray;
 
     for (mode, in_dropped) in [
         (CloseMode::Drop, false),
@@ -6162,7 +6162,7 @@ fn secondary_configuration(primary: &AddInstance, secondary: &Replica) -> Config
     Configuration {
         unit,
         service,
-        replicas: fube_transport::serialization::serde::ObjectArray(vec![p, s]),
+        replicas: fubst::serde::ObjectArray(vec![p, s]),
     }
 }
 fn reconfigure(body: Configuration) -> Command {
@@ -6413,7 +6413,7 @@ fn status_completion(actions: &[Effect]) -> ConfigurationCompletion {
                 Some(ConfigurationCompletion {
                     unit: body.unit.clone(),
                     local,
-                    replicas: fube_transport::serialization::serde::ObjectArray(vec![]),
+                    replicas: fubst::serde::ObjectArray(vec![]),
                     flags: 0,
                     error: 0,
                 })
@@ -6840,7 +6840,7 @@ async fn activating_configured_survivor(
                 configuration: Configuration {
                     unit,
                     service: original.body.service.clone(),
-                    replicas: fube_transport::serialization::serde::ObjectArray(replicas),
+                    replicas: fubst::serde::ObjectArray(replicas),
                 },
                 deactivation: original
                     .peer_creation
@@ -8984,10 +8984,7 @@ async fn lfum_reports_admitted_manual_creation_and_omits_aborted_remote_creation
         let mut expected = Configuration {
             unit: original.body.unit.clone(),
             service: original.body.service.clone(),
-            replicas: fube_transport::serialization::serde::ObjectArray(vec![original
-                .body
-                .replica
-                .clone()]),
+            replicas: fubst::serde::ObjectArray(vec![original.body.replica.clone()]),
         };
         let frozen = capture_committed_lfum(&executor, &expected, Epoch::default(), true).await;
         let request = fm_idle_request(&original);
@@ -10056,7 +10053,7 @@ async fn configured_initial_membership_preserves_sizes_and_waits_for_every_activ
         let config = Configuration {
             unit,
             service: request.service.clone(),
-            replicas: fube_transport::serialization::serde::ObjectArray(replicas),
+            replicas: fubst::serde::ObjectArray(replicas),
         };
         for bad in 0..4 {
             let mut invalid = config.clone();
@@ -12513,26 +12510,22 @@ async fn fm_stateful_drop_ack_requires_dropped_state_before_first_retry() {
             assert_eq!(current.fm_stage, FmStage::ReplicaDropped);
             assert_eq!(current.report_sequence, 0);
             let report = ReplicaUp {
-                dropped: fube_transport::serialization::serde::ObjectArray(vec![
-                    FailoverUnitInfo {
-                        service: current.body.service.clone(),
-                        unit: current.body.unit.clone(),
-                        replicas: fube_transport::serialization::serde::ObjectArray(vec![
-                            ReplicaInfo {
-                                description: Replica {
-                                    node: request.replica.node.clone(),
-                                    id: request.replica.id,
-                                    instance: request.replica.instance,
-                                    state: 3,
-                                    up: false,
-                                    ..Replica::default()
-                                },
-                                intermediate_role: 1,
-                            },
-                        ]),
-                        ..FailoverUnitInfo::default()
-                    },
-                ]),
+                dropped: fubst::serde::ObjectArray(vec![FailoverUnitInfo {
+                    service: current.body.service.clone(),
+                    unit: current.body.unit.clone(),
+                    replicas: fubst::serde::ObjectArray(vec![ReplicaInfo {
+                        description: Replica {
+                            node: request.replica.node.clone(),
+                            id: request.replica.id,
+                            instance: request.replica.instance,
+                            state: 3,
+                            up: false,
+                            ..Replica::default()
+                        },
+                        intermediate_role: 1,
+                    }]),
+                    ..FailoverUnitInfo::default()
+                }]),
                 ..ReplicaUp::default()
             };
             let mut stale = report.clone();
@@ -14160,7 +14153,7 @@ fn description_ack(executor: &Executor, update: u64) -> Command {
     report.dropped.0.push(FailoverUnitInfo {
         service,
         unit: current.body.unit.clone(),
-        replicas: fube_transport::serialization::serde::ObjectArray(vec![ReplicaInfo {
+        replicas: fubst::serde::ObjectArray(vec![ReplicaInfo {
             description: current.body.replica.clone(),
             intermediate_role: 1,
         }]),
@@ -14532,8 +14525,7 @@ async fn missing_remove_stores_native_constructed_tombstone_not_request_or_physi
         let [Request::Insert(record)] = journal.as_slice() else {
             panic!("one insert")
         };
-        let stored: StoredAggregate =
-            fube_transport::serialization::serde::from_slice(&record.value).unwrap();
+        let stored: StoredAggregate = fubst::serde::from_slice(&record.value).unwrap();
         assert_eq!(record.key.record_type, "ra/entity/v1");
         assert_eq!(stored.format, 2);
         assert_eq!(stored.body, *committed.body);
@@ -15033,7 +15025,7 @@ async fn node_notification_aggregates_partitions_and_consumes_only_instance_matc
         &executor,
         Command::ServiceTypeReply {
             body: Box::new(ServiceTypeNotification {
-                infos: fube_transport::serialization::serde::ObjectArray(vec![ack]),
+                infos: fubst::serde::ObjectArray(vec![ack]),
             }),
             source: admission().fm_source,
             generation: GenerationHeader {
@@ -15560,7 +15552,7 @@ async fn vanilla_generic_generation_guard_precedes_node_ack() {
         let ticket = executor
             .submit(Command::ServiceTypeReply {
                 body: Box::new(ServiceTypeNotification {
-                    infos: fube_transport::serialization::serde::ObjectArray(vec![info]),
+                    infos: fubst::serde::ObjectArray(vec![info]),
                 }),
                 source: admission().fm_source,
                 generation: GenerationHeader {
@@ -16221,7 +16213,7 @@ async fn closing_reacquisition_normalizes_version_and_disposes_rejected_mismatch
                     &executor,
                     Command::ServiceTypeReply {
                         body: Box::new(ServiceTypeNotification {
-                            infos: fube_transport::serialization::serde::ObjectArray(vec![ack]),
+                            infos: fubst::serde::ObjectArray(vec![ack]),
                         }),
                         source: admission().fm_source,
                         generation: GenerationHeader {

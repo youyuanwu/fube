@@ -5,10 +5,10 @@
 //! ErrorCode diagnostic strings are not serialized. No Federation routing.
 use fube_transport::{
     message::{Header, Message, ACTION, ACTOR, HIGH_PRIORITY},
-    serialization::serde::{
-        from_slice, to_vec, ByteArray, Derived, Guid, Inline, NativeEnum, ObjectArray, Pointer,
-    },
     Error, Result,
+};
+use fubst::serde::{
+    from_slice, to_vec, ByteArray, Derived, Guid, Inline, NativeEnum, ObjectArray, Pointer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -706,7 +706,7 @@ pub fn decode_replica_up_reply(message: &Message) -> Result<(ReplicaUp, Generati
 }
 pub fn decode_service_type_notification(message: &Message) -> Result<ServiceTypeNotification> {
     check_factory(message, "ServiceTypeNotification", &[FM_ACTOR])?;
-    from_slice(&message.body)
+    Ok(from_slice(&message.body)?)
 }
 pub fn decode_service_type_notification_reply(
     message: &Message,

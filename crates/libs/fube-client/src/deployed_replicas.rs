@@ -164,7 +164,7 @@ impl Query for DeployedReplicaQueryParameters {
 mod tests {
     use super::*;
     use crate::query_protocol::{encode_query, tests::assert_request};
-    use fube_transport::serialization::{
+    use fubst::{
         serde::{from_slice, to_vec},
         Encoder, MAX_STRING_UNITS,
     };
@@ -210,7 +210,7 @@ mod tests {
 
     // Independent ServiceModel/DeployedServiceReplicaQueryResult.h
     // FABRIC_FIELDS_15, not serialization of the Rust result model.
-    fn fields(e: &mut Encoder, f: &Fixture<'_>, count: usize) -> Result<()> {
+    fn fields(e: &mut Encoder, f: &Fixture<'_>, count: usize) -> fubst::Result<()> {
         for field in 0..count {
             match field {
                 0 => e.i64(f.kind),
@@ -240,7 +240,7 @@ mod tests {
         Ok(())
     }
 
-    fn reconfiguration_fields(e: &mut Encoder, f: &Fixture<'_>, count: usize) -> Result<()> {
+    fn reconfiguration_fields(e: &mut Encoder, f: &Fixture<'_>, count: usize) -> fubst::Result<()> {
         for field in 0..count {
             e.i64(match field {
                 0 => f.previous_role,

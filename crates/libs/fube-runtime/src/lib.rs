@@ -140,10 +140,8 @@ use std::{
 
 use channel_adapter::{IpcChannel, IpcMessage};
 pub use error::{Error, ErrorKind, RejectedRegistrationInput, Result};
-use fube_transport::{
-    connection::deadline_after,
-    serialization::serde::{from_slice, to_vec},
-};
+use fube_transport::connection::deadline_after;
+use fubst::serde::{from_slice, to_vec};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 pub(crate) use api::PartitionKind;
@@ -801,9 +799,7 @@ impl Runtime {
                 &UnregisterHost {
                     activity: Activity {
                         id: ActivityId {
-                            guid: fube_transport::serialization::serde::Guid(
-                                uuid::Uuid::new_v4().to_bytes_le(),
-                            ),
+                            guid: fubst::serde::Guid(uuid::Uuid::new_v4().to_bytes_le()),
                             index: 0,
                         },
                         kind: 0,

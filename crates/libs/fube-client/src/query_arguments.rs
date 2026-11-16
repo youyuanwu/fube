@@ -3,7 +3,7 @@
 //! Values use their ordinary JSON representations. Field adapters explicitly
 //! select numeric flag masks and embedded JSON without per-request serializers.
 
-use fube_transport::serialization::{MAX_COLLECTION_COUNT, MAX_STRING_UNITS};
+use fubst::{MAX_COLLECTION_COUNT, MAX_STRING_UNITS};
 use serde::{
     de::{value::MapAccessDeserializer, DeserializeSeed, IntoDeserializer, MapAccess, Visitor},
     ser::{Impossible, SerializeMap, SerializeStruct},

@@ -531,7 +531,7 @@ Native facts and the detailed source map are in
 the inspected implementation; line anchors identify the relevant surfaces.
 
 [rust-frame]: ../../crates/libs/fube-transport/src/frame.rs#L1-L85
-[rust-serde]: ../../crates/libs/fube-transport/src/serialization/serde.rs#L1-L28
+[rust-serde]: ../../crates/libs/fubst/src/serde.rs#L1-L28
 [rust-connection]: ../../crates/libs/fube-transport/src/native_channel.rs
 [rust-client]: ../../crates/libs/fube-client/Cargo.toml
 [rust-ext]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/libs/mssf-ext/src/state_replicator.rs#L17-L69
@@ -539,6 +539,6 @@ the inspected implementation; line anchors identify the relevant surfaces.
 [rust-sample]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/samples/kvmap/src/kvmap.rs#L210-L259
 [rust-reverse]: ../../crates/libs/fube-client/src/channel_adapter.rs#L58-L73
 [rust-reverse-dispatch]: ../../crates/libs/fube-client/src/channel_adapter.rs#L43-L55
-[rust-limits]: ../../crates/libs/fube-transport/src/serialization.rs#L5-L8
+[rust-limits]: ../../crates/libs/fubst/src/lib.rs#L11-L14
 [client-status]: ../transport/RustFabricClient.md
 [native-ipc-config]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/TransportConfig.h#L90-L115

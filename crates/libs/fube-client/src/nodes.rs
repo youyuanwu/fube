@@ -1,6 +1,6 @@
 //! Owned native node query data. Scalar enum numbers are never silently coerced.
 
-use fube_transport::serialization::serde::ByteArray;
+use fubst::serde::ByteArray;
 use serde::{Deserialize, Serialize};
 
 use crate::{PagedQuery, QueryPage};

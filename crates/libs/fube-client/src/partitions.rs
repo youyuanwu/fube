@@ -51,7 +51,7 @@ crate::native::strict_enum! {
 ///
 /// Only Named uses `name`; only Int64Range uses the inclusive signed key bounds.
 /// Native tag validation is selected by the containing field's adapter; standalone
-/// native consumers can use `fube_transport::serialization::serde::Untagged<Self>`.
+/// native consumers can use `fubst::serde::Untagged<Self>`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct PartitionInformation {
     pub kind: PartitionKind,
@@ -130,7 +130,7 @@ impl Query for PartitionQueryParameters {
 pub(crate) mod tests {
     use super::*;
     use crate::query_protocol::{encode_query, tests::assert_request};
-    use fube_transport::serialization::{serde::from_slice, Encoder};
+    use fubst::{serde::from_slice, Encoder};
     use std::num::NonZeroU64;
 
     pub(crate) const ID: &str = "00112233-4455-6677-8899-aabbccddeeff";
@@ -140,7 +140,7 @@ pub(crate) mod tests {
     ];
 
     // ServiceModel/ServicePartitionInformation.h FABRIC_FIELDS_05.
-    fn information(e: &mut Encoder, key: i64, low: i64, high: i64) -> Result<()> {
+    fn information(e: &mut Encoder, key: i64, low: i64, high: i64) -> fubst::Result<()> {
         e.object(|e| {
             e.i64(key);
             e.guid(&GUID_BYTES);
@@ -152,7 +152,7 @@ pub(crate) mod tests {
     }
 
     // ServiceModel/ServicePartitionQueryResult.h FABRIC_FIELDS_09.
-    fn base(e: &mut Encoder, kind: i64, key: i64, low: i64, high: i64) -> Result<()> {
+    fn base(e: &mut Encoder, kind: i64, key: i64, low: i64, high: i64) -> fubst::Result<()> {
         e.i64(kind);
         information(e, key, low, high)?;
         e.i32(if kind == 1 { -1 } else { 0 });
@@ -163,7 +163,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    fn partition_fields(e: &mut Encoder, kind: i64, key: i64, suffix: usize) -> Result<()> {
+    fn partition_fields(e: &mut Encoder, kind: i64, key: i64, suffix: usize) -> fubst::Result<()> {
         base(e, kind, key, i64::MIN, i64::MAX)?;
         if suffix >= 1 {
             e.i64(i64::MAX);
@@ -178,7 +178,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    fn decode_fields(fields: impl FnOnce(&mut Encoder) -> Result<()>) -> Result<Partition> {
+    fn decode_fields(fields: impl FnOnce(&mut Encoder) -> fubst::Result<()>) -> Result<Partition> {
         let mut e = Encoder::new();
         e.object(fields)?;
         PartitionQueryParameters::validate_record(from_slice(&e.finish())?)

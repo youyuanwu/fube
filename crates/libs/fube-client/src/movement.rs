@@ -5,10 +5,8 @@ use crate::{
     query_protocol::{Query, Reply},
     Error, Result,
 };
-use fube_transport::{
-    message::{Message, ACTION, ACTOR},
-    serialization::serde::{from_slice, Pointer, RawTagged},
-};
+use fube_transport::message::{Message, ACTION, ACTOR};
+use fubst::serde::{from_slice, Pointer, RawTagged};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -80,7 +78,7 @@ impl Reply for EmptyReply {
 mod tests {
     use super::*;
     use crate::query_protocol::{decode_reply, tests::assert_request};
-    use fube_transport::serialization::Encoder;
+    use fubst::Encoder;
     fn reply(kind: i64, error: i64, payload: bool, paging: bool) -> Message {
         let mut e = Encoder::new();
         e.object(|e| {

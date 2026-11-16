@@ -3,10 +3,8 @@ use fube_local_host::process::OwnedApp;
 use fube_node::control::wire::{self, Link};
 use fube_node_runner::{Config, Fm, Identity, Placement};
 use fube_ra::protocol::*;
-use fube_transport::{
-    channel::IncomingMessage, message::Message, native_channel::GatewayTarget,
-    serialization::serde::ObjectArray,
-};
+use fube_transport::{channel::IncomingMessage, message::Message, native_channel::GatewayTarget};
+use fubst::serde::ObjectArray;
 use serde_json::Value;
 use std::{
     fs,

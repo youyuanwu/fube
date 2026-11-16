@@ -1,5 +1,6 @@
-use fube_transport::serialization::serde::{from_fields, from_slice, to_vec};
-use fube_transport::{message::Message, serialization::Decoder};
+use fube_transport::message::Message;
+use fubst::serde::{from_fields, from_slice, to_vec};
+use fubst::Decoder;
 use serde::Deserialize;
 
 use crate::{Error, GatewayDescription, NamingUri, NodeId, Result};
@@ -8,7 +9,7 @@ use crate::{Error, GatewayDescription, NamingUri, NodeId, Result};
 pub(crate) const DELETE_NAME_HEADER: u16 = 0x8033;
 
 pub(crate) fn encode_name(name: &str) -> Result<Vec<u8>> {
-    to_vec(&NamingUri::parse(name)?)
+    Ok(to_vec(&NamingUri::parse(name)?)?)
 }
 
 pub(crate) fn check_failure(message: &Message) -> Result<()> {
@@ -139,7 +140,7 @@ pub(crate) fn decode_name_write(message: &Message) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fube_transport::serialization::Encoder;
+    use fubst::Encoder;
 
     #[test]
     fn naming_uri_serde_bytes_match_the_manual_native_schema() {

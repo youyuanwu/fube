@@ -167,7 +167,7 @@ async fn notification_terminal_cause_is_not_replaced_by_generic_connection_shutd
 #[tokio::test]
 async fn known_driver_failure_precedes_buffered_updates_without_worker_progress() {
     use crate::resolution_protocol::{Cuid, ReplicaSet, TableEntry};
-    use fube_transport::serialization::serde::{CountedStrings, CountedValues, Guid, Pointer};
+    use fubst::serde::{CountedStrings, CountedValues, Guid, Pointer};
     let (session, _cleanups, _peer) = session().await;
     let page = wire::Page {
         id: wire::PageId {

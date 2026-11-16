@@ -360,10 +360,10 @@ impl LocalStatusConsumer {
             .collect();
         types.sort_by(compare_service_types);
         let body = ServiceTypeUpdate {
-            types: fube_transport::serialization::serde::ObjectArray(types),
+            types: fubst::serde::ObjectArray(types),
             sequence,
         };
-        if fube_transport::serialization::serde::to_vec(&body)
+        if fubst::serde::to_vec(&body)
             .map_err(|_| Failure::Capacity)?
             .len()
             > self.max_bytes

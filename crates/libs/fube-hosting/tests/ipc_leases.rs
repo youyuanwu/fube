@@ -2,8 +2,8 @@ use fube_hosting::{ipc::*, wire, ClosedRegisteredEvent, Error};
 use fube_transport::{
     connection::{read_message, write_message},
     message::{Header, ListenInstance, Message, MessageId, EXPECTS_REPLY, IPC},
-    serialization::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer},
 };
+use fubst::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer};
 use serde::Serialize;
 use std::time::{Duration, Instant};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
@@ -312,7 +312,7 @@ impl Peer {
         let frame = self.frame(15, "", vec![]);
         self.raw(frame)
             .await
-            .and_then(|message| from_slice::<wire::LeaseReply>(&message.body).map(|v| v.ttl))
+            .and_then(|message| Ok(from_slice::<wire::LeaseReply>(&message.body)?.ttl))
     }
 }
 fn new_id() -> MessageId {

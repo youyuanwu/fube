@@ -223,8 +223,8 @@ the byte-level encoding and representative schemas. Keep frame parsing, raw
 header-record boundaries, and TLS handling outside the object serializer;
 operation/header schemas call the same serialization primitives.
 
-The implementation uses bounded `serialization::{Encoder, Decoder}` cursors
-and explicit scope helpers. `serialization::serde` now adds ordered DTO derives
+The implementation uses bounded `fubst::{Encoder, Decoder}` cursors
+and explicit scope helpers. `fubst::serde` adds ordered DTO derives
 over those same primitives, alongside manual schemas where native boundaries
 or validation demand them. `FabricEncode`/`FabricDecode` were an initial design
 direction, not implemented traits. Keep native field order and compatibility

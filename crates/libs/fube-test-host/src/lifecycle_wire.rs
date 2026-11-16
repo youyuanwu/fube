@@ -1,7 +1,7 @@
 //! Native RA12 stateless subset. Source: ServiceModel/reliability/failover/
 //! and Reliability/Failover/{common,ra}/ declarations at the pinned revision.
 use crate::wire::{PackageId, VersionInstance};
-use fube_transport::serialization::serde::{ByteArray, EmptyObjectArray, Guid};
+use fubst::serde::{ByteArray, EmptyObjectArray, Guid};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

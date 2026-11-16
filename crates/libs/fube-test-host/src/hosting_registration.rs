@@ -8,10 +8,8 @@ use fube_hosting::{self as hosting, ipc, wire};
 use fube_node::{Config, Input, Node, Response};
 use fube_ra::{entity as ra, protocol};
 use fube_ra_store::{MemoryBackend, Settings as StoreSettings, Store};
-use fube_transport::{
-    connection::{read_message, write_message},
-    serialization::serde::{from_slice, to_vec},
-};
+use fube_transport::connection::{read_message, write_message};
+use fubst::serde::{from_slice, to_vec};
 use std::{
     sync::Arc,
     time::{Duration, Instant},

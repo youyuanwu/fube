@@ -11,6 +11,7 @@ qualification = []
 
 [dependencies]
 fube-transport.workspace = true
+fubst.workspace = true
 fube-ra-store = { path = "../fube-ra-store" }
 serde.workspace = true
 tokio.workspace = true

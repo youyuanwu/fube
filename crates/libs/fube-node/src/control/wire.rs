@@ -10,9 +10,9 @@ use fube_transport::{
     native_demux::{
         ActorDemux, ActorRegistration, ChannelComposition, OutboundKind, RequestPolicy,
     },
-    serialization::serde::{from_slice_with_budget, to_vec},
     Channel, ChannelLimits,
 };
+use fubst::serde::{from_slice_with_budget, to_vec};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     sync::{Arc, Mutex},
@@ -286,9 +286,7 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     from_slice_with_budget(bytes, &mut |count| {
         budget = budget
             .checked_sub(count)
-            .ok_or(fube_transport::Error::ResourceLimit(
-                "cluster native decode",
-            ))?;
+            .ok_or(fubst::Error::ResourceLimit("cluster native decode"))?;
         Ok(())
     })
     .map_err(err)
@@ -581,7 +579,7 @@ fn validate_source(message: &Message, local: &NodeInstance, remote: &NodeInstanc
     let value: PToP = from_slice_with_budget(&header.value, &mut |bytes| {
         budget = budget
             .checked_sub(bytes)
-            .ok_or(fube_transport::Error::ResourceLimit("PToP decode"))?;
+            .ok_or(fubst::Error::ResourceLimit("PToP decode"))?;
         Ok(())
     })
     .map_err(err)?;

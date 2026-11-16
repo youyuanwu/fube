@@ -1,5 +1,5 @@
 use super::*;
-use fube_transport::serialization::serde::ObjectArray;
+use fubst::serde::ObjectArray;
 
 /// Session-only ordinary-FM generations; these do not restore runtime authority.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
