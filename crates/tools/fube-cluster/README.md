@@ -46,8 +46,11 @@ GetLSN/history, checks separate PC/CC read quorums, selects using deactivation
 history before LSN and can redirect the FM candidate with ChangeConfiguration.
 All required surviving Deactivate/Activate commits and final RAP/FM completion
 precede endpoint publication. FM-link loss alone cannot authorize promotion.
-Configured sizes and service version remain unchanged; current membership may
-shrink, respecting minimum when removing additional down Secondaries.
+Configured sizes and service version remain unchanged. The former Primary
+becomes a down CC Secondary; down members, including that former Primary, leave
+CC only while its count exceeds minimum. At 3/3 and 4/4, a surviving majority
+can therefore acknowledge writes after genuine failover completion without
+shrinking membership below minimum. A retained down member supplies no vote.
 
 After completed failover and processed predecessor deletion,
 `Cluster::repair_primary_replica().await` explicitly restores one missing member

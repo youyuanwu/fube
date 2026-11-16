@@ -709,7 +709,7 @@ impl Ledger {
         for r in &mut body.configuration.replicas.0 {
             r.previous_role = r.current_role;
             if r.node == self.placements[lost].launch.node {
-                r.current_role = 1;
+                r.current_role = 3;
                 r.up = false;
                 r.state = 3;
             } else if r.node == self.placements[candidate].launch.node {
@@ -728,20 +728,17 @@ impl Ledger {
             r.first_lsn = -1;
             r.last_lsn = -1;
         }
-        if configured {
-            let mut count = body
-                .configuration
-                .replicas
-                .0
-                .iter()
-                .filter(|r| r.current_role >= 3)
-                .count();
-            for r in &mut body.configuration.replicas.0 {
-                if !r.up && r.current_role == 3 && count > body.configuration.unit.minimum as usize
-                {
-                    r.current_role = 1;
-                    count -= 1;
-                }
+        let mut count = body
+            .configuration
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.current_role >= 3)
+            .count();
+        for r in &mut body.configuration.replicas.0 {
+            if !r.up && r.current_role == 3 && count > body.configuration.unit.minimum as usize {
+                r.current_role = 1;
+                count -= 1;
             }
         }
         body.phase0_duration = i64::MAX;
