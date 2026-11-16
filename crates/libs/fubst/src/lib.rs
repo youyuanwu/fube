@@ -1,6 +1,12 @@
-use crate::{Error, Result};
+//! Bounded Service Fabric native serialization, independent of transport.
+//!
+//! [`Encoder`] and [`Decoder`] implement the supported positional wire format.
+//! The [`mod@serde`] module provides Serde mappings and explicit native adapters.
 
+mod error;
 pub mod serde;
+
+pub use error::{Error, Result};
 
 pub const MAX_STRING_UNITS: usize = 32_768;
 pub const MAX_COLLECTION_COUNT: usize = 4_096;

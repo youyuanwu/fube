@@ -2,7 +2,7 @@
 //! mappings are in docs/cluster/RaStatelessRemoval.md; these are trusted adapter
 //! events, not a live Hosting/RAP implementation.
 use super::*;
-use fube_transport::serialization::serde::ObjectArray;
+use fubst::serde::ObjectArray;
 
 pub const APPLICATION_HOST_CRASH: i64 = -2_147_017_573;
 pub const STALE_REQUEST: i64 = SERVICE_TYPE_NOT_REGISTERED + 50;

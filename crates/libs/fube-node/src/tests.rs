@@ -1,6 +1,6 @@
 use super::*;
 use fube_ra_store::{MemoryBackend, Settings as StoreSettings, Store};
-use fube_transport::serialization::serde::{ObjectArray, Pointer};
+use fubst::serde::{ObjectArray, Pointer};
 
 #[tokio::test]
 async fn poisoned_metadata_still_joins_and_transfers_shutdown_ownership() {

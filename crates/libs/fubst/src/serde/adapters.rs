@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 /// Serde field adapter for `[u8; 16]` GUIDs in native Windows byte order.
 ///
-/// Use `#[serde(with = "fube_transport::serialization::serde::guid")]`.
+/// Use `#[serde(with = "fubst::serde::guid")]`.
 /// Native encoding uses [`Guid`] metadata; human-readable formats use arrays.
 pub mod guid {
     use super::Guid;
@@ -110,7 +110,7 @@ field_adapter!(
 /// No `NativeType` implementation is needed. The tag is not a body field.
 ///
 /// ```
-/// use fube_transport::serialization::serde::{from_slice, to_vec, FixedTag};
+/// use fubst::serde::{from_slice, to_vec, FixedTag};
 /// use serde::{Deserialize, Serialize};
 /// #[derive(Debug, PartialEq, Serialize, Deserialize)]
 /// struct Fields { value: String }
@@ -329,7 +329,7 @@ optional_adapter!(Trailing, TRAILING_ADAPTER);
 /// `type_info` returns an encoding error for values without a valid native tag.
 ///
 /// ```
-/// use fube_transport::serialization::serde::{
+/// use fubst::serde::{
 ///     from_slice, to_vec, NativeType, Pointer, Typed,
 /// };
 /// use serde::{Deserialize, Serialize};
@@ -338,9 +338,9 @@ optional_adapter!(Trailing, TRAILING_ADAPTER);
 /// struct Event { kind: i64, text: String }
 ///
 /// impl NativeType for Event {
-///     fn type_info(&self) -> fube_transport::Result<&[u8]> {
+///     fn type_info(&self) -> fubst::Result<&[u8]> {
 ///         if self.kind != 1 {
-///             return Err(fube_transport::Error::InvalidInput("invalid event kind"));
+///             return Err(fubst::Error::InvalidInput("invalid event kind"));
 ///         }
 ///         Ok(&[1, 0, 0, 0])
 ///     }

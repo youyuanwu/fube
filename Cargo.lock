@@ -305,6 +305,7 @@ dependencies = [
  "clap",
  "fube-client",
  "fube-transport",
+ "fubst",
  "libc",
  "tokio",
  "uuid",
@@ -317,6 +318,7 @@ dependencies = [
  "bitflags",
  "clap",
  "fube-transport",
+ "fubst",
  "openapi-service-fabric",
  "reqwest",
  "serde",
@@ -337,6 +339,7 @@ dependencies = [
  "fube-ra",
  "fube-ra-store",
  "fube-transport",
+ "fubst",
  "libc",
  "serde",
  "serde_json",
@@ -349,6 +352,7 @@ name = "fube-core"
 version = "0.1.0"
 dependencies = [
  "fube-transport",
+ "fubst",
  "tokio",
  "uuid",
 ]
@@ -359,6 +363,7 @@ version = "0.1.0"
 dependencies = [
  "fube-core",
  "fube-transport",
+ "fubst",
  "serde",
  "serde_json",
  "tokio",
@@ -373,6 +378,7 @@ dependencies = [
  "fube-ra",
  "fube-ra-store",
  "fube-transport",
+ "fubst",
  "serde",
  "socket2",
  "tokio",
@@ -397,6 +403,7 @@ dependencies = [
  "fube-ra",
  "fube-ra-store",
  "fube-transport",
+ "fubst",
  "serde",
  "tokio",
  "uuid",
@@ -413,6 +420,7 @@ dependencies = [
  "fube-ra",
  "fube-ra-store",
  "fube-transport",
+ "fubst",
  "serde",
  "serde_json",
  "tokio",
@@ -426,6 +434,7 @@ dependencies = [
  "clap",
  "fube-ra-store",
  "fube-transport",
+ "fubst",
  "serde",
  "tokio",
 ]
@@ -445,6 +454,7 @@ version = "0.1.0"
 dependencies = [
  "fube-runtime",
  "fube-transport",
+ "fubst",
  "serde",
  "tokio",
  "uuid",
@@ -463,6 +473,7 @@ dependencies = [
  "fube-rap-test-support",
  "fube-runtime",
  "fube-transport",
+ "fubst",
  "libc",
  "roxmltree",
  "serde",
@@ -482,6 +493,7 @@ dependencies = [
  "fube-ra",
  "fube-ra-store",
  "fube-transport",
+ "fubst",
  "serde",
  "serde_json",
  "sha2",
@@ -493,7 +505,7 @@ dependencies = [
 name = "fube-transport"
 version = "0.1.0"
 dependencies = [
- "bitflags",
+ "fubst",
  "serde",
  "tokio",
  "uuid",
@@ -508,6 +520,14 @@ dependencies = [
  "fube-runtime",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "fubst"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "serde",
 ]
 
 [[package]]
@@ -596,6 +616,7 @@ dependencies = [
  "fube-ra-store",
  "fube-runtime",
  "fube-transport",
+ "fubst",
  "serde_json",
  "tokio",
  "uuid",

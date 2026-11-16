@@ -5,10 +5,8 @@ use crate::{
     PartitionKind, RuntimeMetrics,
 };
 use crate::{Error, OpenMode, Result};
-use fube_transport::{
-    connection::deadline_after,
-    serialization::serde::{to_vec, Guid, ObjectArray, Pointer},
-};
+use fube_transport::connection::deadline_after;
+use fubst::serde::{to_vec, Guid, ObjectArray, Pointer};
 use std::{
     collections::HashMap,
     future::Future,

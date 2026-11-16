@@ -2,8 +2,8 @@ use super::*;
 use fube_transport::{
     connection::{read_message, write_message},
     message::{Header, ListenInstance, Message, MessageId, ACTIVITY},
-    serialization::Encoder,
 };
+use fubst::Encoder;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::oneshot,

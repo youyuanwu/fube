@@ -908,7 +908,7 @@ impl Adapter {
                         continue;
                     }
                     Some(FmWork::RetryReport(PartitionId {
-                        guid: fube_transport::serialization::serde::Guid(entity),
+                        guid: fubst::serde::Guid(entity),
                     }))
                 }
                 ra::Effect::ServiceTypeWorkCaptured { work, body } => {

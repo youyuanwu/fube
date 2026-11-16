@@ -1,10 +1,10 @@
 use crate::{
     frame::{Frame, FIXED_HEADER_SIZE, MAX_FRAME_SIZE, MAX_HEADER_SIZE},
-    serialization::{
-        serde::{from_slice, to_fields, to_vec, Guid},
-        Decoder, Encoder,
-    },
     Error, Result,
+};
+use fubst::{
+    serde::{from_slice, to_fields, to_vec, Guid},
+    Decoder, Encoder,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +32,7 @@ pub const MAX_HEADER_COUNT: usize = 4096;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageId {
     /// Native GUID field order, not a UUID's network byte order.
-    #[serde(with = "crate::serialization::serde::guid")]
+    #[serde(with = "fubst::serde::guid")]
     pub guid: [u8; 16],
     pub index: u32,
 }
@@ -43,7 +43,7 @@ impl MessageId {
         encoder.u32(self.index);
     }
 
-    pub fn decode(decoder: &mut Decoder<'_>) -> Result<Self> {
+    pub fn decode(decoder: &mut Decoder<'_>) -> fubst::Result<Self> {
         Ok(Self {
             guid: decoder.guid()?,
             index: decoder.u32()?,
@@ -58,7 +58,7 @@ pub struct Header {
 }
 
 impl Header {
-    pub fn object(id: u16, fields: impl FnOnce(&mut Encoder) -> Result<()>) -> Result<Self> {
+    pub fn object(id: u16, fields: impl FnOnce(&mut Encoder) -> fubst::Result<()>) -> Result<Self> {
         let mut encoder = Encoder::new();
         encoder.object(fields)?;
         let value = encoder.finish();
@@ -113,7 +113,7 @@ impl Header {
         Self::object(id, |encoder| to_fields(encoder, value))
     }
 
-    pub fn read<T>(&self, fields: impl FnOnce(&mut Decoder<'_>) -> Result<T>) -> Result<T> {
+    pub fn read<T>(&self, fields: impl FnOnce(&mut Decoder<'_>) -> fubst::Result<T>) -> Result<T> {
         let mut decoder = Decoder::new(&self.value);
         let result = decoder.object(fields)?;
         decoder.finish()?;
@@ -260,17 +260,17 @@ impl Message {
 pub struct ListenInstance {
     pub address: String,
     pub instance: u64,
-    #[serde(with = "crate::serialization::serde::guid")]
+    #[serde(with = "fubst::serde::guid")]
     pub nonce: [u8; 16],
 }
 
 impl ListenInstance {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        to_vec(self)
+        Ok(to_vec(self)?)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        from_slice(bytes)
+        Ok(from_slice(bytes)?)
     }
 }
 
@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn migrated_payloads_match_independent_pre_serde_schemas() {
-        fn compare(header: Header, fields: impl FnOnce(&mut Encoder) -> Result<()>) {
+        fn compare(header: Header, fields: impl FnOnce(&mut Encoder) -> fubst::Result<()>) {
             assert_eq!(header, Header::object(header.id, fields).unwrap());
         }
         for guid in [[0; 16], std::array::from_fn(|i| (i + 1) as u8)] {

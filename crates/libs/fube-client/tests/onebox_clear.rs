@@ -459,7 +459,7 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     .await
     .unwrap();
     let target = probe.resolve_target(&config.gateway).unwrap();
-    let mut body = fube_transport::serialization::Encoder::new();
+    let mut body = fubst::Encoder::new();
     body.object(|encoder| {
         encoder.object(|encoder| encoder.object_array::<()>(&[], |_, _| Ok(())))?;
         encoder.string("GetNodeList")

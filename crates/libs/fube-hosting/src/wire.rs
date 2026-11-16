@@ -1,7 +1,7 @@
 //! Hosting2 ordered wire records, pinned native baseline 3988b451.
 //! Ordered bootstrap/runtime/type records. Schema alone enables no consumer,
 //! reports or deployment; factory capability requires explicit owned admission.
-use fube_transport::serialization::serde::{ByteArray, Guid, ObjectArray, Pointer};
+use fubst::serde::{ByteArray, Guid, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

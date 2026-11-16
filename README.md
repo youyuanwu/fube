@@ -7,7 +7,8 @@ and standalone test host in Rust.
 | --- | --- |
 | [`fube-client`](crates/libs/fube-client) | Native clear-TCP FabricClient queries, naming, health, resolution, notifications, and ImageStore upload; no native SF library dependency. |
 | [`fube-cli`](crates/tools/fube-cli) | Thin native application-package upload CLI with explicit unsecured-development opt-in. |
-| [`fube-transport`](crates/libs/fube-transport) | Bounded Fabric framing, serialization, and concurrent TCP messaging. |
+| [`fubst`](crates/libs/fubst) | Transport-independent bounded Fabric serialization, encoding/decoding, and Serde adapters. |
+| [`fube-transport`](crates/libs/fube-transport) | Bounded Fabric framing, message/header codecs, and concurrent TCP messaging. |
 | [`fube-test-host`](crates/libs/fube-test-host) | Node-side stateless test-host subset, including manifest-based SharedProcess activation. |
 | [`fube-runtime`](crates/libs/fube-runtime) | Owned async stateless/stateful application runtime; real SF placement/reconfiguration without native SF libraries in the application. Linux x86-64 only. |
 | [`fube-data`](crates/libs/fube-data) | Owned volatile classic V1 replication, explicit acknowledgments, copy streams and native Fabric TCP peers. |
@@ -34,7 +35,7 @@ qualification additionally requires Linux x86-64.
 
 ```sh
 cargo build --locked --workspace
-cargo test --locked -p fube-transport -p fube-client -p fube-test-host
+cargo test --locked -p fubst -p fube-transport -p fube-client -p fube-test-host
 python3 -m tests.run --suite offline
 ```
 

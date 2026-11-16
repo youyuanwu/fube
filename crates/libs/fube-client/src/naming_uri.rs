@@ -1,6 +1,6 @@
 use std::{fmt, str::FromStr};
 
-use fube_transport::serialization::serde::{CountedStrings, Untagged};
+use fubst::serde::{CountedStrings, Untagged};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};

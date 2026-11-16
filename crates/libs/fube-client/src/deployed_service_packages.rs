@@ -72,13 +72,13 @@ mod tests {
         query_protocol::{encode_query, tests::assert_request},
         Error,
     };
-    use fube_transport::serialization::{
+    use fubst::{
         serde::{from_slice, to_vec},
         Encoder,
     };
 
     // ServiceModel/DeployedServiceManifestQueryResult.h FABRIC_FIELDS_04.
-    fn fields(e: &mut Encoder, count: usize, status: i64) -> Result<()> {
+    fn fields(e: &mut Encoder, count: usize, status: i64) -> fubst::Result<()> {
         for field in 0..count {
             match field {
                 0 => e.string("ServiceManifest")?,

@@ -3,10 +3,8 @@ mod support;
 
 use clap::Parser;
 use fube_ra::protocol::*;
-use fube_transport::{
-    message::{Header, Message, ACTION, ACTOR, HIGH_PRIORITY},
-    serialization::serde::{from_slice, to_vec, CountedStrings, ObjectArray},
-};
+use fube_transport::message::{Header, Message, ACTION, ACTOR, HIGH_PRIORITY};
+use fubst::serde::{from_slice, to_vec, CountedStrings, ObjectArray};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     fmt::Debug,

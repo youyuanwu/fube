@@ -1,7 +1,5 @@
-use fube_transport::{
-    message::Message,
-    serialization::serde::{from_slice, to_vec, CountedStrings, Guid, Pointer},
-};
+use fube_transport::message::Message;
+use fubst::serde::{from_slice, to_vec, CountedStrings, Guid, Pointer};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -77,7 +75,7 @@ pub(crate) fn encode_refresh(
                 p.partition.id,
             )
         });
-    to_vec(&Request {
+    Ok(to_vec(&Request {
         name,
         request: RequestData {
             key,
@@ -92,7 +90,7 @@ pub(crate) fn encode_refresh(
             include_description: false,
         },
         bypass_cache: false,
-    })
+    })?)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -43,9 +43,9 @@ use super::{
 };
 use fube_transport::{
     message::{Message, ACTION, ACTOR, HIGH_PRIORITY},
-    serialization::serde::{from_slice_with_budget, CountedStrings, ObjectArray},
     Error, Result,
 };
+use fubst::serde::{from_slice_with_budget, CountedStrings, ObjectArray};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -358,7 +358,7 @@ fn check_bootstrap_factory(
     message: &Message,
     action: &str,
     actor: i64,
-    reserve: &mut impl FnMut(usize) -> Result<()>,
+    reserve: &mut impl FnMut(usize) -> fubst::Result<()>,
 ) -> Result<()> {
     check_envelope(message)?;
     // Transport headers are primitive Encoder values, not FabricSerializable
@@ -375,12 +375,12 @@ fn check_bootstrap_factory(
     Ok(())
 }
 
-fn allocation_budget() -> impl FnMut(usize) -> Result<()> {
+fn allocation_budget() -> impl FnMut(usize) -> fubst::Result<()> {
     let mut remaining = BOOTSTRAP_MAX_DECODE_ALLOCATION;
     move |bytes| {
         remaining = remaining
             .checked_sub(bytes)
-            .ok_or(Error::ResourceLimit("bootstrap decode allocation"))?;
+            .ok_or(fubst::Error::ResourceLimit("bootstrap decode allocation"))?;
         Ok(())
     }
 }
@@ -396,10 +396,10 @@ pub fn decode_node_up(message: &Message) -> Result<NodeUp> {
 /// before constructing Message; this decoder cannot undo prior allocations.
 pub fn decode_node_up_with_budget(
     message: &Message,
-    reserve: &mut impl FnMut(usize) -> Result<()>,
+    reserve: &mut impl FnMut(usize) -> fubst::Result<()>,
 ) -> Result<NodeUp> {
     check_bootstrap_factory(message, "NodeUp", FM_ACTOR, reserve)?;
-    from_slice_with_budget(&message.body, reserve)
+    Ok(from_slice_with_budget(&message.body, reserve)?)
 }
 
 pub fn decode_node_up_ack(message: &Message) -> Result<(NodeUpAck, GenerationHeader)> {
@@ -408,7 +408,7 @@ pub fn decode_node_up_ack(message: &Message) -> Result<(NodeUpAck, GenerationHea
 
 pub fn decode_node_up_ack_with_budget(
     message: &Message,
-    reserve: &mut impl FnMut(usize) -> Result<()>,
+    reserve: &mut impl FnMut(usize) -> fubst::Result<()>,
 ) -> Result<(NodeUpAck, GenerationHeader)> {
     check_bootstrap_factory(message, "NodeUpAck", RS_ACTOR, reserve)?;
     let generation = from_slice_with_budget(&unique(message, GENERATION_HEADER)?.value, reserve)?;

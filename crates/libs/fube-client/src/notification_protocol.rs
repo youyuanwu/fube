@@ -1,9 +1,7 @@
 //! Source-derived notification schemas. No endpoint description enrichment.
-use fube_transport::{
-    message::Message,
-    serialization::serde::{
-        from_slice, from_slice_with_budget, to_vec, CountedValues, Guid, ObjectArray, Pointer,
-    },
+use fube_transport::message::Message;
+use fubst::serde::{
+    from_slice, from_slice_with_budget, to_vec, CountedValues, Guid, ObjectArray, Pointer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -138,7 +136,7 @@ pub(crate) fn decode_page(
     let decoded = from_slice_with_budget::<PageBody>(body, &mut |bytes| {
         reserve(bytes).map_err(|error| {
             allocation_error = Some(error);
-            Error::ResourceLimit("decoded allocation reservation")
+            fubst::Error::ResourceLimit("decoded allocation reservation")
         })
     });
     if let Some(error) = allocation_error {
@@ -155,7 +153,7 @@ pub(crate) fn status(success: bool) -> Result<Vec<u8>> {
         error: i64,
     }
     // ErrorCodeValue::OperationFailed (HRESULT E_FAIL), not a Result payload.
-    to_vec(&Status {
+    Ok(to_vec(&Status {
         error: if success { 0 } else { -2147467259 },
-    })
+    })?)
 }

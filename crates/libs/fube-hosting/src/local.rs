@@ -10,7 +10,7 @@ use fube_local_host::{
     manifest::Package,
     process::{OwnedApp, ProcessStatus},
 };
-use fube_transport::serialization::serde::{Guid, ObjectArray, Pointer};
+use fubst::serde::{Guid, ObjectArray, Pointer};
 use std::{
     net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},

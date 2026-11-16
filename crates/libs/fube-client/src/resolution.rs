@@ -18,9 +18,9 @@ impl PartitionKey {
     pub(crate) fn validate(&self) -> Result<()> {
         if let Self::Named(name) = self {
             if name.is_empty()
-                || name.len() > fube_transport::serialization::MAX_STRING_UNITS * 3
+                || name.len() > fubst::MAX_STRING_UNITS * 3
                 || name.contains('\0')
-                || name.encode_utf16().count() > fube_transport::serialization::MAX_STRING_UNITS
+                || name.encode_utf16().count() > fubst::MAX_STRING_UNITS
             {
                 return Err(Error::InvalidInput("invalid named partition key"));
             }

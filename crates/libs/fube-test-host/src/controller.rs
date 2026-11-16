@@ -1,8 +1,6 @@
 use crate::{ipc::Session, lifecycle_wire::*, require, wire, HostError, Result};
-use fube_transport::{
-    message::Message,
-    serialization::serde::{from_slice, to_vec, ByteArray, EmptyObjectArray, Guid},
-};
+use fube_transport::message::Message;
+use fubst::serde::{from_slice, to_vec, ByteArray, EmptyObjectArray, Guid};
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},

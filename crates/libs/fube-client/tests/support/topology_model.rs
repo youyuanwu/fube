@@ -9,7 +9,7 @@ use fube_client::{
     PartitionQueryParameters, ReplicaQueryDescription, ReplicaQueryParameters,
 };
 use fube_transport::message::{ACTION, ACTOR, IPC, RELATES_TO};
-use fube_transport::serialization::serde::{EmptyObjectArray, FixedTag, Pointer};
+use fubst::serde::{EmptyObjectArray, FixedTag, Pointer};
 use serde::Serialize;
 
 #[tokio::test]
@@ -240,7 +240,7 @@ fn native_error(kind: QueryKind, request: &Message) -> Message {
     query_reply(
         kind,
         request,
-        fube_transport::serialization::serde::to_vec(&QueryError {
+        fubst::serde::to_vec(&QueryError {
             kind: 0,
             payload: Pointer(None),
             error: REMOTE_CODE,

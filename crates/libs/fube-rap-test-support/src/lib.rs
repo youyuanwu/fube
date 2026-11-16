@@ -13,10 +13,8 @@ use fube_runtime::{
 use fube_transport::{
     connection::{read_message, write_message},
     message::{Header, ListenInstance, Message, MessageId},
-    serialization::serde::{
-        from_slice, to_vec, ByteArray, EmptyObjectArray, Guid, ObjectArray, Pointer,
-    },
 };
+use fubst::serde::{from_slice, to_vec, ByteArray, EmptyObjectArray, Guid, ObjectArray, Pointer};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, thread::JoinHandle};
 use tokio::{
     net::TcpListener,

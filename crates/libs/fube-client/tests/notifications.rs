@@ -4,8 +4,8 @@ use fube_client::*;
 use fube_transport::{
     connection::{read_message, write_message},
     message::{Header, Message, MessageId, EXPECTS_REPLY, UNCORRELATED_REPLY},
-    serialization::Decoder,
 };
+use fubst::Decoder;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 #[path = "support/notification_composition_tests.rs"]

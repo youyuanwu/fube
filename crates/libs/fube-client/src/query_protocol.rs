@@ -2,12 +2,10 @@
 
 use std::marker::PhantomData;
 
-use fube_transport::{
-    message::{Message, ACTION, ACTOR},
-    serialization::{
-        serde::{from_slice, to_vec, EmptyObjectArray, FixedTag, ObjectArray, Pointer, RawTagged},
-        MAX_COLLECTION_COUNT,
-    },
+use fube_transport::message::{Message, ACTION, ACTOR};
+use fubst::{
+    serde::{from_slice, to_vec, EmptyObjectArray, FixedTag, ObjectArray, Pointer, RawTagged},
+    MAX_COLLECTION_COUNT,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -99,12 +97,12 @@ fn encode(name: &str, args: &[(String, String)]) -> Result<Vec<u8>> {
         .iter()
         .map(|(key, value)| Pair(Key { value: key }, value))
         .collect();
-    to_vec(&Request(
+    Ok(to_vec(&Request(
         Arguments {
             values: ObjectArray(pairs),
         },
         name,
-    ))
+    ))?)
 }
 
 pub(crate) trait Reply {
@@ -302,10 +300,8 @@ fn decode<T: DeserializeOwned, U>(
 pub(crate) mod tests {
     use super::*;
     use crate::*;
-    use fube_transport::{
-        message::Header,
-        serialization::{Decoder, Encoder},
-    };
+    use fube_transport::message::Header;
+    use fubst::{Decoder, Encoder};
     use std::{collections::BTreeMap, num::NonZeroU64};
 
     #[test]

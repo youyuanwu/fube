@@ -27,7 +27,7 @@
 //! Renames do not affect bytes. Supported unknown tails are skipped, not retained.
 //!
 //! ```
-//! use fube_transport::serialization::serde::{to_vec, from_slice, Guid};
+//! use fubst::serde::{to_vec, from_slice, Guid};
 //! use serde::{Serialize, Deserialize};
 //! #[derive(Debug, PartialEq, Serialize, Deserialize)]
 //! struct Payload { address: String, instance: u64, nonce: Guid }
@@ -38,7 +38,7 @@
 //! Derived polymorphism requires no `NativeType` implementation or body-kind field:
 //!
 //! ```
-//! use fube_transport::serialization::serde::{from_slice, to_vec, NativeEnum, Pointer};
+//! use fubst::serde::{from_slice, to_vec, NativeEnum, Pointer};
 //! use serde::{Deserialize, Serialize};
 //!
 //! #[derive(Debug, PartialEq, Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-use fube_transport::serialization::serde::{EmptyObjectArray, Guid, Pointer};
+use fubst::serde::{EmptyObjectArray, Guid, Pointer};
 use serde::{Deserialize, Serialize};
 
 pub const IPC_HEADER: u16 = 0x800b;
@@ -66,7 +66,7 @@ pub struct StartReply {
 
 #[derive(Debug, Serialize)]
 pub struct SharedLog {
-    pub path: fube_transport::serialization::serde::ByteArray,
+    pub path: fubst::serde::ByteArray,
     pub disk: Guid,
     pub id: Guid,
     pub size: i64,

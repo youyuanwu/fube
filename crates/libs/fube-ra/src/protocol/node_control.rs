@@ -88,7 +88,7 @@ pub fn report_load_message(body: &ReportLoad) -> Result<Message> {
 }
 pub fn decode_report_load(message: &Message) -> Result<ReportLoad> {
     check_factory(message, "ReportLoad", &[FM_ACTOR])?;
-    from_slice(&message.body)
+    Ok(from_slice(&message.body)?)
 }
 
 fn request<T: Serialize>(body: &T, action: &str, generation: &GenerationHeader) -> Result<Message> {
@@ -189,11 +189,11 @@ pub fn service_type_disabled_message(body: &ServiceTypeUpdate) -> Result<Message
 }
 pub fn decode_service_type_enabled(message: &Message) -> Result<ServiceTypeUpdate> {
     check_factory(message, "ServiceTypeEnabled", &[FM_ACTOR])?;
-    from_slice(&message.body)
+    Ok(from_slice(&message.body)?)
 }
 pub fn decode_service_type_disabled(message: &Message) -> Result<ServiceTypeUpdate> {
     check_factory(message, "ServiceTypeDisabled", &[FM_ACTOR])?;
-    from_slice(&message.body)
+    Ok(from_slice(&message.body)?)
 }
 pub fn service_type_enabled_reply_message(
     body: &ServiceTypeUpdateReply,

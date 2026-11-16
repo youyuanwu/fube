@@ -2,10 +2,8 @@
 mod support;
 
 use fube_ra::protocol::*;
-use fube_transport::{
-    message::{Header, ACTION, ACTOR, HIGH_PRIORITY},
-    serialization::serde::{from_slice, to_vec, ByteArray, NativeEnum, Pointer},
-};
+use fube_transport::message::{Header, ACTION, ACTOR, HIGH_PRIORITY};
+use fubst::serde::{from_slice, to_vec, ByteArray, NativeEnum, Pointer};
 use serde::Serialize;
 
 fn generation_owner(high: u64, low: u64) -> [u8; 16] {
@@ -17,7 +15,7 @@ fn generation_owner(high: u64, low: u64) -> [u8; 16] {
 
 #[test]
 fn change_configuration_preserves_native_configuration_and_unit_reply_schemas() {
-    use fube_transport::serialization::serde::ObjectArray;
+    use fubst::serde::ObjectArray;
     let request = support::rich_request();
     let body = Configuration {
         unit: request.unit,
@@ -61,7 +59,7 @@ fn change_configuration_preserves_native_configuration_and_unit_reply_schemas() 
 
 #[test]
 fn lfum_upload_preserves_native_body_generation_and_bodyless_correlated_ack() {
-    use fube_transport::serialization::serde::ObjectArray;
+    use fubst::serde::ObjectArray;
     let generation = support::rich_generation(false);
     let upload = LfumUpload {
         generation: generation.number.clone(),
@@ -298,8 +296,8 @@ fn peer_creation_preserves_native_scopes_deactivation_and_reply_values() {
 
 #[test]
 fn peer_creation_rejects_bad_headers_shapes_and_every_proper_prefix() {
-    use fube_transport::serialization::serde::Inline;
     use fube_transport::{message::Message, Result};
+    use fubst::serde::Inline;
     type Decoder = fn(&Message) -> Result<()>;
     let base = support::rich_request();
     let info = ReplicaDeactivationInfo {
@@ -1143,7 +1141,7 @@ fn node_control_sequences_owners_and_full_service_descriptions_are_lossless() {
 
 #[test]
 fn service_type_status_and_endpoint_actions_do_not_alias_shared_schemas() {
-    use fube_transport::serialization::serde::ObjectArray;
+    use fubst::serde::ObjectArray;
     let types = support::rich_notification()
         .infos
         .0
@@ -1362,7 +1360,7 @@ fn stage_two_factory_defaults_and_malformed_headers_match_native_asymmetry() {
 
 #[test]
 fn complete_load_legacy_and_modern_map_scopes_roundtrip_and_reject_bad_node_ids() {
-    use fube_transport::serialization::serde::{Guid, ObjectArray};
+    use fubst::serde::{Guid, ObjectArray};
     let stats = LoadMetricStats {
         name: "cpuπ🦀".into(),
         value: u32::MAX,

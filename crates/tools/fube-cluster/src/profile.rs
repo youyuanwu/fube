@@ -236,7 +236,7 @@ impl Launch {
             self.profile.control_profile(),
             self.placement == 1,
             PartitionId {
-                guid: fube_transport::serialization::serde::Guid(
+                guid: fubst::serde::Guid(
                     uuid::Uuid::parse_str(&self.partition)
                         .map_err(err)?
                         .to_bytes_le(),

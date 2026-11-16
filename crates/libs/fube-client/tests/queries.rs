@@ -12,7 +12,7 @@ fn json_round_trip<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug
 
 #[test]
 fn scalar_node_enums_use_signed_numeric_serde_and_retain_unknown_values() {
-    use fube_transport::serialization::{
+    use fubst::{
         serde::{from_slice, to_vec},
         Encoder,
     };
@@ -53,7 +53,7 @@ fn scalar_node_enums_use_signed_numeric_serde_and_retain_unknown_values() {
 
 #[test]
 fn strict_scalar_enums_preserve_numeric_json_and_native_contracts() {
-    use fube_transport::serialization::{
+    use fubst::{
         serde::{from_slice, to_vec},
         Encoder,
     };
@@ -81,7 +81,7 @@ fn strict_scalar_enums_preserve_numeric_json_and_native_contracts() {
             encoder.i64(raw);
             assert!(matches!(
                 from_slice::<T>(&encoder.finish()),
-                Err(Error::Protocol(_))
+                Err(fubst::Error::Protocol(_))
             ));
         }
         for json in ["null", "\"Ready\"", "1.5", "18446744073709551615"] {

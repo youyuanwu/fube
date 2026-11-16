@@ -1,7 +1,7 @@
 //! Native authorities (3988b451): Hosting.ServiceTypeMap.cpp:20-145,
 //! Infrastructure.BackgroundWorkManager.cpp:53-225 and RetryTimer.cpp:46-149.
 use super::*;
-use fube_transport::serialization::serde::ObjectArray;
+use fubst::serde::ObjectArray;
 use std::cmp::Ordering;
 
 /// Linux PAL wc16.c:131-150, native short-wchar build, startup C locale.

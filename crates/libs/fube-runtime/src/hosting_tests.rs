@@ -5,8 +5,8 @@ use fube_hosting::{ipc, wire as hosting_wire};
 use fube_transport::{
     connection::{read_message, write_message},
     message::{Message, MessageId},
-    serialization::serde::{from_slice, to_vec, ObjectArray, Pointer},
 };
+use fubst::serde::{from_slice, to_vec, ObjectArray, Pointer};
 use std::{collections::HashMap, io::Write, process::Stdio, time::Instant};
 use tokio::{
     io::AsyncBufReadExt,

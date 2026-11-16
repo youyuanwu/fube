@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
 use fube_client::{ApplicationDefinitionKindFilter, Error, HealthEventsFilter, NodeStatusFilter};
-use fube_transport::serialization::{
+use fubst::{
     serde::{from_slice, to_vec},
     Encoder,
 };

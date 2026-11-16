@@ -1,15 +1,11 @@
 use std::{cell::Cell, mem::size_of};
 
-use fube_transport::{
-    serialization::{
-        serde::{
-            from_slice, from_slice_with_budget, to_vec, ByteArray, CountedStrings, CountedValues,
-            Derived, Guid, Inline, NativeEnum, NumericEnum, ObjectArray, Pointer, RawTagged,
-            Trailing,
-        },
-        Encoder, MAX_COLLECTION_COUNT,
+use fubst::{
+    serde::{
+        from_slice, from_slice_with_budget, to_vec, ByteArray, CountedStrings, CountedValues,
+        Derived, Guid, Inline, NativeEnum, NumericEnum, ObjectArray, Pointer, RawTagged, Trailing,
     },
-    Error, Result,
+    Encoder, Error, Result, MAX_COLLECTION_COUNT,
 };
 use serde::{Deserialize, Serialize};
 

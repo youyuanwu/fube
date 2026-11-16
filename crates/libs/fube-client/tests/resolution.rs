@@ -1,10 +1,8 @@
 //! Synthetic positional schema tests, not native runtime qualification.
 //! Field order is checked separately from production DTOs using the shared Rust codec.
 use fube_client::*;
-use fube_transport::{
-    connection::{read_message, write_message},
-    serialization::Decoder,
-};
+use fube_transport::connection::{read_message, write_message};
+use fubst::Decoder;
 use std::{cmp::Ordering, time::Duration};
 use tokio::net::TcpListener;
 use uuid::Uuid;

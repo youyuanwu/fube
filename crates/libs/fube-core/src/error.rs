@@ -405,6 +405,11 @@ impl From<fube_transport::Error> for Error {
         }
     }
 }
+impl From<fubst::Error> for Error {
+    fn from(error: fubst::Error) -> Self {
+        fube_transport::Error::from(error).into()
+    }
+}
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

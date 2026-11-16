@@ -12,8 +12,8 @@ use fube_ra_store::{
 use fube_transport::{
     connection::{read_message, write_message},
     message::MessageId,
-    serialization::serde::{from_slice, to_vec},
 };
+use fubst::serde::{from_slice, to_vec};
 use std::{collections::HashMap, process::Stdio, time::Instant};
 use tokio::{
     net::{TcpListener, TcpStream},

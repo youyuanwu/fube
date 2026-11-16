@@ -5,12 +5,10 @@
 
 use super::*;
 use crate::protocol::{PackageVersion, RA_ACTOR};
-use fube_transport::{
-    message::Header,
-    serialization::{
-        serde::{from_slice, to_vec},
-        Encoder,
-    },
+use fube_transport::message::Header;
+use fubst::{
+    serde::{from_slice, to_vec},
+    Encoder,
 };
 
 fn version() -> FabricVersionInstance {
@@ -142,7 +140,7 @@ fn rich_ack() -> NodeUpAck {
     }
 }
 
-fn source_version(e: &mut Encoder) -> Result<()> {
+fn source_version(e: &mut Encoder) -> fubst::Result<()> {
     e.object(|e| {
         e.object(|e| {
             e.object(|e| {
@@ -159,7 +157,7 @@ fn source_version(e: &mut Encoder) -> Result<()> {
     })
 }
 
-fn source_rollout(e: &mut Encoder, major: u32, minor: u32) -> Result<()> {
+fn source_rollout(e: &mut Encoder, major: u32, minor: u32) -> fubst::Result<()> {
     e.object(|e| {
         e.u32(major);
         e.u32(minor);
@@ -167,7 +165,12 @@ fn source_rollout(e: &mut Encoder, major: u32, minor: u32) -> Result<()> {
     })
 }
 
-fn source_package(e: &mut Encoder, application: &str, number: u32, name: &str) -> Result<()> {
+fn source_package(
+    e: &mut Encoder,
+    application: &str,
+    number: u32,
+    name: &str,
+) -> fubst::Result<()> {
     e.object(|e| {
         e.object(|e| {
             e.string(application)?;
@@ -527,7 +530,7 @@ fn bounded_decode_rejects_truncation_trailing_bytes_and_reservation_exhaustion()
         let mut charges = vec![];
         let mut reserve = |bytes| {
             charges.push(bytes);
-            Err(Error::ResourceLimit("test reservation"))
+            Err(fubst::Error::ResourceLimit("test reservation"))
         };
         let result = if ack {
             decode_node_up_ack_with_budget(&original, &mut reserve).map(|_| ())
@@ -553,7 +556,7 @@ fn caller_reservations_cover_body_allocations_not_only_headers() {
         let mut reserve = |bytes| {
             charges.push(bytes);
             if bytes > BOOTSTRAP_MAX_HEADER_BYTES {
-                Err(Error::ResourceLimit("test body reservation"))
+                Err(fubst::Error::ResourceLimit("test body reservation"))
             } else {
                 Ok(())
             }

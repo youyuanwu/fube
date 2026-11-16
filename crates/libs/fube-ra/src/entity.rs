@@ -6,7 +6,7 @@
 //! EntityJobItem; see the catalog's selected stateless decision/test tables.
 use crate::protocol::*;
 use fube_ra_store::{self as store, KeyValueStore, Output, Record, RecordId, Request};
-use fube_transport::serialization::serde::{from_slice, to_vec};
+use fubst::serde::{from_slice, to_vec};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -1355,7 +1355,7 @@ impl Executor {
         &self,
         entity: EntityId,
         kind: Kind,
-        bytes: fube_transport::Result<Vec<u8>>,
+        bytes: fubst::Result<Vec<u8>>,
         view: &mut View,
     ) -> Result<Ticket> {
         // Add may report a closed replica then return StaleRequest. Lifecycle

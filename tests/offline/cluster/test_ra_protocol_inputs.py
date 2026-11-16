@@ -10,7 +10,7 @@ from tests.ra_protocol.consumer import (
     CASES, GENERATION_FACTORIES, PEER_FACTORIES, REPLICA_FACTORIES, CONFIGURATION_FACTORIES,
     REVISION, consume, validate,
 )
-from tests.ra_protocol import schema
+from tests.ra_protocol import producer, schema
 
 
 class InputTests(unittest.TestCase):
@@ -47,6 +47,23 @@ class InputTests(unittest.TestCase):
 
     def save(self):
         (self.bundle / "manifest.json").write_text(json.dumps(self.manifest))
+
+    def test_source_digest_tracks_extracted_serializer_changes(self):
+        crate = self.root / "crates/libs/fubst"
+        (crate / "src/serde").mkdir(parents=True)
+        paths = [crate / "Cargo.toml", crate / "src/lib.rs", crate / "src/serde/adapters.rs"]
+        for path in paths:
+            path.write_text("original")
+        with patch.object(producer, "ROOT", self.root), patch.object(
+            producer, "NATIVE", self.root / "tests/ra_protocol/native"
+        ):
+            original, inputs = producer.source_digest()
+            self.assertTrue(all(str(path.relative_to(self.root)) in inputs for path in paths))
+            for path in paths:
+                with self.subTest(path=path):
+                    path.write_text("changed")
+                    self.assertNotEqual(producer.source_digest()[0], original)
+                    path.write_text("original")
 
     def test_inventory_model_is_valid_not_an_execution_claim(self):
         manifest = validate(self.bundle, "a" * 40, self.source)

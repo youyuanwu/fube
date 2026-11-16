@@ -1,9 +1,8 @@
 use super::*;
 use crate::fm::{Desired, IdleDeleteTarget, Observed};
-use fube_transport::{
-    channel::IncomingMessage, native_channel::GatewayTarget,
-    serialization::serde::ObjectArray,
-};
+use fubst::serde::ObjectArray;
+use fube_transport::{channel::IncomingMessage,
+native_channel::GatewayTarget};
 use std::{
     io::{Read, Write},
     net::TcpStream,

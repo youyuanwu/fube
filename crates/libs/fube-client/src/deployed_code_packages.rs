@@ -183,7 +183,7 @@ mod tests {
         query_protocol::{encode_query, tests::assert_request},
         Error,
     };
-    use fube_transport::serialization::{
+    use fubst::{
         serde::{from_slice, to_vec},
         Encoder, MAX_STRING_UNITS,
     };
@@ -216,7 +216,7 @@ mod tests {
     }
 
     // ServiceModel/CodePackageEntryPointStatistics.h FABRIC_FIELDS_11.
-    fn statistics_fields(e: &mut Encoder, wire: Wire) -> Result<()> {
+    fn statistics_fields(e: &mut Encoder, wire: Wire) -> fubst::Result<()> {
         for field in 0..wire.statistics_fields {
             match field {
                 0 => e.u32(u32::MAX),
@@ -237,7 +237,7 @@ mod tests {
     }
 
     // Both entry points are embedded objects, not pointers or nullable Options.
-    fn entry_fields(e: &mut Encoder, wire: Wire, setup: bool) -> Result<()> {
+    fn entry_fields(e: &mut Encoder, wire: Wire, setup: bool) -> fubst::Result<()> {
         for field in 0..wire.entry_fields {
             match field {
                 0 => e.string(if setup {
@@ -262,7 +262,7 @@ mod tests {
     }
 
     // ServiceModel/DeployedCodePackageQueryResult.h FABRIC_FIELDS_13.
-    fn package_fields(e: &mut Encoder, wire: Wire) -> Result<()> {
+    fn package_fields(e: &mut Encoder, wire: Wire) -> fubst::Result<()> {
         for field in 0..wire.package_fields {
             match field {
                 0 => e.string("Code_应用")?,
@@ -549,7 +549,7 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 from_slice::<DeployedCodePackage>(&e.finish()),
-                Err(Error::Protocol(_))
+                Err(fubst::Error::Protocol(_))
             ));
         }
         let mut e = Encoder::new();
@@ -568,7 +568,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             from_slice::<CodePackageEntryPoint>(&e.finish()),
-            Err(Error::Protocol(_))
+            Err(fubst::Error::Protocol(_))
         ));
     }
 
@@ -593,7 +593,7 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 from_slice::<DeployedCodePackage>(&e.finish()),
-                Err(Error::Protocol(_))
+                Err(fubst::Error::Protocol(_))
             ));
         }
         let mut e = Encoder::new();
@@ -611,7 +611,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             from_slice::<CodePackageEntryPoint>(&e.finish()),
-            Err(Error::Protocol(_))
+            Err(fubst::Error::Protocol(_))
         ));
         let mut e = Encoder::new();
         e.object(|e| {
@@ -628,7 +628,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             from_slice::<DeployedCodePackage>(&e.finish()),
-            Err(Error::Protocol(_))
+            Err(fubst::Error::Protocol(_))
         ));
         let mut e = Encoder::new();
         e.object(|e| {
@@ -638,7 +638,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             from_slice::<CodePackageEntryPointStatistics>(&e.finish()),
-            Err(Error::Protocol(_))
+            Err(fubst::Error::Protocol(_))
         ));
     }
 
@@ -750,7 +750,7 @@ mod tests {
             ] {
                 assert!(matches!(
                     from_slice::<DeployedCodePackage>(&record(wire)),
-                    Err(Error::Protocol(_))
+                    Err(fubst::Error::Protocol(_))
                 ));
             }
         }

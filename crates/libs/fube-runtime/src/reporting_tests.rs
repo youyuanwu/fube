@@ -3,7 +3,7 @@
 //! FABRIC_FIELDS_02/03/04; HealthReport.h; LoadOrMoveCostDescription.h:89,
 //! .cpp:121-141; ReplicaRole.cpp:54-83; LocalLoadReportingComponent.cpp:204-232.
 use super::*;
-use fube_transport::serialization::{Decoder, Encoder};
+use fubst::{Decoder, Encoder};
 
 pub(super) const PARTITION: &str = "00112233-4455-6677-8899-aabbccddeeff";
 pub(super) async fn without_advancing_time<T>(future: impl std::future::Future<Output = T>) -> T {

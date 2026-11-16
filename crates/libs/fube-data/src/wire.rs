@@ -32,9 +32,9 @@ use fube_core::Epoch;
 use fube_transport::{
     frame::MAX_FRAME_SIZE,
     message::{Header, Message, MessageId, ACTION, MESSAGE_ID},
-    serialization::{Decoder, Encoder, MAX_COLLECTION_COUNT, MAX_STRING_UNITS},
     Error, Result,
 };
+use fubst::{Decoder, Encoder, MAX_COLLECTION_COUNT, MAX_STRING_UNITS};
 use uuid::Uuid;
 
 const RE_FROM: u16 = 0x800a;
@@ -70,7 +70,7 @@ impl Actor {
         encoder.guid(&self.incarnation.to_bytes_le());
     }
 
-    fn read(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn read(decoder: &mut Decoder<'_>) -> fubst::Result<Self> {
         Ok(Self {
             partition: Uuid::from_bytes_le(decoder.guid()?),
             replica: decoder.i64()?,
@@ -576,36 +576,43 @@ impl Packet {
                     last,
                 }
             }
-            "ReplicationAck" => read_object(&message.body, |d| {
-                let received = d.i64()?;
-                let applied = d.i64()?;
-                let copy_received = d.i64()?;
-                let copy_applied = d.i64()?;
-                validate_ack(received, applied, copy_received, copy_applied)?;
-                Ok(Body::Ack {
+            "ReplicationAck" => {
+                let (received, applied, copy_received, copy_applied) =
+                    read_object(&message.body, |d| {
+                        let received = d.i64()?;
+                        let applied = d.i64()?;
+                        let copy_received = d.i64()?;
+                        let copy_applied = d.i64()?;
+                        validate_ack(received, applied, copy_received, copy_applied)?;
+                        Ok((received, applied, copy_received, copy_applied))
+                    })?;
+                Body::Ack {
                     received,
                     applied,
                     copy_received,
                     copy_applied,
                     error: read_error(message)?,
-                })
-            })?,
+                }
+            }
             "RequestAck" => {
                 if !message.body.is_empty() {
                     return Err(Error::Protocol("RequestAck body must be empty"));
                 }
                 Body::RequestAck
             }
-            "CopyContextAckAction" => read_object(&message.body, |d| {
-                let sequence = d.i64()?;
-                if sequence < 0 {
-                    return Err(Error::Protocol("invalid copy-context ACK sequence"));
-                }
-                Ok(Body::CopyContextAck {
+            "CopyContextAckAction" => {
+                let sequence = read_object(&message.body, |d| {
+                    let sequence = d.i64()?;
+                    if sequence < 0 {
+                        return Err(fubst::Error::Protocol("invalid copy-context ACK sequence"));
+                    }
+                    Ok(sequence)
+                })?;
+                Body::CopyContextAck {
                     sequence,
                     error: read_error(message)?,
-                })
-            })?,
+                }
+            }
             "InduceFault" => read_object(&message.body, |d| {
                 Ok(Body::InduceFault {
                     target: d.i64()?,
@@ -619,13 +626,13 @@ impl Packet {
     }
 }
 
-fn object(f: impl FnOnce(&mut Encoder) -> Result<()>) -> Result<Vec<u8>> {
+fn object(f: impl FnOnce(&mut Encoder) -> fubst::Result<()>) -> Result<Vec<u8>> {
     let mut encoder = Encoder::new();
     encoder.object(f)?;
     Ok(encoder.finish())
 }
 
-fn read_object<T>(bytes: &[u8], f: impl FnOnce(&mut Decoder<'_>) -> Result<T>) -> Result<T> {
+fn read_object<T>(bytes: &[u8], f: impl FnOnce(&mut Decoder<'_>) -> fubst::Result<T>) -> Result<T> {
     let mut decoder = Decoder::new(bytes);
     let value = decoder.object(f)?;
     decoder.finish()?;
@@ -707,7 +714,7 @@ fn operation_parts(message: &Message, id: u16) -> Result<(&[u8], &[u8])> {
     }
 }
 
-fn write_epoch(encoder: &mut Encoder, epoch: Epoch) -> Result<()> {
+fn write_epoch(encoder: &mut Encoder, epoch: Epoch) -> fubst::Result<()> {
     validate_epoch(epoch)?;
     let mut bytes = [0; 24];
     bytes[..8].copy_from_slice(&epoch.data_loss_number.to_le_bytes());
@@ -715,10 +722,10 @@ fn write_epoch(encoder: &mut Encoder, epoch: Epoch) -> Result<()> {
     encoder.byte_array(&bytes)
 }
 
-fn read_epoch(decoder: &mut Decoder<'_>) -> Result<Epoch> {
+fn read_epoch(decoder: &mut Decoder<'_>) -> fubst::Result<Epoch> {
     let bytes = decoder.byte_array()?;
     if bytes.len() != 24 || bytes[16..].iter().any(|b| *b != 0) {
-        return Err(Error::Protocol("invalid Linux FABRIC_EPOCH ABI"));
+        return Err(fubst::Error::Protocol("invalid Linux FABRIC_EPOCH ABI"));
     }
     let epoch = Epoch {
         data_loss_number: i64::from_le_bytes(bytes[..8].try_into().unwrap()),
@@ -728,14 +735,19 @@ fn read_epoch(decoder: &mut Decoder<'_>) -> Result<Epoch> {
     Ok(epoch)
 }
 
-fn validate_epoch(epoch: Epoch) -> Result<()> {
+fn validate_epoch(epoch: Epoch) -> fubst::Result<()> {
     if epoch.data_loss_number < 0 || epoch.configuration_number < 0 {
-        return Err(Error::Protocol("negative replication epoch"));
+        return Err(fubst::Error::Protocol("negative replication epoch"));
     }
     Ok(())
 }
 
-fn write_metadata(encoder: &mut Encoder, kind: u32, sequence: i64, group: i64) -> Result<()> {
+fn write_metadata(
+    encoder: &mut Encoder,
+    kind: u32,
+    sequence: i64,
+    group: i64,
+) -> fubst::Result<()> {
     validate_metadata(kind, group)?;
     positive_sequence(sequence)?;
     let mut bytes = [0; 32];
@@ -745,10 +757,10 @@ fn write_metadata(encoder: &mut Encoder, kind: u32, sequence: i64, group: i64) -
     encoder.byte_array(&bytes)
 }
 
-fn read_metadata(decoder: &mut Decoder<'_>) -> Result<(u32, i64, i64)> {
+fn read_metadata(decoder: &mut Decoder<'_>) -> fubst::Result<(u32, i64, i64)> {
     let bytes = decoder.byte_array()?;
     if bytes.len() != 32 || bytes[24..].iter().any(|b| *b != 0) {
-        return Err(Error::Protocol(
+        return Err(fubst::Error::Protocol(
             "invalid Linux FABRIC_OPERATION_METADATA ABI",
         ));
     }
@@ -761,9 +773,11 @@ fn read_metadata(decoder: &mut Decoder<'_>) -> Result<(u32, i64, i64)> {
     Ok((kind, sequence, group))
 }
 
-fn validate_metadata(kind: u32, group: i64) -> Result<()> {
+fn validate_metadata(kind: u32, group: i64) -> fubst::Result<()> {
     if !matches!(kind, NORMAL | END_OF_STREAM | 0x10 | 0x20 | 0x40 | 0x80) || group < -1 {
-        return Err(Error::Protocol("invalid operation type or atomic group"));
+        return Err(fubst::Error::Protocol(
+            "invalid operation type or atomic group",
+        ));
     }
     Ok(())
 }
@@ -776,17 +790,20 @@ fn copy_kind(last: bool) -> u32 {
     }
 }
 
-fn validate_copy_metadata((kind, _sequence, group): (u32, i64, i64), last: bool) -> Result<()> {
+fn validate_copy_metadata(
+    (kind, _sequence, group): (u32, i64, i64),
+    last: bool,
+) -> fubst::Result<()> {
     // The native receiver explicitly overwrites Type with EOS when isLast.
     if group != INVALID_ATOMIC_GROUP || !(kind == NORMAL || (last && kind == END_OF_STREAM)) {
-        return Err(Error::Protocol("invalid copy operation metadata"));
+        return Err(fubst::Error::Protocol("invalid copy operation metadata"));
     }
     Ok(())
 }
 
-fn positive_sequence(sequence: i64) -> Result<()> {
+fn positive_sequence(sequence: i64) -> fubst::Result<()> {
     if sequence <= 0 {
-        return Err(Error::Protocol("nonpositive operation sequence"));
+        return Err(fubst::Error::Protocol("nonpositive operation sequence"));
     }
     Ok(())
 }
@@ -813,7 +830,12 @@ fn validate_batch(
     Ok(())
 }
 
-fn validate_ack(received: i64, applied: i64, copy_received: i64, copy_applied: i64) -> Result<()> {
+fn validate_ack(
+    received: i64,
+    applied: i64,
+    copy_received: i64,
+    copy_applied: i64,
+) -> fubst::Result<()> {
     if received < 0
         || applied < 0
         || applied > received
@@ -822,7 +844,9 @@ fn validate_ack(received: i64, applied: i64, copy_received: i64, copy_applied: i
         || (copy_applied == -1 && copy_received != -1)
         || (copy_received >= 0 && copy_applied > copy_received)
     {
-        return Err(Error::Protocol("invalid cumulative replication/copy ACK"));
+        return Err(fubst::Error::Protocol(
+            "invalid cumulative replication/copy ACK",
+        ));
     }
     // -1 for received means all copy was received, not a smaller watermark.
     Ok(())
@@ -928,7 +952,9 @@ fn decode_replication(message: &Message) -> Result<Body> {
         let completed = if d.is_scope_end()? { 0 } else { d.i64()? };
         if first == 0 {
             if last != 0 || batch_end != 0 || !counts.is_empty() {
-                return Err(Error::Protocol("inconsistent legacy replication batch"));
+                return Err(fubst::Error::Protocol(
+                    "inconsistent legacy replication batch",
+                ));
             }
             let count = sizes.len() as u32;
             return Ok((

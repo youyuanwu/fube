@@ -16,7 +16,7 @@ pub fn lfum_upload_message(body: &LfumUpload) -> Result<Message> {
 
 pub fn decode_lfum_upload(message: &Message) -> Result<LfumUpload> {
     without_generation(message, "LFUMUpload")?;
-    from_slice(&message.body)
+    Ok(from_slice(&message.body)?)
 }
 
 pub fn lfum_upload_reply_message(generation: &GenerationHeader) -> Result<Message> {
@@ -73,7 +73,7 @@ pub fn decode_generation_proposal(message: &Message) -> Result<GenerationHeader>
     if !message.body.is_empty() {
         return Err(Error::Protocol("GenerationProposal must be bodyless"));
     }
-    from_slice(&unique(message, GENERATION_HEADER)?.value)
+    Ok(from_slice(&unique(message, GENERATION_HEADER)?.value)?)
 }
 
 /// Reply on the original request context. Unlike SendToFMM, that path does not
@@ -92,7 +92,7 @@ fn without_generation(message: &Message, action: &str) -> Result<()> {
 
 pub fn decode_generation_proposal_reply(message: &Message) -> Result<GenerationProposalReply> {
     without_generation(message, "GenerationProposalReply")?;
-    from_slice(&message.body)
+    Ok(from_slice(&message.body)?)
 }
 
 fn ordinary_fm(generation: &GenerationHeader) -> Result<()> {
@@ -125,5 +125,5 @@ pub fn generation_update_reject_message(body: &GenerationNumber) -> Result<Messa
 
 pub fn decode_generation_update_reject(message: &Message) -> Result<GenerationNumber> {
     without_generation(message, "GenerationUpdateReject")?;
-    from_slice(&message.body)
+    Ok(from_slice(&message.body)?)
 }

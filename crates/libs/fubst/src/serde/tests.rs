@@ -1,5 +1,5 @@
 use super::*;
-use crate::serialization::{MAX_COLLECTION_COUNT, MAX_DEPTH, MAX_STRING_UNITS};
+use crate::{MAX_COLLECTION_COUNT, MAX_DEPTH, MAX_STRING_UNITS};
 use ::serde::ser::SerializeStruct;
 use std::{cell::Cell, fmt::Write};
 

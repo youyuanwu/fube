@@ -1,6 +1,6 @@
 use crate::{err, Result};
 use fube_ra::protocol::{GenerationHeader, GenerationNumber, NodeInstance, PartitionId};
-use fube_transport::serialization::serde::Guid;
+use fubst::serde::Guid;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,

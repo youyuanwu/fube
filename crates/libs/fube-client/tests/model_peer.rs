@@ -7,8 +7,8 @@ use fube_client::{ClientError, DomainFailure, Error, FabricClient, GatewayDescri
 use fube_transport::{
     connection::{read_message, write_message},
     message::{Header, ListenInstance, Message, MessageId, ACTIVITY, FAULT, TIMEOUT},
-    serialization::{Decoder, Encoder},
 };
+use fubst::{Decoder, Encoder};
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream},
@@ -228,7 +228,7 @@ mod topology_lists;
 #[path = "support/channel_composition_model.rs"]
 mod channel_composition;
 
-fn body(fields: impl FnOnce(&mut Encoder) -> fube_transport::Result<()>) -> Vec<u8> {
+fn body(fields: impl FnOnce(&mut Encoder) -> fubst::Result<()>) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.object(fields).unwrap();
     encoder.finish()
@@ -1146,11 +1146,7 @@ mod node_queries {
         Uuid::from_u128(0x11223344_5566_7788_99aa_bbccddeeff00 + kind as u128)
     }
 
-    fn encode_safety(
-        encoder: &mut Encoder,
-        kind: i64,
-        shape: NodeShape,
-    ) -> fube_transport::Result<()> {
+    fn encode_safety(encoder: &mut Encoder, kind: i64, shape: NodeShape) -> fubst::Result<()> {
         let mut tag = (kind as i32).to_le_bytes().to_vec();
         let mut serialized_kind = kind;
         if kind == 2 {
@@ -1183,7 +1179,7 @@ mod node_queries {
         })
     }
 
-    fn encode_node(encoder: &mut Encoder, shape: &NodeShape) -> fube_transport::Result<()> {
+    fn encode_node(encoder: &mut Encoder, shape: &NodeShape) -> fubst::Result<()> {
         let mut id = Vec::from(0x0123456789abcdefu64.to_le_bytes());
         id.extend_from_slice(&0xfedcba9876543210u64.to_le_bytes());
         let unknown = matches!(shape, NodeShape::UnrecognizedScalars);
@@ -1255,7 +1251,7 @@ mod node_queries {
         Ok(())
     }
 
-    fn encode_wrapper(encoder: &mut Encoder, nodes: &[NodeShape]) -> fube_transport::Result<()> {
+    fn encode_wrapper(encoder: &mut Encoder, nodes: &[NodeShape]) -> fubst::Result<()> {
         encoder.object_array(nodes, encode_node)?;
         encoder.pointer(None, |_| Ok(()))
     }
@@ -1265,7 +1261,7 @@ mod node_queries {
         wrapper_tag: Option<&[u8]>,
         error: i64,
         token: Option<&str>,
-        wrapper: impl FnOnce(&mut Encoder) -> fube_transport::Result<()>,
+        wrapper: impl FnOnce(&mut Encoder) -> fubst::Result<()>,
     ) -> Vec<u8> {
         body(|encoder| {
             encoder.i64(kind);
@@ -1408,7 +1404,7 @@ mod node_queries {
     fn node_deserializes_directly_and_retains_both_native_ids() {
         for shape in [NodeShape::Complete, NodeShape::DisagreeingIdCopies] {
             let bytes = body(|encoder| encode_node(encoder, &shape));
-            let node: Node = fube_transport::serialization::serde::from_slice(&bytes).unwrap();
+            let node: Node = fubst::serde::from_slice(&bytes).unwrap();
             let mut expected = expected_node();
             if matches!(shape, NodeShape::DisagreeingIdCopies) {
                 expected.id_copy.low ^= 1 << 56;
@@ -1419,7 +1415,7 @@ mod node_queries {
 
     #[test]
     fn safety_checks_deserialize_directly_with_native_codes_and_guid_order() {
-        use fube_transport::serialization::serde::{from_slice, NativeEnum, Pointer};
+        use fubst::serde::{from_slice, NativeEnum, Pointer};
 
         for (kind, expected) in expected_node()
             .deactivation

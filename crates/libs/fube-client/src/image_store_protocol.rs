@@ -1,10 +1,10 @@
 use fube_transport::{
     frame::{FIXED_HEADER_SIZE, MAX_FRAME_SIZE},
     message::{Header, Message, MessageId, ACTION, ACTIVITY, ACTOR, CLIENT_VERSION, IPC},
-    serialization::{
-        serde::{to_fields, to_vec, Derived, Guid, Inline},
-        Decoder,
-    },
+};
+use fubst::{
+    serde::{to_fields, to_vec, Derived, Guid, Inline},
+    Decoder,
 };
 use serde::Serialize;
 use tokio::time::Instant;
@@ -86,7 +86,7 @@ pub(crate) fn decode_reply(message: &Message) -> Result<FileTransferReply> {
         d.object(|d| {
             let guid = d.guid()?;
             if guid == [0; 16] || d.u64()? != 0 {
-                return Err(Error::Protocol("invalid native upload Activity"));
+                return Err(fubst::Error::Protocol("invalid native upload Activity"));
             }
             Ok(guid)
         })
@@ -95,7 +95,9 @@ pub(crate) fn decode_reply(message: &Message) -> Result<FileTransferReply> {
         Some(required(FILE_SEQUENCE)?.read(|d| {
             let number = d.u64()?;
             if d.boolean()? {
-                return Err(Error::Protocol("v1.2 acknowledgement has last-chunk flag"));
+                return Err(fubst::Error::Protocol(
+                    "v1.2 acknowledgement has last-chunk flag",
+                ));
             }
             Ok(FileSequence {
                 number,
@@ -299,7 +301,7 @@ pub(crate) fn decode_delete(message: Message) -> Result<Option<[u8; 16]>> {
         d.object(|d| {
             let guid = d.guid()?;
             if d.u64()? != 0 {
-                return Err(Error::Protocol("invalid Delete Activity index"));
+                return Err(fubst::Error::Protocol("invalid Delete Activity index"));
             }
             Ok(Guid(guid))
         })
