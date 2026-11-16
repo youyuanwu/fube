@@ -789,6 +789,35 @@ fn configured_ledger(target: i32, minimum: i32) -> Ledger {
 }
 
 #[test]
+fn configured_failover_removes_down_members_only_above_minimum() {
+    for (target, minimum, secondary_losses) in [
+        (3, 3, 0), (4, 4, 0), (4, 4, 1), (4, 3, 1), (5, 3, 1), (64, 64, 0),
+    ] {
+        let mut ledger = configured_ledger(target, minimum);
+        let previous = ledger.configuration.as_ref().unwrap().reply.as_ref().unwrap().clone();
+        for index in (target as usize - secondary_losses..target as usize)
+            .chain(std::iter::once(0))
+        {
+            ledger.report(index, &stateful_loss_report(&ledger.placements[index])).unwrap();
+        }
+        let intent = ledger.start_primary_failover(Instant::now()).unwrap().unwrap();
+        assert_eq!(intent.configuration.unit.previous, previous.unit.current);
+        assert_eq!(intent.configuration.service, ledger.placements[0].body().unwrap().service);
+        assert_eq!(intent.configuration.replicas.0.iter().filter(|r| r.current_role >= 3).count(),
+            (target as usize - 1 - secondary_losses).max(minimum as usize));
+        for (replica, old) in intent.configuration.replicas.0.iter().zip(&previous.replicas.0) {
+            assert_eq!(replica.previous_role, old.current_role);
+            assert_eq!((replica.node.clone(), replica.id, replica.instance),
+                (old.node.clone(), old.id, old.instance));
+        }
+        let old_primary = &intent.configuration.replicas.0[0];
+        assert!(!old_primary.up);
+        assert_eq!(old_primary.current_role, if target == minimum { 3 } else { 1 });
+        assert_eq!(ledger.configuration_retry(Instant::now() + Duration::from_secs(11)), Some(intent));
+    }
+}
+
+#[test]
 fn configured_failover_redirects_only_exact_native_progress_and_replays_legacy_reply() {
     let mut ledger = configured_ledger(5, 3);
     let service = ledger.placements[0].body().unwrap().service;
@@ -1215,6 +1244,11 @@ fn primary_repair_requires_fresh_host_owned_build_and_exact_final_membership() {
         ledger.reply(0, AddInstanceReply {
             unit: original.unit, replica: dropped_replica(&original.replica), error: 0,
         }, true).unwrap();
+        if sizes.is_some_and(|(target, minimum)| target == minimum) {
+            assert!(ledger.begin_primary_repair(Instant::now()).is_err());
+            assert!(ledger.repair.is_none());
+            continue;
+        }
         assert!(ledger.begin_primary_repair(Instant::now()).unwrap());
         assert!(!ledger.begin_primary_repair(Instant::now()).unwrap());
         let repair = ledger.repair.as_ref().unwrap();
@@ -4136,7 +4170,7 @@ fn configured_sizes_reject_invalid_bounds_before_acquiring_a_deployment() {
 #[tokio::test]
 async fn configured_primary_failover_preserves_sizes_data_and_quorum_with_unavailable_secondaries() {
     for (target, minimum, secondary_losses, expected) in [
-        (2, 1, 0, true), (4, 2, 1, true), (4, 3, 1, true), (4, 4, 0, true),
+        (2, 1, 0, true), (3, 3, 0, true), (4, 2, 1, true), (4, 3, 1, true), (4, 4, 0, true),
         (5, 3, 1, true), (5, 1, 3, false),
     ] {
         let fixture = Fixture::new("configured-failover");
@@ -4181,6 +4215,11 @@ async fn configured_primary_failover_preserves_sizes_data_and_quorum_with_unavai
             let request = cluster.ledger.swap.as_ref().unwrap().body.clone();
             assert_eq!(request.configuration.service, service);
             assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), target as usize);
+            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role >= 3).count(),
+                (target as usize - 1 - secondary_losses).max(minimum as usize));
+            let former_primary = request.configuration.replicas.0.iter().find(|r| r.previous_role == 4).unwrap();
+            assert_eq!(former_primary.current_role, if target == minimum { 3 } else { 1 });
+            assert!(!former_primary.up);
             let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11)).ok_or("missing failover retry")?;
             assert_eq!(retry, request);
             cluster.send_configuration(&retry).await?;
@@ -4188,11 +4227,7 @@ async fn configured_primary_failover_preserves_sizes_data_and_quorum_with_unavai
             let (reply, _) = decode_do_reconfiguration_reply(&lost).map_err(err)?;
             assert_eq!(cluster.ledger.swap.as_ref().unwrap().reply.as_ref(), Some(&reply));
             let endpoint = cluster.ledger.placements[1].endpoint.clone().ok_or("missing new Primary endpoint")?;
-            if minimum as usize > reply.replicas.0.len() {
-                assert!(!data_contact(&endpoint, b"write-more\n").starts_with("OK "));
-                assert_eq!(cluster.ledger.placements[1].body()?.service, service);
-                return Ok(());
-            }
+            assert!(reply.replicas.0.len() >= minimum as usize);
             assert!(data_contact(&endpoint, b"read\n").contains("committed=1 value=acknowledged"));
             let written = data_contact(&endpoint, b"write-more\n");
             assert!(written.contains("committed=2 value=continued"), "{target}/{minimum}: {written}");
@@ -4209,6 +4244,25 @@ async fn configured_primary_failover_preserves_sizes_data_and_quorum_with_unavai
             }
             if secondary_losses > 0 {
                 assert!(cluster.repair_primary_replica().await.is_err());
+            }
+            if target == minimum {
+                assert!(reply.replicas.0.iter().any(|r| r.node == former_primary.node
+                    && r.id == former_primary.id && r.instance == former_primary.instance
+                    && r.current_role == 3 && !r.up));
+                assert!(cluster.repair_primary_replica().await.is_err());
+                let lost = target as usize - 1;
+                let pid = cluster.ledger.placements[lost].profile.as_ref().unwrap().app_pid;
+                assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()])
+                    .status().map_err(err)?.success());
+                until(&mut cluster, |c| c.ledger.placements[lost].loss_reported).await;
+                let mut pending = TcpStream::connect(&endpoint).map_err(err)?;
+                pending.set_read_timeout(Some(Duration::from_millis(250))).map_err(err)?;
+                pending.write_all(b"write-final\n").map_err(err)?;
+                until(&mut cluster, |c| c.status()["nodes"][1]["retained_work"]["app_observation"]["primary_last_admitted"] == 3).await;
+                let mut bytes = [0; 1024];
+                assert!(matches!(pending.read(&mut bytes), Err(ref e) if matches!(e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)));
+                assert_eq!(cluster.status()["nodes"][1]["retained_work"]["app_observation"]["primary_last_acknowledged"], 2);
             }
             Ok::<(), String>(())
         }).await;
@@ -4777,7 +4831,7 @@ async fn secondary_repair_blocks_at_minimum_without_quorum_and_after_another_los
 
 #[tokio::test]
 async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing() {
-    for (target, minimum, interrupted) in [(2, 1, false), (4, 2, false), (4, 4, false), (5, 3, false), (4, 3, true)] {
+    for (target, minimum, interrupted) in [(2, 1, false), (4, 2, false), (5, 3, false), (4, 3, true)] {
         let fixture = Fixture::new("configured-repair");
         let mut config = fixture.config();
         config.profile = ServiceProfile::Stateful { target, minimum };
@@ -4830,9 +4884,6 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
                 let primary = cluster.ledger.primary_index();
                 let endpoint = cluster.ledger.placements[primary].endpoint.clone().ok_or("missing repaired-cycle endpoint")?;
                 assert!(data_contact(&endpoint, b"read\n").contains(&format!("committed={}", if cycle == 0 { 1 } else { 2 })));
-                if target == minimum {
-                    assert!(!data_contact(&endpoint, if cycle == 0 { b"write-more\n" } else { b"write-final\n" }).starts_with("OK "));
-                }
                 let failover = cluster.ledger.swap.as_ref().unwrap().body.clone();
                 assert_eq!(failover.configuration.service, service);
                 assert_eq!(failover.configuration.unit.previous, epoch);
@@ -4927,7 +4978,7 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
             assert_eq!(cluster.ledger.placements[0].retired.len(), 2);
             let primary = cluster.ledger.primary_index();
             let endpoint = cluster.ledger.placements[primary].endpoint.clone().unwrap();
-            if target == 2 || minimum == target {
+            if target == 2 {
                 assert!(data_contact(&endpoint, b"write-final\n").contains("committed=3 value=final"));
             } else {
                 let acknowledged = cluster.status()["nodes"][primary]["retained_work"]["app_observation"]["primary_last_acknowledged"].clone();
@@ -6741,13 +6792,13 @@ async fn hold_superseding_lfum_with_deactivation(
 ) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
     let before = cluster.status();
     cluster.begin_generation_handshake()?;
-    send_generation_updates(cluster).await?;
-    let old = hold_lfum_uploads(cluster).await?;
+    let pending = send_generation_updates(cluster).await?;
+    let old = hold_lfum_uploads_with_pending(cluster, pending).await?;
     let frozen = old.iter().map(|incoming| decode_lfum_upload(&incoming.message))
         .collect::<std::result::Result<Vec<_>, _>>().map_err(err)?;
     cluster.ledger.generation.as_mut().unwrap().reject(&frozen[0].generation)?;
-    send_generation_updates(cluster).await?;
-    let current = hold_lfum_uploads(cluster).await?;
+    let pending = send_generation_updates(cluster).await?;
+    let current = hold_lfum_uploads_with_pending(cluster, pending).await?;
     if let Some(index) = deactivate {
         let link = cluster.children[index].link.as_ref().unwrap();
         link.send(node_deactivate_request_message(&NodeActivationRequest {
@@ -6781,13 +6832,37 @@ async fn hold_superseding_lfum_with_deactivation(
     Ok(current)
 }
 
-async fn send_generation_updates(cluster: &mut Cluster) -> Result<()> {
+async fn send_generation_updates(
+    cluster: &mut Cluster,
+) -> Result<Vec<(usize, IncomingMessage<GatewayTarget>)>> {
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut pending = vec![];
     loop {
-        for index in 0..cluster.children.len() { cluster.retry_generation(index).await?; }
+        for index in 0..cluster.children.len() {
+            if cluster.ledger.generation.as_ref().is_some_and(|round| round.phase == fm::GenerationPhase::Proposing) {
+                let link = cluster.children[index].link.as_ref().ok_or("missing generation link")?.clone();
+                let retry = cluster.retry_generation(index);
+                tokio::pin!(retry);
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut retry => { result?; break; }
+                        incoming = link.receive(wire::deadline()) => {
+                            if let Some(mut incoming) = incoming? {
+                                // Release ordered transport, not the held semantic completion.
+                                if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+                                pending.push((index, incoming));
+                            }
+                        }
+                    }
+                }
+            } else {
+                cluster.retry_generation(index).await?;
+            }
+        }
         let round = cluster.ledger.generation.as_ref().ok_or("missing LFUM generation round")?;
         if round.phase == fm::GenerationPhase::AwaitingUpload && round.updates_sent.iter().all(|sent| *sent) {
-            return Ok(());
+            return Ok(pending);
         }
         if Instant::now() >= deadline {
             return Err(format!("LFUM generation proposal/update deadline: {}", cluster.status()));
@@ -7149,11 +7224,22 @@ async fn real_lfum_during_secondary_admission_preserves_sf_inventory_and_origina
 }
 
 async fn hold_lfum_uploads(cluster: &mut Cluster) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
+    hold_lfum_uploads_with_pending(cluster, vec![]).await
+}
+
+async fn hold_lfum_uploads_with_pending(
+    cluster: &mut Cluster,
+    mut pending: Vec<(usize, IncomingMessage<GatewayTarget>)>,
+) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
     let mut held = vec![];
     for index in 0..cluster.children.len() {
         loop {
-            let mut incoming = cluster.children[index].link.as_ref().unwrap().receive(wire::deadline()).await?
-                .ok_or("missing replicated LFUM upload")?;
+            let mut incoming = if let Some(position) = pending.iter().position(|(node, _)| *node == index) {
+                pending.remove(position).1
+            } else {
+                cluster.children[index].link.as_ref().unwrap().receive(wire::deadline()).await?
+                    .ok_or("missing replicated LFUM upload")?
+            };
             if incoming.message.properties().map_err(err)?.action == "LFUMUpload" {
                 if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
                 held.push(incoming);
@@ -7161,6 +7247,9 @@ async fn hold_lfum_uploads(cluster: &mut Cluster) -> Result<Vec<IncomingMessage<
             }
             cluster.receive_message(index, incoming).await?;
         }
+    }
+    if !pending.is_empty() {
+        return Err("unconsumed generation frames after LFUM capture".into());
     }
     Ok(held)
 }

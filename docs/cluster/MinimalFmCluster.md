@@ -66,7 +66,7 @@ explicitly rejected. Original per-peer Channels and process cleanup receipts
 remain deployment/session/node bound; clean handoff now accounts for variable
 child counts without relaxing physical-owner cleanup.
 
-Acceptance covers `1/1`, `2/1`, `3/2`, `4/2`, `4/3`, `5/3` and `4/4`, real copy
+Acceptance covers `1/1`, `2/1`, `3/2`, `3/3`, `4/2`, `4/3`, `5/3` and `4/4`, real copy
 and application replication, blocked initial writes below minimum, lost final
 configuration-reply replay and clean original-owner shutdown. Four-member
 quorum checks distinguish configured minimum from actual majority: `4/2` cannot
@@ -97,12 +97,16 @@ FM-link disappearance is not proof of Primary failure. No new service Open,
 host adoption, private data-engine access or size update is substituted for
 the normal RAP callbacks.
 
-FM keeps PC from the last committed membership and removes the failed Primary
-from CC. Other unavailable Secondaries can leave CC only while its count is
-above the configured minimum, matching `fm/ReconfigurationTask.cpp:325-344`.
+FM keeps PC from the last committed membership, swaps the former Primary to a
+down CC Secondary and removes down CC members only while CC exceeds minimum.
+This follows `fm/FailoverUnit.cpp:1036-1048` and
+`fm/ReconfigurationTask.cpp:325-344`; the failed Primary is not exempt from
+minimum. Shared RA admits that retained member as ordinary failover, distinct
+from the epoch/history of interrupted Secondary removal. See S1 in the
+[configured-size plan](RustRaPort.md#configurable-replica-set-sizes-plan).
 Desired target/minimum and service update version remain unchanged. Available
-members must cover PC's read quorum before this no-data-loss-only adapter
-starts promotion; it does not use minimum as a read/write-quorum override.
+members must cover PC's read quorum before this no-data-loss-only adapter starts
+promotion; minimum is not a read/write-quorum override.
 
 RA retains one GetLSN result/history per exact replica incarnation. Phase 1
 checks PC and CC read quorums separately, waits for up replicas for the native
@@ -147,12 +151,17 @@ Native correspondence at the pinned revision:
   `ra/MessageHandler.cpp:161-165`: explicit deprecated-reply rejection.
 - `common/FailoverConfig.h:633`: dynamic progress-query wait default.
 
-Real-process acceptance covers `2/1`, `4/2`, `4/3`, `4/4`, `5/3` and an
+Real-process acceptance covers `2/1`, `3/3`, `4/2`, `4/3`, `4/4`, `5/3` and an
 insufficient-PC-quorum `5/1` case. It verifies nonempty data continuity,
 unavailable Secondaries, final-reply loss/replay, unchanged settings, original
-owners/one Open and cleanup. `4/4` can complete reconfiguration after Primary
-loss but cannot acknowledge a new write below minimum; retaining a down CC
-member at `4/3` does not replace the configuration-derived quorum.
+owners/one Open and cleanup. At `3/3` and `4/4`, the former Primary remains a
+down CC Secondary, preserving minimum and allowing a new majority-backed write
+after promotion. Losing another Secondary cannot acknowledge a new operation;
+retained down membership never supplies a vote. Original-node-only repair is
+explicitly rejected while the failed member must remain in CC. RA tests retain
+the same member in committed LFUM, hold each required survivor and final commit,
+reject invalid retained identities/states and replay completed failover without
+another Open.
 Separate process acceptance injects a native candidate-change FM input to
 verify new-candidate routing and deprecated-reply rejection without reopening
 survivors; it is not evidence that real differing runtime histories triggered
@@ -173,6 +182,11 @@ the failed Primary's native loss/deletion must be processed, all original Node/R
 sessions must remain connected and every other member must still be running.
 Only one missing member is admitted; failover with additional unavailable
 Secondaries does not authorize partial or multi-loss repair.
+When minimum requires the failed Primary to remain a down CC Secondary, this
+missing-member repair path is not admitted. Ready-Idle replacement at minimum
+is separate S3 work in the
+[configured-size plan](RustRaPort.md#configurable-replica-set-sizes-plan);
+neither minimum nor current membership is lowered to enable repair.
 
 The same physical predecessor boundary described in
 [third-replica repair](#post-failover-third-replica-repair) is retained: exact
@@ -211,7 +225,7 @@ Resize and automatic placement/restart remain deferred.
 RA and FM models cover configured repair through 64/32, preserving sizes and
 rejecting changed owners, resize, stale/partial replies and survivor loss.
 RA holds each admission, Deactivate, Activate and final completion commit.
-Real-process acceptance runs three failover/repair cycles at 2/1, 4/2, 4/4 and
+Real-process acceptance runs three failover/repair cycles at 2/1, 4/2 and
 5/3, promoting a rebuilt replica and replacing one placement twice. It covers
 nonempty recopy/continuing writes, lost build/final replies, old traffic,
 unchanged original Node/survivor owners and quorum blocking after repair.

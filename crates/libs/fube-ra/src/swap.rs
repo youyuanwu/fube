@@ -81,12 +81,9 @@ fn failover_epoch(unit: &FailoverUnit, active: &Reconfiguration, interrupted: bo
 fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
     let active = failover_membership(state)?;
     let old = &active.request;
-    let interrupted = body
-        .replicas
-        .0
-        .iter()
-        .any(|r| r.previous_role == 4 && r.current_role == 3 && !r.up && r.state == 3);
     let removal = active.secondary_loss && reconfiguration::secondary_removal(old);
+    // Ordinary failover can also retain the down former Primary to preserve minimum.
+    let interrupted = removal || failover_epoch(&body.unit, active, true);
     if body.replicas.0.len() != old.replicas.0.len()
         || body.service != old.service
         || !valid_stateful_sizes(&body.service)
@@ -95,7 +92,6 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
         || body.unit.id != old.unit.id
         || body.unit.consistency != old.unit.consistency
         || !failover_epoch(&body.unit, active, interrupted)
-        || (removal && !interrupted)
         || (interrupted
             && (body.replicas.0.len() != body.service.target as usize
                 || !reconfiguration::secondary_removal(body)
@@ -139,7 +135,9 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
                 .iter()
                 .any(|other| other.node.id == r.node.id || other.id == r.id)
             || if expected.current_role == 4 {
-                r.up || r.state != 3 || r.current_role != if interrupted { 3 } else { 1 }
+                r.up || r.state != 3
+                    || !matches!(r.current_role, 1 | 3)
+                    || (interrupted && r.current_role != 3)
             } else if removal && expected.current_role == 1 {
                 r.up || r.state != 3 || r.current_role != 1
             } else if interrupted {

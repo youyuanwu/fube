@@ -7,7 +7,7 @@ full RA, restart recovery and native interoperability are not qualified.**
 |---|---|
 | Store and execution | [P1 store seam](RaStore.md), [bounded entity/protocol foundation](RaProtocolFoundation.md), commit-before-effects and per-entity serialization. Memory/SQLite contract tests do not enable durable RA restart. |
 | Lifecycle and node coordination | Stateless and volatile stateful Open/Close/Drop/Abort, native FM creation/deletion/reporting, explicit fresh recreation and bounded node-wide coordination. Semantic replies and original physical disposal/accounting remain separate. |
-| Replication and reconfiguration | Real public runtime/data-replicator Open, Idle copy/build, active admission, configured Primary failover, explicit repair and supported removal supersession. [Process profiles](MinimalFmCluster.md) retain separate PC/CC quorum/history obligations and exact incarnation/retry fences. Healthy planned transfer is limited to the two-member profile. |
+| Replication and reconfiguration | Real public runtime/data-replicator Open, Idle copy/build, active admission, configured Primary failover, explicit repair and supported removal supersession. [Process profiles](MinimalFmCluster.md) retain separate PC/CC quorum/history obligations and exact incarnation/retry fences. Minimum-preserving Primary failover is qualified at 3/3 and 4/4; general standalone sizes are next in the [configured-size plan](#configurable-replica-set-sizes-plan). Healthy planned transfer is limited to the two-member profile. |
 | Hosting restoration | Shared Node/Hosting activates an installed-package fresh volatile host for a committed Open's registration lookup after predecessor cleanup. Successful forced cleanup is allowed; diagnostic history is bounded independently of lifetime replacements. Surviving Node/RA/store/Channels are retained; lost runtime/data is not adopted. |
 | Ordinary-FM LFUM | Generic committed inventory, separate PC/IC/CC views and independently owned uploads/retries. Real-process coverage includes stable/build/admission, two live 3/2 Primary failover/repair cycles and repair-Secondary deactivation during held role/upload work. Model/store coverage remains broader. See [current LFUM status](MinimalFmCluster.md#live-session-lfum-upload) and the [alignment plan](#lfum-alignment-plan). |
 | Unsupported recovery/ownership | Nonempty startup reconciliation, full initial ReplicaUp batching/final ACK, durable RA restart, FM/FMM rebuild and FM-service execution remain gated. Broader deployment/upgrade and original C++ handler/interoperability qualification are separate work. |
@@ -511,6 +511,58 @@ commit. Native 900-second close deadlines and 15-second checks terminate only
 captured original hosts, once per monitor; termination is not closure proof.
 Status work keeps native five-second minimum starts, 30-second retries,
 current-sequence acknowledgments and independent history cleanup.
+
+#### Configurable replica-set sizes plan
+
+**S1 is implemented: minimum-preserving Primary failover is qualified at
+3/3 and 4/4. Next, expose the shared configured-size path through standalone
+`fube-node` (S2). S3 and the follow-on transitions remain unimplemented.**
+Configurability means choosing service sizes at creation; live resizing is a
+separate capability. Do not introduce another size-specific execution profile.
+
+Current shared RA/Node/runtime admission accepts general sizes satisfying
+`1 <= minimum <= target <= 64`; 64 is a fube resource bound, not an SF rule.
+This does not make every lifecycle branch generic: standalone ingress and
+package validation require 3/2, shared RA active-replica deletion has a 3/2
+gate, and healthy planned transfer remains limited to 2/1. Configured failover
+retains the down former Primary as a CC Secondary when removal would violate
+minimum. Shared RA distinguishes that ordinary failover from interrupted
+Secondary removal using the committed transition and incoming epoch, not just
+the former Primary's role.
+
+Source baseline: Service Fabric
+`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`:
+
+- `ServiceModel/reliability/failover/ServiceDescription.cpp:249-258` permits
+  positive stateful minimum no greater than target, including equality.
+- `fm/FailoverUnit.cpp:1036-1048` swaps the former Primary to Secondary;
+  `fm/ReconfigurationTask.cpp:325-344` removes down CC members only while
+  CC exceeds minimum. The failed Primary has no unconditional exemption.
+- `ra/FailoverUnitProxy.cpp:1393-1455` checks configured CC size against
+  minimum separately from available PC/CC majority. Minimum is not the number
+  of acknowledgements required for each write.
+- `fm/ReconfigurationTask.cpp:357-418` accounts for Ready Idles during
+  removal/admission and desired target separately from current membership.
+
+| Increment | Scope and dependencies | Completion gate |
+|---|---|---|
+| S1. Minimum-preserving Primary failover (implemented) | Shared RA admits a retained down former Primary without confusing it with Secondary-removal supersession. Test FM swaps Primary/Secondary roles before removing down members only above minimum. RA/FM regressions first failed against the old implementation; removal above minimum and interrupted-removal paths remain covered. | Real 3/3 and 4/4 process cases preserve minimum, retain nonempty data and acknowledge a new majority-backed write after final reconfiguration, including a lost final reply and exact replay. Another Secondary loss cannot acknowledge a new operation. RA tests hold survivor/final commits, reject changed identities/invalid retained state or interruption epochs, preserve LFUM/runtime ownership and replay completion without another Open. |
+| S2. Configurable standalone sizes (second PR; depends on S1) | Require explicit target/minimum in standalone configuration, with shared validation and the existing generic ingress profile. Replace fixed 3/2 package admission with comparison of resolved package sizes to declared service sizes. Generalize active deletion without weakening identity, epoch, incarnation or completion fences. Admit variable original-node counts, report actual sizes and migrate affected callers/tests. | Real processes in both launchers cover initial build/admission, Primary failover, deletion, LFUM/replay and owned shutdown. Use a bounded matrix spanning singleton, even/odd targets, minimum below/above majority and minimum=target. Reject invalid bounds and package/config/native-description mismatches before the corresponding work is admitted. No per-size reliability state machine or claim of 64-process qualification. |
+| S3. Placement and replacement at minimum (depends on S2) | Separate available placement identities from desired target rather than permanently equating node-pool size with target. Port/qualify the required Ready-Idle replacement and combined removal/admission sequence against SF, including original-host fencing and fresh identity/activation. | Restore redundancy at minimum without temporarily lowering minimum or mistaking copy/build completion for active membership. Preserve PC/CC obligations, stale-owner rejection, retained data and independent physical cleanup. Until qualified, original-node-only repair remains explicitly bounded. |
+| Follow-on size-dependent transitions | Migrate remaining named-profile production paths and their tests to shared size/membership invariants as each transition is qualified. General planned transfer, broader test-FM LFUM overlap admission and live service-size updates need their own source-derived gates; S2 does not enable them implicitly. | Fixed sizes may remain test inputs, not general production admission rules. Keep unsupported functionality explicit and preserve native wire contracts. |
+
+Backward compatibility for runner configuration, launcher profile names and
+size-specific aliases/defaults is not required for this work. Update dependent
+callers and tests rather than adding a legacy configuration path. This does
+not relax native SF message or public runtime/data-replicator contracts.
+
+Reliability validation/execution remains in shared RA/Node/Hosting; the FM
+supplies explicit membership intent and launchers own transport/processes.
+Use public runtime/data-replicator contracts for tests, not engine hooks.
+Each increment requires focused shared model/store tests, real-process checks
+for its admitted launchers, formatting/linting and updated current-status docs.
+This plan does not enable dynamic resizing, restart recovery, arbitrary
+multi-loss recovery or native FM/Federation interoperability.
 
 #### LFUM alignment plan
 

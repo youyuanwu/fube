@@ -6391,7 +6391,7 @@ fn failover_configuration(state: &EntityState, candidate: &NodeInstance) -> Conf
     for r in &mut config.replicas.0 {
         r.previous_role = r.current_role;
         if r.current_role == 4 {
-            r.current_role = 1;
+            r.current_role = 3;
             r.state = 3;
             r.up = false;
         } else if &r.node == candidate {
@@ -6399,6 +6399,18 @@ fn failover_configuration(state: &EntityState, candidate: &NodeInstance) -> Conf
         }
         r.first_lsn = -1;
         r.last_lsn = -1;
+    }
+    let mut count = config
+        .replicas
+        .0
+        .iter()
+        .filter(|r| r.current_role >= 3)
+        .count();
+    for r in &mut config.replicas.0 {
+        if !r.up && r.current_role == 3 && count > config.unit.minimum as usize {
+            r.current_role = 1;
+            count -= 1;
+        }
     }
     config
 }
@@ -6879,12 +6891,32 @@ fn failover_progress(
 }
 
 #[tokio::test]
-async fn configured_failover_and_repair_track_every_survivor_and_commit_with_unequal_progress() {
-    for (target, minimum) in [(2, 1), (4, 2), (4, 3), (4, 4), (5, 3), (64, 32)] {
+async fn configured_failover_and_supported_repair_track_every_survivor_and_commit_with_unequal_progress(
+) {
+    for (target, minimum) in [(2, 1), (3, 3), (4, 2), (4, 3), (4, 4), (5, 3), (64, 32)] {
         let (store, executor, hooks) = setup(WAIT).await;
         active_configured_survivor(&executor, target, minimum).await;
         let original = state(&executor);
         let intent = failover_configuration(&original, &admission().local_node);
+        if target == minimum {
+            for invalid in 0..4 {
+                let mut bad = intent.clone();
+                match invalid {
+                    0 => bad.replicas.0[0].instance += 1,
+                    1 => bad.replicas.0[0].up = true,
+                    2 => bad.replicas.0[0].state = 2,
+                    _ => bad.unit.current.configuration += 1,
+                }
+                assert!(executor
+                    .submit(reconfigure(bad))
+                    .unwrap()
+                    .wait(WAIT)
+                    .await
+                    .is_err());
+                assert!(effects(&executor).is_empty());
+                assert_eq!(state(&executor), original);
+            }
+        }
         run(&executor, reconfigure(intent.clone())).await;
         let actions = effects(&executor);
         let frozen_failover =
@@ -6903,7 +6935,7 @@ async fn configured_failover_and_repair_track_every_survivor_and_commit_with_une
             .replicas
             .0
             .iter()
-            .filter(|r| r.current_role == 3)
+            .filter(|r| r.up && r.current_role == 3)
             .enumerate()
         {
             run(
@@ -6936,7 +6968,12 @@ async fn configured_failover_and_repair_track_every_survivor_and_commit_with_une
             .unwrap()
             .service_endpoint = "127.0.0.1:12349".into();
         capture_committed_lfum(&executor, &deactivating, intent.unit.current, true).await;
-        for remote in intent.replicas.0.iter().filter(|r| r.current_role == 3) {
+        for remote in intent
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.up && r.current_role == 3)
+        {
             let ack = Command::DeactivateReply {
                 source: remote.node.clone(),
                 generation: generation_header(admission().generation.generation),
@@ -6966,7 +7003,12 @@ async fn configured_failover_and_repair_track_every_survivor_and_commit_with_une
             ticket.wait(WAIT).await.unwrap();
             actions = effects(&executor);
         }
-        for remote in intent.replicas.0.iter().filter(|r| r.current_role == 3) {
+        for remote in intent
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.up && r.current_role == 3)
+        {
             let mut unit = intent.unit.clone();
             unit.previous = Epoch::default();
             let mut replica = remote.clone();
@@ -6997,10 +7039,22 @@ async fn configured_failover_and_repair_track_every_survivor_and_commit_with_une
         }
         let end = configured(&actions);
         assert_eq!(end.flags, 1);
-        run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
+        let (entered, release) = hooks.pause(false);
+        let ticket = executor
+            .submit(Command::CompleteConfiguration(Box::new(end)))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(effects(&executor).is_empty());
+        assert_eq!(
+            state(&executor).swap.as_ref().unwrap().stage,
+            SwapStage::End
+        );
+        release.send(()).unwrap();
+        ticket.wait(WAIT).await.unwrap();
+        let completed = effects(&executor);
         assert!(
-            matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(r)]
-            if r.replicas.0.len() == target as usize - 1)
+            matches!(completed.as_slice(), [Effect::DoReconfigurationReply(r)]
+            if r.replicas.0.len() == if target == minimum { target as usize } else { target as usize - 1 })
         );
         assert_eq!(state(&executor).body.service, original.body.service);
         assert_eq!(state(&executor).runtime, original.runtime);
@@ -7012,6 +7066,36 @@ async fn configured_failover_and_repair_track_every_survivor_and_commit_with_une
             true,
         )
         .await;
+        if target == minimum {
+            let retained = promoted
+                .swap
+                .as_ref()
+                .unwrap()
+                .body
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.node == peer_source())
+                .unwrap();
+            assert_eq!(retained.current_role, 3);
+            assert!(!retained.up);
+            assert_eq!(
+                retained.id,
+                original
+                    .reconfiguration
+                    .as_ref()
+                    .unwrap()
+                    .request
+                    .replicas
+                    .0[0]
+                    .id
+            );
+            assert_eq!(promoted.usage, original.usage);
+            run(&executor, reconfigure(intent)).await;
+            assert_eq!(effects(&executor), completed);
+            finish(&store, &executor).await;
+            continue;
+        }
         let mut fresh = intent
             .replicas
             .0
