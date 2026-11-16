@@ -606,13 +606,14 @@ reconstruction or writer election.
 | Evidence/profile | Current coverage | Boundary |
 |---|---|---|
 | Shared RA model/store | Generic committed replica-store descriptions and separately committed IC roles; configured repair/removal, planned transfer, candidate redirection and failed RAP/build states. Multi-entity reads, definite/unknown commits, deletion and overlapping upload ownership are tested. | No LFUM lineage/size allowlist or upload-pending control gate. Ordinary runtime/profile admission still applies. This is not complete native handler execution. |
-| Local-cluster live sessions | Stateless/independent volatile singleton rounds; original 3/2 stable membership, FM-owned Idle build, same-Primary admission and two Primary app-host failover/explicit-repair cycles. | Participating build/configuration requests must be committed. Repeated failover rounds freeze the latest completed three-member membership; repair uses its matching completed two-survivor failover. Interrupted repair/removal and candidate redirection are not admitted by this extension. |
-| Standalone real Node binaries | Empty pre-placement upload and the same 3/2 stable/build/admission and two-cycle failover/repair overlaps over real native-shaped Channels. | Fixed three-Node 3/2 deployment; no nonempty startup/rejoin or reconnect. Planned transfer is currently a separate two-member local-cluster runtime profile, not standalone 3/2 support. |
+| Local-cluster live sessions | Stateless/independent volatile singleton rounds; original 3/2 stable membership, FM-owned Idle build, same-Primary admission, two Primary app-host failover/explicit-repair cycles and native deactivation of a repair Secondary with its role callback held. | Participating build/configuration requests must be committed. Repeated rounds freeze the latest completed membership; repair uses its matching completed failover. Deactivation interrupts existing repair, not a new recovery/supersession policy. |
+| Standalone real Node binaries | Empty pre-placement upload and the same 3/2 stable/build/admission, two-cycle failover/repair and repair-Secondary deactivation overlaps over real native-shaped Channels. | Fixed three-Node 3/2 deployment; no nonempty startup/rejoin or reconnect. Planned transfer is currently a separate two-member local-cluster runtime profile, not standalone 3/2 support. |
 | Native evidence | Bidirectional native-stream/schema and source-derived helper evidence in the [protocol oracle](../../tests/ra_protocol/README.md) and [C14 contract](NativeRaProtocol.md). | Full original C++ handler traces and native FM/Federation interoperability remain unqualified; passing process tests is not full SF parity. |
 
 The remaining dependency plan is maintained in
-[RustRaPort.md](RustRaPort.md#lfum-alignment-plan). Interrupted removal/repair is
-the next common-launcher increment. Transfer requires profile-specific runtime
+[RustRaPort.md](RustRaPort.md#lfum-alignment-plan). Copy/build interruption and
+supported removal supersession remain separate increments.
+Transfer requires profile-specific runtime
 and test-FM admission; NodeUp/ReplicaUp discovery and FM/FMM/restart are separate
 protocol/recovery tracks.
 
@@ -635,6 +636,7 @@ Pinned SF revision `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the bounda
 | `ra/ReconfigurationAgent.cpp:2244-2298`; `ra/ServiceTypeRegistrationWrapper.cpp:283-297`; `Hosting2/FabricRuntimeManager.cpp:181-229` | Fresh replica creation admits Open; its service-type lookup demands Hosting activation. Neither a cluster StartNode API nor LFUM completion supplies a replacement host or replica authority. |
 | `ra/NodeUpAckProcessor.cpp:37-154`; `ra/Node.PendingReplicaUploadStateProcessor.cpp:46-168` | Initial discovery is a separate owner-specific node lifecycle: version/activation and per-FT NodeUpAck processing precede readiness and pending-replica upload. Retry/final ReplicaUp state is not LFUM generation completion. |
 | `ra/ReplicaUpMessageBuilder.cpp:21-50`; `ra/ReconfigurationAgent.cpp:3268-3334` | Batch normal/dropped reports and compute IsLast from pending entities. Process both ACK lists before final-upload completion; consume the last flag only while RA remains open and group processing succeeds. This full protocol is still planned in fube. |
+| `ra/Node.NodeDeactivationMessageProcessor.cpp:32-60`; `ra/Node.NodeDeactivationStateProcessor.cpp:15-85` | Native node deactivation closes all owner FTs through the shared node coordinator, not an LFUM callback or a replica-role allowlist. Deactivation reply follows required closure. Fube admits this same deactivation/close/check path for peer-created replicas; it does not grant reactivation/recovery authority. |
 
 #### Upload ownership and authority
 
@@ -721,10 +723,17 @@ The covered invariants are:
 | Read/commit and ownership | Multi-entity ordering, definite/unknown commits, empty/deleted-only maps, same-generation independent uploads and stale/FMM replies. Capacity retains an unadmitted frame without advancing receive while existing correlated replies can still free ownership. Lost-reply retry deadlines are driven explicitly. |
 | Stable/build/admission overlaps (both launchers) | Held/superseding uploads, real public copy/role callbacks, initial configuration before build-upload ACK and exact peer retries afterward. Original owners and acknowledged data survive; completion cannot mutate frozen inventory. |
 | Failover/repair overlaps (both launchers) | Two successive live 3/2 cycles, including promotion of the first repaired replica and repair of the next lost Primary. Query-only survivor PC uses the latest membership/fresh identity, not bootstrap replicas. Held/superseding build and role uploads retain phase metadata; repair configuration and local Secondary completion can precede ACK, but final public IPrimaryReplicator work remains independent. Replays neither reopen survivors nor activate another host. |
+| Interrupted repair Secondary (both launchers) | Native NodeDeactivateRequest during a held public Secondary role callback, after two generations have frozen their inventory. A stale reply retires its own upload while the replica is Closing without advancing send. Current ACK advances send but cannot finish Close, node deactivation or repair configuration, or dispose the held original resources. Releasing the original role allows native Close and its separate deactivation reply; service/provider files prove disposal. Healthy survivors acknowledge a new write, but Primary alone cannot use the interrupted replica's vote after the other survivor is lost. Owned shutdown separately reaps/drains hosts and retains unfinished external work. |
 | Application authority | Nonempty replication after completion, fresh repaired-member quorum after another survivor loss, and local-cluster rejection of a new write with Primary alone. FM-channel loss keeps the owned upload pending without advancing send or treating the surviving app as recovered/shut down. |
 
-Nonempty NodeUp reconciliation, full ReplicaUp batching/final ACK, interrupted
-repair/removal and transfer/redirection process overlaps, FM/FMM rebuild and durable RA
+The interruption case keeps Node/RA/Channels alive while the replica closes;
+it does not qualify accepted inventory jobs through whole-RA shutdown, automatic
+restart of the interrupted repair, or discovery on a recovered owner.
+Native close retry/deactivation-check intervals are unchanged.
+
+Nonempty NodeUp reconciliation, full ReplicaUp batching/final ACK, copy/build
+interruption, removal supersession and transfer/redirection process overlaps,
+FM/FMM rebuild and durable RA
 restart remain unqualified. Broader ordinary reconfiguration/restoration tests
 do not imply LFUM overlap qualification for those journeys.
 

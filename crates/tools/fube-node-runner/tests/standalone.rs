@@ -257,6 +257,8 @@ struct FmFixture {
     held_build: Option<AddReplicaReply>,
     hold_configuration: bool,
     held_configuration: Option<ConfigurationReply>,
+    deactivation_requests: [Option<i64>; 3],
+    deactivation_replies: [Option<i64>; 3],
     initial_membership: Option<Configuration>,
     initial_builds: Option<Vec<AddReplica>>,
     failover: Option<Configuration>,
@@ -319,6 +321,8 @@ impl FmFixture {
             held_build: None,
             hold_configuration: false,
             held_configuration: None,
+            deactivation_requests: [None; 3],
+            deactivation_replies: [None; 3],
             initial_membership: None,
             initial_builds: None,
             failover: None,
@@ -362,6 +366,12 @@ impl FmFixture {
             wire::predecode(&incoming.message).unwrap();
             let generation = self.configurations[index].generation().unwrap();
             match incoming.message.properties().unwrap().action.as_str() {
+                "NodeDeactivateReply" => {
+                    let (reply, owner) = decode_node_deactivate_reply(&incoming.message).unwrap();
+                    assert_eq!(owner, Owner::Fm);
+                    assert_eq!(Some(reply.sequence), self.deactivation_requests[index]);
+                    self.deactivation_replies[index] = Some(reply.sequence);
+                }
                 "LFUMUpload" => {
                     let body = decode_lfum_upload(&incoming.message).unwrap();
                     assert_eq!(body.generation, generation.number);
@@ -746,7 +756,17 @@ impl FmFixture {
     }
 
     async fn until(&mut self, fixture: &mut Fixture, condition: impl Fn(&Self) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(8);
+        self.until_with_budget(fixture, Duration::from_secs(8), condition)
+            .await;
+    }
+
+    async fn until_with_budget(
+        &mut self,
+        fixture: &mut Fixture,
+        budget: Duration,
+        condition: impl Fn(&Self) -> bool,
+    ) {
+        let deadline = Instant::now() + budget;
         while !condition(self) {
             assert!(
                 Instant::now() < deadline,
@@ -872,6 +892,11 @@ async fn standalone_repeated_failover_and_repair_lfum_preserves_latest_membershi
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_repair_deactivation_keeps_lfum_close_and_configuration_completion_separate() {
+    journey(Fault::DeactivatedRepairGenerationHandshake).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_restores_a_fresh_original_replica_before_repeated_primary_failover() {
     journey(Fault::Restore).await;
 }
@@ -957,6 +982,7 @@ enum Fault {
     FailoverGenerationHandshake,
     RepairGenerationHandshake,
     RepeatedRepairGenerationHandshake,
+    DeactivatedRepairGenerationHandshake,
 }
 
 async fn start_rollover(fm: &mut FmFixture) {
@@ -1010,6 +1036,14 @@ async fn admitting_rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
 }
 
 async fn hold_superseding_rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
+    hold_superseding_rollover_with_deactivation(fm, fixture, None).await;
+}
+
+async fn hold_superseding_rollover_with_deactivation(
+    fm: &mut FmFixture,
+    fixture: &mut Fixture,
+    deactivate: Option<usize>,
+) {
     let before: Vec<_> = (0..3).map(|index| fixture.status(index)).collect();
     fm.hold_uploads = true;
     start_rollover(fm).await;
@@ -1025,6 +1059,25 @@ async fn hold_superseding_rollover(fm: &mut FmFixture, fixture: &mut Fixture) {
             before.as_ref().unwrap().units,
             after.as_ref().unwrap().units
         );
+    }
+    if let Some(index) = deactivate {
+        let request = NodeActivationRequest {
+            sequence: 1,
+            from_fmm: false,
+        };
+        fm.deactivation_requests[index] = Some(request.sequence);
+        let generation = fm.configurations[index].generation().unwrap();
+        fm.send(
+            index,
+            node_deactivate_request_message(&request, &generation).unwrap(),
+        )
+        .await;
+        until_node(fm, fixture, index, |status| {
+            status["replica_phase"] == "Closing"
+        })
+        .await;
+        assert_eq!(fixture.status(index)["generations"]["pending_uploads"], 2);
+        assert_eq!(fm.deactivation_replies[index], None);
     }
     for (index, mut incoming) in old {
         let body = decode_lfum_upload(&incoming.message).unwrap();
@@ -1305,6 +1358,11 @@ async fn until_node(
     }
 }
 
+enum RepairLfumOutcome {
+    Completed(ConfigurationReply),
+    Deactivated,
+}
+
 async fn repair_with_lfum(
     fm: &mut FmFixture,
     fixture: &mut Fixture,
@@ -1312,7 +1370,8 @@ async fn repair_with_lfum(
     primary_index: usize,
     previous: &ConfigurationReply,
     predecessor: &AddInstance,
-) -> ConfigurationReply {
+    deactivate: bool,
+) -> RepairLfumOutcome {
     let owners: Vec<_> = (0..3).map(|i| fixture.status(i)).collect();
     let mut generation = fm.configurations[primary_index].generation().unwrap();
     fm.send(
@@ -1501,7 +1560,8 @@ async fn repair_with_lfum(
             && status["local_configuration_complete"] == true
     })
     .await;
-    hold_superseding_rollover(fm, fixture).await;
+    hold_superseding_rollover_with_deactivation(fm, fixture, deactivate.then_some(destination))
+        .await;
     let frozen = fm.uploaded.clone();
     assert_eq!(
         frozen[primary_index].as_ref().unwrap().units.0[0].intermediate,
@@ -1511,6 +1571,101 @@ async fn repair_with_lfum(
         frozen[destination].as_ref().unwrap().units.0[0].intermediate,
         Epoch::default()
     );
+    if deactivate {
+        for resource in ["local-instance.resource", "local-provider.resource"] {
+            assert!(
+                secondary_work.join(resource).exists(),
+                "held role still owns {resource}"
+            );
+        }
+        assert_eq!(fixture.status(destination)["replica_phase"], "Closing");
+        assert_eq!(fm.deactivation_replies[destination], None);
+        acknowledge_rollover(fm, fixture).await;
+        assert_eq!(fixture.status(destination)["replica_phase"], "Closing");
+        assert_eq!(fm.deactivation_replies[destination], None);
+        assert_eq!(fm.configured.len(), completed_before);
+        assert_eq!(fm.uploaded, frozen);
+        assert!(!secondary_work.join("local-secondary-role.release").exists());
+        for resource in ["local-instance.resource", "local-provider.resource"] {
+            assert!(
+                secondary_work.join(resource).exists(),
+                "LFUM ACK cannot dispose {resource}"
+            );
+        }
+        let endpoint = &previous
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.current_role == 4)
+            .unwrap()
+            .service_endpoint;
+        assert!(application(endpoint, "write-more")
+            .await
+            .contains("committed=2 value=continued"));
+        fs::write(
+            secondary_work.join("local-secondary-role.release"),
+            b"finish original role so native Close can drain",
+        )
+        .unwrap();
+        fm.until_with_budget(fixture, Duration::from_secs(40), |fm| {
+            fm.deactivation_replies[destination].is_some()
+        })
+        .await;
+        until_node(fm, fixture, destination, |status| {
+            status["replica_phase"] == "Closed"
+        })
+        .await;
+        for resource in ["local-instance.resource", "local-provider.resource"] {
+            assert!(
+                !secondary_work.join(resource).exists(),
+                "native Close must dispose {resource}"
+            );
+        }
+        assert_eq!(fm.configured.len(), completed_before);
+        assert!(!primary_work
+            .join("local-current-configuration.held")
+            .exists());
+        assert_eq!(
+            fixture.status(destination)["host_replacement_count"],
+            replacement_count + 1
+        );
+        assert!(
+            PathBuf::from(fresh["runtime_root"].as_str().unwrap()).exists(),
+            "replica Close is not app-host retirement"
+        );
+        for index in [primary_index, survivor] {
+            assert_eq!(
+                fixture.status(index)["application_pid"],
+                owners[index]["application_pid"]
+            );
+            assert_eq!(
+                fixture.status(index)["runtime_root"],
+                owners[index]["runtime_root"]
+            );
+            assert_eq!(fixture.status(index)["control_unknown"], false);
+        }
+        let pid = fixture.status(survivor)["application_pid"]
+            .as_u64()
+            .unwrap();
+        assert!(Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success());
+        fm.until(fixture, |fm| fm.losses.contains(&survivor)).await;
+        if let Ok(reply) = tokio::time::timeout(
+            Duration::from_millis(250),
+            application(endpoint, "write-final"),
+        )
+        .await
+        {
+            assert!(
+                !reply.starts_with("OK"),
+                "Primary alone cannot use the interrupted replica's vote"
+            );
+        }
+        return RepairLfumOutcome::Deactivated;
+    }
     fs::write(
         secondary_work.join("local-secondary-role.release"),
         b"finish Secondary before LFUM ACK",
@@ -1591,7 +1746,7 @@ async fn repair_with_lfum(
     fm.repair_previous = None;
     fm.repair_build = None;
     fm.repair_membership = None;
-    repaired
+    RepairLfumOutcome::Completed(repaired)
 }
 
 async fn journey(fault: Fault) {
@@ -1878,6 +2033,7 @@ async fn journey(fault: Fault) {
             | Fault::FailoverGenerationHandshake
             | Fault::RepairGenerationHandshake
             | Fault::RepeatedRepairGenerationHandshake
+            | Fault::DeactivatedRepairGenerationHandshake
     ) {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -2010,12 +2166,14 @@ async fn journey(fault: Fault) {
         assert!(application(&new_primary.service_endpoint, "read")
             .await
             .contains("value=acknowledged"));
-        assert!(application(&new_primary.service_endpoint, "write-more")
-            .await
-            .starts_with("OK"));
-        assert!(application(&new_primary.service_endpoint, "read")
-            .await
-            .contains("value=continued"));
+        if fault != Fault::DeactivatedRepairGenerationHandshake {
+            assert!(application(&new_primary.service_endpoint, "write-more")
+                .await
+                .starts_with("OK"));
+            assert!(application(&new_primary.service_endpoint, "read")
+                .await
+                .contains("value=continued"));
+        }
         assert!(
             TcpStream::connect(&endpoint).await.is_err(),
             "lost Primary listener cannot survive"
@@ -2043,17 +2201,43 @@ async fn journey(fault: Fault) {
         }
         if matches!(
             fault,
-            Fault::RepairGenerationHandshake | Fault::RepeatedRepairGenerationHandshake
+            Fault::RepairGenerationHandshake
+                | Fault::RepeatedRepairGenerationHandshake
+                | Fault::DeactivatedRepairGenerationHandshake
         ) {
-            let mut repaired = repair_with_lfum(
+            let mut repaired = match repair_with_lfum(
                 &mut fm,
                 &mut fixture,
                 selected,
                 candidate,
                 &promoted,
                 &deletion_bodies[selected],
+                fault == Fault::DeactivatedRepairGenerationHandshake,
             )
-            .await;
+            .await
+            {
+                RepairLfumOutcome::Completed(repaired) => repaired,
+                RepairLfumOutcome::Deactivated => {
+                    let replies = fm.configured.len();
+                    fm.stopping = true;
+                    for index in 0..3 {
+                        fixture.stop_node(&mut fm, index).await;
+                    }
+                    assert_eq!(
+                        fm.configured.len(),
+                        replies,
+                        "owned shutdown cannot complete interrupted repair"
+                    );
+                    assert!(
+                        fixture.status(candidate)["cleanup"]["pending_work"]
+                            .as_u64()
+                            .unwrap()
+                            > 0
+                    );
+                    fixture.finish([true; 3]);
+                    return;
+                }
+            };
             generation = fm.configurations[candidate].generation().unwrap();
             pids[selected] = fixture.status(selected)["application_pid"].clone();
             let mut repaired_primary = candidate;
@@ -2174,15 +2358,20 @@ async fn journey(fault: Fault) {
                     )
                     .unwrap();
                 }
-                repaired = repair_with_lfum(
+                let RepairLfumOutcome::Completed(completed) = repair_with_lfum(
                     &mut fm,
                     &mut fixture,
                     candidate,
                     selected,
                     &promoted,
                     &predecessor,
+                    false,
                 )
-                .await;
+                .await
+                else {
+                    panic!("repeated repair unexpectedly deactivated");
+                };
+                repaired = completed;
                 pids[candidate] = fixture.status(candidate)["application_pid"].clone();
                 repaired_primary = selected;
                 generation = fm.configurations[selected].generation().unwrap();
@@ -2435,6 +2624,7 @@ async fn journey(fault: Fault) {
             | Fault::FailoverGenerationHandshake
             | Fault::RepairGenerationHandshake
             | Fault::RepeatedRepairGenerationHandshake
+            | Fault::DeactivatedRepairGenerationHandshake
     );
     if refusal {
         if fault == Fault::LostFm {
@@ -2489,7 +2679,8 @@ async fn journey(fault: Fault) {
             | Fault::BuildingGenerationHandshake
             | Fault::FailoverGenerationHandshake
             | Fault::RepairGenerationHandshake
-            | Fault::RepeatedRepairGenerationHandshake => unreachable!(),
+            | Fault::RepeatedRepairGenerationHandshake
+            | Fault::DeactivatedRepairGenerationHandshake => unreachable!(),
         };
         assert!(
             fixture.status(selected)["error"]

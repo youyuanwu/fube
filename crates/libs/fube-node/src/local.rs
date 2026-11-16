@@ -726,7 +726,10 @@ impl Node {
             && self.ra.peer().is_some()
             && matches!(
                 work,
-                FmWork::CaptureTypeStatus
+                FmWork::NodeDeactivate(..)
+                    | FmWork::CheckNodeDeactivation(..)
+                    | FmWork::CloseNodeUnit(..)
+                    | FmWork::CaptureTypeStatus
                     | FmWork::CleanupTypeStatus
                     | FmWork::TypeStatusReply(..)
                     | FmWork::ServiceTypeReply(..)
