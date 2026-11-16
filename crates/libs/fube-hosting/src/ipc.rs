@@ -1529,10 +1529,7 @@ fn deadline_needs_state(shared: &Shared, entry: &Arc<Entry>) -> TransportResult<
         return Err(TransportError::Closed);
     }
     let due = entry.registration_deadline.load(Ordering::SeqCst);
-    if due == 0 || (shared.ticks() as u64) < due {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(due != 0 && (shared.ticks() as u64) >= due)
 }
 fn deadline_locked(shared: &Shared, entry: &Arc<Entry>, state: &mut State) -> TransportResult<()> {
     if !deadline_needs_state(shared, entry)? {
