@@ -4666,8 +4666,8 @@ async fn secondary_repair_blocks_at_minimum_without_quorum_and_after_another_los
                 c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 1)).await;
             let old = cluster.ledger.placements[1].body()?;
             let primary = cluster.ledger.placements[0].profile.clone().unwrap();
-            for i in 1..=losses {
-                let pid = cluster.ledger.placements[i].profile.as_ref().unwrap().app_pid;
+            for placement in &cluster.ledger.placements[1..=losses] {
+                let pid = placement.profile.as_ref().unwrap().app_pid;
                 assert!(std::process::Command::new("kill").args(["-KILL",&pid.to_string()]).status().map_err(err)?.success());
             }
             until(&mut cluster, |c| (1..=losses).all(|i| c.ledger.placements[i].loss_reported
@@ -6743,8 +6743,8 @@ async fn real_lfum_during_idle_build_preserves_sf_inventory_copy_and_original_ow
     cluster.start().await.unwrap();
     let mut barriers = vec![];
     let result = peer_idle_catch(async {
-        for index in 1..3 {
-            let profile = cluster.children[index].metadata.as_ref().unwrap().profile.as_ref().unwrap();
+        for child in &cluster.children[1..3] {
+            let profile = child.metadata.as_ref().unwrap().profile.as_ref().unwrap();
             let work = profile.runtime_root.join("deployment/HostingLocalStatefulApp_App1/work");
             fs::write(work.join("local-copy.block"), b"hold actual copy").map_err(err)?;
             barriers.push(work);
@@ -6861,8 +6861,8 @@ async fn real_lfum_during_secondary_admission_preserves_sf_inventory_and_origina
         for destination in [2, 3] { cluster.add_idle_replica_on(destination).await?; }
         until(&mut cluster, |c| c.ledger.idle_status()["ready"] == true).await;
         let owners = cluster.status();
-        for index in 1..3 {
-            let profile = cluster.children[index].metadata.as_ref().unwrap().profile.as_ref().unwrap();
+        for child in &cluster.children[1..3] {
+            let profile = child.metadata.as_ref().unwrap().profile.as_ref().unwrap();
             let work = profile.runtime_root.join("deployment/HostingLocalStatefulApp_App1/work");
             fs::write(work.join("local-secondary-role.block"), b"hold role").map_err(err)?;
             barriers.push(work);
@@ -6930,8 +6930,8 @@ async fn real_lfum_during_secondary_admission_preserves_sf_inventory_and_origina
         let reply = hold_peer_loss_frame(&mut cluster, 0, "DoReconfigurationReply", Duration::from_secs(8)).await?;
         assert_eq!(decode_do_reconfiguration_reply(&reply).map_err(err)?.0,
             *cluster.ledger.configuration.as_ref().unwrap().reply.as_ref().unwrap());
-        for index in 1..3 {
-            let pid = cluster.ledger.placements[index].profile.as_ref().unwrap().app_pid;
+        for placement in &cluster.ledger.placements[1..3] {
+            let pid = placement.profile.as_ref().unwrap().app_pid;
             assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()])
                 .status().map_err(err)?.success());
         }

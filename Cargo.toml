@@ -32,7 +32,6 @@ fube-client = { path = "./crates/libs/fube-client" }
 fube-runtime = { path = "./crates/libs/fube-runtime" }
 fube-rap-test-support = { path = "./crates/libs/fube-rap-test-support" }
 fube-data = { path = "./crates/libs/fube-data" }
-fube-txn = { path = "./crates/libs/fube-txn" }
 mssf-core = "0.10"
 mssf-util = "0.10"
 uuid = { version = "1", features = ["v4"] }
