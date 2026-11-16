@@ -6502,15 +6502,20 @@ async fn lfum_overlapping_updates_keep_independent_retries_and_resume_backpressu
 
 #[tokio::test]
 async fn real_lfum_during_primary_repair_activates_fresh_host_and_preserves_quorum() {
-    primary_repair_lfum(1).await;
+    primary_repair_lfum(1, false).await;
 }
 
 #[tokio::test]
 async fn real_lfum_during_repeated_primary_failover_and_repair_preserves_latest_membership_and_quorum() {
-    primary_repair_lfum(2).await;
+    primary_repair_lfum(2, false).await;
 }
 
-async fn primary_repair_lfum(cycles: usize) {
+#[tokio::test]
+async fn real_lfum_during_repair_deactivation_keeps_upload_close_and_configuration_completion_separate() {
+    primary_repair_lfum(1, true).await;
+}
+
+async fn primary_repair_lfum(cycles: usize, deactivate: bool) {
     let fixture = Fixture::new("repair-lfum");
     let mut config = fixture.config();
     config.profile = ServiceProfile::Stateful { target: 3, minimum: 2 };
@@ -6597,13 +6602,71 @@ async fn primary_repair_lfum(cycles: usize) {
         cluster.send_configuration(&request).await?;
         until(&mut cluster, |c| secondary_work.join("local-secondary-role.held").exists()
             && c.status()["nodes"][primary]["retained_work"]["local_replica"]["configuration"]["stage"] == "Activate").await;
-        let activating = hold_superseding_lfum(&mut cluster).await?;
+        let activating = hold_superseding_lfum_with_deactivation(
+            &mut cluster, deactivate.then_some(destination),
+        ).await?;
         let frozen = activating.iter().map(|incoming| decode_lfum_upload(&incoming.message))
             .collect::<std::result::Result<Vec<_>, _>>().map_err(err)?;
         assert_eq!(frozen[primary].units.0[0].unit, request.configuration.unit);
         assert_eq!(frozen[primary].units.0[0].intermediate, request.configuration.unit.current);
         assert_eq!(frozen[destination].units.0[0].unit, request.configuration.unit);
         assert_eq!(frozen[destination].units.0[0].intermediate, Epoch::default());
+        if deactivate {
+            for resource in ["local-instance.resource", "local-provider.resource"] {
+                assert!(secondary_work.join(resource).exists(), "held role still owns {resource}");
+            }
+            let local = cluster.status()["nodes"][destination]["retained_work"]["local_replica"].clone();
+            assert_eq!(local["phase"], "Closing");
+            assert!(local["registration"].is_object());
+            for (index, incoming) in activating.into_iter().enumerate() {
+                assert_eq!(decode_lfum_upload(&incoming.message).map_err(err)?, frozen[index]);
+                cluster.receive_message(index, incoming).await?;
+            }
+            until(&mut cluster, |c| !c.ledger.generation_pending()
+                && c.status()["nodes"].as_array().unwrap().iter().all(|n|
+                    n["retained_work"]["generations"]["upload_pending"] == false)).await;
+            assert_eq!(cluster.status()["nodes"][destination]["retained_work"]["local_replica"]["phase"], "Closing");
+            assert_eq!(cluster.ledger.repair_status()["ready"], false);
+            assert_eq!(cluster.ledger.repair_status()["host_ready"], true);
+            assert!(!releases[release_start].exists());
+            for resource in ["local-instance.resource", "local-provider.resource"] {
+                assert!(secondary_work.join(resource).exists(), "LFUM ACK cannot dispose {resource}");
+            }
+            assert!(data_contact(&promoted, b"write-more\n").contains("committed=2 value=continued"));
+            fs::write(&releases[release_start], b"finish original role so native Close can drain").map_err(err)?;
+            let reply = hold_peer_loss_frame(&mut cluster, destination, "NodeDeactivateReply", Duration::from_secs(40)).await?;
+            let (reply, owner) = decode_node_deactivate_reply(&reply).map_err(err)?;
+            assert_eq!(owner, Owner::Fm);
+            assert_eq!(reply.sequence,
+                cluster.ledger.placements[destination].activation_sequence + 1);
+            until(&mut cluster, |c| c.status()["nodes"][destination]["retained_work"]["local_replica"]["phase"] == "Closed"
+                && c.status()["nodes"][destination]["retained_work"]["local_replica"]["retained_usage"] == 0).await;
+            for resource in ["local-instance.resource", "local-provider.resource"] {
+                assert!(!secondary_work.join(resource).exists(), "native Close must dispose {resource}");
+            }
+            assert_eq!(cluster.ledger.repair_status()["ready"], false);
+            assert!(!primary_work.join("local-current-configuration.held").exists());
+            assert_eq!(cluster.ledger.placements[destination].profile.as_ref(), Some(&fresh));
+            assert!(fresh.runtime_root.exists(), "replica Close is not app-host retirement");
+            for index in [primary, survivor] {
+                for field in ["node_pid", "app_pid", "runtime_root"] {
+                    assert_eq!(cluster.status()["nodes"][index][field], owners["nodes"][index][field]);
+                }
+            }
+            let pid = cluster.ledger.placements[survivor].profile.as_ref().unwrap().app_pid;
+            assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+            until(&mut cluster, |c| c.ledger.placements[survivor].loss_reported).await;
+            let mut pending = TcpStream::connect(&promoted).map_err(err)?;
+            pending.set_read_timeout(Some(Duration::from_millis(250))).map_err(err)?;
+            pending.write_all(b"write-final\n").map_err(err)?;
+            let mut bytes = [0; 1024];
+            match pending.read(&mut bytes) {
+                Ok(size) => assert!(!std::str::from_utf8(&bytes[..size]).map_err(err)?.starts_with("OK")),
+                Err(error) => assert!(matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+            }
+            assert_eq!(cluster.status()["nodes"][primary]["retained_work"]["app_observation"]["primary_last_acknowledged"], 2);
+            return Ok(());
+        }
         fs::write(&releases[release_start], b"finish Secondary role before LFUM ACK").map_err(err)?;
         until(&mut cluster, |c| c.status()["nodes"][destination]["retained_work"]["local_replica"]["configuration"]["stage"] == "Complete").await;
         assert_eq!(cluster.status()["nodes"][destination]["retained_work"]["generations"]["upload_pending"], true);
@@ -6660,22 +6723,41 @@ async fn primary_repair_lfum(cycles: usize) {
     for path in &releases {
         if path.parent().is_some_and(Path::exists) { fs::write(path, b"release repair").unwrap(); }
     }
-    if !matches!(&result, Ok(Ok(()))) { eprintln!("REPAIR_LFUM_STATUS {}", cluster.status()); }
+    if !matches!(&result, Ok(Ok(()))) {
+        eprintln!("REPAIR_LFUM_STATUS {}", cluster.status());
+        for child in &cluster.children { eprintln!("REPAIR_LFUM_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+    }
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
     result.unwrap().unwrap();
 }
 
 async fn hold_superseding_lfum(cluster: &mut Cluster) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
+    hold_superseding_lfum_with_deactivation(cluster, None).await
+}
+
+async fn hold_superseding_lfum_with_deactivation(
+    cluster: &mut Cluster,
+    deactivate: Option<usize>,
+) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
     let before = cluster.status();
     cluster.begin_generation_handshake()?;
-    for _ in 0..2 { for index in 0..3 { cluster.retry_generation(index).await?; } }
+    send_generation_updates(cluster).await?;
     let old = hold_lfum_uploads(cluster).await?;
     let frozen = old.iter().map(|incoming| decode_lfum_upload(&incoming.message))
         .collect::<std::result::Result<Vec<_>, _>>().map_err(err)?;
     cluster.ledger.generation.as_mut().unwrap().reject(&frozen[0].generation)?;
-    for _ in 0..2 { for index in 0..3 { cluster.retry_generation(index).await?; } }
+    send_generation_updates(cluster).await?;
     let current = hold_lfum_uploads(cluster).await?;
+    if let Some(index) = deactivate {
+        let link = cluster.children[index].link.as_ref().unwrap();
+        link.send(node_deactivate_request_message(&NodeActivationRequest {
+            sequence: cluster.ledger.placements[index].activation_sequence + 1,
+            from_fmm: false,
+        }, &link.generation()).map_err(err)?).await?;
+        until(cluster, |c| c.status()["nodes"][index]["retained_work"]["local_replica"]["phase"] == "Closing").await;
+        assert_eq!(cluster.status()["nodes"][index]["retained_work"]["generations"]["pending_uploads"], 2);
+    }
     for (index, mut incoming) in old.into_iter().enumerate() {
         assert_eq!(decode_lfum_upload(&current[index].message).map_err(err)?.units, frozen[index].units);
         incoming.reply.take().ok_or("missing repair LFUM reply")?.reply(
@@ -6698,6 +6780,21 @@ async fn hold_superseding_lfum(cluster: &mut Cluster) -> Result<Vec<IncomingMess
         assert_eq!(after["nodes"][index]["retained_work"]["generations"]["upload_pending"], true);
     }
     Ok(current)
+}
+
+async fn send_generation_updates(cluster: &mut Cluster) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        for index in 0..cluster.children.len() { cluster.retry_generation(index).await?; }
+        let round = cluster.ledger.generation.as_ref().ok_or("missing LFUM generation round")?;
+        if round.phase == fm::GenerationPhase::AwaitingUpload && round.updates_sent.iter().all(|sent| *sent) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("LFUM generation proposal/update deadline: {}", cluster.status()));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 #[tokio::test]

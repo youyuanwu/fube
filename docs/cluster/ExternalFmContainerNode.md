@@ -369,30 +369,40 @@ and 32 local command/effect observation slots.
 Real-process generation rollover is qualified for empty pre-placement inventory,
 original 3/2 stable membership, FM-owned Idle build, same-Primary admission,
 and two successive Primary app-host failover/explicit-repair cycles, including
-promotion of a repaired replica. Participating build/configuration requests
-must be committed. This is live-session metadata reconciliation, not startup
+promotion of a repaired replica. Native node deactivation also interrupts the
+fresh repair Secondary while its public role callback and superseding uploads
+are held. Participating build/configuration requests must be committed.
+This is live-session metadata reconciliation, not startup
 recovery or a production FM rebuild.
 
 Shared RA projects generic committed replica-store and independent PC/IC/CC
 state, clears reported LSNs and follows SF current/previous-Primary rules.
 Every accepted update owns fresh reads and an independent frozen upload/retry;
 a stale reply retires only its original request, and only a reply equal to
-current receive advances send generation. There is no upload-pending control
-gate: admitted build/configuration and local Secondary completion can progress
+current receive advances send generation. During replica Closing, stale/current
+upload completion cannot finish Close, node deactivation or repair configuration.
+There is no upload-pending control gate: admitted build/configuration and
+local Secondary completion can progress
 before ACK. LFUM cannot finish final RAP work, grant quorum authority or activate
 a host. Fresh repair activation instead follows the committed Open lookup and
 predecessor cleanup in shared Node/Hosting.
 
 The [current LFUM contract and evidence](MinimalFmCluster.md#live-session-lfum-upload)
 is shared with the local cluster. The [alignment plan](RustRaPort.md#lfum-alignment-plan)
-prioritizes interrupted removal/repair overlaps. Each repeated failover round
-uses the latest completed membership and known fresh replica identities, not
-the original configuration. Shared model/store coverage of
-transfer/redirection does not enable standalone planned transfer: that runtime
+tracks remaining copy/build interruption and removal supersession.
+Each repeated failover round uses the latest completed membership and known
+fresh replica identities, not the original configuration. Shared model/store
+coverage of transfer/redirection does not enable standalone planned transfer: that runtime
 path is currently two-member only, while this profile is fixed 3/2.
 Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,
 FM/FMM rebuild and restart remain gated; native handler/interoperability evidence
 remains incomplete.
+
+The deactivated repair remains incomplete; ordinary owned shutdown separately
+drains/reaps its host and records pending external work. Healthy survivors keep
+their owners and actual quorum; after another survivor is lost, Primary alone
+cannot use the interrupted replica's vote. This keeps the original Node/RA
+owner alive during replica Close, not restart/recovery or whole-RA-close parity.
 
 ## Failure behavior and limits
 
