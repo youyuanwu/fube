@@ -137,6 +137,15 @@ ReplicaEndpointUpdated/Reply is not completion. Process tests replay lost final
 replies for each transfer, fence stale earlier intent and the old writer,
 commit a fresh application write after every transfer, retain owners/data and require the unchanged
 Secondary's real vote after the old Primary closes. A separate 3/2 case
+qualifies one app-host crash after completed healthy handoff, for either first
+candidate and each of the three lost roles. New-Primary loss uses native
+failover; Secondary loss keeps the current Primary. Explicit FM removal/build/
+admission restores a fresh volatile replica on the same original Node after
+verified predecessor cleanup, then another handoff uses that fresh identity.
+Original Node/RA and surviving app owners stay unchanged, old requests/Delete
+cannot affect successors, and quorum/no-quorum plus owned shutdown are checked.
+Crashes during unfinished handoff, other post-handoff sizes and persisted
+Reopen remain outside this qualification. Another separate 3/2 case
 withholds a live Node's progress, then exercises SF's force-Deactivate volatile
 Close/drop path and final native reply replay. A dropped member retains its
 CC identity but supplies no vote; it is not rebuilt in that handoff.

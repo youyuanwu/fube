@@ -2092,8 +2092,9 @@ check the exact current role/source/epoch, including on the legacy two-member pa
 Original-process tests copy nonempty state, lose/replay the final reply, verify
 old-writer rejection and new-Primary ACKs continuing on the demoted member,
 retain original owners and one Open each, and confirm new-Primary host
-loss cannot reactivate the old writer. New-Primary down reporting makes transfer
-observation unknown. A pending 3/2 Secondary report withdraws that member but
+loss cannot reactivate the old writer. The legacy 2/1 profile leaves new-Primary
+loss unknown; fixed 3/2 recovery after completed handoff is qualified below.
+A pending 3/2 Secondary report withdraws that member but
 cannot publish the Primary or supply replacement, election or quorum fallback.
 
 Standalone real-process cases qualify 2/1 and both possible 3/2 candidates
@@ -2111,6 +2112,52 @@ acknowledging. Both launchers replay final completion, reject old-writer
 writes and retain immutable sizes/data and original process/runtime owners.
 An external FM must publish the new Primary only after the successful native
 DoReconfigurationReply, not merely after a continuation or endpoint message.
+
+#### Application crash after completed planned handoff
+
+Both launchers qualify a completed healthy 3/2 handoff to either original
+Secondary, followed by one application-host crash on any of the three Nodes.
+Loss of the new Primary starts ordinary no-data-loss failover. Loss of the
+former Primary or unchanged Secondary uses same-Primary removal. Explicit
+repair then copies/builds a fresh volatile replica on that same original Node
+and restores 3/2; no spare pool or persisted Reopen is involved.
+
+Shared RA derives failover roles, identities, replication endpoints and epochs
+from the latest completed configuration or swap, not the older reconfiguration
+record. Query-only survivors use the same baseline. An interrupted Secondary
+removal still retains its original PC/history obligations, including when a
+local Secondary completed before FM observed the final reply. Closed-replica
+recreation validates the current Primary/history against the latest completed
+membership without fabricating peer-creation lineage for the original Primary.
+
+The test FM treats a successful handoff as historical completion, not a
+permanent failover veto or a pending operation invalidated by a later app crash.
+Earlier transition receipts remain retained for stale-message fencing.
+Unfinished/unknown handoffs, lost Node ownership and insufficient quorum do not
+authorize this recovery. Native RA progress/history, survivor commits, final
+RAP completion and the matching new-Primary FM reply remain independent gates.
+
+Real-process cases preserve nonempty acknowledged writes, hold/replay native
+completion, restore fresh identities, and hand off again to the rebuilt member.
+Earlier handoff/repair replies and predecessor Delete requests cannot affect
+the new transition or successor. Surviving app owners and all original
+Node/RA/store/peer sessions remain unchanged. The exact predecessor is reaped,
+its process group drained and its Hosting root removed before fresh-host use;
+that physical proof is the local ownership profile, not a native wire ACK.
+Another Secondary loss permits a genuine quorum write; losing both prevents
+a fresh ACK. Normal teardown joins cleanup for predecessor and successor.
+
+| Pinned SF source | Recovery responsibility |
+|---|---|
+| `fm/ReconfigurationTask.cpp:176-344` | Choose from the current configuration under PC/CC quorum obligations; a completed swap is not a permanent failover exemption. |
+| `ra/FailoverUnit.cpp:1355-1446,1850-1907` | Initialize a later reconfiguration from its new epoch/current roles; same-epoch completion remains replayable. |
+| `fm/FailoverUnit.cpp:718-739`; `fm/Replica.cpp:555-585` | Permit reuse of a dropped placement with newer identity and cleared endpoints. Same-Node placement is this bounded profile, not a universal SF placement requirement. |
+| `ra/ReconfigurationAgent.cpp:3750-3776` | Distinguish volatile Drop from persisted Restart; application-crash recovery must not reopen an empty volatile replica as recovered data. |
+
+This qualifies sequential fixed-3/2 recovery after completed healthy handoff,
+not crashes during handoff, arbitrary multi-loss recovery, automatic failback,
+other post-handoff sizes or concurrent generation/LFUM overlaps. Persisted
+application storage and durable RA/Node/FM restart remain separate capabilities.
 
 #### Volatile Secondary restart and explicit rebuild
 
@@ -2151,7 +2198,7 @@ This enables sequential healthy transfers at the qualified sizes, not arbitrary
 reconfiguration recovery. Concurrent supersession or transfer-generation/LFUM
 overlaps, persisted Secondary restart, same-handoff volatile rebuild,
 restart-required recovery at other sizes, aborted-swap recovery, loss-driven
-failover, changed membership/endpoints outside this promotion, data loss,
+recovery outside the completed healthy 3/2 profile above, data loss,
 FMM, reconnect and restart remain gated. Native source-stream evidence covers
 163 bidirectional cases, 83 types/251 fields, 167 bundle files and 47 actual
 native truncation rejections. Original C++ handler traces and native

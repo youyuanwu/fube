@@ -6,28 +6,36 @@ pub(super) fn lost_replica_replacement(
     source: &NodeInstance,
     history: &ReplicaDeactivationInfo,
 ) -> bool {
-    let secondary = !old.fm_primary
-        && old
-            .peer_creation
-            .as_ref()
-            .is_some_and(|p| p.host_down && p.delete_operation != 0 && p.deactivation == *history)
-        && old.reconfiguration.as_ref().is_some_and(|c| {
-            c.stage == ConfigurationStage::Complete
-                && c.request
-                    .replicas
-                    .0
-                    .iter()
-                    .any(|r| r.node == *source && r.current_role == 4)
-                && c.request
-                    .replicas
+    let completed = reconfiguration::completed_configuration(old);
+    let active = old
+        .reconfiguration
+        .as_ref()
+        .filter(|_| reconfiguration::replica_replacement_metadata(old))
+        .map(|c| &c.request)
+        .filter(|c| completed.is_none_or(|latest| !c.unit.current.older_than(latest.unit.current)))
+        .or(completed);
+    let secondary = (old.peer_creation.as_ref().is_some_and(|p| {
+        p.host_down
+            && p.delete_operation != 0
+            && (p.deactivation == *history
+                || old.primary_deactivation == Some((history.epoch, history.catchup_lsn)))
+    }) || (old.fm_primary
+        && completed_primary_change(old)
+        && old.primary_deactivation == Some((Epoch::default(), -2))
+        && active.is_some_and(|c| c.unit.current == history.epoch)))
+        && active.is_some_and(|c| {
+            c.replicas
+                .0
+                .iter()
+                .any(|r| r.node == *source && r.current_role == 4)
+                && c.replicas
                     .0
                     .iter()
                     .any(|r| r.node == old.body.replica.node && r.current_role == 3)
         });
     let promoted = reconfiguration::replica_replacement_metadata(old)
-        && old.reconfiguration.as_ref().is_some_and(|c| {
-            c.request
-                .replicas
+        && active.is_some_and(|c| {
+            c.replicas
                 .0
                 .iter()
                 .any(|r| r.node == *source && r.current_role == 3)
@@ -57,11 +65,14 @@ pub(super) fn lost_replica_replacement(
         && old.runtime.is_none()
         && old.usage.is_none()
         && old.registration_lookups.is_empty()
+        && old
+            .swap
+            .as_ref()
+            .is_none_or(|s| s.stage == SwapStage::Complete)
         && reconfiguration::replica_replacement_metadata(old)
-        && old.reconfiguration.as_ref().is_some_and(|c| {
-            c.request.unit.target >= 2
-                && c.request
-                    .replicas
+        && active.is_some_and(|c| {
+            c.unit.target >= 2
+                && c.replicas
                     .0
                     .iter()
                     .any(|r| r.node == *source && r.current_role == if secondary { 4 } else { 3 })

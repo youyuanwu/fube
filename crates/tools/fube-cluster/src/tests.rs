@@ -1857,6 +1857,52 @@ fn configured_planned_transfer_preserves_remaining_secondary_and_exact_completio
 }
 
 #[test]
+fn post_handoff_primary_failover_uses_completed_swap_and_retains_earlier_receipts() {
+    for destination in [1, 2] {
+        for blocked in 0..5 {
+            let mut ledger = configured_ledger(3, 2);
+            let request = ledger.request_primary_transfer_to(destination, Instant::now()).unwrap();
+            let mut reply = ConfigurationReply {
+                unit: request.configuration.unit.clone(), replicas: request.configuration.replicas.clone(), error: 0,
+            };
+            reply.unit.previous = Epoch::default();
+            for r in &mut reply.replicas.0 {
+                r.previous_role = 1; r.first_lsn = 1; r.last_lsn = 8;
+                r.service_endpoint = if r.current_role == 4 { "127.0.0.1:23456".into() } else { String::new() };
+            }
+            if blocked == 2 { ledger.lost(0, "handoff ownership became unknown before completion".into()); }
+            if blocked != 1 {
+                ledger.configuration_reply(destination, reply.clone()).unwrap();
+            }
+            if blocked == 3 {
+                let other = 3 - destination;
+                ledger.report(other, &stateful_loss_report(&ledger.placements[other])).unwrap();
+            }
+            if blocked == 4 { ledger.lost(0, "original Node ownership lost".into()); }
+            ledger.report(destination, &stateful_loss_report(&ledger.placements[destination])).unwrap();
+            let intent = ledger.start_primary_failover(Instant::now()).unwrap();
+            if blocked != 0 {
+                assert!(intent.is_none(), "blocked post-handoff failover case {blocked}");
+                continue;
+            }
+            let intent = intent.expect("completed handoff permits a fresh failover");
+            assert_eq!(intent.configuration.unit.previous, reply.unit.current);
+            assert_eq!(intent.configuration.unit.current.configuration, reply.unit.current.configuration + 0x1_0000_0001);
+            assert_eq!(ledger.failed_primary_index(), Some(destination));
+            for old in &reply.replicas.0 {
+                let actual = intent.configuration.replicas.0.iter().find(|r| r.node == old.node).unwrap();
+                assert_eq!((actual.id, actual.instance, actual.previous_role), (old.id, old.instance, old.current_role));
+                assert_eq!(actual.replication_endpoint, old.replication_endpoint);
+            }
+            let pending = ledger.status();
+            ledger.configuration_reply(destination, reply).unwrap();
+            assert_eq!(ledger.status(), pending);
+            assert!(ledger.start_primary_failover(Instant::now()).unwrap().is_none());
+        }
+    }
+}
+
+#[test]
 fn repeated_planned_transfers_fence_old_completions_and_use_each_latest_primary() {
     for (target, minimum) in [(2, 1), (3, 2)] {
         let mut ledger = configured_ledger(target, minimum);
@@ -6312,6 +6358,140 @@ async fn planned_handoff_drops_unresponsive_volatile_secondary_then_explicitly_r
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
     result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn post_handoff_app_crash_repairs_same_node_then_transfers_with_fresh_membership() {
+    for candidate in [1, 2] {
+        for lost in 0..3 {
+            let fixture = Fixture::new("post-handoff-recovery");
+            let mut config = fixture.config();
+            config.profile = ServiceProfile::Stateful { target: 3, minimum: 2 };
+            config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+            let mut cluster = Cluster::new(config).unwrap();
+            cluster.start().await.unwrap();
+            let result = peer_idle_catch(async {
+                cluster.execute(command("primary", "create", Some(1))).await?;
+                until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+                let original_endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+                until(&mut cluster, |_| data_contact(&original_endpoint, b"read\n").starts_with("OK ")).await;
+                assert!(data_contact(&original_endpoint, b"write\n").contains("committed=1"));
+                cluster.transfer_primary_to(candidate as u8 + 1).await?;
+                until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+                let endpoint = cluster.ledger.placements[candidate].endpoint.clone().unwrap();
+                assert!(data_contact(&endpoint, b"write 2\n").contains("committed=2"));
+                until(&mut cluster, |c| (0..3).filter(|i| *i != candidate).all(|i|
+                    c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 2)).await;
+                let planned = cluster.ledger.swap.as_ref().unwrap().clone();
+                let predecessor = cluster.ledger.placements[lost].body()?;
+                let profiles = cluster.ledger.placements.iter().map(|p| p.profile.clone().unwrap()).collect::<Vec<_>>();
+                let node_pids = cluster.status()["nodes"].as_array().unwrap().iter().map(|n| n["node_pid"].clone()).collect::<Vec<_>>();
+                assert!(std::process::Command::new("kill").args(["-KILL", &profiles[lost].app_pid.to_string()])
+                    .status().map_err(err)?.success());
+                if lost == candidate {
+                    let primary = (0..3).find(|i| *i != lost).unwrap();
+                    let held = hold_peer_loss_frame(&mut cluster, primary, "DoReconfigurationReply", Duration::from_secs(20)).await?;
+                    let (reply, _) = decode_do_reconfiguration_reply(&held).map_err(err)?;
+                    assert_eq!(cluster.ledger.configuration_status()["ready"], false);
+                    cluster.ledger.configuration_reply(candidate, planned.reply.as_ref().unwrap().clone())?;
+                    assert_eq!(cluster.ledger.configuration_status()["ready"], false);
+                    let request = cluster.ledger.swap.as_ref().unwrap().body.clone();
+                    assert_eq!(request.configuration.unit.previous, planned.reply.as_ref().unwrap().unit.current);
+                    cluster.send_configuration(&request).await?;
+                    until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+                    assert_eq!(cluster.ledger.swap.as_ref().unwrap().reply.as_ref(), Some(&reply));
+                }
+                until(&mut cluster, |c| c.ledger.placements[lost].loss_reported
+                    && c.ledger.placements[lost].status()["native_replica_deleted"] == true).await;
+                let primary = cluster.ledger.primary_index();
+                let endpoint = cluster.ledger.placements[primary].endpoint.clone().unwrap();
+                assert!(data_contact(&endpoint, b"read\n").contains("committed=2"));
+                if lost == candidate { cluster.repair_primary_replica().await?; }
+                else { cluster.repair_secondary_replica(lost as u8 + 1).await?; }
+                let held = hold_peer_loss_frame(&mut cluster, primary, "AddReplicaReply", Duration::from_secs(25)).await?;
+                let (built, _) = decode_add_replica_reply(&held).map_err(err)?;
+                assert_eq!(cluster.ledger.repair_status()["built"], false);
+                let retry = cluster.ledger.idle_retry(primary, Instant::now() + Duration::from_secs(11))
+                    .ok_or("missing post-handoff build retry")?;
+                cluster.send_idle(&retry).await?;
+                let held = hold_peer_loss_frame(&mut cluster, primary, "DoReconfigurationReply", Duration::from_secs(20)).await?;
+                let (repaired, _) = decode_do_reconfiguration_reply(&held).map_err(err)?;
+                assert_eq!(cluster.ledger.repair.as_ref().unwrap().build.reply.as_ref(), Some(&built));
+                assert_eq!(cluster.ledger.repair_status()["ready"], false);
+                cluster.ledger.configuration_reply(candidate, planned.reply.as_ref().unwrap().clone())?;
+                assert_eq!(cluster.ledger.repair_status()["ready"], false);
+                let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11))
+                    .ok_or("missing post-handoff repair retry")?;
+                cluster.send_configuration(&retry).await?;
+                until(&mut cluster, |c| c.ledger.repair_status()["ready"] == true).await;
+                assert_eq!(cluster.ledger.repair.as_ref().unwrap().configuration.as_ref().unwrap().reply.as_ref(), Some(&repaired));
+                assert_eq!((repaired.unit.target, repaired.unit.minimum, repaired.replicas.0.len()), (3, 2, 3));
+                let fresh = cluster.ledger.placements[lost].profile.as_ref().unwrap();
+                assert_ne!(fresh.app_pid, profiles[lost].app_pid);
+                assert_ne!(fresh.runtime_root, profiles[lost].runtime_root);
+                assert!(!profiles[lost].runtime_root.exists());
+                assert!(!Path::new(&format!("/proc/{}", profiles[lost].app_pid)).exists());
+                assert!(cluster.ledger.placements[lost].replica > predecessor.replica.id);
+                assert!(cluster.ledger.placements[lost].incarnation > predecessor.replica.instance);
+                for (i, profile) in profiles.iter().enumerate().filter(|(i, _)| *i != lost) {
+                    assert_eq!(cluster.ledger.placements[i].profile.as_ref(), Some(profile));
+                }
+                assert!(data_contact(&endpoint, b"write 3\n").contains("committed=3"));
+                let old_link = cluster.children[0].link.as_ref().unwrap();
+                old_link.send(do_reconfiguration_message(&planned.body, &old_link.generation()).map_err(err)?).await?;
+                let link = cluster.children[lost].link.as_ref().unwrap();
+                link.send(delete_replica_message(&DeleteReplica::new(predecessor.clone(), false), &link.generation()).map_err(err)?).await?;
+                cluster.transfer_primary_to(lost as u8 + 1).await?;
+                let held = hold_peer_loss_frame(&mut cluster, lost, "DoReconfigurationReply", Duration::from_secs(20)).await?;
+                let (completed, _) = decode_do_reconfiguration_reply(&held).map_err(err)?;
+                assert!(data_contact(&endpoint, b"write 4\n").contains("NotPrimary"));
+                cluster.ledger.configuration_reply(primary, repaired.clone())?;
+                cluster.ledger.configuration_reply(candidate, planned.reply.as_ref().unwrap().clone())?;
+                assert_eq!(cluster.ledger.configuration_status()["ready"], false);
+                let request = cluster.ledger.swap.as_ref().unwrap().body.clone();
+                assert!(request.configuration.replicas.0.iter().any(|r| r.node == predecessor.replica.node
+                    && r.id > predecessor.replica.id && r.instance > predecessor.replica.instance && r.current_role == 4));
+                cluster.send_configuration(&request).await?;
+                until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+                assert_eq!(cluster.ledger.swap.as_ref().unwrap().reply.as_ref(), Some(&completed));
+                let endpoint = cluster.ledger.placements[lost].endpoint.clone().unwrap();
+                assert!(data_contact(&endpoint, b"read\n").contains("committed=3"));
+                assert!(data_contact(&endpoint, b"write 4\n").contains("committed=4"));
+                for (i, pid) in node_pids.iter().enumerate() {
+                    assert_eq!(cluster.status()["nodes"][i]["node_pid"], *pid);
+                    assert_eq!(cluster.status()["nodes"][i]["retained_work"]["app_observation"]["opens"], 1);
+                    assert_eq!(cluster.status()["nodes"][i]["retained_work"]["peer_command_error"], Value::Null);
+                }
+                let secondaries = (0..3).filter(|i| *i != lost).collect::<Vec<_>>();
+                for (round, secondary) in secondaries.into_iter().enumerate() {
+                    let pid = cluster.ledger.placements[secondary].profile.as_ref().unwrap().app_pid;
+                    assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+                    until(&mut cluster, |c| c.ledger.placements[secondary].loss_reported).await;
+                    if round == 0 {
+                        assert!(data_contact(&endpoint, b"write 5\n").contains("committed=5"));
+                    } else {
+                        let mut pending = TcpStream::connect(&endpoint).map_err(err)?;
+                        pending.set_read_timeout(Some(Duration::from_millis(250))).map_err(err)?;
+                        pending.write_all(b"write 6\n").map_err(err)?;
+                        until(&mut cluster, |c| c.status()["nodes"][lost]["retained_work"]["app_observation"]["primary_last_admitted"] == 6).await;
+                        let mut bytes = [0; 1024];
+                        assert!(matches!(pending.read(&mut bytes), Err(ref e) if matches!(e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)));
+                        assert_eq!(cluster.status()["nodes"][lost]["retained_work"]["app_observation"]["primary_last_acknowledged"], 5);
+                    }
+                }
+                Ok::<(), String>(())
+            }).await;
+            if !matches!(&result, Ok(Ok(()))) {
+                eprintln!("POST_HANDOFF_CASE candidate={candidate} lost={lost}");
+                eprintln!("POST_HANDOFF_STATUS {}", cluster.status());
+                for child in &cluster.children { eprintln!("POST_HANDOFF_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+            }
+            let cleanup = cluster.shutdown().await;
+            assert_eq!(cleanup["clean"], true, "{cleanup}");
+            result.unwrap().unwrap();
+        }
+    }
 }
 
 #[tokio::test]
