@@ -1341,7 +1341,7 @@ impl Cluster {
         Ok(self.ledger.configuration_status())
     }
     pub async fn transfer_primary(&mut self) -> Result<Value> {
-        if self.finished.is_some() || self.children.len() != 2 {
+        if self.finished.is_some() || self.children.len() != self.ledger.placements.len() {
             return Err("Primary transfer requires the original running cluster".into());
         }
         let body = self.ledger.request_primary_transfer(Instant::now())?;

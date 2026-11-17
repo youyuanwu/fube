@@ -88,7 +88,9 @@ path could accept is rejected by the immutable profile's actual ingress.
 
 This initial slice deliberately waits for all original build destinations and
 admits them together. The failover extension below adds loss-driven promotion.
-Incremental/partial admission, resize, generic planned transfer,
+One [healthy planned transfer](#healthy-planned-primary-transfer) is now
+qualified at 2/1 and 3/2 without changing service sizes.
+Incremental/partial admission, resize, general planned transfer,
 healthy Secondary retirement, whole-node/FM restart and persisted recovery remain
 unsupported for this new profile. The older named profiles remain separate
 qualification fixtures with their existing behavior; their bounded lifecycle
@@ -690,7 +692,7 @@ reconstruction or writer election.
 |---|---|---|
 | Shared RA model/store | Generic committed replica-store descriptions and separately committed IC roles; configured repair/removal, planned transfer, candidate redirection and failed RAP/build states. Multi-entity reads, definite/unknown commits, deletion and overlapping upload ownership are tested. | No LFUM lineage/size allowlist or upload-pending control gate. Ordinary runtime/profile admission still applies. This is not complete native handler execution. |
 | Local-cluster live sessions | Stateless/independent volatile singleton rounds and stable configured membership across 1/1, 2/1, 3/2, 3/3, 4/2, 4/3, 4/4 and 5/3. Additional 3/2 cases cover FM-owned Idle build, same-Primary admission, two Primary app-host failover/explicit-repair cycles and native deactivation of a repair Secondary with its role callback held. | Participating build/configuration requests must be committed. Repeated rounds freeze the latest completed membership; repair uses its matching completed failover. Deactivation interrupts existing repair, not a new recovery/supersession policy. |
-| Standalone real Node binaries | Empty pre-placement and stable configured membership across 1/1, 2/1, 3/3, 4/2, 4/3, 4/4 and 5/3. Additional 3/2 build/admission, two-cycle failover/repair and repair-Secondary deactivation overlaps use real native-shaped Channels. | Immutable explicit sizes and original placements; no nonempty startup/rejoin or reconnect. Configurability does not qualify every overlap; planned transfer retains its separate healthy two-member runtime qualification. |
+| Standalone real Node binaries | Empty pre-placement and stable configured membership across 1/1, 2/1, 3/3, 4/2, 4/3, 4/4 and 5/3. Additional 3/2 build/admission, two-cycle failover/repair and repair-Secondary deactivation overlaps use real native-shaped Channels. | Immutable explicit sizes and original placements; no nonempty startup/rejoin or reconnect. Healthy planned transfer is separately qualified at 2/1 and 3/2, not its generation/LFUM overlaps. |
 | Native evidence | Bidirectional native-stream/schema and source-derived helper evidence in the [protocol oracle](../../tests/ra_protocol/README.md) and [C14 contract](NativeRaProtocol.md). | Full original C++ handler traces and native FM/Federation interoperability remain unqualified; passing process tests is not full SF parity. |
 
 The remaining dependency plan is maintained in
@@ -866,7 +868,8 @@ cases for DoReconfiguration, Activate and DoReconfigurationReply: 172
 bidirectional cases, 84 types/255 fields, 176 bundle files and 52 actual native
 truncation rejections. These are native-stream/schema-adapter and native-free
 process results, not full original-handler or FM/Federation interoperability.
-Three-member planned transfer, retirement/replacement, superseding configurations,
+Three-member planned transfer is qualified [below](#healthy-planned-primary-transfer).
+Retirement/replacement, superseding configurations,
 generation/peer inventories, node/FM-loss failover, data loss, reconnect and restart remain
 explicitly gated. A failed native build remains failed/to-be-dropped with
 cleanup required; this profile does not invent successful repair or replacement.
@@ -2023,12 +2026,13 @@ unqualified.
 
 ### Healthy planned Primary transfer
 
-After completed two-member active admission (including the supported fresh
-Secondary), `Cluster::transfer_primary()` explicitly transfers Primary from
-original node 1 to node 2. Both original admitted sessions and replicas must be
+After completed healthy 2/1 or 3/2 active admission,
+`Cluster::transfer_primary()` explicitly transfers Primary from original node 1
+to node 2. The legacy 2/1 profile also permits its supported fresh Secondary.
+All original admitted sessions and replicas must be
 healthy, with no pending build/removal/deletion, node/service work or generation
 upload. The request keeps the service, membership and replica incarnations,
-sets P/S and S/P and increments the configuration version by `0x100000001`
+sets P/S and S/P (plus unchanged S/S at 3/2) and increments the configuration version by `0x100000001`
 without changing data-loss version. The FM withdraws its old endpoint while
 transfer is pending; withdrawal alone is not proof of runtime write revocation.
 
@@ -2038,9 +2042,10 @@ Pinned SF source `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the flow:
 |---|---|
 | `fm/FailoverUnit.cpp:878-895`; `ra/ReconfigurationState.cpp:76-119`; `ra/FailoverUnit.cpp:1754-1779` | Explicit healthy SwapPrimary starts at the old Primary in phase 0, not direct promotion or a local role setter. Real RAP configuration/catch-up revokes writes, catches up the candidate and changes the old service/replicator to Secondary. |
 | `ra/FailoverUnit.cpp:736-782,2926-2950,3497-3540` | Matching successful demotion and its commit precede peer DoReconfiguration with retained non-Max phase-0 duration. A duplicate FM request replays that continuation, never an old-Primary success reply. |
-| `ra/FailoverUnit.cpp:628-703,2204-2299`; `ra/ReconfigurationAgent.cpp:2425-2507` | Candidate phase 1 uses real local RAP UpdateEpochAndGetStatus and native peer GetLSN/Reply. GetLSNReply inherits ReplicaReplyMessageBody and adds nested deactivation information. This bounded profile requires initialized matched progress on both original members; other histories stop rather than inventing election, repair or data loss. |
-| `ra/FailoverUnit.cpp:736-818,3063-3124`; `common/FailoverConfig.h:387` | Candidate promotion/catch-up uses full two-member PC and CC. The native default PC=CC optimization skips phase-3 Deactivate; it does not reuse the S/N retirement/Close path. |
-| `ra/FailoverUnit.cpp:2703-2873,3164-3272,3376-3415,3487-3496` | Peer Activate updates the demoted member without another Open/build. Exact ActivateReply precedes final RAP EndReconfiguration and commit before the new Primary's native DoReconfigurationReply. Stable completion clears previous epoch/roles. |
+| `ra/FailoverUnit.cpp:628-703,1964-2155,2204-2299,3014-3078`; `ra/ReconfigurationAgent.cpp:2425-2507` | Candidate phase 1 uses real local RAP UpdateEpochAndGetStatus and native peer GetLSN/Reply. Bound the wait for up replicas, retain separate PC/CC read quorums, then select by deactivation history and highest eligible LSN. Equal LSNs are not required. Swap retains its forwarded candidate and skips failover-only catch-up-capability redirection; contradictory candidate history rejects without inventing election or data loss. |
+| `ra/FailoverUnit.cpp:736-818,3063-3124`; `common/FailoverConfig.h:387` | Candidate promotion/catch-up uses complete unchanged PC and CC membership at 2/1 or 3/2. The native default PC=CC optimization skips phase-3 Deactivate; it does not reuse the S/N retirement/Close path. |
+| `ra/ReconfigurationAgent.cpp:2810-2848`; `ra/FailoverUnit.cpp:959-999,2703-2873,3164-3272,3376-3415,3487-3496` | Peer Activate updates every Secondary without another Open/build. An unchanged S/S member commits stable activation metadata and ACKs without RAP, including with a missing/pending GetLSN callback. The old Primary is already Secondary after phase 0 and also needs no second RAP role transition. Every exact ActivateReply and its metadata commit precede final RAP EndReconfiguration/commit and the new Primary's native DoReconfigurationReply. Stable completion clears previous epoch/roles. |
+| `ra/FailoverUnit.cpp:2271-2354` | SF marks non-responding, unknown-progress or uncatchable up/Ready CC members for restart/rebuild after selection. Fube's planned path does not implement that recovery contract and explicitly rejects successful catch-up completion before activation if it would be required. Timed selection is not evidence that an unqueried member is caught up or that activation repairs it. |
 | `ra/FailoverUnit.cpp:3590-3630,4597-4624,5701-5710`; `ra/EndpointPublishState.cpp:47-145`; `common/FailoverConfig.h:486` | Original-runtime ProxyReplicaEndpointUpdated is ACKed, but only matching active promotion updates the committed endpoint. The existing helper owns the native 30-second early-publication timeout and exact FM ACK. Final reconfiguration completion publishes the new Primary address; an endpoint update/ACK alone does not complete the transfer. |
 
 Poll `configuration` for `kind=planned_primary_transfer` and `ready=true`.
@@ -2059,17 +2064,31 @@ The old listener remains contactable but rejects writes through the real public
 partition/replicator authority checks. No engine-specific mutation or
 qualification-only execution hook supplies progress, role change or success.
 
-Model/store tests cover failed demotion, both progress results, exact native FM
-completion, retained retries, endpoint timeout/publication, definite commit
-veto/uncertainty and demotion/endpoint/final-reply commit barriers.
+Model/store tests cover failed demotion, timed read quorum, unequal progress,
+history-first selection, no failover-only redirection, exact native FM
+completion, retained retries and endpoint timeout/publication. Unchanged
+Secondary activation with absent/pending/completed GetLSN waits only for its
+metadata commit; definite veto/unknown commit and late status results cannot
+publish an early ACK. Demotion/endpoint/final-reply commits remain independent.
+Missing or uncatchable progress explicitly gates restart-required completion.
 Original-process tests copy nonempty state, lose/replay the final reply, verify
 old-writer rejection and new-Primary ACKs continuing on the demoted member,
-retain both original owners and one Open each, and confirm new-Primary host
+retain original owners and one Open each, and confirm new-Primary host
 loss cannot reactivate the old writer. Native down reporting makes transfer
 observation unknown; it supplies no replacement, election or quorum fallback.
 
+Standalone real-process cases qualify 2/1 and both possible 3/2 candidates
+through mesh ingress and the same RA/Node/Hosting execution. The 3/2 cases
+close the old Primary and commit a fresh write using the unchanged Secondary's
+actual vote; closing that Secondary then prevents a new operation from
+acknowledging. Both launchers replay final completion, reject old-writer
+writes and retain immutable sizes/data and original process/runtime owners.
+An external FM must publish the new Primary only after the successful native
+DoReconfigurationReply, not merely after a continuation or endpoint message.
+
 This enables one explicit healthy transfer only. Reverse/second transfer,
-concurrent supersession, mismatched progress, aborted-swap recovery, loss-driven
+transfer after repair/generation rounds in the local test FM, concurrent
+supersession, native Secondary restart/rebuild, aborted-swap recovery, loss-driven
 failover, changed membership/endpoints outside this promotion, data loss,
 FMM, reconnect and restart remain gated. Native source-stream evidence covers
 163 bidirectional cases, 83 types/251 fields, 167 bundle files and 47 actual
