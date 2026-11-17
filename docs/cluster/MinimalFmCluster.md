@@ -360,10 +360,30 @@ applied commit, reject premature/changed-owner requests and exercise store veto.
 FM tests reject used/unspecified/unprocessed destinations and fence additional
 losses during build/readmission.
 
+Two sequential cycles are qualified in both launchers on target-plus-two
+pools at 3/3, 4/4, 3/2, 4/2, 4/3 and 5/3. The next loss can affect the current
+Primary, another original Secondary or the first replacement. The FM archives
+the preceding completed repair and selects the latest completed membership.
+An exact processed predecessor already removed by a completed spare cycle
+remains historical loss, not a new loss or serving member. Unprocessed/new
+losses, changed owners, unfinished configurations and control uncertainty
+cannot bypass admission or final completion.
+
+Shared RA retains completed removal requests for replay, but ordinary later
+failover builds PC from the completed CC. A Secondary's local completion alone
+does not prove the Primary/FM finished: an explicit interrupted-removal PC
+still follows its original epoch/history and commit barriers. Shared Node
+passes bound, unchanged-service stale remote intent to RA for native stale
+handling even when the new Primary never built that old destination.
+Each cycle preserves real copy, lost-reply replay, old-request/reply fencing,
+survivor ownership and independent cleanup. Final quorum/no-quorum writes
+require the second spare's vote; no cached write result substitutes for quorum.
+
 The pool remains bounded to 64 known Nodes; process evidence is not
-64-process/native-Federation interoperability. Repeated spare cycles, automatic
-placement, dynamic joining, arbitrary multi-loss repair and generation-upload
-overlaps during spare repair are not enabled.
+64-process/native-Federation interoperability. More than two cycles are not
+process-qualified. Automatic placement, dynamic joining, old-placement reuse,
+arbitrary multi-loss repair and generation-upload overlaps during spare repair
+are not enabled.
 
 ## Primary loss during Secondary removal
 

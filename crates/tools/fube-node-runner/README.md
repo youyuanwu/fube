@@ -324,8 +324,16 @@ actual quorum vote after enough original Secondaries are lost. Additional
 3/2, 4/2, 4/3 and 5/3 cases qualify restoration from target-minus-one membership
 after Primary failover, with the same copy, replay and owner guarantees.
 Losing the spare then prevents a fresh write. Predecessor cleanup remains independently owned.
-This does not qualify dynamic joins, automatic placement, repeated spare
-cycles or generation-upload overlaps during spare repair.
+Two sequential replacements are qualified on target-plus-two static pools at
+3/3, 4/4, 3/2, 4/2, 4/3 and 5/3, including another Primary loss, an original
+Secondary loss and loss of the first replacement. Each new intent starts from
+the latest completed membership and awaits the exact new predecessor's processed
+deletion. Old requests cannot rebuild or reintroduce removed owners; every
+surviving host/runtime stays unchanged. Lost build/final replies replay in each
+cycle, and the final quorum/no-quorum check uses the second spare's real vote.
+More than two cycles are not process-qualified. Dynamic joins, automatic
+placement, old-placement reuse and generation-upload overlaps during spare
+repair remain outside this qualification.
 
 ### Original-node replica restoration
 
