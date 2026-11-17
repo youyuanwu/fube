@@ -190,7 +190,7 @@ Only one missing member is admitted; failover with additional unavailable
 Secondaries does not authorize partial or multi-loss repair.
 When minimum requires the failed Primary to remain a down CC Secondary, this
 missing-member repair path is not admitted. Use explicit
-[preconfigured-spare replacement](#preconfigured-spare-replacement-at-minimum);
+[preconfigured-spare restoration](#preconfigured-spare-restoration);
 neither minimum nor current membership is lowered to enable repair.
 
 The same physical predecessor boundary described in
@@ -321,7 +321,7 @@ Federation interoperability. Multi-loss repair, automatic
 restart, broader interrupted-transition recovery, resize and node/FM restart remain
 deferred. The 64 bound is model/resource qualification, not 64-process testing.
 
-## Preconfigured spare replacement at minimum
+## Preconfigured spare restoration
 
 `Cluster::replace_replica_on(node)` explicitly chooses an unused placement in
 the static pool; standalone uses the same native AddReplica/Open/copy contracts.
@@ -341,12 +341,21 @@ commits, final RAP EndReconfiguration and the FM reply are independent barriers.
 Neither target/minimum nor service version changes; old runtime adoption and
 fabricated votes remain forbidden.
 
+When ordinary failover already removed the lost Primary above minimum, the
+local FM identifies its exact predecessor from the completed transition, not
+only the final reply's surviving membership. Its processed deletion is still
+required. One Ready Idle then restores target from target-minus-one membership;
+PC contains only those survivors, and the removed owner is not reintroduced.
+This reuses shared RA's existing unchanged-size admission, not a new
+launcher-specific reliability path.
+
 Both launchers qualify 3/3 and 4/4 after either Primary or Secondary app-host
 loss with one spare. Evidence includes stable member/empty-spare LFUM,
 nonempty copy, lost build/final replies and exact replay, original survivor
-owners, separate physical cleanup and an actual write after another original
-Secondary loss. That write needs the replacement's vote; losing the spare
-prevents the next fresh write. RA tests preserve PC/CC, frozen LFUM and each
+owners and separate physical cleanup. Additional 3/2, 4/2, 4/3 and 5/3 cases
+qualify below-target restoration after Primary failover with the same evidence.
+An actual write after enough original Secondary losses needs the replacement's
+vote; losing the spare prevents the next fresh write. RA tests preserve PC/CC, frozen LFUM and each
 applied commit, reject premature/changed-owner requests and exercise store veto.
 FM tests reject used/unspecified/unprocessed destinations and fence additional
 losses during build/readmission.

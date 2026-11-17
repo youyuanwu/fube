@@ -438,8 +438,11 @@ known pool. Explicit spare replacement at minimum is qualified at 3/3 and 4/4
 after Primary or Secondary app-host loss: build the fresh Idle through normal
 native contracts, then combine down-Secondary removal and Ready-Idle admission.
 Keep the old member in PC and await final configuration completion; minimum
-never changes and copy completion alone grants no vote. See the
-[runner contract](../../crates/tools/fube-node-runner/README.md#explicit-spare-replacement-at-minimum).
+never changes and copy completion alone grants no vote. Additional 3/2, 4/2,
+4/3 and 5/3 cases restore target after completed Primary failover already
+removed the down owner: retain only the surviving PC and admit the Ready Idle.
+See the
+[runner contract](../../crates/tools/fube-node-runner/README.md#explicit-spare-restoration).
 Dynamic joining, automatic placement, repeated spare cycles and spare-repair
 generation-upload overlaps remain outside that qualification.
 It does not provide persisted state, elections, a production
