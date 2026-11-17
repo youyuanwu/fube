@@ -11607,8 +11607,10 @@ async fn planned_swap_uses_timed_read_quorums_and_history_without_failover_redir
         "delayed",
         "older-history",
         "catchup-capability",
+        "unknown",
+        "unknown-no-quorum",
     ] {
-        let (store, executor, _) = setup(WAIT).await;
+        let (store, executor, hooks) = setup(WAIT).await;
         active_configured_survivor(&executor, 3, 2).await;
         let original = state(&executor);
         let mut intent = original.reconfiguration.as_ref().unwrap().request.clone();
@@ -11649,7 +11651,7 @@ async fn planned_swap_uses_timed_read_quorums_and_history_without_failover_redir
             .unwrap()
             .deactivation
             .clone();
-        if case != "no-quorum" {
+        if !matches!(case, "no-quorum" | "unknown-no-quorum") {
             run(
                 &executor,
                 failover_progress(&intent, &intent.replicas.0[0], history.clone(), last),
@@ -11663,7 +11665,27 @@ async fn planned_swap_uses_timed_read_quorums_and_history_without_failover_redir
                 .iter()
                 .any(|e| matches!(e, Effect::UpdateConfiguration { .. })));
         }
-        if matches!(case, "older-history" | "catchup-capability") {
+        if matches!(case, "unknown" | "unknown-no-quorum") {
+            run(
+                &executor,
+                Command::GetLsnReply {
+                    source: intent.replicas.0[2].node.clone(),
+                    generation: generation_header(admission().generation.generation),
+                    body: Box::new(GetLsnReply {
+                        replica: AddInstanceReply {
+                            unit: intent.unit.clone(),
+                            replica: intent.replicas.0[2].clone(),
+                            error: 0x8007_1cf0_u32 as i32 as i64,
+                        },
+                        deactivation: ReplicaDeactivationInfo {
+                            epoch: Epoch::default(),
+                            catchup_lsn: -2,
+                        },
+                    }),
+                },
+            )
+            .await;
+        } else if matches!(case, "older-history" | "catchup-capability") {
             let mut remote_history = history;
             let remote_last = if case == "older-history" {
                 remote_history.epoch.configuration -= 0x1_0000_0000;
@@ -11687,7 +11709,7 @@ async fn planned_swap_uses_timed_read_quorums_and_history_without_failover_redir
             .await;
         }
         let actions = effects(&executor);
-        if case == "no-quorum" {
+        if matches!(case, "no-quorum" | "unknown-no-quorum") {
             assert_eq!(
                 state(&executor).swap.as_ref().unwrap().stage,
                 SwapStage::GetLsn
@@ -11701,25 +11723,361 @@ async fn planned_swap_uses_timed_read_quorums_and_history_without_failover_redir
             assert_eq!(catchup.local.node, admission().local_node);
             assert_eq!(catchup.local.last_lsn, last);
             assert!(state(&executor).swap.as_ref().unwrap().change.is_none());
-            if matches!(case, "delayed" | "catchup-capability") {
+            if matches!(case, "delayed" | "catchup-capability" | "unknown") {
+                assert!(actions.iter().any(|e| matches!(e,
+                    Effect::PeerDeactivate { body, .. } if body.force
+                        && body.deactivation == ReplicaDeactivationInfo::default())));
                 catchup.local.service_endpoint = "127.0.0.1:23456".into();
+                run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
+                let retry = effects(&executor);
+                assert!(retry.iter().any(|e| matches!(e,
+                    Effect::PeerDeactivate { body, .. } if body.force)));
+                assert!(!retry.iter().any(|e| matches!(
+                    e,
+                    Effect::UpdateConfiguration { flags: 1, .. }
+                        | Effect::DoReconfigurationReply(_)
+                )));
+                let restarted = &intent.replicas.0[2];
+                assert!(!catchup_replica(&actions, &restarted.node).up);
+                let mut stable = state(&executor).swap.as_ref().unwrap().body.clone();
+                stable.unit.previous = Epoch::default();
+                for r in &mut stable.replicas.0 {
+                    r.previous_role = 1;
+                }
                 let before = state(&executor);
-                assert!(matches!(
-                    executor
-                        .submit(Command::CompleteConfiguration(Box::new(catchup)))
-                        .unwrap()
-                        .wait(WAIT)
-                        .await,
-                    Err(Failure::Unsupported(
-                        "planned swap requires native Secondary restart/rebuild before activation"
-                    ))
-                ));
+                let mut premature = restarted.clone();
+                premature.previous_role = 1;
+                assert_eq!(
+                    run(
+                        &executor,
+                        Command::ActivateReply {
+                            source: restarted.node.clone(),
+                            generation: generation_header(admission().generation.generation),
+                            body: Box::new(ActivateReply {
+                                unit: stable.unit.clone(),
+                                replica: premature,
+                                error: 0,
+                            }),
+                        }
+                    )
+                    .await,
+                    Disposition::IgnoredStale
+                );
                 assert_eq!(state(&executor), before);
                 assert!(effects(&executor).is_empty());
+                let healthy = stable
+                    .replicas
+                    .0
+                    .iter()
+                    .find(|r| r.node == intent.replicas.0[0].node)
+                    .unwrap()
+                    .clone();
+                run(
+                    &executor,
+                    Command::ActivateReply {
+                        source: healthy.node.clone(),
+                        generation: generation_header(admission().generation.generation),
+                        body: Box::new(ActivateReply {
+                            unit: stable.unit,
+                            replica: healthy,
+                            error: 0,
+                        }),
+                    },
+                )
+                .await;
+                let pending = state(&executor);
+                assert_eq!(pending.swap.as_ref().unwrap().stage, SwapStage::Activate);
+                assert!(!effects(&executor)
+                    .iter()
+                    .any(|e| matches!(e, Effect::UpdateConfiguration { .. })));
+                let reply = DeactivateReply {
+                    unit: intent.unit.clone(),
+                    replica: Replica {
+                        node: restarted.node.clone(),
+                        id: restarted.id,
+                        instance: restarted.instance,
+                        up: false,
+                        state: 3,
+                        ..Replica::default()
+                    },
+                    error: 0,
+                };
+                let ack = |body| Command::DeactivateReply {
+                    source: restarted.node.clone(),
+                    generation: generation_header(admission().generation.generation),
+                    body: Box::new(body),
+                };
+                let mut stale = reply.clone();
+                stale.replica.instance -= 1;
+                assert_eq!(run(&executor, ack(stale)).await, Disposition::IgnoredStale);
+                assert!(effects(&executor).is_empty());
+                let (entered, release) = hooks.pause(true);
+                let ticket = executor.submit(ack(reply.clone())).unwrap();
+                entered.await.unwrap();
+                assert_eq!(state(&executor), pending);
+                assert!(effects(&executor).is_empty());
+                release.send(()).unwrap();
+                assert!(matches!(ticket.wait(WAIT).await, Err(Failure::Store(_))));
+                assert_eq!(state(&executor), pending);
+                run(&executor, ack(reply)).await;
+                let end = configured(&effects(&executor));
+                assert_eq!(end.flags, 1);
+                let dropped = end
+                    .replicas
+                    .0
+                    .iter()
+                    .find(|r| r.node == restarted.node)
+                    .unwrap();
+                assert!(!dropped.up && dropped.state == 3 && dropped.current_role == 3);
+                run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
+                assert!(
+                    matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(reply)]
+                    if reply.replicas.0.len() == 3 && reply.replicas.0.iter().filter(|r| r.up).count() == 2)
+                );
+                assert_eq!(state(&executor).runtime, original.runtime);
+                assert_eq!(state(&executor).usage, original.usage);
             }
         }
         finish(&store, &executor).await;
     }
+}
+
+fn catchup_replica(actions: &[Effect], node: &NodeInstance) -> Replica {
+    configured(actions)
+        .replicas
+        .0
+        .into_iter()
+        .find(|r| r.node == *node)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn planned_forced_deactivation_closes_exact_lifetime_before_reply_without_advancing_history()
+{
+    for former_primary in [false, true] {
+        for (fail, unknown) in [(false, false), (true, false), (false, true)] {
+            let (store, executor, hooks) = setup(if unknown {
+                Duration::from_millis(50)
+            } else {
+                WAIT
+            })
+            .await;
+            if former_primary {
+                let active = built_three_idles(&executor).await;
+                complete_primary_activation(&executor, &active).await;
+            } else {
+                active_configured_survivor(&executor, 3, 2).await;
+            }
+            let before = state(&executor);
+            let mut intent = before.configuration.as_ref().unwrap().clone();
+            let candidate = intent
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.current_role == 3 && r.node != admission().local_node)
+                .unwrap()
+                .node
+                .clone();
+            intent.unit.previous = intent.unit.current;
+            intent.unit.current.configuration += 0x1_0000_0001;
+            for r in &mut intent.replicas.0 {
+                r.previous_role = r.current_role;
+                r.current_role = if r.node == candidate { 4 } else { 3 };
+            }
+            if former_primary {
+                run(&executor, reconfigure(intent.clone())).await;
+                let mut demote = configured(&effects(&executor));
+                demote.local.service_endpoint.clear();
+                demote.local.first_lsn = 1;
+                demote.local.last_lsn = 8;
+                run(&executor, Command::CompleteConfiguration(Box::new(demote))).await;
+                effects(&executor);
+                intent = state(&executor)
+                    .swap
+                    .as_ref()
+                    .unwrap()
+                    .forwarded
+                    .as_ref()
+                    .unwrap()
+                    .configuration
+                    .clone();
+            }
+            for r in &mut intent.replicas.0 {
+                r.previous_role = 1;
+            }
+            let request = Deactivate {
+                configuration: intent,
+                force: true,
+                deactivation: ReplicaDeactivationInfo::default(),
+            };
+            let command = |body| Command::Deactivate {
+                body: Box::new(body),
+                source: candidate.clone(),
+                generation: generation_header(admission().generation.generation),
+            };
+            let admitted = state(&executor);
+            for invalid in 0..4 {
+                let mut bad = request.clone();
+                match invalid {
+                    0 => {
+                        bad.configuration
+                            .replicas
+                            .0
+                            .iter_mut()
+                            .find(|r| r.node == admission().local_node)
+                            .unwrap()
+                            .id += 1
+                    }
+                    1 => bad.deactivation.catchup_lsn = 0,
+                    2 => bad.configuration.unit.current.configuration += 1,
+                    _ => {
+                        bad.configuration
+                            .replicas
+                            .0
+                            .iter_mut()
+                            .find(|r| r.node == candidate)
+                            .unwrap()
+                            .instance += 1
+                    }
+                }
+                assert!(executor
+                    .submit(command(bad))
+                    .unwrap()
+                    .wait(WAIT)
+                    .await
+                    .is_err());
+                assert_eq!(state(&executor), admitted);
+                assert!(effects(&executor).is_empty());
+            }
+            let (entered, release) = hooks.pause(true);
+            let ticket = executor.submit(command(request.clone())).unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            assert_eq!(state(&executor), admitted);
+            release.send(()).unwrap();
+            assert!(matches!(ticket.wait(WAIT).await, Err(Failure::Store(_))));
+            run(&executor, command(request.clone())).await;
+            assert!(effects(&executor)
+                .iter()
+                .any(|e| matches!(e, Effect::Close { .. })));
+            let closing = state(&executor);
+            assert_eq!(closing.primary_deactivation, admitted.primary_deactivation);
+            assert_eq!(
+                closing.peer_creation.as_ref().map(|p| &p.deactivation),
+                admitted.peer_creation.as_ref().map(|p| &p.deactivation)
+            );
+            let mut complete = CloseCompletion {
+                unit: closing.body.unit.clone(),
+                replica: closing.body.replica.clone(),
+                error: -99,
+            };
+            run(
+                &executor,
+                Command::CompleteClose(Box::new(complete.clone())),
+            )
+            .await;
+            assert!(!effects(&executor)
+                .iter()
+                .any(|e| matches!(e, Effect::PeerDeactivateReply { .. })));
+            complete.error = 0;
+            let (entered, release) = hooks.pause(fail);
+            let ticket = executor
+                .submit(Command::CompleteClose(Box::new(complete.clone())))
+                .unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            assert_eq!(state(&executor).phase, Phase::Closing);
+            if unknown {
+                assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            }
+            release.send(()).unwrap();
+            if fail {
+                assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+                assert!(effects(&executor).is_empty());
+                run(&executor, Command::CompleteClose(Box::new(complete))).await;
+            } else {
+                ticket.resolve(WAIT).await.unwrap();
+            }
+            let closed = state(&executor);
+            assert_eq!(closed.phase, Phase::Closed);
+            assert!(closed.runtime.is_none() && closed.usage.is_none());
+            assert!(effects(&executor).iter().any(|e| matches!(e,
+                Effect::PeerDeactivateReply { target, body }
+                if *target == candidate && body.unit == request.configuration.unit
+                    && body.replica.id == before.body.replica.id && body.replica.instance == before.body.replica.instance)));
+            run(&executor, command(request)).await;
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::PeerDeactivateReply { .. }]
+            ));
+            if !unknown {
+                run(&executor, primary_delete((*closed.body).clone(), false)).await;
+                assert!(matches!(
+                    effects(&executor).as_slice(),
+                    [Effect::DeleteReplicaReply(_)]
+                ));
+                assert!(state(&executor).local_deleted);
+            }
+            finish(&store, &executor).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn planned_forced_deactivation_of_closed_secondary_replies_without_reopening() {
+    let (store, executor, _) = setup(WAIT).await;
+    active_configured_survivor(&executor, 3, 2).await;
+    let original = state(&executor);
+    let mut intent = original.configuration.as_ref().unwrap().clone();
+    let candidate = intent.replicas.0[2].node.clone();
+    intent.unit.previous = intent.unit.current;
+    intent.unit.current.configuration += 0x1_0000_0001;
+    for r in &mut intent.replicas.0 {
+        r.previous_role = 1;
+        r.current_role = if r.node == candidate { 4 } else { 3 };
+        r.service_endpoint.clear();
+    }
+    run(
+        &executor,
+        Command::CloseLocal {
+            unit: original.body.unit.id.clone(),
+            mode: CloseMode::Drop,
+        },
+    )
+    .await;
+    effects(&executor);
+    let closing = state(&executor);
+    run(
+        &executor,
+        Command::CompleteClose(Box::new(CloseCompletion {
+            unit: closing.body.unit.clone(),
+            replica: closing.body.replica.clone(),
+            error: 0,
+        })),
+    )
+    .await;
+    effects(&executor);
+    assert_eq!(state(&executor).phase, Phase::Closed);
+    run(
+        &executor,
+        Command::Deactivate {
+            source: candidate.clone(),
+            generation: generation_header(admission().generation.generation),
+            body: Box::new(Deactivate {
+                configuration: intent.clone(),
+                force: true,
+                deactivation: ReplicaDeactivationInfo::default(),
+            }),
+        },
+    )
+    .await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PeerDeactivateReply { target, body }]
+        if *target == candidate && body.unit == intent.unit && body.replica.id == original.body.replica.id)
+    );
+    assert_eq!(state(&executor).phase, Phase::Closed);
+    assert!(state(&executor).runtime.is_none() && state(&executor).usage.is_none());
+    finish(&store, &executor).await;
 }
 
 #[tokio::test]

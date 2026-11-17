@@ -421,7 +421,7 @@ fn reply(state: &EntityState) -> Effect {
             .expect("owned configuration")
             .request,
     );
-    if state.fm_primary {
+    if state.body.replica.current_role == 4 {
         body.replicas.0.retain(|r| r.current_role >= 3);
         Effect::DoReconfigurationReply(ConfigurationReply {
             unit: body.unit,
@@ -430,12 +430,7 @@ fn reply(state: &EntityState) -> Effect {
         })
     } else {
         Effect::PeerActivateReply {
-            target: state
-                .peer_creation
-                .as_ref()
-                .expect("peer origin")
-                .source
-                .clone(),
+            target: local_primary(state),
             body: Box::new(ActivateReply {
                 unit: body.unit,
                 replica: state.body.replica.clone(),
@@ -444,14 +439,19 @@ fn reply(state: &EntityState) -> Effect {
         }
     }
 }
+fn local_primary(state: &EntityState) -> NodeInstance {
+    state
+        .reconfiguration
+        .as_ref()
+        .and_then(|c| c.request.replicas.0.iter().find(|r| r.current_role == 4))
+        .map(|r| r.node.clone())
+        .or_else(|| state.peer_creation.as_ref().map(|p| p.source.clone()))
+        .expect("admitted configuration Primary")
+}
+
 pub(super) fn deactivate_reply(state: &EntityState) -> Effect {
     Effect::PeerDeactivateReply {
-        target: state
-            .peer_creation
-            .as_ref()
-            .expect("peer origin")
-            .source
-            .clone(),
+        target: local_primary(state),
         body: Box::new(DeactivateReply {
             unit: state.body.unit.clone(),
             replica: Replica {
@@ -658,7 +658,7 @@ pub(super) fn transition(
                 return Ok(lifecycle::changed(state, effects, true));
             }
             let initial = initial_configuration(&body.configuration, current);
-            let repair = completed_primary_failover(current)
+            let repair = completed_primary_change(current)
                 && body.configuration.service == current.body.service
                 && valid_stateful_sizes(&body.configuration.service);
             if repair
@@ -771,11 +771,23 @@ pub(super) fn transition(
             let repair = body.configuration.unit.target >= 2
                 && valid_stateful_sizes(&body.configuration.service)
                 && body.configuration.service == current.body.service
-                && (completed_primary_failover(current) || current.body.replica.current_role == 2)
+                && (completed_primary_change(current) || current.body.replica.current_role == 2)
                 && body.deactivation.epoch == body.configuration.unit.current
                 && body.deactivation.catchup_lsn >= 0;
-            if current.fm_primary
+            let continued_secondary = completed_primary_change(current)
+                && current.body.replica.current_role == 3
+                && completed_configuration(current).is_some_and(|c| {
+                    c.replicas
+                        .0
+                        .iter()
+                        .any(|r| r.node == *source && r.current_role == 4)
+                })
+                && current.primary_deactivation
+                    == Some((body.deactivation.epoch, body.deactivation.catchup_lsn));
+            if (current.fm_primary
+                && !(completed_primary_change(current) && current.body.replica.current_role == 3))
                 || (!repair
+                    && !continued_secondary
                     && current.peer_creation.as_ref().is_none_or(|origin| {
                         &origin.source != source || origin.deactivation != body.deactivation
                     }))
@@ -787,10 +799,13 @@ pub(super) fn transition(
             let deactivated = current.reconfiguration.as_ref().is_some_and(|c| {
                 c.stage == ConfigurationStage::Deactivated
                     && c.request == body.configuration
-                    && current
-                        .peer_creation
-                        .as_ref()
-                        .is_some_and(|p| p.source == *source && p.deactivation == body.deactivation)
+                    && local_primary(current) == *source
+                    && (current.primary_deactivation
+                        == Some((body.deactivation.epoch, body.deactivation.catchup_lsn))
+                        || current
+                            .peer_creation
+                            .as_ref()
+                            .is_some_and(|p| p.deactivation == body.deactivation))
             });
             if let Some(config) = &current.reconfiguration {
                 if config.request != body.configuration {
@@ -835,12 +850,12 @@ pub(super) fn transition(
             if repair {
                 if !peers.contains(source)
                     || local(&body.configuration, source)?.current_role != 4
-                    || (!completed_primary_failover(current)
+                    || (!completed_primary_change(current)
                         && current
                             .peer_creation
                             .as_ref()
                             .is_none_or(|p| p.source != *source))
-                    || (completed_primary_failover(current)
+                    || (completed_primary_change(current)
                         && current.swap.as_ref().is_none_or(|s| {
                             !s.body
                                 .replicas
@@ -853,12 +868,10 @@ pub(super) fn transition(
                         "repair Activate requires the surviving Primary",
                     ));
                 }
-                let origin = state
-                    .peer_creation
-                    .as_mut()
-                    .ok_or(Failure::Admission("missing peer origin"))?;
-                origin.source = source.clone();
-                origin.deactivation = body.deactivation.clone();
+                if let Some(origin) = &mut state.peer_creation {
+                    origin.source = source.clone();
+                    origin.deactivation = body.deactivation.clone();
+                }
                 state.primary_deactivation =
                     Some((body.deactivation.epoch, body.deactivation.catchup_lsn));
             }
@@ -889,7 +902,7 @@ pub(super) fn transition(
             let body: Deactivate =
                 from_slice(&work.bytes).map_err(|_| Failure::Admission("invalid Deactivate"))?;
             let secondary_loss = secondary_transition(&body.configuration, current);
-            if (completed_primary_failover(current) || secondary_loss)
+            if (completed_primary_change(current) || secondary_loss)
                 && valid_stateful_sizes(&body.configuration.service)
                 && body.configuration.service == current.body.service
                 && body.configuration.unit.current.data_loss == current.body.unit.current.data_loss
@@ -899,10 +912,13 @@ pub(super) fn transition(
                 if current.reconfiguration.as_ref().is_some_and(|c| {
                     c.stage == ConfigurationStage::Deactivated && c.request == body.configuration
                 }) && !body.force
-                    && current
-                        .peer_creation
-                        .as_ref()
-                        .is_some_and(|p| p.source == *source && p.deactivation == body.deactivation)
+                    && local_primary(current) == *source
+                    && (current.primary_deactivation
+                        == Some((body.deactivation.epoch, body.deactivation.catchup_lsn))
+                        || current
+                            .peer_creation
+                            .as_ref()
+                            .is_some_and(|p| p.deactivation == body.deactivation))
                 {
                     return Ok(Transition {
                         update: Update::None,
@@ -930,7 +946,9 @@ pub(super) fn transition(
                 shape(&body.configuration, current, source)?;
                 let expected = local(&body.configuration, &admission.local_node)?;
                 if body.force
-                    || current.fm_primary
+                    || (current.fm_primary
+                        && !(completed_primary_change(current)
+                            && current.body.replica.current_role == 3))
                     || expected.previous_role != 3
                     || expected.current_role != 3
                     || expected.id != current.body.replica.id
@@ -954,10 +972,14 @@ pub(super) fn transition(
                                 body.deactivation != ReplicaDeactivationInfo { epoch, catchup_lsn }
                             },
                         )))
-                    || current
-                        .peer_creation
-                        .as_ref()
-                        .is_none_or(|p| body.deactivation.catchup_lsn < p.deactivation.catchup_lsn)
+                    || current.primary_deactivation.map_or_else(
+                        || {
+                            current.peer_creation.as_ref().is_none_or(|p| {
+                                body.deactivation.catchup_lsn < p.deactivation.catchup_lsn
+                            })
+                        },
+                        |(_, lsn)| body.deactivation.catchup_lsn < lsn,
+                    )
                     || (!secondary_loss
                         && current.swap.as_ref().is_none_or(|s| {
                             !s.body
@@ -972,9 +994,10 @@ pub(super) fn transition(
                     ));
                 }
                 let mut state = current.clone();
-                let origin = state.peer_creation.as_mut().expect("surviving peer");
-                origin.source = source.clone();
-                origin.deactivation = body.deactivation.clone();
+                if let Some(origin) = &mut state.peer_creation {
+                    origin.source = source.clone();
+                    origin.deactivation = body.deactivation.clone();
+                }
                 state.primary_deactivation =
                     Some((body.deactivation.epoch, body.deactivation.catchup_lsn));
                 apply_body(&mut state, &body.configuration, &admission.local_node)?;
@@ -1241,7 +1264,7 @@ pub(super) fn transition(
                 return Ok(lifecycle::changed(state, vec![], false));
             }
             if config.stage == ConfigurationStage::Catchup {
-                let repair = completed_primary_failover(current) && !config.secondary_loss;
+                let repair = completed_primary_change(current) && !config.secondary_loss;
                 if repair {
                     if body.local.last_lsn < 0 {
                         return Err(Failure::Admission(

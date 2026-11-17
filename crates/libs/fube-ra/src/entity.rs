@@ -51,14 +51,14 @@ mod reconfiguration;
 #[path = "swap.rs"]
 mod swap;
 pub use peer::{
-    completed_primary_failover, BuildCompletion, PeerCreation, RemoteBuild, RemoteIdle,
-    RemoteRemoval, RemovalCompletion,
+    completed_primary_change, completed_primary_failover, BuildCompletion, PeerCreation,
+    RemoteBuild, RemoteIdle, RemoteRemoval, RemovalCompletion,
 };
 pub use reconfiguration::{
     replica_replacement_metadata, retired_configuration, secondary_removal_in_progress,
     secondary_service, ConfigurationCompletion, ConfigurationStage, Reconfiguration,
 };
-pub use swap::{PrimarySwap, ProgressQuery, SwapStage};
+pub use swap::{ForcedDeactivation, PrimarySwap, ProgressQuery, SwapStage};
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -216,6 +216,7 @@ pub struct Settings {
     pub notification_node_ms: u64,
     pub notification_type_ms: u64,
     pub notification_retry_ms: u64,
+    pub remote_replica_progress_query_wait_ms: u32,
     pub open_retry: RetryPolicy,
     pub open_registration: RetryPolicy,
 }
@@ -241,6 +242,7 @@ impl Default for Settings {
             notification_node_ms: 5_000,
             notification_type_ms: 45_000,
             notification_retry_ms: 30_000,
+            remote_replica_progress_query_wait_ms: 30_000,
             open_retry: RetryPolicy::open(),
             open_registration: RetryPolicy::registration(),
         }
@@ -657,6 +659,7 @@ pub struct EntityState {
     pub reconfiguration: Option<Reconfiguration>,
     pub swap: Option<PrimarySwap>,
     pub progress_query: Option<ProgressQuery>,
+    pub forced_deactivation: Option<ForcedDeactivation>,
     /// Committed replica-store view, independent of retained operation history.
     pub configuration: Option<Configuration>,
     /// IC roles survive independently of subsequent CC descriptions.
@@ -2272,6 +2275,7 @@ fn transition(
                     reconfiguration: None,
                     swap: None,
                     progress_query: None,
+                    forced_deactivation: None,
                     configuration: None,
                     intermediate_configuration: None,
                     phase: Phase::Opening,

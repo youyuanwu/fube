@@ -1171,7 +1171,7 @@ impl Node {
                 .is_some_and(|s| {
                     s.fm_primary
                         && s.body.replica.current_role == 4
-                        && ra::completed_primary_failover(&s)
+                        && ra::completed_primary_change(&s)
                 }))
             || !self.ra.is_peer(source)
             || generation.for_fm_replica
@@ -1599,9 +1599,7 @@ impl Node {
                 .ra
                 .snapshot(body.unit.id.guid.0)
                 .committed
-                .is_none_or(|s| {
-                    s.swap.is_none() && !self.active_stateful_configuration(body.unit.id.guid.0)
-                })
+                .is_none_or(|s| s.swap.is_none() && s.reconfiguration.is_none())
         {
             return Err(Error::Unsupported);
         }
@@ -1623,10 +1621,7 @@ impl Node {
                 .ra
                 .snapshot(body.replica.unit.id.guid.0)
                 .committed
-                .is_none_or(|s| {
-                    s.swap.is_none()
-                        && !self.active_stateful_configuration(body.replica.unit.id.guid.0)
-                })
+                .is_none_or(|s| s.swap.is_none() && s.reconfiguration.is_none())
         {
             return Err(Error::Unsupported);
         }
@@ -1728,7 +1723,15 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if !self.peer_profile() || !self.ra.is_peer(source) || generation.for_fm_replica {
+        if (!self.peer_profile()
+            && !self
+                .ra
+                .snapshot(body.configuration.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| s.swap.is_some()))
+            || !self.ra.is_peer(source)
+            || generation.for_fm_replica
+        {
             return Err(Error::Unsupported);
         }
         self.admit_configuration(&body.configuration)?;
@@ -1753,7 +1756,7 @@ impl Node {
                 .is_some_and(|s| {
                     s.fm_primary
                         && s.body.replica.current_role == 4
-                        && ra::completed_primary_failover(&s)
+                        && ra::completed_primary_change(&s)
                 }))
             || !self.ra.is_peer(source)
             || generation.for_fm_replica
@@ -1851,7 +1854,7 @@ impl Node {
                 .is_some_and(|s| {
                     s.fm_primary
                         && s.body.replica.current_role == 4
-                        && ra::completed_primary_failover(&s)
+                        && ra::completed_primary_change(&s)
                 }))
             || !self.live.load(Ordering::SeqCst)
             || !self.ra.is_peer(&body.replica.node)

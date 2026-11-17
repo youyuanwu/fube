@@ -177,7 +177,10 @@ fn report(state: &EntityState) -> ReplicaUp {
 }
 fn semantic_reply(state: &EntityState, mode: CloseMode, effects: &mut Vec<Effect>) {
     if mode == CloseMode::Deactivate && state.phase == Phase::Closed {
-        effects.push(reconfiguration::deactivate_reply(state));
+        effects.push(
+            swap::forced_deactivation_reply(state)
+                .unwrap_or_else(|| reconfiguration::deactivate_reply(state)),
+        );
     }
     if mode == CloseMode::Delete && state.phase == Phase::Closed && state.local_deleted {
         let body = Box::new(RemoveInstanceReply {
@@ -645,7 +648,8 @@ pub(super) fn transition(
                             && original.reconfiguration.as_ref().is_some_and(|c| {
                                 c.stage == ConfigurationStage::Retiring
                                     || (c.stage == ConfigurationStage::Complete
-                                        && original.peer_host_loss())
+                                        && (original.peer_host_loss()
+                                            || original.forced_deactivation.is_some()))
                             }))
                     {
                         return Err(Failure::Unsupported(
@@ -684,6 +688,7 @@ pub(super) fn transition(
                 reconfiguration: None,
                 swap: None,
                 progress_query: None,
+                forced_deactivation: None,
                 configuration: None,
                 intermediate_configuration: None,
                 // TryCreateFailoverUnit constructs from ID, consistency and

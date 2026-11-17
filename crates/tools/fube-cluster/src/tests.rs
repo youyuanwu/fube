@@ -599,6 +599,7 @@ fn lfum_reconciliation_requires_both_exact_inventories_and_retains_duplicate_rec
 fn launches() -> [Launch; 2] {
     [1, 2].map(|placement| Launch {
         profile: ServiceProfile::Stateless,
+        remote_replica_progress_query_wait_ms: fube_ra::entity::Settings::default().remote_replica_progress_query_wait_ms,
         deployment: "00000000-0000-4000-8000-000000000001".into(),
         session: format!("00000000-0000-4000-8000-00000000000{}", placement + 1),
         capability: uuid::Uuid::new_v4().to_string(),
@@ -6225,6 +6226,95 @@ async fn repeated_planned_transfers_preserve_fresh_writes_owners_and_native_comp
 }
 
 #[tokio::test]
+async fn planned_handoff_drops_unresponsive_volatile_secondary_then_explicitly_rebuilds_on_spare() {
+    let fixture = Fixture::new("planned-secondary-restart");
+    let mut config = fixture.config();
+    config.remote_replica_progress_query_wait_ms = 250;
+    config.profile = ServiceProfile::Stateful { target: 3, minimum: 2 };
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::with_node_pool(config, 4).unwrap();
+    cluster.start().await.unwrap();
+    let mut stopped = None;
+    let result = peer_idle_catch(async {
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+        let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        until(&mut cluster, |_| data_contact(&endpoint, b"read\n").starts_with("OK ")).await;
+        assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+        until(&mut cluster, |c| (1..3).all(|i|
+            c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 1)).await;
+        let owners = cluster.status()["nodes"].as_array().unwrap().iter()
+            .map(|n| (n["node_pid"].clone(), n["app_pid"].clone(), n["runtime_root"].clone())).collect::<Vec<_>>();
+        let predecessor = cluster.ledger.placements[2].body()?;
+        let pid = cluster.children[2].process.as_ref().unwrap().pid();
+        assert!(std::process::Command::new("kill").args(["-STOP", &pid.to_string()]).status().map_err(err)?.success());
+        stopped = Some(pid);
+        cluster.transfer_primary_to(2).await?;
+        let intent = cluster.ledger.swap.as_ref().unwrap().body.clone();
+        until_with_budget(&mut cluster, Duration::from_secs(45), |c|
+            c.status()["nodes"][1]["retained_work"]["local_replica"]["swap"]["stage"] == "Activate").await;
+        assert_eq!(cluster.ledger.configuration_status()["state"], "pending");
+        assert!(cluster.ledger.placements.iter().all(|p| p.endpoint.is_none()));
+        assert!(data_contact(&endpoint, b"write-more\n").contains("NotPrimary"));
+        assert!(std::process::Command::new("kill").args(["-CONT", &pid.to_string()]).status().map_err(err)?.success());
+        stopped = None;
+        let held = hold_peer_loss_frame(&mut cluster, 1, "DoReconfigurationReply", Duration::from_secs(20)).await?;
+        let (reply, _) = decode_do_reconfiguration_reply(&held).map_err(err)?;
+        assert_eq!(cluster.ledger.configuration_status()["state"], "pending");
+        assert!(cluster.ledger.placements.iter().all(|p| p.endpoint.is_none()));
+        let dropped = reply.replicas.0.iter().find(|r| r.node == predecessor.replica.node).unwrap();
+        assert!(!dropped.up && dropped.state == 3 && dropped.current_role == 3);
+        assert_eq!((dropped.id, dropped.instance), (predecessor.replica.id, predecessor.replica.instance));
+        cluster.send_configuration(&intent).await?;
+        until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true
+            && c.ledger.placements[2].loss_reported
+            && c.status()["nodes"][2]["native_replica_deleted"] == true).await;
+        assert_eq!(cluster.ledger.swap.as_ref().unwrap().reply.as_ref(), Some(&reply));
+        let endpoint = cluster.ledger.placements[1].endpoint.clone().unwrap();
+        assert!(data_contact(&endpoint, b"write-more\n").contains("committed=2"));
+        assert!(cluster.ledger.repair.is_none());
+        cluster.replace_replica_on(4).await?;
+        until(&mut cluster, |c| c.ledger.repair_status()["ready"] == true).await;
+        let restored = cluster.ledger.repair.as_ref().unwrap().configuration.as_ref().unwrap().reply.as_ref().unwrap();
+        assert_eq!(restored.replicas.0.len(), 3);
+        assert!(!restored.replicas.0.iter().any(|r| r.node == predecessor.replica.node));
+        assert!(data_contact(&endpoint, b"write-final\n").contains("committed=3"));
+        for i in [0, 1] {
+            let status = cluster.status();
+            assert_eq!(owners[i], (status["nodes"][i]["node_pid"].clone(),
+                status["nodes"][i]["app_pid"].clone(), status["nodes"][i]["runtime_root"].clone()));
+            assert_eq!(status["nodes"][i]["retained_work"]["app_observation"]["opens"], 1);
+        }
+        let pid = cluster.ledger.placements[0].profile.as_ref().unwrap().app_pid;
+        assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+        until(&mut cluster, |c| c.ledger.placements[0].loss_reported).await;
+        assert!(data_contact(&endpoint, b"write 4\n").contains("committed=4"));
+        let pid = cluster.ledger.placements[3].profile.as_ref().unwrap().app_pid;
+        assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+        until(&mut cluster, |c| c.ledger.placements[3].loss_reported).await;
+        let mut pending = TcpStream::connect(&endpoint).map_err(err)?;
+        pending.set_read_timeout(Some(Duration::from_millis(250))).map_err(err)?;
+        pending.write_all(b"write 5\n").map_err(err)?;
+        until(&mut cluster, |c| c.status()["nodes"][1]["retained_work"]["app_observation"]["primary_last_admitted"] == 5).await;
+        let mut bytes = [0; 1024];
+        assert!(matches!(pending.read(&mut bytes), Err(ref e) if matches!(e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)));
+        assert_eq!(cluster.status()["nodes"][1]["retained_work"]["app_observation"]["primary_last_acknowledged"], 4);
+        Ok::<(), String>(())
+    }).await;
+    if let Some(pid) = stopped {
+        assert!(std::process::Command::new("kill").args(["-CONT", &pid.to_string()]).status().unwrap().success());
+    }
+    if !matches!(&result, Ok(Ok(()))) {
+        eprintln!("RESTART_SWAP_STATUS {}", cluster.status());
+        for child in &cluster.children { eprintln!("RESTART_SWAP_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+    }
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn planned_transfers_after_repair_use_current_membership_and_surviving_primary() {
     for (lost, spare) in [(0, true), (2, true), (0, false), (2, false)] {
         let fixture = Fixture::new("repaired-planned-transfer");
@@ -7095,6 +7185,7 @@ impl Fixture {
             root: self.root.clone(),
             app: support::binary("cluster-stateless-app", "FUBE_CLUSTER_APP"),
             executable: support::binary("fube-cluster", "FUBE_CLUSTER_NODE_EXE"),
+            remote_replica_progress_query_wait_ms: fube_ra::entity::Settings::default().remote_replica_progress_query_wait_ms,
         }
     }
 }

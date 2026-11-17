@@ -222,6 +222,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         admission,
         ra::Settings {
             max_outstanding: 32,
+            remote_replica_progress_query_wait_ms: launch.remote_replica_progress_query_wait_ms,
             max_service_types: 1,
             notification_batch_count: 1,
             notification_batch_bytes: LIMIT,

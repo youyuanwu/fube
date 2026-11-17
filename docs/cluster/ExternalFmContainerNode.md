@@ -422,8 +422,16 @@ runtime owners and fence stale earlier requests/completions.
 Unequal progress is permitted without failover-only catch-up-capability
 redirection. Secondary activation is a metadata commit, not another RAP role
 transition; a pending GetLSN callback cannot hold an otherwise valid S/S ACK.
-Cases requiring native Secondary restart/rebuild remain explicitly gated
-before activation. Other sizes, swap abort and concurrent standalone
+At 3/2, missing-progress process qualification now follows native force
+Deactivate with invalid history: the volatile Secondary closes/drops before
+its acknowledgement, and the candidate commits it as a non-voting down CC
+member before final RAP/FM completion. A later explicit FM build on a static
+spare restores target through normal removal/admission; no same-handoff reopen
+or invented successful activation is used. Actual disposal, lost final reply
+replay, unchanged survivors and replacement quorum/no-quorum are exercised.
+Shared model/store cases also cover unknown and uncatchable progress and a
+former-Primary target. Persisted restart, same-handoff volatile rebuild,
+other restart-required sizes, swap abort and concurrent standalone
 generation/LFUM transfer overlaps remain unqualified or gated.
 Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,
 FM/FMM rebuild and restart remain gated; native handler/interoperability evidence

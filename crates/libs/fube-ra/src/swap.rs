@@ -1,6 +1,8 @@
 use super::*;
 use std::time::Instant;
 
+const GET_LSN_NOT_FOUND: i64 = 0x8007_1cf0_u32 as i32 as i64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwapStage {
     Demote,
@@ -26,6 +28,7 @@ pub struct PrimarySwap {
     pub forwarded: Option<DoReconfiguration>,
     pub local_progress: Option<Replica>,
     pub remote_progress: Vec<GetLsnReply>,
+    pub restarting: Vec<NodeInstance>,
     pub deactivated: Vec<NodeInstance>,
     pub activated: Vec<NodeInstance>,
     pub change: Option<Configuration>,
@@ -41,6 +44,141 @@ pub struct ProgressQuery {
     pub request: AddInstance,
     pub reply: Option<GetLsnReply>,
     pub error: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForcedDeactivation {
+    pub source: NodeInstance,
+    pub request: Deactivate,
+}
+
+pub(super) fn forced_deactivation_reply(state: &EntityState) -> Option<Effect> {
+    let owner = state.forced_deactivation.as_ref()?;
+    (state.phase == Phase::Closed).then(|| Effect::PeerDeactivateReply {
+        target: owner.source.clone(),
+        body: Box::new(DeactivateReply {
+            unit: owner.request.configuration.unit.clone(),
+            replica: Replica {
+                node: state.body.replica.node.clone(),
+                id: state.body.replica.id,
+                instance: state.body.replica.instance,
+                up: false,
+                state: 3,
+                ..Replica::default()
+            },
+            error: 0,
+        }),
+    })
+}
+
+fn forced_deactivation(
+    work: &Submission,
+    current: &EntityState,
+    admission: &Admission,
+    peers: &[NodeInstance],
+) -> Result<Option<Transition>> {
+    let Kind::Deactivate {
+        source,
+        generation: header,
+    } = &work.kind
+    else {
+        return Ok(None);
+    };
+    let request: Deactivate =
+        from_slice(&work.bytes).map_err(|_| Failure::Admission("invalid forced Deactivate"))?;
+    if !request.force {
+        return Ok(None);
+    }
+    if !peers.contains(source) {
+        return Err(Failure::Admission("unbound forced Deactivate source"));
+    }
+    if !generation(source, source, header, admission)?
+        || request
+            .configuration
+            .unit
+            .current
+            .older_than(current.body.unit.current)
+        || replica(&request.configuration, &admission.local_node)?.instance
+            < current.body.replica.instance
+    {
+        return Ok(Some(Transition::ignored(Disposition::IgnoredStale)));
+    }
+    if let Some(owner) = &current.forced_deactivation {
+        if owner.source != *source || owner.request != request {
+            return Err(Failure::Unsupported(
+                "forced Deactivate supersession is gated",
+            ));
+        }
+        let mut out = vec![];
+        if let Some(reply) = forced_deactivation_reply(current) {
+            out.push(reply);
+        } else {
+            lifecycle::close_retry(current, &mut out);
+        }
+        return Ok(Some(Transition {
+            update: Update::None,
+            effects: out,
+            disposition: Disposition::Applied,
+        }));
+    }
+    let closed = current.phase == Phase::Closed
+        && current.runtime.is_none()
+        && current.usage.is_none()
+        && admission.node_open
+        && admission.owner_ready
+        && admission.node_activated;
+    if !ready(current, admission) && !closed {
+        return Ok(Some(Transition::ignored(Disposition::IgnoredNotReady)));
+    }
+    let active = reconfiguration::completed_configuration(current).ok_or(Failure::Unsupported(
+        "forced Deactivate requires active membership",
+    ))?;
+    let local = replica(&request.configuration, &admission.local_node)?;
+    if current.body.service.persisted
+        || request.deactivation != ReplicaDeactivationInfo::default()
+        || local.current_role != 3
+        || local.id != current.body.replica.id
+        || local.instance != current.body.replica.instance
+        || replica(&request.configuration, source)?.current_role != 4
+        || request
+            .configuration
+            .replicas
+            .0
+            .iter()
+            .any(|r| r.previous_role != 1)
+        || current
+            .progress_query
+            .as_ref()
+            .is_some_and(|q| q.source != *source || q.request.unit != request.configuration.unit)
+        || current.swap.as_ref().is_some_and(|s| {
+            s.stage != SwapStage::Complete
+                && (s.stage != SwapStage::Continue || s.intent.unit != request.configuration.unit)
+        })
+    {
+        return Err(Failure::Admission(
+            "forced Deactivate changed the planned handoff owner",
+        ));
+    }
+    let mut intent = request.configuration.clone();
+    for r in &mut intent.replicas.0 {
+        let previous = replica(active, &r.node)?;
+        r.previous_role = previous.current_role;
+        if r.node == *source {
+            r.service_endpoint = previous.service_endpoint.clone();
+        }
+    }
+    validate(&intent, current)?;
+    let mut state = current.clone();
+    state.forced_deactivation = Some(ForcedDeactivation {
+        source: source.clone(),
+        request,
+    });
+    let mut body = (*state.body).clone();
+    body.unit = intent.unit;
+    state.body = Arc::new(body);
+    let mut out = vec![];
+    lifecycle::start_close(&mut state, CloseMode::Deactivate, work.id, &mut out);
+    Ok(Some(lifecycle::changed(state, out, true)))
 }
 
 fn deactivation(state: &EntityState) -> Result<ReplicaDeactivationInfo> {
@@ -380,6 +518,12 @@ fn progress_query(
             }
             let primary = replica(&body.configuration, source)?;
             let mut intent = body.configuration.clone();
+            for r in &mut intent.replicas.0 {
+                if !r.up && r.state == 3 && r.current_role == 3 && r.node != admission.local_node {
+                    r.up = true;
+                    r.state = 2;
+                }
+            }
             let mut original_endpoint = primary.clone();
             original_endpoint.service_endpoint = replica(active, source)?.service_endpoint.clone();
             replace(&mut intent, original_endpoint)?;
@@ -481,6 +625,7 @@ fn new_transition(body: Configuration, failover: bool, stage: SwapStage) -> Prim
         forwarded: None,
         local_progress: None,
         remote_progress: vec![],
+        restarting: vec![],
         deactivated: vec![],
         activated: vec![],
         change: None,
@@ -495,7 +640,18 @@ fn elapsed(swap: &PrimarySwap) -> i64 {
 }
 
 pub(super) fn handles(work: &Submission, state: Option<&EntityState>) -> Result<bool> {
-    if state.is_some_and(completed_primary_failover) {
+    if matches!(work.kind, Kind::Deactivate { .. })
+        && from_slice::<Deactivate>(&work.bytes)
+            .map_err(|_| Failure::Admission("invalid Deactivate"))?
+            .force
+    {
+        return Ok(true);
+    }
+    if state.is_some_and(|s| {
+        s.swap
+            .as_ref()
+            .is_some_and(|s| s.stage == SwapStage::Complete)
+    }) {
         let s = state.expect("completed failover");
         let epoch = s.swap.as_ref().expect("swap").body.unit.current;
         let newer = match work.kind {
@@ -829,7 +985,12 @@ fn effects(state: &EntityState) -> Vec<Effect> {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.current_role == 3 && r.up && !swap.activated.contains(&r.node))
+                .filter(|r| {
+                    r.current_role == 3
+                        && r.up
+                        && !swap.restarting.contains(&r.node)
+                        && !swap.activated.contains(&r.node)
+                })
                 .map(|target| Effect::PeerActivate {
                     target: target.node.clone(),
                     body: Box::new(Activate {
@@ -906,6 +1067,22 @@ fn effects(state: &EntityState) -> Vec<Effect> {
             }),
         }],
     };
+    if matches!(swap.stage, SwapStage::Catchup | SwapStage::Activate) {
+        for target in &swap.restarting {
+            let mut configuration = swap.intent.clone();
+            for r in &mut configuration.replicas.0 {
+                r.previous_role = 1;
+            }
+            result.push(Effect::PeerDeactivate {
+                target: target.clone(),
+                body: Box::new(Deactivate {
+                    configuration,
+                    force: true,
+                    deactivation: ReplicaDeactivationInfo::default(),
+                }),
+            });
+        }
+    }
     if swap.endpoint_available {
         result.push(Effect::ReplicaEndpointUpdated(Box::new(
             (*state.body).clone(),
@@ -923,6 +1100,7 @@ fn advance_get_lsn(state: &mut EntityState, config: &NativeConfig) -> Result<()>
         .chain(
             swap.remote_progress
                 .iter()
+                .filter(|p| p.replica.error == 0)
                 .map(|p| (p.replica.replica.clone(), p.deactivation.clone())),
         )
         .collect();
@@ -959,12 +1137,14 @@ fn advance_get_lsn(state: &mut EntityState, config: &NativeConfig) -> Result<()>
         }
     }
     if elapsed(swap) < config.node(NodeProperty::RemoteReplicaProgressQueryWaitTicks)
-        && swap
-            .body
-            .replicas
-            .0
-            .iter()
-            .any(|r| r.up && r.current_role >= 3 && !progress.iter().any(|(p, _)| p.node == r.node))
+        && swap.body.replicas.0.iter().any(|r| {
+            r.up && r.current_role >= 3
+                && r.node != local.node
+                && !swap
+                    .remote_progress
+                    .iter()
+                    .any(|p| p.replica.replica.node == r.node)
+        })
     {
         return Ok(());
     }
@@ -1043,12 +1223,20 @@ fn advance_get_lsn(state: &mut EntityState, config: &NativeConfig) -> Result<()>
         });
     } else {
         swap.rap = swap.body.clone();
+        if !swap.failover {
+            swap.restarting = planned_secondary_restarts(swap);
+            for r in &mut swap.rap.replicas.0 {
+                if swap.restarting.contains(&r.node) {
+                    r.up = false;
+                }
+            }
+        }
         swap.stage = SwapStage::Catchup;
     }
     Ok(())
 }
 
-fn planned_secondary_restart_needed(swap: &PrimarySwap) -> bool {
+fn planned_secondary_restarts(swap: &PrimarySwap) -> Vec<NodeInstance> {
     let local = swap
         .local_progress
         .as_ref()
@@ -1058,15 +1246,34 @@ fn planned_secondary_restart_needed(swap: &PrimarySwap) -> bool {
         .0
         .iter()
         .filter(|r| r.up && r.current_role == 3)
-        .any(|r| {
+        .filter(|r| {
             swap.remote_progress
                 .iter()
                 .find(|p| p.replica.replica.node == r.node)
                 .is_none_or(|p| {
                     let last = p.replica.replica.last_lsn;
-                    last < local.last_lsn && (local.first_lsn == 0 || last < local.first_lsn - 1)
+                    p.replica.error == GET_LSN_NOT_FOUND
+                        || (last < local.last_lsn
+                            && (local.first_lsn == 0 || last < local.first_lsn - 1))
                 })
         })
+        .map(|r| r.node.clone())
+        .collect()
+}
+
+fn finish_activation(swap: &mut PrimarySwap) {
+    if swap.restarting.is_empty()
+        && swap
+            .body
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.up && r.current_role == 3)
+            .all(|r| swap.activated.contains(&r.node))
+    {
+        swap.stage = SwapStage::End;
+        swap.rap = swap.body.clone();
+    }
 }
 
 pub(super) fn transition(
@@ -1076,9 +1283,15 @@ pub(super) fn transition(
     config: &NativeConfig,
     peers: &[NodeInstance],
 ) -> Result<Transition> {
-    let Some(current) = current.filter(|s| ready(s, admission)) else {
+    let Some(current) = current else {
         return Ok(Transition::ignored(Disposition::IgnoredNotReady));
     };
+    if let Some(result) = forced_deactivation(work, current, admission, peers)? {
+        return Ok(result);
+    }
+    if !ready(current, admission) {
+        return Ok(Transition::ignored(Disposition::IgnoredNotReady));
+    }
     if let Some(result) = progress_query(work, current, admission, peers)? {
         return Ok(result);
     }
@@ -1181,7 +1394,11 @@ pub(super) fn transition(
                 if &body.configuration != expected {
                     return Err(Failure::Unsupported("swap supersession is gated"));
                 }
-                let replay = if from_fm && !swap.failover && swap.stage != SwapStage::Demote {
+                let replay = if from_fm
+                    && !swap.failover
+                    && swap.stage != SwapStage::Demote
+                    && replica(&swap.intent, &admission.local_node)?.previous_role == 4
+                {
                     let mut copy = current.clone();
                     copy.swap.as_mut().expect("swap").stage = SwapStage::Continue;
                     effects(&copy)
@@ -1350,19 +1567,27 @@ pub(super) fn transition(
                 return stale();
             };
             let expected = replica(&swap.body, peer)?;
+            let unknown = !swap.failover
+                && body.replica.error == GET_LSN_NOT_FOUND
+                && body.deactivation
+                    == (ReplicaDeactivationInfo {
+                        epoch: Epoch::default(),
+                        catchup_lsn: -2,
+                    });
             // A survivor reports its own PC, not the candidate's requested PC.
             let mut reported_unit = body.replica.unit.clone();
             reported_unit.previous = swap.body.unit.previous;
             if reported_unit != swap.body.unit
-                || body.replica.error != 0
+                || (body.replica.error != 0 && !unknown)
                 || !expected.up
                 || expected.current_role != 3
                 || !same_replica(&body.replica.replica, expected)
-                || body.replica.replica.first_lsn < 0
-                || body.replica.replica.last_lsn < 0
-                || body.deactivation.epoch.data_loss != swap.body.unit.previous.data_loss
-                || swap.body.unit.previous.older_than(body.deactivation.epoch)
-                || body.deactivation.catchup_lsn < 0
+                || (!unknown
+                    && (body.replica.replica.first_lsn < 0
+                        || body.replica.replica.last_lsn < 0
+                        || body.deactivation.epoch.data_loss != swap.body.unit.previous.data_loss
+                        || swap.body.unit.previous.older_than(body.deactivation.epoch)
+                        || body.deactivation.catchup_lsn < 0))
             {
                 return stale();
             }
@@ -1423,14 +1648,6 @@ pub(super) fn transition(
                     "Primary catch-up changed progress without a data-loss exchange",
                 ));
             }
-            if !swap.failover
-                && swap.stage == SwapStage::Catchup
-                && planned_secondary_restart_needed(swap)
-            {
-                return Err(Failure::Unsupported(
-                    "planned swap requires native Secondary restart/rebuild before activation",
-                ));
-            }
             replace(
                 &mut state.swap.as_mut().expect("swap").body,
                 body.local.clone(),
@@ -1478,7 +1695,7 @@ pub(super) fn transition(
             if state
                 .swap
                 .as_ref()
-                .is_some_and(|s| s.failover && s.stage == SwapStage::Complete)
+                .is_some_and(|s| s.stage == SwapStage::Complete)
                 && state.body.replica.current_role == 4
             {
                 state.fm_primary = true;
@@ -1507,7 +1724,13 @@ pub(super) fn transition(
                 return stale();
             }
             for r in &body.configuration.replicas.0 {
-                if !same_replica(r, replica(&swap.rap, &r.node)?) {
+                let expected = replica(&swap.rap, &r.node)?;
+                let mut actual = r.clone();
+                if !r.up && r.state == 3 && r.current_role == 3 && r.node != admission.local_node {
+                    actual.up = expected.up;
+                    actual.state = expected.state;
+                }
+                if !same_replica(&actual, expected) {
                     return stale();
                 }
             }
@@ -1578,6 +1801,36 @@ pub(super) fn transition(
             }
             let body: DeactivateReply = from_slice(&work.bytes)
                 .map_err(|_| Failure::Admission("invalid survivor DeactivateReply"))?;
+            if let Some(swap) = current.swap.as_ref().filter(|s| {
+                !s.failover
+                    && matches!(s.stage, SwapStage::Catchup | SwapStage::Activate)
+                    && s.restarting.contains(source)
+            }) {
+                let remote = replica(&swap.body, source)?;
+                let expected = Replica {
+                    node: remote.node.clone(),
+                    id: remote.id,
+                    instance: remote.instance,
+                    up: false,
+                    state: 3,
+                    ..Replica::default()
+                };
+                if body.unit != swap.body.unit || body.replica != expected || body.error != 0 {
+                    return stale();
+                }
+                let s = state.swap.as_mut().expect("swap");
+                let mut dropped = remote.clone();
+                dropped.up = false;
+                dropped.state = 3;
+                replace(&mut s.body, dropped)?;
+                s.restarting.retain(|node| node != source);
+                if s.stage == SwapStage::Activate {
+                    finish_activation(s);
+                }
+                apply(&mut state, &admission.local_node)?;
+                let out = effects(&state);
+                return Ok(lifecycle::changed(state, out, true));
+            }
             let Some(swap) = current
                 .swap
                 .as_ref()
@@ -1635,6 +1888,7 @@ pub(super) fn transition(
             let remote = replica(&expected, peer)?;
             if !remote.up
                 || remote.current_role != 3
+                || swap.restarting.contains(peer)
                 || swap.activated.contains(peer)
                 || body.unit != expected.unit
                 || body.error != 0
@@ -1657,16 +1911,7 @@ pub(super) fn transition(
                 .expect("peer")
                 .previous_role = original.previous_role;
             s.activated.push(peer.clone());
-            if s.body
-                .replicas
-                .0
-                .iter()
-                .filter(|r| r.up && r.current_role == 3)
-                .all(|r| s.activated.contains(&r.node))
-            {
-                s.stage = SwapStage::End;
-                s.rap = s.body.clone();
-            }
+            finish_activation(s);
         }
         Kind::ProxyEndpoint => {
             let body: AddInstance = from_slice(&work.bytes)

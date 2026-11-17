@@ -97,7 +97,7 @@ impl NativeConfig {
                 6_000_000_000,
                 300_000_000,
                 300_000_000,
-                300_000_000,
+                i64::from(settings.remote_replica_progress_query_wait_ms) * 10_000,
             ]
             .map(AtomicI64::new),
         }

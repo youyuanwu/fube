@@ -136,9 +136,14 @@ Publish the new Primary only after its successful native DoReconfigurationReply;
 ReplicaEndpointUpdated/Reply is not completion. Process tests replay lost final
 replies for each transfer, fence stale earlier intent and the old writer,
 commit a fresh application write after every transfer, retain owners/data and require the unchanged
-Secondary's real vote after the old Primary closes. Non-responding or
-uncatchable Secondaries that SF would restart explicitly block completion:
-native Secondary restart/rebuild is not implemented. Other sizes,
+Secondary's real vote after the old Primary closes. A separate 3/2 case
+withholds a live Node's progress, then exercises SF's force-Deactivate volatile
+Close/drop path and final native reply replay. A dropped member retains its
+CC identity but supplies no vote; it is not rebuilt in that handoff.
+Subsequent explicit FM AddReplica and removal/admission restore target on a
+static spare, with actual disposal, unchanged survivor owners and real
+replacement quorum/no-quorum checks. Persisted restart, in-handoff volatile
+rebuild, other restart-required sizes,
 swap abort and concurrent generation/LFUM overlaps remain unqualified or gated.
 Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,
 FM/FMM rebuild and restart remain gated. Native-free acceptance is not complete
@@ -211,9 +216,15 @@ Example for the first of three original placements:
   ],
   "run_directory": "/run/fube/node1-session1",
   "startup_timeout_ms": 30000,
-  "shutdown_timeout_ms": 20000
+  "shutdown_timeout_ms": 20000,
+  "remote_replica_progress_query_wait_ms": 30000
 }
 ```
+
+`remote_replica_progress_query_wait_ms` is optional and defaults to SF's
+30-second `RemoteReplicaProgressQueryWaitDuration`. Zero bypasses only the
+optional wait for additional responses; PC/CC read quorums remain mandatory.
+`primary_swap_stage` reports shared RA phase ownership, not serving readiness.
 
 The sample parameters above apply to `hosting-local-app` and its `pkg-stateful`
 manifest. Package that executable under `LocalService/Code/hosting-local-app`.

@@ -571,6 +571,7 @@ impl Ledger {
             .configured_sizes()
             .is_some()
         {
+            let planned = !self.primary_failover();
             return self.swap.as_ref().is_some_and(|s| {
                 s.body
                     .configuration
@@ -579,9 +580,11 @@ impl Ledger {
                     .iter()
                     .filter(|r| r.up && r.current_role >= 3)
                     .all(|r| {
-                        self.placements
-                            .iter()
-                            .any(|p| p.launch.node == r.node && p.link_alive && !p.loss_reported)
+                        self.placements.iter().any(|p| {
+                            p.launch.node == r.node
+                                && p.link_alive
+                                && (!p.loss_reported || (planned && r.current_role == 3))
+                        })
                     })
             });
         }
@@ -1773,6 +1776,19 @@ impl Ledger {
             return Ok(response);
         }
         let old_failover_primary = self.failed_primary_index() == Some(index);
+        let planned_secondary = !self.primary_failover()
+            && self.swap.as_ref().is_some_and(|s| {
+                s.body.configuration.unit.target == 3
+                    && s.body.configuration.unit.minimum == 2
+                    && s.body.configuration.replicas.0.iter().any(|r| {
+                        r.node == self.placements[index].launch.node && r.current_role == 3
+                    })
+                    && s.reply.as_ref().is_none_or(|reply| {
+                        reply.replicas.0.iter().any(|r| {
+                            r.node == self.placements[index].launch.node && !r.up && r.state == 3
+                        })
+                    })
+            });
         let placement = &mut self.placements[index];
         if response.is_some()
             && placement.bootstrap == Bootstrap::Admitted
@@ -1780,6 +1796,7 @@ impl Ledger {
         {
             if let Some(swap) = self.swap.as_mut().filter(|s| {
                 !old_failover_primary
+                    && !planned_secondary
                     && s.body
                         .configuration
                         .replicas
@@ -2694,8 +2711,23 @@ impl Ledger {
             .configuration
             .iter()
             .chain(self.configuration_history.iter())
+            .chain(self.swap.iter())
             .find(|c| {
-                c.body.configuration.unit.target == 1
+                (c.body.configuration.unit.target == 1
+                    || (c.body.configuration.unit.target == 3
+                        && c.body.configuration.unit.minimum == 2
+                        && c.body
+                            .configuration
+                            .replicas
+                            .0
+                            .iter()
+                            .all(|r| r.up && r.state == 2)
+                        && c.body
+                            .configuration
+                            .replicas
+                            .0
+                            .iter()
+                            .any(|r| r.previous_role == 4 && r.current_role == 3)))
                     && c.body.configuration.unit == proof.disposal.body.unit
                     && c.body.configuration.service == proof.disposal.body.service
             })
@@ -2710,6 +2742,14 @@ impl Ledger {
                 .ok_or("retirement proof omitted configured destination")?
                 .clone();
             replica.state = 3;
+            if config.body.configuration.unit.target == 3 {
+                if replica.current_role != 3 {
+                    return Err("planned restart disposal requires a Secondary".into());
+                }
+                replica.first_lsn = proof.disposal.body.replica.first_lsn;
+                replica.last_lsn = proof.disposal.body.replica.last_lsn;
+                replica.service_endpoint.clear();
+            }
             if proof.disposal.body.replica != replica {
                 return Err("retirement proof changed the configured Close identity".into());
             }
@@ -2854,6 +2894,21 @@ impl Ledger {
                     })
                 })
                 .unwrap_or(0)
+        }
+    }
+
+    pub fn configuration_target_index(&self) -> usize {
+        let primary = self.primary_index();
+        if self
+            .swap
+            .as_ref()
+            .is_some_and(|s| s.reply.is_none() && !s.unknown)
+            && !self.primary_failover()
+            && self.placements[primary].loss_reported
+        {
+            self.transition_primary_index()
+        } else {
+            primary
         }
     }
 
@@ -4327,6 +4382,23 @@ impl Ledger {
                 return Ok(());
             };
             let mut actual = r.clone();
+            let restarted = !failover
+                && body.unit.target == 3
+                && body.unit.minimum == 2
+                && r.current_role == 3
+                && !r.up
+                && r.state == 3
+                && body
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|r| r.up && r.state == 2)
+                    .count()
+                    >= 2;
+            if restarted {
+                actual.up = expected.up;
+                actual.state = expected.state;
+            }
             actual.previous_role = expected.previous_role;
             actual.first_lsn = expected.first_lsn;
             actual.last_lsn = expected.last_lsn;
@@ -4368,6 +4440,10 @@ impl Ledger {
                 .find(|r| r.node == p.launch.node)
                 .ok_or("swap omitted placement")?
                 .clone();
+            if !replica.up {
+                p.endpoint = None;
+                continue;
+            }
             p.endpoint = (replica.current_role == 4).then(|| replica.service_endpoint.clone());
             p.ready_replica = Some(replica);
             p.active_unit = Some(body.unit.clone());
