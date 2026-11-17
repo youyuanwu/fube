@@ -178,7 +178,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     // bootstrap exchanges completed for this original session.
     private_dir(&launch.directory.join("hosting"))?;
     let mut options = Options::new(launch.directory.join("hosting"));
-    if launch.profile.peer_replicas() {
+    if launch.profile.peer_replicas() || launch.profile.configured_sizes().is_some() {
         options.service_package_version_instance = Some(1);
     }
     if let Some((target, minimum)) = launch.profile.configured_sizes() {
@@ -237,7 +237,10 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     node.apply_fresh_node_up_ack(&ack, &generation)
         .map_err(err)?;
     let mut adapter = Adapter::default();
-    let mut arguments = if launch.profile.peer_replicas() && launch.placement != 1 {
+    let mut arguments = if (launch.profile.peer_replicas()
+        || launch.profile.configured_sizes().is_some())
+        && launch.placement != 1
+    {
         vec![(
             "Arguments".into(),
             "--stateful-lifecycle --data-replicator".into(),

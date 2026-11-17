@@ -287,7 +287,13 @@ impl Launch {
     }
     pub fn validate(&self) -> Result<()> {
         self.profile.validate()?;
-        if !(1..=self.profile.node_count()).contains(&usize::from(self.placement))
+        let pool = if self.profile.mesh_peers() {
+            self.peers.len() + 1
+        } else {
+            self.profile.node_count()
+        };
+        self.profile.control_profile().validate_node_pool(pool)?;
+        if !(1..=pool).contains(&usize::from(self.placement))
             || self.node.id == self.fm.id
             || self.node.instance == 0
             || self.fm.instance == 0
@@ -310,9 +316,10 @@ impl Launch {
         ] {
             uuid::Uuid::parse_str(id).map_err(err)?;
         }
-        let expected = if self.profile.peer_replicas() {
+        let expected = if self.profile.peer_replicas() || self.profile.configured_sizes().is_some()
+        {
             if self.placement == 1 || self.profile.mesh_peers() {
-                self.profile.node_count() - 1
+                pool - 1
             } else {
                 1
             }

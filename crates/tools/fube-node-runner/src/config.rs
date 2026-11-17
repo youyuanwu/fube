@@ -196,9 +196,9 @@ impl Config {
         let fm = self.fm.identity.native()?;
         address(self.fm.address)?;
         let profile = self.control_profile();
-        profile.validate()?;
-        if self.fm.generation <= 0 || self.peers.len() != profile.node_count() - 1 {
-            return Err("initial FM generation and target-1 original peers are required".into());
+        profile.validate_node_pool(self.peers.len() + 1)?;
+        if self.fm.generation <= 0 {
+            return Err("positive initial FM generation is required".into());
         }
         let mut ids = BTreeSet::from([fm.id]);
         let mut ips = BTreeSet::new();

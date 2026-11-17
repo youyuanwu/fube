@@ -54,9 +54,16 @@ pub struct Cluster {
     finished: Option<Value>,
 }
 impl Cluster {
-    pub fn new(mut config: Config) -> Result<Self> {
-        config.profile.validate()?;
+    pub fn new(config: Config) -> Result<Self> {
         let node_count = config.profile.node_count();
+        Self::with_node_pool(config, node_count)
+    }
+
+    pub fn with_node_pool(mut config: Config, node_count: usize) -> Result<Self> {
+        config
+            .profile
+            .control_profile()
+            .validate_node_pool(node_count)?;
         config.app = config.app.canonicalize().map_err(err)?;
         config.executable = config.executable.canonicalize().map_err(err)?;
         use std::os::unix::fs::PermissionsExt;
@@ -80,7 +87,7 @@ impl Cluster {
             },
             for_fm_replica: false,
         };
-        let mut launches: Vec<_> = (1..=config.profile.node_count() as u8)
+        let mut launches: Vec<_> = (1..=node_count as u8)
             .map(|placement| Launch {
                 profile: config.profile,
                 deployment: interlock.deployment.clone(),
@@ -105,7 +112,7 @@ impl Cluster {
                 peers: vec![],
             })
             .collect();
-        if config.profile.peer_replicas() {
+        if config.profile.peer_replicas() || config.profile.configured_sizes().is_some() {
             let partition = launches[0].partition.clone();
             for launch in &mut launches {
                 launch.partition = partition.clone();
@@ -151,10 +158,11 @@ impl Cluster {
         for index in 0..self.ledger.placements.len() {
             self.spawn(index).await?;
         }
-        if self.config.profile.peer_replicas() {
+        if self.config.profile.peer_replicas() || self.config.profile.configured_sizes().is_some() {
             for source in 0..self.children.len() {
                 for index in source + 1..self.children.len() {
-                    if !self.config.profile.peer_replicas()
+                    if (!self.config.profile.peer_replicas()
+                        && self.config.profile.configured_sizes().is_none())
                         || (source != 0 && !self.config.profile.mesh_peers())
                     {
                         continue;
@@ -352,7 +360,6 @@ impl Cluster {
             || !metadata.address.ip().is_loopback()
             || metadata.address.port() == 0
             || profile != metadata.profile.is_some()
-            || owner.launch.profile.peer_replicas() != metadata.peer_address.is_some()
             || metadata
                 .peer_address
                 .is_some_and(|address| !address.ip().is_loopback() || address.port() == 0)
@@ -710,7 +717,7 @@ impl Cluster {
     async fn advance_initial_membership(&mut self) -> Result<()> {
         if self.config.profile.configured_sizes().is_none()
             || self.ledger.generation_pending()
-            || self.children.len() <= 1
+            || self.config.profile.node_count() <= 1
             || self.ledger.configuration.is_some()
             || self.ledger.placements[0].observed != fm::Observed::Running
             || self
@@ -721,7 +728,7 @@ impl Cluster {
         {
             return Ok(());
         }
-        if let Some(destination) = (1..self.children.len()).find(|index| {
+        if let Some(destination) = (1..self.config.profile.node_count()).find(|index| {
             !self
                 .ledger
                 .idles
@@ -747,7 +754,7 @@ impl Cluster {
     pub async fn repair_primary_replica(&mut self) -> Result<Value> {
         if self.finished.is_some()
             || !self.config.profile.mesh_peers()
-            || self.children.len() != self.config.profile.node_count()
+            || self.children.len() != self.ledger.placements.len()
         {
             return Err("Primary repair requires the original running configured cluster".into());
         }
@@ -761,7 +768,7 @@ impl Cluster {
     pub async fn repair_secondary_replica(&mut self, destination: u8) -> Result<Value> {
         if self.finished.is_some()
             || destination == 0
-            || self.children.len() != self.config.profile.node_count()
+            || self.children.len() != self.ledger.placements.len()
         {
             return Err("Secondary repair requires the original running cluster".into());
         }
@@ -773,6 +780,23 @@ impl Cluster {
                 self.ledger.lost(self.ledger.primary_index(), error.clone());
                 return Err(error);
             }
+        }
+        Ok(self.ledger.repair_status())
+    }
+
+    /// Replace one processed lost member on an explicitly selected unused Node.
+    pub async fn replace_replica_on(&mut self, destination: u8) -> Result<Value> {
+        if self.finished.is_some()
+            || destination == 0
+            || self.children.len() != self.ledger.placements.len()
+        {
+            return Err("replacement requires the original running Node pool".into());
+        }
+        if self
+            .ledger
+            .begin_spare_replacement(usize::from(destination - 1), Instant::now())?
+        {
+            self.request_repair_build().await?;
         }
         Ok(self.ledger.repair_status())
     }
@@ -881,7 +905,7 @@ impl Cluster {
     /// Begin one live-session ordinary-FM inventory reconciliation. New
     /// mutations remain gated until all native LFUM uploads are processed.
     pub fn begin_generation_handshake(&mut self) -> Result<Value> {
-        if self.finished.is_some() || self.children.len() != self.config.profile.node_count() {
+        if self.finished.is_some() || self.children.len() != self.ledger.placements.len() {
             return Err("generation handshake requires the original running cluster".into());
         }
         self.ledger.begin_generation()?;
@@ -1266,7 +1290,7 @@ impl Cluster {
         if !(self.config.profile == ServiceProfile::StatefulThree
             || self.config.profile.configured_sizes().is_some())
             || self.finished.is_some()
-            || self.children.len() != self.config.profile.node_count()
+            || self.children.len() != self.ledger.placements.len()
             || !(2..=self.children.len()).contains(&usize::from(destination))
         {
             return Err(
@@ -1303,7 +1327,7 @@ impl Cluster {
         Ok(self.ledger.idle_status())
     }
     pub async fn activate_idle_replica(&mut self) -> Result<Value> {
-        if self.finished.is_some() || self.children.len() != self.config.profile.node_count() {
+        if self.finished.is_some() || self.children.len() != self.ledger.placements.len() {
             return Err("configuration requires the original running cluster".into());
         }
         let body = self.ledger.request_configuration(Instant::now())?;
@@ -1671,7 +1695,7 @@ impl Cluster {
                 .repair_history
                 .iter()
                 .chain(self.ledger.repair.iter())
-                .filter(|r| r.predecessor.replica.node == child.launch.node)
+                .filter(|r| !r.uses_spare() && r.predecessor.replica.node == child.launch.node)
             {
                 let path = child.launch.host_replacement_path(
                     repair.predecessor.replica.id,

@@ -4,8 +4,10 @@
 the local FM launcher's parent/stdin contract. An external FM owns the native
 reliability exchanges. The execution profile is one fresh volatile partition
 with explicit, immutable `target` and `minimum`, satisfying
-`1 <= minimum <= target <= 64`. This initial topology has `target` original
-Nodes and `target - 1` peers per Node; a singleton has no peers. The ceiling is
+`1 <= minimum <= target <= 64`. The statically known Node pool may exceed
+target, up to 64 Nodes: list every other pool member in each Node's `peers`.
+Initial active membership still contains target replicas; unused placements
+are spares, not voters. A one-Node pool has no peers. The ceiling is
 a fube resource bound, not an SF replica-set-size rule.
 
 The runner is a thin process/transport owner over
@@ -201,9 +203,9 @@ the explicit overrides select 3/2 here. A custom application supplies its own
 declared parameters, listeners and client protocol.
 Both size fields are required; there are no compatibility defaults. To select
 3/3, set `minimum` to 3 and make the resolved package minimum 3 too.
-Size changes during the deployment remain unsupported. Spare placement and
-replacement at minimum remain separate
-[S3 work](../../../docs/cluster/RustRaPort.md#configurable-replica-set-sizes-plan).
+Size changes during the deployment remain unsupported. For a spare, configure
+an additional distinct placement and include it in every original peer list
+before startup; dynamic joining is not supported.
 
 Node IDs are nonzero hexadecimal numbers, not UUIDs. Configuration supplies the
 original Node/replica instances, replica IDs, bootstrap generation and
@@ -296,10 +298,29 @@ frame without acknowledging admission, in both launchers.
 Unsupported native branches still reject explicitly. The runner does not expose
 the local launcher's owned replacement-host control: fresh-host provisioning
 belongs to shared Node/Hosting after admitted replica creation. It does not invent an external FM,
-spare placement, reconnect or restart protocol. The deprecated
+automatic placement, reconnect or restart protocol. The deprecated
 ChangeConfigurationReply remains explicitly logged/rejected by the shared
 adapter, never a progress gate. Definite rejected control produces a failed
 command receipt without blocking unrelated cleanup; uncertain work stays owned.
+
+### Explicit spare replacement at minimum
+
+The external FM may build an unused preconfigured placement with normal
+AddReplica/CreateReplica/Open/copy. A fresh Idle receives the surviving
+Primary's compatible deactivation history, never an old runtime or vote.
+After the actual Ready/Idle AddReplicaReply, one same-Primary
+DoReconfiguration retains the exact down S/N member in PC, preserves every
+live P/P and S/S identity, and admits the fresh I/S member in CC. Target,
+minimum and service version stay unchanged. All survivor phase commits and
+final RAP/FM completion remain required; a build reply alone restores no vote.
+
+Real-process cases cover 3/3 and 4/4 after either Primary or Secondary app-host
+loss, using one spare. They preserve nonempty data and original survivor
+owners, replay lost build/final replies, and prove that the spare supplies an
+actual quorum vote after another original Secondary is lost. Losing the spare
+then prevents a fresh write. Predecessor cleanup remains independently owned.
+This does not qualify dynamic joins, automatic placement, repeated spare
+cycles or generation-upload overlaps during spare repair.
 
 ### Original-node replica restoration
 

@@ -514,16 +514,18 @@ current-sequence acknowledgments and independent history cleanup.
 
 #### Configurable replica-set sizes plan
 
-**S1 and S2 are implemented: minimum-preserving Primary failover and configurable
-standalone sizes. Next is placement/replacement at minimum (S3).
-S3 and the follow-on transitions remain unimplemented.**
+**S1-S3 are implemented: minimum-preserving Primary failover, configurable
+standalone sizes and explicit replacement on a statically preconfigured spare.
+Follow-on transitions remain separately gated.**
 Configurability means choosing service sizes at creation; live resizing is a
 separate capability. Do not introduce another size-specific execution profile.
 
 Current shared RA/Node/runtime admission accepts general sizes satisfying
 `1 <= minimum <= target <= 64`; 64 is a fube resource bound, not an SF rule.
 Both launchers use the same parameterized Hosting/profile contract and shared
-size validation. Standalone requires explicit sizes, compares resolved package
+size/pool validation. A static pool can contain more Nodes than desired members;
+unused placements have empty LFUM inventory and no replica vote.
+Standalone requires explicit sizes, compares resolved package
 sizes before acquiring its run directory and admits normal active deletion
 only for an exact completed current membership. This does not make every
 lifecycle branch generic: healthy planned transfer remains limited to 2/1,
@@ -546,12 +548,14 @@ Source baseline: Service Fabric
   of acknowledgements required for each write.
 - `fm/ReconfigurationTask.cpp:357-418` accounts for Ready Idles during
   removal/admission and desired target separately from current membership.
+- `ra/FailoverUnit.cpp:269-297` gives a fresh Idle the creating Primary's
+  deactivation history; copy completion is not active membership.
 
 | Increment | Scope and dependencies | Completion gate |
 |---|---|---|
 | S1. Minimum-preserving Primary failover (implemented) | Shared RA admits a retained down former Primary without confusing it with Secondary-removal supersession. Test FM swaps Primary/Secondary roles before removing down members only above minimum. RA/FM regressions first failed against the old implementation; removal above minimum and interrupted-removal paths remain covered. | Real 3/3 and 4/4 process cases preserve minimum, retain nonempty data and acknowledge a new majority-backed write after final reconfiguration, including a lost final reply and exact replay. Another Secondary loss cannot acknowledge a new operation. RA tests hold survivor/final commits, reject changed identities/invalid retained state or interruption epochs, preserve LFUM/runtime ownership and replay completion without another Open. |
 | S2. Configurable standalone sizes (implemented) | Explicit target/minimum feed shared ingress and the parameterized Hosting package contract, also used by the configured local cluster. Resolved package/native descriptions must agree with immutable service sizes. Variable original topologies include a peerless singleton; successors retain the same declared sizes. Active deletion retains exact lifetime/current-epoch/completed-configuration fences, including refusal during unfinished failover. | Standalone processes cover 1/1, 2/1, 3/3, 4/2, 4/3, 4/4 and 5/3 with initial build/admission, lost-reply replay, stable LFUM, Primary failover where applicable, normal deletion/replay and owned shutdown. Local-cluster cases share Hosting validation and extend stable LFUM across configured sizes, retaining existing failover/repair qualification. Missing/invalid sizes and package/native-description mismatches reject before the corresponding work; shared model/package tests include 64/64, not 64 processes. |
-| S3. Placement and replacement at minimum (depends on S2) | Separate available placement identities from desired target rather than permanently equating node-pool size with target. Port/qualify the required Ready-Idle replacement and combined removal/admission sequence against SF, including original-host fencing and fresh identity/activation. | Restore redundancy at minimum without temporarily lowering minimum or mistaking copy/build completion for active membership. Preserve PC/CC obligations, stale-owner rejection, retained data and independent physical cleanup. Until qualified, original-node-only repair remains explicitly bounded. |
+| S3. Placement and replacement at minimum (implemented) | Known pool size is independent of target: standalone lists every other preconfigured Node; local cluster accepts `--nodes` / `Cluster::with_node_pool`. Initial membership uses target placements, leaving spares unopened. Explicit FM AddReplica builds a fresh Idle on an unused bound Node with the surviving Primary's compatible history. The existing shared RA removal/admission transition retains the down member in PC, removes it from CC and admits the Ready Idle without changing sizes. | Both launchers qualify 3/3 and 4/4 after either Primary or Secondary app-host loss, with one preconfigured spare, stable membership/empty-spare LFUM, lost build/final-reply replay, nonempty copy, unchanged survivor owners and independent cleanup. Another original Secondary loss can still commit only with the replacement's real vote; losing that spare prevents a fresh write. RA models cover rejected/premature/changed-owner intent, fresh Open and survivor/final commit barriers, store veto and frozen LFUM. FM models fence further losses during build/admission. Dynamic joining, automatic placement, repeated spare cycles and new spare-repair LFUM overlaps are not enabled. |
 | Follow-on size-dependent transitions | Migrate remaining named-profile production paths and their tests to shared size/membership invariants as each transition is qualified. General planned transfer, broader test-FM LFUM overlap admission and live service-size updates need their own source-derived gates; S2 does not enable them implicitly. | Fixed sizes may remain test inputs, not general production admission rules. Keep unsupported functionality explicit and preserve native wire contracts. |
 
 Backward compatibility for runner configuration, launcher profile names and

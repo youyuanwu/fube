@@ -434,29 +434,47 @@ fn create_remote(
     let current = current.ok_or(Failure::Admission(
         "remote creation needs an existing Primary",
     ))?;
-    let repair = (completed_primary_failover(current)
-        || reconfiguration::completed_secondary_removal(current))
-        && current.body.replica.current_role == 4
-        && reconfiguration::completed_configuration(current).is_some_and(|c| {
-            !c.replicas
+    let spare = reconfiguration::completed_configuration(current).is_some_and(|c| {
+        c.unit.current == current.body.unit.current
+            && valid_stateful_sizes(&c.service)
+            && c.unit.target >= 2
+            && c.replicas.0.iter().filter(|r| r.current_role >= 3).count() <= c.unit.target as usize
+            && !c
+                .replicas
                 .0
                 .iter()
-                .any(|r| r.node == target.node && r.current_role >= 3)
-        })
-        && current
-            .reconfiguration
-            .iter()
-            .map(|c| &c.request)
-            .chain(current.swap.iter().map(|s| &s.intent))
-            .any(|body| {
-                body.replicas.0.iter().any(|r| {
-                    r.node == target.node
-                        && !r.up
-                        && matches!(r.current_role, 1 | 3)
-                        && target.id > r.id
-                        && target.instance > r.instance
-                })
-            });
+                .any(|r| r.node.id == target.node.id || r.id == target.id)
+            && current.remote_idles.iter().all(|idle| {
+                c.replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == idle.target && r.current_role >= 3)
+            })
+    });
+    let repair = spare
+        || (completed_primary_failover(current)
+            || reconfiguration::completed_secondary_removal(current))
+            && current.body.replica.current_role == 4
+            && reconfiguration::completed_configuration(current).is_some_and(|c| {
+                !c.replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == target.node && r.current_role >= 3)
+            })
+            && current
+                .reconfiguration
+                .iter()
+                .map(|c| &c.request)
+                .chain(current.swap.iter().map(|s| &s.intent))
+                .any(|body| {
+                    body.replicas.0.iter().any(|r| {
+                        r.node == target.node
+                            && !r.up
+                            && matches!(r.current_role, 1 | 3)
+                            && target.id > r.id
+                            && target.instance > r.instance
+                    })
+                });
     if current.reconfiguration.is_some() && !retired_configuration(current) && !repair {
         return Err(Failure::Unsupported(
             "active-configuration replica changes are gated",
