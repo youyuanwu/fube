@@ -119,8 +119,22 @@ and [LFUM alignment plan](../../../docs/cluster/RustRaPort.md#lfum-alignment-pla
 Copy/build interruption and removal supersession remain separate qualification.
 Deactivation keeps Node/RA live while the replica closes; whole-RA shutdown of
 accepted snapshot jobs and automatic interrupted-repair recovery are not claimed.
-Planned transfer retains the separate healthy two-member runtime qualification;
-configurable sizes do not qualify general transfer or standalone transfer overlaps.
+Healthy planned transfer is qualified at 2/1 and 3/2, including either Secondary
+as the 3/2 candidate. FM sends native DoReconfiguration to the old Primary with
+P/S, S/P and (at 3/2) S/S roles, unchanged identities/sizes and the next Primary
+epoch. Shared RA owns demotion, peer continuation, timed quorum/history GetLSN,
+catch-up, every Secondary's committed activation and final RAP/FM completion.
+Unequal progress is permitted when history selects the forwarded candidate.
+An unchanged Secondary commits activation metadata without a RAP request,
+even with its GetLSN callback pending; the demoted member also needs no second
+RAP round trip after its real phase-0 role change.
+Publish the new Primary only after its successful native DoReconfigurationReply;
+ReplicaEndpointUpdated/Reply is not completion. Process tests replay lost final
+replies, fence the old writer, retain owners/data and require the unchanged
+Secondary's real vote after the old Primary closes. Non-responding or
+uncatchable Secondaries that SF would restart explicitly block completion:
+native Secondary restart/rebuild is not implemented. Other sizes,
+abort/reverse transfer and generation/LFUM overlaps remain unqualified or gated.
 Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,
 FM/FMM rebuild and restart remain gated. Native-free acceptance is not complete
 original C++ handler or native FM/Federation interoperability evidence.

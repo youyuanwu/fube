@@ -127,8 +127,9 @@ The original-node repair APIs retain their target-sized topology qualification;
 a larger pool does not implicitly enable recycling original placements or
 replacement after every possible partial-membership transition.
 
-The configured profile still rejects resize, planned transfer and healthy
-Secondary retirement. Host replacement is explicit, never automatic.
+The configured profile still rejects resize and healthy Secondary retirement.
+One healthy planned transfer is qualified at 2/1 and 3/2 as described below;
+other sizes remain gated. Host replacement is explicit, never automatic.
 Insufficient read quorum blocks failover without declaring data loss. Additional
 loss during an in-flight transition makes its ownership unknown, not successful,
 except for the bounded pre-replacement Primary-loss supersession above.
@@ -159,8 +160,8 @@ quorum. Source-bound process tests also lose/replay build and final configuratio
 replies, preserve all original owners/one Open each and verify independent
 three-child cleanup. The bounded Primary app-host failover and explicit repair
 below are supported, as is generation upload from stable completed membership
-or original healthy same-Primary Secondary admission;
-planned transfer, general replacement/retirement, broader in-flight configuration upload,
+or original healthy same-Primary Secondary admission, and one healthy planned
+transfer as described below. General replacement/retirement, broader in-flight configuration upload,
 data loss and node/runtime adoption remain gated for this profile.
 See [source mapping and limits](../../../docs/cluster/MinimalFmCluster.md#healthy-three-replica-service).
 
@@ -274,12 +275,17 @@ replacement, concurrent supersession and restart stay gated.
 See the [source mapping and evidence limits](../../../docs/cluster/MinimalFmCluster.md#healthy-configured-secondary-retirement-and-replacement).
 
 `Cluster::transfer_primary().await` explicitly transfers Primary from node 1
-to node 2 after completed healthy two-member active admission, including the
-supported replacement. Native phase-0 RAP demotion/write revocation must finish
+to node 2 after completed healthy 2/1 or 3/2 active admission. The legacy 2/1
+path also accepts its supported replacement. Native phase-0 RAP demotion/write revocation must finish
 before peer DoReconfiguration continuation. The candidate then obtains actual
 local RAP and peer GetLSN progress, promotes/catches up, activates the demoted
-member and completes final RAP configuration and its committed FM reply.
-The native default PC=CC path skips phase-3 Deactivate; neither member reopens
+member and any unchanged Secondary, and completes final RAP configuration and its committed FM reply.
+GetLSN uses SF's bounded wait, separate PC/CC read quorums and deactivation
+history before comparing LSNs; equal progress is not required. The selected
+swap candidate does not use failover's catch-up-capability redirection.
+Secondary activation commits metadata and ACKs without another RAP round trip;
+the old Primary's actual demotion already completed in phase 0.
+The native default PC=CC path skips phase-3 Deactivate; no member reopens
 or rebuilds. Existing data and node/app/factory/runtime owners remain intact.
 Poll `configuration.kind=planned_primary_transfer` and `ready=true`.
 Only the exact new-Primary reply publishes node 2's endpoint in `nodes[1]`;
@@ -290,8 +296,11 @@ Prior requests/replies remain in `configuration.history`; current swap
 phase/error is in `nodes[].retained_work.local_replica.swap`.
 Lost replies replay the retained continuation/completion without another Open.
 New-Primary loss yields unknown, never failback or quorum reduction. Second/
-reverse transfer, progress mismatch repair, swap abort, automatic failover,
+reverse transfer, transfer after repair/generation rounds, swap abort, automatic failover,
 restart and full native handler/interoperability qualification remain gated.
+If SF requires restarting a non-responding or uncatchable Secondary after
+GetLSN selection, completion explicitly rejects before activation: native
+Secondary restart/rebuild is not implemented by this handoff path.
 See the [source mapping and acceptance boundaries](../../../docs/cluster/MinimalFmCluster.md#healthy-planned-primary-transfer).
 
 `Cluster::remove_idle_replica_via_fm().await` lets FM cancel its original pending

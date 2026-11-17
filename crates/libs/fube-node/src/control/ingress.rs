@@ -422,8 +422,9 @@ impl Ingress {
             return Err("new peer lifecycle intent is not admitted during shutdown".into());
         }
         let result = match action.as_str() {
-            "DoReconfiguration" if !self.coordinating && !self.profile.mesh_peers() => {
+            "DoReconfiguration" if !self.coordinating || self.profile.mesh_peers() => {
                 let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
+                self.description(&body.configuration.unit, &body.configuration.service)?;
                 node.continue_swap_from_peer(body, source, &generation)
             }
             "GetLSN" => {

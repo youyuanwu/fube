@@ -4045,8 +4045,20 @@ impl Ledger {
         Some(config.body.clone())
     }
     pub fn request_primary_transfer(&mut self, now: Instant) -> Result<DoReconfiguration> {
-        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
-            || self.generation.is_some()
+        if !matches!(
+            self.placements[0].launch.profile,
+            crate::ServiceProfile::StatefulPeerIdle
+                | crate::ServiceProfile::StatefulThree
+                | crate::ServiceProfile::Stateful {
+                    target: 2,
+                    minimum: 1
+                }
+                | crate::ServiceProfile::Stateful {
+                    target: 3,
+                    minimum: 2
+                }
+        ) || self.generation.is_some()
+            || self.repair.is_some()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
             || self.placements.iter().any(|p| {
@@ -4060,7 +4072,7 @@ impl Ledger {
             })
         {
             return Err(
-                "Primary transfer requires the two healthy original admitted sessions".into(),
+                "Primary transfer requires healthy original admitted 2/1 or 3/2 sessions".into(),
             );
         }
         if let Some(swap) = &mut self.swap {
@@ -4073,14 +4085,18 @@ impl Ledger {
         let active = self
             .configuration
             .as_ref()
-            .filter(|c| c.reply.is_some() && !c.unknown && c.body.configuration.unit.target == 2)
-            .ok_or("Primary transfer requires completed two-member active membership")?;
+            .filter(|c| {
+                c.reply.is_some()
+                    && !c.unknown
+                    && c.body.configuration.replicas.0.len() == self.placements.len()
+            })
+            .ok_or("Primary transfer requires completed original active membership")?;
         if self
             .placements
             .iter()
             .any(|p| p.observed != Observed::Running)
         {
-            return Err("Primary transfer requires both members Running".into());
+            return Err("Primary transfer requires every member Running".into());
         }
         let mut body = active.body.clone();
         let reply = active.reply.as_ref().expect("completed configuration");
@@ -4093,9 +4109,17 @@ impl Ledger {
             .checked_add(0x1_0000_0001)
             .ok_or("Primary epoch exhausted")?;
         body.configuration.replicas = reply.replicas.clone();
+        let candidate = reply
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.current_role == 3)
+            .ok_or("Primary transfer requires an active Secondary")?
+            .node
+            .clone();
         for r in &mut body.configuration.replicas.0 {
             r.previous_role = r.current_role;
-            r.current_role = if r.current_role == 4 { 3 } else { 4 };
+            r.current_role = if r.node == candidate { 4 } else { 3 };
         }
         body.phase0_duration = i64::MAX;
         for p in &mut self.placements {

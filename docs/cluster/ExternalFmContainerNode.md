@@ -407,9 +407,20 @@ is shared with the local cluster. The [alignment plan](RustRaPort.md#lfum-alignm
 tracks remaining copy/build interruption and removal supersession.
 Each repeated failover round uses the latest completed membership and known
 fresh replica identities, not the original configuration. Shared model/store
-coverage of transfer/redirection does not enable standalone planned transfer: that runtime
-qualification remains limited to the separate healthy two-member runtime path.
-Configurable sizes do not qualify general transfer or standalone transfer overlaps.
+coverage of transfer/redirection is separate from runtime qualification.
+Standalone now qualifies one healthy planned handoff at 2/1 and 3/2, including
+either original Secondary as candidate and committed participation by the
+unchanged 3/2 Secondary. FM starts at the old Primary; shared RA owns the native
+demotion/continuation, timed PC/CC quorum and deactivation-history GetLSN
+selection, catch-up, activation and final
+RAP/FM barriers. Publish the new Primary only after its successful native
+DoReconfigurationReply, never an early endpoint update/ACK.
+Unequal progress is permitted without failover-only catch-up-capability
+redirection. Secondary activation is a metadata commit, not another RAP role
+transition; a pending GetLSN callback cannot hold an otherwise valid S/S ACK.
+Cases requiring native Secondary restart/rebuild remain explicitly gated
+before activation. Other sizes, abort/reverse transfer and standalone
+generation/LFUM transfer overlaps remain unqualified or gated.
 Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,
 FM/FMM rebuild and restart remain gated; native handler/interoperability evidence
 remains incomplete.
