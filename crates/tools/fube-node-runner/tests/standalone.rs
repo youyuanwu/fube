@@ -1183,13 +1183,22 @@ async fn standalone_configured_sizes_preserve_membership_failover_lfum_and_delet
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn standalone_spare_replaces_a_lost_member_at_minimum_without_reopening_survivors() {
-    for (target, lose_primary) in [(3, true), (4, true), (3, false), (4, false)] {
+async fn standalone_spare_restores_target_membership_without_reopening_survivors() {
+    for (target, minimum, lose_primary) in [
+        (3, 3, true),
+        (4, 4, true),
+        (3, 3, false),
+        (4, 4, false),
+        (3, 2, true),
+        (4, 2, true),
+        (4, 3, true),
+        (5, 3, true),
+    ] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else {
             unreachable!()
         };
-        let mut fixture = Fixture::with_node_pool(address, target, target, target + 1);
+        let mut fixture = Fixture::with_node_pool(address, target, minimum, target + 1);
         fixture.start();
         let mut fm = FmFixture::accept(listener, &mut fixture).await;
         fm.until(&mut fixture, |fm| {
@@ -1288,7 +1297,7 @@ async fn standalone_spare_replaces_a_lost_member_at_minimum_without_reopening_su
             for r in &mut config.replicas.0 {
                 r.previous_role = r.current_role;
                 if r.node == old.node {
-                    r.current_role = 3;
+                    r.current_role = if minimum == target { 3 } else { 1 };
                     r.up = false;
                     r.state = 3;
                 } else if r.node == fixture.configs[selected].node.identity.native().unwrap() {
@@ -1365,7 +1374,7 @@ async fn standalone_spare_replaces_a_lost_member_at_minimum_without_reopening_su
                 .iter()
                 .filter(|r| r.previous_role >= 3)
                 .count(),
-            target as usize
+            target as usize - usize::from(lose_primary && minimum < target)
         );
         assert_eq!(
             replacement
@@ -1401,7 +1410,7 @@ async fn standalone_spare_replaces_a_lost_member_at_minimum_without_reopening_su
         assert_eq!(fm.configured.last(), Some(&held));
         assert_eq!(held.replicas.0.len(), target as usize);
         assert!(held.replicas.0.iter().all(|r| r.node != old.node && r.up));
-        assert_eq!((held.unit.target, held.unit.minimum), (target, target));
+        assert_eq!((held.unit.target, held.unit.minimum), (target, minimum));
         assert!(application(&endpoint, "read")
             .await
             .contains("committed=1 value=acknowledged"));
@@ -1415,18 +1424,20 @@ async fn standalone_spare_replaces_a_lost_member_at_minimum_without_reopening_su
             }
             assert_eq!(fixture.status(i)["host_replacement_count"], 0);
         }
-        // Losing another original Secondary leaves a real majority only if the spare votes.
-        let second_loss = (0..target as usize)
-            .find(|i| *i != lost && *i != selected)
-            .unwrap();
-        let pid = owners[second_loss]["application_pid"].as_u64().unwrap();
-        assert!(Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status()
-            .unwrap()
-            .success());
-        fm.until(&mut fixture, |fm| fm.losses.contains(&second_loss))
-            .await;
+        // The surviving originals need the spare's vote to form a majority.
+        for second_loss in (0..target as usize)
+            .filter(|i| *i != lost && *i != selected)
+            .take(spare - (spare / 2 + 1))
+        {
+            let pid = owners[second_loss]["application_pid"].as_u64().unwrap();
+            assert!(Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status()
+                .unwrap()
+                .success());
+            fm.until(&mut fixture, |fm| fm.losses.contains(&second_loss))
+                .await;
+        }
         assert!(application(&endpoint, "write-more")
             .await
             .contains("committed=2 value=continued"));

@@ -303,7 +303,7 @@ ChangeConfigurationReply remains explicitly logged/rejected by the shared
 adapter, never a progress gate. Definite rejected control produces a failed
 command receipt without blocking unrelated cleanup; uncertain work stays owned.
 
-### Explicit spare replacement at minimum
+### Explicit spare restoration
 
 The external FM may build an unused preconfigured placement with normal
 AddReplica/CreateReplica/Open/copy. A fresh Idle receives the surviving
@@ -313,12 +313,17 @@ DoReconfiguration retains the exact down S/N member in PC, preserves every
 live P/P and S/S identity, and admits the fresh I/S member in CC. Target,
 minimum and service version stay unchanged. All survivor phase commits and
 final RAP/FM completion remain required; a build reply alone restores no vote.
+If completed Primary failover already removed the down member above minimum,
+the next configuration instead keeps the surviving membership as PC and adds
+the Ready Idle to CC, restoring target without reintroducing the removed owner.
 
 Real-process cases cover 3/3 and 4/4 after either Primary or Secondary app-host
 loss, using one spare. They preserve nonempty data and original survivor
 owners, replay lost build/final replies, and prove that the spare supplies an
-actual quorum vote after another original Secondary is lost. Losing the spare
-then prevents a fresh write. Predecessor cleanup remains independently owned.
+actual quorum vote after enough original Secondaries are lost. Additional
+3/2, 4/2, 4/3 and 5/3 cases qualify restoration from target-minus-one membership
+after Primary failover, with the same copy, replay and owner guarantees.
+Losing the spare then prevents a fresh write. Predecessor cleanup remains independently owned.
 This does not qualify dynamic joins, automatic placement, repeated spare
 cycles or generation-upload overlaps during spare repair.
 

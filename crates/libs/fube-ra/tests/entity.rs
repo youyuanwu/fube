@@ -7064,9 +7064,21 @@ fn failover_progress(
 #[tokio::test]
 async fn configured_failover_and_supported_repair_track_every_survivor_and_commit_with_unequal_progress(
 ) {
-    for (target, minimum) in [(2, 1), (3, 3), (4, 2), (4, 3), (4, 4), (5, 3), (64, 32)] {
+    for (target, minimum, spare) in [
+        (2, 1, false),
+        (3, 3, true),
+        (4, 2, false),
+        (4, 3, false),
+        (4, 4, true),
+        (5, 3, false),
+        (64, 32, false),
+        (3, 2, true),
+        (4, 2, true),
+        (4, 3, true),
+        (5, 3, true),
+    ] {
         let (store, executor, hooks) = setup(WAIT).await;
-        if target == minimum {
+        if spare {
             let completion =
                 activating_configured_survivor_in_pool(&executor, target, minimum, target + 1)
                     .await;
@@ -7280,7 +7292,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
         let mut fresh = intent.replicas.0.iter().find(|r| !r.up).unwrap().clone();
         fresh.id += 1000;
         fresh.instance += 1000;
-        if target == minimum {
+        if spare {
             fresh.node = NodeInstance {
                 id: [20 + (target - 2) as u8; 16],
                 instance: 100 + (target - 2) as u64,
@@ -7323,7 +7335,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
             effects(&executor).as_slice(),
             [Effect::BuildIdle { .. }]
         ));
-        if target == minimum {
+        if spare {
             let mut premature = promoted.swap.as_ref().unwrap().body.clone();
             premature.unit.previous = premature.unit.current;
             premature.unit.current.configuration += 1;
@@ -7534,7 +7546,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
         assert_eq!(state(&executor).runtime, original.runtime);
         let mut stable = repair.clone();
         stable.unit.previous = Epoch::default();
-        if target == minimum {
+        if spare {
             stable.replicas.0.retain(|r| r.current_role >= 3);
         }
         for replica in &mut stable.replicas.0 {

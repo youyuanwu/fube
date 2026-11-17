@@ -861,6 +861,83 @@ fn spare_replacement_requires_explicit_unused_placement_and_fences_each_further_
 }
 
 #[test]
+fn spare_restoration_after_failover_requires_the_exact_processed_removed_primary() {
+    for (target, minimum) in [(3, 2), (4, 2), (4, 3), (5, 3)] {
+        for lose_at in 0..4 {
+            let mut ledger = configured_ledger_in_pool(target, minimum, target + 1);
+            let old = ledger.placements[0].body().unwrap();
+            ledger.report(0, &stateful_loss_report(&ledger.placements[0])).unwrap();
+            let failover = ledger.start_primary_failover(Instant::now()).unwrap().unwrap();
+            assert!(ledger.begin_spare_replacement(target as usize, Instant::now()).is_err());
+            let mut reply = ConfigurationReply {
+                unit: failover.configuration.unit,
+                replicas: failover.configuration.replicas,
+                error: 0,
+            };
+            reply.unit.previous = Epoch::default();
+            reply.replicas.0.retain(|r| r.current_role >= 3);
+            for r in &mut reply.replicas.0 {
+                r.previous_role = 1;
+                r.first_lsn = 1;
+                r.last_lsn = 1;
+                r.service_endpoint = if r.current_role == 4 { "127.0.0.1:12349".into() } else { String::new() };
+            }
+            ledger.configuration_reply(1, reply.clone()).unwrap();
+            assert_eq!(ledger.configuration_status()["ready"], true);
+            assert_eq!(reply.replicas.0.len(), target as usize - 1);
+            assert!(ledger.begin_spare_replacement(target as usize, Instant::now()).is_err());
+            ledger.reply(0, AddInstanceReply {
+                unit: old.unit, replica: dropped_replica(&old.replica), error: 0,
+            }, true).unwrap();
+            assert!(ledger.begin_spare_replacement(1, Instant::now()).is_err());
+            assert!(ledger.begin_spare_replacement(target as usize, Instant::now()).unwrap());
+            let build = ledger.repair.as_ref().unwrap().build.body.clone();
+            assert_eq!(build.unit, reply.unit);
+            let mut built = AddReplicaReply { unit: build.unit, replica: build.replica, error: 0 };
+            built.replica.state = 2;
+            built.replica.replication_endpoint = "127.0.0.1:12350".into();
+            if lose_at == 0 {
+                ledger.report(2, &stateful_loss_report(&ledger.placements[2])).unwrap();
+            }
+            ledger.idle_reply(1, built).unwrap();
+            if lose_at == 1 {
+                ledger.report(2, &stateful_loss_report(&ledger.placements[2])).unwrap();
+            }
+            let request = ledger.start_repair_configuration(Instant::now()).unwrap();
+            if lose_at < 2 {
+                assert!(request.is_none());
+                assert_eq!(ledger.repair_status()["state"], "unknown");
+                continue;
+            }
+            let request = request.unwrap().configuration;
+            assert_eq!((request.unit.target, request.unit.minimum), (target, minimum));
+            assert_eq!(request.replicas.0.len(), target as usize);
+            assert_eq!(request.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), target as usize - 1);
+            assert!(!request.replicas.0.iter().any(|r| r.node == old.replica.node));
+            for old in &reply.replicas.0 {
+                let mut survivor = request.replicas.0.iter().find(|r| r.node == old.node).unwrap().clone();
+                survivor.previous_role = old.previous_role;
+                assert_eq!(&survivor, old);
+            }
+            if lose_at == 2 {
+                ledger.report(2, &stateful_loss_report(&ledger.placements[2])).unwrap();
+            }
+            let mut completed = ConfigurationReply {
+                unit: request.unit, replicas: request.replicas, error: 0,
+            };
+            completed.unit.previous = Epoch::default();
+            for r in &mut completed.replicas.0 { r.previous_role = 1; }
+            ledger.configuration_reply(1, reply).unwrap();
+            assert_eq!(ledger.repair_status()["ready"], false);
+            ledger.configuration_reply(1, completed.clone()).unwrap();
+            ledger.configuration_reply(1, completed).unwrap();
+            assert_eq!(ledger.repair_status()["ready"], lose_at == 3);
+            assert!(ledger.placements[0].loss_reported);
+        }
+    }
+}
+
+#[test]
 fn configured_failover_removes_down_members_only_above_minimum() {
     for (target, minimum, secondary_losses) in [
         (3, 3, 0), (4, 4, 0), (4, 4, 1), (4, 3, 1), (5, 3, 1), (64, 64, 0),
@@ -4366,11 +4443,14 @@ async fn configured_primary_failover_preserves_sizes_data_and_quorum_with_unavai
 }
 
 #[tokio::test]
-async fn configured_spare_replaces_a_lost_member_at_minimum_and_supplies_a_real_vote() {
-    for (target, lose_primary) in [(3, true), (4, true), (3, false), (4, false)] {
+async fn configured_spare_restores_target_membership_and_supplies_a_real_vote() {
+    for (target, minimum, lose_primary) in [
+        (3, 3, true), (4, 4, true), (3, 3, false), (4, 4, false),
+        (3, 2, true), (4, 2, true), (4, 3, true), (5, 3, true),
+    ] {
         let fixture = Fixture::new("configured-spare");
         let mut config = fixture.config();
-        config.profile = ServiceProfile::Stateful { target, minimum: target };
+        config.profile = ServiceProfile::Stateful { target, minimum };
         config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
         let mut cluster = Cluster::with_node_pool(config, target as usize + 1).unwrap();
         if let Err(error) = cluster.start().await {
@@ -4419,8 +4499,9 @@ async fn configured_spare_replaces_a_lost_member_at_minimum_and_supplies_a_real_
             let (built, _) = decode_add_replica_reply(&lost_build).map_err(err)?;
             assert_eq!(repair.build.reply.as_ref(), Some(&built));
             let request = repair.configuration.as_ref().unwrap().body.clone();
-            assert_eq!((request.configuration.unit.target, request.configuration.unit.minimum), (target, target));
-            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), spare);
+            assert_eq!((request.configuration.unit.target, request.configuration.unit.minimum), (target, minimum));
+            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(),
+                spare - usize::from(lose_primary && minimum < target));
             assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role >= 3).count(), spare);
             cluster.send_configuration(&request).await?;
             until(&mut cluster, |c| c.ledger.repair_status()["ready"] == true).await;
@@ -4436,10 +4517,13 @@ async fn configured_spare_replaces_a_lost_member_at_minimum_and_supplies_a_real_
                     assert_eq!(status["nodes"][i]["retained_work"]["app_observation"]["opens"], 1);
                 }
             }
-            let second_loss = (0..spare).find(|i| *i != lost && *i != selected).unwrap();
-            let pid = cluster.ledger.placements[second_loss].profile.as_ref().unwrap().app_pid;
-            assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
-            until(&mut cluster, |c| c.ledger.placements[second_loss].loss_reported).await;
+            for second_loss in (0..spare).filter(|i| *i != lost && *i != selected)
+                .take(spare - (spare / 2 + 1))
+            {
+                let pid = cluster.ledger.placements[second_loss].profile.as_ref().unwrap().app_pid;
+                assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+                until(&mut cluster, |c| c.ledger.placements[second_loss].loss_reported).await;
+            }
             assert!(data_contact(&endpoint, b"write-more\n").contains("committed=2 value=continued"));
             let pid = cluster.ledger.placements[spare].profile.as_ref().unwrap().app_pid;
             assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());

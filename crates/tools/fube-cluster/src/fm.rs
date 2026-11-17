@@ -2906,16 +2906,28 @@ impl Ledger {
             .ok_or("replacement requires completed current membership")?;
         let previous = active.reply.as_ref().expect("completed membership");
         let target = &self.placements[destination];
+        // The completed reply omits members removed during failover.
         let lost: Vec<_> = self
             .placements
             .iter()
             .filter(|p| {
-                p.loss_reported && previous.replicas.0.iter().any(|r| r.node == p.launch.node)
+                p.loss_reported
+                    && active.body.configuration.replicas.0.iter().any(|r| {
+                        r.node == p.launch.node && (r.previous_role >= 3 || r.current_role >= 3)
+                    })
             })
             .collect();
         let [lost] = lost.as_slice() else {
-            return Err("replacement requires exactly one known lost current member".into());
+            return Err(
+                "replacement requires exactly one known lost member of the completed transition"
+                    .into(),
+            );
         };
+        let retained = previous
+            .replicas
+            .0
+            .iter()
+            .any(|r| r.node == lost.launch.node);
         let primary = previous
             .replicas
             .0
@@ -2928,7 +2940,7 @@ impl Ledger {
             || !lost.remove_received
             || lost.launch.node == primary.node
             || previous.unit.target != profile.node_count() as i32
-            || previous.replicas.0.len() != previous.unit.target as usize
+            || previous.replicas.0.len() + usize::from(!retained) != previous.unit.target as usize
             || previous
                 .replicas
                 .0

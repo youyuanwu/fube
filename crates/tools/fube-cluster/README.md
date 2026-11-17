@@ -102,13 +102,17 @@ data-plane writes still require their actual quorum.
 With a preconfigured spare, `Cluster::replace_replica_on(node).await` explicitly
 selects an unused one-based placement after one processed member loss/deletion
 and completed membership/failover. It builds through the shared native
-Open/copy path, then combines down S/N removal and fresh I/S admission.
-PC still contains the down member; CC never falls below minimum. Poll
+Open/copy path, then combines down S/N removal and fresh I/S admission when
+the lost member is still configured. If completed failover already removed the
+old Primary, it instead adds the Ready Idle to the surviving membership.
+PC contains exactly that preceding membership; CC never falls below minimum. Poll
 `repair.ready`, not `host_ready` or `built`. Both launchers qualify this at
 3/3 and 4/4 after Primary or Secondary app-host loss, including stable LFUM
 with empty spare inventory, lost build/final reply replay and actual replacement
-votes after another original Secondary loss. Survivor hosts/runtimes stay
-unchanged, and physical cleanup is independent. Further loss during repair
+votes after another original Secondary loss. Additional 3/2, 4/2, 4/3 and 5/3
+cases restore target from target-minus-one membership after Primary failover,
+with the same copy/replay/ownership checks and actual quorum/no-quorum writes.
+Survivor hosts/runtimes stay unchanged, and physical cleanup is independent. Further loss during repair
 fences completion. Repeated spare cycles, automatic placement, dynamic joining
 and spare-repair generation overlaps remain gated.
 The original-node repair APIs retain their target-sized topology qualification;
