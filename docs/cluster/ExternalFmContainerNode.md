@@ -419,6 +419,16 @@ uses the latest completed membership/roles, including fresh lifetimes after
 the qualified two-cycle 3/2 static-spare repair and completed generation round.
 Process cases perform A-B-A-C with fresh writes after every transfer, retain
 runtime owners and fence stale earlier requests/completions.
+Fixed 3/2 additionally qualifies application-host loss after completed healthy
+handoff to either first candidate: loss of the new Primary runs ordinary native
+failover; loss of either Secondary keeps the current Primary. Explicit FM
+repair rebuilds a fresh volatile replica on the same original Node after exact
+predecessor cleanup, and a later handoff uses its current identity/history.
+All original Node/RA sessions and surviving app owners remain live. Earlier
+replies/Delete cannot affect successors; quorum/no-quorum and owned cleanup
+are exercised. A completed swap is a current-membership baseline, not a permanent
+failover veto. Unfinished/unknown handoffs, other post-handoff sizes, automatic
+failback and persisted Reopen remain outside this bounded recovery profile.
 Unequal progress is permitted without failover-only catch-up-capability
 redirection. Secondary activation is a metadata commit, not another RAP role
 transition; a pending GetLSN callback cannot hold an otherwise valid S/S ACK.

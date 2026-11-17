@@ -49,7 +49,8 @@ or the retained create result, not registration or transport completion.
 Status exposes `replica_set: { target, minimum, immutable: true }`.
 For N = 1 the normal AddPrimary completion settles creation.
 
-After completed initial membership or explicit repair, a matched Primary app-host
+After completed initial membership, explicit repair or qualified healthy 3/2
+planned handoff, a matched Primary app-host
 loss can start no-data-loss failover on the original live Node/RA sessions. Available
 Secondaries need not all have identical progress. RA collects per-member
 GetLSN/history, checks separate PC/CC read quorums, selects using deactivation
@@ -313,8 +314,18 @@ quorum/no-quorum checks. Local 3/2 cases also transfer to and back from a
 freshly repaired original placement or spare after Primary or Secondary loss.
 Completed generation rounds do not permanently disable transfer; concurrent
 generation/LFUM overlap remains unqualified.
-New-Primary loss yields unknown, never failback or quorum reduction. Swap abort, automatic failover,
-restart and full native handler/interoperability qualification remain gated.
+After a completed healthy 3/2 handoff, a matched new-Primary app-host crash can
+start native failover; a former-Primary or unchanged-Secondary crash uses
+same-Primary removal. Explicit `repair_primary_replica()` or
+`repair_secondary_replica(node)` rebuilds on the same original Node after exact
+predecessor cleanup, without a spare pool. Both first candidates and all three
+lost roles are process-qualified, followed by another handoff to the rebuilt
+member, stale earlier traffic, preserved owners/data and real quorum/no-quorum.
+Earlier swap completion remains historical evidence, never automatic failback
+or serving authority. Unfinished/unknown handoffs and other post-handoff sizes
+remain gated or unqualified; the legacy 2/1 new-Primary loss still yields unknown.
+Swap abort, Node/FM restart and full native handler/interoperability
+qualification remain gated.
 Missing, unknown or uncatchable Secondary progress follows SF's volatile
 restart path: shared RA projects the member down to RAP, sends force Deactivate
 with invalid history, and commits its successful Close/DeactivateReply as

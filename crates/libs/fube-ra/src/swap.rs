@@ -189,15 +189,28 @@ fn deactivation(state: &EntityState) -> Result<ReplicaDeactivationInfo> {
         .ok_or(Failure::Admission("missing original replica history"))
 }
 
-fn failover_membership(state: &EntityState) -> Result<&Reconfiguration> {
-    state
-        .reconfiguration
-        .as_ref()
-        .filter(|c| {
-            c.request.replicas.0.len() >= 2
-                && (c.stage == ConfigurationStage::Complete
-                    || reconfiguration::secondary_removal_in_progress(state))
-        })
+fn failover_membership<'a>(
+    state: &'a EntityState,
+    unit: &FailoverUnit,
+) -> Result<(&'a Configuration, bool)> {
+    let completed = reconfiguration::completed_configuration(state);
+    if let Some(active) = state.reconfiguration.as_ref().filter(|c| {
+        completed.is_none_or(|latest| !c.request.unit.current.older_than(latest.unit.current))
+    }) {
+        if active.stage != ConfigurationStage::Complete
+            && !reconfiguration::secondary_removal_in_progress(state)
+        {
+            return Err(Failure::Unsupported(
+                "failover cannot interrupt this membership change",
+            ));
+        }
+        if active.request.replicas.0.len() >= 2 && retains_removal_pc(unit, active) {
+            return Ok((&active.request, true));
+        }
+    }
+    completed
+        .filter(|c| c.replicas.0.len() >= 2)
+        .map(|c| (c, false))
         .ok_or(Failure::Unsupported(
             "failover requires completed membership or exact Secondary removal",
         ))
@@ -229,18 +242,17 @@ fn failover_epoch(
 }
 
 fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
-    let active = failover_membership(state)?;
-    let removal = retains_removal_pc(&body.unit, active);
+    let (active, removal) = failover_membership(state, &body.unit)?;
     let mut stable;
-    let old = if active.stage == ConfigurationStage::Complete && !removal {
-        stable = reconfiguration::stable(&active.request);
+    let old = if !removal {
+        stable = reconfiguration::stable(active);
         stable.replicas.0.retain(|r| r.current_role >= 3);
         &stable
     } else {
-        &active.request
+        active
     };
     // Ordinary failover can also retain the down former Primary to preserve minimum.
-    let interrupted = removal || failover_epoch(&body.unit, &active.request, removal, true);
+    let interrupted = removal || failover_epoch(&body.unit, active, removal, true);
     if body.replicas.0.len() != old.replicas.0.len()
         || body.service != old.service
         || !valid_stateful_sizes(&body.service)
@@ -248,7 +260,7 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
         || body.unit.minimum != old.unit.minimum
         || body.unit.id != old.unit.id
         || body.unit.consistency != old.unit.consistency
-        || !failover_epoch(&body.unit, &active.request, removal, interrupted)
+        || !failover_epoch(&body.unit, active, removal, interrupted)
         || (interrupted
             && (body.replicas.0.len() != body.service.target as usize
                 || !reconfiguration::secondary_removal(body)
@@ -359,13 +371,7 @@ fn progress_query(
             {
                 return Ok(None);
             }
-            let active = failover_membership(current)?;
-            let removal = retains_removal_pc(&request.unit, active);
-            let membership = if active.stage == ConfigurationStage::Complete && !removal {
-                reconfiguration::completed_configuration(current).expect("completed membership")
-            } else {
-                &active.request
-            };
+            let (membership, removal) = failover_membership(current, &request.unit)?;
             if request.unit.current.older_than(current.body.unit.current) {
                 return Ok(Some(Transition::ignored(Disposition::IgnoredStale)));
             }
@@ -421,20 +427,26 @@ fn progress_query(
             }
             let mut body = (*state.body).clone();
             body.unit = request.unit.clone();
-            body.unit.previous = if current.body.unit.previous == Epoch::default() {
-                current.body.unit.current
+            body.unit.previous = if removal {
+                membership.unit.previous
             } else {
-                current.body.unit.previous
+                membership.unit.current
             };
             if let Some(configuration) = &mut state.configuration {
                 configuration.unit = body.unit.clone();
-                if current.body.unit.previous == Epoch::default() {
-                    for replica in &mut configuration.replicas.0 {
-                        replica.previous_role = replica.current_role;
-                    }
-                    body.replica.previous_role = body.replica.current_role;
+                for r in &mut configuration.replicas.0 {
+                    r.previous_role = if removal {
+                        replica(membership, &r.node)?.previous_role
+                    } else {
+                        r.current_role
+                    };
                 }
             }
+            body.replica.previous_role = if removal {
+                replica(membership, &body.replica.node)?.previous_role
+            } else {
+                body.replica.current_role
+            };
             state.body = Arc::new(body);
             state.progress_query = Some(ProgressQuery {
                 source: source.clone(),

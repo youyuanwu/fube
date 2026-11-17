@@ -552,16 +552,17 @@ fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Resul
     }
     Ok(())
 }
+fn primary_failover_configuration(body: &Configuration) -> bool {
+    body.replicas
+        .0
+        .iter()
+        .any(|r| r.previous_role == 4 && matches!(r.current_role, 1 | 3) && !r.up)
+}
 impl Ledger {
     pub fn primary_failover(&self) -> bool {
-        self.swap.as_ref().is_some_and(|s| {
-            s.body
-                .configuration
-                .replicas
-                .0
-                .iter()
-                .any(|r| r.previous_role == 4 && matches!(r.current_role, 1 | 3) && !r.up)
-        })
+        self.swap
+            .as_ref()
+            .is_some_and(|s| primary_failover_configuration(&s.body.configuration))
     }
 
     fn primary_transition_live(&self) -> bool {
@@ -620,11 +621,15 @@ impl Ledger {
                 .repair
                 .as_ref()
                 .is_some_and(|r| r.configuration.as_ref().is_none_or(|c| c.reply.is_none()))
-            || (self.swap.is_some()
-                && !self
+            || self.swap.as_ref().is_some_and(|s| {
+                !self
                     .repair
                     .as_ref()
-                    .is_some_and(|r| r.configuration.as_ref().is_some_and(|c| c.reply.is_some())))
+                    .is_some_and(|r| r.configuration.as_ref().is_some_and(|c| c.reply.is_some()))
+                    && (self.primary_failover()
+                        || s.unknown
+                        || s.reply.as_ref().is_none_or(|reply| reply.error != 0))
+            })
         {
             return Ok(None);
         }
@@ -632,12 +637,23 @@ impl Ledger {
             .repair
             .as_ref()
             .and_then(|r| r.configuration.as_ref())
-            .or(self.configuration.as_ref())
+            .into_iter()
+            .chain(self.swap.iter())
+            .chain(self.configuration.iter())
             .filter(|c| {
-                c.reply.is_some()
+                c.reply.as_ref().is_some_and(|reply| reply.error == 0)
                     && (configured
                         || (c.body.configuration.unit.target == 3
                             && c.body.configuration.unit.minimum == 2))
+            })
+            .max_by_key(|c| {
+                let epoch = c
+                    .reply
+                    .as_ref()
+                    .expect("completed configuration")
+                    .unit
+                    .current;
+                (epoch.data_loss, epoch.configuration)
             })
         else {
             return Ok(None);
@@ -883,6 +899,9 @@ impl Ledger {
                 repair.superseded_by = Some(body.configuration.unit.current);
             }
             self.repair_history.push(repair);
+        }
+        if let Some(swap) = self.swap.take() {
+            self.configuration_history.push(swap);
         }
         self.candidate_changes.clear();
         self.swap_endpoint = None;
@@ -1549,7 +1568,10 @@ impl Ledger {
             // Host loss invalidates observations, not completed membership.
             let original = previous.reply.as_ref()?;
             (!swap.unknown
-                && self.configuration_history.is_empty()
+                && self.configuration_history.iter().all(|previous| {
+                    previous.reply.is_some()
+                        && primary_failover_configuration(&previous.body.configuration)
+                })
                 && self.candidate_changes.is_empty()
                 && self.restoration.is_none()
                 && original.error == 0
@@ -1775,8 +1797,9 @@ impl Ledger {
         if peer_idle && self.retiring_secondary() && self.idle_predecessor.is_none() {
             return Ok(response);
         }
+        let failover = self.primary_failover();
         let old_failover_primary = self.failed_primary_index() == Some(index);
-        let planned_secondary = !self.primary_failover()
+        let planned_secondary = !failover
             && self.swap.as_ref().is_some_and(|s| {
                 s.body.configuration.unit.target == 3
                     && s.body.configuration.unit.minimum == 2
@@ -1795,7 +1818,8 @@ impl Ledger {
             && placement.launch.profile.stateful()
         {
             if let Some(swap) = self.swap.as_mut().filter(|s| {
-                !old_failover_primary
+                (s.reply.is_none() || failover)
+                    && !old_failover_primary
                     && !planned_secondary
                     && s.body
                         .configuration
