@@ -65,10 +65,13 @@ adapter rejects incoming size changes and keeps unsupported lifecycle operations
 explicitly rejected. Original per-peer Channels and process cleanup receipts
 remain deployment/session/node bound; clean handoff now accounts for variable
 child counts without relaxing physical-owner cleanup.
+The configured cluster and standalone runner use the same parameterized Hosting
+package profile, comparing resolved manifest target/minimum with declared
+service sizes; legacy named profiles retain their existing package checks.
 
 Acceptance covers `1/1`, `2/1`, `3/2`, `3/3`, `4/2`, `4/3`, `5/3` and `4/4`, real copy
 and application replication, blocked initial writes below minimum, lost final
-configuration-reply replay and clean original-owner shutdown. Four-member
+configuration-reply replay, stable LFUM at unchanged sizes and clean original-owner shutdown. Four-member
 quorum checks distinguish configured minimum from actual majority: `4/2` cannot
 acknowledge with only two live members, while `4/4` can still acknowledge with
 three live members in its unchanged four-member configuration. RA tests pause
@@ -620,8 +623,8 @@ reconstruction or writer election.
 | Evidence/profile | Current coverage | Boundary |
 |---|---|---|
 | Shared RA model/store | Generic committed replica-store descriptions and separately committed IC roles; configured repair/removal, planned transfer, candidate redirection and failed RAP/build states. Multi-entity reads, definite/unknown commits, deletion and overlapping upload ownership are tested. | No LFUM lineage/size allowlist or upload-pending control gate. Ordinary runtime/profile admission still applies. This is not complete native handler execution. |
-| Local-cluster live sessions | Stateless/independent volatile singleton rounds; original 3/2 stable membership, FM-owned Idle build, same-Primary admission, two Primary app-host failover/explicit-repair cycles and native deactivation of a repair Secondary with its role callback held. | Participating build/configuration requests must be committed. Repeated rounds freeze the latest completed membership; repair uses its matching completed failover. Deactivation interrupts existing repair, not a new recovery/supersession policy. |
-| Standalone real Node binaries | Empty pre-placement upload and the same 3/2 stable/build/admission, two-cycle failover/repair and repair-Secondary deactivation overlaps over real native-shaped Channels. | Fixed three-Node 3/2 deployment; no nonempty startup/rejoin or reconnect. Planned transfer is currently a separate two-member local-cluster runtime profile, not standalone 3/2 support. |
+| Local-cluster live sessions | Stateless/independent volatile singleton rounds and stable configured membership across 1/1, 2/1, 3/2, 3/3, 4/2, 4/3, 4/4 and 5/3. Additional 3/2 cases cover FM-owned Idle build, same-Primary admission, two Primary app-host failover/explicit-repair cycles and native deactivation of a repair Secondary with its role callback held. | Participating build/configuration requests must be committed. Repeated rounds freeze the latest completed membership; repair uses its matching completed failover. Deactivation interrupts existing repair, not a new recovery/supersession policy. |
+| Standalone real Node binaries | Empty pre-placement and stable configured membership across 1/1, 2/1, 3/3, 4/2, 4/3, 4/4 and 5/3. Additional 3/2 build/admission, two-cycle failover/repair and repair-Secondary deactivation overlaps use real native-shaped Channels. | Immutable explicit sizes and original placements; no nonempty startup/rejoin or reconnect. Configurability does not qualify every overlap; planned transfer retains its separate healthy two-member runtime qualification. |
 | Native evidence | Bidirectional native-stream/schema and source-derived helper evidence in the [protocol oracle](../../tests/ra_protocol/README.md) and [C14 contract](NativeRaProtocol.md). | Full original C++ handler traces and native FM/Federation interoperability remain unqualified; passing process tests is not full SF parity. |
 
 The remaining dependency plan is maintained in

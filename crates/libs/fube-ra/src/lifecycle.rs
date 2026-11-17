@@ -585,20 +585,20 @@ pub(super) fn transition(
             let stateful = matches!(work.kind, Kind::DeleteReplica { .. });
             if stateful {
                 // Native DeleteLocalReplica closes open active replicas too.
-                // Enable only exact completed 3/2 owners in the external profile.
+                // Enable only exact completed owners in the admitted profile.
                 let active_delete = config.allow_active_replica_delete
                     && !request.deletion.0.force
                     && current.is_some_and(|state| {
                         (state.fm_primary || state.peer_creation.is_some())
-                            && state.body.service.target == 3
-                            && state.body.service.minimum == 2
                             && state.body.service == body.service
                             && state.body.unit.current == body.unit.current
                             && state.body.replica.id == body.replica.id
                             && body.replica.instance <= state.body.replica.instance
-                            && state.reconfiguration.as_ref().is_some_and(|configuration| {
-                                configuration.stage == ConfigurationStage::Complete
-                            })
+                            && reconfiguration::completed_configuration(state).is_some_and(
+                                |configuration| {
+                                    configuration.unit.current == state.body.unit.current
+                                },
+                            )
                     });
                 if current.is_some_and(|s| {
                     s.peer_creation.is_some()

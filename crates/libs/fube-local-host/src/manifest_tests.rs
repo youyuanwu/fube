@@ -181,6 +181,43 @@ fn volatile_stateful_registration_requires_opt_in_and_materializes_both_type_dec
 }
 
 #[test]
+fn configured_volatile_sizes_match_resolved_manifest_values() {
+    let fixture = Fixture::new();
+    let (app, service) = stateful_manifests();
+    let app = app
+        .replace(
+            r#"MinReplicaSetSize="1""#,
+            r#"MinReplicaSetSize="[Minimum]""#,
+        )
+        .replace(
+            "</Parameters>",
+            r#"<Parameter Name="Minimum" DefaultValue="1"/></Parameters>"#,
+        );
+    fixture.write(&app, &service);
+    for (target, minimum) in [(1, 1), (3, 3), (4, 2), (4, 3), (5, 3), (64, 64)] {
+        let profile = Profile::VolatileStatefulExternalFm { target, minimum };
+        let overrides = [
+            ("Count".into(), target.to_string()),
+            ("Minimum".into(), minimum.to_string()),
+        ];
+        let package =
+            Package::load_with_profile(&fixture.0, "fabric:/Local", &overrides, profile).unwrap();
+        assert_eq!(package.profile, profile);
+        for (index, value) in [
+            (0, (target + 1).to_string()),
+            (1, "0".into()),
+            (1, "invalid".into()),
+        ] {
+            let mut bad = overrides.clone();
+            bad[index].1 = value;
+            assert!(
+                Package::load_with_profile(&fixture.0, "fabric:/Local", &bad, profile).is_err()
+            );
+        }
+    }
+}
+
+#[test]
 fn stateful_registration_rejects_persistence_mismatches_and_broader_package_shapes() {
     let fixture = Fixture::new();
     let (app, service) = stateful_manifests();

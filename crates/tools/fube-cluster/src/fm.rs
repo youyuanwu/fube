@@ -1469,10 +1469,11 @@ impl Ledger {
     }
 
     pub fn begin_generation(&mut self) -> Result<()> {
-        let peer = self.placements[0].launch.profile.peer_replicas();
+        let profile = self.placements[0].launch.profile;
+        let peer = profile.peer_replicas();
         let stable_peer = self.configuration.as_ref().is_some_and(|c| {
-            c.body.configuration.service.target == 3
-                && c.body.configuration.service.minimum == 2
+            (profile.configured_sizes().is_some()
+                || profile == crate::ServiceProfile::StatefulThree)
                 && c.reply
                     .as_ref()
                     .is_some_and(|r| r.error == 0 && r.replicas.0.len() == self.placements.len())

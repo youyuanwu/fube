@@ -226,7 +226,7 @@ impl Activation {
             Profile::VolatileStatefulLifecycle
                 | Profile::VolatileStatefulPrimaryLifecycle
                 | Profile::VolatileStatefulFmPrimary
-                | Profile::VolatileStatefulExternalFm
+                | Profile::VolatileStatefulExternalFm { .. }
         ) && self.consumer_gate.is_none()
         {
             return Err(Error::UnsupportedCapability.into());
@@ -438,7 +438,7 @@ impl Activation {
             | Profile::VolatileStatefulLifecycle
             | Profile::VolatileStatefulPrimaryLifecycle
             | Profile::VolatileStatefulFmPrimary
-            | Profile::VolatileStatefulExternalFm => prepared.lease,
+            | Profile::VolatileStatefulExternalFm { .. } => prepared.lease,
             Profile::VolatileStatefulRegistration => prepared.lease.registration_only(),
         });
         if let Some((_, error)) = prepared.failure {
@@ -480,7 +480,7 @@ impl Activation {
                 .is_none_or(|p| !p.reaped || !p.group_drained)
             || !matches!(
                 profile,
-                Profile::VolatileStatefulLifecycle | Profile::VolatileStatefulExternalFm
+                Profile::VolatileStatefulLifecycle | Profile::VolatileStatefulExternalFm { .. }
             )
         {
             return Err(LocalError::Busy);

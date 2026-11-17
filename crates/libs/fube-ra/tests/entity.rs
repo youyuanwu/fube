@@ -6802,6 +6802,75 @@ async fn active_configured_survivor(executor: &Executor, target: i32, minimum: i
     effects(executor);
 }
 
+#[tokio::test]
+async fn configured_active_deletion_requires_exact_completed_membership_and_close_commit() {
+    for (target, minimum) in [(2, 1), (3, 2), (3, 3), (4, 2), (4, 4), (5, 3), (64, 64)] {
+        for failover_pending in [false, true] {
+            let (store, executor, hooks) = setup_open(
+                Settings {
+                    allow_active_replica_delete: true,
+                    ..Settings::default()
+                },
+                WAIT,
+            )
+            .await;
+            active_configured_survivor(&executor, target, minimum).await;
+            if failover_pending {
+                let intent = failover_configuration(&state(&executor), &admission().local_node);
+                run(&executor, reconfigure(intent)).await;
+                effects(&executor);
+                let before = state(&executor);
+                assert!(executor
+                    .submit(primary_delete((*before.body).clone(), false))
+                    .unwrap()
+                    .wait(WAIT)
+                    .await
+                    .is_err());
+                assert_eq!(state(&executor), before);
+                assert!(effects(&executor).is_empty());
+                finish(&store, &executor).await;
+                continue;
+            }
+            let before = state(&executor);
+            for invalid in 0..4 {
+                let mut bad = (*before.body).clone();
+                match invalid {
+                    0 => bad.service.minimum = if minimum == 1 { 2 } else { 1 },
+                    1 => bad.unit.current.configuration += 1,
+                    2 => bad.replica.instance += 1,
+                    _ => bad.replica.id += 1,
+                }
+                assert!(executor
+                    .submit(primary_delete(bad, false))
+                    .unwrap()
+                    .wait(WAIT)
+                    .await
+                    .is_err());
+                assert_eq!(state(&executor), before);
+                assert!(effects(&executor).is_empty());
+            }
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor
+                .submit(primary_delete((*before.body).clone(), false))
+                .unwrap();
+            entered.await.unwrap();
+            assert_eq!(state(&executor), before);
+            assert!(effects(&executor).is_empty());
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            let closing = state(&executor);
+            assert_eq!(closing.phase, Phase::Closing);
+            assert_eq!(closing.runtime, before.runtime);
+            assert_eq!(closing.usage, before.usage);
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::Close { flags: 8, .. }]
+            ));
+            finish(&store, &executor).await;
+        }
+    }
+}
+
 async fn activating_configured_survivor(
     executor: &Executor,
     target: i32,

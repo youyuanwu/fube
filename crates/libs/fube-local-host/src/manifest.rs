@@ -20,7 +20,10 @@ pub enum Profile {
     VolatileStatefulLifecycle,
     VolatileStatefulPrimaryLifecycle,
     VolatileStatefulFmPrimary,
-    VolatileStatefulExternalFm,
+    VolatileStatefulExternalFm {
+        target: i32,
+        minimum: i32,
+    },
 }
 
 #[derive(Debug)]
@@ -311,7 +314,9 @@ impl Package {
             | Profile::VolatileStatefulLifecycle
             | Profile::VolatileStatefulPrimaryLifecycle
             | Profile::VolatileStatefulFmPrimary
-            | Profile::VolatileStatefulExternalFm => ("StatefulService", "StatefulServiceType"),
+            | Profile::VolatileStatefulExternalFm { .. } => {
+                ("StatefulService", "StatefulServiceType")
+            }
         };
         shape(
             service,
@@ -333,7 +338,7 @@ impl Package {
             | Profile::VolatileStatefulLifecycle
             | Profile::VolatileStatefulPrimaryLifecycle
             | Profile::VolatileStatefulFmPrimary
-            | Profile::VolatileStatefulExternalFm => &[
+            | Profile::VolatileStatefulExternalFm { .. } => &[
                 "ServiceTypeName",
                 "TargetReplicaSetSize",
                 "MinReplicaSetSize",
@@ -359,11 +364,21 @@ impl Package {
                     && attr(description, "MinReplicaSetSize", &params)? == "1",
                 "only volatile stateful target/minimum=1/1 is supported",
             )?,
-            Profile::VolatileStatefulExternalFm => require(
-                attr(description, "TargetReplicaSetSize", &params)? == "3"
-                    && attr(description, "MinReplicaSetSize", &params)? == "2",
-                "external-FM profile requires volatile target/minimum=3/2",
-            )?,
+            Profile::VolatileStatefulExternalFm { target, minimum } => {
+                let declared_target = attr(description, "TargetReplicaSetSize", &params)?
+                    .parse::<i32>()
+                    .map_err(invalid)?;
+                let declared_minimum = attr(description, "MinReplicaSetSize", &params)?
+                    .parse::<i32>()
+                    .map_err(invalid)?;
+                require(
+                    minimum >= 1
+                        && target >= minimum
+                        && declared_target == target
+                        && declared_minimum == minimum,
+                    "package target/minimum must match the configured volatile service",
+                )?;
+            }
         }
         shape(
             one(description, "SingletonPartition")?,
@@ -400,7 +415,9 @@ impl Package {
             | Profile::VolatileStatefulLifecycle
             | Profile::VolatileStatefulPrimaryLifecycle
             | Profile::VolatileStatefulFmPrimary
-            | Profile::VolatileStatefulExternalFm => &["ServiceTypeName", "HasPersistedState"],
+            | Profile::VolatileStatefulExternalFm { .. } => {
+                &["ServiceTypeName", "HasPersistedState"]
+            }
         };
         shape(declared, type_kind, type_attributes, &[])?;
         if profile != Profile::Stateless {
@@ -532,7 +549,7 @@ impl Package {
             | Profile::VolatileStatefulLifecycle
             | Profile::VolatileStatefulPrimaryLifecycle
             | Profile::VolatileStatefulFmPrimary
-            | Profile::VolatileStatefulExternalFm => format!(
+            | Profile::VolatileStatefulExternalFm { .. } => format!(
                 r#"<StatefulServiceType ServiceTypeName="{}" HasPersistedState="false" />"#,
                 escape(&self.service_type)
             ),
