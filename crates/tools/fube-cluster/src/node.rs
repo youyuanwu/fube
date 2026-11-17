@@ -181,7 +181,10 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     if launch.profile.peer_replicas() {
         options.service_package_version_instance = Some(1);
     }
-    if launch.profile.stateful() {
+    if let Some((target, minimum)) = launch.profile.configured_sizes() {
+        options.profile =
+            fube_hosting::local::Profile::VolatileStatefulExternalFm { target, minimum };
+    } else if launch.profile.stateful() {
         options.profile = if launch.profile.peer_replicas() && launch.placement != 1 {
             fube_hosting::local::Profile::VolatileStatefulLifecycle
         } else {
@@ -234,7 +237,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     node.apply_fresh_node_up_ack(&ack, &generation)
         .map_err(err)?;
     let mut adapter = Adapter::default();
-    let arguments = if launch.profile.peer_replicas() && launch.placement != 1 {
+    let mut arguments = if launch.profile.peer_replicas() && launch.placement != 1 {
         vec![(
             "Arguments".into(),
             "--stateful-lifecycle --data-replicator".into(),
@@ -244,6 +247,10 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     } else {
         vec![]
     };
+    if let Some((target, minimum)) = launch.profile.configured_sizes() {
+        arguments.push(("TargetReplicaSetSize".into(), target.to_string()));
+        arguments.push(("MinReplicaSetSize".into(), minimum.to_string()));
+    }
     let started = node
         .start(&launch.package, APPLICATION, &arguments)
         .map_err(err);

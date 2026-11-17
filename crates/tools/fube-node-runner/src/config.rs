@@ -76,6 +76,8 @@ pub struct Config {
     pub fm: Fm,
     pub peers: Vec<Placement>,
     pub partition: String,
+    pub target: i32,
+    pub minimum: i32,
     pub package: PathBuf,
     pub application: String,
     pub package_version_instance: u64,
@@ -116,8 +118,22 @@ fn absolute(path: &Path) -> bool {
 }
 
 impl Config {
+    pub fn control_profile(&self) -> fube_node::control::ingress::Profile {
+        fube_node::control::ingress::Profile::Stateful {
+            target: self.target,
+            minimum: self.minimum,
+        }
+    }
+
+    pub fn hosting_profile(&self) -> fube_hosting::local::Profile {
+        fube_hosting::local::Profile::VolatileStatefulExternalFm {
+            target: self.target,
+            minimum: self.minimum,
+        }
+    }
+
     pub fn ingress(&self) -> Result<fube_node::control::ingress::Ingress> {
-        use fube_node::control::ingress::{Ingress, Placement as ControlPlacement, Profile};
+        use fube_node::control::ingress::{Ingress, Placement as ControlPlacement};
         let placement = |value: &Placement| -> Result<ControlPlacement> {
             Ok(ControlPlacement {
                 node: value.identity.native()?,
@@ -126,10 +142,7 @@ impl Config {
             })
         };
         Ingress::new(
-            Profile::Stateful {
-                target: 3,
-                minimum: 2,
-            },
+            self.control_profile(),
             true,
             self.partition_id()?,
             self.fm.identity.native()?,
@@ -182,10 +195,10 @@ impl Config {
         self.node.validate()?;
         let fm = self.fm.identity.native()?;
         address(self.fm.address)?;
-        if self.fm.generation <= 0 || self.peers.len() != 2 {
-            return Err(
-                "volatile 3/2 profile requires an initial FM generation and two peers".into(),
-            );
+        let profile = self.control_profile();
+        profile.validate()?;
+        if self.fm.generation <= 0 || self.peers.len() != profile.node_count() - 1 {
+            return Err("initial FM generation and target-1 original peers are required".into());
         }
         let mut ids = BTreeSet::from([fm.id]);
         let mut ips = BTreeSet::new();

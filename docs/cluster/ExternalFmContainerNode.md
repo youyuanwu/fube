@@ -1,9 +1,11 @@
 # Standalone Nodes with an external FM
 
 `fube-node` runs one Node/RA/Hosting process and its application child under a
-user-supplied Failover Manager (FM). Three Node processes form **one volatile
-partition** with one Primary, two ActiveSecondaries and fixed target/minimum
-replica-set sizes **3/2**.
+user-supplied Failover Manager (FM). The original Node processes form **one volatile
+partition** with explicit immutable target/minimum sizes satisfying
+`1 <= minimum <= target <= 64`. Initially there are `target` original Nodes,
+one Primary and `target - 1` ActiveSecondaries after admission. The 64 bound is
+a fube resource limit, not an SF rule; process qualification covers up to five Nodes.
 
 The feature supports fresh startup, application use, explicitly FM-driven
 Primary app-host failover, fresh-Secondary repair and owned shutdown. The runner is a thin owner over
@@ -15,6 +17,8 @@ native reliability contract. Container images, networking and orchestration
 belong to the user; fube does not ship a production FM or a container test tier.
 
 ## What runs where
+
+Example three-Node topology (the configuration example below selects 3/2):
 
 ```text
                       User-owned FM
@@ -45,14 +49,14 @@ application command-line role flag chooses it.
 |---|---|
 | `node.address` | This Node's concrete RA listener address. |
 | `fm.address` | The external FM listener that this Node connects to. |
-| `peers[].address` | The other two Nodes' RA listeners, used for direct `CreateReplica` and `Activate` exchanges. These are not FM addresses. |
+| `peers[].address` | The other original Nodes' RA listeners, used for direct peer reliability exchanges. Supply target-1 peers, or an empty list for a singleton. These are not FM addresses. |
 | Application replication endpoint | An application-owned listener used for direct copy/replication. Its complete endpoint is exchanged during replica creation/build. |
 | Application service endpoint | The application's own client protocol, returned through native replica replies. |
 | Runtime/Hosting/RAP/lease IPC | Container-local or host-local loopback connections; not exposed as remote control endpoints. |
 
 There is **one full-duplex TCP connection per Node-FM pair**, initiated by the
-Node. FM commands, Node reports and replies use that same connection. Three
-Nodes therefore establish three FM connections, not a separate connection for
+Node. FM commands, Node reports and replies use that same connection. N
+Nodes therefore establish N FM connections, not a separate connection for
 each direction.
 
 Each original Node pair also shares one full-duplex RA control connection.
@@ -63,7 +67,7 @@ port. The mesh is established before application startup, without waiting for
 reliability traffic on every link. FM/RA control connections do not carry
 application data.
 
-Use distinct, static IPv4 addresses for the three Nodes. The runner binds and
+Use distinct, static IPv4 addresses for all original Nodes. The runner binds and
 publishes each configured concrete address directly, without `0.0.0.0` or a
 separate advertised-IP field. NAT/port translation, service VIPs and load
 balancing between replica endpoints are not supported by this profile.
@@ -99,8 +103,9 @@ Install the runner and package in each Node environment. The examples below use
 `/opt/fube/fube-node` and `/opt/fube/package`; other absolute paths are valid.
 No ImageStore upload or native Service Fabric installation is required.
 
-The `VolatileStatefulExternalFm` package profile requires one volatile stateful
-service with default target/minimum sizes 3/2 after parameter substitution.
+The parameterized `VolatileStatefulExternalFm` package profile requires one
+volatile stateful service whose resolved target/minimum matches the declared
+Node configuration. The configured local cluster uses the same Hosting contract.
 The sample manifest defaults to 1/1, so the configuration below explicitly
 overrides both sizes and selects its data-replicator lifecycle mode.
 
@@ -166,6 +171,8 @@ This is the complete configuration for Node 1:
     }
   ],
   "partition": "22222222-2222-4222-8222-222222222222",
+  "target": 3,
+  "minimum": 2,
   "package": "/opt/fube/package",
   "application": "fabric:/External",
   "package_version_instance": 1,
@@ -182,8 +189,12 @@ This is the complete configuration for Node 1:
 
 For Nodes 2 and 3, change `name`, the local `node` placement, the two `peers`,
 the IPs in `Arguments` and `run_directory`. Keep the same deployment, partition,
-FM authority/generation, application, package version and 3/2 description.
+FM authority/generation, application, package version and configured sizes.
 Each local placement must appear unchanged in the other Nodes' peer lists.
+Target/minimum are mandatory, without compatibility defaults. For 3/3, set
+`minimum` to 3 and resolve `MinReplicaSetSize` to 3 in the package parameters.
+For another target, supply that many original placements and target-1 peers
+per Node. This is not a general spare-placement or live-resize contract.
 
 The package and run-directory paths are absolute. The package and run-directory
 **parent** must already exist and be accessible to the Node user; the configured
@@ -199,7 +210,7 @@ ms, with a 100-60,000 ms range; shutdown defaults to 20,000 ms, with a
 and [runner reference](../../crates/tools/fube-node-runner/README.md) for all
 validation rules.
 
-### 4. Start the FM and all three Node processes
+### 4. Start the FM and all original Node processes
 
 Start the FM listener first, then launch this command in each Node environment
 with its own configuration:
@@ -208,7 +219,7 @@ with its own configuration:
 /opt/fube/fube-node --config /etc/fube/node.json
 ```
 
-Start all three Nodes without waiting for one Node to become service-ready
+Start all original Nodes without waiting for one Node to become service-ready
 before launching the next. Each runner first establishes its original peer
 mesh, then connects to the FM and completes fresh `NodeUp` and final empty
 `ReplicaUp` handshakes. Only then does it start its owned application.
@@ -228,19 +239,19 @@ The FM drives the native sequence below:
    activated `NodeUpAck` and fixed generation. Answer its final empty
    `ReplicaUp` with the matching `ReplicaUpReply`.
 2. Select any original Node as Primary and send `AddPrimary` with the actual
-   package/type/version, partition and replica identities and volatile 3/2
+   package/type/version, partition and replica identities and matching volatile target/minimum
    service description. Wait for `AddPrimaryReply`.
 3. Send `AddReplica` to that Primary for each other original placement,
    one destination at a time. Wait for each actual `AddReplicaReply`.
    Primary RA drives direct peer creation and real RAP Open/copy/build;
    `CreateReplicaReply` or Idle readiness alone does not complete FM build.
-4. Send one same-Primary `DoReconfiguration` admitting all three exact live
+4. For target > 1, send one same-Primary `DoReconfiguration` admitting all exact original live
    Ready replicas: Primary P/P and the built Idles I/S, with unchanged service
    sizes and data-loss epoch. Wait for the matched final
    `DoReconfigurationReply`, after peer activation commits and final RAP
    completion. Retain its canonical unit/epoch for subsequent operations.
 5. Complete create and publish the Primary endpoint only after that final
-   native completion. Preserve the full opaque service/replication endpoint
+   native completion (AddPrimaryReply for a singleton). Preserve the full opaque service/replication endpoint
    strings returned by the replicas.
 
 ACK actual service-type notification/status and endpoint-update reports when
@@ -277,7 +288,7 @@ for command in (b"write\n", b"read\n"):
 This line protocol belongs to the sample, not the generic Node. A custom
 application supplies its own serving probe and client.
 
-In the initial singleton configuration, membership is below minimum two and
+In the example's initial Primary-only configuration, membership is below minimum two and
 writes are denied. Building an Idle does not grant active membership. As normal
 RAP installs the configuration, writes follow native partition authority,
 configured minimum and actual replication quorum. They can become valid before
@@ -295,6 +306,7 @@ cat /run/fube/node1-session1/status.json
 | Field | Observation |
 |---|---|
 | `stage` | `starting`, `running`, `stopping` or `stopped`. |
+| `replica_set` | Declared immutable target/minimum, not current live membership or quorum. |
 | `control_bootstrapped` | The original fresh bootstrap completed. |
 | `fm_connected`, `peers_connected` | Original control-connection observations. |
 | `registered`, `application_pid` | Actual local application registration/process observations. |
@@ -341,7 +353,7 @@ recover volatile state or fence a surviving writer.
 
 ## External FM contract
 
-The profile identifier is `external-fm-volatile-three-v1`. It names the supported
+The profile identifier is `external-fm-volatile-configured-v1`. It names the supported
 execution subset, not a new native wire schema or an HTTP orchestration API.
 A Rust FM can reuse the [native codecs](../../crates/libs/fube-ra/src/protocol.rs)
 and [wire compositions/Link](../../crates/libs/fube-node/src/control/wire.rs).
@@ -366,8 +378,9 @@ and 32 local command/effect observation slots.
 
 ### Ordinary-FM LFUM status
 
-Real-process generation rollover is qualified for empty pre-placement inventory,
-original 3/2 stable membership, FM-owned Idle build, same-Primary admission,
+Real-process generation rollover is qualified for empty pre-placement inventory
+and stable configured membership across 1/1, 2/1, 3/3, 4/2, 4/3, 4/4 and 5/3.
+The additional 3/2 cases cover FM-owned Idle build, same-Primary admission,
 and two successive Primary app-host failover/explicit-repair cycles, including
 promotion of a repaired replica. Native node deactivation also interrupts the
 fresh repair Secondary while its public role callback and superseding uploads
@@ -393,7 +406,8 @@ tracks remaining copy/build interruption and removal supersession.
 Each repeated failover round uses the latest completed membership and known
 fresh replica identities, not the original configuration. Shared model/store
 coverage of transfer/redirection does not enable standalone planned transfer: that runtime
-path is currently two-member only, while this profile is fixed 3/2.
+qualification remains limited to the separate healthy two-member runtime path.
+Configurable sizes do not qualify general transfer or standalone transfer overlaps.
 Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,
 FM/FMM rebuild and restart remain gated; native handler/interoperability evidence
 remains incomplete.
@@ -417,8 +431,10 @@ owner alive during replica Close, not restart/recovery or whole-RA-close parity.
 | Resize, arbitrary host restart or restart reconciliation | Unsupported branches remain explicit shared Node/RA or supervisor gates; dispatch alone grants no authority. |
 | FM/Node restart or volatile state loss | No adoption, rejoin or data recovery. Tear down the old deployment before starting a fresh one. |
 
-The profile supports one immutable original three-Node, one-partition volatile
-3/2 service only. It does not provide persisted state, elections, a production
+The profile supports one immutable original-node, one-partition volatile
+service. Spare placement/replacement at minimum remains separate
+[S3 work](RustRaPort.md#configurable-replica-set-sizes-plan).
+It does not provide persisted state, elections, a production
 FM, rolling upgrades, multiple partitions or native FM/Federation interoperability.
 The shared native ingress does not expose the local launcher's replacement-host
 command, peer reconnection or runtime adoption. It reactivates only the installed
@@ -431,7 +447,10 @@ before acquiring a fresh host; failed cleanup supplies no authority.
 
 The [integration tests](../../crates/tools/fube-node-runner/tests/standalone.rs)
 launch actual Node binaries and application children under a native fixture FM.
-They cover initial 3/2 startup/build/admission, singleton write denial, real
+The configured-size matrix covers startup/build/admission, singleton completion,
+stable LFUM, Primary failover at unchanged sizes (including 3/3 and 4/4),
+normal active deletion/replay and owned shutdown. Additional 3/2 cases cover
+write denial below minimum, real
 write/readback, lost build/final-reply replay, writes before FM observation,
 generation/membership refusal, FM-loss retention, verified Primary app-host loss
 with real peer failover and continuing writes, stable replicated generation

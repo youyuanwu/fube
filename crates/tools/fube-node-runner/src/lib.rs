@@ -6,7 +6,7 @@
 pub mod config;
 
 pub use config::{Config, Fm, Identity, Placement};
-use fube_hosting::local::{Activation, NodeContext, Options, Profile};
+use fube_hosting::local::{Activation, NodeContext, Options};
 use fube_local_host::manifest::Package;
 use fube_node::{
     control::{
@@ -69,7 +69,7 @@ struct Peer {
 
 fn activation(config: &Config) -> Result<Activation> {
     let mut options = Options::new(config.run_directory.join("hosting"));
-    options.profile = Profile::VolatileStatefulExternalFm;
+    options.profile = config.hosting_profile();
     options.node = Some(NodeContext {
         id: config.node.identity.id.clone(),
         instance: config.node.identity.instance,
@@ -104,7 +104,7 @@ impl Owner {
             &config.package,
             &config.application,
             &config.parameters,
-            Profile::VolatileStatefulExternalFm,
+            config.hosting_profile(),
         )
         .map_err(err)?;
         fs::DirBuilder::new()
@@ -206,7 +206,8 @@ impl Owner {
             .as_ref()
             .and_then(|snapshot| snapshot.committed.as_ref());
         let status = serde_json::json!({
-            "schema_version": 1, "protocol_profile": "external-fm-volatile-three-v1",
+            "schema_version": 1, "protocol_profile": "external-fm-volatile-configured-v1",
+            "replica_set": {"target": self.config.target, "minimum": self.config.minimum, "immutable": true},
             "deployment": self.config.deployment, "node": self.config.node.identity,
             "name": self.config.name, "address": self.config.node.address, "stage": stage,
             "control_bootstrapped": self.bootstrapped,
@@ -456,14 +457,16 @@ impl Owner {
         .map_err(err)?;
         self.node = Some(node);
         let node = self.node.as_mut().expect("original Node owner");
-        node.bind_peers(
-            self.config
-                .peers
-                .iter()
-                .map(|peer| peer.identity.native())
-                .collect::<Result<Vec<_>>>()?,
-        )
-        .map_err(err)?;
+        if !self.config.peers.is_empty() {
+            node.bind_peers(
+                self.config
+                    .peers
+                    .iter()
+                    .map(|peer| peer.identity.native())
+                    .collect::<Result<Vec<_>>>()?,
+            )
+            .map_err(err)?;
+        }
         node.apply_fresh_node_up_ack(&ack, &generation)
             .map_err(err)?;
         node.start(

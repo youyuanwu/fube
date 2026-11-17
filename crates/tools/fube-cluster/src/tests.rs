@@ -4044,7 +4044,7 @@ async fn fm_deletes_original_built_idle_destination_without_replacing_or_stoppin
 
 #[tokio::test]
 async fn immutable_configured_service_builds_initial_membership_without_resize() {
-    for (target, minimum) in [(1, 1), (2, 1), (3, 2), (4, 2), (4, 3), (5, 3), (4, 4)] {
+    for (target, minimum) in [(1, 1), (2, 1), (3, 2), (3, 3), (4, 2), (4, 3), (5, 3), (4, 4)] {
         let fixture = Fixture::new("immutable-sizes");
         let mut config = fixture.config();
         config.profile = ServiceProfile::Stateful { target, minimum };
@@ -4095,6 +4095,11 @@ async fn immutable_configured_service_builds_initial_membership_without_resize()
             until(&mut cluster, |c| (0..target as usize).all(|i|
                 c.status()["nodes"][i]["retained_work"]["app_observation"]["opens"] == 1
                 && c.status()["nodes"][i]["retained_work"]["local_replica"]["replica"]["current_role"] == if i == 0 { 4 } else { 3 })).await;
+            cluster.begin_generation_handshake()?;
+            until(&mut cluster, |c| !c.ledger.generation_pending()
+                && c.status()["nodes"].as_array().unwrap().iter().all(|node|
+                    node["retained_work"]["generations"]["upload_pending"] == false)).await;
+            assert!(data_contact(&endpoint, b"read\n").contains("committed=1 value=acknowledged"));
             assert!(cluster.transfer_primary().await.is_err());
             assert!(cluster.retire_secondary_replica().await.is_err());
             assert!(cluster.repair_primary_replica().await.is_err());

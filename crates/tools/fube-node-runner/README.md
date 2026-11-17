@@ -2,8 +2,11 @@
 
 `fube-node` runs one Linux Node/RA/Hosting owner and its application child without
 the local FM launcher's parent/stdin contract. An external FM owns the native
-reliability exchanges. The execution profile is one fresh volatile partition,
-three original Nodes and immutable target/minimum **3/2**.
+reliability exchanges. The execution profile is one fresh volatile partition
+with explicit, immutable `target` and `minimum`, satisfying
+`1 <= minimum <= target <= 64`. This initial topology has `target` original
+Nodes and `target - 1` peers per Node; a singleton has no peers. The ceiling is
+a fube resource bound, not an SF replica-set-size rule.
 
 The runner is a thin process/transport owner over
 [`fube_node::control::ingress`](../../libs/fube-node/src/control/ingress.rs).
@@ -11,7 +14,7 @@ The local cluster uses that same native FM/peer dispatch, topology checks and
 capability admission. There is no standalone-only creation/configuration state
 machine: retries, epochs, roles and completion belong to the shared Node/RA.
 
-This is experimental. Native-free tests exercise three separate Node binaries,
+This is experimental. Native-free tests exercise variable-size Node deployments,
 real runtime/replicator construction, copy/build, application replication,
 lost-reply replay, no-data-loss Primary app-host failover, explicit fresh-Secondary
 repair and owned shutdown. Repair uses shared Node/Hosting activation driven by
@@ -35,9 +38,10 @@ adopts a previous owner. Successful shutdown retains `status.json`; it does not
 make the old configuration restartable. Disable container automatic restart.
 
 The user supplies a trusted minimal ExeHost package supported by
-`fube-local-host`. The new `VolatileStatefulExternalFm` package profile requires
-volatile stateful default sizes 3/2. Existing local package profiles retain their
-1/1 checks. Hosting still owns actual process/registration/usage/lease cleanup;
+`fube-local-host`. The parameterized `VolatileStatefulExternalFm` package profile
+requires resolved volatile stateful manifest sizes to match the configured
+target/minimum. The configured local cluster uses this same Hosting profile;
+legacy local package profiles retain their 1/1 checks. Hosting still owns actual process/registration/usage/lease cleanup;
 running inside an OCI container does not enable native SF container activation.
 
 ### Independent node shutdown
@@ -67,7 +71,16 @@ lease recovery. Source baseline `3988b451`: `ReconfigurationAgent::Close`,
 
 ### Process-binary tests
 
-The crate-local integration tests launch three actual `fube-node` processes
+The configured-size process matrix covers 1/1, 2/1, 3/3, 4/2, 4/3, 4/4 and 5/3:
+bootstrap, initial membership, lost build/final-reply replay, stable LFUM,
+Primary app-host failover where applicable, continuing nonempty data, normal
+active deletion/replay and owned shutdown. At 3/3 and 4/4, failover retains the
+down former Primary when minimum requires it; a retained member supplies no
+vote. Closing the remaining Secondaries cannot acknowledge a new operation.
+Invalid bounds, missing sizes and package/native-description mismatches reject
+before the corresponding directory acquisition or replica Open.
+
+The additional 3/2 integration tests launch three actual `fube-node` processes
 with separate run directories and concrete loopback-alias IPs. A native fixture
 FM selects the middle Node as Primary and drives the real application children
 through bootstrap, copy/build, 3/2 admission, acknowledged writes/readback,
@@ -78,9 +91,13 @@ new acknowledged writes, and replays the final reconfiguration.
 
 #### LFUM qualification
 
+Stable inventory is qualified across the configured-size matrix above.
+Held build/admission/failover/repair overlaps below retain their 3/2 evidence;
+configurability does not extend every overlap or recovery profile.
+
 | Standalone live-session profile | Current process evidence |
 |---|---|
-| Empty pre-placement and stable original 3/2 | Correlated proposal/update/upload/reply, full committed member inventory, acknowledged data on original owners and new-generation control/replay. |
+| Empty pre-placement and stable configured membership | Correlated proposal/update/upload/reply, full committed member inventory, acknowledged data on original owners and new-generation control/replay, including singleton and minimum=target. |
 | Original Idle build and same-Primary admission | Public copy/Secondary role barriers, superseding generations and stale replies. Initial configuration can be admitted before build-upload ACK; exact peer retries resume after send advancement without another Open or mutated inventory. |
 | First original Primary app-host failover | Real Primary role and public IPrimaryReplicator final-configuration barriers. Query-only survivor PC, candidate phase-4 IC and completed survivor views are checked before continuing nonempty data. |
 | First explicit post-failover repair | Normal AddReplica/CreateReplica demands shared Hosting activation after predecessor cleanup. Repair configuration and fresh Secondary completion can precede ACK, but cannot finish held final RAP work. Exact replays activate no second host; the fresh member supplies quorum after another survivor loss. |
@@ -100,8 +117,8 @@ and [LFUM alignment plan](../../../docs/cluster/RustRaPort.md#lfum-alignment-pla
 Copy/build interruption and removal supersession remain separate qualification.
 Deactivation keeps Node/RA live while the replica closes; whole-RA shutdown of
 accepted snapshot jobs and automatic interrupted-repair recovery are not claimed.
-Planned transfer currently supports only the two-member local-cluster runtime profile,
-not standalone 3/2; broader RA model/store inventory coverage does not change that.
+Planned transfer retains the separate healthy two-member runtime qualification;
+configurable sizes do not qualify general transfer or standalone transfer overlaps.
 Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,
 FM/FMM rebuild and restart remain gated. Native-free acceptance is not complete
 original C++ handler or native FM/Federation interoperability evidence.
@@ -161,6 +178,8 @@ Example for the first of three original placements:
     }
   ],
   "partition": "22222222-2222-4222-8222-222222222222",
+  "target": 3,
+  "minimum": 2,
   "package": "/opt/fube/package",
   "application": "fabric:/External",
   "package_version_instance": 1,
@@ -180,17 +199,22 @@ manifest. Package that executable under `LocalService/Code/hosting-local-app`.
 Its default target/minimum parameters remain 1/1 for existing local fixtures;
 the explicit overrides select 3/2 here. A custom application supplies its own
 declared parameters, listeners and client protocol.
+Both size fields are required; there are no compatibility defaults. To select
+3/3, set `minimum` to 3 and make the resolved package minimum 3 too.
+Size changes during the deployment remain unsupported. Spare placement and
+replacement at minimum remain separate
+[S3 work](../../../docs/cluster/RustRaPort.md#configurable-replica-set-sizes-plan).
 
 Node IDs are nonzero hexadecimal numbers, not UUIDs. Configuration supplies the
 original Node/replica instances, replica IDs, bootstrap generation and
 package-version instance. Every Node has the same deployment, partition, initial
-generation and service/package facts, but its own local placement, peer pair and run directory.
+generation and service/package facts, but its own local placement, peer list and run directory.
 The FM may select any original placement as Primary; no node number or
 application role flag selects it.
 
 The runner uses the configured concrete IPv4 socket for both RA binding and
 publication. It does not need a separate advertised IP or store `0.0.0.0`.
-All three Node IPs must be distinct. Concrete loopback aliases are allowed for
+All configured Node IPs must be distinct. Concrete loopback aliases are allowed for
 same-host testing, not as evidence of cross-container connectivity. Container
 deployments must use their reachable container IPs, without NAT/port translation,
 service VIPs or load balancing between replica endpoints.
@@ -211,7 +235,8 @@ loopback inside each Node's container.
 
 Use the existing [`fube-ra` native codecs](../../libs/fube-ra/src/protocol.rs) and
 [`control::wire`](../../libs/fube-node/src/control/wire.rs) compositions/Link.
-The public profile identifier in status is `external-fm-volatile-three-v1`.
+The public profile identifier in status is `external-fm-volatile-configured-v1`;
+`replica_set` reports the actual target/minimum and their immutability.
 It describes an execution subset, not a new native wire schema or HTTP API.
 
 All traffic retains native PToP headers (`0x8013`) with exact configured
@@ -246,13 +271,13 @@ different identity domains; do not substitute one for another.
 |---|---|
 | NodeUp / NodeUpAck | Node requests fresh bootstrap on its original FM Channel. Validate the configured Node instance/PToP context; return the matching activated native version and fixed generation. |
 | Final empty ReplicaUp / ReplicaUpReply | Complete the original empty-inventory handshake before any local application authority. No nonempty reconciliation/recovery upload is accepted. |
-| AddPrimary / reply | Select exactly one initial Primary. Supply the actual package/type/version, configured partition and local replica identity, volatile 3/2 description, and native initial-role fields. |
+| AddPrimary / reply | Select exactly one initial Primary. Supply the actual package/type/version, configured partition and local replica identity, matching volatile target/minimum description, and native initial-role fields. For a singleton, this completes initial membership. |
 | AddReplica / reply | Ask that Primary to build each original destination. Wait for its actual reply, not CreateReplicaReply or local Idle readiness. |
-| DoReconfiguration / reply | Admit all three exact live Ready identities with P/P and I/S roles, unchanged service description and data-loss epoch. Every required peer commit and final RAP completion precedes the final native reply. |
+| DoReconfiguration / reply | For target > 1, admit the exact original live Ready identities with P/P and I/S roles, unchanged service description and data-loss epoch. Every required peer commit and final RAP completion precedes the final native reply. |
 | Service-type notification/status and matching replies | Process and ACK actual native work when emitted. These are not a mandatory pre-placement factory-ready handshake. |
 | ReplicaUp / reply | Match the real processed-report semantics. A verified app-host loss can inform explicit FM failover intent; report ACKs are not physical disposal or replacement-host authority. |
 | Endpoint-updated reply, when applicable | Match the exact native local lifetime; registration/listeners do not constitute client-ready publication. |
-| Normal DeleteReplica / reply | Tear down the whole service through exact per-member deletion. Local physical cleanup is a separate observation. Force deletion is not admitted. |
+| Normal DeleteReplica / reply | Tear down the whole service through exact per-member deletion. Local physical cleanup is a separate observation. The configured-size matrix does not qualify broader force-deletion branches. |
 
 After fresh Node bootstrap, FM may issue placement for its known package/type.
 RA retains actual registration lookup/Open and semantic completion; the FM must
@@ -263,7 +288,7 @@ that first FT.
 After initial admission, an external FM may drive the same supported native
 reconfiguration as the local cluster. Primary failover requires an actual
 matched app-host loss and eligible surviving history/quorums, not a lost FM
-connection. The shared ingress fixes configured sizes at 3/2 and original peer
+connection. The shared ingress enforces the declared immutable sizes and original peer
 bindings; the Node/RA enforces exact epochs, replica lifetimes, runtime authority,
 commit barriers and callback completion. Capacity retains the original incoming
 frame without acknowledging admission, in both launchers.
@@ -331,7 +356,7 @@ quorum.
 For healthy teardown, FM sends normal DeleteReplica to each original member and
 consumes the actual replies, then the orchestrator sends SIGTERM/SIGINT to each
 runner. The external package profile enables native active Delete only for the
-exact completed original 3/2 owner, with unchanged service/current epoch and
+exact completed configured owner, with unchanged service/current epoch and
 normal non-force intent. Legacy profiles keep their prior active-delete gates.
 This follows pinned SF `ReconfigurationAgent.cpp:776-834,2239-2242`
 (`DeleteLocalReplica` / `DeleteReplicaMessageProcessor`): normal open-replica

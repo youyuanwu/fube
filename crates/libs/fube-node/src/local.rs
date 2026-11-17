@@ -488,7 +488,7 @@ impl Node {
         matches!(
             self.activation.profile(),
             h::local::Profile::VolatileStatefulFmPrimary
-                | h::local::Profile::VolatileStatefulExternalFm
+                | h::local::Profile::VolatileStatefulExternalFm { .. }
         )
     }
 
@@ -496,7 +496,7 @@ impl Node {
         matches!(
             self.activation.profile(),
             h::local::Profile::VolatileStatefulLifecycle
-                | h::local::Profile::VolatileStatefulExternalFm
+                | h::local::Profile::VolatileStatefulExternalFm { .. }
         )
     }
 
@@ -518,8 +518,10 @@ impl Node {
             return Err(Error::Unsupported);
         }
         settings.max_entities = 1;
-        settings.allow_active_replica_delete =
-            activation.profile() == h::local::Profile::VolatileStatefulExternalFm;
+        settings.allow_active_replica_delete = matches!(
+            activation.profile(),
+            h::local::Profile::VolatileStatefulExternalFm { .. }
+        );
         settings.max_command_bytes = settings.max_command_bytes.min(BODY);
         settings.max_effects = settings.max_effects.min(SLOTS);
         settings.max_registration_lookups = settings.max_registration_lookups.min(SLOTS);
@@ -613,7 +615,7 @@ impl Node {
             self.activation.profile(),
             h::local::Profile::VolatileStatefulFmPrimary
                 | h::local::Profile::VolatileStatefulLifecycle
-                | h::local::Profile::VolatileStatefulExternalFm
+                | h::local::Profile::VolatileStatefulExternalFm { .. }
         ) || snapshot.fenced
             || !lost_replica_metadata(&state)
             || self.last_error.is_some()
@@ -827,17 +829,18 @@ impl Node {
                 });
                 // Whole-service teardown may delete an original active member.
                 // Legacy peer profiles still require their retirement/loss gates.
-                let external_active = self.activation.profile()
-                    == h::local::Profile::VolatileStatefulExternalFm
-                    && current.as_ref().is_some_and(|state| {
-                        matches!(state.body.replica.current_role, 3 | 4)
-                            && (state.fm_primary || state.peer_creation.is_some())
-                            && state.body.replica.node == incoming.replica.node
-                            && state.body.replica.id == incoming.replica.id
-                            && incoming.replica.instance <= state.body.replica.instance
-                            && state.body.unit.current == incoming.unit.current
-                            && state.body.service == incoming.service
-                    });
+                let external_active = matches!(
+                    self.activation.profile(),
+                    h::local::Profile::VolatileStatefulExternalFm { .. }
+                ) && current.as_ref().is_some_and(|state| {
+                    matches!(state.body.replica.current_role, 3 | 4)
+                        && (state.fm_primary || state.peer_creation.is_some())
+                        && state.body.replica.node == incoming.replica.node
+                        && state.body.replica.id == incoming.replica.id
+                        && incoming.replica.instance <= state.body.replica.instance
+                        && state.body.unit.current == incoming.unit.current
+                        && state.body.service == incoming.service
+                });
                 if peer_work && !stale_host && !external_active {
                     let eligible = match &current {
                         None => self.selected.is_none() || self.pending.iter().any(|pending| {
@@ -1881,6 +1884,9 @@ impl Node {
             || body.service.activation_mode != 0
             || !body.service.scaling.0.is_empty()
             || body.service.partitions != 1
+            || matches!(self.activation.profile(),
+                h::local::Profile::VolatileStatefulExternalFm { target, minimum }
+                if body.service.target != target || body.service.minimum != minimum)
             || (self.host_predecessors.is_empty()
                 && ((stateful && !ra::valid_stateful_sizes(&body.service))
                     || (!stateful && (body.service.target != 1 || body.service.minimum != 1))))
@@ -2719,9 +2725,11 @@ impl Node {
         if !old_process.reaped || !old_process.group_drained || !old_root_removed {
             return Err(Error::Unsupported);
         }
-        let profile = if self.activation.profile() == h::local::Profile::VolatileStatefulExternalFm
-        {
-            h::local::Profile::VolatileStatefulExternalFm
+        let profile = if matches!(
+            self.activation.profile(),
+            h::local::Profile::VolatileStatefulExternalFm { .. }
+        ) {
+            self.activation.profile()
         } else {
             h::local::Profile::VolatileStatefulLifecycle
         };
