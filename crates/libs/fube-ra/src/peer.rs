@@ -113,6 +113,13 @@ pub fn completed_primary_failover(state: &EntityState) -> bool {
         .is_some_and(|s| s.failover && s.stage == SwapStage::Complete)
 }
 
+pub fn completed_primary_change(state: &EntityState) -> bool {
+    state
+        .swap
+        .as_ref()
+        .is_some_and(|s| s.stage == SwapStage::Complete)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerCreation {
     pub source: NodeInstance,
@@ -817,7 +824,7 @@ pub(super) fn start_build(
         || !current.fm_primary
         || current.body.replica.current_role != 4
         || (current.peer_creation.is_some()
-            && !completed_primary_failover(current)
+            && !completed_primary_change(current)
             && !reconfiguration::completed_secondary_removal(current))
         || peer != Some(&remote.target)
     {

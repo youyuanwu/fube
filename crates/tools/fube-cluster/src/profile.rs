@@ -210,6 +210,7 @@ pub struct Peer {
 pub struct Launch {
     #[serde(default)]
     pub profile: ServiceProfile,
+    pub remote_replica_progress_query_wait_ms: u32,
     pub deployment: String,
     pub session: String,
     pub capability: String,

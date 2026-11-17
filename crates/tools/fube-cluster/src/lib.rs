@@ -27,6 +27,7 @@ pub struct Config {
     pub root: PathBuf,
     pub app: PathBuf,
     pub executable: PathBuf,
+    pub remote_replica_progress_query_wait_ms: u32,
 }
 struct ChildOwner {
     launch: Launch,
@@ -90,6 +91,7 @@ impl Cluster {
         let mut launches: Vec<_> = (1..=node_count as u8)
             .map(|placement| Launch {
                 profile: config.profile,
+                remote_replica_progress_query_wait_ms: config.remote_replica_progress_query_wait_ms,
                 deployment: interlock.deployment.clone(),
                 session: uuid::Uuid::new_v4().to_string(),
                 capability: uuid::Uuid::new_v4().to_string(),
@@ -1391,7 +1393,7 @@ impl Cluster {
     async fn send_configuration(&self, body: &DoReconfiguration) -> Result<()> {
         let child = self
             .children
-            .get(self.ledger.primary_index())
+            .get(self.ledger.configuration_target_index())
             .ok_or("missing original Primary owner")?;
         child
             .link

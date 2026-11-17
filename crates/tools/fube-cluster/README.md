@@ -29,6 +29,11 @@ pool, with `N <= K <= 64`; omitting it uses N Nodes. Every pool member is
 prebound, but initial build/admission uses only the first N placements.
 Unused Nodes do not Open a replica or supply a vote.
 
+`--remote-replica-progress-query-wait-ms` /
+`Config::remote_replica_progress_query_wait_ms` passes SF's ordinary
+`RemoteReplicaProgressQueryWaitDuration` to shared RA (default 30,000 ms).
+Zero skips only the optional wait for additional responses, never read quorums.
+
 Send the existing `create` command for node1. Driving the cluster automatically
 builds the original Secondary destinations, one at a time, then admits all
 successful Idles through unchanged-Primary reconfiguration. Target/minimum
@@ -310,9 +315,16 @@ Completed generation rounds do not permanently disable transfer; concurrent
 generation/LFUM overlap remains unqualified.
 New-Primary loss yields unknown, never failback or quorum reduction. Swap abort, automatic failover,
 restart and full native handler/interoperability qualification remain gated.
-If SF requires restarting a non-responding or uncatchable Secondary after
-GetLSN selection, completion explicitly rejects before activation: native
-Secondary restart/rebuild is not implemented by this handoff path.
+Missing, unknown or uncatchable Secondary progress follows SF's volatile
+restart path: shared RA projects the member down to RAP, sends force Deactivate
+with invalid history, and commits its successful Close/DeactivateReply as
+down/Dropped before final completion. It is not activated or reopened.
+The 3/2 process case then explicitly calls `replace_replica_on(4)` to build and
+admit an unused static spare, preserving survivor owners and proving the
+replacement's real quorum vote. Native completion, dropped reporting, normal
+metadata Delete and original-owner disposal remain separate barriers.
+Persisted restart, in-handoff volatile rebuild, other restart-required sizes,
+swap abort and concurrent generation/LFUM overlap remain unqualified or gated.
 See the [source mapping and acceptance boundaries](../../../docs/cluster/MinimalFmCluster.md#healthy-planned-primary-transfer).
 
 `Cluster::remove_idle_replica_via_fm().await` lets FM cancel its original pending

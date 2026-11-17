@@ -29,6 +29,28 @@ struct Fixture {
 }
 
 struct GroupHelper(Child);
+
+struct PausedNode(u32);
+impl PausedNode {
+    fn new(pid: u32) -> Self {
+        assert!(Command::new("kill")
+            .args(["-STOP", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success());
+        Self(pid)
+    }
+}
+impl Drop for PausedNode {
+    fn drop(&mut self) {
+        assert!(Command::new("kill")
+            .args(["-CONT", &self.0.to_string()])
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+
 impl GroupHelper {
     fn join(pid: u64) -> Self {
         Self(
@@ -121,6 +143,7 @@ impl Fixture {
             ],
             run_directory: root.join(format!("node{}", index + 1)),
             startup_timeout_ms: 10_000, shutdown_timeout_ms: 20_000,
+            remote_replica_progress_query_wait_ms: fube_ra::entity::Settings::default().remote_replica_progress_query_wait_ms,
         }).collect();
         Self {
             root,
@@ -1265,6 +1288,48 @@ async fn planned_handoff(
     (request, held)
 }
 
+async fn configured_membership(fm: &mut FmFixture, fixture: &mut Fixture) -> DoReconfiguration {
+    fm.until(fixture, |fm| fm.bootstrapped.iter().all(|ready| *ready))
+        .await;
+    let body = primary(&fixture.configs[0]);
+    let generation = fixture.configs[0].generation().unwrap();
+    fm.send(0, add_primary_message(&body, &generation).unwrap())
+        .await;
+    fm.until(fixture, |fm| fm.primary.is_some()).await;
+    for destination in 1..fixture.configs[0].target as usize {
+        let build = idle_request(&body, &fixture.configs[destination]);
+        fm.send(0, add_replica_message(&build, &generation).unwrap())
+            .await;
+        fm.until(fixture, |fm| fm.builds.len() == destination).await;
+    }
+    let mut replicas = vec![fm.primary.as_ref().unwrap().replica.clone()];
+    replicas[0].previous_role = 4;
+    for built in &fm.builds {
+        let mut replica = built.replica.clone();
+        replica.previous_role = 2;
+        replica.current_role = 3;
+        replicas.push(replica);
+    }
+    let mut unit = body.unit.clone();
+    unit.previous = unit.current;
+    unit.current.configuration += 1;
+    let request = DoReconfiguration {
+        configuration: Configuration {
+            unit,
+            service: body.service,
+            replicas: ObjectArray(replicas),
+        },
+        phase0_duration: i64::MAX,
+    };
+    fm.send(
+        0,
+        do_reconfiguration_message(&request, &generation).unwrap(),
+    )
+    .await;
+    fm.until(fixture, |fm| fm.configured.len() == 1).await;
+    request
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_repeated_planned_handoffs_coordinate_all_members_and_replay_native_completion()
 {
@@ -1276,15 +1341,9 @@ async fn standalone_repeated_planned_handoffs_coordinate_all_members_and_replay_
         let mut fixture = Fixture::with_sizes(address, target, minimum);
         fixture.start();
         let mut fm = FmFixture::accept(listener, &mut fixture).await;
-        fm.until(&mut fixture, |fm| {
-            fm.bootstrapped.iter().all(|ready| *ready)
-        })
-        .await;
+        let initial = configured_membership(&mut fm, &mut fixture).await;
         let body = primary(&fixture.configs[0]);
         let generation = fixture.configs[0].generation().unwrap();
-        fm.send(0, add_primary_message(&body, &generation).unwrap())
-            .await;
-        fm.until(&mut fixture, |fm| fm.primary.is_some()).await;
         let old_endpoint = fm
             .primary
             .as_ref()
@@ -1292,38 +1351,6 @@ async fn standalone_repeated_planned_handoffs_coordinate_all_members_and_replay_
             .replica
             .service_endpoint
             .clone();
-        for destination in 1..target as usize {
-            let build = idle_request(&body, &fixture.configs[destination]);
-            fm.send(0, add_replica_message(&build, &generation).unwrap())
-                .await;
-            fm.until(&mut fixture, |fm| fm.builds.len() == destination)
-                .await;
-        }
-        let mut replicas = vec![fm.primary.as_ref().unwrap().replica.clone()];
-        replicas[0].previous_role = 4;
-        for built in &fm.builds {
-            let mut replica = built.replica.clone();
-            replica.previous_role = 2;
-            replica.current_role = 3;
-            replicas.push(replica);
-        }
-        let mut unit = body.unit.clone();
-        unit.previous = unit.current;
-        unit.current.configuration += 1;
-        let initial = DoReconfiguration {
-            configuration: Configuration {
-                unit,
-                service: body.service.clone(),
-                replicas: ObjectArray(replicas),
-            },
-            phase0_duration: i64::MAX,
-        };
-        fm.send(
-            0,
-            do_reconfiguration_message(&initial, &generation).unwrap(),
-        )
-        .await;
-        fm.until(&mut fixture, |fm| fm.configured.len() == 1).await;
         let deadline = Instant::now() + Duration::from_secs(8);
         while !application(&old_endpoint, "read").await.starts_with("OK") {
             assert!(
@@ -1466,6 +1493,220 @@ async fn standalone_repeated_planned_handoffs_coordinate_all_members_and_replay_
         }
         fixture.finish(vec![true; target as usize]);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_planned_handoff_drops_missing_progress_then_rebuilds_an_explicit_spare() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let mut fixture = Fixture::with_node_pool(address, 3, 2, 4);
+    for config in &mut fixture.configs {
+        config.remote_replica_progress_query_wait_ms = 250;
+    }
+    fixture.start();
+    let mut fm = FmFixture::accept(listener, &mut fixture).await;
+    let initial = configured_membership(&mut fm, &mut fixture).await;
+    let generation = fixture.configs[0].generation().unwrap();
+    let mut membership = fm.configured[0].clone();
+    let endpoint = membership.replicas.0[0].service_endpoint.clone();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !application(&endpoint, "read").await.starts_with("OK") {
+        assert!(Instant::now() < deadline, "{}", fixture.diagnostics());
+        fm.step().await;
+    }
+    assert!(application(&endpoint, "write")
+        .await
+        .contains("committed=1"));
+    let owners: Vec<_> = (0..4).map(|i| fixture.status(i)).collect();
+    let paused = PausedNode::new(fixture.children[2].pid());
+    let mut intent = initial.configuration.clone();
+    intent.unit.previous = membership.unit.current;
+    intent.unit.current = membership.unit.current;
+    intent.unit.current.configuration += 0x1_0000_0001;
+    intent.replicas = membership.replicas;
+    let candidate = fixture.configs[1].node.identity.native().unwrap();
+    for r in &mut intent.replicas.0 {
+        r.previous_role = r.current_role;
+        r.current_role = if r.node == candidate { 4 } else { 3 };
+    }
+    let request = DoReconfiguration {
+        configuration: intent,
+        phase0_duration: i64::MAX,
+    };
+    fm.hold_configuration = true;
+    fm.send(
+        0,
+        do_reconfiguration_message(&request, &generation).unwrap(),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while fixture.status(1)["primary_swap_stage"] != "Activate" {
+        assert!(Instant::now() < deadline, "{}", fixture.diagnostics());
+        fm.step().await;
+    }
+    assert_eq!(fm.configured.len(), 1);
+    assert!(fm.held_configuration.is_none());
+    assert!(application(&endpoint, "write-more")
+        .await
+        .contains("NotPrimary"));
+    drop(paused);
+    fm.until(&mut fixture, |fm| fm.held_configuration.is_some())
+        .await;
+    let held = fm.held_configuration.take().unwrap();
+    for resource in ["local-instance.resource", "local-provider.resource"] {
+        assert!(
+            !fixture.work(2).join(resource).exists(),
+            "native restart Close must dispose {resource}"
+        );
+    }
+    let lost = fixture.configs[2].node.identity.native().unwrap();
+    let dropped = held
+        .replicas
+        .0
+        .iter()
+        .find(|r| r.node == lost)
+        .unwrap()
+        .clone();
+    assert!(!dropped.up && dropped.state == 3 && dropped.current_role == 3);
+    assert_eq!(fm.configured.len(), 1);
+    fm.hold_configuration = false;
+    fm.send(
+        0,
+        do_reconfiguration_message(&request, &generation).unwrap(),
+    )
+    .await;
+    fm.until(&mut fixture, |fm| {
+        fm.configured.len() == 2 && fm.losses.contains(&2)
+    })
+    .await;
+    assert_eq!(fm.configured.last(), Some(&held));
+    membership = held;
+    let endpoint = membership
+        .replicas
+        .0
+        .iter()
+        .find(|r| r.current_role == 4)
+        .unwrap()
+        .service_endpoint
+        .clone();
+    assert!(application(&endpoint, "write-more")
+        .await
+        .contains("committed=2"));
+    let delete = DeleteReplica::new(
+        AddInstance {
+            unit: request.configuration.unit,
+            service: initial.configuration.service.clone(),
+            replica: dropped,
+        },
+        false,
+    );
+    fm.send(2, delete_replica_message(&delete, &generation).unwrap())
+        .await;
+    fm.until(&mut fixture, |fm| fm.deleted[2]).await;
+    let mut build = idle_request(&primary(&fixture.configs[0]), &fixture.configs[3]);
+    build.unit = membership.unit.clone();
+    fm.hold_build = true;
+    fm.send(1, add_replica_message(&build, &generation).unwrap())
+        .await;
+    fm.until(&mut fixture, |fm| fm.held_build.is_some()).await;
+    let built = fm.held_build.take().unwrap();
+    fm.hold_build = false;
+    fm.send(1, add_replica_message(&build, &generation).unwrap())
+        .await;
+    fm.until(&mut fixture, |fm| fm.builds.len() == 3).await;
+    assert_eq!(fm.builds.last(), Some(&built));
+    let mut repair = Configuration {
+        unit: membership.unit.clone(),
+        service: initial.configuration.service.clone(),
+        replicas: membership.replicas,
+    };
+    repair.unit.previous = repair.unit.current;
+    repair.unit.current.configuration += 1;
+    for r in &mut repair.replicas.0 {
+        r.previous_role = r.current_role;
+        if r.node == lost {
+            r.current_role = 1;
+        }
+    }
+    let mut fresh = built.replica;
+    fresh.previous_role = 2;
+    fresh.current_role = 3;
+    repair.replicas.0.push(fresh);
+    let repair = DoReconfiguration {
+        configuration: repair,
+        phase0_duration: i64::MAX,
+    };
+    fm.hold_configuration = true;
+    fm.send(1, do_reconfiguration_message(&repair, &generation).unwrap())
+        .await;
+    fm.until(&mut fixture, |fm| fm.held_configuration.is_some())
+        .await;
+    let restored = fm.held_configuration.take().unwrap();
+    fm.hold_configuration = false;
+    fm.send(1, do_reconfiguration_message(&repair, &generation).unwrap())
+        .await;
+    fm.until(&mut fixture, |fm| fm.configured.len() == 3).await;
+    assert_eq!(fm.configured.last(), Some(&restored));
+    assert_eq!(restored.replicas.0.len(), 3);
+    assert!(restored.replicas.0.iter().all(|r| r.node != lost && r.up));
+    assert!(application(&endpoint, "write-final")
+        .await
+        .contains("committed=3"));
+    for i in [0, 1] {
+        assert_eq!(
+            fixture.status(i)["application_pid"],
+            owners[i]["application_pid"]
+        );
+        assert_eq!(fixture.status(i)["runtime_root"], owners[i]["runtime_root"]);
+        assert_eq!(fixture.status(i)["host_replacement_count"], 0);
+    }
+    fm.stopping = true;
+    for index in [0, 3, 1] {
+        if index == 3 {
+            assert!(application(&endpoint, "write 4")
+                .await
+                .contains("committed=4"));
+        } else if index == 1 {
+            if let Ok(reply) = tokio::time::timeout(
+                Duration::from_millis(250),
+                application(&endpoint, "write 5"),
+            )
+            .await
+            {
+                assert!(
+                    !reply.starts_with("OK"),
+                    "dropped replicas cannot vote: {reply}"
+                );
+            }
+        }
+        let node = fixture.configs[index].node.identity.native().unwrap();
+        let delete = DeleteReplica::new(
+            AddInstance {
+                unit: restored.unit.clone(),
+                service: initial.configuration.service.clone(),
+                replica: restored
+                    .replicas
+                    .0
+                    .iter()
+                    .find(|r| r.node == node)
+                    .unwrap()
+                    .clone(),
+            },
+            false,
+        );
+        fm.send(index, delete_replica_message(&delete, &generation).unwrap())
+            .await;
+        fm.until(&mut fixture, |fm| fm.deleted[index]).await;
+    }
+    for index in 0..4 {
+        fixture.stop_node(&mut fm, index).await;
+    }
+    for link in fm.links.iter().flatten() {
+        link.close().await.unwrap();
+    }
+    fixture.finish(vec![true; 4]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

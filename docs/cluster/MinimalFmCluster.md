@@ -2054,7 +2054,8 @@ Pinned SF source `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the flow:
 | `ra/FailoverUnit.cpp:628-703,1964-2155,2204-2299,3014-3078`; `ra/ReconfigurationAgent.cpp:2425-2507` | Candidate phase 1 uses real local RAP UpdateEpochAndGetStatus and native peer GetLSN/Reply. Bound the wait for up replicas, retain separate PC/CC read quorums, then select by deactivation history and highest eligible LSN. Equal LSNs are not required. Swap retains its forwarded candidate and skips failover-only catch-up-capability redirection; contradictory candidate history rejects without inventing election or data loss. |
 | `ra/FailoverUnit.cpp:736-818,3063-3124`; `common/FailoverConfig.h:387` | Candidate promotion/catch-up uses complete unchanged PC and CC membership at 2/1 or 3/2. The native default PC=CC optimization skips phase-3 Deactivate; it does not reuse the S/N retirement/Close path. |
 | `ra/ReconfigurationAgent.cpp:2810-2848`; `ra/FailoverUnit.cpp:959-999,2703-2873,3164-3272,3376-3415,3487-3496` | Peer Activate updates every Secondary without another Open/build. An unchanged S/S member commits stable activation metadata and ACKs without RAP, including with a missing/pending GetLSN callback. The old Primary is already Secondary after phase 0 and also needs no second RAP role transition. Every exact ActivateReply and its metadata commit precede final RAP EndReconfiguration/commit and the new Primary's native DoReconfigurationReply. Stable completion clears previous epoch/roles. |
-| `ra/FailoverUnit.cpp:2271-2354` | SF marks non-responding, unknown-progress or uncatchable up/Ready CC members for restart/rebuild after selection. Fube's planned path does not implement that recovery contract and explicitly rejects successful catch-up completion before activation if it would be required. Timed selection is not evidence that an unqueried member is caught up or that activation repairs it. |
+| `ra/FailoverUnit.cpp:2271-2354,2566-2595,3147-3272`; `ra/Replica.cpp:200-214` | Mark missing, NotFound/unknown-history or uncatchable up/Ready CC Secondaries for restart after selection. Unknown progress supplies no read-quorum/history vote. Keep their membership for quorum accounting but project them down to RAP; retry native force Deactivate with invalid deactivation info, not Activate. Final EndReconfiguration cannot overtake the restart acknowledgement. |
+| `ra/ReconfigurationAgent.cpp:2495-2600`; `ra/FailoverUnit.cpp:1104-1170`; `ra/Replica.cpp:308-314` | For volatile services, force Deactivate closes/drops the exact lifetime, rather than reopening it. It does not update deactivation history from the invalid restart payload. Successful committed Close precedes DeactivateReply; an already closed replica replays the ACK. The candidate commits the matched reply as down/Dropped in CC and does not rebuild that lifetime in the same reconfiguration. |
 | `ra/FailoverUnit.cpp:3590-3630,4597-4624,5701-5710`; `ra/EndpointPublishState.cpp:47-145`; `common/FailoverConfig.h:486` | Original-runtime ProxyReplicaEndpointUpdated is ACKed, but only matching active promotion updates the committed endpoint. The existing helper owns the native 30-second early-publication timeout and exact FM ACK. Final reconfiguration completion publishes the new Primary address; an endpoint update/ACK alone does not complete the transfer. |
 
 Poll `configuration` for `kind=planned_primary_transfer` and `ready=true`.
@@ -2080,7 +2081,8 @@ completion, retained retries and endpoint timeout/publication. Unchanged
 Secondary activation with absent/pending/completed GetLSN waits only for its
 metadata commit; definite veto/unknown commit and late status results cannot
 publish an early ACK. Demotion/endpoint/final-reply commits remain independent.
-Missing or uncatchable progress explicitly gates restart-required completion.
+Missing, unknown or uncatchable progress instead follows the volatile
+restart/Close path below; it cannot be activated as though it were caught up.
 Repeated shared model/store cases exercise candidate, former-Primary and
 unchanged-Secondary roles across fresh epochs, including absent/pending/completed
 GetLSN, failed new-intent commits and stale prior RAP completions. A completed
@@ -2090,8 +2092,9 @@ check the exact current role/source/epoch, including on the legacy two-member pa
 Original-process tests copy nonempty state, lose/replay the final reply, verify
 old-writer rejection and new-Primary ACKs continuing on the demoted member,
 retain original owners and one Open each, and confirm new-Primary host
-loss cannot reactivate the old writer. Native down reporting makes transfer
-observation unknown; it supplies no replacement, election or quorum fallback.
+loss cannot reactivate the old writer. New-Primary down reporting makes transfer
+observation unknown. A pending 3/2 Secondary report withdraws that member but
+cannot publish the Primary or supply replacement, election or quorum fallback.
 
 Standalone real-process cases qualify 2/1 and both possible 3/2 candidates
 through mesh ingress and the same RA/Node/Hosting execution. Both launchers
@@ -2109,9 +2112,45 @@ writes and retain immutable sizes/data and original process/runtime owners.
 An external FM must publish the new Primary only after the successful native
 DoReconfigurationReply, not merely after a continuation or endpoint message.
 
+#### Volatile Secondary restart and explicit rebuild
+
+The shared candidate RA marks restart-required Secondaries after GetLSN
+selection and sends force Deactivate alongside catch-up. RAP sees those members
+as down without reducing PC/CC membership or quorum requirements. The target
+retains the exact request/source/lifetime, closes through normal shared
+Node/Hosting/RAP ownership, and replies only after the Close result commits.
+Retries neither close another lifetime nor advance history with the invalid
+restart deactivation info. Late GetLSN work is stale RA work, not a mesh fault.
+
+The candidate commits the exact DeactivateReply as down/Dropped, waits for all
+remaining up members' activation and final RAP completion, then sends its
+native FM reply. The dropped member remains a non-voting CC Secondary in that
+reply; it is not silently removed, reopened or replaced. If an old Primary was
+dropped after forwarding, FM retries may target the selected candidate, whose
+retained native transition owns replay. Readiness still requires native completion.
+
+Both launchers qualify a 3/2 missing-progress handoff with nonempty data,
+withheld/replayed final completion and real old-writer fencing. A subsequent
+explicit FM request builds on an unused preconfigured spare and admits it via
+the existing unchanged-size removal/admission transition. Survivor runtime
+owners remain unchanged, genuine service/provider disposal is checked, the new
+member supplies a real quorum vote, and losing it prevents another fresh ACK.
+Shared model/store cases additionally cover uncatchable and unknown progress,
+former-Primary and unchanged-Secondary closure, exact identity/source/epoch
+checks, failed/unknown commits and metadata-only Delete of the dropped lifetime.
+
+`remote_replica_progress_query_wait_ms` configures SF's
+`RemoteReplicaProgressQueryWaitDuration` (`common/FailoverConfig.h:633`).
+The shared default remains 30,000 ms; zero disables only the optional wait for
+additional up-member responses, never the separate PC/CC read-quorum checks.
+The local CLI exposes `--remote-replica-progress-query-wait-ms`; standalone
+accepts the same snake-case JSON setting. Process tests shorten this ordinary
+RA setting rather than fabricating progress or waiting out unrelated host leases.
+
 This enables sequential healthy transfers at the qualified sizes, not arbitrary
 reconfiguration recovery. Concurrent supersession or transfer-generation/LFUM
-overlaps, native Secondary restart/rebuild, aborted-swap recovery, loss-driven
+overlaps, persisted Secondary restart, same-handoff volatile rebuild,
+restart-required recovery at other sizes, aborted-swap recovery, loss-driven
 failover, changed membership/endpoints outside this promotion, data loss,
 FMM, reconnect and restart remain gated. Native source-stream evidence covers
 163 bidirectional cases, 83 types/251 fields, 167 bundle files and 47 actual

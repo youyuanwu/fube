@@ -567,6 +567,10 @@ impl Adapter {
                         s.phase != ra::Phase::Ready
                             || (s.swap.is_none() && s.progress_query.is_none())
                             || s.body.unit.current != unit.current
+                            || (matches!(reply.effect, ra::Effect::PeerGetLsn { .. })
+                                && s.swap
+                                    .as_ref()
+                                    .is_none_or(|swap| swap.stage != ra::SwapStage::GetLsn))
                     })
                 {
                     self.peer_replies.pop_front();
@@ -589,6 +593,10 @@ impl Adapter {
                             || state.body.replica.id != body.replica.id
                             || state.body.replica.instance != body.replica.instance
                             || (!survivor_ack
+                                && !state.forced_deactivation.as_ref().is_some_and(|owner| {
+                                    owner.source == *peer
+                                        && owner.request.configuration.unit == body.unit
+                                })
                                 && state
                                     .peer_creation
                                     .as_ref()

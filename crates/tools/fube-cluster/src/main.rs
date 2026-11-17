@@ -42,6 +42,10 @@ struct Arguments {
     #[arg(long, requires = "stateful")]
     nodes: Option<usize>,
 
+    /// SF RemoteReplicaProgressQueryWaitDuration, in milliseconds.
+    #[arg(long, default_value_t = fube_ra::entity::Settings::default().remote_replica_progress_query_wait_ms)]
+    remote_replica_progress_query_wait_ms: u32,
+
     #[arg(long, hide = true, conflicts_with_all = ["root", "app", "stateful_singleton", "stateful_peer_idle", "stateful_three", "stateful"])]
     internal_node: Option<PathBuf>,
 }
@@ -108,6 +112,7 @@ async fn foreground(
     app: PathBuf,
     profile: ServiceProfile,
     nodes: Option<usize>,
+    remote_replica_progress_query_wait_ms: u32,
 ) -> Result<bool> {
     let mut cluster = Cluster::with_node_pool(
         Config {
@@ -115,6 +120,7 @@ async fn foreground(
             root,
             app,
             executable: std::env::current_exe().map_err(|error| error.to_string())?,
+            remote_replica_progress_query_wait_ms,
         },
         nodes.unwrap_or_else(|| profile.node_count()),
     )?;
@@ -202,6 +208,7 @@ async fn run(arguments: Arguments) -> Result<bool> {
         arguments.app.expect("clap requires --app"),
         profile,
         arguments.nodes,
+        arguments.remote_replica_progress_query_wait_ms,
     )
     .await
 }

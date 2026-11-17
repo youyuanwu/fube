@@ -88,6 +88,12 @@ pub struct Config {
     pub startup_timeout_ms: u64,
     #[serde(default = "shutdown_ms")]
     pub shutdown_timeout_ms: u64,
+    #[serde(default = "progress_query_wait_ms")]
+    pub remote_replica_progress_query_wait_ms: u32,
+}
+
+fn progress_query_wait_ms() -> u32 {
+    fube_ra::entity::Settings::default().remote_replica_progress_query_wait_ms
 }
 
 fn startup_ms() -> u64 {

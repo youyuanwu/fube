@@ -234,6 +234,8 @@ impl Owner {
                 .is_some_and(|configuration| configuration.stage == ra::ConfigurationStage::Complete)),
             "local_configuration_stage": state.and_then(|state| state.reconfiguration.as_ref())
                 .map(|configuration| format!("{:?}", configuration.stage)),
+            "primary_swap_stage": state.and_then(|state| state.swap.as_ref())
+                .map(|swap| format!("{:?}", swap.stage)),
             "configuration_members": state.and_then(|state| state.reconfiguration.as_ref())
                 .map(|configuration| configuration.request.replicas.0.iter().filter(|replica| replica.current_role >= 3).count()),
             "generations": self.node.as_ref().map(|node| {
@@ -450,6 +452,9 @@ impl Owner {
             },
             ra::Settings {
                 max_outstanding: 32,
+                remote_replica_progress_query_wait_ms: self
+                    .config
+                    .remote_replica_progress_query_wait_ms,
                 max_service_types: 1,
                 ..ra::Settings::default()
             },
