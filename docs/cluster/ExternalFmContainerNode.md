@@ -408,18 +408,22 @@ tracks remaining copy/build interruption and removal supersession.
 Each repeated failover round uses the latest completed membership and known
 fresh replica identities, not the original configuration. Shared model/store
 coverage of transfer/redirection is separate from runtime qualification.
-Standalone now qualifies one healthy planned handoff at 2/1 and 3/2, including
-either original Secondary as candidate and committed participation by the
+Standalone now qualifies repeated/reverse healthy planned handoff at 2/1 and 3/2,
+including either original Secondary as the first candidate and committed participation by the
 unchanged 3/2 Secondary. FM starts at the old Primary; shared RA owns the native
 demotion/continuation, timed PC/CC quorum and deactivation-history GetLSN
 selection, catch-up, activation and final
 RAP/FM barriers. Publish the new Primary only after its successful native
-DoReconfigurationReply, never an early endpoint update/ACK.
+DoReconfigurationReply, never an early endpoint update/ACK. A later handoff
+uses the latest completed membership/roles, including fresh lifetimes after
+the qualified two-cycle 3/2 static-spare repair and completed generation round.
+Process cases perform A-B-A-C with fresh writes after every transfer, retain
+runtime owners and fence stale earlier requests/completions.
 Unequal progress is permitted without failover-only catch-up-capability
 redirection. Secondary activation is a metadata commit, not another RAP role
 transition; a pending GetLSN callback cannot hold an otherwise valid S/S ACK.
 Cases requiring native Secondary restart/rebuild remain explicitly gated
-before activation. Other sizes, abort/reverse transfer and standalone
+before activation. Other sizes, swap abort and concurrent standalone
 generation/LFUM transfer overlaps remain unqualified or gated.
 Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,
 FM/FMM rebuild and restart remain gated; native handler/interoperability evidence

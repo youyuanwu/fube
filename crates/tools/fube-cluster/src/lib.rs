@@ -1347,7 +1347,29 @@ impl Cluster {
         let body = self.ledger.request_primary_transfer(Instant::now())?;
         if self.ledger.configuration_status()["ready"] != true {
             if let Err(error) = self.send_configuration(&body).await {
-                self.ledger.lost(0, error.clone());
+                self.ledger.lost(self.ledger.primary_index(), error.clone());
+                return Err(error);
+            }
+        }
+        Ok(self.ledger.configuration_status())
+    }
+    /// Request a handoff to a one-based current Secondary; retrying the same
+    /// destination replays that transition until another handoff is requested.
+    pub async fn transfer_primary_to(&mut self, destination: u8) -> Result<Value> {
+        if self.finished.is_some()
+            || destination == 0
+            || self.children.len() != self.ledger.placements.len()
+        {
+            return Err(
+                "Primary transfer requires a running cluster and explicit destination".into(),
+            );
+        }
+        let body = self
+            .ledger
+            .request_primary_transfer_to(usize::from(destination - 1), Instant::now())?;
+        if self.ledger.configuration_status()["ready"] != true {
+            if let Err(error) = self.send_configuration(&body).await {
+                self.ledger.lost(self.ledger.primary_index(), error.clone());
                 return Err(error);
             }
         }

@@ -303,12 +303,8 @@ impl Ingress {
                 node.add_primary_from_fm(body, &self.fm, &generation)
             }
             "DoReconfiguration" => {
-                if !self.profile.peer_replicas()
-                    || (!self.coordinating && !self.profile.mesh_peers())
-                {
-                    return Err(
-                        "DoReconfiguration requires the original coordinating Primary".into(),
-                    );
+                if !self.profile.peer_replicas() {
+                    return Err("DoReconfiguration requires a replicated stateful profile".into());
                 }
                 let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
                 self.description(&body.configuration.unit, &body.configuration.service)?;
@@ -422,7 +418,7 @@ impl Ingress {
             return Err("new peer lifecycle intent is not admitted during shutdown".into());
         }
         let result = match action.as_str() {
-            "DoReconfiguration" if !self.coordinating || self.profile.mesh_peers() => {
+            "DoReconfiguration" if self.profile.peer_replicas() => {
                 let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
                 self.description(&body.configuration.unit, &body.configuration.service)?;
                 node.continue_swap_from_peer(body, source, &generation)
