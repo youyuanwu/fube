@@ -802,7 +802,7 @@ async fn dial_peer_to(launch: &Launch, peer: &Peer, address: &str) -> Result<Lin
             .connect_until(wire::deadline())
             .await
             .map_err(err)?;
-    Link::new(
+    Link::new_peer(
         channel,
         launch.node.clone(),
         peer.node.clone(),
@@ -832,7 +832,7 @@ async fn accept_peer_from(
     )
     .await
     .map_err(err)?;
-    Link::new(
+    Link::new_peer(
         channel,
         launch.node.clone(),
         peer.node.clone(),

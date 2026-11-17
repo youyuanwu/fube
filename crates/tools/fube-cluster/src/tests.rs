@@ -342,6 +342,134 @@ fn failover_lfum_validates_original_phase_views_without_finishing_promotion() {
 }
 
 #[test]
+fn planned_handoff_lfum_validates_each_committed_phase_without_completing_transfer() {
+    for candidate in [1, 2] {
+        let mut ledger = configured_ledger(3, 2);
+        for (index, placement) in ledger.placements.iter_mut().enumerate() {
+            placement.node_description = Some(NodeDescription { name: format!("node{index}"), ..NodeDescription::default() });
+        }
+        for destination in [candidate, 0] {
+            let previous = ledger.swap.as_ref().and_then(|s| s.reply.clone())
+                .unwrap_or_else(|| ledger.configuration.as_ref().unwrap().reply.clone().unwrap());
+            let source = ledger.placements.iter().position(|p|
+                previous.replicas.0.iter().any(|r| r.node == p.launch.node && r.current_role == 4)).unwrap();
+            let intent = ledger.request_primary_transfer_to(destination, Instant::now()).unwrap();
+            for phase in 0..6 {
+                ledger.begin_generation().unwrap();
+                let generation = ledger.generation.as_ref().unwrap().number.clone();
+                for index in 0..3 {
+                    ledger.generation.as_mut().unwrap().proposal_reply(index, &GenerationProposalReply {
+                        proposed: generation.clone(), current: generation.clone(), error: 0,
+                    }).unwrap();
+                }
+                for index in 0..3 {
+                    let mut config = intent.configuration.clone();
+                    let mut primary = index == destination;
+                    let mut intermediate = Epoch::default();
+                    if phase == 0 && index != source {
+                        config.unit = previous.unit.clone();
+                        config.replicas = previous.replicas.clone();
+                        primary = false;
+                    } else if phase < 4 && index != source && index != destination {
+                        config.replicas = previous.replicas.clone();
+                        for r in &mut config.replicas.0 { r.previous_role = r.current_role; }
+                    } else {
+                        if phase != 0 {
+                            config.replicas.0.iter_mut().find(|r| r.previous_role == 4).unwrap().service_endpoint.clear();
+                        }
+                        if phase >= 3 && (index == destination || phase >= 4) {
+                            config.replicas.0.iter_mut().find(|r| r.current_role == 4).unwrap().service_endpoint = "127.0.0.1:23456".into();
+                        }
+                        if index == source && phase == 0 {
+                            primary = true;
+                        } else if phase == 5 || (phase >= 4 && index != destination) {
+                            config.unit.previous = Epoch::default();
+                            for r in &mut config.replicas.0 { r.previous_role = 1; }
+                        } else if index == source {
+                            config.replicas.0.iter_mut().find(|r| r.node == ledger.placements[source].launch.node).unwrap().state = 1;
+                        }
+                        if index == destination && phase == 4 { intermediate = config.unit.current; }
+                    }
+                    let body = LfumUpload {
+                        generation: generation.clone(), node: ledger.placements[index].node_description.clone().unwrap(),
+                        any_replica_found: true,
+                        units: ObjectArray(vec![FailoverUnitInfo {
+                            service: config.service, unit: config.unit, intermediate,
+                            report_from_primary: primary, local_deleted: false,
+                            replicas: ObjectArray(config.replicas.0.into_iter().map(|mut description| {
+                                description.first_lsn = -1; description.last_lsn = -1;
+                                ReplicaInfo { intermediate_role: if intermediate == Epoch::default() { 1 } else { description.current_role }, description }
+                            }).collect()),
+                        }]),
+                    };
+                    for mutation in 0..13 {
+                        let mut bad = body.clone();
+                        let info = &mut bad.units.0[0];
+                        match mutation {
+                            0 => info.replicas.0[0].description.instance += 1,
+                            1 => info.replicas.0[0].description.last_lsn = 12,
+                            2 => info.replicas.0[0].description.replication_endpoint = "foreign".into(),
+                            3 => info.report_from_primary = !info.report_from_primary,
+                            4 => info.unit.current.configuration += 1,
+                            5 => info.replicas.0[0].intermediate_role = 2,
+                            6 => info.replicas.0[0].description.up = false,
+                            7 => info.replicas.0[0] = info.replicas.0[1].clone(),
+                            8 => info.local_deleted = true,
+                            9 => info.service.persisted = true,
+                            10 => info.unit.previous.configuration += 1,
+                            11 => info.intermediate.configuration += 9,
+                            _ => info.replicas.0[0].description.previous_role = 2,
+                        }
+                        assert!(ledger.lfum_upload(index, bad).is_err(), "candidate {candidate} destination {destination} phase {phase} mutation {mutation}");
+                        assert!(ledger.generation.as_ref().unwrap().uploads[index].is_none());
+                    }
+                    ledger.lfum_upload(index, body).unwrap();
+                    assert!(ledger.swap.as_ref().unwrap().reply.is_none());
+                    assert!(ledger.placements.iter().all(|p| p.endpoint.is_none()));
+                }
+                assert!(!ledger.generation_pending());
+                assert_eq!(ledger.configuration_status()["ready"], false);
+            }
+            let mut completed = ConfigurationReply {
+                unit: intent.configuration.unit.clone(), replicas: intent.configuration.replicas.clone(), error: 0,
+            };
+            completed.unit.previous = Epoch::default();
+            for r in &mut completed.replicas.0 {
+                r.previous_role = 1;
+                r.first_lsn = 1; r.last_lsn = 8;
+                r.service_endpoint = if r.current_role == 4 { "127.0.0.1:23456".into() } else { String::new() };
+            }
+            ledger.configuration_reply(destination, completed).unwrap();
+            assert_eq!(ledger.configuration_status()["ready"], true);
+        }
+    }
+    let mut unsupported = configured_ledger(2, 1);
+    unsupported.request_primary_transfer(Instant::now()).unwrap();
+    assert!(unsupported.begin_generation().is_err());
+    let mut restarted = configured_ledger(3, 2);
+    let request = restarted.request_primary_transfer(Instant::now()).unwrap();
+    let mut reply = ConfigurationReply {
+        unit: request.configuration.unit, replicas: request.configuration.replicas, error: 0,
+    };
+    reply.unit.previous = Epoch::default();
+    for r in &mut reply.replicas.0 {
+        r.previous_role = 1; r.first_lsn = 1; r.last_lsn = 8;
+        r.service_endpoint = if r.current_role == 4 { "127.0.0.1:23456".into() } else { String::new() };
+    }
+    reply.replicas.0[2].up = false;
+    reply.replicas.0[2].state = 3;
+    restarted.configuration_reply(1, reply).unwrap();
+    assert_eq!(restarted.configuration_status()["ready"], true);
+    assert!(restarted.begin_generation().is_err());
+    for lost in 0..3 {
+        let mut ledger = configured_ledger(3, 2);
+        ledger.request_primary_transfer(Instant::now()).unwrap();
+        ledger.lost(lost, "unknown handoff owner".into());
+        assert!(ledger.begin_generation().is_err());
+    }
+}
+
+#[test]
 fn repair_lfum_validates_fresh_lifetimes_and_phase_roles_without_completing_repair() {
     let mut ledger = configured_ledger(3, 2);
     for (index, placement) in ledger.placements.iter_mut().enumerate() {
@@ -7813,6 +7941,14 @@ async fn hold_superseding_lfum_with_deactivation(
 async fn send_generation_updates(
     cluster: &mut Cluster,
 ) -> Result<Vec<(usize, IncomingMessage<GatewayTarget>)>> {
+    let updates: Vec<_> = (0..cluster.children.len()).collect();
+    send_generation_updates_to(cluster, &updates).await
+}
+
+async fn send_generation_updates_to(
+    cluster: &mut Cluster,
+    updates: &[usize],
+) -> Result<Vec<(usize, IncomingMessage<GatewayTarget>)>> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut pending = vec![];
     loop {
@@ -7834,12 +7970,12 @@ async fn send_generation_updates(
                         }
                     }
                 }
-            } else {
+            } else if updates.contains(&index) {
                 cluster.retry_generation(index).await?;
             }
         }
         let round = cluster.ledger.generation.as_ref().ok_or("missing LFUM generation round")?;
-        if round.phase == fm::GenerationPhase::AwaitingUpload && round.updates_sent.iter().all(|sent| *sent) {
+        if round.phase == fm::GenerationPhase::AwaitingUpload && updates.iter().all(|&index| round.updates_sent[index]) {
             return Ok(pending);
         }
         if Instant::now() >= deadline {
@@ -7847,6 +7983,222 @@ async fn send_generation_updates(
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+#[tokio::test]
+async fn real_lfum_during_planned_handoff_preserves_sf_phases_upload_owners_and_writer_fencing() {
+    for candidate in [1, 2] {
+        let fixture = Fixture::new("handoff-lfum");
+        let mut config = fixture.config();
+        config.profile = ServiceProfile::Stateful { target: 3, minimum: 2 };
+        config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+        let mut cluster = Cluster::new(config).unwrap();
+        cluster.start().await.unwrap();
+        let mut releases = vec![];
+        let mut stopped = None;
+        let result = peer_idle_catch(async {
+            cluster.execute(command("primary", "create", Some(1))).await?;
+            until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+            let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+            assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+            until(&mut cluster, |c| (1..3).all(|i|
+                c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 1)).await;
+            let owners = cluster.status();
+            let third = 3 - candidate;
+            let mut work = vec![];
+            for (index, barrier) in [(0, "local-secondary-role"), (candidate, "local-primary-role"), (candidate, "local-current-configuration")] {
+                let profile = cluster.children[index].metadata.as_ref().unwrap().profile.as_ref().unwrap();
+                let path = profile.runtime_root.join("deployment/HostingLocalStatefulApp_App1/work");
+                fs::write(path.join(format!("{barrier}.block")), b"hold actual handoff callback").map_err(err)?;
+                releases.push(path.join(format!("{barrier}.release")));
+                work.push(path.join(format!("{barrier}.held")));
+            }
+            cluster.transfer_primary_to(candidate as u8 + 1).await?;
+            let intent = cluster.ledger.swap.as_ref().unwrap().body.clone();
+            until(&mut cluster, |c| work[0].exists()
+                && c.status()["nodes"][0]["retained_work"]["local_replica"]["swap"]["stage"] == "Demote").await;
+            let demoting = hold_superseding_lfum(&mut cluster).await?;
+            let body = decode_lfum_upload(&demoting[0].message).map_err(err)?;
+            assert_eq!(body.units.0[0].unit, intent.configuration.unit);
+            assert!(body.units.0[0].report_from_primary);
+            finish_lfum_round(&mut cluster, demoting).await?;
+            assert!(cluster.ledger.swap.as_ref().unwrap().reply.is_none());
+
+            let before = cluster.status()["nodes"][candidate]["retained_work"]["generations"].clone();
+            cluster.begin_generation_handshake()?;
+            let mut pending = send_generation_updates_to(&mut cluster, &[0]).await?;
+            let source_upload = hold_lfum_upload(&mut cluster, 0, &mut pending).await?;
+            let source_snapshot = decode_lfum_upload(&source_upload.message).map_err(err)?;
+            cluster.receive_message(0, source_upload).await?;
+            for (index, incoming) in pending { cluster.receive_message(index, incoming).await?; }
+            observe_without_fm_scan(&cluster, |c|
+                c.status()["nodes"][0]["retained_work"]["generations"]["upload_pending"] == false).await?;
+            let pid = cluster.ledger.placements[third].profile.as_ref().unwrap().app_pid;
+            assert!(std::process::Command::new("kill").args(["-STOP", &pid.to_string()]).status().map_err(err)?.success());
+            stopped = Some(pid);
+            fs::write(&releases[0], b"finish actual demotion").map_err(err)?;
+            observe_without_fm_scan(&cluster, |c|
+                c.status()["nodes"][candidate]["retained_work"]["local_replica"]["swap"]["stage"] == "GetLsn"
+                    && !c.status()["nodes"][third]["retained_work"]["local_replica"]["progress_query"].is_null()).await?;
+            for field in ["receive", "send", "upload_pending", "pending_uploads"] {
+                assert_eq!(cluster.status()["nodes"][candidate]["retained_work"]["generations"][field], before[field],
+                    "newer peer continuation cannot adopt the sender's generation");
+            }
+            let header = cluster.children[0].link.as_ref().unwrap().generation();
+            cluster.children[0].link.as_ref().unwrap().send(
+                generation_update_message(&GenerationUpdate::default(), &header).map_err(err)?,
+            ).await?;
+            let pending = send_generation_updates(&mut cluster).await?;
+            let querying = hold_lfum_uploads_with_pending(&mut cluster, pending).await?;
+            let old = decode_lfum_upload(&querying[0].message).map_err(err)?;
+            assert_ne!(source_snapshot.units, old.units);
+            assert_eq!(cluster.ledger.generation.as_ref().unwrap().uploads[0].as_ref(), Some(&source_snapshot));
+            assert!(!old.units.0[0].report_from_primary);
+            let old_local = old.units.0[0].replicas.0.iter().find(|r| r.description.node == cluster.children[0].launch.node).unwrap();
+            assert_eq!(old_local.description.state, 1);
+            assert!(old_local.description.service_endpoint.is_empty());
+            let queried = decode_lfum_upload(&querying[third].message).map_err(err)?;
+            assert_eq!(queried.units.0[0].unit, intent.configuration.unit);
+            assert!(queried.units.0[0].replicas.0.iter().any(|r| r.description.current_role == 4 && r.description.previous_role == 4));
+            assert!(!work[1].exists(), "missing progress cannot complete GetLSN");
+            finish_lfum_round(&mut cluster, querying).await?;
+            assert!(!work[1].exists(), "LFUM ACK cannot replace missing progress");
+            assert!(std::process::Command::new("kill").args(["-CONT", &pid.to_string()]).status().map_err(err)?.success());
+            stopped = None;
+            cluster.send_configuration(&intent).await?;
+            until(&mut cluster, |c| work[1].exists()
+                && c.status()["nodes"][candidate]["retained_work"]["local_replica"]["swap"]["stage"] == "Catchup").await;
+            assert!(data_contact(&endpoint, b"write-more\n").contains("NotPrimary"));
+
+            let catching_up = begin_lfum_round(&mut cluster).await?;
+            let mut delayed = None;
+            for (index, incoming) in catching_up.into_iter().enumerate() {
+                let body = decode_lfum_upload(&incoming.message).map_err(err)?;
+                assert_eq!(body.units.0[0].intermediate, Epoch::default());
+                if index == third {
+                    cluster.ledger.lfum_upload(index, body)?;
+                    delayed = Some(incoming);
+                } else {
+                    cluster.receive_message(index, incoming).await?;
+                }
+            }
+            until(&mut cluster, |c| !c.ledger.generation_pending()
+                && c.status()["nodes"][candidate]["retained_work"]["generations"]["upload_pending"] == false).await;
+            assert!(!work[2].exists());
+            fs::write(&releases[1], b"finish Primary role").map_err(err)?;
+            until(&mut cluster, |c| c.status()["nodes"][candidate]["retained_work"]["local_replica"]["swap"]["stage"] == "Activate").await;
+            assert!(!work[2].exists(), "every Secondary's matching ActivateReply is required");
+
+            let activating = begin_lfum_round(&mut cluster).await?;
+            let candidate_info = decode_lfum_upload(&activating[candidate].message).map_err(err)?;
+            assert_eq!(candidate_info.units.0[0].intermediate, intent.configuration.unit.current);
+            for index in [0, third] {
+                let info = decode_lfum_upload(&activating[index].message).map_err(err)?;
+                assert_eq!(info.units.0[0].unit.previous, Epoch::default());
+                assert!(!info.units.0[0].report_from_primary);
+            }
+            let mut delayed = delayed.unwrap();
+            let old = decode_lfum_upload(&delayed.message).map_err(err)?;
+            assert_ne!(old.units, decode_lfum_upload(&activating[third].message).map_err(err)?.units);
+            let send = cluster.status()["nodes"][third]["retained_work"]["generations"]["send"].clone();
+            delayed.reply.take().ok_or("missing delayed handoff LFUM reply")?.reply(
+                cluster.children[third].link.as_ref().unwrap().seal(lfum_upload_reply_message(&GenerationHeader {
+                    number: old.generation, for_fm_replica: false,
+                }).map_err(err)?)?, wire::deadline(),
+            ).await.map_err(err)?;
+            until(&mut cluster, |c| c.status()["nodes"][third]["retained_work"]["generations"]["pending_uploads"] == 1).await;
+            assert_eq!(cluster.status()["nodes"][third]["retained_work"]["generations"]["send"], send);
+            assert_eq!(cluster.status()["nodes"][third]["retained_work"]["generations"]["upload_pending"], true);
+            assert!(!work[2].exists());
+            finish_lfum_round(&mut cluster, activating).await?;
+            cluster.send_configuration(&intent).await?;
+            until(&mut cluster, |c| work[2].exists()
+                && c.status()["nodes"][candidate]["retained_work"]["local_replica"]["swap"]["stage"] == "End").await;
+
+            let ending = begin_lfum_round(&mut cluster).await?;
+            assert_eq!(decode_lfum_upload(&ending[candidate].message).map_err(err)?.units.0[0].intermediate, intent.configuration.unit.current);
+            finish_lfum_round(&mut cluster, ending).await?;
+            assert!(cluster.ledger.swap.as_ref().unwrap().reply.is_none());
+            assert!(cluster.ledger.placements.iter().all(|p| p.endpoint.is_none()));
+            fs::write(&releases[2], b"finish final RAP configuration").map_err(err)?;
+            let lost = hold_peer_loss_frame(&mut cluster, candidate, "DoReconfigurationReply", Duration::from_secs(15)).await?;
+            let (completed, _) = decode_do_reconfiguration_reply(&lost).map_err(err)?;
+            let complete = begin_lfum_round(&mut cluster).await?;
+            assert!(complete.iter().all(|incoming|
+                decode_lfum_upload(&incoming.message).unwrap().units.0[0].unit.previous == Epoch::default()));
+            finish_lfum_round(&mut cluster, complete).await?;
+            assert!(cluster.ledger.swap.as_ref().unwrap().reply.is_none());
+            cluster.send_configuration(&intent).await?;
+            until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
+            assert_eq!(cluster.ledger.swap.as_ref().unwrap().reply.as_ref(), Some(&completed));
+            let promoted = cluster.ledger.placements[candidate].endpoint.clone().unwrap();
+            assert!(data_contact(&promoted, b"read\n").contains("committed=1"));
+            assert!(data_contact(&promoted, b"write-more\n").contains("committed=2"));
+            until(&mut cluster, |c| [0, third].iter().all(|&i|
+                c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 2)).await;
+            let after = cluster.status();
+            for index in 0..3 {
+                for field in ["node_pid", "app_pid", "runtime_root"] {
+                    assert_eq!(after["nodes"][index][field], owners["nodes"][index][field]);
+                }
+                assert_eq!(after["nodes"][index]["retained_work"]["app_observation"]["opens"], 1);
+                assert_eq!(after["nodes"][index]["retained_work"]["app_observation"]["provider_acquisitions"], 1);
+                assert_eq!(after["nodes"][index]["retained_work"]["peer_command_error"], Value::Null);
+            }
+            for (index, request) in [(0, b"write-final\n".as_slice()), (third, b"write 4\n".as_slice())] {
+                let pid = cluster.ledger.placements[index].profile.as_ref().unwrap().app_pid;
+                assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().map_err(err)?.success());
+                until(&mut cluster, |c| c.ledger.placements[index].loss_reported).await;
+                if index == 0 {
+                    assert!(data_contact(&promoted, request).contains("committed=3"));
+                } else {
+                    let mut pending = TcpStream::connect(&promoted).map_err(err)?;
+                    pending.set_read_timeout(Some(Duration::from_millis(250))).map_err(err)?;
+                    pending.write_all(request).map_err(err)?;
+                    let mut bytes = [0; 1024];
+                    assert!(matches!(pending.read(&mut bytes), Err(ref error)
+                        if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)));
+                    assert_eq!(cluster.status()["nodes"][candidate]["retained_work"]["app_observation"]["primary_last_acknowledged"], 3);
+                }
+            }
+            Ok::<(), String>(())
+        }).await;
+        if let Some(pid) = stopped {
+            assert!(std::process::Command::new("kill").args(["-CONT", &pid.to_string()]).status().unwrap().success());
+        }
+        for path in &releases { fs::write(path, b"release handoff callback").unwrap(); }
+        let cleanup = cluster.shutdown().await;
+        assert_eq!(cleanup["clean"], true, "{cleanup}");
+        result.unwrap().unwrap();
+    }
+}
+
+async fn begin_lfum_round(cluster: &mut Cluster) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
+    cluster.begin_generation_handshake()?;
+    let pending = send_generation_updates(cluster).await?;
+    hold_lfum_uploads_with_pending(cluster, pending).await
+}
+
+async fn observe_without_fm_scan(cluster: &Cluster, predicate: impl Fn(&Cluster) -> bool) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while !predicate(cluster) {
+        if Instant::now() >= deadline {
+            return Err(format!("Node progress while FM updates are withheld: {}", cluster.status()));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
+}
+
+async fn finish_lfum_round(cluster: &mut Cluster, uploads: Vec<IncomingMessage<GatewayTarget>>) -> Result<()> {
+    for (index, incoming) in uploads.into_iter().enumerate() {
+        cluster.receive_message(index, incoming).await?;
+    }
+    until(cluster, |c| !c.ledger.generation_pending()
+        && c.status()["nodes"].as_array().unwrap().iter().all(|n|
+            n["retained_work"]["generations"]["pending_uploads"] == 0
+                && n["retained_work"]["generations"]["upload_pending"] == false)).await;
+    Ok(())
 }
 
 #[tokio::test]
@@ -8211,25 +8563,32 @@ async fn hold_lfum_uploads_with_pending(
 ) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
     let mut held = vec![];
     for index in 0..cluster.children.len() {
-        loop {
-            let mut incoming = if let Some(position) = pending.iter().position(|(node, _)| *node == index) {
-                pending.remove(position).1
-            } else {
-                cluster.children[index].link.as_ref().unwrap().receive(wire::deadline()).await?
-                    .ok_or("missing replicated LFUM upload")?
-            };
-            if incoming.message.properties().map_err(err)?.action == "LFUMUpload" {
-                if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
-                held.push(incoming);
-                break;
-            }
-            cluster.receive_message(index, incoming).await?;
-        }
+        held.push(hold_lfum_upload(cluster, index, &mut pending).await?);
     }
     if !pending.is_empty() {
         return Err("unconsumed generation frames after LFUM capture".into());
     }
     Ok(held)
+}
+
+async fn hold_lfum_upload(
+    cluster: &mut Cluster,
+    index: usize,
+    pending: &mut Vec<(usize, IncomingMessage<GatewayTarget>)>,
+) -> Result<IncomingMessage<GatewayTarget>> {
+    loop {
+        let mut incoming = if let Some(position) = pending.iter().position(|(node, _)| *node == index) {
+            pending.remove(position).1
+        } else {
+            cluster.children[index].link.as_ref().unwrap().receive(wire::deadline()).await?
+                .ok_or("missing replicated LFUM upload")?
+        };
+        if incoming.message.properties().map_err(err)?.action == "LFUMUpload" {
+            if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+            return Ok(incoming);
+        }
+        cluster.receive_message(index, incoming).await?;
+    }
 }
 
 #[tokio::test]

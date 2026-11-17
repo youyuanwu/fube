@@ -693,7 +693,8 @@ reconstruction or writer election.
 |---|---|---|
 | Shared RA model/store | Generic committed replica-store descriptions and separately committed IC roles; configured repair/removal, planned transfer, candidate redirection and failed RAP/build states. Multi-entity reads, definite/unknown commits, deletion and overlapping upload ownership are tested. | No LFUM lineage/size allowlist or upload-pending control gate. Ordinary runtime/profile admission still applies. This is not complete native handler execution. |
 | Local-cluster live sessions | Stateless/independent volatile singleton rounds and stable configured membership across 1/1, 2/1, 3/2, 3/3, 4/2, 4/3, 4/4 and 5/3. Additional 3/2 cases cover FM-owned Idle build, same-Primary admission, two Primary app-host failover/explicit-repair cycles and native deactivation of a repair Secondary with its role callback held. | Participating build/configuration requests must be committed. Repeated rounds freeze the latest completed membership; repair uses its matching completed failover. Deactivation interrupts existing repair, not a new recovery/supersession policy. |
-| Standalone real Node binaries | Empty pre-placement and stable configured membership across 1/1, 2/1, 3/3, 4/2, 4/3, 4/4 and 5/3. Additional 3/2 build/admission, two-cycle failover/repair and repair-Secondary deactivation overlaps use real native-shaped Channels. | Immutable explicit sizes and original placements; no nonempty startup/rejoin or reconnect. Healthy planned transfer is separately qualified at 2/1 and 3/2, not its generation/LFUM overlaps. |
+| Standalone real Node binaries | Empty pre-placement and stable configured membership across 1/1, 2/1, 3/3, 4/2, 4/3, 4/4 and 5/3. Additional 3/2 build/admission, two-cycle failover/repair and repair-Secondary deactivation overlaps use real native-shaped Channels. | Immutable explicit sizes and original placements; no nonempty startup/rejoin or reconnect. Healthy planned transfer is separately qualified at 2/1 and 3/2. |
+| Healthy planned-handoff overlaps, both launchers | Fixed 3/2 on three original Nodes, with either original Secondary as candidate. Rollover during demotion, missing-progress GetLSN, catch-up, Secondary activation, final RAP End and locally completed handoff with its final FM reply lost. | Upload completion is independent of every native phase and final FM completion. Broader sizes, spare-pool/restart-required handoff overlaps, candidate redirection and handoff-crash recovery are not added. |
 | Native evidence | Bidirectional native-stream/schema and source-derived helper evidence in the [protocol oracle](../../tests/ra_protocol/README.md) and [C14 contract](NativeRaProtocol.md). | Full original C++ handler traces and native FM/Federation interoperability remain unqualified; passing process tests is not full SF parity. |
 
 The remaining dependency plan is maintained in
@@ -756,6 +757,7 @@ view; failed operations remain reportable without becoming successful.
 | Committed phase | Previous epoch/roles | Intermediate epoch/roles |
 |---|---|---|
 | Initial Idle build | Invalid/None | Invalid/None |
+| Planned Primary demotion/continuation | Admitted transfer PC; completed demotion reports the old Primary as local InBuild, not report-from-Primary | Invalid/None |
 | Same-Primary admission/repair catch-up | Retained from admitted configuration | Invalid/None |
 | Same-Primary Primary Activate/final RAP End pending | Retained from admitted configuration | Current epoch/current roles |
 | Candidate GetLSN/catch-up | Admitted failover PC | Invalid/None |
@@ -809,6 +811,7 @@ The covered invariants are:
 | Read/commit and ownership | Multi-entity ordering, definite/unknown commits, empty/deleted-only maps, same-generation independent uploads and stale/FMM replies. Capacity retains an unadmitted frame without advancing receive while existing correlated replies can still free ownership. Lost-reply retry deadlines are driven explicitly. |
 | Stable/build/admission overlaps (both launchers) | Held/superseding uploads, real public copy/role callbacks, initial configuration before build-upload ACK and exact peer retries afterward. Original owners and acknowledged data survive; completion cannot mutate frozen inventory. |
 | Failover/repair overlaps (both launchers) | Two successive live 3/2 cycles, including promotion of the first repaired replica and repair of the next lost Primary. Query-only survivor PC uses the latest membership/fresh identity, not bootstrap replicas. Held/superseding build and role uploads retain phase metadata; repair configuration and local Secondary completion can precede ACK, but final public IPrimaryReplicator work remains independent. Replays neither reopen survivors nor activate another host. |
+| Healthy planned-handoff overlaps (both launchers) | Either 3/2 candidate, public demotion/Primary-role/final-configuration barriers and missing actual progress. Superseding uploads retain committed PC/IC/CC; delayed older ACKs retire only their own frozen snapshots even after Secondary activation changes the current view. Generation-stale peer messages are ignored without closing the original Channel. Every Secondary's matching activation and final RAP/FM reply remain required. Lost final completion replays at the new generation, old writers reject writes, original owners remain unchanged and actual quorum/no-quorum plus normal owned teardown are checked. Shared model/store cases additionally hold activation/final commits, including definite failure and uncertainty, and validate reverse-transfer inventory against retained latest membership. |
 | Interrupted repair Secondary (both launchers) | Native NodeDeactivateRequest during a held public Secondary role callback, after two generations have frozen their inventory. A stale reply retires its own upload while the replica is Closing without advancing send. Current ACK advances send but cannot finish Close, node deactivation or repair configuration, or dispose the held original resources. Releasing the original role allows native Close and its separate deactivation reply; service/provider files prove disposal. Healthy survivors acknowledge a new write, but Primary alone cannot use the interrupted replica's vote after the other survivor is lost. Owned shutdown separately reaps/drains hosts and retains unfinished external work. |
 | Application authority | Nonempty replication after completion, fresh repaired-member quorum after another survivor loss, and local-cluster rejection of a new write with Primary alone. FM-channel loss keeps the owned upload pending without advancing send or treating the surviving app as recovered/shut down. |
 
@@ -818,7 +821,7 @@ restart of the interrupted repair, or discovery on a recovered owner.
 Native close retry/deactivation-check intervals are unchanged.
 
 Nonempty NodeUp reconciliation, full ReplicaUp batching/final ACK, copy/build
-interruption, removal supersession and transfer/redirection process overlaps,
+interruption, removal supersession and broader transfer/redirection process overlaps,
 FM/FMM rebuild and durable RA
 restart remain unqualified. Broader ordinary reconfiguration/restoration tests
 do not imply LFUM overlap qualification for those journeys.
@@ -2113,6 +2116,55 @@ writes and retain immutable sizes/data and original process/runtime owners.
 An external FM must publish the new Primary only after the successful native
 DoReconfigurationReply, not merely after a continuation or endpoint message.
 
+#### Generation rollover during healthy planned handoff
+
+Both launchers qualify fixed 3/2 on the three original Nodes, with either
+original Secondary as the first candidate. The test FM freezes the successful
+previous membership and explicit transfer intent, then validates each Node's
+committed phase view. Shared RA retains generic inventory reads and native
+reconfiguration policy; no transfer-specific upload gate or writer selection
+is added to the launchers.
+
+Demotion reports the old Primary until its actual role change commits.
+The completed demotion instead reports its local replica InBuild and not
+report-from-Primary. A GetLSN-only Secondary copies the old CC into PC;
+candidate catch-up has no IC, candidate activation/final RAP retain IC=CC,
+and completed Secondaries clear PC/IC. Every reported LSN is invalid.
+These follow `ra/FailoverUnit.cpp:3999-4125`,
+`ra/ReconfigurationState.cpp:162-169` and
+`ra/GenerationStateManager.cpp:355-451` at the pinned revision.
+
+Process tests hold the public demotion, Primary-role and final-configuration
+callbacks. They pause only one owned application to withhold actual progress,
+keeping its Node/RA alive for inventory. An upload ACK cannot replace that
+progress. During activation, one Secondary has committed its new metadata but
+its older-generation reply cannot complete the candidate's phase. Generation
+rollover and the matching current-generation peer retry remain independent.
+SF `ra/GenerationStateManager.cpp:23-40,315-329` ignores generation-stale
+messages and advances send only on the current receive-generation upload ACK.
+Shared transport now releases such an older message without losing the bound
+RA-peer Channel; malformed envelopes and foreign Node incarnations still fail.
+The existing fixed-FM command-generation refusal profile is unchanged.
+Both launchers also stagger updates: the old Primary advances first and sends
+its native continuation before the candidate's own update. Bound peer
+generations are a receive lower bound, not an equality requirement or an
+implicit local generation update. Epoch, history and lifetime checks still
+apply; FM intent still requires its admitted generation. A fresh same-generation
+read after demotion neither mutates nor replaces the earlier accepted snapshot.
+
+Superseding snapshots and delayed older upload ACKs retain separate ownership.
+The older snapshot remains frozen while activation changes the current view;
+its completion cannot advance send or consume the newer upload. Even after
+the candidate completes locally, LFUM cannot supply its lost FM completion.
+Exact native request replay obtains the original final reply at the new
+generation before FM publishes readiness. Nonempty writes survive, demoted
+writers reject writes, Node/RA/app owners remain unchanged and actual
+quorum/no-quorum and owned cleanup are qualified.
+
+This adds healthy handoff overlap, not crashes/abort during handoff,
+restart-required or spare-pool handoff overlaps, candidate redirection,
+other transfer sizes, persisted recovery or RA/Node/FM restart.
+
 #### Application crash after completed planned handoff
 
 Both launchers qualify a completed healthy 3/2 handoff to either original
@@ -2156,7 +2208,7 @@ a fresh ACK. Normal teardown joins cleanup for predecessor and successor.
 
 This qualifies sequential fixed-3/2 recovery after completed healthy handoff,
 not crashes during handoff, arbitrary multi-loss recovery, automatic failback,
-other post-handoff sizes or concurrent generation/LFUM overlaps. Persisted
+other post-handoff sizes or generation/LFUM overlaps with crash recovery. Persisted
 application storage and durable RA/Node/FM restart remain separate capabilities.
 
 #### Volatile Secondary restart and explicit rebuild
@@ -2195,8 +2247,8 @@ accepts the same snake-case JSON setting. Process tests shorten this ordinary
 RA setting rather than fabricating progress or waiting out unrelated host leases.
 
 This enables sequential healthy transfers at the qualified sizes, not arbitrary
-reconfiguration recovery. Concurrent supersession or transfer-generation/LFUM
-overlaps, persisted Secondary restart, same-handoff volatile rebuild,
+reconfiguration recovery. Concurrent supersession, restart-required
+transfer-generation/LFUM overlaps, persisted Secondary restart, same-handoff volatile rebuild,
 restart-required recovery at other sizes, aborted-swap recovery, loss-driven
 recovery outside the completed healthy 3/2 profile above, data loss,
 FMM, reconnect and restart remain gated. Native source-stream evidence covers

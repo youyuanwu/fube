@@ -9688,7 +9688,24 @@ async fn capture_committed_lfum(
     intermediate: Epoch,
     primary: bool,
 ) -> LfumInventory {
-    start_lfum(executor, admission().generation.generation);
+    capture_lfum_at_generation(
+        executor,
+        admission().generation.generation,
+        expected,
+        intermediate,
+        primary,
+    )
+    .await
+}
+
+async fn capture_lfum_at_generation(
+    executor: &Executor,
+    generation: i64,
+    expected: &Configuration,
+    intermediate: Epoch,
+    primary: bool,
+) -> LfumInventory {
+    start_lfum(executor, generation);
     let inventory = wait_lfum(executor).await;
     assert_failover_lfum(&inventory, expected, intermediate, primary);
     assert_eq!(
@@ -11721,8 +11738,13 @@ async fn repeated_planned_swaps_use_latest_roles_history_and_commit_before_new_e
 
 #[tokio::test]
 async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_activation_commit() {
-    for fail in [false, true] {
-        let (store, executor, hooks) = setup(WAIT).await;
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(40)
+        } else {
+            WAIT
+        })
+        .await;
         active_configured_survivor(&executor, 3, 2).await;
         let original = state(&executor);
         let mut intent = original.reconfiguration.as_ref().unwrap().request.clone();
@@ -11744,7 +11766,7 @@ async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_a
                 phase0_duration: 1,
             }),
             source: peer_source(),
-            generation: generation_header(admission().generation.generation),
+            generation: generation_header(executor.generation_state().receive.generation),
         };
         for invalid in 0..6 {
             let mut bad = intent.clone();
@@ -11780,8 +11802,15 @@ async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_a
             .is_err());
         assert_eq!(state(&executor), original);
         assert!(effects(&executor).is_empty());
-        run(&executor, continuation(intent.clone())).await;
+        let mut forwarded = continuation(intent.clone());
+        if let Command::DoReconfiguration { generation, .. } = &mut forwarded {
+            generation.number.generation += 1;
+        }
+        let generations = executor.generation_state();
+        run(&executor, forwarded).await;
+        assert_eq!(executor.generation_state(), generations);
         let actions = effects(&executor);
+        let first = capture_lfum_at_generation(&executor, 8, &intent, Epoch::default(), true).await;
         assert_eq!(
             actions
                 .iter()
@@ -11805,11 +11834,14 @@ async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_a
             .filter(|r| r.node != admission().local_node)
             .cloned()
             .collect();
-        run(
-            &executor,
-            failover_progress(&intent, &remotes[0], history.clone(), 7),
-        )
-        .await;
+        let progress = |remote: &Replica, lsn| {
+            let mut command = failover_progress(&intent, remote, history.clone(), lsn);
+            if let Command::GetLsnReply { generation, .. } = &mut command {
+                *generation = generation_header(executor.generation_state().receive.generation + 1);
+            }
+            command
+        };
+        run(&executor, progress(&remotes[0], 7)).await;
         assert_eq!(
             state(&executor).swap.as_ref().unwrap().stage,
             SwapStage::GetLsn
@@ -11817,15 +11849,15 @@ async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_a
         assert!(!effects(&executor)
             .iter()
             .any(|e| matches!(e, Effect::UpdateConfiguration { .. })));
-        run(
-            &executor,
-            failover_progress(&intent, &remotes[1], history, 8),
-        )
-        .await;
+        capture_lfum_at_generation(&executor, 9, &intent, Epoch::default(), true).await;
+        run(&executor, progress(&remotes[1], 8)).await;
         let mut catchup = configured(&effects(&executor));
+        capture_lfum_at_generation(&executor, 10, &intent, Epoch::default(), true).await;
         catchup.local.service_endpoint = "127.0.0.1:23456".into();
         run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
         let actions = effects(&executor);
+        let activated = state(&executor).swap.as_ref().unwrap().body.clone();
+        capture_lfum_at_generation(&executor, 11, &activated, activated.unit.current, true).await;
         assert_eq!(
             actions
                 .iter()
@@ -11841,7 +11873,7 @@ async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_a
         for (index, remote) in remotes.iter().enumerate() {
             let ack = || Command::ActivateReply {
                 source: remote.node.clone(),
-                generation: generation_header(admission().generation.generation),
+                generation: generation_header(executor.generation_state().receive.generation + 1),
                 body: Box::new(ActivateReply {
                     unit: stable.unit.clone(),
                     replica: stable
@@ -11863,6 +11895,8 @@ async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_a
                 assert!(!effects(&executor)
                     .iter()
                     .any(|e| matches!(e, Effect::UpdateConfiguration { .. })));
+                capture_lfum_at_generation(&executor, 12, &activated, activated.unit.current, true)
+                    .await;
             } else {
                 let (entered, release) = hooks.pause(fail);
                 let ticket = executor.submit(ack()).unwrap();
@@ -11872,6 +11906,8 @@ async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_a
                     state(&executor).swap.as_ref().unwrap().stage,
                     SwapStage::Activate
                 );
+                start_lfum(&executor, 13);
+                assert!(executor.lfum_inventory().unwrap().is_none());
                 release.send(()).unwrap();
                 if fail {
                     assert!(matches!(ticket.wait(WAIT).await, Err(Failure::Store(_))));
@@ -11880,29 +11916,74 @@ async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_a
                 } else {
                     ticket.wait(WAIT).await.unwrap();
                 }
+                let inventory = wait_lfum(&executor).await;
+                assert_failover_lfum(&inventory, &activated, activated.unit.current, true);
+                executor.take_lfum_inventory().unwrap().unwrap();
             }
         }
         let end = configured(&effects(&executor));
         assert_eq!(end.flags, 1);
-        let (entered, release) = hooks.pause(false);
+        let (entered, release) = hooks.pause(fail);
         let ticket = executor
-            .submit(Command::CompleteConfiguration(Box::new(end)))
+            .submit(Command::CompleteConfiguration(Box::new(end.clone())))
             .unwrap();
         entered.await.unwrap();
         assert!(effects(&executor).is_empty());
+        start_lfum(&executor, 14);
+        assert!(executor.lfum_inventory().unwrap().is_none());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.lfum_inventory().unwrap().is_none());
+        }
         release.send(()).unwrap();
-        ticket.wait(WAIT).await.unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            assert!(effects(&executor).is_empty());
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        let inventory = wait_lfum(&executor).await;
+        assert_failover_lfum(
+            &inventory,
+            if fail { &activated } else { &stable },
+            if fail {
+                activated.unit.current
+            } else {
+                Epoch::default()
+            },
+            true,
+        );
+        executor.take_lfum_inventory().unwrap().unwrap();
+        assert!(!executor
+            .complete_lfum_upload(first.upload, &admission().fm_source, &generation_header(8))
+            .unwrap());
+        assert_eq!(
+            executor.generation_state().send,
+            generation_header(7).number
+        );
+        assert!(executor
+            .complete_lfum_upload(
+                inventory.upload,
+                &admission().fm_source,
+                &generation_header(14)
+            )
+            .unwrap());
+        if fail {
+            run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
+        }
         assert!(
             matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(reply)]
             if reply.unit == stable.unit && reply.replicas.0.len() == 3)
         );
         assert_eq!(state(&executor).runtime, original.runtime);
         assert_eq!(state(&executor).usage, original.usage);
-        run(&executor, continuation(intent)).await;
-        assert!(matches!(
-            effects(&executor).as_slice(),
-            [Effect::DoReconfigurationReply(_)]
-        ));
+        if !unknown {
+            run(&executor, continuation(intent.clone())).await;
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::DoReconfigurationReply(_)]
+            ));
+        }
         finish(&store, &executor).await;
     }
 }

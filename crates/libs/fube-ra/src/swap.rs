@@ -799,7 +799,8 @@ fn generation(
     if header.number.older_than(&admission.generation) {
         return Ok(false);
     }
-    if header.number != admission.generation {
+    // A peer may advance before this Node receives its own GenerationUpdate.
+    if source == &admission.fm_source && header.number != admission.generation {
         return Err(Failure::Unsupported(
             "swap requires the current FM generation",
         ));

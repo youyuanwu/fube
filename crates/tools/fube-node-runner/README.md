@@ -105,6 +105,7 @@ configurability does not extend every overlap or recovery profile.
 | First explicit post-failover repair | Normal AddReplica/CreateReplica demands shared Hosting activation after predecessor cleanup. Repair configuration and fresh Secondary completion can precede ACK, but cannot finish held final RAP work. Exact replays activate no second host; the fresh member supplies quorum after another survivor loss. |
 | Second live failover/repair cycle | Promote the repaired replica and repair the next lost Primary. Freeze the latest completed membership/fresh identities for superseding uploads during actual promotion/final RAP, build and Secondary activation. Survivors retain their owners/data; a new write uses the second repaired member's actual quorum. |
 | Native deactivation during repair activation | Close the fresh Secondary while its public role callback and two frozen generations remain held. Stale ACK retires only its upload; current ACK cannot finish Close/deactivation or repair. Original service/provider disposal follows role release; host/group/root cleanup is separate. Healthy survivors acknowledge a new write, but Primary alone cannot use the interrupted replica's vote after another loss. |
+| Healthy planned handoff | Fixed 3/2 on three original Nodes, either first candidate. Rollover during held demotion, missing-progress GetLSN, catch-up, Secondary activation, final RAP End and local completion awaiting its lost FM reply. Older frozen upload ACKs cannot advance current send or finish a phase; generation-stale peer replies preserve the original Channels. Real writes, old-writer fencing, original owners, final reply replay and actual quorum/no-quorum plus normal teardown are checked. |
 
 Shared RA owns generic committed inventory and independent PC/IC/CC views,
 without a lineage allowlist or upload-pending peer-control gate. The fixture FM
@@ -153,7 +154,7 @@ Subsequent explicit FM AddReplica and removal/admission restore target on a
 static spare, with actual disposal, unchanged survivor owners and real
 replacement quorum/no-quorum checks. Persisted restart, in-handoff volatile
 rebuild, other restart-required sizes,
-swap abort and concurrent generation/LFUM overlaps remain unqualified or gated.
+swap abort and restart-required generation/LFUM overlaps remain unqualified or gated.
 Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,
 FM/FMM rebuild and restart remain gated. Native-free acceptance is not complete
 original C++ handler or native FM/Federation interoperability evidence.

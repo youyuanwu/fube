@@ -420,6 +420,12 @@ pub struct Link {
     local: NodeInstance,
     remote: NodeInstance,
     generation: Arc<Mutex<GenerationHeader>>,
+    kind: LinkKind,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkKind {
+    Fm,
+    Peer,
 }
 impl Link {
     pub fn generation(&self) -> GenerationHeader {
@@ -447,7 +453,19 @@ impl Link {
             local,
             remote,
             generation: Arc::new(Mutex::new(generation)),
+            kind: LinkKind::Fm,
         })
+    }
+    /// Bind an original RA peer Channel; stale generations are native message drops.
+    pub fn new_peer(
+        channel: Channel,
+        local: NodeInstance,
+        remote: NodeInstance,
+        generation: GenerationHeader,
+    ) -> Result<Self> {
+        let mut link = Self::new(channel, local, remote, generation)?;
+        link.kind = LinkKind::Peer;
+        Ok(link)
     }
     pub fn seal(&self, mut message: Message) -> Result<Message> {
         if message.headers.iter().any(|header| header.id == PTOP) {
@@ -469,6 +487,12 @@ impl Link {
         Ok(message)
     }
     pub fn validate(&self, message: &Message) -> Result<()> {
+        if !self.is_current(message)? {
+            return Err("foreign/stale/duplicate native FM generation".into());
+        }
+        Ok(())
+    }
+    fn is_current(&self, message: &Message) -> Result<bool> {
         validate_source(message, &self.local, &self.remote)?;
         let mut headers = message
             .headers
@@ -476,18 +500,18 @@ impl Link {
             .filter(|header| header.id == GENERATION_HEADER);
         if let Some(header) = headers.next() {
             let generation: GenerationHeader = decode(&header.value)?;
-            let negotiation = matches!(
+            let generation_independent = matches!(
                 message.properties().map_err(err)?.action.as_str(),
                 "GenerationProposal" | "GenerationUpdate" | "LFUMUploadReply"
             );
-            if headers.next().is_some()
-                || generation.for_fm_replica
-                || (!negotiation && generation.number.older_than(&self.generation().number))
-            {
+            if headers.next().is_some() || generation.for_fm_replica {
                 return Err("foreign/stale/duplicate native FM generation".into());
             }
+            if !generation_independent && generation.number.older_than(&self.generation().number) {
+                return Ok(false);
+            }
         }
-        Ok(())
+        Ok(true)
     }
     pub async fn send(&self, message: Message) -> Result<()> {
         self.channel
@@ -531,16 +555,32 @@ impl Link {
             .receive(until)
             .await
         {
-            Ok(incoming) => {
+            Ok(mut incoming) => {
                 if !Arc::ptr_eq(&incoming.source, &self.target) {
                     self.channel.dispose();
                     return Err(ReceiveError::Invalid(
                         "foreign Channel source capability".into(),
                     ));
                 }
-                if let Err(error) = self.validate(&incoming.message) {
-                    self.channel.dispose();
-                    return Err(ReceiveError::Invalid(error));
+                match self.is_current(&incoming.message) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if self.kind != LinkKind::Peer {
+                            self.channel.dispose();
+                            return Err(ReceiveError::Invalid(
+                                "foreign/stale/duplicate native FM generation".into(),
+                            ));
+                        }
+                        if let Some(handoff) = incoming.handoff.as_mut() {
+                            handoff.acknowledge();
+                        }
+                        eprintln!("ignored native message from older FM generation");
+                        return Ok(None);
+                    }
+                    Err(error) => {
+                        self.channel.dispose();
+                        return Err(ReceiveError::Invalid(error));
+                    }
                 }
                 Ok(Some(incoming))
             }
@@ -601,6 +641,161 @@ fn validate_source(message: &Message, local: &NodeInstance, remote: &NodeInstanc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fube_ra::protocol::*;
+
+    async fn links(peer: bool) -> (Link, Link) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = fube_transport::Endpoint::unsecured_tcp(
+            listener.local_addr().unwrap(),
+            if peer {
+                peer_composition()
+            } else {
+                composition(false)
+            }
+            .unwrap(),
+        )
+        .unwrap()
+        .channel_limits(limits());
+        let (sender, receiver) = tokio::join!(endpoint.connect_until(deadline()), async {
+            let (stream, _) = listener.accept().await.unwrap();
+            fube_transport::accept_unsecured_tcp(
+                stream,
+                if peer {
+                    peer_composition()
+                } else {
+                    composition(true)
+                }
+                .unwrap(),
+                limits(),
+                deadline(),
+            )
+            .await
+        });
+        let local = NodeInstance {
+            id: [1; 16],
+            instance: 10,
+        };
+        let remote = NodeInstance {
+            id: [2; 16],
+            instance: 20,
+        };
+        let generation = GenerationHeader {
+            number: GenerationNumber {
+                owner: [9; 16],
+                generation: 7,
+            },
+            for_fm_replica: false,
+        };
+        (
+            (if peer { Link::new_peer } else { Link::new })(
+                sender.unwrap(),
+                local.clone(),
+                remote.clone(),
+                generation.clone(),
+            )
+            .unwrap(),
+            (if peer { Link::new_peer } else { Link::new })(
+                receiver.unwrap(),
+                remote,
+                local,
+                generation,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn stale_peer_generation_releases_transport_but_foreign_incarnation_still_closes_it() {
+        let (sender, receiver) = links(true).await;
+        let old = sender.generation();
+        let mut current = old.clone();
+        current.number.generation += 1;
+        receiver.advance_generation(&current);
+        sender
+            .send(get_lsn_reply_message(&GetLsnReply::default(), &old).unwrap())
+            .await
+            .unwrap();
+        assert!(receiver
+            .receive_checked(deadline())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(receiver.channel.terminal_error().is_none());
+        sender
+            .send(get_lsn_reply_message(&GetLsnReply::default(), &current).unwrap())
+            .await
+            .unwrap();
+        let mut incoming = receiver.receive_checked(deadline()).await.unwrap().unwrap();
+        assert_eq!(decode_get_lsn_reply(&incoming.message).unwrap().1, current);
+        if let Some(handoff) = incoming.handoff.as_mut() {
+            handoff.acknowledge();
+        }
+        let mut invalid = sender
+            .seal(get_lsn_reply_message(&GetLsnReply::default(), &old).unwrap())
+            .unwrap();
+        let mut foreign = sender.local.clone();
+        foreign.instance += 1;
+        invalid
+            .headers
+            .iter_mut()
+            .find(|h| h.id == PTOP)
+            .unwrap()
+            .value = to_vec(&PToP {
+            from: foreign,
+            to: sender.remote.clone(),
+            actor: 0,
+            from_ring: String::new(),
+            to_ring: String::new(),
+            exact_instance: true,
+        })
+        .unwrap();
+        sender
+            .channel
+            .send_reserved(&sender.target, invalid, deadline(), None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.receive_checked(deadline()).await,
+            Err(ReceiveError::Invalid(_))
+        ));
+        receiver.close().await.unwrap();
+        sender.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn older_lfum_request_remains_acknowledgeable_after_fm_generation_advances() {
+        let (node, fm) = links(false).await;
+        let old = node.generation();
+        let mut current = old.clone();
+        current.number.generation += 1;
+        fm.advance_generation(&current);
+        let body = LfumUpload {
+            generation: old.number.clone(),
+            ..LfumUpload::default()
+        };
+        let (reply, ()) = tokio::join!(node.request(lfum_upload_message(&body).unwrap()), async {
+            let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
+            assert_eq!(decode_lfum_upload(&incoming.message).unwrap(), body);
+            incoming
+                .reply
+                .take()
+                .unwrap()
+                .reply(
+                    fm.seal(lfum_upload_reply_message(&old).unwrap()).unwrap(),
+                    deadline(),
+                )
+                .await
+                .unwrap();
+            if let Some(handoff) = incoming.handoff.as_mut() {
+                handoff.acknowledge();
+            }
+        });
+        assert_eq!(decode_lfum_upload_reply(&reply.unwrap()).unwrap(), old);
+        assert_eq!(fm.generation(), current);
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
     #[test]
     fn peer_idle_channel_admits_only_generation_bound_high_priority_one_way_ra_actions() {
         use fube_ra::protocol::*;

@@ -297,7 +297,7 @@ impl Owner {
                     } else {
                         self.config.fm.identity.native()?
                     };
-                    return Link::new(
+                    return (if peer { Link::new_peer } else { Link::new })(
                         channel,
                         self.config.node.identity.native()?,
                         remote,
@@ -384,7 +384,7 @@ impl Owner {
             )
             .await
             .map_err(err)?;
-            self.peers[index].link = Some(Link::new(
+            self.peers[index].link = Some(Link::new_peer(
                 channel,
                 local.clone(),
                 self.peers[index].placement.identity.native()?,

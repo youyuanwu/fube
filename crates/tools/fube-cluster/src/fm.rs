@@ -215,11 +215,12 @@ pub(crate) struct GenerationHandshake {
     pub uploads: Vec<Option<LfumUpload>>,
     initial_membership: Option<Configuration>,
     initial_builds: Option<Vec<AddReplica>>,
-    failover: Option<FailoverInventory>,
+    failover: Option<ConfigurationInventory>,
+    transfer: Option<ConfigurationInventory>,
     repair: Option<RepairInventory>,
     retry_at: Vec<Instant>,
 }
-struct FailoverInventory {
+struct ConfigurationInventory {
     previous: ConfigurationReply,
     configuration: Configuration,
 }
@@ -239,6 +240,7 @@ impl GenerationHandshake {
             initial_membership: None,
             initial_builds: None,
             failover: None,
+            transfer: None,
             repair: None,
             retry_at: vec![Instant::now(); nodes],
         })
@@ -1117,6 +1119,13 @@ impl Ledger {
     }
 
     fn validate_peer_lfum(&self, index: usize, body: &LfumUpload) -> Result<()> {
+        if let Some(transfer) = self
+            .generation
+            .as_ref()
+            .and_then(|round| round.transfer.as_ref())
+        {
+            return self.validate_transfer_lfum(index, body, transfer);
+        }
         if let Some(repair) = self
             .generation
             .as_ref()
@@ -1304,7 +1313,7 @@ impl Ledger {
         &self,
         index: usize,
         body: &LfumUpload,
-        failover: &FailoverInventory,
+        failover: &ConfigurationInventory,
     ) -> Result<()> {
         let placement = &self.placements[index];
         let original = &failover.previous;
@@ -1416,6 +1425,131 @@ impl Ledger {
             {
                 return Err(
                     "LFUM report changed an original failover replica or its phase roles".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_transfer_lfum(
+        &self,
+        index: usize,
+        body: &LfumUpload,
+        transfer: &ConfigurationInventory,
+    ) -> Result<()> {
+        let placement = &self.placements[index];
+        if placement.node_description.as_ref() != Some(&body.node)
+            || !body.any_replica_found
+            || body.units.0.len() != 1
+        {
+            return Err("LFUM transfer requires the known live Node inventory".into());
+        }
+        let info = &body.units.0[0];
+        let intent = &transfer.configuration;
+        let old = intent
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.previous_role == 4)
+            .ok_or("missing transfer source")?;
+        let candidate = intent
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.current_role == 4)
+            .ok_or("missing transfer candidate")?;
+        let mut complete = intent.unit.clone();
+        complete.previous = Epoch::default();
+        let mut expected = intent.clone();
+        let primary;
+        let mut intermediate = Epoch::default();
+        if info.unit == transfer.previous.unit {
+            expected.unit = transfer.previous.unit.clone();
+            expected.replicas = transfer.previous.replicas.clone();
+            primary = placement.launch.node == old.node;
+        } else if info.unit == complete {
+            expected.unit = complete.clone();
+            for r in &mut expected.replicas.0 {
+                r.previous_role = 1;
+            }
+            primary = placement.launch.node == candidate.node;
+        } else if info.unit == intent.unit {
+            if placement.launch.node == old.node {
+                primary = info.report_from_primary;
+                if !primary {
+                    // A completed demotion is no longer reconfiguring locally.
+                    let local = expected
+                        .replicas
+                        .0
+                        .iter_mut()
+                        .find(|r| r.node == old.node)
+                        .unwrap();
+                    local.state = 1;
+                    local.service_endpoint.clear();
+                }
+            } else if placement.launch.node == candidate.node {
+                primary = true;
+                if info.intermediate == intent.unit.current {
+                    intermediate = intent.unit.current;
+                }
+            } else {
+                // GetLSN copies the old CC into PC; Activate commits the new stable CC.
+                expected.replicas = transfer.previous.replicas.clone();
+                for r in &mut expected.replicas.0 {
+                    r.previous_role = r.current_role;
+                }
+                primary = false;
+            }
+        } else {
+            return Err("LFUM transfer changed a known configuration epoch".into());
+        }
+        let new_membership = info.unit == complete
+            || (info.unit == intent.unit && placement.launch.node == candidate.node);
+        if new_membership {
+            expected
+                .replicas
+                .0
+                .iter_mut()
+                .find(|r| r.node == old.node)
+                .unwrap()
+                .service_endpoint
+                .clear();
+        }
+        if info.service != intent.service
+            || info.local_deleted
+            || info.report_from_primary != primary
+            || info.intermediate != intermediate
+            || info.replicas.0.len() != expected.replicas.0.len()
+        {
+            return Err("LFUM report changed the known planned transfer phase".into());
+        }
+        for mut expected in expected.replicas.0 {
+            expected.first_lsn = -1;
+            expected.last_lsn = -1;
+            let mut matching = info
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.description.node == expected.node);
+            let actual = matching.next().ok_or("missing planned transfer member")?;
+            if new_membership && expected.node == candidate.node {
+                // Role completion can precede its independently delivered endpoint notification.
+                if info.unit == complete && actual.description.service_endpoint.is_empty() {
+                    return Err("completed transfer inventory has no Primary endpoint".into());
+                }
+                expected.service_endpoint = actual.description.service_endpoint.clone();
+            }
+            if matching.next().is_some()
+                || actual.description != expected
+                || actual.intermediate_role
+                    != if intermediate == Epoch::default() {
+                        1
+                    } else {
+                        expected.current_role
+                    }
+            {
+                return Err(
+                    "LFUM transfer changed a known replica lifetime or its phase roles".into(),
                 );
             }
         }
@@ -1612,7 +1746,7 @@ impl Ledger {
                                     }))
                         })
                 }))
-            .then(|| FailoverInventory {
+            .then(|| ConfigurationInventory {
                 previous: original.clone(),
                 configuration: swap.body.configuration.clone(),
             })
@@ -1649,13 +1783,47 @@ impl Ledger {
                     .as_ref()
                     .map(|c| c.body.configuration.clone()),
             });
+        let transfer = self.swap.as_ref().and_then(|swap| {
+            let intent = &swap.body.configuration;
+            if swap.unknown
+                || self.primary_failover()
+                || self.placements.len() != 3
+                || intent.service.target != 3
+                || intent.service.minimum != 2
+                || !self.candidate_changes.is_empty()
+                || self.restoration.is_some()
+                || self.repair.is_some()
+                || !self.healthy_transfer_members(&intent.replicas.0)
+                || swap.reply.as_ref().is_some_and(|reply| {
+                    reply.error != 0 || !self.healthy_transfer_members(&reply.replicas.0)
+                })
+            {
+                return None;
+            }
+            self.configuration
+                .iter()
+                .chain(&self.configuration_history)
+                .chain(
+                    self.repair_history
+                        .iter()
+                        .filter_map(|r| r.configuration.as_ref()),
+                )
+                .filter(|c| !c.unknown && c.body.configuration.service == intent.service)
+                .filter_map(|c| c.reply.as_ref())
+                .find(|reply| reply.error == 0 && reply.unit.current == intent.unit.previous)
+                .map(|previous| ConfigurationInventory {
+                    previous: previous.clone(),
+                    configuration: intent.clone(),
+                })
+        });
         if (peer
             && !stable_peer
             && initial_membership.is_none()
             && initial_builds.is_none()
             && failover.is_none()
+            && transfer.is_none()
             && repair.is_none())
-            || (self.swap.is_some() && failover.is_none() && repair.is_none())
+            || (self.swap.is_some() && failover.is_none() && transfer.is_none() && repair.is_none())
             || (self.repair.is_some() && repair.is_none())
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
@@ -1699,7 +1867,7 @@ impl Ledger {
                                 || (placement.loss_reported && !lost_primary)))
                 })
         {
-            return Err("generation handshake requires admitted sessions and stable or initial build/admitting membership".into());
+            return Err("generation handshake requires admitted sessions and a supported live membership transition".into());
         }
         let current = self
             .generation
@@ -1712,6 +1880,7 @@ impl Ledger {
         round.initial_membership = initial_membership;
         round.initial_builds = initial_builds;
         round.failover = failover;
+        round.transfer = transfer;
         round.repair = repair;
         Ok(())
     }
