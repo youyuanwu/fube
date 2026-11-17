@@ -2896,11 +2896,20 @@ impl Ledger {
             {
                 return Ok(false);
             }
-            return Err("another repair owns the current cycle".into());
+            if !repair.uses_spare()
+                || repair
+                    .configuration
+                    .as_ref()
+                    .is_none_or(|c| c.reply.is_none())
+            {
+                return Err("another repair owns the current cycle".into());
+            }
         }
         let active = self
-            .swap
+            .repair
             .as_ref()
+            .and_then(|r| r.configuration.as_ref())
+            .or(self.swap.as_ref())
             .or(self.configuration.as_ref())
             .filter(|c| c.reply.is_some())
             .ok_or("replacement requires completed current membership")?;
@@ -2912,6 +2921,7 @@ impl Ledger {
             .iter()
             .filter(|p| {
                 p.loss_reported
+                    && !self.known_spare_loss(p)
                     && active.body.configuration.replicas.0.iter().any(|r| {
                         r.node == p.launch.node && (r.previous_role >= 3 || r.current_role >= 3)
                     })
@@ -2962,6 +2972,9 @@ impl Ledger {
                     || p.pending.is_some()
                     || p.node_control.is_some()
                     || p.service_update.is_some()
+                    || (p.loss_reported
+                        && p.launch.node != lost.launch.node
+                        && !self.known_spare_loss(p))
                     || (p.launch.node != lost.launch.node
                         && previous.replicas.0.iter().any(|r| r.node == p.launch.node)
                         && (p.loss_reported || p.observed != Observed::Running))
@@ -3001,7 +3014,9 @@ impl Ledger {
         placement.created = true;
         placement.desired = Desired::Running;
         placement.observed = Observed::Pending;
-        self.repair = Some(repair);
+        if let Some(previous) = self.repair.replace(repair) {
+            self.repair_history.push(previous);
+        }
         Ok(true)
     }
 
@@ -3123,11 +3138,33 @@ impl Ledger {
         })
     }
 
+    fn known_spare_loss(&self, placement: &Placement) -> bool {
+        placement.loss_reported
+            && placement.remove_received
+            && self.repair.iter().chain(&self.repair_history).any(|r| {
+                r.uses_spare()
+                    && r.predecessor.replica.node == placement.launch.node
+                    && r.predecessor.replica.id == placement.replica
+                    && r.predecessor.replica.instance == placement.incarnation
+                    && r.configuration.as_ref().is_some_and(|c| {
+                        c.reply.as_ref().is_some_and(|reply| {
+                            reply.error == 0
+                                && !reply
+                                    .replicas
+                                    .0
+                                    .iter()
+                                    .any(|replica| replica.node == placement.launch.node)
+                        })
+                    })
+            })
+    }
+
     fn repair_members_live(&self) -> bool {
         self.placements.iter().all(|p| {
             p.link_alive
                 && (!p.loss_reported
                     || self.known_restoration_loss(p)
+                    || self.known_spare_loss(p)
                     || self.repair.as_ref().is_some_and(|r| {
                         r.uses_spare()
                             && p.launch.node == r.predecessor.replica.node

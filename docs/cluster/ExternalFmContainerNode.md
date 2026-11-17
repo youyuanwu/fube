@@ -443,8 +443,13 @@ never changes and copy completion alone grants no vote. Additional 3/2, 4/2,
 removed the down owner: retain only the surviving PC and admit the Ready Idle.
 See the
 [runner contract](../../crates/tools/fube-node-runner/README.md#explicit-spare-restoration).
-Dynamic joining, automatic placement, repeated spare cycles and spare-repair
-generation-upload overlaps remain outside that qualification.
+Two sequential replacements on target-plus-two pools are also qualified,
+including loss of the first replacement, another original Secondary or the
+current Primary. Each cycle uses the latest completed membership and exact
+processed predecessor deletion; prior requests/replies cannot complete a new
+cycle. Dynamic joining, automatic placement, old-placement reuse, more than two
+process cycles and spare-repair generation-upload overlaps remain outside that
+qualification.
 It does not provide persisted state, elections, a production
 FM, rolling upgrades, multiple partitions or native FM/Federation interoperability.
 The shared native ingress does not expose the local launcher's replacement-host

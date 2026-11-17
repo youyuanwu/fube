@@ -112,9 +112,17 @@ with empty spare inventory, lost build/final reply replay and actual replacement
 votes after another original Secondary loss. Additional 3/2, 4/2, 4/3 and 5/3
 cases restore target from target-minus-one membership after Primary failover,
 with the same copy/replay/ownership checks and actual quorum/no-quorum writes.
-Survivor hosts/runtimes stay unchanged, and physical cleanup is independent. Further loss during repair
-fences completion. Repeated spare cycles, automatic placement, dynamic joining
-and spare-repair generation overlaps remain gated.
+Survivor hosts/runtimes stay unchanged, and physical cleanup is independent.
+Sequential replacements use the latest completed membership, retaining prior
+repair/deletion history without counting removed predecessors as new losses.
+Both launchers qualify two cycles on target-plus-two pools, including another
+Primary loss, an original Secondary loss and loss of the first replacement.
+Each cycle replays lost build/final replies and fences stale earlier-cycle
+requests/replies; the final write requires the second spare's actual vote.
+A new cycle requires completed configuration and processed deletion of its
+exact new predecessor. Further loss during unfinished repair fences completion.
+Automatic placement, dynamic joining, old-placement reuse and spare-repair
+generation overlaps remain gated; more than two cycles are not process-qualified.
 The original-node repair APIs retain their target-sized topology qualification;
 a larger pool does not implicitly enable recycling original placements or
 replacement after every possible partial-membership transition.

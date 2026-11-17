@@ -65,9 +65,17 @@ fn failover_membership(state: &EntityState) -> Result<&Reconfiguration> {
         ))
 }
 
+fn retains_removal_pc(unit: &FailoverUnit, active: &Reconfiguration) -> bool {
+    // Local Secondary completion can precede the Primary/FM's final completion.
+    active.secondary_loss
+        && reconfiguration::secondary_removal(&active.request)
+        && (active.stage != ConfigurationStage::Complete
+            || unit.previous == active.request.unit.previous)
+}
+
 fn failover_epoch(unit: &FailoverUnit, active: &Reconfiguration, interrupted: bool) -> bool {
     let old = &active.request.unit;
-    let removal = active.secondary_loss && reconfiguration::secondary_removal(&active.request);
+    let removal = retains_removal_pc(unit, active);
     unit.previous == if removal { old.previous } else { old.current }
         && unit.current.data_loss == old.current.data_loss
         && unit
@@ -80,8 +88,15 @@ fn failover_epoch(unit: &FailoverUnit, active: &Reconfiguration, interrupted: bo
 
 fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
     let active = failover_membership(state)?;
-    let old = &active.request;
-    let removal = active.secondary_loss && reconfiguration::secondary_removal(old);
+    let removal = retains_removal_pc(&body.unit, active);
+    let mut stable;
+    let old = if active.stage == ConfigurationStage::Complete && !removal {
+        stable = reconfiguration::stable(&active.request);
+        stable.replicas.0.retain(|r| r.current_role >= 3);
+        &stable
+    } else {
+        &active.request
+    };
     // Ordinary failover can also retain the down former Primary to preserve minimum.
     let interrupted = removal || failover_epoch(&body.unit, active, true);
     if body.replicas.0.len() != old.replicas.0.len()

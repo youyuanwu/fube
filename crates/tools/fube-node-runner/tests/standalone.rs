@@ -1183,22 +1183,22 @@ async fn standalone_configured_sizes_preserve_membership_failover_lfum_and_delet
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn standalone_spare_restores_target_membership_without_reopening_survivors() {
-    for (target, minimum, lose_primary) in [
-        (3, 3, true),
-        (4, 4, true),
-        (3, 3, false),
-        (4, 4, false),
-        (3, 2, true),
-        (4, 2, true),
-        (4, 3, true),
-        (5, 3, true),
+async fn standalone_sequential_spares_restore_latest_membership_without_reopening_survivors() {
+    for (target, minimum, lose_primary, second_lost) in [
+        (3, 3, true, 1),
+        (4, 4, true, 3),
+        (3, 3, false, 3),
+        (4, 4, false, 0),
+        (3, 2, true, 3),
+        (4, 2, true, 1),
+        (4, 3, true, 3),
+        (5, 3, true, 5),
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else {
             unreachable!()
         };
-        let mut fixture = Fixture::with_node_pool(address, target, minimum, target + 1);
+        let mut fixture = Fixture::with_node_pool(address, target, minimum, target + 2);
         fixture.start();
         let mut fm = FmFixture::accept(listener, &mut fixture).await;
         fm.until(&mut fixture, |fm| {
@@ -1258,177 +1258,226 @@ async fn standalone_spare_restores_target_membership_without_reopening_survivors
         assert_eq!(fixture.status(spare)["replica_phase"], Value::Null);
         rollover(&mut fm, &mut fixture).await;
         generation = fm.configurations[0].generation().unwrap();
-        let owners: Vec<_> = (0..=spare).map(|i| fixture.status(i)).collect();
-        let lost = if lose_primary { 0 } else { target as usize - 1 };
-        let pid = owners[lost]["application_pid"].as_u64().unwrap();
-        assert!(Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status()
-            .unwrap()
-            .success());
-        fm.until(&mut fixture, |fm| fm.losses.contains(&lost)).await;
-        let old = membership
-            .replicas
-            .0
-            .iter()
-            .find(|r| r.node == fixture.configs[lost].node.identity.native().unwrap())
-            .unwrap()
-            .clone();
-        let delete = DeleteReplica::new(
-            AddInstance {
-                unit: membership.unit.clone(),
-                service: body.service.clone(),
-                replica: old.clone(),
-            },
-            false,
-        );
-        fm.send(lost, delete_replica_message(&delete, &generation).unwrap())
-            .await;
-        fm.until(&mut fixture, |fm| fm.deleted[lost]).await;
-        let selected = if lose_primary { 1 } else { 0 };
-        if lose_primary {
-            let mut config = Configuration {
+        let owners: Vec<_> = (0..fixture.configs.len())
+            .map(|i| fixture.status(i))
+            .collect();
+        let mut selected = 0;
+        let mut endpoint = endpoint;
+        let mut previous: Option<(AddReplica, DoReconfiguration)> = None;
+        for (cycle, lost) in [
+            if lose_primary { 0 } else { target as usize - 1 },
+            second_lost,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let spare = target as usize + cycle;
+            let was_primary = selected == lost;
+            let pid = owners[lost]["application_pid"].as_u64().unwrap();
+            assert!(Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status()
+                .unwrap()
+                .success());
+            fm.until(&mut fixture, |fm| fm.losses.contains(&lost)).await;
+            let old = membership
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.node == fixture.configs[lost].node.identity.native().unwrap())
+                .unwrap()
+                .clone();
+            let delete = DeleteReplica::new(
+                AddInstance {
+                    unit: membership.unit.clone(),
+                    service: body.service.clone(),
+                    replica: old.clone(),
+                },
+                false,
+            );
+            fm.send(lost, delete_replica_message(&delete, &generation).unwrap())
+                .await;
+            fm.until(&mut fixture, |fm| fm.deleted[lost]).await;
+            selected = fixture
+                .configs
+                .iter()
+                .position(|config| {
+                    membership.replicas.0.iter().any(|r| {
+                        r.node == config.node.identity.native().unwrap()
+                            && r.node != old.node
+                            && r.current_role == if was_primary { 3 } else { 4 }
+                            && r.up
+                    })
+                })
+                .unwrap();
+            if was_primary {
+                let before = fm.configured.len();
+                let mut config = Configuration {
+                    unit: membership.unit.clone(),
+                    service: body.service.clone(),
+                    replicas: membership.replicas.clone(),
+                };
+                config.unit.previous = config.unit.current;
+                config.unit.current.configuration += 0x1_0000_0001;
+                for r in &mut config.replicas.0 {
+                    r.previous_role = r.current_role;
+                    if r.node == old.node {
+                        r.current_role = if minimum == target { 3 } else { 1 };
+                        r.up = false;
+                        r.state = 3;
+                    } else if r.node == fixture.configs[selected].node.identity.native().unwrap() {
+                        r.current_role = 4;
+                    }
+                    r.first_lsn = -1;
+                    r.last_lsn = -1;
+                }
+                fm.send(
+                    selected,
+                    do_reconfiguration_message(
+                        &DoReconfiguration {
+                            configuration: config,
+                            phase0_duration: i64::MAX,
+                        },
+                        &generation,
+                    )
+                    .unwrap(),
+                )
+                .await;
+                fm.until(&mut fixture, |fm| fm.configured.len() == before + 1)
+                    .await;
+                membership = fm.configured.last().unwrap().clone();
+            }
+            endpoint = membership
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.current_role == 4)
+                .unwrap()
+                .service_endpoint
+                .clone();
+            assert!(application(&endpoint, "read").await.contains("committed=1"));
+
+            let mut build = idle_request(&body, &fixture.configs[spare]);
+            build.unit = membership.unit.clone();
+            let before = fm.builds.len();
+            fm.hold_build = true;
+            fm.send(selected, add_replica_message(&build, &generation).unwrap())
+                .await;
+            fm.until(&mut fixture, |fm| fm.held_build.is_some()).await;
+            let held = fm.held_build.take().unwrap();
+            assert_eq!(held.replica.current_role, 2);
+            assert_eq!(fixture.status(spare)["replica_role"], 2);
+            fm.hold_build = false;
+            fm.send(selected, add_replica_message(&build, &generation).unwrap())
+                .await;
+            fm.until(&mut fixture, |fm| fm.builds.len() == before + 1)
+                .await;
+            assert_eq!(fm.builds.last(), Some(&held));
+
+            let mut replacement = Configuration {
                 unit: membership.unit.clone(),
                 service: body.service.clone(),
                 replicas: membership.replicas.clone(),
             };
-            config.unit.previous = config.unit.current;
-            config.unit.current.configuration += 0x1_0000_0001;
-            for r in &mut config.replicas.0 {
+            replacement.unit.previous = replacement.unit.current;
+            replacement.unit.current.configuration += 1;
+            for r in &mut replacement.replicas.0 {
                 r.previous_role = r.current_role;
                 if r.node == old.node {
-                    r.current_role = if minimum == target { 3 } else { 1 };
+                    r.current_role = 1;
                     r.up = false;
                     r.state = 3;
-                } else if r.node == fixture.configs[selected].node.identity.native().unwrap() {
-                    r.current_role = 4;
                 }
-                r.first_lsn = -1;
-                r.last_lsn = -1;
+            }
+            let mut fresh = held.replica;
+            fresh.previous_role = 2;
+            fresh.current_role = 3;
+            replacement.replicas.0.push(fresh);
+            assert_eq!(
+                replacement
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|r| r.previous_role >= 3)
+                    .count(),
+                target as usize - usize::from(was_primary && minimum < target)
+            );
+            assert_eq!(
+                replacement
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|r| r.current_role >= 3)
+                    .count(),
+                target as usize
+            );
+            let request = DoReconfiguration {
+                configuration: replacement,
+                phase0_duration: i64::MAX,
+            };
+            let before = fm.configured.len();
+            fm.hold_configuration = true;
+            fm.send(
+                selected,
+                do_reconfiguration_message(&request, &generation).unwrap(),
+            )
+            .await;
+            fm.until(&mut fixture, |fm| fm.held_configuration.is_some())
+                .await;
+            let held = fm.held_configuration.take().unwrap();
+            fm.hold_configuration = false;
+            if let Some((old_build, old_request)) = &previous {
+                fm.send(
+                    selected,
+                    add_replica_message(old_build, &generation).unwrap(),
+                )
+                .await;
+                fm.send(
+                    selected,
+                    do_reconfiguration_message(old_request, &generation).unwrap(),
+                )
+                .await;
             }
             fm.send(
                 selected,
-                do_reconfiguration_message(
-                    &DoReconfiguration {
-                        configuration: config,
-                        phase0_duration: i64::MAX,
-                    },
-                    &generation,
-                )
-                .unwrap(),
+                do_reconfiguration_message(&request, &generation).unwrap(),
             )
             .await;
-            fm.until(&mut fixture, |fm| fm.configured.len() == 2).await;
-            membership = fm.configured.last().unwrap().clone();
-        }
-        let endpoint = membership
-            .replicas
-            .0
-            .iter()
-            .find(|r| r.current_role == 4)
-            .unwrap()
-            .service_endpoint
-            .clone();
-        assert!(application(&endpoint, "read").await.contains("committed=1"));
-
-        let mut build = idle_request(&body, &fixture.configs[spare]);
-        build.unit = membership.unit.clone();
-        let before = fm.builds.len();
-        fm.hold_build = true;
-        fm.send(selected, add_replica_message(&build, &generation).unwrap())
-            .await;
-        fm.until(&mut fixture, |fm| fm.held_build.is_some()).await;
-        let held = fm.held_build.take().unwrap();
-        assert_eq!(held.replica.current_role, 2);
-        assert_eq!(fixture.status(spare)["replica_role"], 2);
-        fm.hold_build = false;
-        fm.send(selected, add_replica_message(&build, &generation).unwrap())
-            .await;
-        fm.until(&mut fixture, |fm| fm.builds.len() == before + 1)
-            .await;
-        assert_eq!(fm.builds.last(), Some(&held));
-
-        let mut replacement = Configuration {
-            unit: membership.unit.clone(),
-            service: body.service.clone(),
-            replicas: membership.replicas.clone(),
-        };
-        replacement.unit.previous = replacement.unit.current;
-        replacement.unit.current.configuration += 1;
-        for r in &mut replacement.replicas.0 {
-            r.previous_role = r.current_role;
-            if r.node == old.node {
-                r.current_role = 1;
-                r.up = false;
-                r.state = 3;
+            fm.until(&mut fixture, |fm| fm.configured.len() == before + 1)
+                .await;
+            assert_eq!(fm.configured.last(), Some(&held));
+            assert_eq!(held.replicas.0.len(), target as usize);
+            assert!(held.replicas.0.iter().all(|r| r.node != old.node && r.up));
+            assert_eq!((held.unit.target, held.unit.minimum), (target, minimum));
+            assert!(application(&endpoint, "read")
+                .await
+                .contains("committed=1 value=acknowledged"));
+            for (i, owner) in owners.iter().enumerate() {
+                if !fm.losses.contains(&i) {
+                    assert_eq!(
+                        fixture.status(i)["application_pid"],
+                        owner["application_pid"]
+                    );
+                    assert_eq!(fixture.status(i)["runtime_root"], owner["runtime_root"]);
+                }
+                assert_eq!(fixture.status(i)["host_replacement_count"], 0);
             }
-        }
-        let mut fresh = held.replica;
-        fresh.previous_role = 2;
-        fresh.current_role = 3;
-        replacement.replicas.0.push(fresh);
-        assert_eq!(
-            replacement
-                .replicas
-                .0
-                .iter()
-                .filter(|r| r.previous_role >= 3)
-                .count(),
-            target as usize - usize::from(lose_primary && minimum < target)
-        );
-        assert_eq!(
-            replacement
-                .replicas
-                .0
-                .iter()
-                .filter(|r| r.current_role >= 3)
-                .count(),
-            target as usize
-        );
-        let request = DoReconfiguration {
-            configuration: replacement,
-            phase0_duration: i64::MAX,
-        };
-        let before = fm.configured.len();
-        fm.hold_configuration = true;
-        fm.send(
-            selected,
-            do_reconfiguration_message(&request, &generation).unwrap(),
-        )
-        .await;
-        fm.until(&mut fixture, |fm| fm.held_configuration.is_some())
-            .await;
-        let held = fm.held_configuration.take().unwrap();
-        fm.hold_configuration = false;
-        fm.send(
-            selected,
-            do_reconfiguration_message(&request, &generation).unwrap(),
-        )
-        .await;
-        fm.until(&mut fixture, |fm| fm.configured.len() == before + 1)
-            .await;
-        assert_eq!(fm.configured.last(), Some(&held));
-        assert_eq!(held.replicas.0.len(), target as usize);
-        assert!(held.replicas.0.iter().all(|r| r.node != old.node && r.up));
-        assert_eq!((held.unit.target, held.unit.minimum), (target, minimum));
-        assert!(application(&endpoint, "read")
-            .await
-            .contains("committed=1 value=acknowledged"));
-        for (i, owner) in owners.iter().enumerate() {
-            if i != lost {
-                assert_eq!(
-                    fixture.status(i)["application_pid"],
-                    owner["application_pid"]
-                );
-                assert_eq!(fixture.status(i)["runtime_root"], owner["runtime_root"]);
-            }
-            assert_eq!(fixture.status(i)["host_replacement_count"], 0);
+            membership = held;
+            previous = Some((build, request));
         }
         // The surviving originals need the spare's vote to form a majority.
-        for second_loss in (0..target as usize)
-            .filter(|i| *i != lost && *i != selected)
+        let quorum_losses = (0..=target as usize)
+            .filter(|i| {
+                *i != selected
+                    && membership
+                        .replicas
+                        .0
+                        .iter()
+                        .any(|r| r.node == fixture.configs[*i].node.identity.native().unwrap())
+            })
             .take(spare - (spare / 2 + 1))
-        {
+            .collect::<Vec<_>>();
+        for second_loss in quorum_losses {
             let pid = owners[second_loss]["application_pid"].as_u64().unwrap();
             assert!(Command::new("kill")
                 .args(["-KILL", &pid.to_string()])
@@ -1441,13 +1490,13 @@ async fn standalone_spare_restores_target_membership_without_reopening_survivors
         assert!(application(&endpoint, "write-more")
             .await
             .contains("committed=2 value=continued"));
-        let pid = owners[spare]["application_pid"].as_u64().unwrap();
+        let pid = owners[spare + 1]["application_pid"].as_u64().unwrap();
         assert!(Command::new("kill")
             .args(["-KILL", &pid.to_string()])
             .status()
             .unwrap()
             .success());
-        fm.until(&mut fixture, |fm| fm.losses.contains(&spare))
+        fm.until(&mut fixture, |fm| fm.losses.contains(&(spare + 1)))
             .await;
         if let Ok(reply) = tokio::time::timeout(
             Duration::from_millis(250),
@@ -1458,13 +1507,13 @@ async fn standalone_spare_restores_target_membership_without_reopening_survivors
             assert!(!reply.starts_with("OK"));
         }
         fm.stopping = true;
-        for index in 0..=spare {
+        for index in 0..fixture.configs.len() {
             fixture.stop_node(&mut fm, index).await;
         }
         for link in fm.links.iter().flatten() {
             link.close().await.unwrap();
         }
-        fixture.finish(vec![true; spare + 1]);
+        fixture.finish(vec![true; spare + 2]);
     }
 }
 

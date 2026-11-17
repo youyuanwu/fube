@@ -1856,7 +1856,12 @@ impl Node {
                 .committed
                 .as_ref()
                 .is_none_or(|current| {
-                    (body.unit != current.body.unit || body.service != current.body.service)
+                    let stale = body.unit.id == current.body.unit.id
+                        && body.unit.consistency == current.body.unit.consistency
+                        && body.unit.current.older_than(current.body.unit.current)
+                        && body.service == current.body.service;
+                    !stale
+                        && (body.unit != current.body.unit || body.service != current.body.service)
                         && self.selected.as_ref().is_none_or(|selected| {
                             body.unit != selected.unit || body.service != selected.service
                         })
