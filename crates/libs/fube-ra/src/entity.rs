@@ -1986,13 +1986,25 @@ fn transition(
                             && body.replica.instance == s.body.replica.instance
                             && body.replica.current_role == 2
                     });
+                    let fresh_idle = state.is_none()
+                        && valid_stateful_sizes(&body.service)
+                        && body.unit.target >= 2
+                        && body.unit.previous == Epoch::default()
+                        && deactivation.catchup_lsn >= 0
+                        && deactivation.epoch.data_loss == body.unit.current.data_loss
+                        && !body.unit.current.older_than(deactivation.epoch)
+                        && deactivation.epoch.configuration & !0xffff_ffff
+                            == body.unit.current.configuration & !0xffff_ffff;
                     if !retired_peer
                         && !lost_primary
                         && !retained_peer
+                        && !fresh_idle
                         && (deactivation.epoch != body.unit.current
                             || deactivation.catchup_lsn != 0)
                     {
-                        return Err(Failure::Unsupported("only initial-primary peer creation"));
+                        return Err(Failure::Unsupported(
+                            "peer creation requires admitted Primary history",
+                        ));
                     }
                     Some(PeerCreation {
                         source: source.clone(),

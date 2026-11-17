@@ -18,11 +18,16 @@ configuration. Stateless remains the default.
 
 `--stateful --target-replica-set-size N --min-replica-set-size M` /
 `ServiceProfile::Stateful { target: N, minimum: M }` creates one volatile
-partition on N original nodes, with **immutable** settings satisfying
+partition with N initial members, with **immutable** settings satisfying
 `1 <= M <= N <= 64`. The ceiling is an implementation resource limit, not
 an SF replica-set-size rule; existing message, metadata and output budgets
 remain enforced. Process qualification covers up to five replicas, not every
 size up to that ceiling.
+
+`--nodes K` / `Cluster::with_node_pool(config, K)` supplies a larger static
+pool, with `N <= K <= 64`; omitting it uses N Nodes. Every pool member is
+prebound, but initial build/admission uses only the first N placements.
+Unused Nodes do not Open a replica or supply a vote.
 
 Send the existing `create` command for node1. Driving the cluster automatically
 builds the original Secondary destinations, one at a time, then admits all
@@ -69,9 +74,9 @@ remain unchanged. Poll `repair.ready`; `removed` and `built` are intermediate
 states, not restored redundancy. Repeated Secondary repair can precede Primary
 failover/repair.
 
-SF does not remove a down Secondary at minimum without a ready spare. This
-original-node-only topology therefore rejects repair when minimum equals target;
-it never lowers minimum or invents a spare placement. Multiple losses also
+SF does not remove a down Secondary at minimum without a ready spare.
+The original-node repair APIs therefore reject repair when minimum equals target;
+they never lower minimum or invent a spare placement. Multiple losses also
 reject a new repair. A further loss during repair makes it unknown and blocks
 host replacement/completion. Before any replacement starts, a matched Primary
 app-host loss during pending Secondary removal can instead supersede removal:
@@ -93,6 +98,22 @@ accounting, and another loss fences restoration rather than enabling recovery.
 FM-link loss and interruption during copy/readmission do not authorize this
 bounded exception. Minimum counts configured CC members, not Ready survivors;
 data-plane writes still require their actual quorum.
+
+With a preconfigured spare, `Cluster::replace_replica_on(node).await` explicitly
+selects an unused one-based placement after one processed member loss/deletion
+and completed membership/failover. It builds through the shared native
+Open/copy path, then combines down S/N removal and fresh I/S admission.
+PC still contains the down member; CC never falls below minimum. Poll
+`repair.ready`, not `host_ready` or `built`. Both launchers qualify this at
+3/3 and 4/4 after Primary or Secondary app-host loss, including stable LFUM
+with empty spare inventory, lost build/final reply replay and actual replacement
+votes after another original Secondary loss. Survivor hosts/runtimes stay
+unchanged, and physical cleanup is independent. Further loss during repair
+fences completion. Repeated spare cycles, automatic placement, dynamic joining
+and spare-repair generation overlaps remain gated.
+The original-node repair APIs retain their target-sized topology qualification;
+a larger pool does not implicitly enable recycling original placements or
+replacement after every possible partial-membership transition.
 
 The configured profile still rejects resize, planned transfer and healthy
 Secondary retirement. Host replacement is explicit, never automatic.

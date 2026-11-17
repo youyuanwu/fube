@@ -30,10 +30,13 @@ handoff rather than closing the FM connection.
 The configured volatile profile is selected with
 `--stateful --target-replica-set-size N --min-replica-set-size M`, or
 `ServiceProfile::Stateful { target: N, minimum: M }`. It creates one partition
-on N original nodes, validates `1 <= M <= N <= 64` before acquiring a deployment,
+with N initial members, validates `1 <= M <= N <= 64` before acquiring a deployment,
 and freezes both settings for that deployment. The 64-member ceiling is a Rust
 resource bound, not an ordinary-service restriction from native SF. Existing
 bounded serialization, metadata, command and output limits remain in force.
+`--nodes K` / `Cluster::with_node_pool(config, K)` can preconfigure a larger
+pool (`N <= K <= 64`). Every Node is bound before startup, but initial
+build/admission uses only the first N placements; unused spares have no replica.
 
 The existing node1 `create` command opens the Primary, then the foreground
 controller builds each original Secondary with AddReplica/CreateReplica and
@@ -186,9 +189,8 @@ sessions must remain connected and every other member must still be running.
 Only one missing member is admitted; failover with additional unavailable
 Secondaries does not authorize partial or multi-loss repair.
 When minimum requires the failed Primary to remain a down CC Secondary, this
-missing-member repair path is not admitted. Ready-Idle replacement at minimum
-is separate S3 work in the
-[configured-size plan](RustRaPort.md#configurable-replica-set-sizes-plan);
+missing-member repair path is not admitted. Use explicit
+[preconfigured-spare replacement](#preconfigured-spare-replacement-at-minimum);
 neither minimum nor current membership is lowered to enable repair.
 
 The same physical predecessor boundary described in
@@ -255,7 +257,7 @@ processed, with every other member and original Node/peer session still owned.
 FM-link disappearance alone cannot authorize replacement.
 
 The pinned FM removes a dropped/down Secondary only while CC plus ready Idles
-exceeds minimum. With no spare placement in this topology, `minimum == target`
+exceeds minimum. With no spare selected by this original-node API, `minimum == target`
 returns an explicit blocked-at-minimum error. No size/service-version update,
 forced quorum reduction or fabricated ready Idle substitutes for that rule.
 Multiple losses reject new repair; insufficient live quorum cannot acknowledge
@@ -315,9 +317,44 @@ cases reject unsafe progress without weakening write quorum.
 No new native schema/action is introduced: the source-stream gate remains
 179 cases/55 native truncation rejections. This is source-derived model/process
 and native-stream/schema-adapter evidence, not full original C++ handler or
-Federation interoperability. Multi-loss repair, spare-node placement, automatic
+Federation interoperability. Multi-loss repair, automatic
 restart, broader interrupted-transition recovery, resize and node/FM restart remain
 deferred. The 64 bound is model/resource qualification, not 64-process testing.
+
+## Preconfigured spare replacement at minimum
+
+`Cluster::replace_replica_on(node)` explicitly chooses an unused placement in
+the static pool; standalone uses the same native AddReplica/Open/copy contracts.
+One exact member's app-host loss/deletion and a surviving current majority are
+required by the local FM. After Primary loss, ordinary failover must finish
+first, retaining the down old Primary as a Secondary when minimum requires it.
+No automatic placement or dynamic Node join is inferred.
+
+The pinned SF `fm/ReconfigurationTask.cpp:357-418` counts Ready Idles before
+removing a down Secondary. Its `ra/FailoverUnit.cpp:269-297` supplies a fresh
+Idle with the creating Primary's deactivation history. Shared RA now admits
+that compatible history on a fresh bound placement, requires real Open/copy
+completion, and reuses the existing combined S/N removal and I/S admission
+transition. The old owner remains in PC, every surviving P/P and S/S identity
+is preserved, and CC never falls below minimum. Build, survivor metadata/role
+commits, final RAP EndReconfiguration and the FM reply are independent barriers.
+Neither target/minimum nor service version changes; old runtime adoption and
+fabricated votes remain forbidden.
+
+Both launchers qualify 3/3 and 4/4 after either Primary or Secondary app-host
+loss with one spare. Evidence includes stable member/empty-spare LFUM,
+nonempty copy, lost build/final replies and exact replay, original survivor
+owners, separate physical cleanup and an actual write after another original
+Secondary loss. That write needs the replacement's vote; losing the spare
+prevents the next fresh write. RA tests preserve PC/CC, frozen LFUM and each
+applied commit, reject premature/changed-owner requests and exercise store veto.
+FM tests reject used/unspecified/unprocessed destinations and fence additional
+losses during build/readmission.
+
+The pool remains bounded to 64 known Nodes; process evidence is not
+64-process/native-Federation interoperability. Repeated spare cycles, automatic
+placement, dynamic joining, arbitrary multi-loss repair and generation-upload
+overlaps during spare repair are not enabled.
 
 ## Primary loss during Secondary removal
 

@@ -3,8 +3,9 @@
 `fube-node` runs one Node/RA/Hosting process and its application child under a
 user-supplied Failover Manager (FM). The original Node processes form **one volatile
 partition** with explicit immutable target/minimum sizes satisfying
-`1 <= minimum <= target <= 64`. Initially there are `target` original Nodes,
-one Primary and `target - 1` ActiveSecondaries after admission. The 64 bound is
+`1 <= minimum <= target <= 64`. A statically preconfigured pool contains at
+least target and at most 64 Nodes, including unused spares. Initial membership
+has one Primary and `target - 1` ActiveSecondaries after admission. The 64 bound is
 a fube resource limit, not an SF rule; process qualification covers up to five Nodes.
 
 The feature supports fresh startup, application use, explicitly FM-driven
@@ -49,7 +50,7 @@ application command-line role flag chooses it.
 |---|---|
 | `node.address` | This Node's concrete RA listener address. |
 | `fm.address` | The external FM listener that this Node connects to. |
-| `peers[].address` | The other original Nodes' RA listeners, used for direct peer reliability exchanges. Supply target-1 peers, or an empty list for a singleton. These are not FM addresses. |
+| `peers[].address` | Every other preconfigured pool member's RA listener, including spares, for direct peer reliability exchanges. Supply pool-size minus one peers; a one-Node pool has none. These are not FM addresses. |
 | Application replication endpoint | An application-owned listener used for direct copy/replication. Its complete endpoint is exchanged during replica creation/build. |
 | Application service endpoint | The application's own client protocol, returned through native replica replies. |
 | Runtime/Hosting/RAP/lease IPC | Container-local or host-local loopback connections; not exposed as remote control endpoints. |
@@ -193,8 +194,9 @@ FM authority/generation, application, package version and configured sizes.
 Each local placement must appear unchanged in the other Nodes' peer lists.
 Target/minimum are mandatory, without compatibility defaults. For 3/3, set
 `minimum` to 3 and resolve `MinReplicaSetSize` to 3 in the package parameters.
-For another target, supply that many original placements and target-1 peers
-per Node. This is not a general spare-placement or live-resize contract.
+For another target, supply at least that many original placements and list
+every other pool member as a peer on each Node. Spare Nodes must be present
+before startup; they are not initial CC members. Sizes remain immutable.
 
 The package and run-directory paths are absolute. The package and run-directory
 **parent** must already exist and be accessible to the Node user; the configured
@@ -431,9 +433,15 @@ owner alive during replica Close, not restart/recovery or whole-RA-close parity.
 | Resize, arbitrary host restart or restart reconciliation | Unsupported branches remain explicit shared Node/RA or supervisor gates; dispatch alone grants no authority. |
 | FM/Node restart or volatile state loss | No adoption, rejoin or data recovery. Tear down the old deployment before starting a fresh one. |
 
-The profile supports one immutable original-node, one-partition volatile
-service. Spare placement/replacement at minimum remains separate
-[S3 work](RustRaPort.md#configurable-replica-set-sizes-plan).
+The profile supports one immutable one-partition volatile service on a static
+known pool. Explicit spare replacement at minimum is qualified at 3/3 and 4/4
+after Primary or Secondary app-host loss: build the fresh Idle through normal
+native contracts, then combine down-Secondary removal and Ready-Idle admission.
+Keep the old member in PC and await final configuration completion; minimum
+never changes and copy completion alone grants no vote. See the
+[runner contract](../../crates/tools/fube-node-runner/README.md#explicit-spare-replacement-at-minimum).
+Dynamic joining, automatic placement, repeated spare cycles and spare-repair
+generation-upload overlaps remain outside that qualification.
 It does not provide persisted state, elections, a production
 FM, rolling upgrades, multiple partitions or native FM/Federation interoperability.
 The shared native ingress does not expose the local launcher's replacement-host

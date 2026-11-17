@@ -38,6 +38,10 @@ struct Arguments {
     #[arg(long, requires = "stateful")]
     min_replica_set_size: Option<i32>,
 
+    /// Number of statically known Nodes, including unused spare placements (defaults to target).
+    #[arg(long, requires = "stateful")]
+    nodes: Option<usize>,
+
     #[arg(long, hide = true, conflicts_with_all = ["root", "app", "stateful_singleton", "stateful_peer_idle", "stateful_three", "stateful"])]
     internal_node: Option<PathBuf>,
 }
@@ -99,13 +103,21 @@ fn output(value: &serde_json::Value) -> Result<()> {
         .and_then(|()| lock.flush())
         .map_err(|error| error.to_string())
 }
-async fn foreground(root: PathBuf, app: PathBuf, profile: ServiceProfile) -> Result<bool> {
-    let mut cluster = Cluster::new(Config {
-        profile,
-        root,
-        app,
-        executable: std::env::current_exe().map_err(|error| error.to_string())?,
-    })?;
+async fn foreground(
+    root: PathBuf,
+    app: PathBuf,
+    profile: ServiceProfile,
+    nodes: Option<usize>,
+) -> Result<bool> {
+    let mut cluster = Cluster::with_node_pool(
+        Config {
+            profile,
+            root,
+            app,
+            executable: std::env::current_exe().map_err(|error| error.to_string())?,
+        },
+        nodes.unwrap_or_else(|| profile.node_count()),
+    )?;
     if let Err(error) = cluster.start().await {
         let cleanup = cluster.shutdown().await;
         output(&json!({"event":"startup_error","error":error,"cleanup":cleanup}))?;
@@ -189,6 +201,7 @@ async fn run(arguments: Arguments) -> Result<bool> {
         arguments.root.expect("clap requires --root"),
         arguments.app.expect("clap requires --app"),
         profile,
+        arguments.nodes,
     )
     .await
 }

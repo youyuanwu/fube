@@ -2811,6 +2811,94 @@ fn peer_create(body: CreateReplica) -> Command {
 }
 
 #[tokio::test]
+async fn fresh_spare_open_requires_compatible_primary_history_and_its_own_commits() {
+    for (target, veto) in [(3, false), (4, false), (4, true)] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        executor.bind_peer(peer_source()).unwrap();
+        let mut request = peer_request();
+        request.replica.0.service.target = target;
+        request.replica.0.service.minimum = target;
+        request.replica.0.unit.target = target;
+        request.replica.0.unit.minimum = target;
+        request.replica.0.unit.current.configuration += 0x1_0000_0002;
+        request.deactivation.epoch = request.replica.0.unit.current;
+        request.deactivation.epoch.configuration -= 1;
+        request.deactivation.catchup_lsn = 9;
+        for invalid in 0..4 {
+            let mut bad = request.clone();
+            match invalid {
+                0 => bad.deactivation.catchup_lsn = -1,
+                1 => bad.deactivation.epoch.data_loss += 1,
+                2 => bad.deactivation.epoch.configuration += 2,
+                _ => bad.deactivation.epoch.configuration -= 0x1_0000_0000,
+            }
+            assert!(executor
+                .submit(peer_create(bad))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+            assert!(executor.snapshot([1; 16]).committed.is_none());
+            assert!(effects(&executor).is_empty());
+        }
+        let (entered, release) = hooks.pause(veto);
+        let ticket = executor.submit(peer_create(request.clone())).unwrap();
+        entered.await.unwrap();
+        assert!(executor.snapshot([1; 16]).committed.is_none());
+        assert!(effects(&executor).is_empty());
+        release.send(()).unwrap();
+        if veto {
+            assert!(matches!(ticket.wait(WAIT).await, Err(Failure::Store(_))));
+            assert!(executor.snapshot([1; 16]).committed.is_none());
+            assert!(effects(&executor).is_empty());
+        } else {
+            ticket.wait(WAIT).await.unwrap();
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::Open { .. }]
+            ));
+            assert_eq!(
+                state(&executor)
+                    .peer_creation
+                    .as_ref()
+                    .unwrap()
+                    .deactivation,
+                request.deactivation
+            );
+            registered(&executor, &request.replica.0, ticket.id).await;
+            let mut completion = complete(&state(&executor).body, ticket.id);
+            completion.replica.service_endpoint.clear();
+            completion.replica.replication_endpoint = "127.0.0.1:12350".into();
+            let (entered, release) = hooks.pause(false);
+            let ticket = executor
+                .submit(Command::CompleteOpen(Box::new(completion)))
+                .unwrap();
+            entered.await.unwrap();
+            assert!(effects(&executor).is_empty());
+            assert_eq!(state(&executor).phase, Phase::Opening);
+            release.send(()).unwrap();
+            ticket.wait(WAIT).await.unwrap();
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::PeerCreateReplicaReply { .. }]
+            ));
+            assert_eq!(state(&executor).body.replica.current_role, 2);
+            assert!(state(&executor).reconfiguration.is_none());
+            let mut changed = request.clone();
+            changed.deactivation.catchup_lsn += 1;
+            assert!(executor
+                .submit(peer_create(changed))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+            assert!(effects(&executor).is_empty());
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
 async fn peer_idle_open_reply_waits_for_both_commits_and_preserves_original_sender() {
     let (store, executor, hooks) = setup(WAIT).await;
     executor.bind_peer(peer_source()).unwrap();
@@ -6876,8 +6964,17 @@ async fn activating_configured_survivor(
     target: i32,
     minimum: i32,
 ) -> ConfigurationCompletion {
+    activating_configured_survivor_in_pool(executor, target, minimum, target).await
+}
+
+async fn activating_configured_survivor_in_pool(
+    executor: &Executor,
+    target: i32,
+    minimum: i32,
+    nodes: i32,
+) -> ConfigurationCompletion {
     let peers: Vec<_> = std::iter::once(peer_source())
-        .chain((0..target - 2).map(|i| NodeInstance {
+        .chain((0..nodes - 2).map(|i| NodeInstance {
             id: [20 + i as u8; 16],
             instance: 100 + i as u64,
         }))
@@ -6901,7 +6998,12 @@ async fn activating_configured_survivor(
     primary.current_role = 4;
     primary.replication_endpoint = "127.0.0.1:12346".into();
     let mut replicas = vec![primary, local];
-    for (i, peer) in peers.into_iter().skip(1).enumerate() {
+    for (i, peer) in peers
+        .into_iter()
+        .skip(1)
+        .take(target as usize - 2)
+        .enumerate()
+    {
         let mut remote = replicas[1].clone();
         remote.node = peer;
         remote.id += 2 + i as i64;
@@ -6964,7 +7066,19 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
 ) {
     for (target, minimum) in [(2, 1), (3, 3), (4, 2), (4, 3), (4, 4), (5, 3), (64, 32)] {
         let (store, executor, hooks) = setup(WAIT).await;
-        active_configured_survivor(&executor, target, minimum).await;
+        if target == minimum {
+            let completion =
+                activating_configured_survivor_in_pool(&executor, target, minimum, target + 1)
+                    .await;
+            run(
+                &executor,
+                Command::CompleteConfiguration(Box::new(completion)),
+            )
+            .await;
+            effects(&executor);
+        } else {
+            active_configured_survivor(&executor, target, minimum).await;
+        }
         let original = state(&executor);
         let intent = failover_configuration(&original, &admission().local_node);
         if target == minimum {
@@ -7160,20 +7274,18 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
                     .id
             );
             assert_eq!(promoted.usage, original.usage);
-            run(&executor, reconfigure(intent)).await;
+            run(&executor, reconfigure(intent.clone())).await;
             assert_eq!(effects(&executor), completed);
-            finish(&store, &executor).await;
-            continue;
         }
-        let mut fresh = intent
-            .replicas
-            .0
-            .iter()
-            .find(|r| r.current_role == 1)
-            .unwrap()
-            .clone();
+        let mut fresh = intent.replicas.0.iter().find(|r| !r.up).unwrap().clone();
         fresh.id += 1000;
         fresh.instance += 1000;
+        if target == minimum {
+            fresh.node = NodeInstance {
+                id: [20 + (target - 2) as u8; 16],
+                instance: 100 + (target - 2) as u64,
+            };
+        }
         fresh.previous_role = 1;
         fresh.current_role = 2;
         fresh.state = 1;
@@ -7211,6 +7323,31 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
             effects(&executor).as_slice(),
             [Effect::BuildIdle { .. }]
         ));
+        if target == minimum {
+            let mut premature = promoted.swap.as_ref().unwrap().body.clone();
+            premature.unit.previous = premature.unit.current;
+            premature.unit.current.configuration += 1;
+            for r in &mut premature.replicas.0 {
+                r.previous_role = r.current_role;
+                if !r.up {
+                    r.current_role = 1;
+                }
+            }
+            let mut replica = fresh.clone();
+            replica.previous_role = 2;
+            replica.current_role = 3;
+            replica.state = 2;
+            premature.replicas.0.push(replica);
+            let before = state(&executor);
+            assert!(executor
+                .submit(reconfigure(premature))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+            assert_eq!(state(&executor), before);
+            assert!(effects(&executor).is_empty());
+        }
         run(
             &executor,
             Command::CompleteBuild(Box::new(BuildCompletion {
@@ -7231,17 +7368,21 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
         repair.unit.current.configuration += 1;
         for r in &mut repair.replicas.0 {
             r.previous_role = r.current_role;
+            if !r.up {
+                r.current_role = 1;
+            }
         }
         fresh.previous_role = 2;
         fresh.current_role = 3;
         fresh.state = 2;
         repair.replicas.0.push(fresh.clone());
-        for kind in 0..3 {
+        for kind in 0..4 {
             let mut bad = repair.clone();
             match kind {
                 0 => bad.replicas.0[0].instance += 1,
                 1 => bad.service.minimum = if minimum == 1 { 2 } else { 1 },
-                _ => bad.replicas.0.truncate(target as usize - 1),
+                2 => bad.replicas.0.truncate(target as usize - 1),
+                _ => bad.replicas.0.last_mut().unwrap().instance += 1,
             }
             assert!(executor
                 .submit(reconfigure(bad))
@@ -7267,12 +7408,21 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
                 .iter()
                 .filter(|r| r.previous_role >= 3)
                 .count(),
-            target as usize - 1
+            if target == minimum {
+                target as usize
+            } else {
+                target as usize - 1
+            }
         );
         run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
         let mut actions = effects(&executor);
         capture_committed_lfum(&executor, &repair, repair.unit.current, true).await;
-        for remote in repair.replicas.0.iter().filter(|r| r.previous_role == 3) {
+        for remote in repair
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.previous_role == 3 && r.up)
+        {
             assert!(!actions
                 .iter()
                 .any(|e| matches!(e, Effect::PeerActivate { .. })));
@@ -7384,6 +7534,9 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
         assert_eq!(state(&executor).runtime, original.runtime);
         let mut stable = repair.clone();
         stable.unit.previous = Epoch::default();
+        if target == minimum {
+            stable.replicas.0.retain(|r| r.current_role >= 3);
+        }
         for replica in &mut stable.replicas.0 {
             replica.previous_role = 1;
         }
@@ -8752,7 +8905,9 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
         (5, 3, false),
         (64, 32, false),
         (4, 2, true),
+        (3, 3, false),
         (4, 4, false),
+        (4, 4, true),
     ] {
         let (store, executor, hooks) = setup(WAIT).await;
         active_configured_survivor(&executor, target, minimum).await;
@@ -8785,15 +8940,13 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
         };
         if target == minimum {
             assert!(executor
-                .submit(deactivate(removal))
+                .submit(deactivate(removal.clone()))
                 .unwrap()
                 .wait(WAIT)
                 .await
                 .is_err());
             assert!(effects(&executor).is_empty());
             assert_eq!(state(&executor).body, original.body);
-            finish(&store, &executor).await;
-            continue;
         }
         for invalid in 0..3 {
             let mut bad = removal.clone();
@@ -8818,6 +8971,10 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
         fresh.current_role = 3;
         fresh.state = 2;
         fresh.replication_endpoint = "127.0.0.1:12350".into();
+        if target == minimum {
+            fresh.node.id = [90; 16];
+            removal.replicas.0.push(fresh.clone());
+        }
         let mut repair = removal.clone();
         repair.unit.previous = repair.unit.current;
         repair.unit.current.configuration += 1;
@@ -8826,7 +8983,12 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
             r.previous_role = r.current_role;
         }
         repair.replicas.0.push(fresh);
-        for body in [removal, repair] {
+        let transitions = if target == minimum {
+            vec![removal]
+        } else {
+            vec![removal, repair]
+        };
+        for body in transitions {
             let before = state(&executor);
             let (entered, release) = hooks.pause(veto);
             let ticket = executor.submit(deactivate(body.clone())).unwrap();
@@ -8896,7 +9058,7 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
                 history
             );
         }
-        if !veto {
+        if !veto && target != minimum {
             let current = state(&executor);
             let candidate = current
                 .reconfiguration

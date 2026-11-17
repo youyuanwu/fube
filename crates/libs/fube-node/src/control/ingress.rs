@@ -51,6 +51,19 @@ impl Profile {
         }
     }
 
+    pub fn validate_node_pool(self, count: usize) -> Result<()> {
+        self.validate()?;
+        let valid = if self.configured_sizes().is_some() {
+            (self.node_count()..=ra::MAX_CONFIGURATION_REPLICAS).contains(&count)
+        } else {
+            count == self.node_count()
+        };
+        if !valid {
+            return Err("Node pool must cover target and contain at most 64 known Nodes".into());
+        }
+        Ok(())
+    }
+
     pub fn check_service_sizes(self, unit: &FailoverUnit, service: &Service) -> Result<()> {
         if self.configured_sizes().is_some_and(|(target, minimum)| {
             unit.target != target
@@ -97,12 +110,14 @@ impl Ingress {
         peers: Vec<Placement>,
     ) -> Result<Self> {
         profile.validate()?;
-        let expected = if profile.peer_replicas() {
-            profile.node_count() - 1
+        let valid_peers = if profile.configured_sizes().is_some() {
+            profile.validate_node_pool(peers.len() + 1).is_ok()
+        } else if profile.peer_replicas() {
+            peers.len() == profile.node_count() - 1
         } else {
-            0
+            peers.is_empty()
         };
-        if peers.len() != expected
+        if !valid_peers
             || fm.instance == 0
             || std::iter::once(&local)
                 .chain(&peers)
