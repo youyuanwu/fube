@@ -1199,8 +1199,75 @@ async fn standalone_configured_sizes_preserve_membership_failover_lfum_and_delet
     }
 }
 
+async fn planned_handoff(
+    fm: &mut FmFixture,
+    fixture: &mut Fixture,
+    current: &Configuration,
+    candidate: usize,
+    generation: &GenerationHeader,
+    stale: &[DoReconfiguration],
+) -> (DoReconfiguration, ConfigurationReply) {
+    let old = current
+        .replicas
+        .0
+        .iter()
+        .find(|r| r.current_role == 4)
+        .unwrap();
+    let source = fixture
+        .configs
+        .iter()
+        .position(|c| c.node.identity.native().unwrap() == old.node)
+        .unwrap();
+    let candidate_node = fixture.configs[candidate].node.identity.native().unwrap();
+    let mut intent = current.clone();
+    intent.unit.previous = intent.unit.current;
+    intent.unit.current.configuration += 0x1_0000_0001;
+    for replica in &mut intent.replicas.0 {
+        replica.previous_role = replica.current_role;
+        replica.current_role = if replica.node == candidate_node { 4 } else { 3 };
+    }
+    let request = DoReconfiguration {
+        configuration: intent,
+        phase0_duration: i64::MAX,
+    };
+    let count = fm.configured.len();
+    fm.hold_configuration = true;
+    fm.send(
+        source,
+        do_reconfiguration_message(&request, generation).unwrap(),
+    )
+    .await;
+    fm.until(fixture, |fm| fm.held_configuration.is_some())
+        .await;
+    let held = fm.held_configuration.take().unwrap();
+    assert_eq!(fm.configured.len(), count);
+    assert!(application(&old.service_endpoint, "write")
+        .await
+        .contains("NotPrimary"));
+    for request in stale {
+        fm.send(
+            source,
+            do_reconfiguration_message(request, generation).unwrap(),
+        )
+        .await;
+    }
+    fm.hold_configuration = false;
+    fm.send(
+        source,
+        do_reconfiguration_message(&request, generation).unwrap(),
+    )
+    .await;
+    fm.until(fixture, |fm| fm.configured.len() == count + 1)
+        .await;
+    assert_eq!(fm.configured.last(), Some(&held));
+    assert_eq!(held.unit.current, request.configuration.unit.current);
+    assert_eq!(held.replicas.0.len(), current.replicas.0.len());
+    (request, held)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn standalone_planned_handoff_coordinates_all_members_and_replays_native_completion() {
+async fn standalone_repeated_planned_handoffs_coordinate_all_members_and_replay_native_completion()
+{
     for (target, minimum, candidate) in [(2, 1, 1), (3, 2, 1), (3, 2, 2)] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else {
@@ -1271,43 +1338,50 @@ async fn standalone_planned_handoff_coordinates_all_members_and_replays_native_c
             .contains("committed=1"));
         let owners: Vec<_> = (0..target as usize).map(|i| fixture.status(i)).collect();
         let completed = fm.configured[0].clone();
-        let candidate_node = fixture.configs[candidate].node.identity.native().unwrap();
-        let mut intent = Configuration {
+        let mut membership = Configuration {
             unit: completed.unit.clone(),
             service: body.service.clone(),
             replicas: completed.replicas,
         };
-        intent.unit.previous = intent.unit.current;
-        intent.unit.current.configuration += 0x1_0000_0001;
-        for replica in &mut intent.replicas.0 {
-            replica.previous_role = replica.current_role;
-            replica.current_role = if replica.node == candidate_node { 4 } else { 3 };
-        }
-        let request = DoReconfiguration {
-            configuration: intent,
-            phase0_duration: i64::MAX,
-        };
-        fm.hold_configuration = true;
-        fm.send(
+        let mut stale = vec![initial.clone()];
+        let destinations = [
+            candidate,
             0,
-            do_reconfiguration_message(&request, &generation).unwrap(),
-        )
-        .await;
-        fm.until(&mut fixture, |fm| fm.held_configuration.is_some())
+            if target == 2 {
+                candidate
+            } else {
+                3 - candidate
+            },
+        ];
+        for (round, destination) in destinations.into_iter().enumerate() {
+            let (request, reply) = planned_handoff(
+                &mut fm,
+                &mut fixture,
+                &membership,
+                destination,
+                &generation,
+                &stale,
+            )
             .await;
-        let lost = fm.held_configuration.take().unwrap();
-        assert_eq!(fm.configured.len(), 1);
-        assert!(application(&old_endpoint, "write-more")
-            .await
-            .contains("NotPrimary"));
-        fm.hold_configuration = false;
-        fm.send(
-            0,
-            do_reconfiguration_message(&request, &generation).unwrap(),
-        )
-        .await;
-        fm.until(&mut fixture, |fm| fm.configured.len() == 2).await;
-        assert_eq!(fm.configured[1], lost);
+            let endpoint = &reply
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.current_role == 4)
+                .unwrap()
+                .service_endpoint;
+            assert!(application(endpoint, "read")
+                .await
+                .contains(&format!("committed={}", round + 1)));
+            assert!(application(endpoint, &format!("write {}", round + 2))
+                .await
+                .contains(&format!("committed={}", round + 2)));
+            membership.unit = reply.unit;
+            membership.replicas = reply.replicas;
+            stale.push(request);
+        }
+        let candidate = destinations[2];
+        let lost = fm.configured.last().unwrap().clone();
         let endpoint = lost
             .replicas
             .0
@@ -1316,7 +1390,7 @@ async fn standalone_planned_handoff_coordinates_all_members_and_replays_native_c
             .unwrap()
             .service_endpoint
             .clone();
-        assert!(application(&endpoint, "read").await.contains("committed=1"));
+        assert!(application(&endpoint, "read").await.contains("committed=4"));
         assert_eq!((lost.unit.target, lost.unit.minimum), (target, minimum));
         assert_eq!(lost.replicas.0.len(), target as usize);
         for (index, owner) in owners.iter().enumerate() {
@@ -1345,14 +1419,14 @@ async fn standalone_planned_handoff_coordinates_all_members_and_replays_native_c
             .chain(std::iter::once(candidate))
         {
             if target == 3 && index != 0 && index != candidate {
-                assert!(application(&endpoint, "write-more")
+                assert!(application(&endpoint, "write 5")
                     .await
-                    .contains("committed=2"));
+                    .contains("committed=5"));
             }
             if target == 3 && index == candidate {
                 if let Ok(reply) = tokio::time::timeout(
                     Duration::from_millis(250),
-                    application(&endpoint, "write-final"),
+                    application(&endpoint, "write 6"),
                 )
                 .await
                 {
@@ -1677,6 +1751,40 @@ async fn standalone_sequential_spares_restore_latest_membership_without_reopenin
             membership = held;
             previous = Some((build, request));
         }
+        if target == 3 && minimum == 2 {
+            let original_primary = selected;
+            let mut stale = vec![previous.as_ref().unwrap().1.clone()];
+            for (round, destination) in [spare + 1, original_primary].into_iter().enumerate() {
+                let current = Configuration {
+                    unit: membership.unit.clone(),
+                    service: body.service.clone(),
+                    replicas: membership.replicas.clone(),
+                };
+                let (request, reply) = planned_handoff(
+                    &mut fm,
+                    &mut fixture,
+                    &current,
+                    destination,
+                    &generation,
+                    &stale,
+                )
+                .await;
+                endpoint = reply
+                    .replicas
+                    .0
+                    .iter()
+                    .find(|r| r.current_role == 4)
+                    .unwrap()
+                    .service_endpoint
+                    .clone();
+                assert!(application(&endpoint, &format!("write {}", round + 2))
+                    .await
+                    .contains(&format!("committed={}", round + 2)));
+                membership = reply;
+                selected = destination;
+                stale.push(request);
+            }
+        }
         // The surviving originals need the spare's vote to form a majority.
         let quorum_losses = (0..=target as usize)
             .filter(|i| {
@@ -1699,9 +1807,21 @@ async fn standalone_sequential_spares_restore_latest_membership_without_reopenin
             fm.until(&mut fixture, |fm| fm.losses.contains(&second_loss))
                 .await;
         }
-        assert!(application(&endpoint, "write-more")
-            .await
-            .contains("committed=2 value=continued"));
+        let repeated_handoff = target == 3 && minimum == 2;
+        assert!(application(
+            &endpoint,
+            if repeated_handoff {
+                "write 4"
+            } else {
+                "write-more"
+            }
+        )
+        .await
+        .contains(if repeated_handoff {
+            "committed=4 value=write-4"
+        } else {
+            "committed=2 value=continued"
+        }));
         let pid = owners[spare + 1]["application_pid"].as_u64().unwrap();
         assert!(Command::new("kill")
             .args(["-KILL", &pid.to_string()])
@@ -1712,7 +1832,14 @@ async fn standalone_sequential_spares_restore_latest_membership_without_reopenin
             .await;
         if let Ok(reply) = tokio::time::timeout(
             Duration::from_millis(250),
-            application(&endpoint, "write-final"),
+            application(
+                &endpoint,
+                if repeated_handoff {
+                    "write 5"
+                } else {
+                    "write-final"
+                },
+            ),
         )
         .await
         {

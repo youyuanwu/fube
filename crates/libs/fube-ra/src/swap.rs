@@ -73,9 +73,13 @@ fn retains_removal_pc(unit: &FailoverUnit, active: &Reconfiguration) -> bool {
             || unit.previous == active.request.unit.previous)
 }
 
-fn failover_epoch(unit: &FailoverUnit, active: &Reconfiguration, interrupted: bool) -> bool {
-    let old = &active.request.unit;
-    let removal = retains_removal_pc(unit, active);
+fn failover_epoch(
+    unit: &FailoverUnit,
+    active: &Configuration,
+    removal: bool,
+    interrupted: bool,
+) -> bool {
+    let old = &active.unit;
     unit.previous == if removal { old.previous } else { old.current }
         && unit.current.data_loss == old.current.data_loss
         && unit
@@ -98,7 +102,7 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
         &active.request
     };
     // Ordinary failover can also retain the down former Primary to preserve minimum.
-    let interrupted = removal || failover_epoch(&body.unit, active, true);
+    let interrupted = removal || failover_epoch(&body.unit, &active.request, removal, true);
     if body.replicas.0.len() != old.replicas.0.len()
         || body.service != old.service
         || !valid_stateful_sizes(&body.service)
@@ -106,7 +110,7 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
         || body.unit.minimum != old.unit.minimum
         || body.unit.id != old.unit.id
         || body.unit.consistency != old.unit.consistency
-        || !failover_epoch(&body.unit, active, interrupted)
+        || !failover_epoch(&body.unit, &active.request, removal, interrupted)
         || (interrupted
             && (body.replicas.0.len() != body.service.target as usize
                 || !reconfiguration::secondary_removal(body)
@@ -218,23 +222,29 @@ fn progress_query(
                 return Ok(None);
             }
             let active = failover_membership(current)?;
+            let removal = retains_removal_pc(&request.unit, active);
+            let membership = if active.stage == ConfigurationStage::Complete && !removal {
+                reconfiguration::completed_configuration(current).expect("completed membership")
+            } else {
+                &active.request
+            };
             if request.unit.current.older_than(current.body.unit.current) {
                 return Ok(Some(Transition::ignored(Disposition::IgnoredStale)));
             }
-            if replica(&active.request, source)?.current_role != 3
+            if replica(membership, source)?.current_role != 3
                 || current.body.replica.current_role != 3
                 || request.replica.node != admission.local_node
                 || request.replica.id != current.body.replica.id
                 || request.replica.instance != current.body.replica.instance
-                || request.service != active.request.service
-                || request.unit.id != active.request.unit.id
-                || request.unit.consistency != active.request.unit.consistency
-                || request.unit.target != active.request.unit.target
-                || request.unit.minimum != active.request.unit.minimum
-                || !(failover_epoch(&request.unit, active, false)
-                    || (active.request.replicas.0.len() == active.request.service.target as usize
-                        && active.request.service.minimum < active.request.service.target
-                        && failover_epoch(&request.unit, active, true)))
+                || request.service != membership.service
+                || request.unit.id != membership.unit.id
+                || request.unit.consistency != membership.unit.consistency
+                || request.unit.target != membership.unit.target
+                || request.unit.minimum != membership.unit.minimum
+                || !(failover_epoch(&request.unit, membership, removal, false)
+                    || (membership.replicas.0.len() == membership.service.target as usize
+                        && membership.service.minimum < membership.service.target
+                        && failover_epoch(&request.unit, membership, removal, true)))
             {
                 return Err(Failure::Unsupported(
                     "not the exact original survivor progress query",
@@ -263,7 +273,14 @@ fn progress_query(
                 }));
             }
             let mut state = current.clone();
-            state.swap = None;
+            // Keep completed membership as the baseline for the next Activate.
+            if state
+                .swap
+                .as_ref()
+                .is_some_and(|s| s.stage == SwapStage::ChangeConfiguration)
+            {
+                state.swap = None;
+            }
             let mut body = (*state.body).clone();
             body.unit = request.unit.clone();
             body.unit.previous = if current.body.unit.previous == Epoch::default() {
@@ -333,14 +350,17 @@ fn progress_query(
         Kind::Activate {
             source,
             generation: header,
-        } if current.swap.is_none() => {
+        } if current
+            .swap
+            .as_ref()
+            .is_none_or(|s| s.stage == SwapStage::Complete) =>
+        {
             let body: Activate = from_slice(&work.bytes)
                 .map_err(|_| Failure::Admission("invalid planned activation"))?;
-            let Some(active) = current.reconfiguration.as_ref().filter(|c| {
-                c.stage == ConfigurationStage::Complete
-                    && current.body.replica.current_role == 3
+            let Some(active) = reconfiguration::completed_configuration(current).filter(|c| {
+                current.body.replica.current_role == 3
                     && body.configuration.unit.current.configuration & !0xffff_ffff
-                        != c.request.unit.current.configuration & !0xffff_ffff
+                        != c.unit.current.configuration & !0xffff_ffff
             }) else {
                 return Ok(None);
             };
@@ -361,8 +381,7 @@ fn progress_query(
             let primary = replica(&body.configuration, source)?;
             let mut intent = body.configuration.clone();
             let mut original_endpoint = primary.clone();
-            original_endpoint.service_endpoint =
-                replica(&active.request, source)?.service_endpoint.clone();
+            original_endpoint.service_endpoint = replica(active, source)?.service_endpoint.clone();
             replace(&mut intent, original_endpoint)?;
             validate(&intent, current)?;
             if current.progress_query.as_ref().is_some_and(|query| {
@@ -614,7 +633,7 @@ fn generation(
     }
     if header.number != admission.generation {
         return Err(Failure::Unsupported(
-            "swap requires the original FM generation",
+            "swap requires the current FM generation",
         ));
     }
     Ok(true)
@@ -634,14 +653,20 @@ fn ready(state: &EntityState, admission: &Admission) -> bool {
         && admission.node_activated
 }
 fn validate(body: &Configuration, state: &EntityState) -> Result<()> {
-    let active = state
+    if state
         .reconfiguration
         .as_ref()
-        .filter(|c| c.stage == ConfigurationStage::Complete)
-        .ok_or(Failure::Unsupported(
-            "swap requires completed active membership",
-        ))?;
-    let old = &active.request;
+        .is_some_and(|c| c.stage != ConfigurationStage::Complete)
+    {
+        return Err(Failure::Unsupported(
+            "swap cannot interrupt membership changes",
+        ));
+    }
+    let active = reconfiguration::completed_configuration(state).ok_or(Failure::Unsupported(
+        "swap requires completed active membership",
+    ))?;
+    let mut old = stable(active);
+    old.replicas.0.retain(|r| r.current_role >= 3);
     if !matches!((old.unit.target, old.unit.minimum), (2, 1) | (3, 2))
         || body.replicas.0.len() != old.unit.target as usize
         || old.replicas.0.len() != body.replicas.0.len()
@@ -684,7 +709,7 @@ fn validate(body: &Configuration, state: &EntityState) -> Result<()> {
         ));
     }
     for (index, r) in body.replicas.0.iter().enumerate() {
-        let expected = replica(old, &r.node)?;
+        let expected = replica(&old, &r.node)?;
         let mut normalized = r.clone();
         normalized.previous_role = expected.previous_role;
         normalized.current_role = expected.current_role;
@@ -1213,9 +1238,9 @@ pub(super) fn transition(
                 },
             ));
             state.swap.as_mut().expect("swap").forwarded = (!from_fm).then_some(body);
+            state.progress_query = None;
             if failover {
                 state.remote_idles.clear();
-                state.progress_query = None;
             }
             apply(&mut state, &admission.local_node)?;
         }

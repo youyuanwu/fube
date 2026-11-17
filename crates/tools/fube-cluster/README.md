@@ -128,7 +128,7 @@ a larger pool does not implicitly enable recycling original placements or
 replacement after every possible partial-membership transition.
 
 The configured profile still rejects resize and healthy Secondary retirement.
-One healthy planned transfer is qualified at 2/1 and 3/2 as described below;
+Repeated healthy planned transfers are qualified at 2/1 and 3/2 as described below;
 other sizes remain gated. Host replacement is explicit, never automatic.
 Insufficient read quorum blocks failover without declaring data loss. Additional
 loss during an in-flight transition makes its ownership unknown, not successful,
@@ -160,8 +160,8 @@ quorum. Source-bound process tests also lose/replay build and final configuratio
 replies, preserve all original owners/one Open each and verify independent
 three-child cleanup. The bounded Primary app-host failover and explicit repair
 below are supported, as is generation upload from stable completed membership
-or original healthy same-Primary Secondary admission, and one healthy planned
-transfer as described below. General replacement/retirement, broader in-flight configuration upload,
+or original healthy same-Primary Secondary admission, and repeated healthy planned
+transfers as described below. General replacement/retirement, broader in-flight configuration upload,
 data loss and node/runtime adoption remain gated for this profile.
 See [source mapping and limits](../../../docs/cluster/MinimalFmCluster.md#healthy-three-replica-service).
 
@@ -275,8 +275,15 @@ replacement, concurrent supersession and restart stay gated.
 See the [source mapping and evidence limits](../../../docs/cluster/MinimalFmCluster.md#healthy-configured-secondary-retirement-and-replacement).
 
 `Cluster::transfer_primary().await` explicitly transfers Primary from node 1
-to node 2 after completed healthy 2/1 or 3/2 active admission. The legacy 2/1
-path also accepts its supported replacement. Native phase-0 RAP demotion/write revocation must finish
+to the first active Secondary after completed healthy 2/1 or 3/2 active admission.
+Use `Cluster::transfer_primary_to(one_based_destination).await` to select a
+current Secondary for another transfer, including reverse transfer and 3/2
+handoff after completed original-node or static-spare repair. Both APIs retry
+their current transition; selecting the same destination does not create another
+epoch. Every new transfer uses the latest completed membership and current
+Primary, ignoring removed placements and retaining earlier repair/swap results.
+The legacy 2/1 path also accepts its supported replacement.
+Native phase-0 RAP demotion/write revocation must finish
 before peer DoReconfiguration continuation. The candidate then obtains actual
 local RAP and peer GetLSN progress, promotes/catches up, activates the demoted
 member and any unchanged Secondary, and completes final RAP configuration and its committed FM reply.
@@ -288,15 +295,20 @@ the old Primary's actual demotion already completed in phase 0.
 The native default PC=CC path skips phase-3 Deactivate; no member reopens
 or rebuilds. Existing data and node/app/factory/runtime owners remain intact.
 Poll `configuration.kind=planned_primary_transfer` and `ready=true`.
-Only the exact new-Primary reply publishes node 2's endpoint in `nodes[1]`;
+Only the exact new-Primary reply publishes the selected node's endpoint;
 the old endpoint is withdrawn while pending, and its retained listener rejects
 writes after real demotion. Proxy endpoint ACKs and optional native 30-second
 ReplicaEndpointUpdated/Reply publication remain distinct from final completion.
 Prior requests/replies remain in `configuration.history`; current swap
 phase/error is in `nodes[].retained_work.local_replica.swap`.
 Lost replies replay the retained continuation/completion without another Open.
-New-Primary loss yields unknown, never failback or quorum reduction. Second/
-reverse transfer, transfer after repair/generation rounds, swap abort, automatic failover,
+Both launchers qualify 2/1 repeats and 3/2 A-B-A-C, with fresh numbered
+application writes after each transfer, old-message fencing and actual
+quorum/no-quorum checks. Local 3/2 cases also transfer to and back from a
+freshly repaired original placement or spare after Primary or Secondary loss.
+Completed generation rounds do not permanently disable transfer; concurrent
+generation/LFUM overlap remains unqualified.
+New-Primary loss yields unknown, never failback or quorum reduction. Swap abort, automatic failover,
 restart and full native handler/interoperability qualification remain gated.
 If SF requires restarting a non-responding or uncatchable Secondary after
 GetLSN selection, completion explicitly rejects before activation: native

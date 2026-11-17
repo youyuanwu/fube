@@ -1572,7 +1572,12 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
-        if !self.peer_profile() || !self.ra.is_peer(source) || generation.for_fm_replica {
+        if (!self.peer_profile()
+            && !(self.fm_primary_profile()
+                && self.active_stateful_configuration(body.configuration.unit.id.guid.0)))
+            || !self.ra.is_peer(source)
+            || generation.for_fm_replica
+        {
             return Err(Error::Unsupported);
         }
         self.admit_configuration(&body.configuration)?;

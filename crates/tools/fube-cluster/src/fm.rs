@@ -2838,10 +2838,22 @@ impl Ledger {
         self.request_idle_on(1, now)
     }
     pub fn primary_index(&self) -> usize {
-        if self.primary_failover() {
+        if self.primary_failover() || self.swap.as_ref().is_some_and(|s| s.reply.is_some()) {
             self.transition_primary_index()
         } else {
-            0
+            self.swap
+                .as_ref()
+                .and_then(|s| {
+                    self.placements.iter().position(|p| {
+                        s.body
+                            .configuration
+                            .replicas
+                            .0
+                            .iter()
+                            .any(|r| r.node == p.launch.node && r.previous_role == 4)
+                    })
+                })
+                .unwrap_or(0)
         }
     }
 
@@ -4045,6 +4057,35 @@ impl Ledger {
         Some(config.body.clone())
     }
     pub fn request_primary_transfer(&mut self, now: Instant) -> Result<DoReconfiguration> {
+        let destination =
+            if self.repair.is_none() && self.swap.is_some() && !self.primary_failover() {
+                self.transition_primary_index()
+            } else {
+                self.repair
+                    .as_ref()
+                    .and_then(|r| r.configuration.as_ref())
+                    .or(self.swap.as_ref())
+                    .or(self.configuration.as_ref())
+                    .and_then(|c| c.reply.as_ref())
+                    .and_then(|reply| {
+                        self.placements.iter().position(|p| {
+                            reply
+                                .replicas
+                                .0
+                                .iter()
+                                .any(|r| r.node == p.launch.node && r.current_role == 3 && r.up)
+                        })
+                    })
+                    .ok_or("Primary transfer requires a completed active Secondary")?
+            };
+        self.request_primary_transfer_to(destination, now)
+    }
+
+    pub fn request_primary_transfer_to(
+        &mut self,
+        destination: usize,
+        now: Instant,
+    ) -> Result<DoReconfiguration> {
         if !matches!(
             self.placements[0].launch.profile,
             crate::ServiceProfile::StatefulPeerIdle
@@ -4057,49 +4098,66 @@ impl Ledger {
                     target: 3,
                     minimum: 2
                 }
-        ) || self.generation.is_some()
-            || self.repair.is_some()
+        ) || self.generation_pending()
+            || destination >= self.placements.len()
+            || self.restoration.is_some()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
-            || self.placements.iter().any(|p| {
-                !p.link_alive
-                    || p.loss_reported
-                    || !p.activated
-                    || p.bootstrap != Bootstrap::Admitted
-                    || p.pending.is_some()
-                    || p.node_control.is_some()
-                    || p.service_update.is_some()
+            || self.repair.as_ref().is_some_and(|r| {
+                r.unknown
+                    || r.configuration
+                        .as_ref()
+                        .is_none_or(|c| c.unknown || c.reply.is_none())
             })
         {
-            return Err(
-                "Primary transfer requires healthy original admitted 2/1 or 3/2 sessions".into(),
-            );
+            return Err("Primary transfer requires completed healthy 2/1 or 3/2 membership".into());
         }
-        if let Some(swap) = &mut self.swap {
+        let candidate = self.placements[destination].launch.node.clone();
+        if let Some(swap) = self.swap.as_ref().filter(|_| self.repair.is_none()) {
             if swap.unknown {
                 return Err("Primary transfer ownership is unknown".into());
             }
-            swap.last = now;
-            return Ok(swap.body.clone());
+            if !self.primary_failover()
+                && swap
+                    .body
+                    .configuration
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == candidate && r.current_role == 4)
+            {
+                if !self.healthy_transfer_members(&swap.body.configuration.replicas.0) {
+                    return Err("Primary transfer requires healthy current members".into());
+                }
+                let swap = self.swap.as_mut().expect("swap");
+                swap.last = now;
+                return Ok(swap.body.clone());
+            }
+            if swap.reply.is_none() {
+                return Err("another Primary transition is still pending".into());
+            }
         }
         let active = self
-            .configuration
+            .repair
             .as_ref()
-            .filter(|c| {
-                c.reply.is_some()
-                    && !c.unknown
-                    && c.body.configuration.replicas.0.len() == self.placements.len()
-            })
-            .ok_or("Primary transfer requires completed original active membership")?;
-        if self
-            .placements
-            .iter()
-            .any(|p| p.observed != Observed::Running)
+            .and_then(|r| r.configuration.as_ref())
+            .or(self.swap.as_ref())
+            .or(self.configuration.as_ref())
+            .filter(|c| c.reply.is_some() && !c.unknown)
+            .ok_or("Primary transfer requires completed current membership")?;
+        let reply = active.reply.as_ref().expect("completed configuration");
+        if reply.error != 0
+            || reply.replicas.0.len() != reply.unit.target as usize
+            || !reply
+                .replicas
+                .0
+                .iter()
+                .any(|r| r.node == candidate && r.current_role == 3)
+            || !self.healthy_transfer_members(&reply.replicas.0)
         {
-            return Err("Primary transfer requires every member Running".into());
+            return Err("Primary transfer requires a healthy current Secondary and every current member Running".into());
         }
         let mut body = active.body.clone();
-        let reply = active.reply.as_ref().expect("completed configuration");
         body.configuration.unit = reply.unit.clone();
         body.configuration.unit.previous = reply.unit.current;
         body.configuration.unit.current.configuration = reply
@@ -4109,30 +4167,33 @@ impl Ledger {
             .checked_add(0x1_0000_0001)
             .ok_or("Primary epoch exhausted")?;
         body.configuration.replicas = reply.replicas.clone();
-        let candidate = reply
-            .replicas
-            .0
-            .iter()
-            .find(|r| r.current_role == 3)
-            .ok_or("Primary transfer requires an active Secondary")?
-            .node
-            .clone();
         for r in &mut body.configuration.replicas.0 {
             r.previous_role = r.current_role;
             r.current_role = if r.node == candidate { 4 } else { 3 };
         }
         body.phase0_duration = i64::MAX;
         for p in &mut self.placements {
-            p.active_unit = Some(body.configuration.unit.clone());
-            p.ready_replica = body
+            let Some(replica) = body
                 .configuration
                 .replicas
                 .0
                 .iter()
                 .find(|r| r.node == p.launch.node)
-                .cloned();
+            else {
+                continue;
+            };
+            p.active_unit = Some(body.configuration.unit.clone());
+            p.ready_replica = Some(replica.clone());
             p.endpoint = None;
         }
+        if let Some(repair) = self.repair.take() {
+            self.repair_history.push(repair);
+        }
+        if let Some(swap) = self.swap.take() {
+            self.configuration_history.push(swap);
+        }
+        self.candidate_changes.clear();
+        self.swap_endpoint = None;
         self.swap = Some(ActiveConfiguration {
             body: body.clone(),
             reply: None,
@@ -4141,6 +4202,23 @@ impl Ledger {
             last: now,
         });
         Ok(body)
+    }
+    fn healthy_transfer_members(&self, replicas: &[Replica]) -> bool {
+        replicas.iter().all(|r| {
+            r.up && r.state == 2
+                && matches!(r.current_role, 3 | 4)
+                && self.placements.iter().any(|p| {
+                    p.launch.node == r.node
+                        && p.link_alive
+                        && !p.loss_reported
+                        && p.activated
+                        && p.bootstrap == Bootstrap::Admitted
+                        && p.observed == Observed::Running
+                        && p.pending.is_none()
+                        && p.node_control.is_none()
+                        && p.service_update.is_none()
+                })
+        })
     }
     pub fn endpoint_updated(
         &mut self,
@@ -4272,15 +4350,14 @@ impl Ledger {
             }
         }
         for (i, p) in self.placements.iter_mut().enumerate() {
-            if failover
-                && (Some(i) == lost
-                    || !swap
-                        .body
-                        .configuration
-                        .replicas
-                        .0
-                        .iter()
-                        .any(|r| r.node == p.launch.node && r.up && r.current_role >= 3))
+            if (failover && Some(i) == lost)
+                || !swap
+                    .body
+                    .configuration
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == p.launch.node && r.up && r.current_role >= 3)
             {
                 continue;
             }
@@ -4325,7 +4402,9 @@ impl Ledger {
             return json!({"state":state,"ready":state == "ready","kind":if self.primary_failover() {"primary_failover"} else {"planned_primary_transfer"},
                 "request":{"configuration":swap.body.configuration,"phase0_duration":swap.body.phase0_duration},
                 "reply":swap.reply,"endpoint_update":self.swap_endpoint,"primary_transfer":true,
-                "from":self.failed_primary_index().map_or(1, |i| i + 1),"to":self.transition_primary_index() + 1,
+                "from":self.placements.iter().position(|p| swap.body.configuration.replicas.0.iter()
+                    .any(|r| r.node == p.launch.node && r.previous_role == 4)).map(|i| i + 1),
+                "to":self.transition_primary_index() + 1,
                 "candidate_redirections":self.candidate_changes,
                 "history":self.configuration_history.iter().chain(self.configuration.iter()).map(|c| json!({"request":c.body.configuration,"reply":c.reply})).collect::<Vec<_>>()});
         }

@@ -637,21 +637,10 @@ impl Drop for ObservedProvider {
             assert!(!self.primary, "Primary cannot own partial destination copy");
         }
         if state.last != 0 {
-            assert!((1..=3).contains(&state.last));
-            assert_eq!(
-                state.values.get("value").map(String::as_str),
-                Some(match state.last {
-                    1 => "acknowledged",
-                    2 => "continued",
-                    _ => "final",
-                })
-            );
-            assert_eq!(state.results.get("primary-write"), Some(&1));
-            if state.last >= 2 {
-                assert_eq!(state.results.get("primary-write-2"), Some(&2));
-            }
-            if state.last == 3 {
-                assert_eq!(state.results.get("primary-write-3"), Some(&3));
+            assert!(state.last > 0);
+            assert_eq!(state.values.get("value"), Some(&write_value(state.last)));
+            for number in 1..=state.last {
+                assert_eq!(state.results.get(&write_identity(number)), Some(&number));
             }
             assert_eq!(
                 (state.values.len(), state.results.len()),
@@ -667,6 +656,21 @@ impl Drop for ObservedProvider {
         } else {
             "LOCAL_DATA_PROVIDER disposed written"
         });
+    }
+}
+fn write_identity(number: i64) -> String {
+    if number == 1 {
+        "primary-write".into()
+    } else {
+        format!("primary-write-{number}")
+    }
+}
+fn write_value(number: i64) -> String {
+    match number {
+        1 => "acknowledged".into(),
+        2 => "continued".into(),
+        3 => "final".into(),
+        n => format!("write-{n}"),
     }
 }
 impl PrimaryState {
@@ -699,40 +703,37 @@ impl PrimaryState {
     }
     async fn request(&self, request: &[u8], stopped: Cancellation) -> Result<String> {
         match request {
-            b"write\n" | b"write-more\n" | b"write-final\n" => {
+            request
+                if matches!(request, b"write\n" | b"write-more\n" | b"write-final\n")
+                    || request.starts_with(b"write ") =>
+            {
                 self.authority(true)?;
-                let more = request == b"write-more\n";
-                let final_write = request == b"write-final\n";
-                let predecessor = if final_write {
-                    "primary-write-2"
-                } else {
-                    "primary-write"
+                let number = match request {
+                    b"write\n" => 1,
+                    b"write-more\n" => 2,
+                    b"write-final\n" => 3,
+                    _ => std::str::from_utf8(&request[6..])
+                        .ok()
+                        .and_then(|s| s.strip_suffix('\n'))
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .filter(|n| *n > 0)
+                        .ok_or(Error::InvalidInput("write requires a positive sequence"))?,
                 };
-                if (more || final_write)
-                    && !self.memory.snapshot().results.contains_key(predecessor)
+                if number > 1
+                    && !self
+                        .memory
+                        .snapshot()
+                        .results
+                        .contains_key(&write_identity(number - 1))
                 {
                     return Err(Error::InvalidInput(
                         "continuing write requires the original write",
                     ));
                 }
                 let mutation = Mutation {
-                    id: if final_write {
-                        "primary-write-3"
-                    } else if more {
-                        "primary-write-2"
-                    } else {
-                        "primary-write"
-                    }
-                    .into(),
+                    id: write_identity(number),
                     key: "value".into(),
-                    value: if final_write {
-                        "final"
-                    } else if more {
-                        "continued"
-                    } else {
-                        "acknowledged"
-                    }
-                    .into(),
+                    value: write_value(number),
                 };
                 if self.memory.admission(&mutation)?.is_some() {
                     return Err(Error::InvalidInput("fixture request already acknowledged"));
@@ -778,7 +779,7 @@ impl PrimaryState {
             }
             _ => {
                 return Err(Error::InvalidInput(
-                    "fixture accepts only read/write/write-more/state/load",
+                    "fixture accepts read/write/write N/write-more/write-final/state/load",
                 ))
             }
         }
