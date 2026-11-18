@@ -588,6 +588,11 @@ multi-loss recovery or native FM/Federation interoperability.
 
 #### LFUM alignment plan
 
+The local CLI now runs the extracted FM manager in `fube-fm`, with bounded
+controller management IPC and unchanged native Node exchanges. This separates
+process ownership, not protocol completeness: initial discovery/reporting and
+FM rebuild below remain distinct unfinished work.
+
 Source baseline: Service Fabric
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`. The
 [current contract/source map](MinimalFmCluster.md#live-session-lfum-upload) is

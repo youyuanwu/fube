@@ -1,6 +1,7 @@
 # Minimal native-free FM cluster
 
-**Profile:** one foreground in-memory FM, two separate RA+Hosting processes,
+**Profile:** one foreground supervisor, a separate ephemeral `fube-fm` process,
+two separate RA+Hosting processes,
 and one fixed stateless application profile. Explicit placement only; no
 automatic recovery, reconnect, failover or native FM/Federation parity.
 An opt-in [healthy three-replica profile](#healthy-three-replica-service) runs
@@ -16,6 +17,17 @@ The [launcher guide](../../crates/tools/fube-cluster/README.md) defines invocati
 bounded JSON commands, independent application contact and cleanup receipts.
 It uses the production local Node/RA/Hosting/runtime, memory store and common
 transport engine, not simulated application activation.
+
+The CLI now separates FM from process supervision. `fube-cluster` owns the FM
+and Node process capabilities; `fube-fm` owns the extracted in-memory ledger and
+native FM message/retry driver. Their bounded, correlated stdin/stdout JSON
+management interface adds no FM/RA wire action. FM progresses independently of
+controller status polling; placement completion still requires actual native
+replies. Source-bound local metadata and physical cleanup remain required.
+See the [process contract and limits](../../crates/tools/fube-cluster/README.md#fm-process-boundary).
+This first same-host profile is not a general external-Node listener or an
+FM restart/rebuild implementation. Embedded library qualification uses the
+same manager for precise fault scheduling.
 
 FM/peer decoding, topology/capability admission and command dispatch live in
 [`fube-node::control::ingress`](../../crates/libs/fube-node/src/control/ingress.rs).

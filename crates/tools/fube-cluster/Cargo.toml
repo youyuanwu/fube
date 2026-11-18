@@ -2,6 +2,15 @@
 name = "fube-cluster"
 version = "0.1.0"
 edition = "2021"
+default-run = "fube-cluster"
+
+[[bin]]
+name = "fube-cluster"
+path = "src/main.rs"
+
+[[bin]]
+name = "fube-fm"
+path = "src/fm_main.rs"
 
 [dependencies]
 clap.workspace = true

@@ -3609,7 +3609,7 @@ async fn peer_idle_app_host_loss_rejects_stale_ack_and_replays_metadata_without_
         let continued = data_contact(&endpoint, b"write-more\n");
         assert!(continued.contains("committed=2 value=continued"), "{continued}");
         assert_eq!(data_contact(&endpoint, b"read\n"), continued);
-        for child in &mut cluster.children { child.process.as_mut().unwrap().check_alive().map_err(err)?; }
+        for process in cluster.processes.iter_mut().flatten() { process.check_alive().map_err(err)?; }
         let terminated = match fs::read_to_string(format!("/proc/{}/stat", profile.app_pid)) {
             Ok(stat) => stat.rsplit_once(')').is_some_and(|(_, rest)|
                 matches!(rest.split_whitespace().next(), Some("Z" | "X"))),
@@ -4126,10 +4126,11 @@ async fn fm_can_remove_ready_idle_without_waiting_for_open_telemetry() {
     }
     let launch = cluster.ledger.placements[0].launch.clone();
     let (fm, node) = node::report_tests::links(&launch).await.unwrap();
-    for placement in &cluster.ledger.placements {
-        cluster.children.push(ChildOwner {
+    let manager = &mut cluster.manager;
+    for placement in &manager.ledger.placements {
+        manager.children.push(manager::Connection {
             launch: placement.launch.clone(),
-            process: None,
+            node_pid: 0,
             link: (placement.launch.node == launch.node).then(|| fm.clone()),
             metadata: None,
         });
@@ -4539,8 +4540,8 @@ async fn fm_deletes_pre_registration_idle_with_distinct_child_cancellation_not_d
     fs::set_permissions(&app, fs::Permissions::from_mode(0o755)).unwrap();
     for index in 0..2 { cluster.spawn(index).await.unwrap(); }
     let address = cluster.children[1].metadata.as_ref().and_then(|metadata| metadata.peer_address).unwrap();
-    let child = &mut cluster.children[0];
-    child.process.as_mut().unwrap().command(
+    let child = &cluster.manager.children[0];
+    cluster.processes[0].as_mut().unwrap().command(
         format!("peer {} {} {address}\n", child.launch.session, child.launch.capability).as_bytes(),
     ).unwrap();
     let profile = cluster.children[1].metadata.as_ref().unwrap().profile.as_ref().unwrap();
@@ -4615,8 +4616,8 @@ async fn fm_deletes_registered_open_idle_through_original_child_adapters_without
     fs::set_permissions(&app, fs::Permissions::from_mode(0o755)).unwrap();
     for index in 0..2 { cluster.spawn(index).await.unwrap(); }
     let address = cluster.children[1].metadata.as_ref().and_then(|metadata| metadata.peer_address).unwrap();
-    let child = &mut cluster.children[0];
-    child.process.as_mut().unwrap().command(
+    let child = &cluster.manager.children[0];
+    cluster.processes[0].as_mut().unwrap().command(
         format!("peer {} {} {address}\n", child.launch.session, child.launch.capability).as_bytes(),
     ).unwrap();
     let profile = cluster.children[1].metadata.as_ref().unwrap().profile.as_ref().unwrap();
@@ -4719,8 +4720,8 @@ async fn fm_deletes_never_created_idle_before_peer_binding_and_publishes_separat
         assert!(cluster.children[1].launch.directory.join("absence.json").exists());
         let address = cluster.children[1].metadata.as_ref().and_then(|metadata| metadata.peer_address)
             .ok_or("missing original target peer listener")?;
-        let child = &mut cluster.children[0];
-        child.process.as_mut().ok_or("missing original Primary owner")?.command(
+        let child = &cluster.manager.children[0];
+        cluster.processes[0].as_mut().ok_or("missing original Primary owner")?.command(
             format!("peer {} {} {address}\n", child.launch.session, child.launch.capability).as_bytes(),
         ).map_err(err)?;
         until(&mut cluster, |cluster| cluster.status()["peer_idle"]["peer_link_alive"] == json!([true, true])
@@ -4916,7 +4917,7 @@ async fn immutable_configured_service_builds_initial_membership_without_resize()
         }).await;
         if !matches!(&result, Ok(Ok(()))) {
             eprintln!("CONFIGURED_STATUS {}", cluster.status());
-            for child in &cluster.children { eprintln!("CONFIGURED_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+            for process in cluster.processes.iter().flatten() { eprintln!("CONFIGURED_LOG {:?}", bounded_logs(process)); }
         }
         let cleanup = cluster.shutdown().await;
         assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -5043,7 +5044,7 @@ async fn configured_primary_failover_preserves_sizes_data_and_quorum_with_unavai
         }).await;
         if !matches!(&result, Ok(Ok(()))) {
             eprintln!("CONFIGURED_FAILOVER_STATUS {}", cluster.status());
-            for child in &cluster.children { eprintln!("CONFIGURED_FAILOVER_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+            for process in cluster.processes.iter().flatten() { eprintln!("CONFIGURED_FAILOVER_LOG {:?}", bounded_logs(process)); }
         }
         let cleanup = cluster.shutdown().await;
         assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -5248,7 +5249,7 @@ async fn configured_candidate_redirection_routes_new_epoch_and_rejects_deprecate
     }).await;
     if !matches!(&result, Ok(Ok(()))) {
         eprintln!("REDIRECTION_STATUS {}", cluster.status());
-        for child in &cluster.children { eprintln!("REDIRECTION_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+        for process in cluster.processes.iter().flatten() { eprintln!("REDIRECTION_LOG {:?}", bounded_logs(process)); }
     }
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -5302,7 +5303,7 @@ async fn secondary_removal_primary_loss(lfum: bool) {
                 Some(hold_peer_loss_frame(&mut cluster,0,"DoReconfigurationReply",Duration::from_secs(30)).await?)
             } else {
                 if checkpoint==1 {
-                    let pid=cluster.children[4].process.as_ref().unwrap().pid();
+                    let pid=cluster.processes[4].as_ref().unwrap().pid();
                     assert!(std::process::Command::new("kill").args(["-STOP",&pid.to_string()]).status().map_err(err)?.success());
                     stopped_node=Some(pid);
                     cluster.send_configuration(&removal).await?;
@@ -5376,7 +5377,7 @@ async fn secondary_removal_primary_loss(lfum: bool) {
         for path in releases { fs::write(path, b"release owned supersession callback").unwrap(); }
         if !matches!(&result,Ok(Ok(()))) {
             eprintln!("REMOVAL_SUPERSESSION_STATUS {}",cluster.status());
-            for child in &cluster.children { eprintln!("REMOVAL_SUPERSESSION_LOG {:?}",bounded_logs(child.process.as_ref().unwrap())); }
+            for process in cluster.processes.iter().flatten() { eprintln!("REMOVAL_SUPERSESSION_LOG {:?}",bounded_logs(process)); }
         }
         let cleanup=cluster.shutdown().await;
         assert_eq!(cleanup["clean"],true,"{cleanup}");
@@ -5628,7 +5629,7 @@ async fn sequential_repair_after_removal_supersession_restores_target_and_later_
         assert!(std::process::Command::new("kill").args(["-KILL",&profiles[1].app_pid.to_string()]).status().map_err(err)?.success());
         until(&mut cluster,|c| c.ledger.placements[1].status()["native_replica_deleted"]==true).await;
         if interrupt_phase3 {
-            let pid=cluster.children[target as usize-1].process.as_ref().unwrap().pid();
+            let pid=cluster.processes[target as usize-1].as_ref().unwrap().pid();
             assert!(std::process::Command::new("kill").args(["-STOP",&pid.to_string()]).status().map_err(err)?.success());
             stopped_node=Some(pid);
         }
@@ -5753,7 +5754,7 @@ async fn sequential_repair_after_removal_supersession_restores_target_and_later_
     }
     if !matches!(&result,Ok(Ok(()))) {
         eprintln!("SEQUENTIAL_RESTORATION_STATUS {}",cluster.status());
-        for child in &cluster.children { eprintln!("SEQUENTIAL_RESTORATION_LOG {:?}",bounded_logs(child.process.as_ref().unwrap())); }
+        for process in cluster.processes.iter().flatten() { eprintln!("SEQUENTIAL_RESTORATION_LOG {:?}",bounded_logs(process)); }
     }
     let cleanup=cluster.shutdown().await;
     assert_eq!(cleanup["clean"],true,"{cleanup}");
@@ -5882,7 +5883,7 @@ async fn secondary_loss_repair(target: i32, minimum: i32) {
         }).await;
         if !matches!(&result, Ok(Ok(()))) {
             eprintln!("SECONDARY_REPAIR_STATUS {}", cluster.status());
-            for child in &cluster.children { eprintln!("SECONDARY_REPAIR_LOG {:?}",bounded_logs(child.process.as_ref().unwrap())); }
+            for process in cluster.processes.iter().flatten() { eprintln!("SECONDARY_REPAIR_LOG {:?}",bounded_logs(process)); }
         }
         let cleanup = cluster.shutdown().await;
         assert_eq!(cleanup["clean"],true,"{cleanup}");
@@ -5954,7 +5955,7 @@ async fn secondary_repair_blocks_at_minimum_without_quorum_and_after_another_los
         }).await;
         if !matches!(&result,Ok(Ok(()))) {
             eprintln!("SECONDARY_BLOCKED_STATUS {}",cluster.status());
-            for child in &cluster.children { eprintln!("SECONDARY_BLOCKED_LOG {:?}",bounded_logs(child.process.as_ref().unwrap())); }
+            for process in cluster.processes.iter().flatten() { eprintln!("SECONDARY_BLOCKED_LOG {:?}",bounded_logs(process)); }
         }
         let cleanup = cluster.shutdown().await;
         assert_eq!(cleanup["clean"],true,"{cleanup}");
@@ -6080,8 +6081,8 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
                     }, true)?;
                     let link = cluster.children[*i].link.as_ref().unwrap();
                     link.send(delete_replica_message(&DeleteReplica::new(body.clone(), false), &link.generation()).map_err(err)?).await?;
-                    let child = &mut cluster.children[*i];
-                    child.process.as_mut().unwrap().command(format!(
+                    let child = &cluster.manager.children[*i];
+                    cluster.processes[*i].as_mut().unwrap().command(format!(
                         "replace-host {} {} {} {}\n", child.launch.session, child.launch.capability,
                         body.replica.id, body.replica.instance,
                     ).as_bytes()).map_err(err)?;
@@ -6135,7 +6136,7 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
         }).await;
         if !matches!(&result, Ok(Ok(()))) {
             eprintln!("CONFIGURED_REPAIR_STATUS {}", cluster.status());
-            for child in &cluster.children { eprintln!("CONFIGURED_REPAIR_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+            for process in cluster.processes.iter().flatten() { eprintln!("CONFIGURED_REPAIR_LOG {:?}", bounded_logs(process)); }
         }
         let cleanup = cluster.shutdown().await;
         assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -6259,7 +6260,7 @@ async fn three_replica_primary_repair_recopies_fresh_owner_and_restores_majority
     }).await;
     if !matches!(&result, Ok(Ok(()))) {
         eprintln!("REPAIR_STATUS {}", cluster.status());
-        for child in &cluster.children { eprintln!("REPAIR_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+        for process in cluster.processes.iter().flatten() { eprintln!("REPAIR_LOG {:?}", bounded_logs(process)); }
     }
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -6371,8 +6372,8 @@ async fn repeated_primary_failover_and_repair_preserve_current_owners_and_data()
                     }, true)?;
                     let link = cluster.children[*i].link.as_ref().unwrap();
                     link.send(delete_replica_message(&DeleteReplica::new(body.clone(), false), &link.generation()).map_err(err)?).await?;
-                    let child = &mut cluster.children[*i];
-                    child.process.as_mut().unwrap().command(format!(
+                    let child = &cluster.manager.children[*i];
+                    cluster.processes[*i].as_mut().unwrap().command(format!(
                         "replace-host {} {} {} {}\n", child.launch.session, child.launch.capability,
                         body.replica.id, body.replica.instance,
                     ).as_bytes()).map_err(err)?;
@@ -6412,7 +6413,7 @@ async fn repeated_primary_failover_and_repair_preserve_current_owners_and_data()
         }).await;
         if !matches!(&result, Ok(Ok(()))) {
             eprintln!("REPEAT_STATUS {}", cluster.status());
-            for child in &cluster.children { eprintln!("REPEAT_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+            for process in cluster.processes.iter().flatten() { eprintln!("REPEAT_LOG {:?}", bounded_logs(process)); }
         }
         let cleanup = cluster.shutdown().await;
         assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -6510,7 +6511,7 @@ async fn three_replica_primary_failover_preserves_data_and_never_promotes_withou
         }).await;
         if !matches!(&result, Ok(Ok(()))) {
             eprintln!("FAILOVER_STATUS {}", cluster.status());
-            for child in &cluster.children { eprintln!("FAILOVER_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+            for process in cluster.processes.iter().flatten() { eprintln!("FAILOVER_LOG {:?}", bounded_logs(process)); }
         }
         let cleanup = cluster.shutdown().await;
         assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -6627,7 +6628,7 @@ async fn three_replica_service_copies_each_peer_replays_replies_and_preserves_ma
     }).await;
     if !matches!(&result, Ok(Ok(()))) {
         eprintln!("THREE_STATUS {}", cluster.status());
-        for child in &cluster.children { eprintln!("THREE_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+        for process in cluster.processes.iter().flatten() { eprintln!("THREE_LOG {:?}", bounded_logs(process)); }
     }
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -6733,7 +6734,7 @@ async fn same_primary_configuration_activates_secondary_and_never_acks_without_i
         Ok::<(), String>(())
     }).await;
     if !matches!(&result, Ok(Ok(()))) {
-        eprintln!("CONFIGURATION_NODE_LOGS {:?}", bounded_logs(cluster.children[0].process.as_ref().unwrap()));
+        eprintln!("CONFIGURATION_NODE_LOGS {:?}", bounded_logs(cluster.processes[0].as_ref().unwrap()));
     }
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -6858,7 +6859,7 @@ async fn repeated_planned_transfers_preserve_fresh_writes_owners_and_native_comp
         }).await;
         if !matches!(&result, Ok(Ok(()))) {
             eprintln!("REPEATED_SWAP_STATUS {}", cluster.status());
-            for child in &cluster.children { eprintln!("REPEATED_SWAP_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+            for process in cluster.processes.iter().flatten() { eprintln!("REPEATED_SWAP_LOG {:?}", bounded_logs(process)); }
         }
         let cleanup = cluster.shutdown().await;
         assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -6887,7 +6888,7 @@ async fn planned_handoff_drops_unresponsive_volatile_secondary_then_explicitly_r
         let owners = cluster.status()["nodes"].as_array().unwrap().iter()
             .map(|n| (n["node_pid"].clone(), n["app_pid"].clone(), n["runtime_root"].clone())).collect::<Vec<_>>();
         let predecessor = cluster.ledger.placements[2].body()?;
-        let pid = cluster.children[2].process.as_ref().unwrap().pid();
+        let pid = cluster.processes[2].as_ref().unwrap().pid();
         assert!(std::process::Command::new("kill").args(["-STOP", &pid.to_string()]).status().map_err(err)?.success());
         stopped = Some(pid);
         cluster.transfer_primary_to(2).await?;
@@ -6948,7 +6949,7 @@ async fn planned_handoff_drops_unresponsive_volatile_secondary_then_explicitly_r
     }
     if !matches!(&result, Ok(Ok(()))) {
         eprintln!("RESTART_SWAP_STATUS {}", cluster.status());
-        for child in &cluster.children { eprintln!("RESTART_SWAP_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+        for process in cluster.processes.iter().flatten() { eprintln!("RESTART_SWAP_LOG {:?}", bounded_logs(process)); }
     }
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -7080,7 +7081,7 @@ async fn post_handoff_app_crash_repairs_same_node_then_transfers_with_fresh_memb
             if !matches!(&result, Ok(Ok(()))) {
                 eprintln!("POST_HANDOFF_CASE candidate={candidate} lost={lost}");
                 eprintln!("POST_HANDOFF_STATUS {}", cluster.status());
-                for child in &cluster.children { eprintln!("POST_HANDOFF_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+                for process in cluster.processes.iter().flatten() { eprintln!("POST_HANDOFF_LOG {:?}", bounded_logs(process)); }
             }
             let cleanup = cluster.shutdown().await;
             assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -7149,7 +7150,7 @@ async fn planned_transfers_after_repair_use_current_membership_and_surviving_pri
         }).await;
         if !matches!(&result, Ok(Ok(()))) {
             eprintln!("REPAIRED_SWAP_STATUS {}", cluster.status());
-            for child in &cluster.children { eprintln!("REPAIRED_SWAP_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+            for process in cluster.processes.iter().flatten() { eprintln!("REPAIRED_SWAP_LOG {:?}", bounded_logs(process)); }
         }
         let cleanup = cluster.shutdown().await;
         assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -7209,7 +7210,7 @@ async fn configured_three_member_planned_transfer_preserves_data_owners_and_rema
     }).await;
     if !matches!(&result, Ok(Ok(()))) {
         eprintln!("THREE_SWAP_STATUS {}", cluster.status());
-        for child in &cluster.children { eprintln!("THREE_SWAP_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+        for process in cluster.processes.iter().flatten() { eprintln!("THREE_SWAP_LOG {:?}", bounded_logs(process)); }
     }
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -7274,7 +7275,7 @@ async fn planned_primary_transfer_fences_old_writer_replays_lost_reply_and_prese
     }).await;
     if !matches!(&result, Ok(Ok(()))) {
         eprintln!("SWAP_STATUS {}", cluster.status());
-        for child in &cluster.children { eprintln!("SWAP_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+        for process in cluster.processes.iter().flatten() { eprintln!("SWAP_LOG {:?}", bounded_logs(process)); }
     }
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -7356,8 +7357,8 @@ async fn configured_secondary_retirement_replaces_and_reactivates_real_data() {
     }).await;
     if !matches!(&result, Ok(Ok(()))) {
         eprintln!("RETIREMENT_STATUS {}", cluster.status());
-        for child in &cluster.children {
-            eprintln!("RETIREMENT_LOG {:?}", bounded_logs(child.process.as_ref().unwrap()));
+        for process in cluster.processes.iter().flatten() {
+            eprintln!("RETIREMENT_LOG {:?}", bounded_logs(process));
         }
     }
     let cleanup = cluster.shutdown().await;
@@ -8496,7 +8497,7 @@ async fn primary_repair_lfum(cycles: usize, deactivate: bool) {
     }
     if !matches!(&result, Ok(Ok(()))) {
         eprintln!("REPAIR_LFUM_STATUS {}", cluster.status());
-        for child in &cluster.children { eprintln!("REPAIR_LFUM_LOG {:?}", bounded_logs(child.process.as_ref().unwrap())); }
+        for process in cluster.processes.iter().flatten() { eprintln!("REPAIR_LFUM_LOG {:?}", bounded_logs(process)); }
     }
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
@@ -10076,8 +10077,7 @@ async fn stateful_app_terminal_and_lost_ack_retire_only_original_reporting_witho
         let result =
             node::report_tests::run_stateful_down(&launch, &mut cluster.ledger, mode).await;
         assert_eq!(request(b"read\n"), written);
-        cluster.children[0]
-            .process
+        cluster.processes[0]
             .as_mut()
             .unwrap()
             .check_alive()
@@ -10244,8 +10244,7 @@ async fn real_node_coordination_and_public_load_preserve_original_disposal_and_s
         .await;
         let launch = cluster.ledger.placements[1].launch.clone();
         let result = node::report_tests::run_node_coordination(&launch, mode).await;
-        cluster.children[0]
-            .process
+        cluster.processes[0]
             .as_mut()
             .unwrap()
             .check_alive()
@@ -10275,7 +10274,7 @@ async fn executable_nodes_preserve_uncertainty_sibling_contact_and_clean_handoff
         .map(|child| {
             (
                 child.launch.clone(),
-                child.process.as_ref().unwrap().pid(),
+                child.node_pid,
                 child
                     .metadata
                     .as_ref()
@@ -10400,7 +10399,7 @@ async fn real_stale_native_generation_is_not_admitted_and_sibling_remains_usable
     let mut cluster = Cluster::new(fixture.config()).unwrap();
     cluster.start().await.unwrap();
     let launch = cluster.children[1].launch.clone();
-    let pid = cluster.children[1].process.as_ref().unwrap().pid();
+    let pid = cluster.processes[1].as_ref().unwrap().pid();
     let app = cluster.children[1]
         .metadata
         .as_ref()
@@ -10449,7 +10448,7 @@ async fn partial_startup_rolls_back_every_acquired_original_child() {
     let mut cluster = Cluster::new(fixture.config()).unwrap();
     cluster.prepare().unwrap();
     cluster.spawn(0).await.unwrap();
-    let pid = cluster.children[0].process.as_ref().unwrap().pid();
+    let pid = cluster.processes[0].as_ref().unwrap().pid();
     let app = cluster.children[0]
         .metadata
         .as_ref()
@@ -10496,7 +10495,7 @@ async fn active_original_node_owner_loss_cannot_fabricate_receipt_or_clean_relau
         .as_ref()
         .unwrap()
         .app_pid;
-    let sibling_pid = cluster.children[1].process.as_ref().unwrap().pid();
+    let sibling_pid = cluster.processes[1].as_ref().unwrap().pid();
     let sibling_app = cluster.children[1]
         .metadata
         .as_ref()
@@ -10507,8 +10506,7 @@ async fn active_original_node_owner_loss_cannot_fabricate_receipt_or_clean_relau
         .app_pid;
     // Fault through the retained ORIGINAL child/group capability, never a
     // process-name signal or a PID reconstructed into ownership.
-    cluster.children[0]
-        .process
+    cluster.processes[0]
         .as_mut()
         .unwrap()
         .cleanup()
@@ -10576,5 +10574,140 @@ fn profile_root_lock_and_missing_handoff_fail_closed() {
     private_dir(&fixture.root).unwrap();
     fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(interlock::Interlock::acquire(&fixture.root).is_err());
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[tokio::test]
+async fn separate_fm_drives_native_membership_lfum_failover_and_fresh_host_repair() {
+    let fixture = Fixture::new("separate-fm");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::Stateful { target: 3, minimum: 2 };
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    let fm_executable = support::binary("fube-fm", "FUBE_FM_EXE");
+    if let Err(error) = cluster.start_with_fm(&fm_executable).await {
+        let cleanup = cluster.shutdown().await;
+        panic!("separate FM startup: {error}; cleanup={cleanup}");
+    }
+    let result = peer_idle_catch(async {
+        let status = cluster.status();
+        let fm_pid = status["fm"]["pid"].as_u64().unwrap() as u32;
+        assert_ne!(fm_pid, std::process::id());
+        assert!(cluster.manager.children.iter().all(|child| child.link.is_none()));
+        assert!(cluster.processes.iter().flatten().all(|process| process.pid() != fm_pid));
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        let end = Instant::now() + Duration::from_secs(12);
+        loop {
+            let path = cluster.manager.children[0].launch.directory.join("observation.json");
+            if path.try_exists().map_err(err)? {
+                let observation: Value = read_json(&path)?;
+                if observation["local_replica"]["configuration"]["stage"] == "Complete" {
+                    break;
+                }
+            }
+            assert!(Instant::now() < end, "FM must drive native membership without controller polling");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        until(&mut cluster, |c| c.status()["configuration"]["ready"] == true).await;
+        assert!(cluster.manager.ledger.operations.is_empty(), "controller must not execute FM intent");
+        assert_eq!(cluster.execute(command("primary", "create", Some(1))).await?["state"], "complete");
+        assert!(cluster.execute(command("primary", "create", Some(2))).await.is_err());
+        let original = cluster.status();
+        let endpoint = original["nodes"][0]["endpoint"].as_str().unwrap().to_owned();
+        until(&mut cluster, |_| data_contact(&endpoint, b"read\n")
+            .contains("read=Granted write=Granted ready=true")).await;
+        assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+        cluster.begin_generation_round().await?;
+        until(&mut cluster, |c| c.status()["generation_handshake"]["complete"] == true).await;
+        let generation = cluster.status()["generation_handshake"].clone();
+        assert_eq!(generation["uploads"].as_array().unwrap().len(), 3);
+        let lost = original["nodes"][0]["app_pid"].as_u64().unwrap() as u32;
+        assert!(std::process::Command::new("kill").args(["-KILL", &lost.to_string()])
+            .status().map_err(err)?.success());
+        until(&mut cluster, |c| {
+            let status = c.status();
+            status["configuration"]["ready"] == true
+                && status["nodes"][1]["endpoint"].as_str().is_some()
+                && status["nodes"][0]["native_replica_deleted"] == true
+        }).await;
+        let endpoint = cluster.status()["nodes"][1]["endpoint"].as_str().unwrap().to_owned();
+        assert!(data_contact(&endpoint, b"read\n").contains("committed=1 value=acknowledged"));
+        assert!(data_contact(&endpoint, b"write-more\n").contains("committed=2 value=continued"));
+        cluster.repair_primary_replica().await?;
+        until(&mut cluster, |c| c.status()["repair"]["ready"] == true).await;
+        let repaired = cluster.status();
+        assert_ne!(repaired["nodes"][0]["app_pid"], original["nodes"][0]["app_pid"]);
+        for index in 0..3 {
+            assert_eq!(repaired["nodes"][index]["node_pid"], original["nodes"][index]["node_pid"]);
+            if index != 0 {
+                assert_eq!(repaired["nodes"][index]["app_pid"], original["nodes"][index]["app_pid"]);
+            }
+        }
+        assert!(gone(lost));
+        cluster.begin_generation_round().await?;
+        until(&mut cluster, |c| c.status()["generation_handshake"]["complete"] == true).await;
+        assert!(data_contact(&endpoint, b"read\n").contains("committed=2 value=continued"));
+        Ok::<(), String>(())
+    }).await;
+    let fm_pid = cluster.status()["fm"]["pid"].as_u64().unwrap() as u32;
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    assert_eq!(cleanup["fm"]["reaped"], true, "{cleanup}");
+    assert_eq!(cleanup["fm"]["group_drained"], true, "{cleanup}");
+    assert!(gone(fm_pid));
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn separate_fm_loss_preserves_original_writer_and_supervisor_cleanup() {
+    let fixture = Fixture::new("separate-fm-loss");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::Stateful { target: 3, minimum: 2 };
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.start_with_fm(&support::binary("fube-fm", "FUBE_FM_EXE")).await.unwrap();
+    let result = peer_idle_catch(async {
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        until(&mut cluster, |c| c.status()["configuration"]["ready"] == true).await;
+        let status = cluster.status();
+        let endpoint = status["nodes"][0]["endpoint"].as_str().unwrap().to_owned();
+        until(&mut cluster, |_| data_contact(&endpoint, b"read\n")
+            .contains("read=Granted write=Granted ready=true")).await;
+        assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+        cluster.remote.as_mut().unwrap().process.as_mut().unwrap().cleanup().map_err(err)?;
+        cluster.drive().await;
+        assert_eq!(cluster.status()["fm"]["control_unknown"], true);
+        assert!(cluster.execute(command("unavailable", "create", Some(1))).await.is_err());
+        assert!(data_contact(&endpoint, b"write-more\n").contains("committed=2 value=continued"));
+        for process in cluster.processes.iter_mut().flatten() {
+            process.check_alive().map_err(err)?;
+        }
+        Ok::<(), String>(())
+    }).await;
+    let pids: Vec<_> = cluster.processes.iter().flatten().map(OwnedApp::pid).collect();
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], false, "lost FM must not claim normal FM completion: {cleanup}");
+    assert!(cleanup["nodes"].as_array().unwrap().iter().any(|receipt| receipt["fm_error"].is_string()));
+    assert!(cleanup["nodes"].as_array().unwrap().iter().filter(|receipt| receipt["node"].is_number())
+        .all(|receipt| receipt["original_cleanup_receipt_valid"] == true), "{cleanup}");
+    assert!(pids.into_iter().all(gone));
+    result.unwrap().unwrap();
+    // Every process capability was independently cleaned; only this failed test deployment remains.
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[tokio::test]
+async fn separate_fm_failed_node_start_keeps_both_process_capabilities_for_cleanup() {
+    let fixture = Fixture::new("separate-fm-start-failure");
+    let mut config = fixture.config();
+    config.executable = PathBuf::from("/bin/false");
+    let mut cluster = Cluster::new(config).unwrap();
+    assert!(cluster.start_with_fm(&support::binary("fube-fm", "FUBE_FM_EXE")).await.is_err());
+    let node = cluster.processes[0].as_ref().unwrap().pid();
+    let fm = cluster.remote.as_ref().unwrap().process.as_ref().unwrap().pid();
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], false, "{cleanup}");
+    assert!(gone(node) && gone(fm));
+    assert!(cluster.processes[0].as_ref().unwrap().status().reaped);
     fs::remove_dir_all(&fixture.root).unwrap();
 }

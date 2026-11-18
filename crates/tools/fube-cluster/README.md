@@ -1,7 +1,8 @@
 # Bounded native-free FM cluster
 
-This tool owns one in-memory FM and, by default, two child processes running the
-existing local RA/Hosting/runtime. It supports only the fixed
+The CLI supervises a separate `fube-fm` child and, by default, two child processes
+running the existing local RA/Hosting/runtime. The FM state remains in memory.
+The default stateless mode supports the fixed
 `ClusterStatelessApp/ClusterService/Code/ClusterStatelessType` package. This is
 not native Federation interoperability, full M1, recovery, failover or a general
 service host.
@@ -10,6 +11,63 @@ The reusable native wire, retained-effect/timer and semantic-ACK adapter lives
 in [`fube_node::control`](../../libs/fube-node/src/control/mod.rs). This launcher
 still owns profile admission, parent controls and physical cleanup. Sharing
 that adapter does not by itself provide a standalone container Node.
+
+## FM process boundary
+
+```text
+fube-cluster -- JSON management over stdin/stdout --> fube-fm
+      |                                                |
+      +-- owns Node processes <-- native reliability --+
+                     |
+                owns app hosts
+```
+
+Building this package's binaries also builds `fube-fm`. The controller locates
+it beside `fube-cluster`; use `--fm-executable /absolute/path/to/fube-fm` to select
+another build. The supervisor prepares the package and private static launch
+manifest, starts FM, then starts and binds the exact original Nodes. Only the
+supervisor owns Node process capabilities, peer-connect controls and final
+physical cleanup. The extracted manager owns the ledger, native FM Channels,
+message dispatch, retries and explicit membership intent. It drives native work
+even while the controller is not polling. Reliability execution remains in
+shared Node/RA/Hosting.
+
+The private process interface uses newline-delimited JSON, bounded to 64 KiB
+including the newline, with strictly increasing request IDs and matching reply
+IDs. For example, `{"id":1,"operation":{"action":"status"}}` requests a snapshot;
+`{"id":2,"operation":{"action":"command","command":{"op":"create","action":"create","node":1}}}`
+submits an ordinary retained command after Node attachment. Results distinguish
+rejection, pending native work and actual native completion. Native requests and
+semantic replies are unchanged: this IPC is not a new SF message or serving
+authority. Protocol stdout is separate from diagnostic stderr. Malformed,
+oversized, truncated or miscorrelated traffic fails explicitly; uncertain
+exchanges are not retried on a new FM.
+
+The first executable profile is same-host, fresh-start and statically configured.
+`fube-fm --config <deployment/fm.json>` consumes the supervisor's versioned list
+of private Node launch files. Its attachment and physical-cleanup validation
+still use source-bound local Node metadata/receipts. It is not yet a general
+listener for independently configured `fube-node` deployments and adds no
+reconnect, FM persistence, FM rebuild, automatic placement or replicated FM service.
+EOF closes the FM's Channels, not the Node processes. FM loss leaves the original
+writer running, marks controller observations uncertain and rejects further
+management work; the supervisor still cleans its owned Nodes. Abnormal FM exit
+prevents a clean deployment handoff even if local Node cleanup succeeds.
+Normal shutdown first stops FM intent/retries, fences prior ordered native
+ingress and joins the FM process, then stops all Nodes before awaiting any
+sibling's cleanup. The fence is not reconfiguration completion. FM returns the
+exact predecessor cleanup owners as well as current metadata; the supervisor
+still verifies actual replacement receipts and physical retirement, including
+a repair interrupted before its fresh host was admitted by FM.
+
+Library qualification can continue to use `Cluster::start()` with the same
+manager embedded for precise message/commit fault scheduling.
+`Cluster::start_with_fm(path).await` uses process management IPC instead.
+`begin_generation_round().await` works with either owner; the older synchronous
+`begin_generation_handshake()` is embedded-only. Direct peer/runtime test
+controls are not exposed as FM management actions.
+
+## Service profiles
 
 An explicit `--stateful-singleton` variant admits the existing
 `hosting-local-app` volatile package and one fresh 1/1 Primary lifetime per node.

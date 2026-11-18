@@ -17,6 +17,13 @@ restart recovery. The deliverable is the standalone process binary and its
 native reliability contract. Container images, networking and orchestration
 belong to the user; fube does not ship a production FM or a container test tier.
 
+The local `fube-cluster` controller now launches a separate
+[`fube-fm` executable](../../crates/tools/fube-cluster/README.md#fm-process-boundary)
+over private management IPC. That first FM process profile binds the local
+controller's original Nodes and source-bound filesystem receipts; it is not
+yet the externally listening FM described in this standalone/container guide.
+No new FM-to-Node reliability RPC was introduced by the extraction.
+
 ## What runs where
 
 Example three-Node topology (the configuration example below selects 3/2):

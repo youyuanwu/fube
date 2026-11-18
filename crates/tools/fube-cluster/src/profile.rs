@@ -392,6 +392,17 @@ pub struct HostReplacementReceipt {
     pub old_host: String,
     pub new_host: String,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HostCleanupOwner {
+    pub node: usize,
+    pub replica: i64,
+    pub incarnation: i64,
+    pub old_profile: ActualProfile,
+    pub host_admitted: bool,
+}
+
 impl HostReplacementReceipt {
     pub fn validate(&self, launch: &Launch, old: &ActualProfile, node_pid: u32) -> Result<()> {
         self.profile.validate(launch)?;
