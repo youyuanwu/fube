@@ -2152,12 +2152,17 @@ async fn standalone_lfum_during_removal_supersession_preserves_pc_uploads_quorum
         drop(replay_owner);
         // Fence the late one-way replay's ingress, not reconfiguration completion.
         let generation = fm.configurations[0].generation().unwrap();
-        let reply = fm.links[0]
-            .as_ref()
-            .unwrap()
-            .request(generation_proposal_message(&generation).unwrap())
-            .await
-            .unwrap();
+        let link = fm.links[0].as_ref().unwrap().clone();
+        let proposal = link.request(generation_proposal_message(&generation).unwrap());
+        tokio::pin!(proposal);
+        let reply = loop {
+            tokio::select! {
+                biased;
+                reply = &mut proposal => break reply.unwrap(),
+                _ = std::future::ready(()) => {}
+            }
+            fm.step().await;
+        };
         let reply = decode_generation_proposal_reply(&reply).unwrap();
         assert_eq!(reply.error, 0);
         assert_eq!(reply.proposed, generation.number);
