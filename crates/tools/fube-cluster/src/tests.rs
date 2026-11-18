@@ -9350,8 +9350,13 @@ async fn real_lfum_channel_loss_preserves_original_primary_without_upload_succes
         cluster.execute(command("primary", "create", Some(1))).await?;
         until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
         let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        until(&mut cluster, |_| {
+            let response = data_contact(&endpoint, b"read\n");
+            response.starts_with("OK ") && response.contains("read=Granted write=Granted ready=true")
+        }).await;
         let initial = cluster.children[0].launch.generation.number.clone();
-        assert!(data_contact(&endpoint, b"write\n").contains("committed=1 value=acknowledged"));
+        let written = data_contact(&endpoint, b"write\n");
+        assert!(written.contains("committed=1 value=acknowledged"), "{written}");
         cluster.begin_generation_handshake()?;
         for index in 0..2 { cluster.retry_generation(index).await?; }
         for index in 0..2 { cluster.retry_generation(index).await?; }
