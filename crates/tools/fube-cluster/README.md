@@ -72,6 +72,20 @@ a fresh host/incarnation; native creation, copy, every surviving S/S Deactivate
 and Secondary Activate commit precede final RAP/FM completion. The same live
 Node/RA/store/peer Channels support repeated failover/repair cycles.
 
+For fixed 3/2 original-Node Primary repair, `Cluster::cancel_repair_build()`
+abandons the fresh Idle before active admission, including a pending copy or a
+completed build whose reply was lost. Native RemoveReplica cancels outstanding
+RAP build work and retries removal; only RemoveReplicaReply completes that
+obligation. `Cluster::delete_cancelled_repair()` independently deletes the exact
+destination. Poll `repair.replicator_removed`, `destination_deleted` and `disposed`
+separately; none means `repair.ready`. Generation/LFUM rollover can overlap this
+cancellation/deletion, retaining earlier upload owners and stale-reply fences.
+Late AddReplica replies/retries cannot restart the cancelled build, admit it,
+activate another host or authorize a successor. Normal shutdown independently
+reaps the fresh app host and drains/removes its group/root. Cancellation during
+active admission, Secondary-loss repair, spare repair and subsequent recovery
+remain separate profiles.
+
 `Cluster::repair_secondary_replica(node).await` explicitly repairs one matched
 Secondary app-host loss on its original live Node, without moving or reopening
 the healthy Primary. Native same-Primary removal must finish before fresh-host

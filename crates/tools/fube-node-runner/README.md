@@ -105,6 +105,7 @@ configurability does not extend every overlap or recovery profile.
 | First explicit post-failover repair | Normal AddReplica/CreateReplica demands shared Hosting activation after predecessor cleanup. Repair configuration and fresh Secondary completion can precede ACK, but cannot finish held final RAP work. Exact replays activate no second host; the fresh member supplies quorum after another survivor loss. |
 | Second live failover/repair cycle | Promote the repaired replica and repair the next lost Primary. Freeze the latest completed membership/fresh identities for superseding uploads during actual promotion/final RAP, build and Secondary activation. Survivors retain their owners/data; a new write uses the second repaired member's actual quorum. |
 | Native deactivation during repair activation | Close the fresh Secondary while its public role callback and two frozen generations remain held. Stale ACK retires only its upload; current ACK cannot finish Close/deactivation or repair. Original service/provider disposal follows role release; host/group/root cleanup is separate. Healthy survivors acknowledge a new write, but Primary alone cannot use the interrupted replica's vote after another loss. |
+| Cancelled original-Node repair copy/build | Fixed 3/2 after completed Primary failover: cancel a held public copy-state stream, or abandon a completed build awaiting its lost FM reply. Native RemoveReplica cancellation/retry, independent destination Delete/disposal and delayed older LFUM replies retain distinct completion owners. Replays neither admit the cancelled Idle nor activate a successor. Survivors preserve writes/owners and actual quorum; owned shutdown separately cleans the app host/group/root. |
 | Healthy planned handoff | Fixed 3/2 on three original Nodes, either first candidate. Rollover during held demotion, missing-progress GetLSN, catch-up, Secondary activation, final RAP End and local completion awaiting its lost FM reply. Older frozen upload ACKs cannot advance current send or finish a phase; generation-stale peer replies preserve the original Channels. Real writes, old-writer fencing, original owners, final reply replay and actual quorum/no-quorum plus normal teardown are checked. |
 
 Shared RA owns generic committed inventory and independent PC/IC/CC views,
@@ -117,7 +118,7 @@ matching current receive advances send generation.
 
 See the [shared current contract/source map](../../../docs/cluster/MinimalFmCluster.md#live-session-lfum-upload)
 and [LFUM alignment plan](../../../docs/cluster/RustRaPort.md#lfum-alignment-plan).
-Copy/build interruption and removal supersession remain separate qualification.
+Supported removal supersession and broader copy/build interruption remain separate qualification.
 Deactivation keeps Node/RA live while the replica closes; whole-RA shutdown of
 accepted snapshot jobs and automatic interrupted-repair recovery are not claimed.
 Healthy planned transfer is qualified at 2/1 and 3/2, including either Secondary

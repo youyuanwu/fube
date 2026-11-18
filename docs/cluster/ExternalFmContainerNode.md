@@ -386,7 +386,11 @@ The additional 3/2 cases cover FM-owned Idle build, same-Primary admission,
 and two successive Primary app-host failover/explicit-repair cycles, including
 promotion of a repaired replica. Native node deactivation also interrupts the
 fresh repair Secondary while its public role callback and superseding uploads
-are held. Participating build/configuration requests must be committed.
+are held. Fixed-3/2 original-Node Primary repair additionally qualifies cancellation
+during public copy-state enumeration or after build completion with its FM reply
+lost. Native RemoveReplica cancellation/retry, destination Delete/disposal and
+generation ACKs remain independent; cancelled intent cannot admit the replica or
+authorize another host. Participating build/configuration requests must be committed.
 Healthy fixed-3/2 planned handoff on three original Nodes additionally qualifies
 generation rollover with either first candidate, during demotion, missing-progress
 GetLSN, catch-up, Secondary activation, final RAP End and locally completed
@@ -408,7 +412,7 @@ predecessor cleanup in shared Node/Hosting.
 
 The [current LFUM contract and evidence](MinimalFmCluster.md#live-session-lfum-upload)
 is shared with the local cluster. The [alignment plan](RustRaPort.md#lfum-alignment-plan)
-tracks remaining copy/build interruption and removal supersession.
+tracks supported removal supersession and broader copy/build interruption.
 Each repeated failover round uses the latest completed membership and known
 fresh replica identities, not the original configuration. Broader
 transfer/redirection model/store coverage remains distinct from the healthy

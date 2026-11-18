@@ -133,6 +133,8 @@ pub(crate) struct ReplicaRepair {
     pub build: IdleBuild,
     pub configuration: Option<ActiveConfiguration>,
     pub removal: Option<ActiveConfiguration>,
+    cancellation: Option<IdleRemoval>,
+    deletion: Option<RepairDeletion>,
     base: Option<ActiveConfiguration>,
     pub host_requested: bool,
     superseded_by: Option<Epoch>,
@@ -142,6 +144,12 @@ impl ReplicaRepair {
     pub(crate) fn uses_spare(&self) -> bool {
         self.predecessor.replica.node != self.build.body.replica.node
     }
+}
+struct RepairDeletion {
+    reply: Option<DeleteReplicaReply>,
+    disposal: Option<RetirementReceipt>,
+    started: Instant,
+    last: Instant,
 }
 #[derive(Clone)]
 pub(crate) struct ActiveConfiguration {
@@ -228,6 +236,8 @@ struct RepairInventory {
     previous: ConfigurationReply,
     build: AddReplica,
     configuration: Option<Configuration>,
+    cancelled: bool,
+    deleting: bool,
 }
 impl GenerationHandshake {
     pub fn new(current: &GenerationNumber, nodes: usize) -> Result<Self> {
@@ -1563,6 +1573,14 @@ impl Ledger {
         repair: &RepairInventory,
     ) -> Result<()> {
         let placement = &self.placements[index];
+        let fresh = placement.launch.node == repair.build.replica.node;
+        if fresh
+            && repair.deleting
+            && placement.node_description.as_ref() == Some(&body.node)
+            && body.units.0.is_empty()
+        {
+            return Ok(());
+        }
         if placement.node_description.as_ref() != Some(&body.node)
             || !body.any_replica_found
             || body.units.0.len() != 1
@@ -1580,7 +1598,6 @@ impl Ledger {
             .0
             .iter()
             .any(|r| r.node == placement.launch.node && r.current_role == 4);
-        let fresh = placement.launch.node == repair.build.replica.node;
         let mut transitioning = false;
         if let Some(request) = &repair.configuration {
             let mut complete = request.unit.clone();
@@ -1601,7 +1618,15 @@ impl Ledger {
             if fresh {
                 expected.replicas.0.clear();
             }
-            if primary || fresh {
+            if (primary || fresh)
+                && !(primary
+                    && repair.cancelled
+                    && !info
+                        .replicas
+                        .0
+                        .iter()
+                        .any(|r| r.description.node == repair.build.replica.node))
+            {
                 expected.replicas.0.push(repair.build.replica.clone());
             }
         }
@@ -1624,18 +1649,27 @@ impl Ledger {
                 .iter()
                 .filter(|r| r.description.node == expected.node);
             let actual = matching.next().ok_or("missing known repair replica")?;
+            let duplicate = matching.next().is_some();
             if building && expected.node == repair.build.replica.node {
-                if !matches!(actual.description.state, 1 | 2)
-                    || (fresh && actual.description.state != 1)
+                let dropped = actual.description.state == 3;
+                if dropped && !(repair.cancelled && (primary || repair.deleting)) {
+                    return Err("LFUM repair drop requires explicit cancellation/deletion".into());
+                }
+                if !matches!(actual.description.state, 1..=3)
+                    || (fresh && actual.description.state == 2)
                     || actual.description.replication_endpoint.is_empty()
+                        && !(fresh && dropped && repair.deleting)
                     || !actual.description.service_endpoint.is_empty()
                 {
                     return Err("LFUM repair build must remain an InBuild/Ready Idle".into());
                 }
                 expected.state = actual.description.state;
                 expected.replication_endpoint = actual.description.replication_endpoint.clone();
+                if fresh && dropped {
+                    expected = dropped_replica(&expected);
+                }
             }
-            if matching.next().is_some()
+            if duplicate
                 || actual.description != expected
                 || actual.intermediate_role
                     != if info.intermediate == Epoch::default() {
@@ -1782,6 +1816,8 @@ impl Ledger {
                     .configuration
                     .as_ref()
                     .map(|c| c.body.configuration.clone()),
+                cancelled: r.build.cancelled,
+                deleting: r.deletion.is_some(),
             });
         let transfer = self.swap.as_ref().and_then(|swap| {
             let intent = &swap.body.configuration;
@@ -2748,6 +2784,16 @@ impl Ledger {
         }
     }
     pub fn reply(&mut self, index: usize, body: AddInstanceReply, removing: bool) -> Result<()> {
+        if removing
+            && self.repair.as_ref().is_some_and(|r| {
+                r.deletion.is_some()
+                    && r.build.body.replica.node == body.replica.node
+                    && r.build.body.replica.id == body.replica.id
+                    && r.build.body.replica.instance == body.replica.instance
+            })
+        {
+            return self.repair_deletion_reply(index, body);
+        }
         if self.repair.iter().chain(&self.repair_history).any(|r| {
             self.placements[index].launch.node == r.predecessor.replica.node
                 && body.unit.id == r.predecessor.unit.id
@@ -2900,6 +2946,37 @@ impl Ledger {
         node_pid: u32,
     ) -> Result<()> {
         let placement = &mut self.placements[index];
+        if let Some(repair) = self
+            .repair
+            .as_mut()
+            .filter(|r| r.deletion.is_some() && r.build.body.replica.node == placement.launch.node)
+        {
+            let expected = &repair.build.body;
+            let replica = &proof.disposal.body.replica;
+            if replica.node != expected.replica.node
+                || replica.id != expected.replica.id
+                || replica.instance != expected.replica.instance
+                || replica.current_role != 2
+                || replica.previous_role != 1
+                || replica.state != 3
+                || !replica.up
+                || !replica.service_endpoint.is_empty()
+            {
+                return Err("cancelled repair disposal changed the exact Idle lifetime".into());
+            }
+            proof.validate_body(
+                &placement.launch,
+                repair.profile.as_ref().ok_or("missing cancelled host")?,
+                node_pid,
+                expected,
+            )?;
+            repair
+                .deletion
+                .as_mut()
+                .expect("requested repair deletion")
+                .disposal = Some(proof);
+            return Ok(());
+        }
         if let Some(config) = self
             .configuration
             .iter()
@@ -3262,6 +3339,8 @@ impl Ledger {
             },
             configuration: None,
             removal: None,
+            cancellation: None,
+            deletion: None,
             base: Some(active.clone()),
             host_requested: false,
             superseded_by: None,
@@ -3661,6 +3740,8 @@ impl Ledger {
             },
             configuration: None,
             removal,
+            cancellation: None,
+            deletion: None,
             base: None,
             host_requested: false,
             superseded_by: None,
@@ -3720,6 +3801,7 @@ impl Ledger {
         if index != primary
             || !live
             || repair.unknown
+            || repair.build.cancelled
             || repair.profile.is_none()
             || repair.build.reply.is_some()
             || body.unit != expected.unit
@@ -3752,7 +3834,7 @@ impl Ledger {
         let Some(repair) = &mut self.repair else {
             return Ok(None);
         };
-        if repair.unknown || repair.configuration.is_some() || !live {
+        if repair.unknown || repair.build.cancelled || repair.configuration.is_some() || !live {
             return Ok(None);
         }
         let Some(built) = repair.build.reply.as_ref().filter(|r| r.error == 0) else {
@@ -3859,6 +3941,153 @@ impl Ledger {
         Ok(())
     }
 
+    pub fn cancel_repair_build(&mut self, now: Instant) -> Result<RemoveReplica> {
+        let live = self.repair_members_live();
+        let repair = self.repair.as_mut().ok_or("no repair build to cancel")?;
+        if !live
+            || repair.unknown
+            || repair.uses_spare()
+            || repair.removal.is_some()
+            || repair.base.is_some()
+            || repair.configuration.is_some()
+            || repair.profile.is_none()
+            || !repair.host_requested
+            || repair.build.body.service.target != 3
+            || repair.build.body.service.minimum != 2
+        {
+            return Err("cancellation requires the known fixed-3/2 original-Node repair Idle before admission".into());
+        }
+        let cancellation = repair.cancellation.get_or_insert_with(|| IdleRemoval {
+            body: repair.build.body.clone(),
+            reply: None,
+            failed_creation: false,
+            unknown: false,
+            started: now,
+            last: now,
+        });
+        if cancellation.unknown {
+            return Err("repair cancellation outcome is unknown".into());
+        }
+        cancellation.last = now;
+        repair.build.cancelled = true;
+        let body = cancellation.body.clone();
+        if let Some(inventory) = self
+            .generation
+            .as_mut()
+            .and_then(|g| g.repair.as_mut())
+            .filter(|r| r.build == body)
+        {
+            inventory.cancelled = true;
+        }
+        Ok(body)
+    }
+
+    fn repair_removal_reply(&mut self, index: usize, body: RemoveReplicaReply) -> Result<()> {
+        let primary = self.primary_index();
+        let repair = self.repair.as_mut().ok_or("unsolicited repair removal")?;
+        let cancellation = repair
+            .cancellation
+            .as_mut()
+            .ok_or("repair was not cancelled")?;
+        let expected = &cancellation.body;
+        if index != primary
+            || repair.unknown
+            || cancellation.unknown
+            || body.unit != expected.unit
+            || body.replica.node != expected.replica.node
+            || body.replica.id != expected.replica.id
+            || body.replica.instance != expected.replica.instance
+            || body.error != 0
+        {
+            return Ok(());
+        }
+        let mut replica = expected.replica.clone();
+        replica.state = 3;
+        replica.replication_endpoint = body.replica.replication_endpoint.clone();
+        if body.replica != replica || replica.replication_endpoint.is_empty() {
+            return Err("repair RemoveReplicaReply changed the cancelled Idle".into());
+        }
+        if cancellation
+            .reply
+            .as_ref()
+            .is_some_and(|previous| previous != &body)
+        {
+            return Err("repair removal completion changed after acceptance".into());
+        }
+        cancellation.reply = Some(body);
+        Ok(())
+    }
+
+    pub fn delete_cancelled_repair(&mut self) -> Result<DeleteReplica> {
+        let repair = self.repair.as_mut().ok_or("no repair to delete")?;
+        if repair.unknown || repair.cancellation.as_ref().is_none_or(|c| c.unknown) {
+            return Err("destination deletion requires the known cancelled repair owner".into());
+        }
+        let now = Instant::now();
+        repair
+            .deletion
+            .get_or_insert(RepairDeletion {
+                reply: None,
+                disposal: None,
+                started: now,
+                last: now,
+            })
+            .last = now;
+        let body = repair.build.body.clone();
+        if let Some(inventory) = self
+            .generation
+            .as_mut()
+            .and_then(|g| g.repair.as_mut())
+            .filter(|r| r.build == body)
+        {
+            inventory.deleting = true;
+        }
+        Ok(DeleteReplica::new(body, false))
+    }
+
+    fn repair_deletion_reply(&mut self, index: usize, body: DeleteReplicaReply) -> Result<()> {
+        let destination = self
+            .repair_destination_index()
+            .ok_or("missing cancelled destination")?;
+        let repair = self.repair.as_mut().expect("repair");
+        if index != destination
+            || repair.deletion.is_none()
+            || repair.unknown
+            || body.unit != repair.build.body.unit
+            || body.error != 0
+            || body.replica.node != repair.build.body.replica.node
+            || body.replica.id != repair.build.body.replica.id
+            || body.replica.instance != repair.build.body.replica.instance
+        {
+            return Ok(());
+        }
+        if body.replica != dropped_replica(&repair.build.body.replica) {
+            return Err("repair deletion reply is not the cancelled dropped lifetime".into());
+        }
+        repair
+            .deletion
+            .as_mut()
+            .expect("requested repair deletion")
+            .reply = Some(body);
+        Ok(())
+    }
+
+    pub fn repair_deletion_retry(&mut self, index: usize, now: Instant) -> Option<DeleteReplica> {
+        if self.repair_destination_index()? != index {
+            return None;
+        }
+        let repair = self.repair.as_mut()?;
+        let deletion = repair.deletion.as_mut()?;
+        if repair.unknown
+            || deletion.reply.is_some()
+            || !action_retry_due(deletion.started, deletion.last, now)
+        {
+            return None;
+        }
+        deletion.last = now;
+        Some(DeleteReplica::new(repair.build.body.clone(), false))
+    }
+
     pub fn repair_status(&self) -> Value {
         let Some(r) = self.repair.as_ref().or_else(|| {
             self.repair_history
@@ -3871,6 +4100,8 @@ impl Ledger {
             "superseded"
         } else if r.unknown {
             "unknown"
+        } else if r.build.cancelled {
+            "cancelled"
         } else if r.configuration.as_ref().is_some_and(|c| c.reply.is_some()) {
             "ready"
         } else if r.build.reply.as_ref().is_some_and(|b| b.error != 0) {
@@ -3885,7 +4116,12 @@ impl Ledger {
             "kind":if r.uses_spare() {"spare_replacement"} else if r.base.is_some() {"restoration"} else if r.removal.is_some() {"secondary"} else {"primary"},
             "removed":r.removal.as_ref().is_some_and(|c| c.reply.is_some()),
             "old_profile":r.old_profile,"profile":r.profile,"request":r.build.body,"build_reply":r.build.reply,
-            "host_ready":r.profile.is_some(),"built":r.build.reply.as_ref().is_some_and(|b| b.error == 0)})
+            "host_ready":r.profile.is_some(),"built":r.build.reply.as_ref().is_some_and(|b| b.error == 0),
+            "cancelled":r.build.cancelled,
+            "pending_remove":r.cancellation.as_ref().is_some_and(|c| c.reply.is_none()),
+            "replicator_removed":r.cancellation.as_ref().is_some_and(|c| c.reply.is_some()),
+            "destination_deleted":r.deletion.as_ref().is_some_and(|d| d.reply.is_some()),
+            "disposed":r.deletion.as_ref().is_some_and(|d| d.disposal.is_some())})
     }
     pub fn request_idle_on(&mut self, destination: usize, now: Instant) -> Result<AddReplica> {
         let count = self.placements[0].launch.profile.node_count();
@@ -4833,6 +5069,7 @@ impl Ledger {
         if let Some(repair) = &mut self.repair {
             if index != primary
                 || repair.unknown
+                || repair.build.cancelled
                 || repair.profile.is_none()
                 || repair.build.reply.is_some()
                 || !action_retry_due(repair.build.started, repair.build.last, now)
@@ -4987,6 +5224,9 @@ impl Ledger {
         Ok(body)
     }
     pub fn idle_removal_reply(&mut self, index: usize, body: RemoveReplicaReply) -> Result<()> {
+        if self.repair.as_ref().is_some_and(|r| r.build.cancelled) {
+            return self.repair_removal_reply(index, body);
+        }
         let Some(removal) = &mut self.idle_removal else {
             return Ok(());
         };
@@ -5025,6 +5265,20 @@ impl Ledger {
         Ok(())
     }
     pub fn idle_removal_retry(&mut self, index: usize, now: Instant) -> Option<RemoveReplica> {
+        let primary = self.primary_index();
+        if let Some(repair) = &mut self.repair {
+            let removal = repair.cancellation.as_mut()?;
+            if index != primary
+                || repair.unknown
+                || removal.unknown
+                || removal.reply.is_some()
+                || !action_retry_due(removal.started, removal.last, now)
+            {
+                return None;
+            }
+            removal.last = now;
+            return Some(removal.body.clone());
+        }
         let removal = self.idle_removal.as_mut()?;
         if index != 0
             || self.generation.is_some()

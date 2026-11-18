@@ -7069,6 +7069,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
 ) {
     for (target, minimum, spare) in [
         (2, 1, false),
+        (3, 2, false),
         (3, 3, true),
         (4, 2, false),
         (4, 3, false),
@@ -7338,6 +7339,93 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
             effects(&executor).as_slice(),
             [Effect::BuildIdle { .. }]
         ));
+        if target == 3 && !spare {
+            let completion = BuildCompletion {
+                unit: build.unit.clone(),
+                local: promoted.body.replica.clone(),
+                remote: fresh.clone(),
+                error: 0,
+                detail: ProxyErrorDetail::default(),
+            };
+            let frozen = capture_committed_lfum(
+                &executor,
+                state(&executor).configuration.as_ref().unwrap(),
+                Epoch::default(),
+                true,
+            )
+            .await;
+            run(&executor, fm_remove_idle(build.clone())).await;
+            let removal = effects(&executor);
+            let mut dropped = fresh.clone();
+            dropped.state = 3;
+            assert!(
+                matches!(removal.as_slice(), [Effect::RemoveIdle { replica, .. }]
+                if **replica == dropped)
+            );
+            let dropping = state(&executor);
+            capture_committed_lfum(
+                &executor,
+                dropping.configuration.as_ref().unwrap(),
+                Epoch::default(),
+                true,
+            )
+            .await;
+            assert_eq!(
+                frozen.units.0[0]
+                    .replicas
+                    .0
+                    .last()
+                    .unwrap()
+                    .description
+                    .state,
+                1
+            );
+            assert_eq!(
+                run(
+                    &executor,
+                    Command::CompleteBuild(Box::new(completion.clone()))
+                )
+                .await,
+                Disposition::IgnoredStale
+            );
+            assert_eq!(
+                run(&executor, fm_add_idle(build.clone())).await,
+                Disposition::IgnoredStale
+            );
+            assert!(effects(&executor).is_empty());
+            let mut removed = RemovalCompletion {
+                remote: dropped,
+                ..completion
+            };
+            removed.error = -992;
+            run(
+                &executor,
+                Command::CompleteRemoval(Box::new(removed.clone())),
+            )
+            .await;
+            assert!(effects(&executor).is_empty());
+            run(&executor, fm_remove_idle(build.clone())).await;
+            assert_eq!(effects(&executor), removal);
+            removed.error = 0;
+            run(&executor, Command::CompleteRemoval(Box::new(removed))).await;
+            let reply = effects(&executor);
+            assert!(matches!(reply.as_slice(), [Effect::RemoveReplicaReply(r)] if r.error == 0));
+            run(&executor, fm_remove_idle(build.clone())).await;
+            assert_eq!(effects(&executor), reply);
+            assert_eq!(state(&executor).runtime, promoted.runtime);
+            assert_eq!(state(&executor).usage, promoted.usage);
+            assert_eq!(state(&executor).body, promoted.body);
+            assert_eq!(state(&executor).swap, promoted.swap);
+            capture_committed_lfum(
+                &executor,
+                state(&executor).configuration.as_ref().unwrap(),
+                Epoch::default(),
+                true,
+            )
+            .await;
+            finish(&store, &executor).await;
+            continue;
+        }
         if spare {
             let mut premature = promoted.swap.as_ref().unwrap().body.clone();
             premature.unit.previous = premature.unit.current;
@@ -10285,6 +10373,103 @@ async fn initial_idle_build_lfum_preserves_sf_states_and_allows_normal_removal_b
     begin(12);
     assert_eq!(wait_lfum(&executor).await.units.0[0].replicas.0.len(), 1);
     finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn configured_idle_delete_keeps_lfum_and_failed_or_unknown_close_commits_separate() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(40)
+        } else {
+            WAIT
+        })
+        .await;
+        let mut request = peer_request();
+        request.replica.0.service.target = 3;
+        request.replica.0.service.minimum = 2;
+        request.replica.0.unit.target = 3;
+        request.replica.0.unit.minimum = 2;
+        open_peer_request(&executor, vec![peer_source()], request).await;
+        let original = state(&executor);
+        let deletion = (*original.body).clone();
+        for mutation in 0..3 {
+            let mut bad = deletion.clone();
+            match mutation {
+                0 => bad.unit.current.configuration += 1,
+                1 => bad.replica.instance += 1,
+                _ => bad.service.minimum = 1,
+            }
+            assert!(executor
+                .submit(primary_delete(bad, false))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+            assert_eq!(state(&executor), original);
+            assert!(effects(&executor).is_empty());
+        }
+        start_lfum(&executor, 8);
+        let frozen = wait_lfum(&executor).await;
+        assert_eq!(
+            frozen.units.0[0].replicas.0[0].description,
+            original.body.replica
+        );
+        executor.take_lfum_inventory().unwrap();
+        run(
+            &executor,
+            Command::DeleteReplica {
+                body: Box::new(DeleteReplica::new(deletion, false)),
+                source: admission().fm_source,
+                generation: generation_header(8),
+            },
+        )
+        .await;
+        let closing = state(&executor);
+        assert!(matches!(effects(&executor).as_slice(),
+            [Effect::Close { flags: 8, token, body, registration }]
+            if *token == closing.close_token && body.unit == original.body.unit
+                && body.replica.id == original.body.replica.id
+                && body.replica.instance == original.body.replica.instance
+                && body.replica.state == 3 && Some(registration) == original.runtime.as_ref()));
+        assert_eq!(closing.runtime, original.runtime);
+        assert!(executor
+            .complete_lfum_upload(frozen.upload, &admission().fm_source, &generation_header(8))
+            .unwrap());
+        assert_eq!(state(&executor), closing);
+        let completion = close_completion(&executor, 0);
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::CompleteClose(Box::new(completion.clone())))
+            .unwrap();
+        entered.await.unwrap();
+        start_lfum(&executor, 9);
+        assert!(executor.lfum_inventory().unwrap().is_none());
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+            let failed = wait_lfum(&executor).await;
+            assert!(failed.units.0.is_empty());
+            assert_eq!(state(&executor), closing);
+            assert!(effects(&executor).is_empty());
+            run(&executor, Command::CompleteClose(Box::new(completion))).await;
+        } else {
+            ticket.resolve(WAIT).await.unwrap();
+        }
+        let closed = state(&executor);
+        assert_eq!(closed.phase, Phase::Closed);
+        assert!(closed.runtime.is_none() && closed.usage.is_none() && closed.local_deleted);
+        assert!(effects(&executor)
+            .iter()
+            .any(|e| matches!(e, Effect::DeleteReplicaReply(r) if r.error == 0)));
+        start_lfum(&executor, 10);
+        assert!(wait_lfum(&executor).await.units.0.is_empty());
+        assert_eq!(frozen.units.0[0].replicas.0[0].description.state, 1);
+        finish(&store, &executor).await;
+    }
 }
 
 #[tokio::test]
