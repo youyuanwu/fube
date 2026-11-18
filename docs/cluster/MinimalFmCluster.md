@@ -441,6 +441,22 @@ Federation interoperability evidence. No native schema/action is added;
 general interrupted recovery, general multi-loss repair, resize and node/FM restart
 remain deferred.
 
+Generation/LFUM overlap is also qualified in both launchers at 5/3, with 3/2
+refusing promotion. Start the round after explicit removal intent is admitted.
+The three successful cases supersede undelivered removal, committed deactivation
+with its reply fenced by an older send generation, and local completion awaiting
+the lost final FM reply. Original, removal, query-only survivor and superseding
+PC/IC/CC views remain distinct; old uploads and retry frames keep their frozen
+bodies and correlated owners. Stale ACKs retire only their uploads, and current
+ACKs cannot replace missing actual GetLSN progress, quorum, final RAP work or
+FM completion. Native final completion is replayed after another round, while a
+late earlier removal reply cannot complete the new transition.
+Original Node/RA/Channels and survivor apps remain unchanged; nonempty writes,
+real quorum/no-quorum and normal owned teardown are checked. No replacement is
+started. After native completion and exact predecessor deletion, a completed
+generation does not veto separately requested existing sequential restoration;
+LFUM during that restoration and broader supersession lineages remain unqualified.
+
 ## Sequential restoration after supersession
 
 After completed Primary-loss supersession, the two exact processed predecessor
@@ -695,12 +711,13 @@ reconstruction or writer election.
 | Local-cluster live sessions | Stateless/independent volatile singleton rounds and stable configured membership across 1/1, 2/1, 3/2, 3/3, 4/2, 4/3, 4/4 and 5/3. Additional 3/2 cases cover FM-owned Idle build, same-Primary admission, two Primary app-host failover/explicit-repair cycles and native deactivation of a repair Secondary with its role callback held. | Participating build/configuration requests must be committed. Repeated rounds freeze the latest completed membership; repair uses its matching completed failover. Deactivation interrupts existing repair, not a new recovery/supersession policy. |
 | Standalone real Node binaries | Empty pre-placement and stable configured membership across 1/1, 2/1, 3/3, 4/2, 4/3, 4/4 and 5/3. Additional 3/2 build/admission, two-cycle failover/repair and repair-Secondary deactivation overlaps use real native-shaped Channels. | Immutable explicit sizes and original placements; no nonempty startup/rejoin or reconnect. Healthy planned transfer is separately qualified at 2/1 and 3/2. |
 | Healthy planned-handoff overlaps, both launchers | Fixed 3/2 on three original Nodes, with either original Secondary as candidate. Rollover during demotion, missing-progress GetLSN, catch-up, Secondary activation, final RAP End and locally completed handoff with its final FM reply lost. | Upload completion is independent of every native phase and final FM completion. Broader sizes, spare-pool/restart-required handoff overlaps, candidate redirection and handoff-crash recovery are not added. |
-| Cancelled original-Node repair copy/build, both launchers | Fixed 3/2 following completed Primary failover: native RemoveReplica during held public copy-state enumeration, or after a completed build awaiting its lost FM reply. Older uploads survive cancellation and independent destination Delete/disposal; replays retain cancelled intent. | No active admission, successor authorization or automatic recovery. Secondary-loss/spare repair cancellation and removal-supersession overlaps remain separate. Original Node/RA/Channels and survivor app owners remain live. |
+| Cancelled original-Node repair copy/build, both launchers | Fixed 3/2 following completed Primary failover: native RemoveReplica during held public copy-state enumeration, or after a completed build awaiting its lost FM reply. Older uploads survive cancellation and independent destination Delete/disposal; replays retain cancelled intent. | No active admission, successor authorization or automatic recovery. Secondary-loss/spare repair cancellation remains separate. Original Node/RA/Channels and survivor app owners remain live. |
+| Pre-replacement removal supersession, both launchers | 5/3 Primary loss during pending Secondary removal, including undelivered removal, deactivated survivors and local completion with its final FM reply lost. A 3/2 case uploads known metadata without promoting its lone survivor. | Original PC/CC, query-only histories, native progress/activation/final barriers and original owners remain required. No replacement or general multi-loss recovery; subsequent restoration LFUM remains separate. |
 | Native evidence | Bidirectional native-stream/schema and source-derived helper evidence in the [protocol oracle](../../tests/ra_protocol/README.md) and [C14 contract](NativeRaProtocol.md). | Full original C++ handler traces and native FM/Federation interoperability remain unqualified; passing process tests is not full SF parity. |
 
 The remaining dependency plan is maintained in
-[RustRaPort.md](RustRaPort.md#lfum-alignment-plan). Broader copy/build interruption
-and supported removal supersession remain separate increments.
+[RustRaPort.md](RustRaPort.md#lfum-alignment-plan). Broader copy/build interruption,
+supersession sizes/lineages and subsequent restoration overlaps remain separate increments.
 Transfer requires profile-specific runtime
 and test-FM admission; NodeUp/ReplicaUp discovery and FM/FMM/restart are separate
 protocol/recovery tracks.
@@ -719,6 +736,7 @@ Pinned SF revision `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` defines the bounda
 | `ra/FailoverUnit.cpp:937-1085,1737-1745,2596-2623,2703-2757` | Initial same-Primary admission retains the committed PC epoch/roles. Catch-up has invalid IC; Primary phase 4 sets IC=CC and IC roles to current roles. Secondary Activate clears IC while retaining PC until its RAP completion. |
 | `ra/FailoverUnit.cpp:624-642,937-1085,2596-2623,2703-2757,3376-3441` | A GetLSN-only survivor copies its old CC to PC without learning the new membership. Phase 3 sets IC=CC on Primary/Deactivate recipients; Activate clears the survivor IC. Local completion clears PC/IC and removes obsolete non-CC members under the reset rules above. |
 | `ra/FailoverUnit.cpp:519-620` | A GetLSN reply carries the survivor's own PC, which can differ from the candidate's PC after interrupted removal. Progress admission does not require that PC to echo the request or adopt it as candidate membership; current epoch and replica identity remain checked. |
+| `fm/ReconfigurationTask.cpp:40-48,225-259,320-352`; `ra/FailoverUnit.cpp:624-672,1737-1751,1929-2202` | Primary-loss supersession preserves the interrupted removal's PC and CC set and checks both read quorums. GetLSN obtains actual local progress and retains per-survivor history; LFUM generation state is not a permanent supersession veto or a substitute for native completion. |
 | `ra/FailoverUnit.cpp:2910-2930,3543-3575,4057-4088`; `ra/ReconfigurationState.cpp:162-169` | Candidate redirection reverts every CC role to PC without promoting the candidate. A completed demotion is no longer an active Primary reconfiguration: its previous-Primary local Ready description reports InBuild and not report-from-Primary until activation completes. |
 | `common/LFUMMessageBody.h:18-61`; `common/RSMessage.cpp:181-182` | Body order is generation, full NodeDescription, FailoverUnitInfo vector, AnyReplicaFound. High-priority FM request has no GenerationHeader; the high-priority RA reply is bodyless and carries the echoed generation. |
 | `common/RALFUMUploadOperation.cpp:14-39`; `common/SendReceiveToFMOperation.cpp:149-160`; `common/FailoverConfig.h:30,37` | A consuming correlated request owns the frozen upload. Native retry delay is base interval plus bounded additive jitter (defaults: 30 seconds and factor 0.3), never a resampled inventory. Fube retains the configured base interval but has not ported jitter; scheduling parity remains in the plan. Node drive and owner shutdown remain independent. |
@@ -817,6 +835,7 @@ The covered invariants are:
 | Healthy planned-handoff overlaps (both launchers) | Either 3/2 candidate, public demotion/Primary-role/final-configuration barriers and missing actual progress. Superseding uploads retain committed PC/IC/CC; delayed older ACKs retire only their own frozen snapshots even after Secondary activation changes the current view. Generation-stale peer messages are ignored without closing the original Channel. Every Secondary's matching activation and final RAP/FM reply remain required. Lost final completion replays at the new generation, old writers reject writes, original owners remain unchanged and actual quorum/no-quorum plus normal owned teardown are checked. Shared model/store cases additionally hold activation/final commits, including definite failure and uncertainty, and validate reverse-transfer inventory against retained latest membership. |
 | Interrupted repair Secondary (both launchers) | Native NodeDeactivateRequest during a held public Secondary role callback, after two generations have frozen their inventory. A stale reply retires its own upload while the replica is Closing without advancing send. Current ACK advances send but cannot finish Close, node deactivation or repair configuration, or dispose the held original resources. Releasing the original role allows native Close and its separate deactivation reply; service/provider files prove disposal. Healthy survivors acknowledge a new write, but Primary alone cannot use the interrupted replica's vote after the other survivor is lost. Owned shutdown separately reaps/drains hosts and retains unfinished external work. |
 | Cancelled original-Node repair copy/build (both launchers) | Pending public copy-state enumeration is actually cancelled and its callback retires without fixture release; the alternate case withholds successful AddReplicaReply. Native removal/retry retains a replayable terminal owner and rejects later Add/build work. Destination Delete and service/provider disposal can complete while the Primary's removal reply is withheld. Older uploads retain their pre-cancellation bodies; stale ACKs cannot advance current send, complete removal or restore target. Surviving writers/data and original Nodes/RA/Channels are retained, actual quorum/no-quorum is checked and normal teardown independently reaps/drains hosts. |
+| Pre-replacement removal supersession (both launchers) | 5/3 recovery from three removal checkpoints and 3/2 refusal retain earlier frozen upload/retry owners across Primary loss and newer failover epochs. Query-only survivor PC/IC is validated independently of the candidate. A paused survivor app withholds actual GetLSN while its original Node uploads metadata; neither stale nor current ACK supplies progress. Held promotion/final RAP and lost final FM completion retain independent barriers. No new host is activated; writes, quorum loss and owned teardown are checked. Shared model/store tests additionally cover failed and unknown commits and reads queued behind them. |
 | Application authority | Nonempty replication after completion, fresh repaired-member quorum after another survivor loss, and local-cluster rejection of a new write with Primary alone. FM-channel loss keeps the owned upload pending without advancing send or treating the surviving app as recovered/shut down. |
 
 The interruption case keeps Node/RA/Channels alive while the replica closes;
@@ -825,7 +844,7 @@ restart of the interrupted repair, or discovery on a recovered owner.
 Native close retry/deactivation-check intervals are unchanged.
 
 Nonempty NodeUp reconciliation, full ReplicaUp batching/final ACK, broader copy/build
-interruption, removal supersession and broader transfer/redirection process overlaps,
+interruption, broader supersession/restoration and transfer/redirection process overlaps,
 FM/FMM rebuild and durable RA
 restart remain unqualified. Broader ordinary reconfiguration/restoration tests
 do not imply LFUM overlap qualification for those journeys.

@@ -119,6 +119,18 @@ FM-link loss and interruption during copy/readmission do not authorize this
 bounded exception. Minimum counts configured CC members, not Ready survivors;
 data-plane writes still require their actual quorum.
 
+After pre-replacement Secondary removal intent is admitted,
+`Cluster::begin_generation_handshake()` supports its 5/3 Primary-loss supersession
+and 3/2 no-quorum refusal. Known removal/supersession intent and completed
+membership validate inventory without reconstructing membership or electing a
+writer from LFUM. Earlier upload/retry bodies, per-survivor PC/IC/CC, native
+GetLSN/quorum, every activation and final RAP/FM completion retain their owners.
+Rounds can cross undelivered removal, committed deactivation and local completion
+with its final FM reply lost. No replacement starts; subsequent explicit existing
+restoration still requires native completion and exact predecessor deletion.
+A completed generation is not a permanent restoration veto. LFUM during that
+restoration, broader sizes/lineages and spare repair overlaps remain separate.
+
 With a preconfigured spare, `Cluster::replace_replica_on(node).await` explicitly
 selects an unused one-based placement after one processed member loss/deletion
 and completed membership/failover. It builds through the shared native

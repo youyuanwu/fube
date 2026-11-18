@@ -6254,6 +6254,9 @@ fn secondary_configuration(primary: &AddInstance, secondary: &Replica) -> Config
     }
 }
 fn reconfigure(body: Configuration) -> Command {
+    reconfigure_at(body, admission().generation.generation)
+}
+fn reconfigure_at(body: Configuration, generation: i64) -> Command {
     Command::DoReconfiguration {
         body: Box::new(DoReconfiguration {
             configuration: body,
@@ -6261,7 +6264,7 @@ fn reconfigure(body: Configuration) -> Command {
         }),
         source: admission().fm_source,
         generation: GenerationHeader {
-            number: admission().generation,
+            number: generation_header(generation).number,
             for_fm_replica: false,
         },
     }
@@ -8456,9 +8459,27 @@ async fn finish_same_primary_restoration(executor: &Executor, hooks: &Hooks, bod
 
 #[tokio::test]
 async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit() {
+    removal_primary_loss_inventory(false).await;
+}
+
+#[tokio::test]
+async fn removal_supersession_lfum_preserves_history_uploads_and_failed_or_unknown_commits() {
+    removal_primary_loss_inventory(true).await;
+}
+
+async fn removal_primary_loss_inventory(lfum: bool) {
     for (target, minimum) in [(4, 3), (5, 3), (64, 32), (64, 63)] {
+        if lfum && target != 5 {
+            continue;
+        }
         for stage in 0..4 {
-            let (store, executor, hooks) = setup(WAIT).await;
+            let uncertain = lfum && stage == 3;
+            let (store, executor, hooks) = setup(if uncertain {
+                Duration::from_millis(40)
+            } else {
+                WAIT
+            })
+            .await;
             active_configured_survivor(&executor, target, minimum).await;
             let original = state(&executor);
             let mut removal = original.reconfiguration.as_ref().unwrap().request.clone();
@@ -8479,7 +8500,7 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
                 .clone();
             let old_deactivate = || Command::Deactivate {
                 source: peer_source(),
-                generation: generation_header(admission().generation.generation),
+                generation: generation_header(executor.generation_state().receive.generation),
                 body: Box::new(Deactivate {
                     configuration: removal.clone(),
                     force: false,
@@ -8488,7 +8509,7 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
             };
             let old_activate = || Command::Activate {
                 source: peer_source(),
-                generation: generation_header(admission().generation.generation),
+                generation: generation_header(executor.generation_state().receive.generation),
                 body: Box::new(Activate {
                     configuration: removal.clone(),
                     deactivation: history.clone(),
@@ -8511,6 +8532,31 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
                 .await;
                 effects(&executor);
             }
+            let mut removal_view = if stage == 0 {
+                original.reconfiguration.as_ref().unwrap().request.clone()
+            } else {
+                removal.clone()
+            };
+            if stage == 0 || stage == 3 {
+                removal_view.unit.previous = Epoch::default();
+                removal_view.replicas.0.retain(|r| r.current_role >= 3);
+                for r in &mut removal_view.replicas.0 {
+                    r.previous_role = 1;
+                }
+            }
+            let removal_ic = if stage == 1 {
+                removal.unit.current
+            } else {
+                Epoch::default()
+            };
+            let frozen = if lfum {
+                Some(
+                    capture_lfum_at_generation(&executor, 8, &removal_view, removal_ic, false)
+                        .await,
+                )
+            } else {
+                None
+            };
             let mut intent = removal.clone();
             intent.unit.current.configuration += 0x1_0000_0001;
             for r in &mut intent.replicas.0 {
@@ -8534,7 +8580,10 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
                     _ => bad.service.minimum -= 1,
                 }
                 assert!(executor
-                    .submit(reconfigure(bad))
+                    .submit(reconfigure_at(
+                        bad,
+                        executor.generation_state().receive.generation
+                    ))
                     .unwrap()
                     .wait(WAIT)
                     .await
@@ -8543,15 +8592,39 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
             }
             let before = state(&executor);
             let (entered, release) = hooks.pause(true);
-            let ticket = executor.submit(reconfigure(intent.clone())).unwrap();
+            let ticket = executor
+                .submit(reconfigure_at(
+                    intent.clone(),
+                    executor.generation_state().receive.generation,
+                ))
+                .unwrap();
             entered.await.unwrap();
             assert!(effects(&executor).is_empty());
+            if lfum {
+                start_lfum(&executor, 9);
+                assert!(executor.lfum_inventory().unwrap().is_none());
+            }
             release.send(()).unwrap();
             assert!(matches!(ticket.wait(WAIT).await, Err(Failure::Store(_))));
             assert_eq!(state(&executor).body, before.body);
             assert!(effects(&executor).is_empty());
-            run(&executor, reconfigure(intent.clone())).await;
+            if lfum {
+                let failed = wait_lfum(&executor).await;
+                assert_failover_lfum(&failed, &removal_view, removal_ic, false);
+                executor.take_lfum_inventory().unwrap();
+            }
+            run(
+                &executor,
+                reconfigure_at(
+                    intent.clone(),
+                    executor.generation_state().receive.generation,
+                ),
+            )
+            .await;
             let progress = status_completion(&effects(&executor));
+            if lfum {
+                capture_lfum_at_generation(&executor, 10, &intent, Epoch::default(), true).await;
+            }
             for command in [old_deactivate(), old_activate()]
                 .into_iter()
                 .chain(old_completion.map(|c| Command::CompleteConfiguration(Box::new(c))))
@@ -8567,11 +8640,11 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
                 .iter()
                 .filter(|r| r.up && r.current_role == 3)
             {
-                run(
-                    &executor,
-                    failover_progress(&intent, remote, history.clone(), 7),
-                )
-                .await;
+                let mut progress = failover_progress(&intent, remote, history.clone(), 7);
+                if let Command::GetLsnReply { generation, .. } = &mut progress {
+                    *generation = generation_header(executor.generation_state().receive.generation);
+                }
+                run(&executor, progress).await;
                 actions = effects(&executor);
                 if target == 5
                     && state(&executor)
@@ -8598,6 +8671,38 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
                     assert!(!actions
                         .iter()
                         .any(|e| matches!(e, Effect::UpdateConfiguration { .. })));
+                    if let Some(frozen) = &frozen {
+                        let current = capture_lfum_at_generation(
+                            &executor,
+                            11,
+                            &intent,
+                            Epoch::default(),
+                            true,
+                        )
+                        .await;
+                        assert!(!executor
+                            .complete_lfum_upload(
+                                frozen.upload,
+                                &admission().fm_source,
+                                &generation_header(8)
+                            )
+                            .unwrap());
+                        assert_eq!(
+                            executor.generation_state().send,
+                            generation_header(7).number
+                        );
+                        assert!(executor
+                            .complete_lfum_upload(
+                                current.upload,
+                                &admission().fm_source,
+                                &generation_header(11)
+                            )
+                            .unwrap());
+                        assert_eq!(
+                            state(&executor).swap.as_ref().unwrap().stage,
+                            SwapStage::GetLsn
+                        );
+                    }
                 }
             }
             let mut catchup = configured(&actions);
@@ -8623,6 +8728,24 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
             catchup.local.service_endpoint = "127.0.0.1:12349".into();
             run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
             effects(&executor);
+            let mut failover_view = intent.clone();
+            failover_view
+                .replicas
+                .0
+                .iter_mut()
+                .find(|r| r.node == admission().local_node)
+                .unwrap()
+                .service_endpoint = "127.0.0.1:12349".into();
+            if lfum {
+                capture_lfum_at_generation(
+                    &executor,
+                    12,
+                    &failover_view,
+                    intent.unit.current,
+                    true,
+                )
+                .await;
+            }
             for remote in intent
                 .replicas
                 .0
@@ -8633,7 +8756,9 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
                 let ticket = executor
                     .submit(Command::DeactivateReply {
                         source: remote.node.clone(),
-                        generation: generation_header(admission().generation.generation),
+                        generation: generation_header(
+                            executor.generation_state().receive.generation,
+                        ),
                         body: Box::new(DeactivateReply {
                             unit: intent.unit.clone(),
                             replica: Replica {
@@ -8671,7 +8796,9 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
                     &executor,
                     Command::ActivateReply {
                         source: remote.node.clone(),
-                        generation: generation_header(admission().generation.generation),
+                        generation: generation_header(
+                            executor.generation_state().receive.generation,
+                        ),
                         body: Box::new(ActivateReply {
                             unit,
                             replica,
@@ -8684,14 +8811,31 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
             }
             let end = configured(&actions);
             assert_eq!(end.flags, 1);
-            let (entered, release) = hooks.pause(false);
+            let fail = lfum && stage == 2;
+            let (entered, release) = hooks.pause(fail);
             let ticket = executor
-                .submit(Command::CompleteConfiguration(Box::new(end)))
+                .submit(Command::CompleteConfiguration(Box::new(end.clone())))
                 .unwrap();
             entered.await.unwrap();
             assert!(effects(&executor).is_empty());
+            if lfum {
+                start_lfum(&executor, 13);
+                assert!(executor.lfum_inventory().unwrap().is_none());
+            }
+            if uncertain {
+                assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            }
             release.send(()).unwrap();
-            ticket.wait(WAIT).await.unwrap();
+            if fail {
+                assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+                let failed = wait_lfum(&executor).await;
+                assert_failover_lfum(&failed, &failover_view, intent.unit.current, true);
+                executor.take_lfum_inventory().unwrap();
+                assert!(effects(&executor).is_empty());
+                run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
+            } else {
+                ticket.resolve(WAIT).await.unwrap();
+            }
             assert!(
                 matches!(effects(&executor).as_slice(),[Effect::DoReconfigurationReply(r)]
                 if r.replicas.0.len() == target as usize-1 && r.replicas.0.iter().filter(|r| r.up).count() == target as usize-2)
@@ -8699,6 +8843,22 @@ async fn removal_primary_loss_preserves_original_pc_cc_and_each_survivor_commit(
             assert_eq!(state(&executor).runtime, original.runtime);
             assert_eq!(state(&executor).usage, original.usage);
             assert_eq!(state(&executor).body.service, original.body.service);
+            if lfum {
+                let mut complete = failover_view;
+                complete.unit.previous = Epoch::default();
+                complete.replicas.0.retain(|r| r.current_role >= 3);
+                for r in &mut complete.replicas.0 {
+                    r.previous_role = 1;
+                }
+                if !fail {
+                    let committed = wait_lfum(&executor).await;
+                    assert_failover_lfum(&committed, &complete, Epoch::default(), true);
+                    assert_eq!(executor.take_lfum_inventory().unwrap(), Some(committed));
+                }
+                capture_lfum_at_generation(&executor, 14, &complete, Epoch::default(), true).await;
+                finish(&store, &executor).await;
+                continue;
+            }
             let mut active = state(&executor).swap.as_ref().unwrap().body.clone();
             let mut removal = active.clone();
             removal.unit.previous = active.unit.current;

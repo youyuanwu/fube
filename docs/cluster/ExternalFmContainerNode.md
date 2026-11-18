@@ -395,6 +395,12 @@ Healthy fixed-3/2 planned handoff on three original Nodes additionally qualifies
 generation rollover with either first candidate, during demotion, missing-progress
 GetLSN, catch-up, Secondary activation, final RAP End and locally completed
 handoff awaiting its lost FM reply.
+Both launchers also qualify 5/3 pre-replacement removal supersession, with 3/2
+refusing promotion: generation rollover crosses undelivered removal, deactivated
+survivors and locally completed removal awaiting its final FM reply. Older upload
+retries remain independently owned; missing GetLSN progress, separate PC/CC
+quorums and final RAP/FM completion cannot be supplied by LFUM ACKs. No new host
+or replica lifetime is authorized.
 This is live-session metadata reconciliation, not startup
 recovery or a production FM rebuild.
 
@@ -412,7 +418,7 @@ predecessor cleanup in shared Node/Hosting.
 
 The [current LFUM contract and evidence](MinimalFmCluster.md#live-session-lfum-upload)
 is shared with the local cluster. The [alignment plan](RustRaPort.md#lfum-alignment-plan)
-tracks supported removal supersession and broader copy/build interruption.
+tracks broader interruption, supersession lineages and subsequent restoration overlaps.
 Each repeated failover round uses the latest completed membership and known
 fresh replica identities, not the original configuration. Broader
 transfer/redirection model/store coverage remains distinct from the healthy
