@@ -2105,12 +2105,6 @@ async fn standalone_lfum_during_removal_supersession_preserves_pc_uploads_quorum
             assert!(application(&endpoint, "write-more")
                 .await
                 .contains("committed=2"));
-            fm.send(
-                0,
-                do_reconfiguration_message(&request, &fm.configurations[0].generation().unwrap())
-                    .unwrap(),
-            )
-            .await;
             let pid = owners[4]["application_pid"].as_u64().unwrap();
             assert!(Command::new("kill")
                 .args(["-KILL", &pid.to_string()])
@@ -2137,13 +2131,14 @@ async fn standalone_lfum_during_removal_supersession_preserves_pc_uploads_quorum
                 .unwrap()
                 .is_empty());
             assert!(TcpStream::connect(&endpoint).await.is_err());
-            fm.send(
-                0,
-                do_reconfiguration_message(&request, &fm.configurations[0].generation().unwrap())
-                    .unwrap(),
-            )
-            .await;
         }
+        let replay_owner = PausedProcess::new(fixture.children[0].pid());
+        fm.send(
+            0,
+            do_reconfiguration_message(&request, &fm.configurations[0].generation().unwrap())
+                .unwrap(),
+        )
+        .await;
         if let Some(late) = late {
             assert_eq!(late.unit.current, removal.unit.current);
             let completed = fm.configured.len();
@@ -2154,6 +2149,19 @@ async fn standalone_lfum_during_removal_supersession_preserves_pc_uploads_quorum
                 "earlier removal reply cannot complete supersession"
             );
         }
+        drop(replay_owner);
+        // Fence the late one-way replay's ingress, not reconfiguration completion.
+        let generation = fm.configurations[0].generation().unwrap();
+        let reply = fm.links[0]
+            .as_ref()
+            .unwrap()
+            .request(generation_proposal_message(&generation).unwrap())
+            .await
+            .unwrap();
+        let reply = decode_generation_proposal_reply(&reply).unwrap();
+        assert_eq!(reply.error, 0);
+        assert_eq!(reply.proposed, generation.number);
+        assert_eq!(reply.current, generation.number);
         for (index, owner) in owners.iter().enumerate() {
             let status = fixture.status(index);
             assert_eq!(fixture.children[index].pid(), nodes[index]);
