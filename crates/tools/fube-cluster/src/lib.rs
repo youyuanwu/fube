@@ -1,14 +1,20 @@
 mod fm;
 mod interlock;
+mod management;
+mod manager;
 mod node;
 mod profile;
 pub(crate) use fube_node::control::wire;
 
 pub use fm::Command;
+pub use management::run as run_fm;
+use manager::Manager;
 pub use profile::Result;
 pub use profile::ServiceProfile;
 
-use fm::{Accepted, Bootstrap, Ledger};
+use fm::Bootstrap;
+#[cfg(test)]
+use fm::{Accepted, Ledger};
 use fube_local_host::process::OwnedApp;
 use fube_ra::protocol::*;
 use profile::*;
@@ -20,7 +26,6 @@ use std::{
     time::Duration,
 };
 use tokio::time::Instant;
-use wire::Link;
 
 pub struct Config {
     pub profile: ServiceProfile,
@@ -29,32 +34,145 @@ pub struct Config {
     pub executable: PathBuf,
     pub remote_replica_progress_query_wait_ms: u32,
 }
-struct ChildOwner {
-    launch: Launch,
-    process: Option<OwnedApp>,
-    link: Option<Link>,
-    metadata: Option<Metadata>,
-}
-impl ChildOwner {
-    fn generation(&self) -> GenerationHeader {
-        self.link
-            .as_ref()
-            .map(Link::generation)
-            .unwrap_or_else(|| self.launch.generation.clone())
-    }
-}
-
-/// One ephemeral foreground authority; no reconnect, automatic replacement or adoption.
-/// Keep this owner through explicit shutdown, including after any error.
+/// Local process supervisor. Native FM state and Channels belong to the manager.
 pub struct Cluster {
     interlock: interlock::Interlock,
     config: Config,
-    ledger: Ledger,
-    children: Vec<ChildOwner>,
-    peer_idle_requested: bool,
-    finished: Option<Value>,
+    manager: manager::Manager,
+    processes: Vec<Option<OwnedApp>>,
+    remote: Option<management::Client>,
+}
+macro_rules! fm_action {
+    ($name:ident, $operation:ident) => {
+        pub async fn $name(&mut self) -> Result<Value> {
+            if let Some(remote) = &mut self.remote {
+                remote.request(management::Operation::$operation).await
+            } else {
+                self.manager.$name().await
+            }
+        }
+    };
+    ($name:ident, $operation:ident, node) => {
+        pub async fn $name(&mut self, node: u8) -> Result<Value> {
+            if let Some(remote) = &mut self.remote {
+                remote
+                    .request(management::Operation::$operation { node })
+                    .await
+            } else {
+                self.manager.$name(node).await
+            }
+        }
+    };
+}
+#[cfg(test)]
+impl std::ops::Deref for Cluster {
+    type Target = manager::Manager;
+    fn deref(&self) -> &Self::Target {
+        &self.manager
+    }
+}
+#[cfg(test)]
+impl std::ops::DerefMut for Cluster {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.manager
+    }
 }
 impl Cluster {
+    fm_action!(repair_primary_replica, RepairPrimary);
+    fm_action!(repair_secondary_replica, RepairSecondary, node);
+    fm_action!(cancel_repair_build, CancelRepair);
+    fm_action!(delete_cancelled_repair, DeleteCancelledRepair);
+    fm_action!(replace_replica_on, ReplaceReplica, node);
+    fm_action!(add_idle_replica, AddIdle);
+    fm_action!(add_idle_replica_on, AddIdleOn, node);
+    fm_action!(replace_idle_replica, ReplaceIdle);
+    fm_action!(activate_idle_replica, ActivateIdle);
+    fm_action!(transfer_primary, TransferPrimary);
+    fm_action!(transfer_primary_to, TransferPrimaryTo, node);
+    fm_action!(retire_secondary_replica, RetireSecondary);
+    fm_action!(remove_idle_replica_via_fm, RemoveIdle);
+
+    pub async fn delete_idle_replica_via_fm(&mut self) -> Result<Value> {
+        self.delete_idle_replica_via_fm_with_force(false).await
+    }
+
+    pub async fn delete_idle_replica_via_fm_with_force(&mut self, force: bool) -> Result<Value> {
+        if let Some(remote) = &mut self.remote {
+            remote
+                .request(management::Operation::DeleteIdle { force })
+                .await
+        } else {
+            self.manager
+                .delete_idle_replica_via_fm_with_force(force)
+                .await
+        }
+    }
+
+    pub fn begin_generation_handshake(&mut self) -> Result<Value> {
+        if self.remote.is_some() {
+            return Err("separate FM requires async begin_generation_round".into());
+        }
+        self.manager.begin_generation_handshake()
+    }
+
+    pub async fn begin_generation_round(&mut self) -> Result<Value> {
+        if let Some(remote) = &mut self.remote {
+            remote.request(management::Operation::Generation).await
+        } else {
+            self.manager.begin_generation_handshake()
+        }
+    }
+
+    pub fn status(&self) -> Value {
+        self.remote
+            .as_ref()
+            .map_or_else(|| self.manager.status(), management::Client::status)
+    }
+
+    pub async fn execute(&mut self, command: Command) -> Result<Value> {
+        if self.manager.finished.is_some() {
+            return Err("deployment already shut down".into());
+        }
+        if let Some(remote) = &mut self.remote {
+            let mut outcome = remote
+                .request(management::Operation::Command { command })
+                .await?;
+            if outcome.get("status").is_some() {
+                outcome["status"] = remote.status();
+            }
+            Ok(outcome)
+        } else {
+            self.manager.execute(command).await
+        }
+    }
+
+    pub async fn drive(&mut self) {
+        for (index, process) in self.processes.iter_mut().enumerate() {
+            if let Some(process) = process {
+                if let Err(error) = process.check_alive() {
+                    self.manager.ledger.lost(index, err(error));
+                }
+            }
+        }
+        if let Some(remote) = &mut self.remote {
+            // A failed exchange is retained as control uncertainty in every status.
+            let _retained_result = remote.request(management::Operation::Status).await;
+        } else {
+            self.manager.drive().await;
+        }
+    }
+
+    pub async fn update_service(&mut self, index: usize, service: Service) -> Result<()> {
+        if let Some(remote) = &mut self.remote {
+            remote
+                .request(management::Operation::UpdateService { index, service })
+                .await?;
+            Ok(())
+        } else {
+            self.manager.update_service(index, service).await
+        }
+    }
+
     pub fn new(config: Config) -> Result<Self> {
         let node_count = config.profile.node_count();
         Self::with_node_pool(config, node_count)
@@ -143,55 +261,95 @@ impl Cluster {
                 launches[index].peers = peers;
             }
         }
+        let manager = Manager::new(launches)?;
         Ok(Self {
             interlock,
             config,
-            ledger: Ledger::new(launches),
-            children: Vec::with_capacity(node_count),
-            finished: None,
-            peer_idle_requested: false,
+            manager,
+            processes: Vec::with_capacity(node_count),
+            remote: None,
         })
     }
     pub async fn start(&mut self) -> Result<()> {
-        if self.finished.is_some() || !self.children.is_empty() {
+        self.start_owner(None).await
+    }
+
+    /// Run FM in an independently owned executable; this supervisor alone spawns Nodes.
+    pub async fn start_with_fm(&mut self, executable: &Path) -> Result<()> {
+        self.start_owner(Some(executable)).await
+    }
+
+    async fn start_owner(&mut self, executable: Option<&Path>) -> Result<()> {
+        if self.manager.finished.is_some() || !self.manager.children.is_empty() {
             return Err("one cluster start per owner".into());
         }
         self.prepare()?;
-        for index in 0..self.ledger.placements.len() {
+        if let Some(executable) = executable {
+            let executable = executable.canonicalize().map_err(err)?;
+            let launches: Vec<_> = self
+                .manager
+                .ledger
+                .placements
+                .iter()
+                .map(|placement| placement.launch.directory.join("launch.json"))
+                .collect();
+            for placement in &self.manager.ledger.placements {
+                private_dir(&placement.launch.directory)?;
+                private_dir(&placement.launch.directory.join("scratch"))?;
+                write_json(
+                    &placement.launch.directory.join("launch.json"),
+                    &placement.launch,
+                )?;
+            }
+            let path = self.config.root.join("deployment/fm.json");
+            write_json(
+                &path,
+                &management::Manifest {
+                    schema_version: 1,
+                    launches,
+                },
+            )?;
+            self.remote = Some(management::Client::new());
+            self.remote
+                .as_mut()
+                .expect("stored FM owner")
+                .start(&executable, &path)
+                .await?;
+        }
+        for index in 0..self.manager.ledger.placements.len() {
             self.spawn(index).await?;
         }
         if self.config.profile.peer_replicas() || self.config.profile.configured_sizes().is_some() {
-            for source in 0..self.children.len() {
-                for index in source + 1..self.children.len() {
+            for source in 0..self.manager.children.len() {
+                for index in source + 1..self.manager.children.len() {
                     if (!self.config.profile.peer_replicas()
                         && self.config.profile.configured_sizes().is_none())
                         || (source != 0 && !self.config.profile.mesh_peers())
                     {
                         continue;
                     }
-                    let source_node = &self.children[source].launch.node;
-                    let incoming_slot = self.children[index]
+                    let source_node = &self.manager.children[source].launch.node;
+                    let incoming_slot = self.manager.children[index]
                         .launch
                         .peers
                         .iter()
                         .position(|p| &p.node == source_node)
                         .ok_or("missing original incoming mesh binding")?;
-                    let address = self.children[index]
+                    let address = self.manager.children[index]
                         .metadata
                         .as_ref()
                         .and_then(|metadata| metadata.peer_addresses.get(incoming_slot))
                         .copied()
                         .ok_or("missing original peer-specific listener")?;
-                    let target = &self.children[index].launch.node;
-                    let peer_index = self.children[source]
+                    let target = &self.manager.children[index].launch.node;
+                    let peer_index = self.manager.children[source]
                         .launch
                         .peers
                         .iter()
                         .position(|p| &p.node == target)
                         .ok_or("missing original mesh peer")?;
-                    let child = &mut self.children[source];
-                    child
-                        .process
+                    let child = &self.manager.children[source];
+                    self.processes[source]
                         .as_mut()
                         .ok_or("missing original Primary owner")?
                         .command(
@@ -256,61 +414,67 @@ impl Cluster {
         Ok(())
     }
     async fn spawn(&mut self, index: usize) -> Result<()> {
-        let launch = self.ledger.placements[index].launch.clone();
-        private_dir(&launch.directory)?;
-        private_dir(&launch.directory.join("scratch"))?;
-        write_json(&launch.directory.join("launch.json"), &launch)?;
+        let launch = self.manager.ledger.placements[index].launch.clone();
+        if self.remote.is_none() {
+            private_dir(&launch.directory)?;
+            private_dir(&launch.directory.join("scratch"))?;
+            write_json(&launch.directory.join("launch.json"), &launch)?;
+        }
         let mut command = ProcessCommand::new(&self.config.executable);
         command
             .arg("--internal-node")
             .arg(launch.directory.join("launch.json"))
             .env("TMPDIR", launch.directory.join("scratch"))
             .current_dir(&launch.directory);
-        self.children.push(ChildOwner {
+        self.processes.push(None);
+        self.manager.children.push(manager::Connection {
             launch: launch.clone(),
-            process: None,
+            node_pid: 0,
             link: None,
             metadata: None,
         });
-        OwnedApp::start(&mut self.children[index].process, command).map_err(err)?;
+        let started = OwnedApp::start(&mut self.processes[index], command).map_err(err);
+        if let Some(process) = &self.processes[index] {
+            self.manager.children[index].node_pid = process.pid();
+        }
+        started?;
         let end = Instant::now() + Duration::from_secs(30);
         loop {
-            self.children[index]
-                .process
+            self.processes[index]
                 .as_mut()
                 .unwrap()
                 .check_alive()
                 .map_err(|error| {
                     format!(
                         "{error:?}; logs={:?}",
-                        bounded_logs(self.children[index].process.as_ref().unwrap())
+                        bounded_logs(self.processes[index].as_ref().unwrap())
                     )
                 })?;
             if launch.directory.join("listener.json").exists() {
                 let metadata: Metadata = read_json(&launch.directory.join("listener.json"))?;
-                self.validate_metadata(index, &metadata, false)?;
-                self.children[index].metadata = Some(metadata.clone());
-                self.children[index]
-                    .process
+                let pid = self.processes[index].as_ref().expect("stored Node").pid();
+                if metadata.pid != pid
+                    || metadata.session != launch.session
+                    || metadata.deployment != launch.deployment
+                    || metadata.node != launch.node
+                {
+                    return Err("listener metadata is not the original owned Node".into());
+                }
+                self.processes[index]
                     .as_mut()
                     .unwrap()
                     .command(format!("admit {} {}\n", launch.session, launch.capability).as_bytes())
                     .map_err(err)?;
-                let channel = fube_transport::Endpoint::unsecured_tcp(
-                    metadata.address,
-                    wire::composition(true).map_err(err)?,
-                )
-                .map_err(err)?
-                .channel_limits(wire::limits())
-                .connect_until(end)
-                .await
-                .map_err(err)?;
-                self.children[index].link = Some(Link::new(
-                    channel,
-                    launch.fm.clone(),
-                    launch.node.clone(),
-                    launch.generation.clone(),
-                )?);
+                if let Some(remote) = &mut self.remote {
+                    let attached = remote
+                        .request(management::Operation::Attach { index, metadata })
+                        .await?;
+                    let attached: Metadata = serde_json::from_value(attached).map_err(err)?;
+                    self.manager.validate_metadata(index, &attached, true)?;
+                    self.manager.children[index].metadata = Some(attached);
+                } else {
+                    self.manager.attach(index, metadata).await?;
+                }
                 break;
             }
             if Instant::now() >= end {
@@ -318,918 +482,23 @@ impl Cluster {
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        loop {
-            self.pump(index).await?;
-            self.children[index]
-                .process
-                .as_mut()
-                .unwrap()
-                .check_alive()
-                .map_err(|error| {
-                    format!(
-                        "{error:?}; logs={:?}",
-                        bounded_logs(self.children[index].process.as_ref().unwrap())
-                    )
-                })?;
-            if self.ledger.placements[index].bootstrap == Bootstrap::Metadata
-                && launch.directory.join("profile.json").exists()
-            {
-                let metadata: Metadata = read_json(&launch.directory.join("profile.json"))?;
-                self.validate_metadata(index, &metadata, true)?;
-                self.ledger.placements[index]
-                    .admit_profile(metadata.profile.clone().ok_or("missing actual profile")?)?;
-                self.children[index].metadata = Some(metadata);
-                break;
-            }
-            if Instant::now() >= end {
-                return Err("native bootstrap/profile startup deadline".into());
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
         Ok(())
-    }
-    fn validate_metadata(&self, index: usize, metadata: &Metadata, profile: bool) -> Result<()> {
-        let owner = &self.children[index];
-        if metadata.pid
-            != owner
-                .process
-                .as_ref()
-                .ok_or("no original child owner")?
-                .pid()
-            || metadata.deployment != owner.launch.deployment
-            || metadata.session != owner.launch.session
-            || metadata.node != owner.launch.node
-            || !metadata.address.ip().is_loopback()
-            || metadata.address.port() == 0
-            || profile != metadata.profile.is_some()
-            || metadata
-                .peer_address
-                .is_some_and(|address| !address.ip().is_loopback() || address.port() == 0)
-            || metadata.peer_addresses.len() != owner.launch.peers.len()
-            || metadata.peer_address != metadata.peer_addresses.first().copied()
-            || metadata
-                .peer_addresses
-                .iter()
-                .enumerate()
-                .any(|(i, address)| {
-                    !address.ip().is_loopback()
-                        || address.port() == 0
-                        || metadata.peer_addresses[..i].contains(address)
-                })
-            || owner.metadata.as_ref().is_some_and(|prior| {
-                prior.address != metadata.address || prior.peer_addresses != metadata.peer_addresses
-            })
-        {
-            return Err(
-                "startup metadata not from the exact original expected child/session".into(),
-            );
-        }
-        Ok(())
-    }
-    async fn pump(&mut self, index: usize) -> Result<()> {
-        let Some(link) = self.children[index].link.as_ref() else {
-            return Ok(());
-        };
-        let incoming = link
-            .receive(Instant::now() + Duration::from_millis(1))
-            .await?;
-        let Some(incoming) = incoming else {
-            return Ok(());
-        };
-        self.receive_message(index, incoming).await
-    }
-    async fn receive_message(
-        &mut self,
-        index: usize,
-        mut incoming: fube_transport::channel::IncomingMessage<
-            fube_transport::native_channel::GatewayTarget,
-        >,
-    ) -> Result<()> {
-        let link = self.children[index]
-            .link
-            .as_ref()
-            .ok_or("original node link absent")?;
-        wire::predecode(&incoming.message)?;
-        let action = incoming.message.properties().map_err(err)?.action;
-        let generation = self.children[index].generation();
-        match action.as_str() {
-            "LFUMUpload" => {
-                let body = decode_lfum_upload(&incoming.message).map_err(err)?;
-                let header = self.ledger.lfum_upload(index, body)?;
-                let response = lfum_upload_reply_message(&header).map_err(err)?;
-                incoming
-                    .reply
-                    .take()
-                    .ok_or("LFUMUpload missing consuming reply authority")?
-                    .reply(link.seal(response)?, wire::deadline())
-                    .await
-                    .map_err(err)?;
-                if self.ledger.generation.as_ref().is_some_and(|round| {
-                    round.number == header.number && round.uploads[index].is_some()
-                }) {
-                    link.advance_generation(&header);
-                }
-            }
-            "ReplicaEndpointUpdated" => {
-                let (body, owner) =
-                    decode_replica_endpoint_updated(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm {
-                    return Err("FMM endpoint publication is gated".into());
-                }
-                if let Some(reply) = self.ledger.endpoint_updated(index, body)? {
-                    let message =
-                        replica_endpoint_updated_reply_message(&reply, &generation).map_err(err)?;
-                    link.send(message).await?;
-                }
-            }
-            "DoReconfigurationReply" => {
-                let (body, owner) =
-                    decode_do_reconfiguration_reply(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm {
-                    return Err("FMM configuration reply is gated".into());
-                }
-                self.ledger.configuration_reply(index, body)?;
-            }
-            "ChangeConfiguration" => {
-                let (body, owner) = decode_change_configuration(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm {
-                    return Err("FMM candidate redirection is gated".into());
-                }
-                if let Some(reply) =
-                    self.ledger
-                        .change_configuration(index, body, Instant::now())?
-                {
-                    link.send(
-                        change_configuration_reply_message(&reply, &generation).map_err(err)?,
-                    )
-                    .await?;
-                    let next = &self
-                        .ledger
-                        .swap
-                        .as_ref()
-                        .ok_or("missing redirected failover")?
-                        .body;
-                    self.send_configuration(next).await?;
-                }
-            }
-            "GenerationUpdateReject" => {
-                let current = decode_generation_update_reject(&incoming.message).map_err(err)?;
-                if let Some(round) = &mut self.ledger.generation {
-                    round.reject(&current)?;
-                }
-            }
-            "ServiceTypeEnabled" | "ServiceTypeDisabled" => {
-                let enabled = action == "ServiceTypeEnabled";
-                let body = if enabled {
-                    decode_service_type_enabled(&incoming.message)
-                } else {
-                    decode_service_type_disabled(&incoming.message)
-                }
-                .map_err(err)?;
-                let reply = self.ledger.type_status(index, enabled, &body)?;
-                let message = if enabled {
-                    service_type_enabled_reply_message(&reply, &generation)
-                } else {
-                    service_type_disabled_reply_message(&reply, &generation)
-                }
-                .map_err(err)?;
-                link.send(message).await?;
-            }
-            "NodeActivateReply" | "NodeDeactivateReply" => {
-                let activate = action == "NodeActivateReply";
-                let (body, owner) = if activate {
-                    decode_node_activate_reply(&incoming.message)
-                } else {
-                    decode_node_deactivate_reply(&incoming.message)
-                }
-                .map_err(err)?;
-                if owner != Owner::Fm {
-                    return Err("FMM activation unsupported".into());
-                }
-                self.ledger.node_control_reply(index, activate, body)?;
-            }
-            "NodeUpdateServiceReply" => {
-                let (body, owner) =
-                    decode_node_update_service_reply(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm {
-                    return Err("FMM service update unsupported".into());
-                }
-                self.ledger.service_reply(index, body)?;
-            }
-            "ReportLoad" => self
-                .ledger
-                .load(index, decode_report_load(&incoming.message).map_err(err)?)?,
-            "NodeUp" => {
-                let body = decode_node_up(&incoming.message).map_err(err)?;
-                body.validate_fresh_stateless().map_err(err)?;
-                let placement = &mut self.ledger.placements[index];
-                let metadata = self.children[index]
-                    .metadata
-                    .as_ref()
-                    .ok_or("missing original listener")?;
-                let expected = NodeUp::fresh_stateless(
-                    placement.launch.name(),
-                    "fube-cluster-local".into(),
-                    metadata.address,
-                    FabricVersionInstance::native_default(),
-                )
-                .map_err(err)?;
-                if placement.bootstrap != Bootstrap::NodeUp || body != expected {
-                    return Err(
-                        "unexpected/stale native NodeUp identity or recovery contents".into(),
-                    );
-                }
-                placement.node_description = Some(body.node.clone());
-                let ack = NodeUpAck::fresh_activated(body.node.version, 1).map_err(err)?;
-                placement.activation_sequence = ack.activation_sequence;
-                placement.activated = ack.activated;
-                let response = node_up_ack_message(&ack, &generation).map_err(err)?;
-                let context = incoming
-                    .reply
-                    .take()
-                    .ok_or("NodeUp missing consuming reply authority")?;
-                context
-                    .reply(link.seal(response)?, wire::deadline())
-                    .await
-                    .map_err(err)?;
-                placement.bootstrap = Bootstrap::FinalUpload;
-            }
-            "ReplicaUp" => {
-                let (body, owner) = decode_replica_up(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm {
-                    return Err("FMM report unsupported".into());
-                }
-                if self.ledger.generation_pending() {
-                    if let Some(handoff) = incoming.handoff.as_mut() {
-                        handoff.acknowledge();
-                    }
-                    return Ok(()); // Rebuild cannot acknowledge inventory without LFUM support.
-                }
-                let response = self.ledger.report(index, &body)?;
-                let Some(response) = response else {
-                    if let Some(handoff) = incoming.handoff.as_mut() {
-                        handoff.acknowledge();
-                    }
-                    return Ok(()); // Known retired lifetime: no semantic ACK or link loss.
-                };
-                if !body.replicas.0.is_empty()
-                    && self.ledger.placements[index].bootstrap == Bootstrap::Admitted
-                {
-                    self.ledger.down(index);
-                }
-                link.send(replica_up_reply_message(&response, &generation).map_err(err)?)
-                    .await?;
-                if self.ledger.placements[index].bootstrap == Bootstrap::FinalUpload {
-                    self.ledger.placements[index].bootstrap = Bootstrap::Metadata;
-                }
-            }
-            "ServiceTypeNotification" => {
-                let body = decode_service_type_notification(&incoming.message).map_err(err)?;
-                let admitted = self.ledger.placements[index].notification(&body)?;
-                if !admitted.infos.0.is_empty() {
-                    self.ledger.placements[index].catalog_notified = true;
-                }
-                link.send(
-                    service_type_notification_reply_message(&admitted, &generation).map_err(err)?,
-                )
-                .await?;
-            }
-            "AddReplicaReply" => {
-                let (body, owner) = decode_add_replica_reply(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm || !self.config.profile.peer_replicas() {
-                    return Err("AddReplicaReply requires the original peer-idle FM profile".into());
-                }
-                self.read_repair_host()?;
-                self.ledger.idle_reply(index, body)?;
-            }
-            "RemoveReplicaReply" => {
-                let (body, owner) = decode_remove_replica_reply(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm || !self.config.profile.peer_replicas() {
-                    return Err(
-                        "RemoveReplicaReply requires the original peer-idle FM profile".into(),
-                    );
-                }
-                self.ledger.idle_removal_reply(index, body)?;
-            }
-            "AddInstanceReply"
-            | "AddPrimaryReply"
-            | "RemoveInstanceReply"
-            | "DeleteReplicaReply" => {
-                let removing = matches!(
-                    action.as_str(),
-                    "RemoveInstanceReply" | "DeleteReplicaReply"
-                );
-                let primary = self.children[index].launch.profile.stateful();
-                let expected_action = match (primary, removing) {
-                    (true, true) => "DeleteReplicaReply",
-                    (true, false) => "AddPrimaryReply",
-                    (false, true) => "RemoveInstanceReply",
-                    (false, false) => "AddInstanceReply",
-                };
-                if action != expected_action {
-                    return Err("reply action does not match admitted lifecycle profile".into());
-                }
-                let (body, owner) = if primary && removing {
-                    decode_delete_replica_reply(&incoming.message)
-                } else if removing {
-                    decode_remove_instance_reply(&incoming.message)
-                } else if primary {
-                    decode_add_primary_reply(&incoming.message)
-                } else {
-                    decode_add_instance_reply(&incoming.message)
-                }
-                .map_err(err)?;
-                if owner != Owner::Fm {
-                    return Err("FMM semantic reply unsupported".into());
-                }
-                self.ledger.reply(index, body, removing)?;
-            }
-            _ => return Err("unsupported native ingress; no successful ACK".into()),
-        }
-        if let Some(handoff) = incoming.handoff.as_mut() {
-            handoff.acknowledge();
-        }
-        Ok(())
-    }
-    pub async fn drive(&mut self) {
-        for index in 0..self.children.len() {
-            if !self.ledger.placements[index].link_alive {
-                continue;
-            }
-            let result = match self.children[index].process.as_mut() {
-                Some(process) => process.check_alive().map_err(err),
-                None => Err("original child owner absent".into()),
-            };
-            let result = match result {
-                Ok(()) => self.pump(index).await,
-                Err(error) => Err(error),
-            };
-            let result = result.and_then(|()| self.read_retirement(index));
-            let result = match result {
-                Ok(()) if self.ledger.generation_pending() => self.retry_generation(index).await,
-                Ok(()) => self.retry_primary(index).await,
-                Err(error) => Err(error),
-            };
-            let result = match result {
-                Ok(()) => self.retry_deletion(index).await,
-                Err(error) => Err(error),
-            };
-            let result = match result {
-                Ok(()) => self.retry_node_work(index).await,
-                Err(error) => Err(error),
-            };
-            let result = match result {
-                Ok(()) => self.retry_idle(index).await,
-                Err(error) => Err(error),
-            };
-            let result = match result {
-                Ok(()) => self.retry_idle_removal(index).await,
-                Err(error) => Err(error),
-            };
-            let result = match result {
-                Ok(()) => self.retry_idle_deletion(index).await,
-                Err(error) => Err(error),
-            };
-            let result = match result {
-                Ok(()) if index == self.ledger.primary_index() => {
-                    if let Some(body) = self.ledger.configuration_retry(Instant::now()) {
-                        self.send_configuration(&body).await
-                    } else {
-                        Ok(())
-                    }
-                }
-                result => result,
-            };
-            if let Err(error) = result {
-                self.ledger.lost(index, error);
-                if let Some(link) = &self.children[index].link {
-                    link.channel.dispose();
-                }
-            }
-        }
-        if let Err(error) = self.advance_initial_membership().await {
-            self.ledger.lost(0, error);
-        }
-        self.start_failover().await;
-        if let Err(error) = self.advance_repair().await {
-            self.ledger
-                .lost(self.ledger.repair_destination_index().unwrap_or(0), error);
-        }
-    }
-    async fn advance_initial_membership(&mut self) -> Result<()> {
-        if self.config.profile.configured_sizes().is_none()
-            || self.ledger.generation_pending()
-            || self.config.profile.node_count() <= 1
-            || self.ledger.configuration.is_some()
-            || self.ledger.placements[0].observed != fm::Observed::Running
-            || self
-                .ledger
-                .placements
-                .iter()
-                .any(|p| !p.link_alive || p.loss_reported)
-        {
-            return Ok(());
-        }
-        if let Some(destination) = (1..self.config.profile.node_count()).find(|index| {
-            !self
-                .ledger
-                .idles
-                .iter()
-                .any(|idle| idle.body.replica.node == self.children[*index].launch.node)
-        }) {
-            if self
-                .ledger
-                .idles
-                .iter()
-                .all(|idle| idle.reply.as_ref().is_some_and(|reply| reply.error == 0))
-            {
-                let body = self.ledger.request_idle_on(destination, Instant::now())?;
-                self.send_idle(&body).await?;
-            }
-        } else if self.ledger.idle_status()["ready"] == true {
-            let body = self.ledger.request_configuration(Instant::now())?;
-            self.send_configuration(&body).await?;
-        }
-        Ok(())
-    }
-    /// Restore one lost volatile Primary as a fresh Secondary on its original live Node.
-    pub async fn repair_primary_replica(&mut self) -> Result<Value> {
-        if self.finished.is_some()
-            || !self.config.profile.mesh_peers()
-            || self.children.len() != self.ledger.placements.len()
-        {
-            return Err("Primary repair requires the original running configured cluster".into());
-        }
-        if self.ledger.begin_primary_repair(Instant::now())? {
-            self.request_repair_build().await?;
-        }
-        Ok(self.ledger.repair_status())
-    }
-
-    /// Restore a lost Secondary without moving or reopening the current Primary.
-    pub async fn repair_secondary_replica(&mut self, destination: u8) -> Result<Value> {
-        if self.finished.is_some()
-            || destination == 0
-            || self.children.len() != self.ledger.placements.len()
-        {
-            return Err("Secondary repair requires the original running cluster".into());
-        }
-        if let Some(body) = self
-            .ledger
-            .begin_secondary_repair(usize::from(destination - 1), Instant::now())?
-        {
-            if let Err(error) = self.send_configuration(&body).await {
-                self.ledger.lost(self.ledger.primary_index(), error.clone());
-                return Err(error);
-            }
-        }
-        Ok(self.ledger.repair_status())
-    }
-
-    /// Cancel one fresh repair Idle without authorizing another replica lifetime.
-    pub async fn cancel_repair_build(&mut self) -> Result<Value> {
-        if self.finished.is_some() {
-            return Err("repair cancellation requires the original running cluster".into());
-        }
-        let body = self.ledger.cancel_repair_build(Instant::now())?;
-        self.send_idle_removal(&body).await?;
-        Ok(self.ledger.repair_status())
-    }
-
-    /// Delete the exact cancelled destination independently of Primary removal.
-    pub async fn delete_cancelled_repair(&mut self) -> Result<Value> {
-        if self.finished.is_some() {
-            return Err("repair deletion requires the original running cluster".into());
-        }
-        let destination = self
-            .ledger
-            .repair_destination_index()
-            .ok_or("missing repair destination")?;
-        let body = self.ledger.delete_cancelled_repair()?;
-        self.send_repair_deletion(destination, &body).await?;
-        Ok(self.ledger.repair_status())
-    }
-
-    async fn send_repair_deletion(&self, destination: usize, body: &DeleteReplica) -> Result<()> {
-        let child = &self.children[destination];
-        child
-            .link
-            .as_ref()
-            .ok_or("original repair destination link absent")?
-            .send(delete_replica_message(body, &child.generation()).map_err(err)?)
-            .await
-    }
-
-    /// Replace one processed lost member on an explicitly selected unused Node.
-    pub async fn replace_replica_on(&mut self, destination: u8) -> Result<Value> {
-        if self.finished.is_some()
-            || destination == 0
-            || self.children.len() != self.ledger.placements.len()
-        {
-            return Err("replacement requires the original running Node pool".into());
-        }
-        if self
-            .ledger
-            .begin_spare_replacement(usize::from(destination - 1), Instant::now())?
-        {
-            self.request_repair_build().await?;
-        }
-        Ok(self.ledger.repair_status())
-    }
-
-    async fn request_repair_build(&mut self) -> Result<()> {
-        let destination = self
-            .ledger
-            .repair_destination_index()
-            .ok_or("missing failed replica")?;
-        let body = self
-            .ledger
-            .repair
-            .as_ref()
-            .expect("repair")
-            .build
-            .body
-            .clone();
-        if let Err(error) = self.send_idle(&body).await {
-            self.ledger.lost(destination, error.clone());
-            return Err(error);
-        }
-        self.ledger.repair.as_mut().expect("repair").host_requested = true;
-        Ok(())
-    }
-
-    fn read_repair_host(&mut self) -> Result<()> {
-        if self
-            .ledger
-            .repair
-            .as_ref()
-            .is_some_and(|r| r.profile.is_none())
-        {
-            let destination = self
-                .ledger
-                .repair_destination_index()
-                .ok_or("missing failed replica")?;
-            let predecessor = &self
-                .ledger
-                .repair
-                .as_ref()
-                .expect("repair")
-                .predecessor
-                .replica;
-            let path = self.children[destination]
-                .launch
-                .host_replacement_path(predecessor.id, predecessor.instance);
-            if path.try_exists().map_err(err)? {
-                let receipt: HostReplacementReceipt = read_json(&path)?;
-                if receipt.predecessor.runtime_root.exists()
-                    || Path::new(&format!("/proc/{}", receipt.predecessor.app_pid)).exists()
-                    || !receipt.profile.runtime_root.exists()
-                    || !Path::new(&format!("/proc/{}", receipt.profile.app_pid)).exists()
-                {
-                    return Err("physical host replacement is not independently observable".into());
-                }
-                let pid = self.children[destination]
-                    .process
-                    .as_ref()
-                    .ok_or("missing original Node")?
-                    .pid();
-                if self.ledger.repaired_host(&receipt, pid)? {
-                    self.children[destination]
-                        .metadata
-                        .as_mut()
-                        .ok_or("missing node metadata")?
-                        .profile = Some(receipt.profile);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn advance_repair(&mut self) -> Result<()> {
-        if self
-            .ledger
-            .repair
-            .as_ref()
-            .is_some_and(|r| r.removal.as_ref().is_some_and(|c| c.reply.is_none()) || r.unknown)
-        {
-            return Ok(());
-        }
-        if self
-            .ledger
-            .repair
-            .as_ref()
-            .is_some_and(|r| !r.host_requested)
-        {
-            self.request_repair_build().await?;
-        }
-        self.read_repair_host()?;
-        if let Some(body) = self.ledger.start_repair_configuration(Instant::now())? {
-            self.send_configuration(&body).await?;
-        }
-        Ok(())
-    }
-    async fn start_failover(&mut self) {
-        let failover = match self.ledger.start_primary_failover(Instant::now()) {
-            Ok(Some(body)) => self.send_configuration(&body).await,
-            Ok(None) => Ok(()),
-            Err(error) => Err(error),
-        };
-        if let Err(error) = failover {
-            self.ledger.lost(self.ledger.primary_index(), error);
-        }
-    }
-    /// Begin one live-session ordinary-FM inventory reconciliation. New
-    /// mutations remain gated until all native LFUM uploads are processed.
-    pub fn begin_generation_handshake(&mut self) -> Result<Value> {
-        if self.finished.is_some() || self.children.len() != self.ledger.placements.len() {
-            return Err("generation handshake requires the original running cluster".into());
-        }
-        self.ledger.begin_generation()?;
-        Ok(self.status()["generation_handshake"].clone())
-    }
-    async fn retry_generation(&mut self, index: usize) -> Result<()> {
-        let Some(work) = self
-            .ledger
-            .generation
-            .as_mut()
-            .and_then(|round| round.next(index, Instant::now()))
-        else {
-            return Ok(());
-        };
-        let link = self.children[index]
-            .link
-            .as_ref()
-            .ok_or("original generation link absent")?;
-        match work {
-            fm::GenerationWork::Propose(header) => {
-                if let Some(message) = link
-                    .request_optional(generation_proposal_message(&header).map_err(err)?)
-                    .await?
-                {
-                    wire::predecode(&message)?;
-                    let body = decode_generation_proposal_reply(&message).map_err(err)?;
-                    self.ledger
-                        .generation
-                        .as_mut()
-                        .ok_or("generation owner lost")?
-                        .proposal_reply(index, &body)?;
-                }
-            }
-            fm::GenerationWork::Update(header) => {
-                link.send(
-                    generation_update_message(
-                        &GenerationUpdate {
-                            fm_service_epoch: Epoch::default(),
-                        },
-                        &header,
-                    )
-                    .map_err(err)?,
-                )
-                .await?;
-                link.advance_generation(&header);
-            }
-        }
-        Ok(())
-    }
-    async fn retry_node_work(&mut self, index: usize) -> Result<()> {
-        if self.ledger.generation_pending() {
-            return Ok(());
-        }
-        let now = Instant::now();
-        let control = self.ledger.node_control_retry(index, now);
-        let service = self.ledger.service_update_retry(index, now);
-        let child = &self.children[index];
-        let link = child.link.as_ref().ok_or("original node link absent")?;
-        if let Some((activate, body)) = control {
-            let message = if activate {
-                node_activate_request_message(&body, &child.generation())
-            } else {
-                node_deactivate_request_message(&body, &child.generation())
-            }
-            .map_err(err)?;
-            link.send(message).await?;
-        }
-        if let Some(body) = service {
-            link.send(
-                node_update_service_request_message(&body, &child.generation()).map_err(err)?,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-    async fn retry_primary(&mut self, index: usize) -> Result<()> {
-        let Some(body) = self.ledger.primary_retry(index, Instant::now())? else {
-            return Ok(());
-        };
-        let child = &self.children[index];
-        let message = add_primary_message(&body, &child.generation()).map_err(err)?;
-        child
-            .link
-            .as_ref()
-            .ok_or("original Primary link absent")?
-            .send(message)
-            .await
-    }
-    async fn retry_idle(&mut self, index: usize) -> Result<()> {
-        let Some(body) = self.ledger.idle_retry(index, Instant::now()) else {
-            return Ok(());
-        };
-        self.send_idle(&body).await
-    }
-    async fn send_idle(&self, body: &AddReplica) -> Result<()> {
-        let child = self
-            .children
-            .get(self.ledger.primary_index())
-            .ok_or("missing original Primary owner")?;
-        child
-            .link
-            .as_ref()
-            .ok_or("original Primary link absent")?
-            .send(add_replica_message(body, &child.generation()).map_err(err)?)
-            .await
-    }
-    async fn retry_idle_removal(&mut self, index: usize) -> Result<()> {
-        let Some(body) = self.ledger.idle_removal_retry(index, Instant::now()) else {
-            return Ok(());
-        };
-        self.send_idle_removal(&body).await
-    }
-    async fn send_idle_removal(&self, body: &RemoveReplica) -> Result<()> {
-        let child = self
-            .children
-            .get(self.ledger.primary_index())
-            .ok_or("missing original Primary owner")?;
-        child
-            .link
-            .as_ref()
-            .ok_or("original Primary link absent")?
-            .send(remove_replica_message(body, &child.generation()).map_err(err)?)
-            .await
-    }
-    async fn retry_deletion(&mut self, index: usize) -> Result<()> {
-        if self.ledger.generation_pending() {
-            return Ok(());
-        }
-        let Some(body) = self.ledger.deletion_retry(index, Instant::now())? else {
-            return Ok(());
-        };
-        let child = &self.children[index];
-        let message = delete_replica_message(&body, &child.generation()).map_err(err)?;
-        child
-            .link
-            .as_ref()
-            .ok_or("original deletion link absent")?
-            .send(message)
-            .await
-    }
-    async fn retry_idle_deletion(&mut self, index: usize) -> Result<()> {
-        if let Some(body) = self.ledger.repair_deletion_retry(index, Instant::now()) {
-            return self.send_repair_deletion(index, &body).await;
-        }
-        let Some(body) = self.ledger.idle_deletion_retry(index, Instant::now()) else {
-            return Ok(());
-        };
-        self.send_idle_deletion(&body).await
-    }
-    async fn send_idle_deletion(&self, body: &DeleteReplica) -> Result<()> {
-        let child = self
-            .children
-            .get(1)
-            .ok_or("missing original destination owner")?;
-        child
-            .link
-            .as_ref()
-            .ok_or("original destination link absent")?
-            .send(delete_replica_message(body, &child.generation()).map_err(err)?)
-            .await
-    }
-    fn read_retirement(&mut self, index: usize) -> Result<()> {
-        let child = &self.children[index];
-        let path = child.launch.directory.join("retirement.json");
-        let node_pid = child
-            .process
-            .as_ref()
-            .ok_or("original node owner absent")?
-            .pid();
-        self.ledger.read_retirement(index, &path, node_pid)?;
-        self.ledger.read_absence(
-            index,
-            &child.launch.directory.join("absence.json"),
-            node_pid,
-        )?;
-        self.ledger.read_pre_open_cancellation(
-            index,
-            &child.launch.directory.join("pre-open-cancellation.json"),
-            node_pid,
-        )?;
-        self.ledger.read_failed_registration(
-            index,
-            &child
-                .launch
-                .directory
-                .join("failed-registration-deletion.json"),
-            node_pid,
-        )?;
-        self.ledger.read_failed_open(
-            index,
-            &child.launch.directory.join("failed-open-deletion.json"),
-            node_pid,
-        )?;
-        self.ledger.read_host_loss(
-            index,
-            &child.launch.directory.join("host-loss.json"),
-            node_pid,
-        )
-    }
-    pub fn status(&self) -> Value {
-        let mut status = self.ledger.status();
-        status["deployment"] = json!(self.interlock.deployment);
-        if let Some(nodes) = status["nodes"].as_array_mut() {
-            for (index, node) in nodes.iter_mut().enumerate() {
-                if let Some(child) = self.children.get(index) {
-                    node["node_pid"] = json!(child.process.as_ref().map(OwnedApp::pid));
-                    let path = child.launch.directory.join("observation.json");
-                    if path.exists() {
-                        match read_json::<Value>(&path) {
-                            Ok(observation)
-                                if observation["deployment"] == child.launch.deployment
-                                    && observation["session"] == child.launch.session
-                                    && observation["node_pid"]
-                                        == json!(child.process.as_ref().map(OwnedApp::pid)) =>
-                            {
-                                node["retained_work"] = observation;
-                            }
-                            _ => {
-                                node["observation_error"] =
-                                    json!("invalid source-bound observation");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if self.config.profile == ServiceProfile::StatefulPeerIdle {
-            let source = &status["nodes"][0]["retained_work"];
-            let target = &status["nodes"][1]["retained_work"];
-            let reply = &source["peer_idle"]["reply"];
-            let failed =
-                self.peer_idle_requested && reply["error"].as_i64().is_some_and(|error| error != 0);
-            let opened = self.peer_idle_requested
-                && reply["error"] == 0
-                && reply["replica"]["id"] == self.ledger.placements[1].replica
-                && reply["replica"]["instance"] == self.ledger.placements[1].incarnation
-                && reply["replica"]["current_role"] == 2
-                && reply["replica"]["state"] == 1
-                && reply["replica"]["replication_endpoint"]
-                    .as_str()
-                    .is_some_and(|value| !value.is_empty())
-                && target["local_replica"]["open"] == true;
-            let removing = source["peer_idle"]["removal"].is_object();
-            let removed = removing && source["peer_idle"]["removal"]["result"] == 0;
-            let destination_lost = self.ledger.placements[1].loss_reported;
-            let configuration = self.ledger.configuration_status();
-            let configured = configuration["ready"] == true
-                && configuration["kind"] == "same_primary_configuration";
-            let retired = configuration["ready"] == true
-                && configuration["kind"] == "same_primary_retirement"
-                && self.ledger.idle_predecessor.is_none();
-            let built = !destination_lost
-                && opened
-                && !removing
-                && source["peer_idle"]["build"]["result"] == 0;
-            status["peer_idle"] = json!({
-                "requested":self.peer_idle_requested,
-                "state": if configured { "active_secondary" } else if retired { "retired_secondary" } else if destination_lost { "lost" } else if removed { "removed" } else if removing { "removing" } else if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
-                "error": if failed { reply["error"].clone() } else { Value::Null },
-                "built":built, "serving":false,
-                "active_secondary":configured,
-                "build":source["peer_idle"]["build"],
-                "fm":self.ledger.idle_status(),
-                "fm_removal":self.ledger.idle_removal_status(),
-                "fm_deletion":self.ledger.idle_deletion_status(),
-                "ready":!destination_lost && source["peer_idle"]["ready"] == true,
-                "destination_lost":destination_lost,
-                "removal":source["peer_idle"]["removal"],
-                "source":source["peer_idle"], "target":target["local_replica"],
-                "peer_link_alive":[source["peer_link_alive"],target["peer_link_alive"]],
-                "peer_error":[source["peer_error"],target["peer_error"]],
-                "command_error":[source["peer_command_error"],target["peer_command_error"]],
-            });
-        }
-        status
     }
     /// Ask the original Primary RA to open its bound remote Idle. This is not
     /// an FM operation, build completion, or permission to serve.
     pub async fn create_idle_replica(&mut self) -> Result<Value> {
-        if !self.ledger.idles.is_empty() {
+        if self.remote.is_some() {
+            return Err("direct peer test controls are not FM management operations".into());
+        }
+        if !self.manager.ledger.idles.is_empty() {
             return Err("FM owns this Idle; use add_idle_replica".into());
         }
         if self.config.profile != ServiceProfile::StatefulPeerIdle
-            || self.finished.is_some()
-            || self.children.len() != 2
-            || self.ledger.generation.is_some()
-            || self.ledger.placements[0].observed != fm::Observed::Running
-            || self.ledger.placements.iter().any(|placement| {
+            || self.manager.finished.is_some()
+            || self.manager.children.len() != 2
+            || self.manager.ledger.generation.is_some()
+            || self.manager.ledger.placements[0].observed != fm::Observed::Running
+            || self.manager.ledger.placements.iter().any(|placement| {
                 !placement.link_alive
                     || placement.bootstrap != Bootstrap::Admitted
                     || !placement.activated
@@ -1246,9 +515,8 @@ impl Cluster {
         ) {
             return Ok(current);
         }
-        let child = &mut self.children[0];
-        child
-            .process
+        let child = &self.manager.children[0];
+        self.processes[0]
             .as_mut()
             .ok_or("missing original Primary owner")?
             .command(
@@ -1259,21 +527,24 @@ impl Cluster {
                 .as_bytes(),
             )
             .map_err(err)?;
-        self.peer_idle_requested = true;
+        self.manager.peer_idle_requested = true;
         Ok(json!({"state":"pending","kind":"peer_idle_open","built":false,"serving":false}))
     }
     /// Ask the original Primary runtime to build its already opened peer Idle.
     /// Completion proves copy/application ACK, not active configuration or FM AddReplica.
     pub async fn build_idle_replica(&mut self) -> Result<Value> {
-        if !self.ledger.idles.is_empty() {
+        if self.remote.is_some() {
+            return Err("direct runtime test controls are not FM management operations".into());
+        }
+        if !self.manager.ledger.idles.is_empty() {
             return Err("FM owns this Idle's build choreography".into());
         }
         if self.config.profile != ServiceProfile::StatefulPeerIdle
-            || self.finished.is_some()
-            || self.children.len() != 2
-            || self.ledger.generation.is_some()
-            || self.ledger.placements[0].observed != fm::Observed::Running
-            || self.ledger.placements.iter().any(|placement| {
+            || self.manager.finished.is_some()
+            || self.manager.children.len() != 2
+            || self.manager.ledger.generation.is_some()
+            || self.manager.ledger.placements[0].observed != fm::Observed::Running
+            || self.manager.ledger.placements.iter().any(|placement| {
                 !placement.link_alive
                     || placement.bootstrap != Bootstrap::Admitted
                     || !placement.activated
@@ -1286,9 +557,8 @@ impl Cluster {
         if current["built"] == true {
             return Ok(current);
         }
-        let child = &mut self.children[0];
-        child
-            .process
+        let child = &self.manager.children[0];
+        self.processes[0]
             .as_mut()
             .ok_or("missing original Primary owner")?
             .command(
@@ -1301,156 +571,21 @@ impl Cluster {
             .map_err(err)?;
         Ok(json!({"state":"pending","kind":"peer_idle_build","built":false,"serving":false}))
     }
-    /// FM AddReplica owns peer creation, RAP build and semantic Ready-Idle completion.
-    pub async fn add_idle_replica(&mut self) -> Result<Value> {
-        let current = self.ledger.idle_status();
-        if self.ledger.configuration.is_some()
-            || self.finished.is_some()
-            || self.children.len() != 2
-            || self.config.profile != ServiceProfile::StatefulPeerIdle
-            || (self.ledger.idle_removal.is_some() && current["state"] != "failed")
-            || self.peer_idle_requested && self.ledger.idles.is_empty()
-        {
-            return Err("FM AddReplica requires the original unused peer-idle profile".into());
-        }
-        if current["state"] != "absent" && current["state"] != "pending" {
-            return Ok(current);
-        }
-        let body = self.ledger.request_idle(Instant::now())?;
-        self.peer_idle_requested = true;
-        if let Err(error) = self.send_idle(&body).await {
-            self.ledger.lost(0, error.clone());
-            return Err(error);
-        }
-        Ok(self.ledger.idle_status())
-    }
-    /// Build one original Secondary destination selected by its one-based node number.
-    pub async fn add_idle_replica_on(&mut self, destination: u8) -> Result<Value> {
-        if !(self.config.profile == ServiceProfile::StatefulThree
-            || self.config.profile.configured_sizes().is_some())
-            || self.finished.is_some()
-            || self.children.len() != self.ledger.placements.len()
-            || !(2..=self.children.len()).contains(&usize::from(destination))
-        {
-            return Err(
-                "targeted build requires an original configured Secondary destination".into(),
-            );
-        }
-        let body = self
-            .ledger
-            .request_idle_on(usize::from(destination - 1), Instant::now())?;
-        if let Err(error) = self.send_idle(&body).await {
-            self.ledger.lost(0, error.clone());
-            return Err(error);
-        }
-        Ok(self.ledger.idle_status())
-    }
-    /// Explicitly authorize one fresh Idle after original FM removal and proved disposal.
-    pub async fn replace_idle_replica(&mut self) -> Result<Value> {
-        if self.finished.is_some()
-            || self.children.len() != 2
-            || self.config.profile != ServiceProfile::StatefulPeerIdle
-        {
-            return Err("Idle replacement requires the original peer-idle profile".into());
-        }
-        let current = self.ledger.idle_status();
-        if self.ledger.idle_predecessor.is_some() && current["state"] == "ready" {
-            return Ok(current);
-        }
-        let body = self.ledger.request_idle_replacement(Instant::now())?;
-        self.peer_idle_requested = true;
-        if let Err(error) = self.send_idle(&body).await {
-            self.ledger.lost(0, error.clone());
-            return Err(error);
-        }
-        Ok(self.ledger.idle_status())
-    }
-    pub async fn activate_idle_replica(&mut self) -> Result<Value> {
-        if self.finished.is_some() || self.children.len() != self.ledger.placements.len() {
-            return Err("configuration requires the original running cluster".into());
-        }
-        let body = self.ledger.request_configuration(Instant::now())?;
-        if self.ledger.configuration_status()["ready"] == true {
-            return Ok(self.ledger.configuration_status());
-        }
-        if let Err(error) = self.send_configuration(&body).await {
-            self.ledger.lost(0, error.clone());
-            return Err(error);
-        }
-        Ok(self.ledger.configuration_status())
-    }
-    pub async fn transfer_primary(&mut self) -> Result<Value> {
-        if self.finished.is_some() || self.children.len() != self.ledger.placements.len() {
-            return Err("Primary transfer requires the original running cluster".into());
-        }
-        let body = self.ledger.request_primary_transfer(Instant::now())?;
-        if self.ledger.configuration_status()["ready"] != true {
-            if let Err(error) = self.send_configuration(&body).await {
-                self.ledger.lost(self.ledger.primary_index(), error.clone());
-                return Err(error);
-            }
-        }
-        Ok(self.ledger.configuration_status())
-    }
-    /// Request a handoff to a one-based current Secondary; retrying the same
-    /// destination replays that transition until another handoff is requested.
-    pub async fn transfer_primary_to(&mut self, destination: u8) -> Result<Value> {
-        if self.finished.is_some()
-            || destination == 0
-            || self.children.len() != self.ledger.placements.len()
-        {
-            return Err(
-                "Primary transfer requires a running cluster and explicit destination".into(),
-            );
-        }
-        let body = self
-            .ledger
-            .request_primary_transfer_to(usize::from(destination - 1), Instant::now())?;
-        if self.ledger.configuration_status()["ready"] != true {
-            if let Err(error) = self.send_configuration(&body).await {
-                self.ledger.lost(self.ledger.primary_index(), error.clone());
-                return Err(error);
-            }
-        }
-        Ok(self.ledger.configuration_status())
-    }
-    pub async fn retire_secondary_replica(&mut self) -> Result<Value> {
-        if self.finished.is_some() || self.children.len() != 2 {
-            return Err("Secondary retirement requires the original running cluster".into());
-        }
-        let body = self.ledger.request_secondary_retirement(Instant::now())?;
-        if self.ledger.configuration_status()["ready"] != true {
-            if let Err(error) = self.send_configuration(&body).await {
-                self.ledger.lost(0, error.clone());
-                return Err(error);
-            }
-        }
-        Ok(self.ledger.configuration_status())
-    }
-    async fn send_configuration(&self, body: &DoReconfiguration) -> Result<()> {
-        let child = self
-            .children
-            .get(self.ledger.configuration_target_index())
-            .ok_or("missing original Primary owner")?;
-        child
-            .link
-            .as_ref()
-            .ok_or("missing original Primary link")?
-            .send(do_reconfiguration_message(body, &child.generation()).map_err(err)?)
-            .await
-    }
     /// Remove the original Idle from the Primary's replicator, not its remote
     /// application. Pending calls retry cancellation/cleanup; success is terminal.
     pub async fn remove_idle_replica(&mut self) -> Result<Value> {
-        if self.ledger.idle_removal.is_some() {
+        if self.remote.is_some() {
+            return Err("direct runtime test controls are not FM management operations".into());
+        }
+        if self.manager.ledger.idle_removal.is_some() {
             return Err("FM owns this removal; use remove_idle_replica_via_fm".into());
         }
         if self.config.profile != ServiceProfile::StatefulPeerIdle
-            || self.finished.is_some()
-            || self.children.len() != 2
-            || self.ledger.generation.is_some()
-            || self.ledger.placements[0].observed != fm::Observed::Running
-            || self.ledger.placements.iter().any(|placement| {
+            || self.manager.finished.is_some()
+            || self.manager.children.len() != 2
+            || self.manager.ledger.generation.is_some()
+            || self.manager.ledger.placements[0].observed != fm::Observed::Running
+            || self.manager.ledger.placements.iter().any(|placement| {
                 !placement.link_alive
                     || placement.bootstrap != Bootstrap::Admitted
                     || !placement.activated
@@ -1465,9 +600,8 @@ impl Cluster {
         if !matches!(current["state"].as_str(), Some("open" | "removing")) {
             return Err("peer removal requires the original opened Idle".into());
         }
-        let child = &mut self.children[0];
-        child
-            .process
+        let child = &self.manager.children[0];
+        self.processes[0]
             .as_mut()
             .ok_or("missing original Primary owner")?
             .command(
@@ -1478,255 +612,52 @@ impl Cluster {
                 .as_bytes(),
             )
             .map_err(err)?;
-        if let Some(idle) = self.ledger.idles.first_mut() {
+        if let Some(idle) = self.manager.ledger.idles.first_mut() {
             idle.cancelled = true;
         }
         Ok(json!({"state":"pending","kind":"peer_idle_removal","built":false,"serving":false}))
     }
-    /// FM retires original creation or removes the opened/lost Idle's replication session.
-    /// Only RemoveReplicaReply clears pending_remove, never destination deletion.
-    pub async fn remove_idle_replica_via_fm(&mut self) -> Result<Value> {
-        if self.finished.is_some()
-            || self.children.len() != 2
-            || self.config.profile != ServiceProfile::StatefulPeerIdle
-        {
-            return Err("FM RemoveReplica requires the original peer-idle profile".into());
-        }
-        let current = self.ledger.idle_removal_status();
-        if current["state"] == "removed" || current["state"] == "unknown" {
-            return Ok(current);
-        }
-        if self.ledger.idle_removal.is_none()
-            && !matches!(
-                self.ledger.idle_status()["state"].as_str(),
-                Some("pending" | "ready" | "failed" | "lost")
-            )
-            && self.status()["peer_idle"]["state"] != "open"
-        {
-            return Err("FM removal requires original FM creation or an opened/lost Idle".into());
-        }
-        let body = self.ledger.request_idle_removal(Instant::now())?;
-        if let Err(error) = self.send_idle_removal(&body).await {
-            self.ledger.lost(0, error.clone());
-            return Err(error);
-        }
-        Ok(self.ledger.idle_removal_status())
-    }
-    /// Delete the original abandoned destination independently of Primary Remove.
-    /// Cleanup joins the native reply with original disposal, pre-Open
-    /// cancellation, known creation failure or never-created absence;
-    /// none authorizes a successor.
-    pub async fn delete_idle_replica_via_fm(&mut self) -> Result<Value> {
-        self.delete_idle_replica_via_fm_with_force(false).await
-    }
-    /// Explicit native force authorization for the original destination only.
-    pub async fn delete_idle_replica_via_fm_with_force(&mut self, force: bool) -> Result<Value> {
-        if self.finished.is_some()
-            || self.children.len() != 2
-            || self.config.profile != ServiceProfile::StatefulPeerIdle
-        {
-            return Err("FM Idle deletion requires the original peer-idle profile".into());
-        }
-        let current = self.ledger.idle_deletion_status();
-        if current["state"] == "deleted" || current["state"] == "unknown" {
-            return Ok(current);
-        }
-        let mut target_kind = fm::IdleDeleteTarget::Runtime;
-        if self.ledger.idle_deletion.is_none() {
-            let status = self.status();
-            let target = &status["peer_idle"]["target"];
-            let unobserved = target.is_null() && self.ledger.idle_absence_allowed();
-            let registered_open = target["phase"] == "Opening"
-                && target["registration"].is_object()
-                && target["retained_usage"] == 1;
-            let pre_registration = target["phase"] == "Opening"
-                && target["registration"].is_null()
-                && target["retained_usage"] == 0
-                && self.ledger.idle_absence_allowed();
-            let failed_registration = target["phase"] == "Closed"
-                && target["pre_open_failure"]["error"]
-                    .as_i64()
-                    .is_some_and(|error| self.ledger.idle_failed_creation_error() == Some(error));
-            let failed_open = target["phase"] == "Closed"
-                && target["runtime_open_failure"]["error"]
-                    .as_i64()
-                    .is_some_and(|error| self.ledger.idle_failed_creation_error() == Some(error));
-            let terminal = target["phase"] == "Closed"
-                || target["phase"] == "Closing"
-                || target["phase"] == "Opening";
-            if target["open"] != true
-                && !registered_open
-                && !pre_registration
-                && !unobserved
-                && !failed_registration
-                && !failed_open
-                && !terminal
-            {
-                return Err("FM Idle deletion requires an original opening/opened or known creation-failed destination, or an absent unanswered FM Add".into());
-            }
-            target_kind = if unobserved {
-                fm::IdleDeleteTarget::Unobserved
-            } else if pre_registration {
-                fm::IdleDeleteTarget::PreRegistration
-            } else if failed_registration {
-                fm::IdleDeleteTarget::FailedRegistration
-            } else if failed_open {
-                fm::IdleDeleteTarget::FailedOpen
-            } else {
-                fm::IdleDeleteTarget::Runtime
-            };
-        }
-        let body = if force {
-            self.ledger
-                .request_idle_deletion_with_force(Instant::now(), target_kind, true)?
-        } else {
-            self.ledger
-                .request_idle_deletion(Instant::now(), target_kind)?
-        };
-        if let Err(error) = self.send_idle_deletion(&body).await {
-            self.ledger.lost(1, error.clone());
-            return Err(error);
-        }
-        Ok(self.ledger.idle_deletion_status())
-    }
-    /// Returns the retained operation outcome, never transport-write success.
-    /// `quit` is accepted here; the foreground then calls owned shutdown.
-    pub async fn execute(&mut self, command: Command) -> Result<Value> {
-        if self.finished.is_some() {
-            return Err("deployment already shut down".into());
-        }
-        let op = command.op.clone();
-        match self.ledger.accept(command)? {
-            Accepted::NodeControl(index, activate, body) => {
-                let generation = &self.children[index].generation();
-                let message = if activate {
-                    node_activate_request_message(&body, generation)
-                } else {
-                    node_deactivate_request_message(&body, generation)
-                }
-                .map_err(err)?;
-                let result = self.children[index]
-                    .link
-                    .as_ref()
-                    .ok_or("original link absent")?
-                    .send(message)
-                    .await;
-                if let Err(error) = result {
-                    self.ledger.lost(index, error);
-                }
-            }
-            Accepted::Duplicate(outcome) => return Ok(outcome),
-            Accepted::Create(index, body) => {
-                let factory = if self.children[index].launch.profile.stateful() {
-                    add_primary_message
-                } else {
-                    add_instance_message
-                };
-                let message = factory(&body, &self.children[index].generation()).map_err(err)?;
-                let result = self.children[index]
-                    .link
-                    .as_ref()
-                    .ok_or("original link absent")?
-                    .send(message)
-                    .await;
-                if let Err(error) = result {
-                    self.ledger.lost(index, error);
-                }
-            }
-            Accepted::Delete(index, body) => {
-                let factory = if self.children[index].launch.profile.stateful() {
-                    delete_replica_message
-                } else {
-                    remove_instance_message
-                };
-                let message = factory(&body, &self.children[index].generation()).map_err(err)?;
-                let result = self.children[index]
-                    .link
-                    .as_ref()
-                    .ok_or("original link absent")?
-                    .send(message)
-                    .await;
-                if let Err(error) = result {
-                    self.ledger.lost(index, error);
-                }
-            }
-            Accepted::Status => {
-                self.ledger
-                    .complete(&op, json!({"op":op,"state":"complete","kind":"status"}));
-                let outcome = json!({"op":op,"state":"complete","status":self.status()});
-                self.ledger.complete(&op, outcome.clone());
-                return Ok(outcome);
-            }
-            Accepted::Quit => {}
-        }
-        Ok(self.ledger.result(&op))
-    }
-    pub async fn update_service(&mut self, index: usize, service: Service) -> Result<()> {
-        if self.config.profile.peer_replicas() {
-            return Err("peer-idle service description is fixed for the original lifetime".into());
-        }
-        if self.ledger.generation_pending() {
-            return Err("service update is gated while generation upload is pending".into());
-        }
-        let placement = self
-            .ledger
-            .placements
-            .get_mut(index)
-            .ok_or("node index out of range")?;
-        if !placement.link_alive
-            || placement.bootstrap != Bootstrap::Admitted
-            || placement.service_update.is_some()
-        {
-            return Err(
-                "service update requires current admitted node without pending update".into(),
-            );
-        }
-        let expected = placement.body()?.service;
-        if service.name != expected.name
-            || service.instance != expected.instance
-            || service.stateful != expected.stateful
-            || service.persisted
-            || service.group
-            || service.service_type != expected.service_type
-            || service.application != expected.application
-            || service.version != expected.version
-            || service.target != expected.target
-            || service.minimum != expected.minimum
-            || service.partitions != expected.partitions
-            || service.activation_mode != expected.activation_mode
-            || !service.scaling.0.is_empty()
-            || service.update_version < expected.update_version
-        {
-            return Err("service update is outside admitted fixed profile/version".into());
-        }
-        let message = node_update_service_request_message(
-            &NodeUpdateServiceRequest {
-                service: service.clone(),
-            },
-            &self.children[index].generation(),
-        )
-        .map_err(err)?;
-        self.children[index]
-            .link
-            .as_ref()
-            .ok_or("original link absent")?
-            .send(message)
-            .await?;
-        placement.service_update = Some(service);
-        placement.service_retry_at = Some(Instant::now() + Duration::from_secs(5));
-        Ok(())
-    }
     pub async fn shutdown(&mut self) -> Value {
-        if let Some(receipt) = &self.finished {
+        if let Some(receipt) = &self.manager.finished {
             return receipt.clone();
         }
         let mut receipts = vec![];
         let mut verified = vec![];
         let mut complete = true;
-        // Stop all original owners first, so one slow/lost sibling cannot hold
-        // the other app alive while its bounded teardown is pending.
-        for child in &mut self.children {
-            if let Some(process) = child.process.as_mut() {
+        let mut host_cleanup = self.manager.host_cleanup_owners();
+        if let Some(remote) = &mut self.remote {
+            match remote.stop().await {
+                Ok(state) if state.metadata.len() == self.manager.children.len() => {
+                    host_cleanup = state.hosts;
+                    for (child, metadata) in self.manager.children.iter_mut().zip(state.metadata) {
+                        if let Some(metadata) = metadata {
+                            if metadata.node != child.launch.node
+                                || metadata.pid != child.node_pid
+                                || metadata.deployment != child.launch.deployment
+                                || metadata.session != child.launch.session
+                            {
+                                complete = false;
+                                receipts.push(json!({"fm_error":"invalid final Node metadata"}));
+                            } else {
+                                child.metadata = Some(metadata);
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {
+                    complete = false;
+                    receipts.push(json!({"fm_error":"incomplete final Node metadata"}));
+                }
+                Err(error) => {
+                    complete = false;
+                    receipts.push(json!({"fm_error":error}));
+                }
+            }
+        }
+        // FM is no longer issuing lifecycle intent. Stop all original Nodes
+        // before waiting for any sibling's independently owned cleanup.
+        for (child, process) in self.manager.children.iter().zip(&mut self.processes) {
+            if let Some(process) = process.as_mut() {
                 let stop =
                     process.command(format!("stop {}\n", child.launch.capability).as_bytes());
                 if let Err(error) = stop {
@@ -1734,14 +665,14 @@ impl Cluster {
                 }
             }
         }
-        for child in &mut self.children {
+        for (index, child) in self.manager.children.iter_mut().enumerate() {
             let mut item = json!({"node":child.launch.placement,"session":child.launch.session});
             if let Some(link) = child.link.take() {
                 if let Err(error) = link.close().await {
                     item["link_close_error"] = json!(error);
                 }
             }
-            let Some(process) = child.process.as_mut() else {
+            let Some(process) = self.processes.get_mut(index).and_then(Option::as_mut) else {
                 continue;
             };
             let exit = process.wait_exit(std::time::Instant::now() + Duration::from_secs(25));
@@ -1751,17 +682,10 @@ impl Cluster {
             let cleanup = process.cleanup();
             let physical = process.status();
             let receipt = read_json::<CleanupReceipt>(&child.launch.directory.join("cleanup.json"));
-            for repair in self
-                .ledger
-                .repair_history
-                .iter()
-                .chain(self.ledger.repair.iter())
-                .filter(|r| !r.uses_spare() && r.predecessor.replica.node == child.launch.node)
-            {
-                let path = child.launch.host_replacement_path(
-                    repair.predecessor.replica.id,
-                    repair.predecessor.replica.instance,
-                );
+            for repair in host_cleanup.iter().filter(|owner| owner.node == index) {
+                let path = child
+                    .launch
+                    .host_replacement_path(repair.replica, repair.incarnation);
                 if path.exists() {
                     let replacement = read_json::<HostReplacementReceipt>(&path).and_then(|r| {
                         r.validate(&child.launch, &repair.old_profile, process.pid())?;
@@ -1785,7 +709,7 @@ impl Cluster {
                             item["host_replacement_error"] = json!(error);
                         }
                     }
-                } else if repair.profile.is_some() {
+                } else if repair.host_admitted {
                     complete = false;
                     item["host_replacement_error"] = json!("admitted replacement receipt missing");
                 }
@@ -1865,11 +789,13 @@ impl Cluster {
             }
         }
         let result = json!({"event":"shutdown","deployment":self.interlock.deployment,
-            "clean":complete,"nodes":receipts,"profile_root":self.config.root});
-        self.finished = Some(result.clone());
+            "clean":complete,"nodes":receipts,"profile_root":self.config.root,
+            "fm":self.remote.as_ref().map(management::Client::cleanup_status)});
+        self.manager.finished = Some(result.clone());
         result
     }
 }
+
 fn sequence() -> u64 {
     (uuid::Uuid::new_v4().as_u128() as u64).max(1)
 }

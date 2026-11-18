@@ -46,6 +46,10 @@ struct Arguments {
     #[arg(long, default_value_t = fube_ra::entity::Settings::default().remote_replica_progress_query_wait_ms)]
     remote_replica_progress_query_wait_ms: u32,
 
+    /// FM executable (defaults to fube-fm beside this controller).
+    #[arg(long, conflicts_with = "internal_node")]
+    fm_executable: Option<PathBuf>,
+
     #[arg(long, hide = true, conflicts_with_all = ["root", "app", "stateful_singleton", "stateful_peer_idle", "stateful_three", "stateful"])]
     internal_node: Option<PathBuf>,
 }
@@ -113,6 +117,7 @@ async fn foreground(
     profile: ServiceProfile,
     nodes: Option<usize>,
     remote_replica_progress_query_wait_ms: u32,
+    fm_executable: Option<PathBuf>,
 ) -> Result<bool> {
     let mut cluster = Cluster::with_node_pool(
         Config {
@@ -124,7 +129,12 @@ async fn foreground(
         },
         nodes.unwrap_or_else(|| profile.node_count()),
     )?;
-    if let Err(error) = cluster.start().await {
+    let fm_executable = fm_executable.unwrap_or(
+        std::env::current_exe()
+            .map_err(|error| error.to_string())?
+            .with_file_name("fube-fm"),
+    );
+    if let Err(error) = cluster.start_with_fm(&fm_executable).await {
         let cleanup = cluster.shutdown().await;
         output(&json!({"event":"startup_error","error":error,"cleanup":cleanup}))?;
         return Ok(false);
@@ -209,6 +219,7 @@ async fn run(arguments: Arguments) -> Result<bool> {
         profile,
         arguments.nodes,
         arguments.remote_replica_progress_query_wait_ms,
+        arguments.fm_executable,
     )
     .await
 }

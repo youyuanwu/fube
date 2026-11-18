@@ -161,6 +161,14 @@ fn foreground_configured_service_builds_four_replicas_from_one_create() {
     let ready = foreground.read();
     assert_eq!(ready["event"], "ready", "{ready}");
     assert_eq!(ready["status"]["nodes"].as_array().unwrap().len(), 4);
+    assert_eq!(ready["status"]["fm"]["separate_process"], true);
+    let fm_pid = ready["status"]["fm"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(fm_pid, foreground.child.id());
+    assert!(ready["status"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|node| node["node_pid"] != fm_pid));
     let expected: Vec<_> = (1..=4).map(|node| Expected::capture(&root, node)).collect();
     assert_eq!(
         foreground.command(&json!({"op":"create","action":"create","node":1}))["state"],
@@ -190,7 +198,10 @@ fn foreground_configured_service_builds_four_replicas_from_one_create() {
         foreground.command(&json!({"op":"create","action":"create","node":1}))["state"],
         "complete"
     );
-    foreground.finish();
+    let cleanup = foreground.finish();
+    assert_eq!(cleanup["fm"]["pid"], fm_pid);
+    assert_eq!(cleanup["fm"]["reaped"], true);
+    assert_eq!(cleanup["fm"]["group_drained"], true);
     for owner in expected {
         owner.assert_gone();
     }

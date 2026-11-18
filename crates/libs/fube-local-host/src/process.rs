@@ -127,6 +127,28 @@ impl OwnedApp {
     /// Store the child owner before any post-spawn fallible setup. An error
     /// leaves `slot` populated when a child exists, including failed cleanup.
     pub fn start(slot: &mut Option<Self>, mut command: Command) -> Result<()> {
+        Self::start_inner(slot, &mut command, false).map(|_| ())
+    }
+
+    /// Retain the same process/group owner while the caller owns protocol pipes.
+    pub fn start_with_pipes(
+        slot: &mut Option<Self>,
+        mut command: Command,
+    ) -> Result<(std::process::ChildStdin, std::process::ChildStdout)> {
+        let stdout = Self::start_inner(slot, &mut command, true)?
+            .ok_or_else(|| HostError("missing owned protocol stdout".into()))?;
+        let stdin = slot
+            .as_mut()
+            .and_then(|owner| owner.child.stdin.take())
+            .ok_or_else(|| HostError("missing owned protocol stdin".into()))?;
+        Ok((stdin, stdout))
+    }
+
+    fn start_inner(
+        slot: &mut Option<Self>,
+        command: &mut Command,
+        protocol_stdout: bool,
+    ) -> Result<Option<std::process::ChildStdout>> {
         if slot.is_some() {
             return Err(HostError("process slot already occupied".into()));
         }
@@ -228,21 +250,20 @@ impl OwnedApp {
                 return Err(error.into());
             }
         }
-        owned.readers = vec![
-            capture(
-                stdout,
-                logs.clone(),
-                stop_logs.clone(),
-                owned.dropped_logs.clone(),
-            ),
-            capture(
-                stderr,
-                logs.clone(),
-                stop_logs.clone(),
-                owned.dropped_logs.clone(),
-            ),
-        ];
-        Ok(())
+        owned.readers.push(capture(
+            stderr,
+            logs.clone(),
+            stop_logs.clone(),
+            owned.dropped_logs.clone(),
+        ));
+        if protocol_stdout {
+            Ok(Some(stdout))
+        } else {
+            owned
+                .readers
+                .push(capture(stdout, logs, stop_logs, owned.dropped_logs.clone()));
+            Ok(None)
+        }
     }
 
     pub fn pid(&self) -> u32 {
