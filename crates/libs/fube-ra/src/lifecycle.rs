@@ -603,6 +603,16 @@ pub(super) fn transition(
                                 },
                             )
                     });
+                let idle_delete = current.is_some_and(|state| {
+                    state.peer_creation.is_some()
+                        && state.body.replica.current_role == 2
+                        && state.reconfiguration.is_none()
+                        && state.swap.is_none()
+                        && state.body.service == body.service
+                        && state.body.unit == body.unit
+                        && state.body.replica.id == body.replica.id
+                        && body.replica.instance <= state.body.replica.instance
+                });
                 if current.is_some_and(|s| {
                     s.peer_creation.is_some()
                         && body.unit.current.older_than(s.body.unit.current)
@@ -618,6 +628,7 @@ pub(super) fn transition(
                     || !valid_stateful_sizes(&body.service)
                     || ((body.service.target != 1 || body.service.minimum != 1)
                         && !active_delete
+                        && !idle_delete
                         && current.is_none_or(|s| {
                             s.phase != Phase::Closed
                                 || s.reconfiguration

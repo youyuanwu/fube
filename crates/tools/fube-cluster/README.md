@@ -72,6 +72,20 @@ a fresh host/incarnation; native creation, copy, every surviving S/S Deactivate
 and Secondary Activate commit precede final RAP/FM completion. The same live
 Node/RA/store/peer Channels support repeated failover/repair cycles.
 
+For fixed 3/2 original-Node Primary repair, `Cluster::cancel_repair_build()`
+abandons the fresh Idle before active admission, including a pending copy or a
+completed build whose reply was lost. Native RemoveReplica cancels outstanding
+RAP build work and retries removal; only RemoveReplicaReply completes that
+obligation. `Cluster::delete_cancelled_repair()` independently deletes the exact
+destination. Poll `repair.replicator_removed`, `destination_deleted` and `disposed`
+separately; none means `repair.ready`. Generation/LFUM rollover can overlap this
+cancellation/deletion, retaining earlier upload owners and stale-reply fences.
+Late AddReplica replies/retries cannot restart the cancelled build, admit it,
+activate another host or authorize a successor. Normal shutdown independently
+reaps the fresh app host and drains/removes its group/root. Cancellation during
+active admission, Secondary-loss repair, spare repair and subsequent recovery
+remain separate profiles.
+
 `Cluster::repair_secondary_replica(node).await` explicitly repairs one matched
 Secondary app-host loss on its original live Node, without moving or reopening
 the healthy Primary. Native same-Primary removal must finish before fresh-host
@@ -104,6 +118,18 @@ accounting, and another loss fences restoration rather than enabling recovery.
 FM-link loss and interruption during copy/readmission do not authorize this
 bounded exception. Minimum counts configured CC members, not Ready survivors;
 data-plane writes still require their actual quorum.
+
+After pre-replacement Secondary removal intent is admitted,
+`Cluster::begin_generation_handshake()` supports its 5/3 Primary-loss supersession
+and 3/2 no-quorum refusal. Known removal/supersession intent and completed
+membership validate inventory without reconstructing membership or electing a
+writer from LFUM. Earlier upload/retry bodies, per-survivor PC/IC/CC, native
+GetLSN/quorum, every activation and final RAP/FM completion retain their owners.
+Rounds can cross undelivered removal, committed deactivation and local completion
+with its final FM reply lost. No replacement starts; subsequent explicit existing
+restoration still requires native completion and exact predecessor deletion.
+A completed generation is not a permanent restoration veto. LFUM during that
+restoration, broader sizes/lineages and spare repair overlaps remain separate.
 
 With a preconfigured spare, `Cluster::replace_replica_on(node).await` explicitly
 selects an unused one-based placement after one processed member loss/deletion
@@ -313,7 +339,16 @@ application writes after each transfer, old-message fencing and actual
 quorum/no-quorum checks. Local 3/2 cases also transfer to and back from a
 freshly repaired original placement or spare after Primary or Secondary loss.
 Completed generation rounds do not permanently disable transfer; concurrent
-generation/LFUM overlap remains unqualified.
+generation/LFUM overlap is qualified for healthy fixed-3/2 handoff on the three
+original Nodes, with either first candidate. Use `begin_generation_handshake()`
+during demotion, GetLSN, catch-up, activation or final RAP work. The thin FM
+validates committed phase inventory against the prior successful membership
+and explicit intent. Upload ACK cannot replace progress, any Secondary's
+matching activation or final RAP/FM completion. Superseded upload receipts
+remain independent, and generation-stale peer messages do not close the
+original Channel. Process cases retain all owners, fence old writers, replay
+lost final completion at the new generation and check real quorum/no-quorum.
+See [phase coverage and limits](../../../docs/cluster/MinimalFmCluster.md#generation-rollover-during-healthy-planned-handoff).
 After a completed healthy 3/2 handoff, a matched new-Primary app-host crash can
 start native failover; a former-Primary or unchanged-Secondary crash uses
 same-Primary removal. Explicit `repair_primary_replica()` or
@@ -335,7 +370,7 @@ admit an unused static spare, preserving survivor owners and proving the
 replacement's real quorum vote. Native completion, dropped reporting, normal
 metadata Delete and original-owner disposal remain separate barriers.
 Persisted restart, in-handoff volatile rebuild, other restart-required sizes,
-swap abort and concurrent generation/LFUM overlap remain unqualified or gated.
+swap abort and restart-required generation/LFUM overlap remain unqualified or gated.
 See the [source mapping and acceptance boundaries](../../../docs/cluster/MinimalFmCluster.md#healthy-planned-primary-transfer).
 
 `Cluster::remove_idle_replica_via_fm().await` lets FM cancel its original pending
@@ -771,6 +806,9 @@ its configuration request, or the first original 3/2 Primary app-host failover
 with both original healthy survivors.
 The first explicit post-failover 3/2 repair also uploads committed fresh-build
 and same-Primary configuration views.
+Healthy fixed-3/2 planned handoff on three original Nodes admits rollover
+during demotion, GetLSN, catch-up, Secondary activation, final RAP End and
+local completion awaiting its final FM reply; either first candidate is qualified.
 This is opt-in, not a CLI command or a change to default bootstrap. Proposed,
 receive and send generations remain distinct; only receive changes on a
 matching Update. The round waits at `awaiting_upload`, `complete=false`:
@@ -806,17 +844,21 @@ configuration commits before held build-upload ACKs, and fresh Secondary role
 completion can precede a later LFUM ACK without changing frozen inventory.
 Final RAP completion, membership and quorum retain their independent owners.
 This is not application-data upload, unknown-partition reconstruction,
-broader reconfiguration or planned-swap/repeated-repair process qualification, nonempty NodeUp, full ReplicaUp
-batching, FM/FMM recovery or durable restart. Replicated acceptance withholds
+broader reconfiguration/transfer overlap qualification, nonempty NodeUp,
+full ReplicaUp batching, FM/FMM recovery or durable restart. Replicated acceptance withholds
 correlated replies, renegotiates a newer generation, rejects the late stale
 completion and preserves all original owners, data and membership.
 First-failover acceptance holds real Primary role and final RAP completion while
 uploading the committed query-only/candidate/completed survivor views. GetLSN
 copies old CC to PC; Deactivate sets IC=CC and survivor Activate clears IC.
 Closed former-Primary metadata is canonical or omitted after deletion. Stale
-upload ACKs neither finish promotion nor change quorum authority. Planned swaps,
-repeated repair and redirected/repeated failover process overlap qualification and restart
-remain separate work.
+upload ACKs neither finish promotion nor change quorum authority. Healthy
+planned-handoff acceptance additionally freezes demotion/continuation views,
+withholds real progress and retains an older upload across Secondary activation.
+The stale ACK cannot advance current send or finish native activation/final RAP;
+generation-stale peer replies preserve the original Channels. A lost final FM
+completion still requires exact request replay at the new generation.
+Broader transfer/redirection overlaps and restart remain separate work.
 Initial-admission acceptance holds actual Secondary role completion across two
 generation updates. LFUM retains committed PC roles/epochs, Primary phase-4 IC
 and Secondary invalid IC; completion later clears PC/IC without changing the

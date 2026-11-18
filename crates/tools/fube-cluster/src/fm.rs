@@ -133,6 +133,8 @@ pub(crate) struct ReplicaRepair {
     pub build: IdleBuild,
     pub configuration: Option<ActiveConfiguration>,
     pub removal: Option<ActiveConfiguration>,
+    cancellation: Option<IdleRemoval>,
+    deletion: Option<RepairDeletion>,
     base: Option<ActiveConfiguration>,
     pub host_requested: bool,
     superseded_by: Option<Epoch>,
@@ -142,6 +144,12 @@ impl ReplicaRepair {
     pub(crate) fn uses_spare(&self) -> bool {
         self.predecessor.replica.node != self.build.body.replica.node
     }
+}
+struct RepairDeletion {
+    reply: Option<DeleteReplicaReply>,
+    disposal: Option<RetirementReceipt>,
+    started: Instant,
+    last: Instant,
 }
 #[derive(Clone)]
 pub(crate) struct ActiveConfiguration {
@@ -215,11 +223,13 @@ pub(crate) struct GenerationHandshake {
     pub uploads: Vec<Option<LfumUpload>>,
     initial_membership: Option<Configuration>,
     initial_builds: Option<Vec<AddReplica>>,
-    failover: Option<FailoverInventory>,
+    failover: Option<ConfigurationInventory>,
+    transfer: Option<ConfigurationInventory>,
     repair: Option<RepairInventory>,
+    removal: Option<RemovalInventory>,
     retry_at: Vec<Instant>,
 }
-struct FailoverInventory {
+struct ConfigurationInventory {
     previous: ConfigurationReply,
     configuration: Configuration,
 }
@@ -227,6 +237,13 @@ struct RepairInventory {
     previous: ConfigurationReply,
     build: AddReplica,
     configuration: Option<Configuration>,
+    cancelled: bool,
+    deleting: bool,
+}
+struct RemovalInventory {
+    previous: ConfigurationReply,
+    removal: Configuration,
+    supersession: Option<Configuration>,
 }
 impl GenerationHandshake {
     pub fn new(current: &GenerationNumber, nodes: usize) -> Result<Self> {
@@ -239,7 +256,9 @@ impl GenerationHandshake {
             initial_membership: None,
             initial_builds: None,
             failover: None,
+            transfer: None,
             repair: None,
+            removal: None,
             retry_at: vec![Instant::now(); nodes],
         })
     }
@@ -552,6 +571,68 @@ fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Resul
     }
     Ok(())
 }
+fn completed_inventory(configuration: &Configuration) -> Configuration {
+    let mut completed = configuration.clone();
+    completed.unit.previous = Epoch::default();
+    completed.replicas.0.retain(|r| r.current_role >= 3);
+    for replica in &mut completed.replicas.0 {
+        replica.previous_role = 1;
+    }
+    completed
+}
+
+fn inventory_view_matches(
+    info: &FailoverUnitInfo,
+    configuration: &Configuration,
+    local: &NodeInstance,
+    intermediate: Option<&Configuration>,
+    promoted: Option<&NodeInstance>,
+) -> bool {
+    if info.unit != configuration.unit
+        || info.service != configuration.service
+        || info.local_deleted
+        || info.intermediate != intermediate.map_or(Epoch::default(), |c| c.unit.current)
+        || info.replicas.0.len() != configuration.replicas.0.len()
+        || info.report_from_primary
+            != configuration
+                .replicas
+                .0
+                .iter()
+                .any(|r| &r.node == local && r.current_role == 4)
+    {
+        return false;
+    }
+    configuration.replicas.0.iter().all(|expected| {
+        let mut matches = info
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.description.node == expected.node);
+        let Some(actual) = matches.next() else {
+            return false;
+        };
+        if matches.next().is_some() {
+            return false;
+        }
+        let mut expected = expected.clone();
+        expected.first_lsn = -1;
+        expected.last_lsn = -1;
+        if promoted == Some(&expected.node) && expected.current_role == 4 {
+            expected.service_endpoint = actual.description.service_endpoint.clone();
+        }
+        let intermediate_role = intermediate
+            .and_then(|c| {
+                c.replicas.0.iter().find(|r| {
+                    r.node == expected.node
+                        && r.id == expected.id
+                        && r.instance == expected.instance
+                })
+            })
+            .map_or(1, |r| r.current_role);
+        actual.description == expected && actual.intermediate_role == intermediate_role
+    })
+}
+
 fn primary_failover_configuration(body: &Configuration) -> bool {
     body.replicas
         .0
@@ -794,7 +875,12 @@ impl Ledger {
         else {
             return Ok(None);
         };
-        if self.generation.is_some()
+        if (self.generation_pending()
+            && self
+                .generation
+                .as_ref()
+                .and_then(|g| g.removal.as_ref())
+                .is_none_or(|inventory| inventory.removal != *configuration))
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
             || self.placements.iter().any(|p| {
@@ -912,6 +998,23 @@ impl Ledger {
             started: now,
             last: now,
         });
+        if let Some(inventory) = self
+            .generation
+            .as_mut()
+            .and_then(|g| g.removal.as_mut())
+            .filter(|inventory| {
+                inventory.removal.unit.previous == body.configuration.unit.previous
+                    && inventory
+                        .removal
+                        .unit
+                        .current
+                        .configuration
+                        .checked_add(0x1_0000_0001)
+                        == Some(body.configuration.unit.current.configuration)
+            })
+        {
+            inventory.supersession = Some(body.configuration.clone());
+        }
         Ok(())
     }
 
@@ -1117,6 +1220,16 @@ impl Ledger {
     }
 
     fn validate_peer_lfum(&self, index: usize, body: &LfumUpload) -> Result<()> {
+        if let Some(removal) = self.generation.as_ref().and_then(|g| g.removal.as_ref()) {
+            return self.validate_removal_lfum(index, body, removal);
+        }
+        if let Some(transfer) = self
+            .generation
+            .as_ref()
+            .and_then(|round| round.transfer.as_ref())
+        {
+            return self.validate_transfer_lfum(index, body, transfer);
+        }
         if let Some(repair) = self
             .generation
             .as_ref()
@@ -1304,7 +1417,7 @@ impl Ledger {
         &self,
         index: usize,
         body: &LfumUpload,
-        failover: &FailoverInventory,
+        failover: &ConfigurationInventory,
     ) -> Result<()> {
         let placement = &self.placements[index];
         let original = &failover.previous;
@@ -1422,6 +1535,131 @@ impl Ledger {
         Ok(())
     }
 
+    fn validate_transfer_lfum(
+        &self,
+        index: usize,
+        body: &LfumUpload,
+        transfer: &ConfigurationInventory,
+    ) -> Result<()> {
+        let placement = &self.placements[index];
+        if placement.node_description.as_ref() != Some(&body.node)
+            || !body.any_replica_found
+            || body.units.0.len() != 1
+        {
+            return Err("LFUM transfer requires the known live Node inventory".into());
+        }
+        let info = &body.units.0[0];
+        let intent = &transfer.configuration;
+        let old = intent
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.previous_role == 4)
+            .ok_or("missing transfer source")?;
+        let candidate = intent
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.current_role == 4)
+            .ok_or("missing transfer candidate")?;
+        let mut complete = intent.unit.clone();
+        complete.previous = Epoch::default();
+        let mut expected = intent.clone();
+        let primary;
+        let mut intermediate = Epoch::default();
+        if info.unit == transfer.previous.unit {
+            expected.unit = transfer.previous.unit.clone();
+            expected.replicas = transfer.previous.replicas.clone();
+            primary = placement.launch.node == old.node;
+        } else if info.unit == complete {
+            expected.unit = complete.clone();
+            for r in &mut expected.replicas.0 {
+                r.previous_role = 1;
+            }
+            primary = placement.launch.node == candidate.node;
+        } else if info.unit == intent.unit {
+            if placement.launch.node == old.node {
+                primary = info.report_from_primary;
+                if !primary {
+                    // A completed demotion is no longer reconfiguring locally.
+                    let local = expected
+                        .replicas
+                        .0
+                        .iter_mut()
+                        .find(|r| r.node == old.node)
+                        .unwrap();
+                    local.state = 1;
+                    local.service_endpoint.clear();
+                }
+            } else if placement.launch.node == candidate.node {
+                primary = true;
+                if info.intermediate == intent.unit.current {
+                    intermediate = intent.unit.current;
+                }
+            } else {
+                // GetLSN copies the old CC into PC; Activate commits the new stable CC.
+                expected.replicas = transfer.previous.replicas.clone();
+                for r in &mut expected.replicas.0 {
+                    r.previous_role = r.current_role;
+                }
+                primary = false;
+            }
+        } else {
+            return Err("LFUM transfer changed a known configuration epoch".into());
+        }
+        let new_membership = info.unit == complete
+            || (info.unit == intent.unit && placement.launch.node == candidate.node);
+        if new_membership {
+            expected
+                .replicas
+                .0
+                .iter_mut()
+                .find(|r| r.node == old.node)
+                .unwrap()
+                .service_endpoint
+                .clear();
+        }
+        if info.service != intent.service
+            || info.local_deleted
+            || info.report_from_primary != primary
+            || info.intermediate != intermediate
+            || info.replicas.0.len() != expected.replicas.0.len()
+        {
+            return Err("LFUM report changed the known planned transfer phase".into());
+        }
+        for mut expected in expected.replicas.0 {
+            expected.first_lsn = -1;
+            expected.last_lsn = -1;
+            let mut matching = info
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.description.node == expected.node);
+            let actual = matching.next().ok_or("missing planned transfer member")?;
+            if new_membership && expected.node == candidate.node {
+                // Role completion can precede its independently delivered endpoint notification.
+                if info.unit == complete && actual.description.service_endpoint.is_empty() {
+                    return Err("completed transfer inventory has no Primary endpoint".into());
+                }
+                expected.service_endpoint = actual.description.service_endpoint.clone();
+            }
+            if matching.next().is_some()
+                || actual.description != expected
+                || actual.intermediate_role
+                    != if intermediate == Epoch::default() {
+                        1
+                    } else {
+                        expected.current_role
+                    }
+            {
+                return Err(
+                    "LFUM transfer changed a known replica lifetime or its phase roles".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn validate_repair_lfum(
         &self,
         index: usize,
@@ -1429,6 +1667,14 @@ impl Ledger {
         repair: &RepairInventory,
     ) -> Result<()> {
         let placement = &self.placements[index];
+        let fresh = placement.launch.node == repair.build.replica.node;
+        if fresh
+            && repair.deleting
+            && placement.node_description.as_ref() == Some(&body.node)
+            && body.units.0.is_empty()
+        {
+            return Ok(());
+        }
         if placement.node_description.as_ref() != Some(&body.node)
             || !body.any_replica_found
             || body.units.0.len() != 1
@@ -1446,7 +1692,6 @@ impl Ledger {
             .0
             .iter()
             .any(|r| r.node == placement.launch.node && r.current_role == 4);
-        let fresh = placement.launch.node == repair.build.replica.node;
         let mut transitioning = false;
         if let Some(request) = &repair.configuration {
             let mut complete = request.unit.clone();
@@ -1467,7 +1712,15 @@ impl Ledger {
             if fresh {
                 expected.replicas.0.clear();
             }
-            if primary || fresh {
+            if (primary || fresh)
+                && !(primary
+                    && repair.cancelled
+                    && !info
+                        .replicas
+                        .0
+                        .iter()
+                        .any(|r| r.description.node == repair.build.replica.node))
+            {
                 expected.replicas.0.push(repair.build.replica.clone());
             }
         }
@@ -1490,18 +1743,27 @@ impl Ledger {
                 .iter()
                 .filter(|r| r.description.node == expected.node);
             let actual = matching.next().ok_or("missing known repair replica")?;
+            let duplicate = matching.next().is_some();
             if building && expected.node == repair.build.replica.node {
-                if !matches!(actual.description.state, 1 | 2)
-                    || (fresh && actual.description.state != 1)
+                let dropped = actual.description.state == 3;
+                if dropped && !(repair.cancelled && (primary || repair.deleting)) {
+                    return Err("LFUM repair drop requires explicit cancellation/deletion".into());
+                }
+                if !matches!(actual.description.state, 1..=3)
+                    || (fresh && actual.description.state == 2)
                     || actual.description.replication_endpoint.is_empty()
+                        && !(fresh && dropped && repair.deleting)
                     || !actual.description.service_endpoint.is_empty()
                 {
                     return Err("LFUM repair build must remain an InBuild/Ready Idle".into());
                 }
                 expected.state = actual.description.state;
                 expected.replication_endpoint = actual.description.replication_endpoint.clone();
+                if fresh && dropped {
+                    expected = dropped_replica(&expected);
+                }
             }
-            if matching.next().is_some()
+            if duplicate
                 || actual.description != expected
                 || actual.intermediate_role
                     != if info.intermediate == Epoch::default() {
@@ -1516,9 +1778,259 @@ impl Ledger {
         Ok(())
     }
 
+    fn removal_inventory(&self) -> Option<RemovalInventory> {
+        let sizes = self.placements[0].launch.profile.configured_sizes()?;
+        if !matches!(sizes, (5, 3) | (3, 2))
+            || self.placements.len() != sizes.0 as usize
+            || !self.configuration_history.is_empty()
+            || !self.candidate_changes.is_empty()
+        {
+            return None;
+        }
+        let (repair, supersession) = if let Some(repair) = &self.repair {
+            if self.swap.is_some() || !self.repair_history.is_empty() || self.restoration.is_some()
+            {
+                return None;
+            }
+            (repair, None)
+        } else {
+            let swap = self.swap.as_ref().filter(|s| !s.unknown)?;
+            let repair = self.repair_history.last().filter(|r| {
+                self.repair_history.len() == 1
+                    && r.superseded_by == Some(swap.body.configuration.unit.current)
+                    && self.restoration.is_some()
+            })?;
+            (repair, Some(&swap.body.configuration))
+        };
+        let removal = &repair
+            .removal
+            .as_ref()
+            .filter(|c| !c.unknown && c.reply.is_none())?
+            .body
+            .configuration;
+        let previous = self
+            .configuration
+            .as_ref()?
+            .reply
+            .as_ref()
+            .filter(|r| r.error == 0)?;
+        let primary = previous.replicas.0.iter().find(|r| r.current_role == 4)?;
+        let lost = &repair.predecessor.replica;
+        if repair.host_requested
+            || repair.profile.is_some()
+            || repair.configuration.is_some()
+            || repair.base.is_some()
+            || repair.build.reply.is_some()
+            || repair.build.cancelled
+            || previous.replicas.0.len() != sizes.0 as usize
+            || !previous
+                .replicas
+                .0
+                .iter()
+                .any(|r| r == lost && r.current_role == 3)
+            || !self
+                .placements
+                .iter()
+                .any(|p| p.launch.node == lost.node && p.loss_reported && p.remove_received)
+            || (repair.unknown
+                && !self
+                    .placements
+                    .iter()
+                    .any(|p| p.launch.node == primary.node && p.loss_reported))
+        {
+            return None;
+        }
+        let mut expected = Configuration {
+            unit: previous.unit.clone(),
+            service: removal.service.clone(),
+            replicas: previous.replicas.clone(),
+        };
+        if expected.service != self.configuration.as_ref()?.body.configuration.service {
+            return None;
+        }
+        expected.unit.previous = previous.unit.current;
+        expected.unit.current.configuration = previous.unit.current.configuration.checked_add(1)?;
+        for r in &mut expected.replicas.0 {
+            r.previous_role = r.current_role;
+            if r.node == lost.node {
+                r.current_role = 1;
+                r.up = false;
+                r.state = 3;
+            }
+        }
+        if expected != *removal {
+            return None;
+        }
+        if let Some(supersession) = supersession {
+            let candidate = supersession
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.current_role == 4)?;
+            if !self
+                .placements
+                .iter()
+                .any(|p| p.launch.node == primary.node && p.loss_reported)
+                || !expected
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == candidate.node && r.current_role == 3 && r.up)
+            {
+                return None;
+            }
+            expected.unit.current.configuration = expected
+                .unit
+                .current
+                .configuration
+                .checked_add(0x1_0000_0001)?;
+            for r in &mut expected.replicas.0 {
+                if r.node == primary.node {
+                    r.current_role = 3;
+                    r.up = false;
+                    r.state = 3;
+                } else if r.node == candidate.node {
+                    r.current_role = 4;
+                }
+                r.first_lsn = -1;
+                r.last_lsn = -1;
+            }
+            if expected != *supersession {
+                return None;
+            }
+        }
+        Some(RemovalInventory {
+            previous: previous.clone(),
+            removal: removal.clone(),
+            supersession: supersession.cloned(),
+        })
+    }
+
+    fn validate_removal_lfum(
+        &self,
+        index: usize,
+        body: &LfumUpload,
+        inventory: &RemovalInventory,
+    ) -> Result<()> {
+        let placement = &self.placements[index];
+        if placement.node_description.as_ref() != Some(&body.node)
+            || !body.any_replica_found
+            || body.units.0.len() > 1
+        {
+            return Err("LFUM removal requires the original known Node inventory".into());
+        }
+        let original = Configuration {
+            unit: inventory.previous.unit.clone(),
+            service: inventory.removal.service.clone(),
+            replicas: inventory.previous.replicas.clone(),
+        };
+        let completed_removal = completed_inventory(&inventory.removal);
+        let local = original
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.node == placement.launch.node)
+            .ok_or("removal inventory omitted its original owner")?;
+        let known_loss = placement.loss_reported
+            && (local.current_role == 4
+                || inventory
+                    .removal
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == local.node && r.current_role == 1));
+        if known_loss {
+            let Some(info) = body.units.0.first() else {
+                return Ok(());
+            };
+            if [
+                original.unit.clone(),
+                inventory.removal.unit.clone(),
+                completed_removal.unit.clone(),
+            ]
+            .contains(&info.unit)
+                && info.service == original.service
+                && !info.report_from_primary
+                && !info.local_deleted
+                && (info.intermediate == Epoch::default()
+                    || info.intermediate == inventory.removal.unit.current)
+                && info.replicas.0
+                    == vec![ReplicaInfo {
+                        description: dropped_replica(local),
+                        intermediate_role: 1,
+                    }]
+            {
+                return Ok(());
+            }
+            if local.current_role == 3 {
+                return Err("deleted removal destination cannot report a live membership".into());
+            }
+        }
+        let info = body
+            .units
+            .0
+            .first()
+            .ok_or("live removal owner omitted its committed inventory")?;
+        let mut views = vec![
+            (original.clone(), None),
+            (inventory.removal.clone(), None),
+            (inventory.removal.clone(), Some(&inventory.removal)),
+            (completed_removal.clone(), None),
+        ];
+        let promoted = inventory
+            .supersession
+            .as_ref()
+            .and_then(|f| f.replicas.0.iter().find(|r| r.current_role == 4));
+        if let Some(failover) = inventory.supersession.as_ref().filter(|_| !known_loss) {
+            views.extend([
+                (failover.clone(), None),
+                (failover.clone(), Some(failover)),
+                (completed_inventory(failover), None),
+            ]);
+            if !known_loss && promoted.is_some_and(|p| p.node != placement.launch.node) {
+                for (mut query, intermediate) in [
+                    (original, None),
+                    (inventory.removal.clone(), None),
+                    (inventory.removal.clone(), Some(&inventory.removal)),
+                    (completed_removal, None),
+                ] {
+                    query.unit = failover.unit.clone();
+                    for r in &mut query.replicas.0 {
+                        r.previous_role = inventory
+                            .removal
+                            .replicas
+                            .0
+                            .iter()
+                            .find(|old| old.node == r.node)
+                            .ok_or("query changed removal membership")?
+                            .previous_role;
+                    }
+                    views.push((query, intermediate));
+                }
+            }
+        }
+        if views.iter().any(|(view, intermediate)| {
+            inventory_view_matches(
+                info,
+                view,
+                &placement.launch.node,
+                *intermediate,
+                promoted.map(|p| &p.node),
+            )
+        }) {
+            Ok(())
+        } else {
+            Err(
+                "LFUM report changed the known removal/supersession PC, IC, CC or replica owner"
+                    .into(),
+            )
+        }
+    }
+
     pub fn begin_generation(&mut self) -> Result<()> {
         let profile = self.placements[0].launch.profile;
         let peer = profile.peer_replicas();
+        let removal = self.removal_inventory();
         let stable_peer = self.configuration.as_ref().is_some_and(|c| {
             (profile.configured_sizes().is_some()
                 || profile == crate::ServiceProfile::StatefulThree)
@@ -1612,7 +2124,7 @@ impl Ledger {
                                     }))
                         })
                 }))
-            .then(|| FailoverInventory {
+            .then(|| ConfigurationInventory {
                 previous: original.clone(),
                 configuration: swap.body.configuration.clone(),
             })
@@ -1648,15 +2160,56 @@ impl Ledger {
                     .configuration
                     .as_ref()
                     .map(|c| c.body.configuration.clone()),
+                cancelled: r.build.cancelled,
+                deleting: r.deletion.is_some(),
             });
+        let transfer = self.swap.as_ref().and_then(|swap| {
+            let intent = &swap.body.configuration;
+            if swap.unknown
+                || self.primary_failover()
+                || self.placements.len() != 3
+                || intent.service.target != 3
+                || intent.service.minimum != 2
+                || !self.candidate_changes.is_empty()
+                || self.restoration.is_some()
+                || self.repair.is_some()
+                || !self.healthy_transfer_members(&intent.replicas.0)
+                || swap.reply.as_ref().is_some_and(|reply| {
+                    reply.error != 0 || !self.healthy_transfer_members(&reply.replicas.0)
+                })
+            {
+                return None;
+            }
+            self.configuration
+                .iter()
+                .chain(&self.configuration_history)
+                .chain(
+                    self.repair_history
+                        .iter()
+                        .filter_map(|r| r.configuration.as_ref()),
+                )
+                .filter(|c| !c.unknown && c.body.configuration.service == intent.service)
+                .filter_map(|c| c.reply.as_ref())
+                .find(|reply| reply.error == 0 && reply.unit.current == intent.unit.previous)
+                .map(|previous| ConfigurationInventory {
+                    previous: previous.clone(),
+                    configuration: intent.clone(),
+                })
+        });
         if (peer
             && !stable_peer
             && initial_membership.is_none()
             && initial_builds.is_none()
             && failover.is_none()
+            && transfer.is_none()
+            && removal.is_none()
             && repair.is_none())
-            || (self.swap.is_some() && failover.is_none() && repair.is_none())
-            || (self.repair.is_some() && repair.is_none())
+            || (self.swap.is_some()
+                && failover.is_none()
+                && transfer.is_none()
+                && repair.is_none()
+                && removal.is_none())
+            || (self.repair.is_some() && repair.is_none() && removal.is_none())
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
             || self
@@ -1668,12 +2221,19 @@ impl Ledger {
                 .iter()
                 .enumerate()
                 .any(|(index, placement)| {
-                    let lost_primary = repair.is_none()
+                    let lost_primary = (repair.is_none()
                         && failover.as_ref().is_some_and(|inventory| {
                             inventory.configuration.replicas.0.iter().any(|r| {
                                 r.node == placement.launch.node && r.previous_role == 4 && !r.up
                             })
-                        });
+                        }))
+                        || (placement.loss_reported
+                            && removal.as_ref().is_some_and(|inventory| {
+                                inventory.removal.replicas.0.iter().any(|r| {
+                                    r.node == placement.launch.node
+                                        && (r.previous_role == 4 || r.current_role == 1)
+                                })
+                            }));
                     placement.bootstrap != Bootstrap::Admitted
                         || !placement.link_alive
                         || (!lost_primary
@@ -1699,7 +2259,7 @@ impl Ledger {
                                 || (placement.loss_reported && !lost_primary)))
                 })
         {
-            return Err("generation handshake requires admitted sessions and stable or initial build/admitting membership".into());
+            return Err("generation handshake requires admitted sessions and a supported live membership transition".into());
         }
         let current = self
             .generation
@@ -1712,7 +2272,9 @@ impl Ledger {
         round.initial_membership = initial_membership;
         round.initial_builds = initial_builds;
         round.failover = failover;
+        round.transfer = transfer;
         round.repair = repair;
+        round.removal = removal;
         Ok(())
     }
     pub fn report(&mut self, index: usize, body: &ReplicaUp) -> Result<Option<ReplicaUp>> {
@@ -2579,6 +3141,16 @@ impl Ledger {
         }
     }
     pub fn reply(&mut self, index: usize, body: AddInstanceReply, removing: bool) -> Result<()> {
+        if removing
+            && self.repair.as_ref().is_some_and(|r| {
+                r.deletion.is_some()
+                    && r.build.body.replica.node == body.replica.node
+                    && r.build.body.replica.id == body.replica.id
+                    && r.build.body.replica.instance == body.replica.instance
+            })
+        {
+            return self.repair_deletion_reply(index, body);
+        }
         if self.repair.iter().chain(&self.repair_history).any(|r| {
             self.placements[index].launch.node == r.predecessor.replica.node
                 && body.unit.id == r.predecessor.unit.id
@@ -2731,6 +3303,37 @@ impl Ledger {
         node_pid: u32,
     ) -> Result<()> {
         let placement = &mut self.placements[index];
+        if let Some(repair) = self
+            .repair
+            .as_mut()
+            .filter(|r| r.deletion.is_some() && r.build.body.replica.node == placement.launch.node)
+        {
+            let expected = &repair.build.body;
+            let replica = &proof.disposal.body.replica;
+            if replica.node != expected.replica.node
+                || replica.id != expected.replica.id
+                || replica.instance != expected.replica.instance
+                || replica.current_role != 2
+                || replica.previous_role != 1
+                || replica.state != 3
+                || !replica.up
+                || !replica.service_endpoint.is_empty()
+            {
+                return Err("cancelled repair disposal changed the exact Idle lifetime".into());
+            }
+            proof.validate_body(
+                &placement.launch,
+                repair.profile.as_ref().ok_or("missing cancelled host")?,
+                node_pid,
+                expected,
+            )?;
+            repair
+                .deletion
+                .as_mut()
+                .expect("requested repair deletion")
+                .disposal = Some(proof);
+            return Ok(());
+        }
         if let Some(config) = self
             .configuration
             .iter()
@@ -3093,6 +3696,8 @@ impl Ledger {
             },
             configuration: None,
             removal: None,
+            cancellation: None,
+            deletion: None,
             base: Some(active.clone()),
             host_requested: false,
             superseded_by: None,
@@ -3305,7 +3910,7 @@ impl Ledger {
             .or(self.swap.as_ref())
             .filter(|c| c.reply.is_some() && !c.unknown)
             .ok_or("restoration requires completed supersession or preceding repair")?;
-        if self.generation.is_some()
+        if self.generation_pending()
             || self.idle_removal.is_some()
             || self.idle_deletion.is_some()
             || self.placements.iter().any(|p| {
@@ -3492,6 +4097,8 @@ impl Ledger {
             },
             configuration: None,
             removal,
+            cancellation: None,
+            deletion: None,
             base: None,
             host_requested: false,
             superseded_by: None,
@@ -3551,6 +4158,7 @@ impl Ledger {
         if index != primary
             || !live
             || repair.unknown
+            || repair.build.cancelled
             || repair.profile.is_none()
             || repair.build.reply.is_some()
             || body.unit != expected.unit
@@ -3583,7 +4191,7 @@ impl Ledger {
         let Some(repair) = &mut self.repair else {
             return Ok(None);
         };
-        if repair.unknown || repair.configuration.is_some() || !live {
+        if repair.unknown || repair.build.cancelled || repair.configuration.is_some() || !live {
             return Ok(None);
         }
         let Some(built) = repair.build.reply.as_ref().filter(|r| r.error == 0) else {
@@ -3690,6 +4298,153 @@ impl Ledger {
         Ok(())
     }
 
+    pub fn cancel_repair_build(&mut self, now: Instant) -> Result<RemoveReplica> {
+        let live = self.repair_members_live();
+        let repair = self.repair.as_mut().ok_or("no repair build to cancel")?;
+        if !live
+            || repair.unknown
+            || repair.uses_spare()
+            || repair.removal.is_some()
+            || repair.base.is_some()
+            || repair.configuration.is_some()
+            || repair.profile.is_none()
+            || !repair.host_requested
+            || repair.build.body.service.target != 3
+            || repair.build.body.service.minimum != 2
+        {
+            return Err("cancellation requires the known fixed-3/2 original-Node repair Idle before admission".into());
+        }
+        let cancellation = repair.cancellation.get_or_insert_with(|| IdleRemoval {
+            body: repair.build.body.clone(),
+            reply: None,
+            failed_creation: false,
+            unknown: false,
+            started: now,
+            last: now,
+        });
+        if cancellation.unknown {
+            return Err("repair cancellation outcome is unknown".into());
+        }
+        cancellation.last = now;
+        repair.build.cancelled = true;
+        let body = cancellation.body.clone();
+        if let Some(inventory) = self
+            .generation
+            .as_mut()
+            .and_then(|g| g.repair.as_mut())
+            .filter(|r| r.build == body)
+        {
+            inventory.cancelled = true;
+        }
+        Ok(body)
+    }
+
+    fn repair_removal_reply(&mut self, index: usize, body: RemoveReplicaReply) -> Result<()> {
+        let primary = self.primary_index();
+        let repair = self.repair.as_mut().ok_or("unsolicited repair removal")?;
+        let cancellation = repair
+            .cancellation
+            .as_mut()
+            .ok_or("repair was not cancelled")?;
+        let expected = &cancellation.body;
+        if index != primary
+            || repair.unknown
+            || cancellation.unknown
+            || body.unit != expected.unit
+            || body.replica.node != expected.replica.node
+            || body.replica.id != expected.replica.id
+            || body.replica.instance != expected.replica.instance
+            || body.error != 0
+        {
+            return Ok(());
+        }
+        let mut replica = expected.replica.clone();
+        replica.state = 3;
+        replica.replication_endpoint = body.replica.replication_endpoint.clone();
+        if body.replica != replica || replica.replication_endpoint.is_empty() {
+            return Err("repair RemoveReplicaReply changed the cancelled Idle".into());
+        }
+        if cancellation
+            .reply
+            .as_ref()
+            .is_some_and(|previous| previous != &body)
+        {
+            return Err("repair removal completion changed after acceptance".into());
+        }
+        cancellation.reply = Some(body);
+        Ok(())
+    }
+
+    pub fn delete_cancelled_repair(&mut self) -> Result<DeleteReplica> {
+        let repair = self.repair.as_mut().ok_or("no repair to delete")?;
+        if repair.unknown || repair.cancellation.as_ref().is_none_or(|c| c.unknown) {
+            return Err("destination deletion requires the known cancelled repair owner".into());
+        }
+        let now = Instant::now();
+        repair
+            .deletion
+            .get_or_insert(RepairDeletion {
+                reply: None,
+                disposal: None,
+                started: now,
+                last: now,
+            })
+            .last = now;
+        let body = repair.build.body.clone();
+        if let Some(inventory) = self
+            .generation
+            .as_mut()
+            .and_then(|g| g.repair.as_mut())
+            .filter(|r| r.build == body)
+        {
+            inventory.deleting = true;
+        }
+        Ok(DeleteReplica::new(body, false))
+    }
+
+    fn repair_deletion_reply(&mut self, index: usize, body: DeleteReplicaReply) -> Result<()> {
+        let destination = self
+            .repair_destination_index()
+            .ok_or("missing cancelled destination")?;
+        let repair = self.repair.as_mut().expect("repair");
+        if index != destination
+            || repair.deletion.is_none()
+            || repair.unknown
+            || body.unit != repair.build.body.unit
+            || body.error != 0
+            || body.replica.node != repair.build.body.replica.node
+            || body.replica.id != repair.build.body.replica.id
+            || body.replica.instance != repair.build.body.replica.instance
+        {
+            return Ok(());
+        }
+        if body.replica != dropped_replica(&repair.build.body.replica) {
+            return Err("repair deletion reply is not the cancelled dropped lifetime".into());
+        }
+        repair
+            .deletion
+            .as_mut()
+            .expect("requested repair deletion")
+            .reply = Some(body);
+        Ok(())
+    }
+
+    pub fn repair_deletion_retry(&mut self, index: usize, now: Instant) -> Option<DeleteReplica> {
+        if self.repair_destination_index()? != index {
+            return None;
+        }
+        let repair = self.repair.as_mut()?;
+        let deletion = repair.deletion.as_mut()?;
+        if repair.unknown
+            || deletion.reply.is_some()
+            || !action_retry_due(deletion.started, deletion.last, now)
+        {
+            return None;
+        }
+        deletion.last = now;
+        Some(DeleteReplica::new(repair.build.body.clone(), false))
+    }
+
     pub fn repair_status(&self) -> Value {
         let Some(r) = self.repair.as_ref().or_else(|| {
             self.repair_history
@@ -3702,6 +4457,8 @@ impl Ledger {
             "superseded"
         } else if r.unknown {
             "unknown"
+        } else if r.build.cancelled {
+            "cancelled"
         } else if r.configuration.as_ref().is_some_and(|c| c.reply.is_some()) {
             "ready"
         } else if r.build.reply.as_ref().is_some_and(|b| b.error != 0) {
@@ -3716,7 +4473,12 @@ impl Ledger {
             "kind":if r.uses_spare() {"spare_replacement"} else if r.base.is_some() {"restoration"} else if r.removal.is_some() {"secondary"} else {"primary"},
             "removed":r.removal.as_ref().is_some_and(|c| c.reply.is_some()),
             "old_profile":r.old_profile,"profile":r.profile,"request":r.build.body,"build_reply":r.build.reply,
-            "host_ready":r.profile.is_some(),"built":r.build.reply.as_ref().is_some_and(|b| b.error == 0)})
+            "host_ready":r.profile.is_some(),"built":r.build.reply.as_ref().is_some_and(|b| b.error == 0),
+            "cancelled":r.build.cancelled,
+            "pending_remove":r.cancellation.as_ref().is_some_and(|c| c.reply.is_none()),
+            "replicator_removed":r.cancellation.as_ref().is_some_and(|c| c.reply.is_some()),
+            "destination_deleted":r.deletion.as_ref().is_some_and(|d| d.reply.is_some()),
+            "disposed":r.deletion.as_ref().is_some_and(|d| d.disposal.is_some())})
     }
     pub fn request_idle_on(&mut self, destination: usize, now: Instant) -> Result<AddReplica> {
         let count = self.placements[0].launch.profile.node_count();
@@ -4664,6 +5426,7 @@ impl Ledger {
         if let Some(repair) = &mut self.repair {
             if index != primary
                 || repair.unknown
+                || repair.build.cancelled
                 || repair.profile.is_none()
                 || repair.build.reply.is_some()
                 || !action_retry_due(repair.build.started, repair.build.last, now)
@@ -4818,6 +5581,9 @@ impl Ledger {
         Ok(body)
     }
     pub fn idle_removal_reply(&mut self, index: usize, body: RemoveReplicaReply) -> Result<()> {
+        if self.repair.as_ref().is_some_and(|r| r.build.cancelled) {
+            return self.repair_removal_reply(index, body);
+        }
         let Some(removal) = &mut self.idle_removal else {
             return Ok(());
         };
@@ -4856,6 +5622,20 @@ impl Ledger {
         Ok(())
     }
     pub fn idle_removal_retry(&mut self, index: usize, now: Instant) -> Option<RemoveReplica> {
+        let primary = self.primary_index();
+        if let Some(repair) = &mut self.repair {
+            let removal = repair.cancellation.as_mut()?;
+            if index != primary
+                || repair.unknown
+                || removal.unknown
+                || removal.reply.is_some()
+                || !action_retry_due(removal.started, removal.last, now)
+            {
+                return None;
+            }
+            removal.last = now;
+            return Some(removal.body.clone());
+        }
         let removal = self.idle_removal.as_mut()?;
         if index != 0
             || self.generation.is_some()

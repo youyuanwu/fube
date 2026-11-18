@@ -386,7 +386,21 @@ The additional 3/2 cases cover FM-owned Idle build, same-Primary admission,
 and two successive Primary app-host failover/explicit-repair cycles, including
 promotion of a repaired replica. Native node deactivation also interrupts the
 fresh repair Secondary while its public role callback and superseding uploads
-are held. Participating build/configuration requests must be committed.
+are held. Fixed-3/2 original-Node Primary repair additionally qualifies cancellation
+during public copy-state enumeration or after build completion with its FM reply
+lost. Native RemoveReplica cancellation/retry, destination Delete/disposal and
+generation ACKs remain independent; cancelled intent cannot admit the replica or
+authorize another host. Participating build/configuration requests must be committed.
+Healthy fixed-3/2 planned handoff on three original Nodes additionally qualifies
+generation rollover with either first candidate, during demotion, missing-progress
+GetLSN, catch-up, Secondary activation, final RAP End and locally completed
+handoff awaiting its lost FM reply.
+Both launchers also qualify 5/3 pre-replacement removal supersession, with 3/2
+refusing promotion: generation rollover crosses undelivered removal, deactivated
+survivors and locally completed removal awaiting its final FM reply. Older upload
+retries remain independently owned; missing GetLSN progress, separate PC/CC
+quorums and final RAP/FM completion cannot be supplied by LFUM ACKs. No new host
+or replica lifetime is authorized.
 This is live-session metadata reconciliation, not startup
 recovery or a production FM rebuild.
 
@@ -404,10 +418,11 @@ predecessor cleanup in shared Node/Hosting.
 
 The [current LFUM contract and evidence](MinimalFmCluster.md#live-session-lfum-upload)
 is shared with the local cluster. The [alignment plan](RustRaPort.md#lfum-alignment-plan)
-tracks remaining copy/build interruption and removal supersession.
+tracks broader interruption, supersession lineages and subsequent restoration overlaps.
 Each repeated failover round uses the latest completed membership and known
-fresh replica identities, not the original configuration. Shared model/store
-coverage of transfer/redirection is separate from runtime qualification.
+fresh replica identities, not the original configuration. Broader
+transfer/redirection model/store coverage remains distinct from the healthy
+fixed-3/2 process overlap qualification.
 Standalone now qualifies repeated/reverse healthy planned handoff at 2/1 and 3/2,
 including either original Secondary as the first candidate and committed participation by the
 unchanged 3/2 Secondary. FM starts at the old Primary; shared RA owns the native
@@ -441,7 +456,7 @@ or invented successful activation is used. Actual disposal, lost final reply
 replay, unchanged survivors and replacement quorum/no-quorum are exercised.
 Shared model/store cases also cover unknown and uncatchable progress and a
 former-Primary target. Persisted restart, same-handoff volatile rebuild,
-other restart-required sizes, swap abort and concurrent standalone
+other restart-required sizes, swap abort and restart-required standalone
 generation/LFUM transfer overlaps remain unqualified or gated.
 Nonempty NodeUp reconciliation, full initial ReplicaUp batching/final ACK,
 FM/FMM rebuild and restart remain gated; native handler/interoperability evidence

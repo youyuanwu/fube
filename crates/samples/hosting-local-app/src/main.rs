@@ -2,7 +2,7 @@
 use clap::Parser;
 use fube_data::{
     extensions::ReplicationEndpointOptions, IOperation, IOperationDataStream, IStateProvider,
-    MemoryProvider, Mutation,
+    MemoryProvider, Mutation, OperationData,
 };
 use fube_runtime::{
     extensions::{
@@ -619,7 +619,61 @@ impl IStateProvider for ObservedProvider {
         horizon: i64,
         context: Option<Arc<dyn IOperationDataStream>>,
     ) -> Result<Arc<dyn IOperationDataStream>> {
-        self.memory.get_copy_state(horizon, context)
+        let inner = self.memory.get_copy_state(horizon, context)?;
+        let release = self.resource.with_file_name("local-copy-state.release");
+        if release.with_file_name("local-copy-state.block").exists() {
+            Ok(Arc::new(HeldCopyState { inner, release }))
+        } else {
+            Ok(inner)
+        }
+    }
+}
+struct HeldCopyState {
+    inner: Arc<dyn IOperationDataStream>,
+    release: PathBuf,
+}
+struct HeldCopyRead {
+    cancel: Cancellation,
+    retired: PathBuf,
+}
+impl Drop for HeldCopyRead {
+    fn drop(&mut self) {
+        std::fs::write(
+            &self.retired,
+            if self.cancel.is_cancelled() {
+                "cancelled"
+            } else {
+                "completed"
+            },
+        )
+        .expect("publish fixture copy-state callback retirement");
+    }
+}
+impl IOperationDataStream for HeldCopyState {
+    fn get_next(&self, cancel: Cancellation) -> ApiFuture<'_, Option<OperationData>> {
+        Box::pin(async move {
+            let _retirement = HeldCopyRead {
+                cancel: cancel.clone(),
+                retired: self.release.with_file_name("local-copy-state.retired"),
+            };
+            std::fs::write(
+                self.release.with_file_name("local-copy-state.held"),
+                b"pending public copy-state enumeration",
+            )
+            .expect("publish fixture copy-state barrier");
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err(Error::new(fube_runtime::ErrorKind::Canceled, "copy-state cancelled"));
+                }
+                result = tokio::time::timeout(Duration::from_secs(30), async {
+                    while !self.release.exists() {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }) => result.expect("bounded fixture copy-state barrier timed out"),
+            }
+            self.inner.get_next(cancel).await
+        })
     }
 }
 impl Drop for ObservedProvider {

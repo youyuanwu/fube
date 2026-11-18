@@ -604,7 +604,7 @@ impl Cluster {
             }
             "RemoveReplicaReply" => {
                 let (body, owner) = decode_remove_replica_reply(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm || self.config.profile != ServiceProfile::StatefulPeerIdle {
+                if owner != Owner::Fm || !self.config.profile.peer_replicas() {
                     return Err(
                         "RemoveReplicaReply requires the original peer-idle FM profile".into(),
                     );
@@ -784,6 +784,40 @@ impl Cluster {
             }
         }
         Ok(self.ledger.repair_status())
+    }
+
+    /// Cancel one fresh repair Idle without authorizing another replica lifetime.
+    pub async fn cancel_repair_build(&mut self) -> Result<Value> {
+        if self.finished.is_some() {
+            return Err("repair cancellation requires the original running cluster".into());
+        }
+        let body = self.ledger.cancel_repair_build(Instant::now())?;
+        self.send_idle_removal(&body).await?;
+        Ok(self.ledger.repair_status())
+    }
+
+    /// Delete the exact cancelled destination independently of Primary removal.
+    pub async fn delete_cancelled_repair(&mut self) -> Result<Value> {
+        if self.finished.is_some() {
+            return Err("repair deletion requires the original running cluster".into());
+        }
+        let destination = self
+            .ledger
+            .repair_destination_index()
+            .ok_or("missing repair destination")?;
+        let body = self.ledger.delete_cancelled_repair()?;
+        self.send_repair_deletion(destination, &body).await?;
+        Ok(self.ledger.repair_status())
+    }
+
+    async fn send_repair_deletion(&self, destination: usize, body: &DeleteReplica) -> Result<()> {
+        let child = &self.children[destination];
+        child
+            .link
+            .as_ref()
+            .ok_or("original repair destination link absent")?
+            .send(delete_replica_message(body, &child.generation()).map_err(err)?)
+            .await
     }
 
     /// Replace one processed lost member on an explicitly selected unused Node.
@@ -1023,7 +1057,7 @@ impl Cluster {
     async fn send_idle_removal(&self, body: &RemoveReplica) -> Result<()> {
         let child = self
             .children
-            .first()
+            .get(self.ledger.primary_index())
             .ok_or("missing original Primary owner")?;
         child
             .link
@@ -1049,6 +1083,9 @@ impl Cluster {
             .await
     }
     async fn retry_idle_deletion(&mut self, index: usize) -> Result<()> {
+        if let Some(body) = self.ledger.repair_deletion_retry(index, Instant::now()) {
+            return self.send_repair_deletion(index, &body).await;
+        }
         let Some(body) = self.ledger.idle_deletion_retry(index, Instant::now()) else {
             return Ok(());
         };

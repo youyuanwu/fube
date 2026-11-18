@@ -928,13 +928,36 @@ pub(super) fn complete_build(
     Ok(lifecycle::changed(state, effects, false))
 }
 
+fn removable_idle(current: &EntityState, target: &NodeInstance) -> bool {
+    if current.reconfiguration.is_none() && current.swap.is_none() {
+        return current.peer_creation.is_none();
+    }
+    current
+        .reconfiguration
+        .as_ref()
+        .is_none_or(|c| c.stage == ConfigurationStage::Complete)
+        && current
+            .swap
+            .as_ref()
+            .is_none_or(|s| s.stage == SwapStage::Complete)
+        && reconfiguration::completed_configuration(current).is_some_and(|c| {
+            c.unit.current == current.body.unit.current
+                && !c
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == *target && r.current_role >= 3)
+        })
+}
+
 pub(super) fn start_removal(
     current: Option<&EntityState>,
     admission: &Admission,
     peer: Option<&NodeInstance>,
 ) -> Result<Transition> {
     let current = current.ok_or(Failure::Admission("removal requires an existing Primary"))?;
-    if current.reconfiguration.is_some() {
+    let target = peer.ok_or(Failure::Unsupported("manual multi-peer removal is gated"))?;
+    if !removable_idle(current, target) {
         return Err(Failure::Unsupported(
             "configured-secondary removal is gated",
         ));
@@ -942,7 +965,6 @@ pub(super) fn start_removal(
     if !admission.node_open || !admission.owner_ready || !admission.node_activated {
         return Ok(Transition::ignored(Disposition::IgnoredNotReady));
     }
-    let target = peer.ok_or(Failure::Unsupported("manual multi-peer removal is gated"))?;
     let remote = current
         .remote_idle(target)
         .ok_or(Failure::Unsupported("no opened peer Idle"))?;
@@ -958,7 +980,6 @@ pub(super) fn start_removal(
     if current.phase != Phase::Ready
         || !current.fm_primary
         || current.body.replica.current_role != 4
-        || current.peer_creation.is_some()
         || peer != Some(&remote.target)
     {
         return Err(Failure::Unsupported(
@@ -1039,7 +1060,7 @@ pub(super) fn remove_from_fm(
     if current.body.replica.current_role != 4
         || current.body.replica.state != 2
         || current.runtime.is_none()
-        || current.peer_creation.is_some()
+        || !removable_idle(current, &remote.target)
         || peer != Some(&remote.target)
     {
         return Err(Failure::Unsupported(
