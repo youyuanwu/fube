@@ -27,6 +27,9 @@ use tokio::{
 };
 use tower_service::Service;
 
+#[path = "transport/typed_server.rs"]
+mod typed_server;
+
 #[derive(Clone)]
 struct Function<F>(F);
 impl<F, Fut, Q, R, E> Service<Q> for Function<F>

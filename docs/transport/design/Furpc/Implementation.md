@@ -93,6 +93,24 @@ zero for empty bodies. Codec errors retain encode/decode phase, original source,
 and resource-limit classification without becoming connection-protocol failures.
 No decoded-allocation ledger or transport-budget handoff is introduced.
 
+Typed ingress methods now use `server::Rpc<C>::unary` or `one_way` inside the
+same byte-facing services. `Reply<T>` supplies response data and ordered headers;
+only the existing runner owns reply tickets, correlation and original-generation
+submission. Adapters validate live core-created context, original exchange kind,
+current native headers, and the admitted input/frame policy before decoding.
+They use the actual scope response-output limit and shared readiness-waiter
+capacity rather than independent method pools or construction-time defaults.
+One-way adaptation never constructs an encoder or requires unused encode
+types/state to be Send.
+
+Invocation context retains only a weak link to private state, not handler/reply
+permits or a scope owner. Queued application workers preserve the original
+deadline and are notified when the owning runner retires their invocation.
+Typed readiness/handler futures are dropped on that cancellation or deadline;
+no method task or work queue is created by the crate. Application codec work
+remains trusted and cooperative. Admitted typed replies can complete during
+graceful drain without a general-purpose Peer.
+
 TCP/custom connectors, Accept, TCP/stream acceptors and
 `Server::serve_with_shutdown` use the same physical engine. Canonical raw
 IngressService bindings admit bounded work at the header gate, before body
@@ -133,7 +151,7 @@ handshake, peer-ready and server drain default to 30 seconds; HandlerLimits
 retain their documented 8 in-flight/4 readiness-waiter/30-second defaults.
 These are not native constants or performance qualification.
 
-Specialized duplex, typed server adapters, Actor routing and TLS remain
+Specialized duplex, Actor routing and TLS remain
 unimplemented. The raw one-way binding still rejects request/reply flags; it
 does not gain reply authority by sharing the managed connection.
 

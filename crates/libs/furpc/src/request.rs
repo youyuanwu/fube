@@ -1,8 +1,5 @@
-use crate::{HeaderRecord, Headers, Peer, Result, Source};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Weak,
-};
+use crate::{service::InvocationState, HeaderRecord, Headers, Peer, Result, Source};
+use std::sync::Weak;
 use tokio::time::Instant;
 
 #[derive(Debug)]
@@ -10,7 +7,7 @@ pub struct RequestContext {
     pub(crate) source: Source,
     pub(crate) peer: Option<Peer>,
     pub(crate) deadline: Instant,
-    pub(crate) live: Weak<AtomicBool>,
+    pub(crate) invocation: Weak<InvocationState>,
 }
 impl RequestContext {
     pub fn source(&self) -> &Source {
@@ -23,9 +20,9 @@ impl RequestContext {
         self.deadline
     }
     pub(crate) fn is_live(&self) -> bool {
-        self.live
+        self.invocation
             .upgrade()
-            .is_some_and(|live| live.load(Ordering::Acquire))
+            .is_some_and(|state| state.is_live())
     }
 }
 
