@@ -525,6 +525,48 @@ class ProofFiles(fixtures.ProjectFiles):
             "same_generation_after_error": True, "mixed_concurrent_operations": 3,
             "native_start_ms": int(start * 1000) + 1, "native_end_ms": int(start * 1000) + 10,
         }
+        topology = lists["topology"]
+        topology.update(
+            partition_count=6, replica_instance_count=22, native_missing_partition_code=-2147017753,
+            exact_partition_replica_application_selectors=True, ready_replica_status_filter=True,
+            raw_native_epoch_not_compared_to_rest_projection=True,
+            furpc={"generation": 1, "same_generation_after_error": True,
+                   "native_error_origin": "domain", "mixed_concurrent_operations": 3,
+                   "native_start_ms": int(start * 1000) + 11, "native_end_ms": int(start * 1000) + 20})
+        topology["independent_partition_replicas"] = []
+        for app in applications:
+            for kind in ("Stateful", "Stateless"):
+                for index in range(2 if kind == "Stateful" else 1):
+                    count = len(topology["independent_partition_replicas"])
+                    identity = partition if count == 0 else f"{count:08x}-1111-4111-8111-111111111111"
+                    information = {"Id": identity, "ServicePartitionKind": "Int64Range" if kind == "Stateful"
+                                   else "Singleton", "LowKey": str(-(2**63)), "HighKey": str(2**63 - 1)}
+                    observed = {
+                        "ServiceKind": kind, "PartitionStatus": "Ready", "HealthState": "Ok",
+                        "PartitionInformation": information, "InstanceCount": 5,
+                        "TargetReplicaSetSize": 3, "MinReplicaSetSize": 2, "LastQuorumLossDurationInSeconds": "0"}
+                    native = {
+                        "kind": kind, "status": "Ready", "health_state": "Ok",
+                        "information": {"id": identity, "kind": information["ServicePartitionKind"], "name": "",
+                                        "low_key": -(2**63), "high_key": 2**63 - 1},
+                        "instance_count": 5, "target_replica_set_size": 3, "min_replica_set_size": 2,
+                        "last_quorum_loss_duration_in_seconds": 0}
+                    native_replicas, independent_replicas = [], []
+                    for number in range(3 if kind == "Stateful" else 5):
+                        replica = {
+                            "id": 10 + number, "node_name": f"N00{number + 1}0",
+                            "kind": kind, "status": "Ready", "health_state": "Ok",
+                            "role": ("Primary" if number == 0 else "ActiveSecondary") if kind == "Stateful" else "Unknown",
+                            "address": f"opaque/{identity}/{number}", "last_in_build_duration_in_seconds": 0}
+                        independent_replicas.append({
+                            "ReplicaId" if kind == "Stateful" else "InstanceId": str(replica["id"]),
+                            "NodeName": replica["node_name"], "ServiceKind": kind, "ReplicaStatus": "Ready",
+                            "ReplicaRole": replica["role"], "HealthState": "Ok", "Address": replica["address"],
+                            "LastInBuildDurationInSeconds": "0"})
+                        native_replicas.append(replica)
+                    topology["independent_partition_replicas"].append({
+                        "service": app + "/" + kind, "partition": observed, "native_partition": native,
+                        "replicas": independent_replicas, "native_replicas": native_replicas})
         notification = {
             **common, "allocation": allocation, "passed": list(ci.NOTIFICATION_CASES),
             "owned_cleanup_confirmed": True, "resolved": [{"model": 1}], "named": {"model": 1},
@@ -1410,6 +1452,47 @@ class WorkerTests(ProofFiles):
                 change(broken[ci.NATIVE_FILES[3]])
                 with self.assertRaises(ci.ProofError):
                     ci.validate_native(broken, archive, allocation)
+
+    def test_furpc_topology_requires_typed_native_results_and_independent_http(self):
+        original = self.native_reports("owned", 1)[ci.NATIVE_FILES[3]]
+        self.assertEqual(ci.validate_furpc_topology(original), [1.011, 1.020])
+        changes = [
+            lambda topology: topology.pop("furpc"),
+            lambda topology: topology["furpc"].update(generation=2),
+            lambda topology: topology["furpc"].update(generation=True),
+            lambda topology: topology["furpc"].update(same_generation_after_error=1),
+            lambda topology: topology["furpc"].update(mixed_concurrent_operations=True),
+            lambda topology: topology["furpc"].update(native_error_origin="local"),
+            lambda topology: topology["furpc"].update(native_end_ms=1010),
+            lambda topology: topology.update(native_missing_partition_code=0),
+            lambda topology: topology.update(partition_count=True),
+            lambda topology: topology.update(replica_instance_count=21),
+            lambda topology: topology["independent_partition_replicas"].pop(),
+            lambda topology: topology["independent_partition_replicas"][0].pop("native_partition"),
+            lambda topology: topology["independent_partition_replicas"][0].update(service="fabric:/foreign"),
+            lambda topology: topology["independent_partition_replicas"][0]["native_partition"].update(kind="Stateless"),
+            lambda topology: topology["independent_partition_replicas"][0]["native_partition"].update(
+                min_replica_set_size=True),
+            lambda topology: topology["independent_partition_replicas"][0]["native_partition"]["information"].update(
+                low_key=0),
+            lambda topology: topology["independent_partition_replicas"][0]["partition"]["PartitionInformation"].update(
+                LowKey=str(-(2**63) - 1)),
+            lambda topology: topology["independent_partition_replicas"][1]["native_partition"]["information"].update(
+                id=topology["independent_partition_replicas"][0]["native_partition"]["information"]["id"]),
+            lambda topology: topology["independent_partition_replicas"][0].update(native_replicas=[]),
+            lambda topology: topology["independent_partition_replicas"][0]["native_replicas"][0].update(id=True),
+            lambda topology: topology["independent_partition_replicas"][0]["native_replicas"][0].update(id="10"),
+            lambda topology: topology["independent_partition_replicas"][0]["native_replicas"][0].update(address="wrong"),
+            lambda topology: topology["independent_partition_replicas"][0]["native_replicas"][0].update(role="Unknown"),
+            lambda topology: topology["independent_partition_replicas"][0]["native_replicas"][0].update(
+                last_in_build_duration_in_seconds=True),
+        ]
+        for index, change in enumerate(changes):
+            with self.subTest(change=index):
+                broken = copy.deepcopy(original)
+                change(broken["topology"])
+                with self.assertRaises(ci.ProofError):
+                    ci.validate_furpc_topology(broken)
 
     def test_native_movement_observation_must_belong_to_current_execution(self):
         directory = self.worker("client-runtime")

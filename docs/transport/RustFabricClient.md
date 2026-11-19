@@ -10,12 +10,12 @@ have been demonstrated against the repository's Ubuntu onebox running
 Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
 
-**Client migration:** Ping, NameExists, node/application/service lists and node
-health are implemented only by `FurpcClient` over furpc. Their old `FabricClient`
+**Client migration:** Ping, NameExists, node/application/service/partition/replica
+lists and node health are implemented only by `FurpcClient` over furpc. Their old `FabricClient`
 methods, `PingRequest`, Exists naming variant and legacy query `ClientRequest`
 implementations have been removed. There is no compatibility wrapper or fallback.
 `FabricClient` and borrowed `GatewayClient` retain the legacy typed-call layer
-for naming writes, partition/replica/deployment queries, resolution and MovePrimary.
+for naming writes, deployment queries, resolution and MovePrimary.
 ServiceNotificationClient owns its **own**
 notification-enabled GatewayChannel/native session; it does not adopt an
 ordinary client's channel or lifecycle. ImageStoreClient owns an independent
@@ -36,7 +36,7 @@ SHA256 comparison passed. Repeated native SDK copy reliability is not claimed.
 
 ### Separate furpc-backed client
 
-`FurpcClient` is the canonical implementation of six read-only native operations.
+`FurpcClient` is the canonical implementation of eight read-only native operations.
 The remaining `FabricClient` API does not expose these operations:
 
 | Method | Typed request body | Typed response body |
@@ -46,6 +46,8 @@ The remaining `FabricClient` API does not expose these operations:
 | `get_node_list` | `NodeQueryDescription` | `NodeListPage` |
 | `get_application_list` | `ApplicationQueryDescription` | `ApplicationListPage` |
 | `get_service_list` | `ServiceQueryDescription` | `ServiceListPage` |
+| `get_partition_list` | `PartitionQueryDescription` | `PartitionListPage` |
+| `get_replica_list` | `ReplicaQueryDescription` | `ReplicaListPage` |
 | `get_node_health` | `NodeHealthQueryDescription` | `NodeHealth` |
 
 Each method accepts `furpc::Request<T>` and an absolute deadline, and returns
@@ -97,7 +99,7 @@ node schema; aggregate Actor/Action headers are optional but checked when presen
 Query error codes remain domain failures, and malformed typed payloads or
 disagreeing repeated node IDs cannot be hidden behind a nonzero query error.
 
-All four queries delegate to the private generic `query` helper and `QueryCodec<Q>`.
+All six queries delegate to the private generic `query` helper and `QueryCodec<Q>`.
 Query declarations supply the native name, Serde arguments, parameter checks,
 typed reply profile and record validation. The remaining legacy query families
 reuse the same transport-independent framing and validation; only their adapter consumes a
@@ -111,6 +113,9 @@ metadata and optional checked NamingGateway/QueryReply headers. Node health is
 an unpaged item requiring Actor 16 and OperationSuccessAction. It preserves the
 distinction between omitted and explicit policy overrides, and sends event
 filters as numeric-mask JSON. An unhealthy aggregate is successful data.
+Partition and replica lists use the same strict list profile with tags 5 and 6.
+Their native names are GetServicePartitionList and GetServicePartitionReplicaList;
+both accept continuations but reject MaxResults before transport submission.
 
 Node filters and paging retain their native values and empty-string omission
 semantics. The new query codec does not adopt legacy standalone string/count
@@ -160,7 +165,17 @@ The initial three archived scenarios passed together on Service Fabric
 **11.8.121.4**, also requalifying Ping, NameExists and GetNodeList after the
 generic-codec refactor.
 
-This qualifies only these six initiating clear-TCP operations on the observed
+The partition/replica migration reuses those declarations and retires both
+legacy methods and typed-request adapters. Its updated owned list scenario
+records canonical furpc partition/replica fields alongside independent HTTP,
+checks six partitions and 22 replicas/instances, and verifies native
+missing-partition error **-2147017753**, original-generation reuse and concurrent
+partition/replica/Ping calls. Movement still uses the legacy writer but observes
+replicas through furpc. The rewritten scenario has not yet been rerun against
+a native onebox; historical legacy topology observations do not qualify the
+new furpc methods.
+
+The completed native run qualifies only the original six initiating clear-TCP operations on the observed
 runtime, not native notifications, accepted-side serving, TLS, other gateway
 operations, or the rest of the client migration.
 
@@ -170,8 +185,8 @@ operations, or the rest of the client migration.
 ordered native headers, client-only ListenInstance establishment, and
 continuously driven, bounded concurrent Tokio request/reply I/O. `fube-client`
 retains single-name creation/deletion, with owned results and explicit errors.
-Legacy typed pages cover service partitions, partition replicas/stateless instances and
-node-local deployed applications. Unpaged node/application-scoped lists inspect
+Legacy typed pages cover node-local deployed applications.
+Unpaged node/application-scoped lists inspect
 service packages, code packages and deployed replicas.
 Uncached resolution and independent notification sessions add endpoint discovery
 without an endpoint-result cache.
@@ -191,8 +206,8 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 | GetNodeHealth | Sends external `GetNodeHealth` via NamingGateway; validates the HM single-item envelope, aggregate, full events and Event evaluations. Independently injected Warning, false/true/inherited policy, event masks, unknown-node error and healthy same-connection reuse qualified live. |
 | GetApplicationList | Native external query with owned application identity/type/version/status/health/parameters/definition; two unique nonempty applications, exact/type/definition filters, parameter exclusion and explicit native continuation qualified live. |
 | GetServiceList | Public Rust method sends external **GetApplicationServiceList** for an ordinary application. Owned kind/type/manifest/status/health/persistence/group results; stateless and volatile stateful guest services, filters and real native continuation qualified live. |
-| GetPartitionList | Sends **GetServicePartitionList**, wrapper tag 5. Singleton/stateless and int64-range/stateful records, GUID selectors and overlapping fields independently compared live for six owned partitions. Named keys and message-size continuations have offline coverage only. |
-| GetReplicaList | Sends **GetServicePartitionReplicaList**, wrapper tag 6. Stateful replicas and stateless instances, signed ID selectors, Ready status filtering, addresses, placement and health compared live for 22 records; missing-partition error followed by healthy reuse. Message-size continuations have offline coverage only. |
+| GetPartitionList | Furpc sends **GetServicePartitionList**, wrapper tag 5. Historical legacy evidence covers six owned partitions, singleton/stateless and int64-range/stateful fields and GUID selectors. Furpc native requalification is pending; Named keys and message-size continuations have offline coverage only. |
+| GetReplicaList | Furpc sends **GetServicePartitionReplicaList**, wrapper tag 6. Historical legacy evidence covers 22 stateful replicas/stateless instances, signed selectors, Ready filtering, placement and native error reuse. Furpc native requalification is pending; message-size continuations have offline coverage only. |
 | GetDeployedApplicationList | Sends **GetApplicationPagedListDeployedOnNode**, wrapper tag 10. Node/application selectors, directory fields, requested/default health and real count-limited continuation independently compared live; missing-node error followed by healthy reuse. |
 | GetDeployedServicePackageList | Sends **GetServiceManifestListDeployedOnNode**, wrapper tag 11. Ten service-package observations independently compared live, including manifest/version/status/activation and exact manifest selectors. No paging. |
 | GetDeployedCodePackageList | Sends **GetCodePackageListDeployedOnNode**, wrapper tag 14. Ten ExeHost code-package observations independently compared live, including entry points/statistics, host/activation fields and exact code-package selectors. Setup execution and container hosts are offline-only. No paging. |
@@ -1029,39 +1044,46 @@ Three additional list APIs extend discovery beyond applications and services:
 | `get_deployed_application_list` | Applications deployed on one selected node, not the cluster-wide application inventory. |
 
 Each accepts a `PagedQuery`-based description and returns one owned `QueryPage`.
-The optional timeout uses one whole-operation deadline,
-including parameter validation and decoding. Continuations are opaque and must
+Partition and replica lists take `furpc::Request<Description>` and an absolute
+deadline, returning the page inside `furpc::Response`. They follow furpc
+settlement/deadline rules. Deployed-application listing remains on `FabricClient`
+with its optional timeout and legacy whole-operation deadline.
+Continuations are opaque and must
 be followed explicitly; observations across pages and families are not a
-snapshot. Native errors and malformed domain replies remain operation-local; transport failures retire
-the shared connection. The existing restricted naming URI profile still applies
+snapshot. Native domain errors and malformed success bodies remain operation-local;
+furpc transport/protocol failures may retire a generation, without replaying a
+submitted call. The existing restricted naming URI profile still applies
 to service names and application selectors.
 
 ```rust,no_run
 use std::time::Duration;
 use fube_client::{
     DeployedApplicationQueryDescription, DeployedApplicationQueryParameters,
-    FabricClient, PartitionQueryDescription, PartitionQueryParameters,
+    FabricClient, FurpcClient, PartitionQueryDescription, PartitionQueryParameters,
     ReplicaQueryDescription, ReplicaQueryParameters,
 };
+use furpc::Request;
+use tokio::time::Instant;
 
-# async fn topology(client: &FabricClient, partition_id: uuid::Uuid) -> Result<(), Box<dyn std::error::Error>> {
+# async fn topology(client: &FabricClient, reads: &mut FurpcClient, partition_id: uuid::Uuid) -> Result<(), Box<dyn std::error::Error>> {
+let deadline = Instant::now() + Duration::from_secs(30);
 let mut partitions = PartitionQueryDescription::new(PartitionQueryParameters::new(
     "fabric:/MyApplication/MyService".parse()?,
 ));
-let page = client.get_partition_list(&partitions, None).await?;
+let page = reads.get_partition_list(Request::new(partitions.clone()), deadline).await?.into_body();
 for partition in page.items {
     println!("{} {:?}", partition.partition_information.id, partition.kind);
     let replicas = ReplicaQueryDescription::new(ReplicaQueryParameters::new(
         partition.partition_information.id,
     ));
-    println!("{:?}", client.get_replica_list(&replicas, None).await?.items);
+    println!("{:?}", reads.get_replica_list(Request::new(replicas), deadline).await?.into_body().items);
 }
 partitions.paging.continuation_token = page.continuation_token;
 
 let replicas = ReplicaQueryDescription::new(ReplicaQueryParameters::new(partition_id));
-let page = client
-    .get_replica_list(&replicas, Some(Duration::from_secs(5)))
-    .await?;
+let page = reads
+    .get_replica_list(Request::new(replicas), Instant::now() + Duration::from_secs(5))
+    .await?.into_body();
 println!("{:?}", page.items);
 
 let mut deployments = DeployedApplicationQueryDescription::new(
@@ -1075,10 +1097,10 @@ println!("{:?}", page.items);
 ```
 
 Request JSON retains separate `parameters` and `paging` objects. These APIs use
-the same shared request encoder and list reply profile as the existing queries;
-they introduce no new transport session, automatic retries, or HTTP fallback.
-Service partition resolution, resolution caching, notifications and additional
-health-detail APIs remain out of scope.
+the same shared declarations and list reply profile as the existing queries.
+Furpc owns the two topology query paths; remaining deployment queries, resolution
+and notification sessions still use their separate legacy adapters. No query
+adds automatic paging, retry, an endpoint cache or HTTP fallback.
 
 Native partition and replica queries accept continuation tokens but not
 `MaxResults`. Their shared paging field must leave `max_results` as `None`;
@@ -1131,12 +1153,14 @@ Native query specifications reject unknown arguments, including count limits
 on the partition/replica routes; the shared encoder's query capability metadata
 rejects those counts before any request is sent.
 
-The existing owned application/service onebox scenario also qualifies these
+The existing owned application/service onebox scenario covers these
 APIs. Its stateless service runs on all five nodes and its stateful service has
 two int64-range partitions. Independent REST observations must converge to
 Ready/Ok partition and replica state before native field comparisons. The live
-fixture covers all six partitions, 22 replicas/instances, node-local deployment
-pages and native error reuse. It does not exercise Named keys live, manufacture
+fixture historically qualified all six partitions, 22 replicas/instances,
+node-local deployment pages and native error reuse on the legacy implementation.
+The updated furpc topology scenario requires fresh native receipts; offline
+models are not native qualification. It does not exercise Named keys live, manufacture
 partition/replica continuation evidence, or qualify persisted data replication.
 
 ### Node-local service packages, code packages and deployed replicas

@@ -66,8 +66,6 @@ async fn forwarded_body_only_aggregate_lists_use_their_typed_profile() {
 
 #[derive(Clone, Copy, Debug)]
 enum QueryKind {
-    Partitions,
-    Replicas,
     Deployments,
     ServicePackages,
     CodePackages,
@@ -75,9 +73,7 @@ enum QueryKind {
 }
 
 impl QueryKind {
-    const ALL: [Self; 6] = [
-        Self::Partitions,
-        Self::Replicas,
+    const ALL: [Self; 4] = [
         Self::Deployments,
         Self::ServicePackages,
         Self::CodePackages,
@@ -86,8 +82,6 @@ impl QueryKind {
 
     fn tag(self) -> i32 {
         match self {
-            Self::Partitions => 5,
-            Self::Replicas => 6,
             Self::Deployments => 10,
             Self::ServicePackages => 11,
             Self::CodePackages => 14,
@@ -101,18 +95,6 @@ impl QueryKind {
         timeout: Option<Duration>,
     ) -> fube_client::ClientResult<()> {
         match self {
-            Self::Partitions => {
-                let query = PartitionQueryDescription::new(PartitionQueryParameters::new(
-                    "fabric:/Model/Service".parse().unwrap(),
-                ));
-                client.get_partition_list(&query, timeout).await.map(|_| ())
-            }
-            Self::Replicas => {
-                let query = ReplicaQueryDescription::new(ReplicaQueryParameters::new(
-                    uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
-                ));
-                client.get_replica_list(&query, timeout).await.map(|_| ())
-            }
             Self::Deployments => {
                 let query = DeployedApplicationQueryDescription::new(
                     DeployedApplicationQueryParameters::new("N0010"),
@@ -346,7 +328,7 @@ async fn malformed_new_query_successes_are_call_local() {
 async fn partition_field_adapters_reject_bad_tags_and_guid_metadata_before_native_errors() {
     for malformed in 0..3 {
         for error in [0, REMOTE_CODE] {
-            let (client, server) = reusable_reply(move |request| {
+            let (mut client, server) = super::reusable_reply(move |request| {
                 let bytes = body(|e| {
                     e.i64(2).unwrap();
                     e.pointer(Some(&5i32.to_le_bytes()), |e| {
@@ -380,13 +362,84 @@ async fn partition_field_adapters_reject_bad_tags_and_guid_metadata_before_nativ
             })
             .await;
             assert!(matches!(
-                QueryKind::Partitions.call(&client, None).await,
-                Err(ClientError::Protocol(_))
+                client
+                    .get_partition_list(
+                        furpc::Request::new(PartitionQueryDescription::new(
+                            PartitionQueryParameters::new("fabric:/Model/Service".parse().unwrap()),
+                        )),
+                        read_deadline(None),
+                    )
+                    .await,
+                Err(ReadError::Protocol(_) | ReadError::Decode(_))
             ));
-            assert!(!client.is_closed());
-            assert!(client.terminal_error().is_none());
-            client.create_name("fabric:/Probe", None).await.unwrap();
-            client.close().await.unwrap();
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .unwrap();
+            drop(client);
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn furpc_topology_queries_preserve_domain_errors_and_connection_reuse() {
+    for partitions in [true, false] {
+        for error in [0, REMOTE_CODE] {
+            let (mut client, server) = super::reusable_reply(move |request| {
+                reply(
+                    request,
+                    "QueryReply",
+                    body(|encoder| {
+                        encoder.i64(if error == 0 { 2 } else { 0 })?;
+                        let tag = if partitions { 5i32 } else { 6i32 }.to_le_bytes();
+                        encoder.pointer((error == 0).then_some(tag.as_slice()), |encoder| {
+                            encoder.object_array::<()>(&[], |_, _| Ok(()))?;
+                            encoder.pointer(None, |_| Ok(()))
+                        })?;
+                        encoder.i64(error)?;
+                        encoder.pointer(None, |_| Ok(()))
+                    }),
+                )
+            })
+            .await;
+            let result = if partitions {
+                client
+                    .get_partition_list(
+                        furpc::Request::new(PartitionQueryDescription::new(
+                            PartitionQueryParameters::new("fabric:/Model/Service".parse().unwrap()),
+                        )),
+                        read_deadline(None),
+                    )
+                    .await
+                    .map(|response| assert!(response.body().items.is_empty()))
+            } else {
+                client
+                    .get_replica_list(
+                        furpc::Request::new(ReplicaQueryDescription::new(
+                            ReplicaQueryParameters::new(uuid::Uuid::nil()),
+                        )),
+                        read_deadline(None),
+                    )
+                    .await
+                    .map(|response| assert!(response.body().items.is_empty()))
+            };
+            if error == 0 {
+                result.unwrap();
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ReadError::Domain(DomainFailure {
+                        code: REMOTE_CODE,
+                        ..
+                    }))
+                ));
+            }
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .unwrap();
+            drop(client);
             server.await.unwrap();
         }
     }
@@ -427,28 +480,6 @@ async fn invalid_new_query_options_send_nothing_and_preserve_connection() {
             ));
             assert!(!client.is_closed());
         }
-    }
-    for limit in [1, i64::MAX as u64, i64::MAX as u64 + 1] {
-        let mut partitions = PartitionQueryDescription::new(PartitionQueryParameters::new(
-            "fabric:/Model/Service".parse().unwrap(),
-        ));
-        partitions.paging.max_results = std::num::NonZeroU64::new(limit);
-        let mut replicas =
-            ReplicaQueryDescription::new(ReplicaQueryParameters::new(uuid::Uuid::nil()));
-        replicas.paging = partitions.paging.clone();
-        assert!(matches!(
-            client.get_partition_list(&partitions, None).await,
-            Err(ClientError::Local(Error::InvalidInput(
-                "query does not support MaxResults"
-            )))
-        ));
-        assert!(matches!(
-            client.get_replica_list(&replicas, None).await,
-            Err(ClientError::Local(Error::InvalidInput(
-                "query does not support MaxResults"
-            )))
-        ));
-        assert!(!client.is_closed());
     }
     for node in ["", "N00\0hidden"] {
         let query =

@@ -1537,6 +1537,110 @@ def validate_furpc_lists(lists):
     return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
 
 
+def validate_furpc_topology(lists):
+    topology = lists.get("topology")
+    require(type(topology) is dict, "furpc topology observations required")
+    value = topology.get("furpc")
+    require(type(value) is dict and integer(value.get("generation"), 1)
+            and value["generation"] == lists["furpc"]["generation"],
+            "furpc topology must reuse the list client's generation")
+    true_fields(value, ("same_generation_after_error",))
+    require(type(value.get("mixed_concurrent_operations")) is int
+            and value["mixed_concurrent_operations"] == 3,
+            "three concurrent furpc partition/replica/Ping operations")
+    require(type(topology.get("native_missing_partition_code")) is int
+            and topology["native_missing_partition_code"] == -2147017753
+            and value.get("native_error_origin") in ("domain", "native_fault"),
+            "furpc missing partition must retain its native error")
+    true_fields(topology, ("exact_partition_replica_application_selectors", "ready_replica_status_filter",
+                          "raw_native_epoch_not_compared_to_rest_projection"))
+
+    def signed(value):
+        require(type(value) is int or (type(value) is str and re.fullmatch(r"-?[0-9]{1,20}", value)),
+                "independent topology integer")
+        result = int(value)
+        require(-(2**63) <= result < 2**63, "independent topology signed native width")
+        return result
+
+    def numeric(actual, expected):
+        require(type(actual) is int and actual == signed(expected),
+                "native topology numeric field must match HTTP")
+
+    def matches(actual, observed, fields):
+        require(type(actual) is dict and type(observed) is dict, "native/HTTP topology records")
+        require(all(type(actual.get(local)) is str and type(observed.get(remote)) is str
+                    and actual[local] == observed[remote] for local, remote in fields.items()),
+                "native topology fields must match HTTP")
+
+    observations = topology.get("independent_partition_replicas")
+    require(type(observations) is list and len(observations) == 6,
+            "six owned native/HTTP partitions required")
+    identities, service_partitions, replica_count = set(), {}, 0
+    for observation in observations:
+        require(type(observation) is dict and observation.get("service") in
+                {service["name"] for service in lists["native_services"]},
+                "topology must belong to an independently corroborated owned service")
+        native, observed = observation.get("native_partition"), observation.get("partition")
+        matches(native, observed, {"kind": "ServiceKind", "status": "PartitionStatus",
+                                   "health_state": "HealthState"})
+        information, independent = native.get("information"), observed.get("PartitionInformation")
+        matches(information, independent, {"id": "Id", "kind": "ServicePartitionKind"})
+        identity = information["id"]
+        require(re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", identity)
+                and identity not in identities, "unique native partition identities")
+        identities.add(identity)
+        kind = information["kind"]
+        require(kind in ("Singleton", "Int64Range", "Named"), "supported native partition key kind")
+        if kind == "Named":
+            matches(information, independent, {"name": "Name"})
+        elif kind == "Int64Range":
+            numeric(information.get("low_key"), independent.get("LowKey"))
+            numeric(information.get("high_key"), independent.get("HighKey"))
+            require(information["low_key"] <= information["high_key"], "ordered partition key range")
+        require(native["kind"] in ("Stateful", "Stateless"), "supported native partition service kind")
+        service = next(item for item in lists["native_services"] if item["name"] == observation["service"])
+        require(native["kind"] == service["kind"], "partition and owned service kinds must agree")
+        service_partitions[observation["service"]] = service_partitions.get(observation["service"], 0) + 1
+        fields = ({"instance_count": "InstanceCount"} if native["kind"] == "Stateless" else
+                  {"target_replica_set_size": "TargetReplicaSetSize", "min_replica_set_size": "MinReplicaSetSize",
+                   "last_quorum_loss_duration_in_seconds": "LastQuorumLossDurationInSeconds"})
+        for local, remote in fields.items():
+            numeric(native.get(local), observed.get(remote))
+        replicas, independent_replicas = observation.get("native_replicas"), observation.get("replicas")
+        require(type(replicas) is list and type(independent_replicas) is list
+                and len(replicas) == len(independent_replicas) > 0, "nonempty native/HTTP replica sets")
+        by_id = {}
+        for replica in independent_replicas:
+            require(type(replica) is dict and replica.get("ServiceKind") == native["kind"],
+                    "independent replica kind must match its partition")
+            identity = signed(replica.get("ReplicaId" if native["kind"] == "Stateful" else "InstanceId"))
+            require(identity not in by_id, "distinct independent replica identities")
+            by_id[identity] = replica
+        seen = set()
+        for replica in replicas:
+            require(type(replica) is dict and type(replica.get("id")) is int
+                    and replica["id"] in by_id and replica["id"] not in seen,
+                    "distinct native replica identities must match HTTP")
+            seen.add(replica["id"])
+            independent = by_id[replica["id"]]
+            fields = {"kind": "ServiceKind", "status": "ReplicaStatus", "health_state": "HealthState",
+                      "node_name": "NodeName", "address": "Address"}
+            if native["kind"] == "Stateful":
+                fields["role"] = "ReplicaRole"
+            matches(replica, independent, fields)
+            numeric(replica.get("last_in_build_duration_in_seconds"), independent.get("LastInBuildDurationInSeconds"))
+        replica_count += len(replicas)
+    require(service_partitions == {service["name"]: 2 if service["kind"] == "Stateful" else 1
+                                   for service in lists["native_services"]}
+            and type(topology.get("partition_count")) is int and topology["partition_count"] == 6
+            and type(topology.get("replica_instance_count")) is int
+            and topology["replica_instance_count"] == replica_count == 22,
+            "complete owned topology inventory")
+    require(all(integer(value.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+            "furpc native topology observation timestamps")
+    return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
+
+
 def health_against_http(native, observed, end_ms):
     states = {"Invalid": 0, "Ok": 1, "Warning": 2, "Error": 3, "Unknown": 65535}
 
@@ -1705,6 +1809,7 @@ def validate_native(reports, archive, allocation):
             "native application/service/topology/deployment observations")
     movement_window = validate_native_movement(lists, health.get("owner"))
     furpc_lists_window = validate_furpc_lists(lists)
+    furpc_topology_window = validate_furpc_topology(lists)
     true_fields(notification, ("owned_cleanup_confirmed",))
     require(notification.get("allocation") == allocation["name"]
             and notification.get("passed") == list(NOTIFICATION_CASES)
@@ -1718,6 +1823,7 @@ def validate_native(reports, archive, allocation):
         "native_move_primary": movement_window,
         "furpc_gateway_methods": furpc_window,
         "furpc_application_service_lists": furpc_lists_window,
+        "furpc_partition_replica_lists": furpc_topology_window,
         **furpc_health_windows,
     }
     require(all(integer(nodes.get(key), 1) for key in

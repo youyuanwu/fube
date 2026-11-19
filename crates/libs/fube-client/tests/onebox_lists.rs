@@ -97,6 +97,8 @@ fn service_evidence(service: &Service) -> Value {
 }
 
 async fn observe_furpc(
+    client: &mut FurpcClient,
+    generation: u64,
     journal: &Journal,
     observed_apps: &[Value],
     observed_services: &[Value],
@@ -105,7 +107,6 @@ async fn observe_furpc(
     use furpc_support::{body, deadline};
 
     let start_ms = furpc_support::now_ms();
-    let (mut client, generation) = furpc_support::connect("127.0.0.1:19000").await?;
     let mut query = ApplicationQueryDescription::new(ApplicationQueryParameters {
         filter: ApplicationListFilter::TypeName(journal.type_name.clone()),
         ..Default::default()
@@ -319,7 +320,15 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     for application in &journal.applications {
         observed_services.extend(http.services(application).await?);
     }
-    let mut reads = observe_furpc(&journal, &observed_apps, &observed_services).await?;
+    let (mut reads_client, generation) = furpc_support::connect("127.0.0.1:19000").await?;
+    let mut reads = observe_furpc(
+        &mut reads_client,
+        generation,
+        &journal,
+        &observed_apps,
+        &observed_services,
+    )
+    .await?;
     let native_applications = reads
         .as_object_mut()
         .unwrap()
@@ -337,9 +346,18 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
             ..Default::default()
         },
     )?;
-    let topology = topology::observe(&client, &http, &journal).await?;
+    let topology =
+        topology::observe(&client, &mut reads_client, generation, &http, &journal).await?;
     let deployment = deployment::observe(&client, &http, &journal).await?;
-    let movement = topology::move_primary(&client, &http, &journal, &topology).await?;
+    let movement = topology::move_primary(
+        &client,
+        &mut reads_client,
+        generation,
+        &http,
+        &journal,
+        &topology,
+    )
+    .await?;
     client.close().await?;
     Ok(json!({
         "runtime_version": runtime, "archive_sha256": journal.archive_sha256,

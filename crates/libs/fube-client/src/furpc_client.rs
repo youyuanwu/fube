@@ -19,7 +19,8 @@ use crate::{
     protocol,
     query_protocol::{self, Query, QueryRequest, Reply},
     ApplicationListPage, ApplicationQueryDescription, DomainFailure, GatewayDescription, NamingUri,
-    NodeHealth, NodeHealthQueryDescription, NodeListPage, NodeQueryDescription, ServiceListPage,
+    NodeHealth, NodeHealthQueryDescription, NodeListPage, NodeQueryDescription, PartitionListPage,
+    PartitionQueryDescription, ReplicaListPage, ReplicaQueryDescription, ServiceListPage,
     ServiceQueryDescription,
 };
 
@@ -103,7 +104,7 @@ type Result<T> = std::result::Result<T, FurpcClientError>;
 
 /// Typed gateway stub over a byte-facing Tower service.
 ///
-/// Ping, NameExists, node/application/service lists and node health are
+/// Ping, NameExists, node/application/service/partition/replica lists and node health are
 /// implemented separately from [`crate::FabricClient`].
 /// The default transport is a furpc Channel; clones share its lifecycle and
 /// dropping the last owner closes it. Later calls may reconnect, but a submitted
@@ -233,6 +234,30 @@ where
         request: Request<ServiceQueryDescription>,
         deadline: Instant,
     ) -> Result<Response<ServiceListPage>> {
+        self.query(request, deadline).await
+    }
+
+    /// Get one service-scoped partition page, not an endpoint-resolution snapshot.
+    ///
+    /// Native paging supports continuation tokens, but not MaxResults. There is
+    /// no automatic paging or retry; a nil partition selector is omitted.
+    pub async fn get_partition_list(
+        &mut self,
+        request: Request<PartitionQueryDescription>,
+        deadline: Instant,
+    ) -> Result<Response<PartitionListPage>> {
+        self.query(request, deadline).await
+    }
+
+    /// Get one page of stateful replicas or stateless instances for a partition.
+    ///
+    /// Native paging supports continuation tokens, but not MaxResults. Signed
+    /// IDs and status masks are preserved, without automatic paging or retries.
+    pub async fn get_replica_list(
+        &mut self,
+        request: Request<ReplicaQueryDescription>,
+        deadline: Instant,
+    ) -> Result<Response<ReplicaListPage>> {
         self.query(request, deadline).await
     }
 

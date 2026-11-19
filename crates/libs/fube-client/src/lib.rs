@@ -4,7 +4,7 @@
 //! Existing [`FabricClient`] connections support bounded concurrency without
 //! automatic reconnect. The separate [`FurpcClient`] is a typed stub over a
 //! byte-facing Tower service, defaulting to furpc's Channel, and provides Ping,
-//! NameExists, single-page node/application/service lists and node health.
+//! NameExists, single-page node/application/service/partition/replica lists and node health.
 //! These reads are no longer available on FabricClient or its ClientRequest
 //! adapters. FabricClient retains the remaining, unmigrated operations.
 //! Native connections require an explicitly selected unsecured development gateway.
@@ -110,7 +110,7 @@ pub struct GatewayDescription {
 
 /// Cloneable client for the native clear-TCP development profile.
 ///
-/// Legacy implementation for naming writes, partition/replica/deployment
+/// Legacy implementation for naming writes, deployment
 /// queries and service resolution. Migrated reads use [`FurpcClient`] only.
 ///
 /// Clones explicitly share one Channel lifecycle owner, typed budget and terminal state.
@@ -230,32 +230,6 @@ impl FabricClient {
         self.call(request, CallContext { deadline })
             .await
             .map(|_| ())
-    }
-
-    /// Get one partition page for a service with one whole-operation deadline.
-    /// Results describe observed partition state, not service endpoint resolution.
-    ///
-    /// Native partition paging supports continuation tokens, not MaxResults.
-    /// No automatic paging, retries, reconnect or replay occurs.
-    pub async fn get_partition_list(
-        &self,
-        query: &PartitionQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<PartitionListPage> {
-        self.query(query, timeout).await
-    }
-
-    /// Get one replica or stateless instance page for a partition.
-    /// Callers inspect and follow continuation tokens within their own overall budget.
-    ///
-    /// Native replica paging supports continuation tokens, not MaxResults.
-    /// No automatic paging, retries, reconnect or replay occurs.
-    pub async fn get_replica_list(
-        &self,
-        query: &ReplicaQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<ReplicaListPage> {
-        self.query(query, timeout).await
     }
 
     /// Get one deployed application page on a selected node.

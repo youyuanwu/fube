@@ -313,3 +313,271 @@ async fn public_read_queries_reject_invalid_parameters_without_submitting() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
+
+#[derive(Serialize)]
+struct PartitionInformationWire(i64, fubst::serde::Guid, &'static str, i64, i64);
+#[derive(Serialize)]
+struct PartitionWire(i64, PartitionInformationWire, i32, u32, u32, i64, i64);
+#[derive(Serialize)]
+struct ReplicaWire(i64, i64, i64, i64, i64, &'static str, &'static str, i64);
+
+fn partition_wire(kind: i64) -> PartitionWire {
+    PartitionWire(
+        kind,
+        PartitionInformationWire(
+            2,
+            fubst::serde::Guid(
+                uuid::Uuid::parse_str(crate::partitions::tests::ID)
+                    .unwrap()
+                    .to_bytes_le(),
+            ),
+            "",
+            i64::MIN,
+            i64::MAX,
+        ),
+        0,
+        3,
+        2,
+        1,
+        1,
+    )
+}
+
+#[tokio::test]
+async fn public_topology_queries_preserve_selectors_tokens_and_native_records() {
+    let id = crate::partitions::tests::ID;
+    let mut call = 0;
+    let mut client = FurpcClient::new(service(move |request: Request<Body>| {
+        let (name, arguments) = query_request(request.body());
+        let response = match call {
+            0 | 1 => {
+                assert_eq!(name, "GetServicePartitionList");
+                let mut expected = vec![("ServiceName", "fabric:/App/Service")];
+                if call == 0 {
+                    expected.extend([("PartitionId", id), ("ContinuationToken", "opaque")]);
+                }
+                assert_eq!(
+                    arguments,
+                    expected
+                        .into_iter()
+                        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                        .collect::<Vec<_>>()
+                );
+                envelope(
+                    None,
+                    None,
+                    native_reply(2, 5, &[partition_wire(2)], None, 0, Some((&[], "next"))),
+                )
+            }
+            2 => {
+                assert_eq!(name, "GetServicePartitionReplicaList");
+                assert_eq!(
+                    arguments,
+                    [
+                        ("PartitionId", id),
+                        ("ReplicaId", "-9223372036854775808"),
+                        ("ReplicaStatusFilter", "4294967295"),
+                        ("ContinuationToken", "opaque")
+                    ]
+                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                );
+                envelope(
+                    Some(5),
+                    Some("QueryReply"),
+                    native_reply(
+                        2,
+                        6,
+                        &[
+                            ReplicaWire(2, i64::MIN, 2, 0, 3, "opaque-address", "N0010", 1),
+                            ReplicaWire(1, 0, 0, i64::MAX, 3, "instance-address", "N0020", 1),
+                        ],
+                        None,
+                        0,
+                        None,
+                    ),
+                )
+            }
+            3 => {
+                assert_eq!(name, "GetServicePartitionReplicaList");
+                assert_eq!(arguments, [("PartitionId".into(), id.into())]);
+                envelope(
+                    None,
+                    None,
+                    native_reply::<ReplicaWire>(2, 6, &[], None, 0, None),
+                )
+            }
+            _ => panic!("unexpected topology call"),
+        };
+        call += 1;
+        ready(Ok::<_, furpc::Error>(response))
+    }));
+    let mut query = PartitionQueryDescription::new(PartitionQueryParameters::new(
+        "fabric:/App/Service".parse().unwrap(),
+    ));
+    query.parameters.partition_id = Some(id.parse().unwrap());
+    query.paging.continuation_token = Some("opaque".into());
+    let page = client
+        .get_partition_list(Request::new(query.clone()), deadline())
+        .await
+        .unwrap()
+        .into_body();
+    assert_eq!(page.items[0].partition_information.id.to_string(), id);
+    assert_eq!(page.items[0].partition_information.low_key, i64::MIN);
+    assert_eq!(page.items[0].partition_information.high_key, i64::MAX);
+    assert_eq!(
+        page.items[0].current_configuration_epoch,
+        ConfigurationEpoch::default()
+    );
+    assert_eq!(page.continuation_token.as_deref(), Some("next"));
+    query.parameters.partition_id = Some(uuid::Uuid::nil());
+    query.paging = Paging::default();
+    client
+        .get_partition_list(Request::new(query), deadline())
+        .await
+        .unwrap();
+
+    let mut query = ReplicaQueryDescription::new(ReplicaQueryParameters::new(id.parse().unwrap()));
+    query.parameters.replica_or_instance_id = Some(i64::MIN);
+    query.parameters.status_filter = ReplicaStatusFilter::from_bits_retain(u32::MAX);
+    query.paging.continuation_token = Some("opaque".into());
+    let page = client
+        .get_replica_list(Request::new(query.clone()), deadline())
+        .await
+        .unwrap()
+        .into_body();
+    assert_eq!(page.items[0].replica_id, i64::MIN);
+    assert_eq!(page.items[0].role, ReplicaRole::Primary);
+    assert_eq!(page.items[1].instance_id, i64::MAX);
+    assert_eq!(page.items[1].kind, ServiceKind::Stateless);
+    assert_eq!(page.items[1].last_in_build_duration_in_seconds, 0);
+    query.parameters.replica_or_instance_id = Some(0);
+    query.parameters.status_filter = ReplicaStatusFilter::DEFAULT;
+    query.paging.continuation_token = Some(String::new());
+    assert!(client
+        .get_replica_list(Request::new(query), deadline())
+        .await
+        .unwrap()
+        .body()
+        .items
+        .is_empty());
+}
+
+#[tokio::test]
+async fn public_topology_queries_validate_profiles_before_embedded_errors() {
+    for partition in [true, false] {
+        for case in 0..5 {
+            let tag = if partition { 5 } else { 6 };
+            let payload = if partition {
+                native_reply(
+                    2,
+                    if case == 0 { 6 } else { tag },
+                    &[partition_wire(if case == 1 { 0 } else { 2 })],
+                    None,
+                    -123,
+                    (case == 2).then_some((&b"typed"[..], "")),
+                )
+            } else {
+                native_reply(
+                    2,
+                    if case == 0 { 5 } else { tag },
+                    &[ReplicaWire(
+                        if case == 1 { 0 } else { 2 },
+                        42,
+                        2,
+                        0,
+                        3,
+                        "address",
+                        "N0010",
+                        1,
+                    )],
+                    None,
+                    -123,
+                    (case == 2).then_some((&b"typed"[..], "")),
+                )
+            };
+            let mut response = Some(envelope(
+                Some(if case == 3 { 13 } else { 5 }),
+                Some(if case == 4 {
+                    "OperationSuccessAction"
+                } else {
+                    "QueryReply"
+                }),
+                payload,
+            ));
+            let mut client = FurpcClient::new(service(move |_| {
+                ready(Ok::<_, furpc::Error>(response.take().unwrap()))
+            }));
+            let error = if partition {
+                client
+                    .get_partition_list(
+                        Request::new(PartitionQueryDescription::new(
+                            PartitionQueryParameters::new("fabric:/App/Service".parse().unwrap()),
+                        )),
+                        deadline(),
+                    )
+                    .await
+                    .unwrap_err()
+            } else {
+                client
+                    .get_replica_list(
+                        Request::new(ReplicaQueryDescription::new(ReplicaQueryParameters::new(
+                            uuid::Uuid::nil(),
+                        ))),
+                        deadline(),
+                    )
+                    .await
+                    .unwrap_err()
+            };
+            assert!(
+                matches!(
+                    error,
+                    FurpcClientError::Protocol(_) | FurpcClientError::Decode(_)
+                ),
+                "partition={partition}, case={case}: {error:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn public_topology_queries_reject_max_results_before_transport_submission() {
+    let mut client = FurpcClient::new(service(
+        |_: Request<Body>| -> Ready<furpc::Result<Response<Body>>> {
+            panic!("unsupported MaxResults must never reach the transport")
+        },
+    ));
+    for limit in [1, i64::MAX as u64, i64::MAX as u64 + 1] {
+        let mut partition = PartitionQueryDescription::new(PartitionQueryParameters::new(
+            "fabric:/App/Service".parse().unwrap(),
+        ));
+        partition.paging.max_results = std::num::NonZeroU64::new(limit);
+        let mut replica =
+            ReplicaQueryDescription::new(ReplicaQueryParameters::new(uuid::Uuid::nil()));
+        replica.paging = partition.paging.clone();
+        for error in [
+            client
+                .get_partition_list(Request::new(partition), deadline())
+                .await
+                .unwrap_err(),
+            client
+                .get_replica_list(Request::new(replica), deadline())
+                .await
+                .unwrap_err(),
+        ] {
+            let FurpcClientError::Native(furpc::Error::Codec {
+                phase: "encode",
+                source,
+            }) = error
+            else {
+                panic!("expected encode error, got {error:?}");
+            };
+            assert!(matches!(
+                std::error::Error::source(&source)
+                    .and_then(|error| error.downcast_ref::<fubst::Error>()),
+                Some(fubst::Error::InvalidInput(
+                    "query does not support MaxResults"
+                ))
+            ));
+        }
+    }
+}

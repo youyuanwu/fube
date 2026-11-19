@@ -2,9 +2,9 @@
 use clap::Parser;
 use fube_client::{
     ClientOptions, DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
-    DeployedReplicaQueryDescription, DeployedReplicaQueryParameters, FabricClient, NamingUri,
-    PartitionKey, PartitionQueryDescription, PartitionQueryParameters, ReplicaQueryDescription,
-    ReplicaQueryParameters, ServiceEndpointRole, ServiceKind,
+    DeployedReplicaQueryDescription, DeployedReplicaQueryParameters, FabricClient, FurpcClient,
+    NamingUri, PartitionKey, PartitionQueryDescription, PartitionQueryParameters,
+    ReplicaQueryDescription, ReplicaQueryParameters, ServiceEndpointRole, ServiceKind,
 };
 use std::{net::SocketAddr, time::Duration};
 use tokio::{
@@ -122,15 +122,25 @@ async fn http(address: &str) -> ObserverResult<serde_json::Value> {
 
 async fn stateful_snapshot(
     client: &FabricClient,
+    gateway: SocketAddr,
     name: &NamingUri,
 ) -> ObserverResult<serde_json::Value> {
+    let channel = FurpcClient::endpoint_clear(gateway)?
+        .connect_timeout(Duration::from_secs(10))
+        .connect()
+        .await?;
+    let mut reads = FurpcClient::new(channel);
     let mut description =
         PartitionQueryDescription::new(PartitionQueryParameters::new(name.clone()));
     let mut partitions = Vec::new();
     for _ in 0..8 {
-        let page = client
-            .get_partition_list(&description, Some(Duration::from_secs(10)))
-            .await?;
+        let page = reads
+            .get_partition_list(
+                furpc::Request::new(description.clone()),
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await?
+            .into_body();
         partitions.extend(page.items);
         if partitions.len() > 32 {
             return Err("partition observation bound".into());
@@ -151,9 +161,13 @@ async fn stateful_snapshot(
     let mut description = ReplicaQueryDescription::new(ReplicaQueryParameters::new(id));
     let mut replicas = Vec::new();
     for _ in 0..8 {
-        let page = client
-            .get_replica_list(&description, Some(Duration::from_secs(10)))
-            .await?;
+        let page = reads
+            .get_replica_list(
+                furpc::Request::new(description.clone()),
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await?
+            .into_body();
         replicas.extend(page.items);
         if replicas.len() > 64 {
             return Err("replica observation bound".into());
@@ -348,7 +362,7 @@ async fn run(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if let Some(target) = args.move_primary {
-        let before = stateful_snapshot(&client, &name).await?;
+        let before = stateful_snapshot(&client, args.gateway, &name).await?;
         let partition = before["partition"].as_str().ok_or("partition")?.parse()?;
         if !before["replicas"]
             .as_array()
@@ -370,7 +384,7 @@ async fn run(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.stateful {
-        let snapshot = stateful_snapshot(&client, &name).await?;
+        let snapshot = stateful_snapshot(&client, args.gateway, &name).await?;
         println!("{snapshot}");
         client.close().await?;
         return Ok(());

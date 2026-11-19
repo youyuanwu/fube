@@ -82,8 +82,6 @@ macro_rules! element_bound {
     };
 }
 element_bound!(DeployedCodePackage, 12 + 2 * 12);
-element_bound!(Partition, 12);
-element_bound!(Replica, 12);
 element_bound!(DeployedApplication, 12);
 element_bound!(DeployedServicePackage, 12);
 element_bound!(DeployedReplica, 12);
@@ -436,20 +434,6 @@ macro_rules! queries {
     };
 }
 queries!(
-    PartitionQueryDescription,
-    PartitionQueryParameters,
-    PartitionListPage,
-    self,
-    Some(&self.paging)
-);
-queries!(
-    ReplicaQueryDescription,
-    ReplicaQueryParameters,
-    ReplicaListPage,
-    self,
-    Some(&self.paging)
-);
-queries!(
     DeployedApplicationQueryDescription,
     DeployedApplicationQueryParameters,
     DeployedApplicationListPage,
@@ -495,8 +479,6 @@ macro_rules! inputs {
 fn optional(value: &Option<String>) -> usize {
     value.as_ref().map_or(0, String::capacity)
 }
-inputs!(PartitionQueryParameters, self, self.service_name.capacity());
-inputs!(ReplicaQueryParameters, self, 0);
 inputs!(
     DeployedApplicationQueryParameters,
     self,

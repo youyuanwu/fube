@@ -50,14 +50,22 @@ healthy reuse, and mixed-method concurrency. Required `furpc_ping` and
 The gateway adapter captures each method's selected reply validator before
 success-body decoding; shared native schemas do not route through legacy
 Messages, channels or retained-allocation budgets.
-All four queries use a generic typed query codec with shared declarations and
+All migrated queries use a generic typed query codec with shared declarations and
 transport-independent list/item/empty reply profiles. Profile-specific actor,
 action, payload-tag and paging checks remain distinct. The existing owned
 list/health scenarios also compare nonempty application/service fields, real
 continuations, parameter exclusion and all 17 health policy/filter cases against
 independent HTTP. Their evidence checks native errors,
 original-generation reuse and concurrent clones without new codecs or fixtures.
-The six legacy read methods and their typed-request adapters are retired;
+Partition and replica list methods now reuse that codec with strict List tags
+5/6 and continuation-only paging, without MaxResults or automatic paging. Their
+legacy methods, typed-request adapters and input accounting are retired.
+The existing owned list scenario now compares canonical furpc topology against
+HTTP, retains actual fields and generation/error evidence, and observes
+MovePrimary through furpc replicas while leaving the mutation on legacy.
+These two methods have focused offline coverage; fresh native requalification
+of the rewritten topology scenario is still pending.
+All eight legacy read methods and their typed-request adapters are retired;
 remaining legacy operations keep their own transport. Current proof gates use
 canonical furpc results and independent HTTP/source-derived expectations, not
 retained legacy implementations as comparison oracles.

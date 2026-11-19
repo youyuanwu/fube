@@ -578,8 +578,6 @@ async fn all_operations_select_optional_timeout_and_reject_invalid_overrides_wit
         DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
         DeployedReplicaQueryDescription, DeployedReplicaQueryParameters,
         DeployedServicePackageQueryDescription, DeployedServicePackageQueryParameters,
-        PartitionQueryDescription, PartitionQueryParameters, ReplicaQueryDescription,
-        ReplicaQueryParameters,
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -591,7 +589,7 @@ async fn all_operations_select_optional_timeout_and_reject_invalid_overrides_wit
             Duration::from_secs(1),
             Duration::from_secs(6),
         ] {
-            for _ in 0..8 {
+            for _ in 0..6 {
                 let request = read_message(&mut stream).await.unwrap();
                 let ticks = request
                     .headers
@@ -666,18 +664,6 @@ async fn all_operations_select_optional_timeout_and_reject_invalid_overrides_wit
         check!(create_name, "fabric:/Model");
         check!(delete_name, "fabric:/Model");
 
-        check!(
-            get_partition_list,
-            &PartitionQueryDescription::new(PartitionQueryParameters::new(
-                "fabric:/Model/Service".parse().unwrap()
-            ))
-        );
-        check!(
-            get_replica_list,
-            &ReplicaQueryDescription::new(ReplicaQueryParameters::new(
-                uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap()
-            ))
-        );
         check!(
             get_deployed_application_list,
             &DeployedApplicationQueryDescription::new(DeployedApplicationQueryParameters::new(

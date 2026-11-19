@@ -7,7 +7,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use super::oracle::{Http, Journal, Result};
+use super::{
+    furpc_support::{self, body, deadline},
+    oracle::{Http, Journal, Result},
+};
+use furpc::Request;
 
 fn signed(value: &Value) -> i64 {
     match value {
@@ -114,7 +118,8 @@ fn compare_replica(replica: &Replica, observed: &Value) {
 }
 
 async fn native_replicas(
-    client: &FabricClient,
+    client: &mut FurpcClient,
+    generation: u64,
     id: uuid::Uuid,
     expected_count: usize,
 ) -> Result<(Vec<Replica>, bool)> {
@@ -122,9 +127,12 @@ async fn native_replicas(
     let mut seen_tokens = BTreeSet::new();
     let mut native = Vec::new();
     loop {
-        let page = client
-            .get_replica_list(&query, Some(Duration::from_secs(30)))
-            .await?;
+        let page = body(
+            client
+                .get_replica_list(Request::new(query.clone()), deadline())
+                .await?,
+            generation,
+        );
         assert!(!page.items.is_empty());
         native.extend(page.items);
         assert!(native.len() <= expected_count);
@@ -170,6 +178,8 @@ fn movement_matches(native: &[Replica], observed: &[Value]) -> bool {
 
 pub async fn move_primary(
     client: &FabricClient,
+    reads: &mut FurpcClient,
+    generation: u64,
     http: &Http,
     journal: &Journal,
     topology: &Value,
@@ -196,7 +206,8 @@ pub async fn move_primary(
         let captured_replicas = captured["replicas"]
             .as_array()
             .ok_or("missing captured owned replicas")?;
-        let (before, _) = native_replicas(client, partition, captured_replicas.len()).await?;
+        let (before, _) =
+            native_replicas(reads, generation, partition, captured_replicas.len()).await?;
         let before_http = http.replicas(partition).await?;
         if !movement_matches(&before, captured_replicas)
             || !movement_matches(&before, &before_http)
@@ -260,7 +271,7 @@ pub async fn move_primary(
         let mut polls = 0;
         loop {
             polls += 1;
-            let (after, _) = native_replicas(client, partition, before.len()).await?;
+            let (after, _) = native_replicas(reads, generation, partition, before.len()).await?;
             let after_http = http.replicas(partition).await?;
             let primaries: Vec<_> = after
                 .iter()
@@ -321,7 +332,41 @@ pub async fn move_primary(
         .map_err(|_| "owned MovePrimary observation exceeded its overall budget")?
 }
 
-pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> Result<Value> {
+fn partition_evidence(partition: &Partition) -> Value {
+    let information = &partition.partition_information;
+    json!({
+        "kind": format!("{:?}", partition.kind),
+        "status": format!("{:?}", partition.status),
+        "health_state": format!("{:?}", partition.health_state),
+        "information": {
+            "id": information.id, "kind": format!("{:?}", information.kind),
+            "name": information.name, "low_key": information.low_key, "high_key": information.high_key,
+        },
+        "instance_count": partition.instance_count,
+        "target_replica_set_size": partition.target_replica_set_size,
+        "min_replica_set_size": partition.min_replica_set_size,
+        "last_quorum_loss_duration_in_seconds": partition.last_quorum_loss_duration_in_seconds,
+    })
+}
+
+fn replica_evidence(replica: &Replica) -> Value {
+    json!({
+        "id": replica_id(replica), "kind": format!("{:?}", replica.kind),
+        "status": format!("{:?}", replica.status), "role": format!("{:?}", replica.role),
+        "node_name": replica.node_name, "address": replica.address,
+        "health_state": format!("{:?}", replica.health_state),
+        "last_in_build_duration_in_seconds": replica.last_in_build_duration_in_seconds,
+    })
+}
+
+pub async fn observe(
+    client: &FabricClient,
+    reads: &mut FurpcClient,
+    generation: u64,
+    http: &Http,
+    journal: &Journal,
+) -> Result<Value> {
+    let start_ms = furpc_support::now_ms();
     let mut partition_count = 0;
     let mut replica_count = 0;
     let mut partition_paging = false;
@@ -334,7 +379,12 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
             assert_eq!(observed.len(), expected_count);
             let mut query =
                 PartitionQueryDescription::new(PartitionQueryParameters::new(name.parse()?));
-            let first = client.get_partition_list(&query, None).await?;
+            let first = body(
+                reads
+                    .get_partition_list(Request::new(query.clone()), deadline())
+                    .await?,
+                generation,
+            );
             let mut partitions = first.items;
             let mut continuation = first.continuation_token;
             let mut seen_tokens = BTreeSet::new();
@@ -345,9 +395,12 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                 );
                 assert!(seen_tokens.len() <= expected_count);
                 query.paging.continuation_token = Some(token);
-                let page = client
-                    .get_partition_list(&query, Some(Duration::from_secs(30)))
-                    .await?;
+                let page = body(
+                    reads
+                        .get_partition_list(Request::new(query.clone()), deadline())
+                        .await?,
+                    generation,
+                );
                 partitions.extend(page.items);
                 continuation = page.continuation_token;
                 partition_paging = true;
@@ -380,7 +433,12 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                 compare_partition(partition, observed);
                 query.parameters.partition_id = Some(partition.partition_information.id);
                 query.paging = Paging::default();
-                let selected = client.get_partition_list(&query, None).await?;
+                let selected = body(
+                    reads
+                        .get_partition_list(Request::new(query.clone()), deadline())
+                        .await?,
+                    generation,
+                );
                 assert_eq!(selected.items.len(), 1);
                 assert_eq!(
                     selected.items[0].partition_information.id,
@@ -399,7 +457,8 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                     expected_replicas > 0,
                     "independent replica/instance list is empty"
                 );
-                let (native, paged) = native_replicas(client, id, expected_replicas).await?;
+                let (native, paged) =
+                    native_replicas(reads, generation, id, expected_replicas).await?;
                 replica_paging |= paged;
                 assert_eq!(
                     native.iter().map(replica_id).collect::<BTreeSet<_>>(),
@@ -416,13 +475,23 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                     );
                     query.parameters.replica_or_instance_id = Some(replica_id(replica));
                     query.paging = Paging::default();
-                    let selected = client.get_replica_list(&query, None).await?;
+                    let selected = body(
+                        reads
+                            .get_replica_list(Request::new(query.clone()), deadline())
+                            .await?,
+                        generation,
+                    );
                     assert_eq!(selected.items.len(), 1);
                     assert_eq!(replica_id(&selected.items[0]), replica_id(replica));
                 }
                 query.parameters.replica_or_instance_id = None;
                 query.parameters.status_filter = ReplicaStatusFilter::READY;
-                let ready = client.get_replica_list(&query, None).await?;
+                let ready = body(
+                    reads
+                        .get_replica_list(Request::new(query), deadline())
+                        .await?,
+                    generation,
+                );
                 assert_eq!(
                     ready.items.iter().map(replica_id).collect::<BTreeSet<_>>(),
                     native
@@ -434,6 +503,9 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                 replica_count += native.len();
                 observations.push(json!({
                     "service": name, "partition": observation, "replicas": replicas,
+                    "native_partition": partition_evidence(partitions.iter().find(|partition|
+                        partition.partition_information.id == id).ok_or("missing native partition")?),
+                    "native_replicas": native.iter().map(replica_evidence).collect::<Vec<_>>(),
                 }));
             }
         }
@@ -513,24 +585,32 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
     );
     let missing_partition =
         ReplicaQueryDescription::new(ReplicaQueryParameters::new(uuid::Uuid::nil()));
-    let missing_replica_code = match client.get_replica_list(&missing_partition, None).await {
-        Err(
-            ClientError::Domain(DomainFailure { code, .. })
-            | ClientError::Transport(Error::Remote { code, .. }),
-        ) => code,
-        other => {
-            return Err(format!("missing partition must return a native error: {other:?}").into())
-        }
-    };
-    assert!(!client.is_closed());
-    client
-        .get_partition_list(
-            &PartitionQueryDescription::new(PartitionQueryParameters::new(
-                format!("{}/Stateless", journal.applications[0]).parse()?,
-            )),
-            None,
-        )
-        .await?;
+    let (missing_replica_code, error_origin) = furpc_support::failure(
+        reads
+            .get_replica_list(Request::new(missing_partition), deadline())
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(missing_replica_code, -2147017753);
+    let partition_query = PartitionQueryDescription::new(PartitionQueryParameters::new(
+        format!("{}/Stateless", journal.applications[0]).parse()?,
+    ));
+    let replica_query = ReplicaQueryDescription::new(ReplicaQueryParameters::new(
+        observations[0]["partition"]["PartitionInformation"]["Id"]
+            .as_str()
+            .ok_or("missing observed partition")?
+            .parse()?,
+    ));
+    let mut partitions = reads.clone();
+    let mut replicas = reads.clone();
+    let (partitions, replicas, ping) = tokio::try_join!(
+        partitions.get_partition_list(Request::new(partition_query), deadline()),
+        replicas.get_replica_list(Request::new(replica_query), deadline()),
+        reads.ping(Request::new(()), deadline()),
+    )?;
+    assert_eq!(body(partitions, generation).items.len(), 1);
+    assert!(!body(replicas, generation).items.is_empty());
+    assert!(!body(ping, generation).node_name.is_empty());
     let absent_node = format!("missing-{}", journal.owner);
     assert!(!nodes.iter().any(|node| node["Name"] == absent_node));
     let missing_node = DeployedApplicationQueryDescription::new(
@@ -548,9 +628,11 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
     };
     assert!(!client.is_closed());
     client
-        .get_partition_list(
-            &PartitionQueryDescription::new(PartitionQueryParameters::new(
-                format!("{}/Stateless", journal.applications[0]).parse()?,
+        .get_deployed_application_list(
+            &DeployedApplicationQueryDescription::new(DeployedApplicationQueryParameters::new(
+                nodes[0]["Name"]
+                    .as_str()
+                    .ok_or("missing independent node")?,
             )),
             None,
         )
@@ -567,7 +649,12 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
         "raw_native_epoch_not_compared_to_rest_projection": true,
         "native_missing_partition_code": missing_replica_code,
         "native_missing_deployment_node_code": missing_node_code,
-        "shared_connection_reuse_after_native_errors": true,
+        "legacy_deployment_connection_reused_after_error": true,
+        "furpc": {
+            "generation": generation, "same_generation_after_error": true,
+            "native_error_origin": error_origin, "mixed_concurrent_operations": 3,
+            "native_start_ms": start_ms, "native_end_ms": furpc_support::now_ms(),
+        },
         "independent_partition_replicas": observations,
         "independent_deployments": deployment_observations,
     }))
