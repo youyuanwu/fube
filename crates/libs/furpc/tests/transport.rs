@@ -1,7 +1,7 @@
 use std::{
     cell::Cell,
     collections::VecDeque,
-    future::{pending, Future},
+    future::{pending, poll_fn, Future},
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -14,8 +14,8 @@ use std::{
 use furpc::{
     header, Accept, Accepted, Body, BoxError, CancelOutcome, Connected, ConnectionOptions,
     Endpoint, Error, HandlerLimits, Headers, IngressLimits, IngressOptions, IngressResponse,
-    IngressService, IoInfo, Message, Peer, Request, SendKind, SendPolicy, Server, ServiceBinding,
-    Source, StreamAcceptor, TcpAcceptor, TransportIo, TransportLimits,
+    IngressService, IoInfo, Message, Peer, Request, RequestPolicy, Response, SendKind, SendPolicy,
+    Server, ServiceBinding, Source, StreamAcceptor, TcpAcceptor, TransportIo, TransportLimits,
 };
 use futures_util::{future::join_all, stream, FutureExt};
 use http::Uri;
@@ -212,6 +212,825 @@ impl tokio::io::AsyncWrite for GuardedIo {
     }
 }
 
+fn rpc_ingress<S>(service: S) -> IngressService<S>
+where
+    S: Service<Request<Body>, Response = IngressResponse> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<BoxError>,
+{
+    IngressService::new(
+        service,
+        vec![ServiceBinding::raw(IngressOptions::requests(
+            RequestPolicy::new(allow, allow),
+            IngressLimits::default(),
+        ))
+        .unwrap()],
+    )
+    .unwrap()
+}
+
+fn rpc_request(bytes: &[u8]) -> Request<Body> {
+    let mut request = Request::new(Body::from_bytes(bytes.to_vec()).unwrap());
+    request.set_deadline(deadline());
+    request
+}
+
+#[tokio::test]
+async fn managed_rpc_uses_opaque_bodies_pending_only_ids_and_original_reply_authority() {
+    let ids = Arc::new(Mutex::new(Vec::new()));
+    let handler = rpc_ingress(Function({
+        let ids = ids.clone();
+        move |mut request: Request<Body>| {
+            let id = request.headers().effective().message_id;
+            assert_ne!(id, furpc::MessageId::default());
+            assert!(request.headers().effective().expects_reply);
+            assert!(request.context().unwrap().peer().is_none());
+            ids.lock().unwrap().push(id);
+            request
+                .headers_mut()
+                .remove_all(header::MESSAGE_ID)
+                .unwrap();
+            request
+                .headers_mut()
+                .append(
+                    furpc::HeaderRecord::native(
+                        header::MESSAGE_ID,
+                        &furpc::MessageId {
+                            guid: [9; 16],
+                            index: 99,
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            async move {
+                Ok::<_, Error>(IngressResponse::Reply(
+                    Message::builder().body(request.into_body()).build()?,
+                ))
+            }
+        }
+    }));
+    let listener = TcpAcceptor::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel();
+    let serving = tokio::spawn(
+        Server::builder()
+            .service(handler)
+            .unwrap()
+            .build()
+            .unwrap()
+            .serve_with_shutdown(listener, ConnectionOptions::managed(), async {
+                stopped.await.unwrap();
+            }),
+    );
+    let channel = bounded(Endpoint::try_from(address).unwrap().connect())
+        .await
+        .unwrap();
+    let peer = channel.peer(deadline()).await.unwrap();
+    let calls = (0..8u8).map(|value| {
+        let peer = peer.clone();
+        async move {
+            let response = peer
+                .request(rpc_request(&[value; 3]), deadline())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.source().unwrap().generation(),
+                peer.info().generation
+            );
+            assert_eq!(
+                response
+                    .body()
+                    .segments()
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![value; 3]
+            );
+            assert_ne!(response.headers().effective().relates_to.guid, [9; 16]);
+            response.headers().effective().relates_to
+        }
+    });
+    let replies = bounded(join_all(calls)).await;
+    {
+        let observed = ids.lock().unwrap();
+        assert_eq!(observed.len(), 8);
+        for (index, id) in observed.iter().enumerate() {
+            assert!(!observed[..index].contains(id));
+            assert!(replies.contains(id));
+        }
+    }
+    assert!(Response::new(Body::empty()).source().is_none());
+    stop.send(()).unwrap();
+    bounded(serving).await.unwrap().unwrap();
+    drop(channel);
+}
+
+#[tokio::test]
+async fn byte_service_reserves_once_does_not_clone_readiness_and_rechecks_actual_frame_size() {
+    let (client, accepted) = tokio::io::duplex(64);
+    let handler = rpc_ingress(Function(|request: Request<Body>| async move {
+        Ok::<_, Error>(IngressResponse::Reply(
+            Message::builder().body(request.into_body()).build()?,
+        ))
+    }));
+    let (stop, stopped) = oneshot::channel();
+    let serving = tokio::spawn(
+        Server::builder()
+            .service(handler)
+            .unwrap()
+            .build()
+            .unwrap()
+            .serve_with_shutdown(one(accepted), ConnectionOptions::managed(), async {
+                stopped.await.unwrap();
+            }),
+    );
+    let mut channel = bounded(
+        Endpoint::from_shared("memory://tower")
+            .unwrap()
+            .limits(TransportLimits {
+                max_pending_requests: 1,
+                max_send_frame_bytes: Some(256),
+                ..Default::default()
+            })
+            .connect_with_connector(Connector::new(vec![client])),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        channel.call(rpc_request(b"no ready")).await,
+        Err(Error::InvalidInput(_))
+    ));
+    poll_fn(|cx| channel.poll_ready(cx)).await.unwrap();
+    poll_fn(|cx| channel.poll_ready(cx)).await.unwrap();
+    let mut clone = channel.clone();
+    assert!(matches!(
+        clone.call(rpc_request(b"clone")).await,
+        Err(Error::InvalidInput(_))
+    ));
+    poll_fn(|cx| clone.poll_ready(cx)).await.unwrap();
+    let response = channel.call(rpc_request(b"one")).await.unwrap();
+    let source = response.source().unwrap().generation();
+    let (parts, body) = response.into_parts();
+    let mapped = Response::from_parts(parts, body).map(|body| body.len());
+    assert_eq!(*mapped.body(), 3);
+    assert_eq!(mapped.source().unwrap().generation(), source);
+    assert!(matches!(
+        clone.call(rpc_request(b"cached capacity failure")).await,
+        Err(Error::ResourceLimit(_))
+    ));
+    poll_fn(|cx| channel.poll_ready(cx)).await.unwrap();
+    let inert = channel.call(rpc_request(b"unpolled"));
+    drop(inert);
+    poll_fn(|cx| channel.poll_ready(cx)).await.unwrap();
+    assert!(matches!(
+        channel.call(Request::new(Body::empty())).await,
+        Err(Error::InvalidInput(_))
+    ));
+    poll_fn(|cx| channel.poll_ready(cx)).await.unwrap();
+    assert!(matches!(
+        channel.call(rpc_request(&[0; 300])).await,
+        Err(Error::ResourceLimit(_))
+    ));
+    poll_fn(|cx| channel.poll_ready(cx)).await.unwrap();
+    assert!(channel.call(rpc_request(b"still works")).await.is_ok());
+    stop.send(()).unwrap();
+    bounded(serving).await.unwrap().unwrap();
+    drop((channel, clone));
+}
+
+#[derive(serde::Serialize)]
+struct FaultDetails<'a> {
+    code: i64,
+    message: &'a str,
+}
+#[derive(serde::Serialize)]
+struct RejectFault<'a> {
+    details: FaultDetails<'a>,
+}
+fn fault_body(message: &str) -> Vec<u8> {
+    fubst::serde::to_vec(&RejectFault {
+        details: FaultDetails { code: 33, message },
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn native_fault_details_override_only_with_a_valid_nonempty_message() {
+    let (client, accepted) = tokio::io::duplex(64);
+    let handler = rpc_ingress(Function(|request: Request<Body>| async move {
+        let case = *request.body().segments().next().unwrap().first().unwrap();
+        let bytes = match case {
+            0 => fault_body("diagnostic"),
+            1 => fault_body(""),
+            5 => {
+                let mut bytes = fault_body("x");
+                let offset = bytes.windows(2).position(|pair| pair == b"x\0").unwrap();
+                bytes[offset..offset + 2].copy_from_slice(&0xd800u16.to_le_bytes());
+                bytes
+            }
+            _ => vec![0xff],
+        };
+        let response = Message::builder()
+            .append_header(furpc::HeaderRecord::native(
+                header::FAULT,
+                &furpc::Fault {
+                    code: if case == 3 { 0 } else { 11 },
+                    has_body: case != 4,
+                },
+            )?)
+            .body(Body::from_bytes(bytes)?)
+            .build()?;
+        Ok::<_, Error>(IngressResponse::Reply(response))
+    }));
+    let (stop, stopped) = oneshot::channel();
+    let serving = tokio::spawn(
+        Server::builder()
+            .service(handler)
+            .unwrap()
+            .build()
+            .unwrap()
+            .serve_with_shutdown(one(accepted), ConnectionOptions::managed(), async {
+                stopped.await.unwrap();
+            }),
+    );
+    let channel = bounded(
+        Endpoint::from_shared("memory://fault")
+            .unwrap()
+            .connect_with_connector(Connector::new(vec![client])),
+    )
+    .await
+    .unwrap();
+    let peer = channel.peer(deadline()).await.unwrap();
+    for case in 0..3 {
+        let error = peer
+            .request(rpc_request(&[case]), deadline())
+            .await
+            .unwrap_err();
+        let Error::RemoteFault(fault) = error else {
+            panic!("native Fault category lost")
+        };
+        assert_eq!(fault.header_code(), 11);
+        assert_eq!(fault.code(), if case == 0 { 33 } else { 11 });
+        if case == 0 {
+            assert_eq!(String::from_utf16(fault.message()).unwrap(), "diagnostic");
+        }
+        assert_eq!(fault.body_error().is_some(), case == 2);
+        assert!(!fault.body().is_empty());
+    }
+    assert_eq!(
+        peer.request(rpc_request(&[3]), deadline())
+            .await
+            .unwrap()
+            .body()
+            .segments()
+            .next()
+            .unwrap(),
+        [0xff]
+    );
+    let Error::RemoteFault(unparsed) = peer
+        .request(rpc_request(&[4]), deadline())
+        .await
+        .unwrap_err()
+    else {
+        panic!("missing unparsed Fault")
+    };
+    assert_eq!(unparsed.code(), 11);
+    assert!(unparsed.body_error().is_none());
+    let Error::RemoteFault(utf16) = peer
+        .request(rpc_request(&[5]), deadline())
+        .await
+        .unwrap_err()
+    else {
+        panic!("missing UTF-16 Fault")
+    };
+    assert_eq!(utf16.code(), 33);
+    assert_eq!(utf16.message(), [0xd800]);
+    stop.send(()).unwrap();
+    bounded(serving).await.unwrap().unwrap();
+    drop(channel);
+}
+
+#[tokio::test]
+async fn rpc_cancellation_timeout_and_late_reply_do_not_reuse_correlation_or_close_the_connection()
+{
+    let (client, accepted) = tokio::io::duplex(64);
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let handler = rpc_ingress(Function({
+        let entered = entered.clone();
+        let release = release.clone();
+        move |request: Request<Body>| {
+            let slow = request.body().segments().next().unwrap() == [1];
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                if slow {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                Ok::<_, Error>(IngressResponse::Reply(
+                    Message::builder().body(request.into_body()).build()?,
+                ))
+            }
+        }
+    }));
+    let (stop, stopped) = oneshot::channel();
+    let serving = tokio::spawn(
+        Server::builder()
+            .service(handler)
+            .unwrap()
+            .build()
+            .unwrap()
+            .serve_with_shutdown(one(accepted), ConnectionOptions::managed(), async {
+                stopped.await.unwrap();
+            }),
+    );
+    let channel = bounded(
+        Endpoint::from_shared("memory://late")
+            .unwrap()
+            .limits(TransportLimits {
+                max_pending_requests: 1,
+                ..Default::default()
+            })
+            .connect_with_connector(Connector::new(vec![client])),
+    )
+    .await
+    .unwrap();
+    let peer = channel.peer(deadline()).await.unwrap();
+    let cancelled = peer.request(rpc_request(&[0]), deadline());
+    assert_eq!(
+        cancelled.attempt().cancel_uncommitted(),
+        CancelOutcome::Retracted
+    );
+    assert!(matches!(cancelled.await, Err(Error::Cancelled)));
+    let mut slow = Box::pin(peer.request(
+        Request::new(Body::from_bytes(vec![1]).unwrap()),
+        Instant::now() + Duration::from_millis(20),
+    ));
+    assert!(slow.as_mut().now_or_never().is_none());
+    bounded(entered.notified()).await;
+    assert!(matches!(slow.await, Err(Error::Timeout("RPC"))));
+    release.notify_one();
+    let response = peer.request(rpc_request(&[2]), deadline()).await.unwrap();
+    assert_eq!(response.body().segments().next().unwrap(), [2]);
+    for id in [
+        header::MESSAGE_ID,
+        header::EXPECTS_REPLY,
+        header::RELATES_TO,
+        header::UNCORRELATED_REPLY,
+    ] {
+        #[derive(serde::Serialize)]
+        struct Flag {
+            value: bool,
+        }
+        let record = if id == header::MESSAGE_ID || id == header::RELATES_TO {
+            furpc::HeaderRecord::native(
+                id,
+                &furpc::MessageId {
+                    guid: [1; 16],
+                    index: 1,
+                },
+            )
+            .unwrap()
+        } else {
+            furpc::HeaderRecord::native(id, &Flag { value: false }).unwrap()
+        };
+        assert!(matches!(
+            peer.request(rpc_request(&[3]).append_header(record).unwrap(), deadline())
+                .await,
+            Err(Error::InvalidInput(_))
+        ));
+    }
+    stop.send(()).unwrap();
+    bounded(serving).await.unwrap().unwrap();
+    drop(channel);
+}
+
+#[tokio::test]
+async fn admitted_rpc_replies_finish_during_drain_without_authorizing_new_peer_sends() {
+    let (client, accepted) = tokio::io::duplex(64);
+    let (peers, mut escaped) = mpsc::channel(1);
+    let release = Arc::new(Notify::new());
+    let handler = IngressService::new(
+        Function({
+            let release = release.clone();
+            move |request: Request<Body>| {
+                let peers = peers.clone();
+                let release = release.clone();
+                async move {
+                    peers
+                        .send(request.context().unwrap().peer().unwrap().clone())
+                        .await
+                        .unwrap();
+                    release.notified().await;
+                    Ok::<_, Error>(IngressResponse::Reply(
+                        Message::builder().body(request.into_body()).build()?,
+                    ))
+                }
+            }
+        }),
+        vec![ServiceBinding::raw(
+            IngressOptions::requests(RequestPolicy::new(allow, allow), IngressLimits::default())
+                .with_send_policy(SendPolicy::new(control_sends)),
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    let (stop, stopped) = oneshot::channel();
+    let serving = tokio::spawn(
+        Server::builder()
+            .service(handler)
+            .unwrap()
+            .build()
+            .unwrap()
+            .serve_with_shutdown(one(accepted), ConnectionOptions::managed(), async {
+                stopped.await.unwrap();
+            }),
+    );
+    let channel = bounded(
+        Endpoint::from_shared("memory://reply-drain")
+            .unwrap()
+            .connect_with_connector(Connector::new(vec![client])),
+    )
+    .await
+    .unwrap();
+    let peer = channel.peer(deadline()).await.unwrap();
+    let mut request = Box::pin(peer.request(rpc_request(b"original"), deadline()));
+    assert!(request.as_mut().now_or_never().is_none());
+    let accepted = bounded(escaped.recv()).await.unwrap();
+    stop.send(()).unwrap();
+    bounded(async {
+        loop {
+            if accepted.send(packet("ack", b""), deadline()).await.is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(!serving.is_finished());
+    release.notify_one();
+    assert_eq!(
+        bounded(request)
+            .await
+            .unwrap()
+            .body()
+            .segments()
+            .next()
+            .unwrap(),
+        b"original"
+    );
+    bounded(serving).await.unwrap().unwrap();
+    drop(channel);
+}
+
+#[tokio::test]
+async fn byte_readiness_never_retargets_a_retired_generation_and_reconnects_only_for_later_calls() {
+    let (first, first_accepted) = tokio::io::duplex(64);
+    let (second, second_accepted) = tokio::io::duplex(64);
+    let mut connector = Connector::new(vec![first, second]);
+    connector.ios.insert(1, None);
+    let calls = connector.calls.clone();
+    let echo = || {
+        rpc_ingress(Function(|request: Request<Body>| async move {
+            Ok::<_, Error>(IngressResponse::Reply(
+                Message::builder().body(request.into_body()).build()?,
+            ))
+        }))
+    };
+    let first_server = tokio::spawn(
+        Server::builder()
+            .service(echo())
+            .unwrap()
+            .build()
+            .unwrap()
+            .serve_with_shutdown(one(first_accepted), ConnectionOptions::managed(), pending()),
+    );
+    let second_server = tokio::spawn(
+        Server::builder()
+            .service(echo())
+            .unwrap()
+            .build()
+            .unwrap()
+            .serve_with_shutdown(
+                one(second_accepted),
+                ConnectionOptions::managed(),
+                pending(),
+            ),
+    );
+    let mut channel = bounded(
+        Endpoint::from_shared("memory://managed-reconnect")
+            .unwrap()
+            .connect_with_connector(connector),
+    )
+    .await
+    .unwrap();
+    poll_fn(|cx| channel.poll_ready(cx)).await.unwrap();
+    let old = channel.peer(deadline()).await.unwrap();
+    first_server.abort();
+    assert!(first_server.await.unwrap_err().is_cancelled());
+    bounded(async {
+        loop {
+            if old.send(packet("old", b""), deadline()).await.is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(channel.call(rpc_request(b"must not replay")).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    poll_fn(|cx| channel.poll_ready(cx)).await.unwrap();
+    poll_fn(|cx| channel.poll_ready(cx)).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        channel.call(rpc_request(b"failed reconnect")).await,
+        Err(Error::Transport {
+            phase: "connector",
+            ..
+        })
+    ));
+    poll_fn(|cx| channel.poll_ready(cx)).await.unwrap();
+    assert_eq!(
+        channel
+            .call(rpc_request(b"fresh"))
+            .await
+            .unwrap()
+            .body()
+            .segments()
+            .next()
+            .unwrap(),
+        b"fresh"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    drop(channel);
+    bounded(second_server).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn pending_rpc_expiry_is_driver_owned_even_when_the_operation_is_not_polled() {
+    let (client, accepted) = tokio::io::duplex(64);
+    let (operations, mut pending_operations) = mpsc::channel(1);
+    let hook = Function(move |peer: Peer| {
+        let operations = operations.clone();
+        async move {
+            let mut operation = Box::pin(peer.request(
+                Request::new(Body::empty()),
+                Instant::now() + Duration::from_millis(20),
+            ));
+            assert!(operation.as_mut().now_or_never().is_none());
+            operations.send(operation).await.unwrap();
+            Ok::<_, Error>(())
+        }
+    });
+    fn requests_allowed(_: SendKind, _: &Headers, _: &Source) -> furpc::Result<()> {
+        Ok(())
+    }
+    let (stop, stopped) = oneshot::channel();
+    let serving = tokio::spawn(
+        Server::builder()
+            .drain_timeout(Duration::from_secs(1))
+            .on_peer_ready(SendPolicy::new(requests_allowed), hook)
+            .unwrap()
+            .build()
+            .unwrap()
+            .serve_with_shutdown(one(accepted), ConnectionOptions::managed(), async {
+                stopped.await.unwrap();
+            }),
+    );
+    let channel = bounded(
+        Endpoint::from_shared("memory://unobserved-rpc")
+            .unwrap()
+            .connect_with_connector(Connector::new(vec![client])),
+    )
+    .await
+    .unwrap();
+    let operation = bounded(pending_operations.recv()).await.unwrap();
+    stop.send(()).unwrap();
+    bounded(serving).await.unwrap().unwrap();
+    assert!(matches!(operation.await, Err(Error::Timeout("RPC"))));
+    drop(channel);
+}
+
+#[tokio::test]
+async fn reply_contract_and_response_policy_failures_send_nothing_and_release_their_tickets() {
+    fn response(headers: &Headers, _: &Source) -> furpc::Result<()> {
+        if action(headers) == "allowed" {
+            Ok(())
+        } else {
+            Err(Error::InvalidInput("response policy"))
+        }
+    }
+    let (client, accepted) = tokio::io::duplex(64);
+    let handler = Function(|request: Request<Body>| async move {
+        let case = request.body().segments().next().unwrap()[0];
+        if case == 0 {
+            return Ok::<_, Error>(IngressResponse::NoReply);
+        }
+        let mut reply = Message::builder().append_header(header::action(if case == 2 {
+            "denied"
+        } else {
+            "allowed"
+        })?);
+        if case == 1 {
+            reply = reply.append_header(furpc::HeaderRecord::native(
+                header::RELATES_TO,
+                &furpc::MessageId {
+                    guid: [5; 16],
+                    index: 5,
+                },
+            )?);
+        }
+        Ok(IngressResponse::Reply(
+            reply.body(request.into_body()).build()?,
+        ))
+    });
+    let service = IngressService::new(
+        handler,
+        vec![ServiceBinding::raw(IngressOptions::requests(
+            RequestPolicy::new(allow, response),
+            IngressLimits::default(),
+        ))
+        .unwrap()],
+    )
+    .unwrap();
+    let (stop, stopped) = oneshot::channel();
+    let serving = tokio::spawn(
+        Server::builder()
+            .service(service)
+            .unwrap()
+            .handler_limits(HandlerLimits {
+                max_in_flight: 1,
+                ..Default::default()
+            })
+            .build()
+            .unwrap()
+            .serve_with_shutdown(one(accepted), ConnectionOptions::managed(), async {
+                stopped.await.unwrap();
+            }),
+    );
+    let channel = bounded(
+        Endpoint::from_shared("memory://reply-contract")
+            .unwrap()
+            .limits(TransportLimits {
+                max_pending_requests: 1,
+                ..Default::default()
+            })
+            .connect_with_connector(Connector::new(vec![client])),
+    )
+    .await
+    .unwrap();
+    let peer = channel.peer(deadline()).await.unwrap();
+    for case in 0..3 {
+        assert!(matches!(
+            peer.request(
+                rpc_request(&[case]),
+                Instant::now() + Duration::from_millis(20)
+            )
+            .await,
+            Err(Error::Timeout("RPC"))
+        ));
+    }
+    assert_eq!(
+        peer.request(rpc_request(&[3]), deadline())
+            .await
+            .unwrap()
+            .body()
+            .segments()
+            .next()
+            .unwrap(),
+        [3]
+    );
+    stop.send(()).unwrap();
+    bounded(serving).await.unwrap().unwrap();
+    drop(channel);
+}
+
+#[tokio::test(start_paused = true)]
+async fn on_time_rpc_response_survives_late_observation_and_generation_retirement() {
+    fn requests_only(kind: SendKind, _: &Headers, _: &Source) -> furpc::Result<()> {
+        if kind == SendKind::Request {
+            Ok(())
+        } else {
+            Err(Error::InvalidInput("requests only"))
+        }
+    }
+    let (client, accepted) = tokio::io::duplex(64);
+    let (peers, mut escaped) = mpsc::channel(1);
+    let reverse = IngressService::new(
+        Function(move |request: Request<Body>| {
+            let peers = peers.clone();
+            async move {
+                peers
+                    .send(request.context().unwrap().peer().unwrap().clone())
+                    .await
+                    .unwrap();
+                Ok::<_, Error>(IngressResponse::NoReply)
+            }
+        }),
+        vec![ServiceBinding::raw(
+            IngressOptions::one_way(allow, IngressLimits::default())
+                .with_send_policy(SendPolicy::new(requests_only)),
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    let entered = Arc::new(Notify::new());
+    let handler = rpc_ingress(Function({
+        let entered = entered.clone();
+        move |request: Request<Body>| {
+            entered.notify_one();
+            async move {
+                Ok::<_, Error>(IngressResponse::Reply(
+                    Message::builder().body(request.into_body()).build()?,
+                ))
+            }
+        }
+    }));
+    let hook = Function(|peer: Peer| async move {
+        peer.send(packet("bootstrap", b""), deadline()).await?;
+        Ok::<_, Error>(())
+    });
+    let (stop, stopped) = oneshot::channel();
+    let serving = tokio::spawn(
+        Server::builder()
+            .service(handler)
+            .unwrap()
+            .on_peer_ready(SendPolicy::new(control_sends), hook)
+            .unwrap()
+            .build()
+            .unwrap()
+            .serve_with_shutdown(one(accepted), ConnectionOptions::managed(), async {
+                stopped.await.unwrap();
+            }),
+    );
+    let channel = bounded(
+        Endpoint::from_shared("memory://settled-rpc")
+            .unwrap()
+            .service(reverse)
+            .unwrap()
+            .connect_with_connector(Connector::new(vec![client])),
+    )
+    .await
+    .unwrap();
+    let peer = bounded(escaped.recv()).await.unwrap();
+    let mut operation = Box::pin(peer.request(
+        Request::new(Body::from_bytes(vec![7]).unwrap()),
+        Instant::now() + Duration::from_secs(1),
+    ));
+    assert!(operation.as_mut().now_or_never().is_none());
+    bounded(entered.notified()).await;
+    stop.send(()).unwrap();
+    bounded(serving).await.unwrap().unwrap();
+    bounded(async {
+        loop {
+            match peer
+                .send(packet("denied without I/O", b""), deadline())
+                .await
+            {
+                Err(Error::Closed) => break,
+                Err(Error::InvalidInput("requests only")) => tokio::task::yield_now().await,
+                result => panic!("unexpected send result {result:?}"),
+            }
+        }
+    })
+    .await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(
+        operation.await.unwrap().body().segments().next().unwrap(),
+        [7]
+    );
+    drop(channel);
+}
+
+#[tokio::test]
+async fn raw_only_mode_rejects_rpc_and_byte_service_readiness_explicitly() {
+    let (client, accepted) = tokio::io::duplex(64);
+    let serving = tokio::spawn(Server::builder().build().unwrap().serve_with_shutdown(
+        one(accepted),
+        ConnectionOptions::raw_only(),
+        pending(),
+    ));
+    let mut channel =
+        bounded(raw("memory://raw-rpc").connect_with_connector(Connector::new(vec![client])))
+            .await
+            .unwrap();
+    let peer = channel.peer(deadline()).await.unwrap();
+    assert!(matches!(
+        peer.request(rpc_request(b"unsupported"), deadline()).await,
+        Err(Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        poll_fn(|cx| channel.poll_ready(cx)).await,
+        Err(Error::Unsupported(_))
+    ));
+    drop(channel);
+    bounded(serving).await.unwrap().unwrap();
+}
+
 #[test]
 fn endpoint_configuration_is_pure_and_preserves_complete_custom_uris() {
     fn send_sync<T: Send + Sync>() {}
@@ -239,9 +1058,8 @@ fn endpoint_configuration_is_pure_and_preserves_complete_custom_uris() {
 }
 
 #[tokio::test]
-async fn managed_mode_and_invalid_configuration_fail_before_connector_polling() {
+async fn invalid_configuration_fails_before_connector_polling() {
     for endpoint in [
-        Endpoint::from_shared("memory://echo").unwrap(),
         raw("memory://echo").connect_timeout(Duration::ZERO),
         raw("memory://echo").limits(TransportLimits {
             max_pending_sends: 0,
@@ -514,6 +1332,7 @@ async fn reconnect_is_coalesced_reuses_send_only_connector_and_never_retargets_o
 #[tokio::test]
 async fn graceful_shutdown_waits_for_admitted_handler_but_closes_new_native_sends() {
     let (client, accepted) = tokio::io::duplex(128);
+    let (peers, mut escaped) = mpsc::channel(1);
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let handler = ingress(
@@ -523,15 +1342,20 @@ async fn graceful_shutdown_waits_for_admitted_handler_but_closes_new_native_send
             move |request: Request<Body>| {
                 let started = started.clone();
                 let release = release.clone();
+                let peers = peers.clone();
                 async move {
                     assert!(request.context().is_some());
+                    peers
+                        .send(request.context().unwrap().peer().unwrap().clone())
+                        .await
+                        .unwrap();
                     started.notify_one();
                     release.notified().await;
                     Ok::<_, Error>(IngressResponse::NoReply)
                 }
             }
         }),
-        false,
+        true,
     );
     let (stop, stopped) = oneshot::channel();
     let serving = tokio::spawn(
@@ -553,10 +1377,14 @@ async fn graceful_shutdown_waits_for_admitted_handler_but_closes_new_native_send
         .await
         .unwrap();
     bounded(started.notified()).await;
+    let accepted_peer = bounded(escaped.recv()).await.unwrap();
     stop.send(()).unwrap();
     bounded(async {
         loop {
-            if peer.send(packet("closed", b""), deadline()).await.is_err() {
+            if matches!(
+                accepted_peer.send(packet("ack", b""), deadline()).await,
+                Err(Error::Closed)
+            ) {
                 break;
             }
             tokio::task::yield_now().await;

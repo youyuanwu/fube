@@ -158,9 +158,13 @@ impl Server {
         A: Accept,
         F: Future<Output = ()> + Send + 'static,
     {
-        options.validate()?;
         let config = self.config;
-        let registry = Registry::new(config.service, config.handler_limits)?;
+        let registry = Registry::new(
+            config.service,
+            config.handler_limits,
+            options,
+            &config.limits,
+        )?;
         let connections = Arc::new(Semaphore::new(config.limits.max_connections));
         let handshakes = Arc::new(Semaphore::new(config.limits.max_handshakes));
         let (stop, _) = watch::channel(false);

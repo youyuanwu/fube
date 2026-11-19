@@ -24,6 +24,18 @@ use crate::{
 
 pub type EnvelopeCheck = fn(&Headers, &Source) -> Result<()>;
 
+/// Independently authorizes inbound requests and their original-path replies.
+#[derive(Clone, Copy)]
+pub struct RequestPolicy {
+    request: EnvelopeCheck,
+    response: EnvelopeCheck,
+}
+impl RequestPolicy {
+    pub fn new(request: EnvelopeCheck, response: EnvelopeCheck) -> Self {
+        Self { request, response }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IngressLimits {
     pub max_body_bytes: usize,
@@ -41,6 +53,7 @@ pub struct IngressOptions {
     check: EnvelopeCheck,
     limits: IngressLimits,
     sends: Option<SendPolicy>,
+    request: Option<RequestPolicy>,
 }
 impl IngressOptions {
     pub fn one_way(check: EnvelopeCheck, limits: IngressLimits) -> Self {
@@ -48,6 +61,15 @@ impl IngressOptions {
             check,
             limits,
             sends: None,
+            request: None,
+        }
+    }
+    pub fn requests(policy: RequestPolicy, limits: IngressLimits) -> Self {
+        Self {
+            check: policy.request,
+            limits,
+            sends: None,
+            request: Some(policy),
         }
     }
     pub fn with_send_policy(mut self, policy: SendPolicy) -> Self {
@@ -224,13 +246,19 @@ pub(crate) struct Registry {
     stopping: AtomicBool,
     generations: Mutex<Vec<Weak<Generation>>>,
     diagnostics: AtomicU64,
+    pub(crate) managed: bool,
+    pub(crate) rpc_slots: Arc<Semaphore>,
+    reply_slots: Arc<Semaphore>,
 }
 impl Registry {
     pub(crate) fn new(
         service: Option<Arc<StoredService>>,
         limits: HandlerLimits,
+        options: crate::ConnectionOptions,
+        transport: &crate::TransportLimits,
     ) -> Result<Arc<Self>> {
         limits.validate()?;
+        let reply_count = limits.max_in_flight;
         Ok(Arc::new(Self {
             service: Mutex::new(service),
             active: Arc::new(Semaphore::new(limits.max_in_flight)),
@@ -241,6 +269,9 @@ impl Registry {
             stopping: AtomicBool::new(false),
             generations: Mutex::new(Vec::new()),
             diagnostics: AtomicU64::new(0),
+            managed: options.is_managed(),
+            rpc_slots: Arc::new(Semaphore::new(transport.max_pending_requests)),
+            reply_slots: Arc::new(Semaphore::new(reply_count)),
         }))
     }
     pub(crate) fn install(&self, service: Arc<StoredService>) -> Result<()> {
@@ -322,7 +353,13 @@ impl Registry {
             .clone()
             .ok_or(DropReason::NoDestination)?;
         let options = &service.binding.options;
-        if body_bytes > options.limits.max_body_bytes || headers.effective().expects_reply {
+        let common = headers.effective();
+        let valid_kind = if options.request.is_some() {
+            common.expects_reply && common.message_id != crate::MessageId::default()
+        } else {
+            !common.expects_reply
+        };
+        if body_bytes > options.limits.max_body_bytes || !valid_kind {
             self.diagnose(
                 "ingress policy",
                 &Error::Protocol("one-way envelope/body rejected"),
@@ -338,6 +375,17 @@ impl Registry {
             .clone()
             .try_acquire_owned()
             .map_err(|_| DropReason::Capacity)?;
+        let reply = options
+            .request
+            .map(|policy| {
+                let slot = self
+                    .reply_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| DropReason::Capacity)?;
+                Ok((common.message_id, policy.response, slot))
+            })
+            .transpose()?;
         Ok(Dispatch {
             service,
             deadline: Instant::now() + self.limits.timeout,
@@ -345,6 +393,8 @@ impl Registry {
                 live: Arc::new(AtomicBool::new(true)),
                 _permit: permit,
             },
+            reply,
+            max_response: self.limits.max_encoded_body_bytes_per_response,
         })
     }
 }
@@ -363,6 +413,8 @@ pub(crate) struct Dispatch {
     service: Arc<StoredService>,
     deadline: Instant,
     guard: Invocation,
+    reply: Option<(crate::MessageId, EnvelopeCheck, OwnedSemaphorePermit)>,
+    max_response: usize,
 }
 impl Dispatch {
     pub(crate) fn deadline(&self) -> Instant {
@@ -384,6 +436,7 @@ impl Dispatch {
             live: Arc::downgrade(&self.guard.live),
         });
         let readiness = core.registry.readiness.clone();
+        let target = Arc::downgrade(core);
         Box::pin(async move {
             let _guard = self.guard;
             if Instant::now() >= self.deadline {
@@ -402,12 +455,29 @@ impl Dispatch {
                 .await
                 .map_err(|_| Error::Timeout("handler"))??
             {
-                IngressResponse::NoReply => Ok(()),
-                IngressResponse::Reply(_) => Err(Error::handler(
+                IngressResponse::NoReply if self.reply.is_none() => Ok(()),
+                IngressResponse::Reply(message) if self.reply.is_some() => {
+                    if message.body().len() > self.max_response {
+                        return Err(Error::ResourceLimit("encoded handler response body"));
+                    }
+                    let (id, policy, slot) = self.reply.expect("authorized reply");
+                    let receipt = target.upgrade().ok_or(Error::Closed)?.reply(
+                        message,
+                        id,
+                        policy,
+                        self.deadline,
+                        slot,
+                    )?;
+                    timeout_at(self.deadline, receipt)
+                        .await
+                        .map_err(|_| Error::Timeout("reply write"))?
+                        .map_err(Error::from)
+                }
+                _ => Err(Error::handler(
                     "response contract",
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "Reply without a reply grant",
+                        "missing response or Reply without a reply grant",
                     ),
                 )),
             }

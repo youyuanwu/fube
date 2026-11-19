@@ -42,6 +42,8 @@ pub(crate) enum DropReason {
 pub(crate) enum ConnectionEvent {
     Opened(ListenInstance),
     IngressAdmitted,
+    Reply(Message),
+    ReadClosed,
     InstanceUpdated(ListenInstance),
     Message(Message),
     Discarded(DropReason),
@@ -84,6 +86,7 @@ impl ActiveSend {
 enum ReceiveKind {
     Hello,
     Application,
+    Reply,
     Discard(DropReason),
 }
 
@@ -116,6 +119,7 @@ pub(crate) struct ConnectionDriver<I> {
     remote: Option<ListenInstance>,
     read_eof: bool,
     timer: Pin<Box<Sleep>>,
+    rpc: bool,
 }
 
 impl<I> ConnectionDriver<I>
@@ -145,6 +149,7 @@ where
                 handles: 1,
                 drain_deadline: None,
                 waker: None,
+                drain_holds: 0,
             }),
             config,
         });
@@ -184,8 +189,13 @@ where
                 remote: None,
                 read_eof: false,
                 timer: Box::pin(sleep_until(establishment_deadline)),
+                rpc: false,
             },
         ))
+    }
+
+    pub(crate) fn enable_rpc(&mut self) {
+        self.rpc = true;
     }
 
     pub(crate) fn poll_event(
@@ -257,7 +267,10 @@ where
                         self.remote.take().expect("verified remote hello"),
                     ))));
                 }
-                if state.phase == Phase::Draining && self.active.is_none() && state.queue.is_empty()
+                if state.phase == Phase::Draining
+                    && state.drain_holds == 0
+                    && self.active.is_none()
+                    && state.queue.is_empty()
                 {
                     drop(state);
                     return match Pin::new(self.io.as_mut().expect("live driver owns I/O"))
@@ -357,7 +370,7 @@ where
         }
         if !operation.committed {
             if let Some(authorization) = &active.job.authorization {
-                if let Err(error) = authorization.check() {
+                if let Err(error) = authorization.check_commit() {
                     drop(operation);
                     drop(state);
                     self.finish_send(Err(error.into()));
@@ -492,7 +505,11 @@ where
                             }
                             _ => {}
                         }
-                        Ok(ReceiveProgress::Progress)
+                        if notify_admission {
+                            Ok(ReceiveProgress::Event(ConnectionEvent::ReadClosed))
+                        } else {
+                            Ok(ReceiveProgress::Progress)
+                        }
                     }
                     Poll::Ready(Ok(())) => {
                         self.frame_deadline
@@ -519,7 +536,7 @@ where
             FrameReadStep::Headers(prefix) => {
                 let headers = Headers::from_received(prefix.area, &self.config.headers)?;
                 let mut kind = self.classify(&headers)?;
-                if matches!(kind, ReceiveKind::Application) {
+                if matches!(kind, ReceiveKind::Application | ReceiveKind::Reply) {
                     if let Err(reason) = admit(&headers, prefix.header.body_len() as usize) {
                         kind = ReceiveKind::Discard(reason);
                     }
@@ -543,7 +560,7 @@ where
                 if notify_admission
                     && matches!(
                         self.provisional.as_ref().unwrap().kind,
-                        ReceiveKind::Application
+                        ReceiveKind::Application | ReceiveKind::Reply
                     )
                 {
                     Ok(ReceiveProgress::Event(ConnectionEvent::IngressAdmitted))
@@ -584,6 +601,9 @@ where
                             )))
                         }
                     }
+                    ReceiveKind::Reply => Ok(ReceiveProgress::Event(ConnectionEvent::Reply(
+                        Message::from_received(headers, verified.body),
+                    ))),
                     ReceiveKind::Discard(_) => {
                         Err(Error::Internal("discarded frame produced retained body").into())
                     }
@@ -628,8 +648,10 @@ where
         }
         let reason = if common.uncorrelated_reply {
             Some(DropReason::SpecialDuplexUnavailable)
-        } else if common.relates_to != MessageId::default() {
+        } else if common.relates_to != MessageId::default() && !self.rpc {
             Some(DropReason::UnmatchedReply)
+        } else if common.relates_to != MessageId::default() {
+            return Ok(ReceiveKind::Reply);
         } else if state.phase == Phase::Draining {
             Some(DropReason::Draining)
         } else if matches!(self.config.ingress, Ingress::None) {

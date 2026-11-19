@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     panic::AssertUnwindSafe,
     sync::{Arc, Mutex, Weak},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -10,7 +11,7 @@ use bytes::Bytes;
 use futures_util::FutureExt;
 use http::Uri;
 use tokio::{
-    sync::{oneshot, watch, Notify, Semaphore},
+    sync::{oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore},
     task::AbortHandle,
     time::{timeout_at, Instant},
 };
@@ -18,14 +19,15 @@ use tower_service::Service;
 
 use super::{
     io::{tcp_destination, validate_uri},
-    session, validate_timeout, Connected, ConnectionOptions, TcpConnector, TransportIo,
+    session, validate_timeout, BoxFuture, Connected, ConnectionOptions, TcpConnector, TransportIo,
     TransportLimits,
 };
 use crate::{
     connection::Role,
-    peer::Generation,
+    peer::{Generation, Reservation},
     service::{Registry, StoredService},
-    Body, BoxError, Error, HandlerLimits, IngressResponse, IngressService, Peer, Request, Result,
+    Body, BoxError, Error, HandlerLimits, IngressResponse, IngressService, Operation, Peer,
+    Request, Response, Result,
 };
 
 /// Inert addressing and transport configuration; constructing it does no I/O.
@@ -123,7 +125,6 @@ impl Endpoint {
         C::Error: Into<BoxError>,
         I: TransportIo,
     {
-        self.options.validate()?;
         self.limits.validate()?;
         self.handler_limits.validate()?;
         validate_timeout(self.connect_timeout)?;
@@ -135,8 +136,13 @@ impl Endpoint {
                 current: Weak::new(),
                 attempt: attempt.clone(),
             }),
-            registry: Registry::new(self.service.clone(), self.handler_limits.clone())?,
-            waiters: Semaphore::new(self.limits.max_peer_waiters),
+            registry: Registry::new(
+                self.service.clone(),
+                self.handler_limits.clone(),
+                self.options,
+                &self.limits,
+            )?,
+            waiters: Arc::new(Semaphore::new(self.limits.max_peer_waiters)),
             demand: Notify::new(),
         });
         let (ready, result) = oneshot::channel();
@@ -164,6 +170,7 @@ impl Endpoint {
                 logical,
                 abort: task.abort_handle(),
             }),
+            ready: Mutex::new(Ready::default()),
         };
         drop(task);
         result
@@ -211,7 +218,7 @@ struct LogicalState {
 struct Logical {
     state: Mutex<LogicalState>,
     registry: Arc<Registry>,
-    waiters: Semaphore,
+    waiters: Arc<Semaphore>,
     demand: Notify,
 }
 struct Owner {
@@ -233,23 +240,58 @@ impl Drop for Owner {
 
 /// Cheap-clone logical ownership. Peer capabilities never retain this owner.
 /// Retain a Channel while its native operations or reverse ingress are needed.
-#[derive(Clone)]
 pub struct Channel {
     owner: Arc<Owner>,
+    // get_mut polls readiness without a lock; the mutex keeps Channel Sync.
+    ready: Mutex<Ready>,
+}
+#[derive(Default)]
+struct Ready {
+    waiting: Option<BoxFuture<Prepared>>,
+    value: Option<Prepared>,
+}
+enum Prepared {
+    Reserved(Reservation),
+    Failed(Error, Option<OwnedSemaphorePermit>),
+}
+impl Clone for Channel {
+    fn clone(&self) -> Self {
+        Self {
+            owner: self.owner.clone(),
+            ready: Mutex::new(Ready::default()),
+        }
+    }
 }
 impl Channel {
     pub async fn peer(&self, deadline: Instant) -> Result<Peer> {
         if Instant::now() >= deadline {
             return Err(Error::Timeout("peer acquisition"));
         }
+        timeout_at(deadline, self.peer_inner())
+            .await
+            .map_err(|_| Error::Timeout("peer acquisition"))?
+    }
+
+    fn current(&self) -> Result<Option<Peer>> {
         let logical = &self.owner.logical;
         if logical.registry.is_stopping() {
             return Err(Error::Closed);
         }
+        Ok(logical
+            .state
+            .lock()
+            .unwrap()
+            .current
+            .upgrade()
+            .filter(|core| core.is_open())
+            .map(|core| core.peer(None)))
+    }
+    fn demand(&self) -> Arc<Establishment> {
+        let logical = &self.owner.logical;
         let attempt = {
             let mut state = logical.state.lock().unwrap();
-            if let Some(current) = state.current.upgrade().filter(|current| current.is_open()) {
-                return Ok(current.peer(None));
+            if state.current.upgrade().is_some_and(|core| core.is_open()) {
+                return state.attempt.clone();
             }
             let completed = state.attempt.result.lock().unwrap().is_some();
             if completed {
@@ -258,18 +300,57 @@ impl Channel {
             state.attempt.clone()
         };
         logical.demand.notify_one();
+        attempt
+    }
+    async fn peer_inner(&self) -> Result<Peer> {
+        if let Some(peer) = self.current()? {
+            return Ok(peer);
+        }
+        let logical = &self.owner.logical;
+        let attempt = self.demand();
         let _waiter = logical
             .waiters
             .try_acquire()
             .map_err(|_| Error::ResourceLimit("peer waiters"))?;
-        let current = timeout_at(deadline, attempt.wait())
-            .await
-            .map_err(|_| Error::Timeout("peer acquisition"))??;
+        let current = attempt.wait().await?;
         let current = current
             .upgrade()
             .filter(|current| current.is_open())
             .ok_or(Error::Closed)?;
         Ok(current.peer(None))
+    }
+
+    async fn prepare(&self) -> Prepared {
+        match self.current() {
+            Ok(Some(peer)) => {
+                return match peer.reserve() {
+                    Ok(reservation) => Prepared::Reserved(reservation),
+                    Err(error) => self.failed(error, None),
+                }
+            }
+            Err(error) => return self.failed(error, None),
+            Ok(None) => {}
+        }
+        let attempt = self.demand();
+        let waiter = match self.owner.logical.waiters.clone().try_acquire_owned() {
+            Ok(waiter) => waiter,
+            Err(_) => return Prepared::Failed(Error::ResourceLimit("RPC readiness waiters"), None),
+        };
+        let result = attempt
+            .wait()
+            .await
+            .and_then(|core| core.upgrade().ok_or(Error::Closed))
+            .and_then(|core| core.peer(None).reserve());
+        match result {
+            Ok(reservation) => Prepared::Reserved(reservation),
+            Err(error) => self.failed(error, Some(waiter)),
+        }
+    }
+    fn failed(&self, error: Error, permit: Option<OwnedSemaphorePermit>) -> Prepared {
+        match permit.or_else(|| self.owner.logical.waiters.clone().try_acquire_owned().ok()) {
+            Some(permit) => Prepared::Failed(error, Some(permit)),
+            None => Prepared::Failed(Error::ResourceLimit("RPC readiness outcomes"), None),
+        }
     }
     pub fn register_service<S>(&self, service: IngressService<S>) -> Result<()>
     where
@@ -278,6 +359,64 @@ impl Channel {
         S::Error: Into<BoxError>,
     {
         self.owner.logical.registry.install(service.erase())
+    }
+}
+
+impl Service<Request<Body>> for Channel {
+    type Response = Response<Body>;
+    type Error = Error;
+    type Future = BoxFuture<Result<Response<Body>>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if !self.owner.logical.registry.managed {
+            return Poll::Ready(Err(Error::Unsupported("RPC in raw-only mode")));
+        }
+        if self.owner.logical.registry.is_stopping() {
+            *self.ready.get_mut().unwrap() = Ready::default();
+            return Poll::Ready(Err(Error::Closed));
+        }
+        if self.ready.get_mut().unwrap().value.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        if self.ready.get_mut().unwrap().waiting.is_none() {
+            let channel = self.clone();
+            self.ready.get_mut().unwrap().waiting =
+                Some(Box::pin(async move { channel.prepare().await }));
+        }
+        let ready = self.ready.get_mut().unwrap();
+        match ready
+            .waiting
+            .as_mut()
+            .expect("readiness future")
+            .as_mut()
+            .poll(cx)
+        {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(value) => {
+                ready.waiting = None;
+                ready.value = Some(value);
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let ready = self.ready.get_mut().unwrap().value.take();
+        self.ready.get_mut().unwrap().waiting = None;
+        let owner = self.owner.clone();
+        Box::pin(async move {
+            let _owner = owner;
+            match ready {
+                Some(Prepared::Reserved(reservation)) => {
+                    let deadline = request
+                        .deadline()
+                        .ok_or(Error::InvalidInput("byte RPC requires a deadline"))?;
+                    Operation::request(reservation.peer, request, deadline, Some(reservation.slot))
+                        .await
+                }
+                Some(Prepared::Failed(error, _permit)) => Err(error),
+                None => Err(Error::InvalidInput("Channel call without readiness")),
+            }
+        })
     }
 }
 

@@ -1,4 +1,8 @@
-use crate::{connection::SendAttempt, transport::BoxFuture, Error, Message, Peer, Result};
+use crate::{
+    connection::{SendAttempt, SendReceipt},
+    transport::BoxFuture,
+    Body, Error, Message, Peer, Request, Response, Result,
+};
 use std::{
     future::Future,
     pin::Pin,
@@ -29,6 +33,31 @@ struct State {
 #[derive(Clone)]
 pub struct Attempt(Arc<Mutex<State>>);
 impl Attempt {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(State {
+            status: AttemptDisposition::Uncommitted,
+            token: None,
+        })))
+    }
+    fn start<T>(
+        &self,
+        submit: impl FnOnce() -> Result<(SendReceipt, T)>,
+    ) -> Result<(SendReceipt, T)> {
+        let mut state = self.0.lock().unwrap();
+        if state.status == AttemptDisposition::Retracted {
+            return Err(Error::Cancelled);
+        }
+        match submit() {
+            Ok((receipt, value)) => {
+                state.token = Some(receipt.attempt());
+                Ok((receipt, value))
+            }
+            Err(error) => {
+                state.status = AttemptDisposition::Retired { committed: false };
+                Err(error)
+            }
+        }
+    }
     pub fn disposition(&self) -> AttemptDisposition {
         let state = self.0.lock().unwrap();
         state
@@ -91,28 +120,12 @@ impl<T> Drop for Operation<T> {
 }
 impl Operation<WriteReceipt> {
     pub(crate) fn send(peer: Peer, message: Message, deadline: Instant) -> Self {
-        let attempt = Attempt(Arc::new(Mutex::new(State {
-            status: AttemptDisposition::Uncommitted,
-            token: None,
-        })));
+        let attempt = Attempt::new();
         let status = attempt.clone();
         let future = Box::pin(async move {
-            let (receipt, token) = {
-                let mut state = status.0.lock().unwrap();
-                if state.status == AttemptDisposition::Retracted {
-                    return Err(Error::Cancelled);
-                }
-                let receipt = match peer.submit(message, deadline) {
-                    Ok(receipt) => receipt,
-                    Err(error) => {
-                        state.status = AttemptDisposition::Retired { committed: false };
-                        return Err(error);
-                    }
-                };
-                let token = receipt.attempt();
-                state.token = Some(token.clone());
-                (receipt, token)
-            };
+            let (receipt, ()) =
+                status.start(|| peer.submit(message, deadline).map(|receipt| (receipt, ())))?;
+            let token = receipt.attempt();
             timeout_at(deadline, receipt)
                 .await
                 .map_err(|_| Error::Timeout("send"))?
@@ -123,7 +136,50 @@ impl Operation<WriteReceipt> {
             if written_at > deadline {
                 return Err(Error::Timeout("send"));
             }
+
             Ok(WriteReceipt { written_at })
+        });
+        Self { future, attempt }
+    }
+}
+
+impl Operation<Response<Body>> {
+    pub(crate) fn request(
+        peer: Peer,
+        request: Request<Body>,
+        deadline: Instant,
+        slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Self {
+        let deadline = request
+            .deadline()
+            .map_or(deadline, |local| local.min(deadline));
+        let attempt = Attempt::new();
+        let status = attempt.clone();
+        let future = Box::pin(async move {
+            let (mut receipt, registration) = status.start(|| {
+                if Instant::now() >= deadline {
+                    return Err(Error::Timeout("RPC"));
+                }
+                peer.start_request(request, deadline, slot)
+            })?;
+            let pending = registration.pending.clone();
+            let mut written = false;
+            let result = timeout_at(deadline, async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        response = pending.wait(deadline) => return response,
+                        result = &mut receipt, if !written => {
+                            result.map_err(Error::from)?;
+                            written = true;
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| Error::Timeout("RPC"))?;
+            drop(registration);
+            result
         });
         Self { future, attempt }
     }

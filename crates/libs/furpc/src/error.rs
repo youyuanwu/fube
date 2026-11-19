@@ -32,6 +32,7 @@ pub enum Error {
     Timeout(&'static str),
     Closed,
     Cancelled,
+    RemoteFault(Arc<crate::RemoteFault>),
     Transport {
         phase: &'static str,
         source: ErrorSource,
@@ -57,6 +58,7 @@ impl fmt::Display for Error {
             Self::Timeout(phase) => write!(f, "native transport {phase} timed out"),
             Self::Closed => f.write_str("native transport closed"),
             Self::Cancelled => f.write_str("native operation cancelled"),
+            Self::RemoteFault(fault) => write!(f, "native remote Fault {}", fault.code()),
             Self::Transport { phase, source } | Self::Handler { phase, source } => {
                 write!(f, "native transport {phase}: {}", source.0)
             }
@@ -89,6 +91,7 @@ impl Error {
             Self::Timeout(phase) => ("timeout", phase),
             Self::Closed => ("closed", "retirement"),
             Self::Cancelled => ("cancelled", "operation"),
+            Self::RemoteFault(_) => ("remote fault", "RPC completion"),
             Self::Transport { phase, .. } => ("transport", phase),
             Self::Handler { phase, .. } => ("handler", phase),
         }
