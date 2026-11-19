@@ -28,6 +28,8 @@ def command(suite, args):
         result = ["cargo-nextest", "nextest", "run", "--archive-file", str(args.archive),
                   "--workspace-remap", str(ROOT), "-E", suite["filter"], "--no-tests", "fail",
                   "--no-fail-fast"]
+        if args.nextest_partition is not None:
+            result.extend(["--partition", args.nextest_partition])
         if suite["ignored"]:
             result.extend(["--run-ignored", "all"])
         if suite["resource"] == "onebox":
@@ -143,11 +145,15 @@ def main(argv=None, *, partition=None):
     for name in ("prebuilt", "producer", "archive", "report-dir", "config-dir", "root",
                  "native-directory", "dependency-directory", "diagnostics-directory", "bundle-tar", "github-output"):
         parser.add_argument("--" + name, type=Path)
+    parser.add_argument("--nextest-partition",
+                        help="partition --suite rust_tests with nextest (e.g. slice:1/2)")
     args = parser.parse_args(argv)
-    if args.matrix:
-        print(json.dumps(suites.MANIFEST.matrix(), separators=(",", ":")))
-        return 0
     try:
+        if args.nextest_partition is not None and args.suite != "rust_tests":
+            raise ValueError("--nextest-partition requires --suite rust_tests")
+        if args.matrix:
+            print(json.dumps(suites.MANIFEST.matrix(), separators=(",", ":")))
+            return 0
         if args.partition is not None:
             needed(args, "name", "prebuilt", "producer", "bundle_tar", "report_dir")
             selected = suites.MANIFEST.selected(args.partition)

@@ -90,6 +90,41 @@ class PartitionTests(unittest.TestCase):
         self.assertEqual(command[command.index("--existing-owner") + 1], "a" * 32)
         self.assertEqual(calls[0].kwargs["timeout"], suites.MANIFEST.suites["native_data"]["timeout"])
 
+    def test_archived_rust_shards_preserve_selection_and_failure_status(self):
+        for partition, returncode in ((None, 0), ("slice:1/2", 0), ("slice:2/2", 3)):
+            arguments = ["--suite", "rust_tests", "--archive", "/prebuilt/tests.tar.zst"]
+            if partition is not None:
+                arguments.extend(["--nextest-partition", partition])
+            with self.subTest(partition=partition), \
+                    patch.object(run.subprocess, "run",
+                                 return_value=subprocess.CompletedProcess([], returncode)) as execute, \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(run.main(arguments), 1 if returncode else 0)
+            command = execute.call_args.args[0]
+            self.assertEqual(command[:3], ["cargo-nextest", "nextest", "run"])
+            self.assertEqual(command[command.index("--archive-file") + 1], "/prebuilt/tests.tar.zst")
+            self.assertEqual(command[command.index("--workspace-remap") + 1], str(run.ROOT))
+            self.assertEqual(command[command.index("-E") + 1], suites.MANIFEST.suites["rust_tests"]["filter"])
+            self.assertEqual(command[command.index("--no-tests") + 1], "fail")
+            self.assertIn("--no-fail-fast", command)
+            self.assertNotIn("--run-ignored", command)
+            if partition is None:
+                self.assertNotIn("--partition", command)
+            else:
+                self.assertEqual(command[command.index("--partition") + 1], partition)
+
+    def test_nextest_partition_cannot_shard_other_suites_or_onebox_allocations(self):
+        for selection in (["--suite", "cluster_models"], ["--suite", "native_clients"],
+                          ["--partition", "client-runtime"], ["--matrix"]):
+            with self.subTest(selection=selection), \
+                    patch.object(run.subprocess, "run") as execute, \
+                    patch("tests.onebox.shared.fixture.run") as allocate, \
+                    contextlib.redirect_stderr(io.StringIO()) as output:
+                self.assertEqual(run.main([*selection, "--nextest-partition", "slice:1/2"]), 1)
+            self.assertIn("--nextest-partition requires --suite rust_tests", output.getvalue())
+            execute.assert_not_called()
+            allocate.assert_not_called()
+
     def test_legacy_keeps_strict_adapter_and_failure_exit(self):
         status, receipt, calls, output = self.invoke(client_runtime, [
             subprocess.CompletedProcess([], 3), subprocess.TimeoutExpired(["child"], 1),
