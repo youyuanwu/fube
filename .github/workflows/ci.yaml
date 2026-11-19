@@ -14,12 +14,16 @@ jobs:
       contents: read
 
   rust-tests:
-    name: Rust workspace tests (archived)
+    name: Rust workspace tests (archived ${{ matrix.shard }}/2)
     needs: rust-build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     env:
       # Runtime model tests own thread pools; avoid cross-test runner contention.
       NEXTEST_TEST_THREADS: "1"
@@ -52,8 +56,11 @@ jobs:
           --producer "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
           --input native_archive --file "$RUNNER_TEMP/rust-tests/rust-tests.tar.zst" \
           --out "$RUNNER_TEMP/validated-test-archive.json"
-    - name: Execute offline workspace tests without compiling
-      run: python3 -m tests.run --suite rust_tests --archive "$RUNNER_TEMP/rust-tests/rust-tests.tar.zst"
+    - name: Execute offline workspace test shard without compiling
+      run: |
+        python3 -m tests.run --suite rust_tests \
+          --archive "$RUNNER_TEMP/rust-tests/rust-tests.tar.zst" \
+          --nextest-partition "slice:${{ matrix.shard }}/2"
 
   rust-quality:
     name: Rust quality and doctests
