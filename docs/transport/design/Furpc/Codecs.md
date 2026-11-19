@@ -186,7 +186,7 @@ native headers and controls remain connection-protocol failures. A codec
 cannot manufacture reply authority, change routing metadata, or turn a local
 decode failure into a successful domain response.
 
-Client adaptation reports `Error::Codec { phase, source }`, with `phase` equal
+Typed adaptation reports `Error::Codec { phase, source }`, with `phase` equal
 to `encode` or `decode`. `CodecError::InvalidPayload` and `ResourceLimit` retain
 their original error sources. `FubstCodec::with_limits` optionally selects
 codec-local `fubst::Limits`; default operations add no depth/work ceiling.

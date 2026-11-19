@@ -1,5 +1,5 @@
 use std::{
-    future::poll_fn,
+    future::{poll_fn, Future},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, Weak,
@@ -9,7 +9,7 @@ use std::{
 };
 
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore},
     time::{timeout_at, Instant},
 };
 use tower_service::Service;
@@ -18,6 +18,7 @@ use crate::{
     connection::{driver::DropReason, ConnectionError},
     peer::Generation,
     transport::{validate_timeout, BoxFuture},
+    wire::headers::HeaderDecodeContext,
     ActorId, Body, BoxError, Error, Headers, Message, Request, RequestContext, Result, SendPolicy,
     Source,
 };
@@ -183,6 +184,32 @@ impl HandlerLimits {
     }
 }
 
+async fn ready<S, Q>(service: &mut S, readiness: Arc<Semaphore>, phase: &'static str) -> Result<()>
+where
+    S: Service<Q>,
+    S::Error: Into<BoxError>,
+{
+    let mut waiting = None;
+    poll_fn(|cx| match service.poll_ready(cx) {
+        Poll::Ready(result) => {
+            waiting.take();
+            Poll::Ready(result.map_err(|error| Error::handler(phase, error)))
+        }
+        Poll::Pending => {
+            if waiting.is_none() {
+                match readiness.clone().try_acquire_owned() {
+                    Ok(permit) => waiting = Some(permit),
+                    Err(_) => {
+                        return Poll::Ready(Err(Error::ResourceLimit("service readiness waiters")))
+                    }
+                }
+            }
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 trait Factory: Send {
     fn make(
         &mut self,
@@ -204,27 +231,7 @@ where
     ) -> BoxFuture<Result<IngressResponse>> {
         let mut service = self.0.clone();
         Box::pin(async move {
-            let mut waiting = None;
-            poll_fn(|cx| match service.poll_ready(cx) {
-                Poll::Ready(result) => {
-                    waiting.take();
-                    Poll::Ready(result.map_err(|error| Error::handler("service readiness", error)))
-                }
-                Poll::Pending => {
-                    if waiting.is_none() {
-                        match readiness.clone().try_acquire_owned() {
-                            Ok(permit) => waiting = Some(permit),
-                            Err(_) => {
-                                return Poll::Ready(Err(Error::ResourceLimit(
-                                    "service readiness waiters",
-                                )))
-                            }
-                        }
-                    }
-                    Poll::Pending
-                }
-            })
-            .await?;
+            ready(&mut service, readiness, "service readiness").await?;
             service
                 .call(request)
                 .await
@@ -249,6 +256,7 @@ pub(crate) struct Registry {
     pub(crate) managed: bool,
     pub(crate) rpc_slots: Arc<Semaphore>,
     reply_slots: Arc<Semaphore>,
+    max_receive_frame_bytes: usize,
 }
 impl Registry {
     pub(crate) fn new(
@@ -272,6 +280,7 @@ impl Registry {
             managed: options.is_managed(),
             rpc_slots: Arc::new(Semaphore::new(transport.max_pending_requests)),
             reply_slots: Arc::new(Semaphore::new(reply_count)),
+            max_receive_frame_bytes: transport.max_receive_frame_bytes,
         }))
     }
     pub(crate) fn install(&self, service: Arc<StoredService>) -> Result<()> {
@@ -386,39 +395,127 @@ impl Registry {
                 Ok((common.message_id, policy.response, slot))
             })
             .transpose()?;
+        let deadline = Instant::now() + self.limits.timeout;
+        let state = Arc::new(InvocationState {
+            live: AtomicBool::new(true),
+            stopped: Notify::new(),
+            kind: if reply.is_some() {
+                InvocationKind::Request
+            } else {
+                InvocationKind::OneWay
+            },
+            deadline,
+            readiness: self.readiness.clone(),
+            max_body_bytes: options.limits.max_body_bytes,
+            max_receive_frame_bytes: self.max_receive_frame_bytes,
+            max_response_body_bytes: self.limits.max_encoded_body_bytes_per_response,
+        });
         Ok(Dispatch {
             service,
-            deadline: Instant::now() + self.limits.timeout,
             guard: Invocation {
-                live: Arc::new(AtomicBool::new(true)),
+                state,
                 _permit: permit,
             },
             reply,
-            max_response: self.limits.max_encoded_body_bytes_per_response,
         })
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvocationKind {
+    Request,
+    OneWay,
+}
+
+#[derive(Debug)]
+pub(crate) struct InvocationState {
+    live: AtomicBool,
+    stopped: Notify,
+    kind: InvocationKind,
+    deadline: Instant,
+    readiness: Arc<Semaphore>,
+    max_body_bytes: usize,
+    max_receive_frame_bytes: usize,
+    pub(crate) max_response_body_bytes: usize,
+}
+impl InvocationState {
+    pub(crate) fn for_request(request: &Request<Body>, kind: InvocationKind) -> Result<Arc<Self>> {
+        let context = request.context().ok_or(Error::InvalidInput(
+            "typed ingress requires received context",
+        ))?;
+        let state = context.invocation.upgrade().ok_or(Error::Closed)?;
+        state.check()?;
+        if state.kind != kind {
+            return Err(Error::InvalidInput("typed ingress exchange kind mismatch"));
+        }
+        if request.body().len() > state.max_body_bytes {
+            return Err(Error::ResourceLimit("ingress body bytes"));
+        }
+        Message::from_received(request.headers().clone(), request.body().clone()).validate(
+            &HeaderDecodeContext::native(),
+            state.max_receive_frame_bytes,
+        )?;
+        Ok(state)
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.live.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        if !self.is_live() {
+            return Err(Error::Closed);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(Error::Timeout("handler"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn ready<S, Q>(&self, service: &mut S) -> Result<()>
+    where
+        S: Service<Q>,
+        S::Error: Into<BoxError>,
+    {
+        ready(service, self.readiness.clone(), "typed service readiness").await?;
+        self.check()
+    }
+
+    pub(crate) async fn run<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
+        let stopped = self.stopped.notified();
+        tokio::pin!(stopped);
+        // Subscribe before checking liveness so guard retirement cannot be missed.
+        stopped.as_mut().enable();
+        self.check()?;
+        tokio::select! {
+            biased;
+            _ = stopped => Err(Error::Closed),
+            result = timeout_at(self.deadline, future) => {
+                result.map_err(|_| Error::Timeout("handler"))?
+            }
+        }
+    }
+}
+
 struct Invocation {
-    live: Arc<AtomicBool>,
+    state: Arc<InvocationState>,
     _permit: OwnedSemaphorePermit,
 }
 impl Drop for Invocation {
     fn drop(&mut self) {
-        self.live.store(false, Ordering::Release);
+        self.state.live.store(false, Ordering::Release);
+        self.state.stopped.notify_waiters();
     }
 }
 
 pub(crate) struct Dispatch {
     service: Arc<StoredService>,
-    deadline: Instant,
     guard: Invocation,
     reply: Option<(crate::MessageId, EnvelopeCheck, OwnedSemaphorePermit)>,
-    max_response: usize,
 }
 impl Dispatch {
     pub(crate) fn deadline(&self) -> Instant {
-        self.deadline
+        self.guard.state.deadline
     }
 
     pub(crate) fn run(self, core: &Arc<Generation>, message: Message) -> BoxFuture<Result<()>> {
@@ -432,14 +529,16 @@ impl Dispatch {
                 .options
                 .sends
                 .map(|policy| core.peer(Some(policy))),
-            deadline: self.deadline,
-            live: Arc::downgrade(&self.guard.live),
+            deadline: self.deadline(),
+            invocation: Arc::downgrade(&self.guard.state),
         });
         let readiness = core.registry.readiness.clone();
         let target = Arc::downgrade(core);
         Box::pin(async move {
+            let deadline = self.deadline();
+            let max_response = self.guard.state.max_response_body_bytes;
             let _guard = self.guard;
-            if Instant::now() >= self.deadline {
+            if Instant::now() >= deadline {
                 return Err(Error::Timeout("handler"));
             }
             if !request.context().is_some_and(RequestContext::is_live) {
@@ -451,24 +550,21 @@ impl Dispatch {
                 .lock()
                 .unwrap()
                 .make(request, readiness);
-            match timeout_at(self.deadline, future)
+            match timeout_at(deadline, future)
                 .await
                 .map_err(|_| Error::Timeout("handler"))??
             {
                 IngressResponse::NoReply if self.reply.is_none() => Ok(()),
                 IngressResponse::Reply(message) if self.reply.is_some() => {
-                    if message.body().len() > self.max_response {
+                    if message.body().len() > max_response {
                         return Err(Error::ResourceLimit("encoded handler response body"));
                     }
                     let (id, policy, slot) = self.reply.expect("authorized reply");
-                    let receipt = target.upgrade().ok_or(Error::Closed)?.reply(
-                        message,
-                        id,
-                        policy,
-                        self.deadline,
-                        slot,
-                    )?;
-                    timeout_at(self.deadline, receipt)
+                    let receipt = target
+                        .upgrade()
+                        .ok_or(Error::Closed)?
+                        .reply(message, id, policy, deadline, slot)?;
+                    timeout_at(deadline, receipt)
                         .await
                         .map_err(|_| Error::Timeout("reply write"))?
                         .map_err(Error::from)

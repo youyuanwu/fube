@@ -7,7 +7,8 @@
 //! driver and canonical [`IngressService`] execution. Managed correlation is the
 //! default; [`ConnectionOptions::raw_only`] keeps caller-owned one-way IDs.
 //! [`RpcClient`] adapts that byte service with a consumed application [`Codec`]
-//! per call. Actor routing, typed server adapters and TLS are not implemented.
+//! per call. [`server::Rpc`] adapts typed handlers inside byte-facing services.
+//! Actor routing and TLS are not implemented.
 //!
 //! ```no_run
 //! use furpc::{Body, ConnectionOptions, Endpoint, Message};
@@ -75,9 +76,11 @@ pub mod header;
 mod message;
 mod operation;
 mod peer;
+mod reply;
 mod request;
 mod response;
 mod rpc;
+pub mod server;
 mod service;
 mod transport;
 mod wire;
@@ -89,6 +92,7 @@ pub use header::{ActorId, CommonHeaders, HeaderId, HeaderRecord, HeaderRef, Head
 pub use message::{Body, Message, MessageBuilder};
 pub use operation::{Attempt, AttemptDisposition, CancelOutcome, Operation, WriteReceipt};
 pub use peer::{Peer, PeerInfo, SendCheck, SendKind, SendPolicy, Source};
+pub use reply::Reply;
 pub use request::{Request, RequestContext, RequestParts};
 pub use response::{Response, ResponseParts};
 pub use rpc::RemoteFault;
