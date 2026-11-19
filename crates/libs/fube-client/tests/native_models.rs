@@ -546,7 +546,7 @@ fn health_models_encode_and_decode_directly_with_exact_native_framing() {
 }
 
 #[test]
-fn direct_health_collection_mappings_retain_bounds_and_required_pointers() {
+fn direct_health_collection_mappings_preserve_large_vectors_and_required_pointers() {
     let health = NodeHealth {
         node_name: "Node".into(),
         health_events: Vec::new(),
@@ -582,10 +582,8 @@ fn direct_health_collection_mappings_retain_bounds_and_required_pointers() {
         unhealthy_evaluations: vec![evaluation; MAX_COLLECTION_COUNT + 1],
         ..at_limit
     };
-    assert!(matches!(
-        to_vec(&over_limit),
-        Err(fubst::Error::InvalidInput(_))
-    ));
+    let bytes = to_vec(&over_limit).unwrap();
+    assert_eq!(from_slice::<NodeHealth>(&bytes).unwrap(), over_limit);
 }
 
 #[test]
