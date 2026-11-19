@@ -536,6 +536,8 @@ version = "0.1.0"
 dependencies = [
  "fubst",
  "serde",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

@@ -278,7 +278,6 @@ impl Headers {
         Ok(())
     }
 
-    #[allow(dead_code, reason = "Receive ownership awaits the connection driver")]
     pub(crate) fn from_received(area: Segment, context: &HeaderDecodeContext) -> Result<Self> {
         context.validate_area(area.bytes().len())?;
         let mut count = 0usize;

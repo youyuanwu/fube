@@ -9,7 +9,7 @@
 
 #![allow(
     dead_code,
-    reason = "Private framing foundation awaits the connection driver"
+    reason = "Private transport awaits public connection integration"
 )]
 
 use std::fmt;

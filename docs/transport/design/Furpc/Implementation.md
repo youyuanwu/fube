@@ -6,6 +6,39 @@ Maps existing gaps to owners and describes staged delivery, consumer
 migration, acceptance, and unresolved qualification work. These are proposed
 milestones, not a record of delivered implementation or qualified support.
 
+## Current implementation
+
+The crate now includes native frames/ordered headers, shared segmented messages,
+incremental admission-gated framing, and a private clear-connection driver.
+Initiating and accepted owned Tokio I/O use the same driver. It exchanges and
+verifies ListenInstance before opening application submission/delivery, accepts
+verified ListenInstance updates, and keeps transmit/receive wire contexts
+separate. Clear transport does not authenticate the advertised address.
+
+The driver owns cooperative preparation, scalar/vectored partial output,
+queued serialized-frame bytes, precommit cancellation/deadlines, local-write
+receipts, partial-frame/discard/committed-write watchdogs, and drain/abort.
+Queue bytes remain charged until the whole unbatched frame is consumed or
+removed, independently of surviving body aliases. Zero disables the native
+queue-byte limit; disabling outgoing frame-size policy preserves the native
+empty-queue exception. Pending-operation counts are explicit execution policy,
+not construction or retained-allocation quotas.
+
+One scope-owned poll loop consumes private verified-message/discard events;
+there is no built-in application inbox, per-frame task, or second I/O owner.
+The provisional raw/no-destination classifier handles controls first, diagnoses
+unmatched replies and unavailable special-duplex deliveries without exposing
+them as ordinary ingress, and checks discarded-frame integrity. Unsupported
+security/send-target controls and transport actions fail explicitly.
+Send expiry/cancellation retracts only uncommitted output; a committed suffix
+remains owned until full write or connection retirement. Drain rejects new
+submission, flushes accepted output, and shuts down under one fixed deadline.
+
+Deterministic I/O cases, backpressured in-memory exchange, and a loopback clear-TCP
+exchange exercise this foundation. They are not native interoperability
+qualification. Public Endpoint/Channel/Server APIs, scope-owned ingress runners,
+managed correlation/duplex, application body codecs, and TLS remain unimplemented.
+
 ## Gap ownership and implementation order
 
 | Existing gap | Primary owner in the new design |

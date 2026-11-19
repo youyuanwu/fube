@@ -2,10 +2,11 @@
 //!
 //! Standalone messages, ordered native headers, and shared segmented bodies.
 //! Private admission-gated framing and cooperative segmented output form the
-//! transport foundation.
-//! Connections, RPC, and TLS are not implemented yet.
+//! transport foundation, with a private clear-connection driver.
+//! Public connections, RPC, and TLS are not implemented yet.
 
 mod body;
+mod connection;
 mod error;
 pub mod header;
 mod message;

@@ -1,7 +1,10 @@
 //! Shared immutable bytes and segmented bodies. Ownership follows references,
 //! independently of connection send-queue accounting.
 
-#![allow(dead_code, reason = "Transport storage awaits the connection driver")]
+#![allow(
+    dead_code,
+    reason = "Private transport awaits public connection integration"
+)]
 
 use std::{ops::Range, sync::Arc};
 
