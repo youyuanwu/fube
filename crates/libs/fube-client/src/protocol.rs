@@ -97,28 +97,40 @@ pub(crate) fn decode_ping(message: &Message) -> Result<GatewayDescription> {
             ))
         }
     }
-    #[derive(Deserialize)]
-    struct NodeInstance(NodeId, u64);
-    #[derive(Deserialize)]
-    struct Gateway(String, NodeInstance, String);
-    #[derive(Deserialize)]
-    struct Reply {
-        gateway: Gateway,
+    from_slice::<PingReplyBody>(&message.body)?
+        .into_gateway()
+        .map_err(Error::Protocol)
+}
+
+#[derive(Deserialize)]
+struct PingNodeInstance(NodeId, u64);
+#[derive(Deserialize)]
+struct PingGateway(String, PingNodeInstance, String);
+#[derive(Deserialize)]
+pub(crate) struct PingReplyBody {
+    gateway: PingGateway,
+}
+impl PingReplyBody {
+    pub(crate) fn into_gateway(self) -> std::result::Result<GatewayDescription, &'static str> {
+        let PingGateway(address, PingNodeInstance(NodeId { high, low }, node_instance), node_name) =
+            self.gateway;
+        if address.is_empty() || node_name.is_empty() {
+            return Err("gateway address and node name must be nonempty");
+        }
+        Ok(GatewayDescription {
+            address,
+            node_id: (u128::from(high) << 64) | u128::from(low),
+            node_instance,
+            node_name,
+        })
     }
-    let Reply {
-        gateway: Gateway(address, NodeInstance(NodeId { high, low }, node_instance), node_name),
-    } = from_slice(&message.body)?;
-    if address.is_empty() || node_name.is_empty() {
-        return Err(Error::Protocol(
-            "gateway address and node name must be nonempty",
-        ));
-    }
-    Ok(GatewayDescription {
-        address,
-        node_id: (u128::from(high) << 64) | u128::from(low),
-        node_instance,
-        node_name,
-    })
+}
+
+#[derive(Deserialize)]
+pub(crate) struct GatewayFailureBody {
+    pub(crate) code: i64,
+    #[serde(deserialize_with = "crate::native::trailing_default::deserialize")]
+    pub(crate) diagnostic: String,
 }
 
 pub(crate) fn decode_name_exists(message: &Message) -> Result<bool> {

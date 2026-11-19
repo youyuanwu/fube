@@ -406,7 +406,10 @@ class ProofFiles(fixtures.ProjectFiles):
         nodes["native_node_count"] = 5
         nodes["native_observation_start_unix_ms"] = int(start * 1000) + 1
         nodes["native_observation_end_unix_ms"] = int(start * 1000) + 10
-        clear = {**common, "executed_cases": cases, "node_list": nodes}
+        gateway = {"address": "172.30.91.11:19000", "node_name": "N0010",
+                   "node_id": "123", "node_instance": 456}
+        clear = {**common, "executed_cases": cases, "node_list": nodes, "gateway": gateway,
+                 "furpc_ping": {"operation_count": 3, "gateway": copy.deepcopy(gateway)}}
         # Clear really has no archive field; the successful command binds it.
         del clear["archive_sha256"]
         health = {
@@ -1428,6 +1431,15 @@ class WorkerTests(ProofFiles):
         for index, value in enumerate((False, 1, "true")):
             broken = copy.deepcopy(original)
             broken["executed_cases"][0]["passed"] = value
+            self.emit(path, broken)
+            self.assertEqual(self.checking("client-runtime", directory), 1)
+        for change in (
+            lambda clear: clear.pop("furpc_ping"),
+            lambda clear: clear["furpc_ping"].update(operation_count=True),
+            lambda clear: clear["furpc_ping"]["gateway"].update(node_id="different"),
+        ):
+            broken = copy.deepcopy(original)
+            change(broken)
             self.emit(path, broken)
             self.assertEqual(self.checking("client-runtime", directory), 1)
         self.emit(path, original)

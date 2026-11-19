@@ -32,6 +32,47 @@ SHA256 comparison passed. Repeated native SDK copy reliability is not claimed.
 
 ## 1. What is implemented
 
+### Separate furpc-backed client
+
+`FurpcClient` is a new, minimal client alongside `FabricClient`, not a backend
+switch on the existing client. Its only remote API is `ping(timeout)`, returning
+the same GatewayDescription. It owns a furpc Channel and uses its native byte
+request/reply path directly; only the Ping/failure body schemas and public result
+models are shared with the existing client. No legacy Message, channel, typed
+budget or lifecycle is adopted.
+
+```rust,no_run
+use fube_client::FurpcClient;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let channel = FurpcClient::endpoint_clear("127.0.0.1:19000".parse()?)?
+    .connect().await?;
+let client = FurpcClient::new(channel);
+let gateway = client.ping(None).await?;
+# let _ = gateway;
+# Ok(())
+# }
+```
+
+The client sends an empty native PingRequest body with gateway Actor, activity,
+protocol 1.1 and remaining-time headers. It validates the effective reply
+Actor/Action and protocol version, and preserves native Fault, domain failure,
+malformed-body and protocol errors separately. One deadline covers Peer acquisition
+and RPC; a failed invocation is never replayed. Clones share Channel ownership
+and pending capacity, and the final owner drop closes it.
+
+The existing `onebox_ping_name_exists_and_node_list` test now also sends three
+overlapping pings on the new client and compares every full gateway identity with
+fresh HTTP management observations and the independent legacy native result.
+Its `furpc_ping` evidence is required by the existing onebox report validator;
+no separate fixture, test partition, or HTTP execution fallback was added.
+The baseline passed against a fresh five-node Service Fabric **11.8.121.4**
+onebox, including all three furpc pings and the existing seven baseline cases.
+This qualifies only the initiating clear-TCP Ping profile, not native
+notifications, accepted-side serving, TLS, or other furpc management operations.
+
+### Existing client
+
 `fube-transport` implements bounded Fabric serialization, clear frames and CRCs,
 ordered native headers, client-only ListenInstance establishment, and
 continuously driven, bounded concurrent Tokio request/reply I/O. `fube-client`

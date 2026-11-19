@@ -7,9 +7,10 @@ use std::{
 };
 
 use fube_client::{
-    ClientError, ClientOptions, DomainFailure, FabricClient, GatewayDescription, HealthState, Node,
-    NodeDeactivationIntent, NodeDeactivationStatus, NodeListPage, NodeQueryDescription,
-    NodeQueryParameters, NodeStatus, NodeStatusFilter, Paging, DEFAULT_TIMEOUT,
+    ClientError, ClientOptions, DomainFailure, FabricClient, FurpcClient, GatewayDescription,
+    HealthState, Node, NodeDeactivationIntent, NodeDeactivationStatus, NodeListPage,
+    NodeQueryDescription, NodeQueryParameters, NodeStatus, NodeStatusFilter, Paging,
+    DEFAULT_TIMEOUT,
 };
 use serde::Deserialize;
 use tokio::{
@@ -638,6 +639,24 @@ async fn onebox_ping_name_exists_and_node_list() {
         .expect("bind client to native gateway channel");
     let gateway = client.ping(None).await.expect("native correlated ping");
     assert_independent_gateway(&gateway, &config, node_id);
+    let furpc_channel = FurpcClient::endpoint_clear(endpoint)
+        .expect("configure furpc native clear gateway")
+        .connect()
+        .await
+        .expect("establish furpc with native gateway");
+    let furpc_client = FurpcClient::new(furpc_channel);
+    let furpc_clone = furpc_client.clone();
+    let (furpc_gateway, second, third) = tokio::try_join!(
+        furpc_client.ping(None),
+        furpc_clone.ping(None),
+        furpc_client.ping(None),
+    )
+    .expect("three furpc native pings on the shared channel");
+    for actual in [&furpc_gateway, &second, &third] {
+        assert_independent_gateway(actual, &config, node_id);
+        assert_eq!(actual, &gateway, "furpc and legacy native identities match");
+    }
+    drop((furpc_client, furpc_clone));
     assert!(client
         .name_exists(&config.existing_name, None)
         .await
@@ -756,6 +775,15 @@ async fn onebox_ping_name_exists_and_node_list() {
             "node_instance": gateway.node_instance
         },
         "node_list": node_evidence,
+        "furpc_ping": {
+            "operation_count": ([&furpc_gateway, &second, &third].len()),
+            "gateway": {
+                "address": furpc_gateway.address,
+                "node_name": furpc_gateway.node_name,
+                "node_id": format!("{:x}", furpc_gateway.node_id),
+                "node_instance": furpc_gateway.node_instance
+            }
+        },
         "executed_cases": [
             {"case": "native_ping", "passed": true},
             {"case": "native_name_exists_existing", "result": true, "passed": true},
