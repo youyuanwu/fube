@@ -74,6 +74,7 @@ const OBJECT_END: u8 = 0x3f;
 const EMPTY: u8 = 0x40;
 const POINTER: u8 = 0x01;
 const OBJECT_ARRAY: u8 = 0x80;
+const UCHAR: u8 = 0x04;
 const UINT16: u8 = 0x06;
 const INT32: u8 = 0x07;
 const UINT32: u8 = 0x08;
@@ -684,6 +685,17 @@ impl<'a> Decoder<'a> {
         self.string_with_budget(&mut |_| Ok(()))
     }
 
+    /// Borrow a native string's little-endian UTF-16 code-unit bytes.
+    ///
+    /// Checks string metadata, count, input limits, and enclosing extents, but
+    /// does not require Unicode scalar validity. Unpaired surrogates, embedded
+    /// NULs, and original code units are preserved. No allocation or alignment
+    /// to `u16` is required; each pair of bytes represents one code unit.
+    /// Use [`Self::string`] when a validated Rust string is required instead.
+    pub fn string_utf16_bytes(&mut self) -> Result<&'a [u8]> {
+        self.string_bytes()
+    }
+
     fn string_with_budget(
         &mut self,
         reserve: &mut dyn FnMut(usize) -> Result<()>,
@@ -850,6 +862,12 @@ impl<'a> Decoder<'a> {
 
     fn skip_scalar_value(&mut self) -> Result<()> {
         match self.peek()? {
+            UCHAR | 0x44 => {
+                if self.byte()? == UCHAR {
+                    self.byte()?;
+                }
+                Ok(())
+            }
             UINT16 | 0x46 => self.u16().map(|_| ()),
             INT32 | 0x47 => self.i32().map(|_| ()),
             UINT32 | 0x48 => self.u32().map(|_| ()),
@@ -858,13 +876,8 @@ impl<'a> Decoder<'a> {
             DOUBLE | 0x4b => self.f64().map(|_| ()),
             GUID | 0x4c => self.guid().map(|_| ()),
             TRUE | FALSE => self.boolean().map(|_| ()),
-            STRING | 0xcd => {
-                let bytes = self.string_bytes()?;
-                for character in Self::characters(bytes) {
-                    character.map_err(|_| Error::Protocol("invalid UTF-16 string"))?;
-                }
-                Ok(())
-            }
+            // Skipping native code units does not require Rust Unicode validity.
+            STRING | 0xcd => self.string_bytes().map(|_| ()),
             BYTE_ARRAY | 0xc4 => self.byte_array_bytes().map(|_| ()),
             UINT32_ARRAY | 0xc8 => {
                 let count = self.u32_array_count()?;
@@ -1012,6 +1025,58 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_utf16_preserves_native_units_without_rust_string_validation() {
+        let bytes = [0x8d, 5, 0x41, 0, 0, 0xd8, 0, 0, 0x34, 0xd8, 0x1e, 0xdd];
+        let mut decoder = Decoder::new(&bytes);
+        let raw = decoder.string_utf16_bytes().unwrap();
+        assert_eq!(raw.as_ptr(), bytes[2..].as_ptr());
+        assert_eq!(
+            raw.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
+                .collect::<Vec<_>>(),
+            [0x41, 0xd800, 0, 0xd834, 0xdd1e]
+        );
+        decoder.finish().unwrap();
+        assert_eq!(
+            Decoder::new(&bytes).string(),
+            Err(Error::Protocol("invalid UTF-16 string"))
+        );
+        let mut decoder = Decoder::new(&[0xcd]);
+        assert_eq!(decoder.string_utf16_bytes().unwrap(), &[]);
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn borrowed_utf16_keeps_metadata_extent_and_input_checks() {
+        let bytes = [0x8d, 2, b'a', 0, b'b', 0];
+        for split in 0..bytes.len() {
+            assert!(Decoder::new(&bytes[..split]).string_utf16_bytes().is_err());
+        }
+        assert!(Decoder::new(&[0xc4]).string_utf16_bytes().is_err());
+        assert!(matches!(
+            Decoder::with_limits(
+                &bytes,
+                Limits {
+                    max_bytes: bytes.len() - 1,
+                    max_depth: 1,
+                }
+            ),
+            Err(Error::ResourceLimit("encoded input size"))
+        ));
+        let mut encoder = Encoder::new();
+        encoder.object(|encoder| encoder.string("ab")).unwrap();
+        let mut bytes = encoder.finish();
+        // Keep the backing bytes, but end the enclosing object inside the string.
+        bytes[1..5].copy_from_slice(&12u32.to_le_bytes());
+        let mut decoder = Decoder::new(&bytes);
+        assert!(decoder
+            .object(|decoder| decoder.string_utf16_bytes())
+            .is_err());
+    }
 
     #[test]
     fn scope_end_probe_does_not_consume_or_forgive_truncated_values() {
@@ -1233,7 +1298,10 @@ mod tests {
                 Err(Error::Protocol(_))
             ));
             let object = object_bytes(bytes);
-            assert!(Decoder::new(&object).object(|_| Ok(())).is_err());
+            assert!(Decoder::new(&object).object(Decoder::string).is_err());
+            let mut decoder = Decoder::new(&object);
+            decoder.object(|_| Ok(())).unwrap();
+            decoder.finish().unwrap();
         }
     }
 
@@ -1737,6 +1805,63 @@ mod tests {
         for tail in [&[0xee][..], &[SCOPE_BEGIN], &[OBJECT_END], &[0x07, 0x80]] {
             let bytes = object_bytes(tail);
             assert!(Decoder::new(&bytes).object(|_| Ok(())).is_err());
+        }
+    }
+
+    #[test]
+    fn native_suffix_uchar_values_include_empty_and_delimiter_payloads() {
+        let fields = [
+            0x48,
+            0x04,
+            0x00,
+            0x04,
+            SCOPE_BEGIN,
+            0x04,
+            SCOPE_END,
+            0x04,
+            OBJECT_END,
+            0x44,
+        ];
+        let mut bytes = object_bytes(&fields);
+        let end = bytes.len() - 1;
+        bytes.splice(end..end, [SCOPE_BEGIN, 0x04, 0xff, 0x44, SCOPE_END]);
+        let size = bytes.len() - 1;
+        set_size(&mut bytes, size);
+        let mut decoder = Decoder::new(&bytes);
+        assert_eq!(decoder.object(Decoder::u32).unwrap(), 0);
+        decoder.finish().unwrap();
+
+        for suffix in [&[0x04][..], &[0x24]] {
+            let mut bytes = object_bytes(suffix);
+            bytes.extend_from_slice(&object_bytes(&[]));
+            assert!(matches!(
+                Decoder::new(&bytes).object(|_| Ok(())),
+                Err(Error::Protocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn native_suffix_strings_keep_raw_utf16_but_still_check_extents() {
+        for suffix in [&[0x8d, 1, 0x00, 0xd8][..], &[0x8d, 1, 0x00, 0xdc], &[0xcd]] {
+            let nested = object_bytes(suffix);
+            let bytes = object_bytes(&nested);
+            let mut decoder = Decoder::new(&bytes);
+            decoder.object(|_| Ok(())).unwrap();
+            decoder.finish().unwrap();
+        }
+        for suffix in [
+            &[0x8d][..],
+            &[0x8d, 0x80],
+            &[0x8d, 3, 0x00, 0xd8],
+            &[0x8d, 0x90, 0x80, 0x80, 0x80, 0x00],
+        ] {
+            let mut bytes = object_bytes(suffix);
+            bytes.extend_from_slice(&object_bytes(&[]));
+            assert!(matches!(
+                Decoder::new(&bytes).object(|_| Ok(())),
+                Err(Error::Protocol(_))
+            ));
         }
     }
 

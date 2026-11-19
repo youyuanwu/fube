@@ -533,6 +533,9 @@ dependencies = [
 [[package]]
 name = "furpc"
 version = "0.1.0"
+dependencies = [
+ "fubst",
+]
 
 [[package]]
 name = "futures-channel"

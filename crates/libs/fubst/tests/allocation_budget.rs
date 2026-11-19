@@ -241,7 +241,7 @@ fn shared_budget_reaches_inline_derived_trailing_and_enum_fields() {
 }
 
 #[test]
-fn skipped_tails_need_no_decoded_value_charge_and_malformed_utf16_remains_an_error() {
+fn skipped_tails_need_no_decoded_value_charge_but_rust_strings_require_unicode() {
     #[derive(Debug, PartialEq, Deserialize)]
     struct Known {
         value: u32,
@@ -258,6 +258,18 @@ fn skipped_tails_need_no_decoded_value_charge_and_malformed_utf16_remains_an_err
         decode::<Known>(&encoder.finish(), 0).unwrap(),
         (Known { value: 7 }, 0)
     );
+
+    let mut encoder = Encoder::new();
+    encoder
+        .object(|encoder| {
+            encoder.u32(7)?;
+            encoder.string("a")
+        })
+        .unwrap();
+    let mut bytes = encoder.finish();
+    let unit_start = bytes.len() - 4;
+    bytes[unit_start..unit_start + 2].copy_from_slice(&0xd800u16.to_le_bytes());
+    assert_eq!(decode::<Known>(&bytes, 0).unwrap(), (Known { value: 7 }, 0));
 
     let mut encoder = Encoder::new();
     encoder.string("a").unwrap();
