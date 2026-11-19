@@ -73,6 +73,26 @@ malformed bodies retain the header failure and expose their decode error rather
 than creating a successful empty response. Application bodies are never decoded
 by this layer.
 
+Application-body adaptation is now available above the byte service through
+public Codec/Encoder/Decoder traits, fallible segmented EncodeBuf/DecodeBuf
+buffers, and FubstCodec. Custom codecs need no Serde, Clone or Sync bounds.
+Encoding can adopt shared body segments without copying; decoding must consume
+the whole body. FubstCodec uses the shared native Serde implementation, borrows
+contiguous input directly and copies fragmented input only when needed by that
+implementation. Its optional byte/depth settings are independent of native
+header/control/Fault decoding and add no default depth/work ceiling.
+
+RpcClient<T> adapts any conforming Tower byte service, borrowing the exact
+transport for readiness and call without cloning, retry or replay. It consumes
+one codec per call and preserves editable envelope parts and native provenance.
+One original absolute deadline covers encoding, readiness and receipt; native
+settlement time remains authoritative when an on-time result is observed late.
+Synthetic results use observation time. ClientCodecLimits optionally narrow
+encoded output and response input, default to native body capacity, and allow
+zero for empty bodies. Codec errors retain encode/decode phase, original source,
+and resource-limit classification without becoming connection-protocol failures.
+No decoded-allocation ledger or transport-budget handoff is introduced.
+
 TCP/custom connectors, Accept, TCP/stream acceptors and
 `Server::serve_with_shutdown` use the same physical engine. Canonical raw
 IngressService bindings admit bounded work at the header gate, before body
@@ -113,7 +133,7 @@ handshake, peer-ready and server drain default to 30 seconds; HandlerLimits
 retain their documented 8 in-flight/4 readiness-waiter/30-second defaults.
 These are not native constants or performance qualification.
 
-Specialized duplex, application body codecs, Actor routing and TLS remain
+Specialized duplex, typed server adapters, Actor routing and TLS remain
 unimplemented. The raw one-way binding still rejects request/reply flags; it
 does not gain reply authority by sharing the managed connection.
 
