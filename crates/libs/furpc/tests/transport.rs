@@ -13,9 +13,10 @@ use std::{
 
 use furpc::{
     header, Accept, Accepted, Body, BoxError, CancelOutcome, Connected, ConnectionOptions,
-    Endpoint, Error, HandlerLimits, Headers, IngressLimits, IngressOptions, IngressResponse,
-    IngressService, IoInfo, Message, Peer, Request, RequestPolicy, Response, SendKind, SendPolicy,
-    Server, ServiceBinding, Source, StreamAcceptor, TcpAcceptor, TransportIo, TransportLimits,
+    Endpoint, Error, FubstCodec, HandlerLimits, Headers, IngressLimits, IngressOptions,
+    IngressResponse, IngressService, IoInfo, Message, Peer, Request, RequestPolicy, Response,
+    RpcClient, SendKind, SendPolicy, Server, ServiceBinding, Source, StreamAcceptor, TcpAcceptor,
+    TransportIo, TransportLimits,
 };
 use futures_util::{future::join_all, stream, FutureExt};
 use http::Uri;
@@ -323,6 +324,24 @@ async fn managed_rpc_uses_opaque_bodies_pending_only_ids_and_original_reply_auth
         }
     }
     assert!(Response::new(Body::empty()).source().is_none());
+    let mut rpc = RpcClient::new(channel.clone());
+    let response = rpc
+        .call(
+            Request::new(73u32),
+            FubstCodec::<u32, u32>::default(),
+            deadline(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.body(), &73);
+    assert_eq!(
+        response.source().unwrap().generation(),
+        peer.info().generation
+    );
+    assert_ne!(
+        response.headers().effective().relates_to,
+        furpc::MessageId::default()
+    );
     stop.send(()).unwrap();
     bounded(serving).await.unwrap().unwrap();
     drop(channel);
@@ -938,11 +957,11 @@ async fn on_time_rpc_response_survives_late_observation_and_generation_retiremen
         .unwrap()],
     )
     .unwrap();
-    let entered = Arc::new(Notify::new());
+    let entered = Arc::new(Semaphore::new(0));
     let handler = rpc_ingress(Function({
         let entered = entered.clone();
         move |request: Request<Body>| {
-            entered.notify_one();
+            entered.add_permits(1);
             async move {
                 Ok::<_, Error>(IngressResponse::Reply(
                     Message::builder().body(request.into_body()).build()?,
@@ -981,8 +1000,15 @@ async fn on_time_rpc_response_survives_late_observation_and_generation_retiremen
         Request::new(Body::from_bytes(vec![7]).unwrap()),
         Instant::now() + Duration::from_secs(1),
     ));
+    let mut rpc = RpcClient::new(channel.clone());
+    let mut typed = Box::pin(rpc.call(
+        Request::new(73u32),
+        FubstCodec::<u32, u32>::default(),
+        Instant::now() + Duration::from_secs(1),
+    ));
     assert!(operation.as_mut().now_or_never().is_none());
-    bounded(entered.notified()).await;
+    assert!(typed.as_mut().now_or_never().is_none());
+    bounded(entered.acquire_many(2)).await.unwrap().forget();
     stop.send(()).unwrap();
     bounded(serving).await.unwrap().unwrap();
     bounded(async {
@@ -1002,6 +1028,12 @@ async fn on_time_rpc_response_survives_late_observation_and_generation_retiremen
     assert_eq!(
         operation.await.unwrap().body().segments().next().unwrap(),
         [7]
+    );
+    let response = typed.await.unwrap();
+    assert_eq!(response.body(), &73);
+    assert_eq!(
+        response.source().unwrap().generation(),
+        peer.info().generation
     );
     drop(channel);
 }

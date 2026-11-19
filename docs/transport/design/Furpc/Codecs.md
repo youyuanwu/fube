@@ -63,7 +63,8 @@ and from application-body bytes. Provide public, externally implementable `Codec
 `Encoder`, and `Decoder` traits. Custom implementations need no Serde traits
 or access to crate-private transport state.
 
-Proposed extension-trait shape, not an implemented declaration. The
+The traits below are implemented in `furpc::codec` and re-exported at the crate
+root, together with `FubstCodec`, `EncodeBuf`, `DecodeBuf`, and `CodecError`. The
 [typed RPC contract](Requests.md#rpc-calls-and-responses) specifies its
 typed-client ownership and concurrency requirements.
 
@@ -161,6 +162,10 @@ framing layer or an HTTP body dependency.
 Native message representability and any explicitly selected codec restrictions
 bound encoded output; there is no additional mandatory construction profile.
 Encoding finishes before submission, so failure cannot leave a partial frame.
+`write_all` copies bytes into the current output segment; `append_body` adopts
+shared visible segments. `remaining` reports the operation's encoded-byte
+allowance. `DecodeBuf` supports checked advancement, shared `take` views,
+`copy_to_slice`, and fallible `copy_remaining`.
 
 `DecodeBuf` exposes exactly one complete body. Its
 `copy_remaining() -> Result<Vec<u8>, CodecError>` consumes and fallibly copies
@@ -180,6 +185,11 @@ it is not automatically a connection-fatal native Protocol error. Malformed
 native headers and controls remain connection-protocol failures. A codec
 cannot manufacture reply authority, change routing metadata, or turn a local
 decode failure into a successful domain response.
+
+Client adaptation reports `Error::Codec { phase, source }`, with `phase` equal
+to `encode` or `decode`. `CodecError::InvalidPayload` and `ResourceLimit` retain
+their original error sources. `FubstCodec::with_limits` optionally selects
+codec-local `fubst::Limits`; default operations add no depth/work ceiling.
 
 [tonic-codec]: https://docs.rs/tonic/latest/tonic/codec/trait.Codec.html
 [tonic-client]: https://docs.rs/tonic/latest/tonic/client/struct.Grpc.html

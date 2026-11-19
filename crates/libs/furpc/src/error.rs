@@ -6,6 +6,16 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Debug, Clone)]
 pub struct ErrorSource(Arc<dyn std::error::Error + Send + Sync>);
 
+impl ErrorSource {
+    pub(crate) fn new(source: impl Into<BoxError>) -> Self {
+        Self(Arc::from(source.into()))
+    }
+
+    pub(crate) fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self.0.as_ref()
+    }
+}
+
 impl PartialEq for ErrorSource {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -13,7 +23,7 @@ impl PartialEq for ErrorSource {
 }
 impl Eq for ErrorSource {}
 
-/// A native construction, transport, execution, or configured-policy failure.
+/// A construction, transport, execution, application-body, or policy failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     InvalidInput(&'static str),
@@ -33,6 +43,10 @@ pub enum Error {
     Closed,
     Cancelled,
     RemoteFault(Arc<crate::RemoteFault>),
+    Codec {
+        phase: &'static str,
+        source: crate::CodecError,
+    },
     Transport {
         phase: &'static str,
         source: ErrorSource,
@@ -59,6 +73,7 @@ impl fmt::Display for Error {
             Self::Closed => f.write_str("native transport closed"),
             Self::Cancelled => f.write_str("native operation cancelled"),
             Self::RemoteFault(fault) => write!(f, "native remote Fault {}", fault.code()),
+            Self::Codec { phase, source } => write!(f, "application body {phase}: {source}"),
             Self::Transport { phase, source } | Self::Handler { phase, source } => {
                 write!(f, "native transport {phase}: {}", source.0)
             }
@@ -70,6 +85,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NativeHeader { source, .. } => Some(source),
+            Self::Codec { source, .. } => Some(source),
             Self::Transport { source, .. } | Self::Handler { source, .. } => {
                 Some(source.0.as_ref())
             }
@@ -92,6 +108,10 @@ impl Error {
             Self::Closed => ("closed", "retirement"),
             Self::Cancelled => ("cancelled", "operation"),
             Self::RemoteFault(_) => ("remote fault", "RPC completion"),
+            Self::Codec { phase, source } => match source {
+                crate::CodecError::InvalidPayload { .. } => ("codec payload", phase),
+                crate::CodecError::ResourceLimit { .. } => ("codec resource limit", phase),
+            },
             Self::Transport { phase, .. } => ("transport", phase),
             Self::Handler { phase, .. } => ("handler", phase),
         }

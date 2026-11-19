@@ -13,7 +13,7 @@ impl ResponseParts {
     }
 }
 
-/// Complete byte response; synthetic responses have no native source/settlement.
+/// Complete response; synthetic responses have no native source/settlement.
 #[derive(Debug)]
 pub struct Response<B> {
     parts: ResponseParts,
