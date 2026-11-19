@@ -4,12 +4,17 @@ use std::marker::PhantomData;
 
 use fube_transport::message::{Message, ACTION, ACTOR};
 use fubst::{
-    serde::{from_slice, to_vec, EmptyObjectArray, FixedTag, ObjectArray, Pointer, RawTagged},
+    serde::{
+        from_slice, to_vec_with_limits, EmptyObjectArray, FixedTag, ObjectArray, Pointer, RawTagged,
+    },
     MAX_COLLECTION_COUNT,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{query_arguments::QueryArguments, Error, Paging, QueryPage, Result};
+use crate::{
+    query_arguments::QueryArguments, DomainFailure, Error, PagedQuery, Paging, QueryDescription,
+    QueryPage, Result,
+};
 
 /// Native payload type IDs from ServiceModel/QueryResultHelpersEnum.h.
 pub(crate) mod result_tags {
@@ -32,18 +37,66 @@ pub(crate) trait Query: Serialize {
     const PAGING_FIRST: bool = false;
     const SUPPORTS_MAX_RESULTS: bool = true;
 
-    fn validate_parameters(&self) -> Result<()> {
+    fn validate_parameters(&self) -> fubst::Result<()> {
         Ok(())
     }
     fn validate_record(
         record: <Self::Reply as Reply>::Record,
-    ) -> Result<<Self::Reply as Reply>::Record> {
+    ) -> std::result::Result<<Self::Reply as Reply>::Record, &'static str> {
         Ok(record)
     }
 }
 
+pub(crate) trait QueryRequest: Send {
+    type Parameters: Query;
+
+    fn parameters(&self) -> &Self::Parameters;
+    fn paging(&self) -> Option<&Paging>;
+}
+
+impl<Q: Query + Send> QueryRequest for PagedQuery<Q> {
+    type Parameters = Q;
+
+    fn parameters(&self) -> &Q {
+        &self.parameters
+    }
+
+    fn paging(&self) -> Option<&Paging> {
+        Some(&self.paging)
+    }
+}
+
+impl<Q: Query + Send> QueryRequest for QueryDescription<Q> {
+    type Parameters = Q;
+
+    fn parameters(&self) -> &Q {
+        &self.parameters
+    }
+
+    fn paging(&self) -> Option<&Paging> {
+        None
+    }
+}
+
 pub(crate) fn encode_query<Q: Query>(query: &Q, paging: Option<&Paging>) -> Result<Vec<u8>> {
-    let mut arguments = QueryArguments::default();
+    let arguments = arguments(query, paging, QueryArguments::default())?;
+    encode(Q::NAME, &arguments.values)
+}
+
+pub(crate) fn encode_query_body<Q: Query>(
+    query: &Q,
+    paging: Option<&Paging>,
+    limits: fubst::Limits,
+) -> fubst::Result<Vec<u8>> {
+    let arguments = arguments(query, paging, QueryArguments::native())?;
+    encode_body(Q::NAME, &arguments.values, limits)
+}
+
+fn arguments<Q: Query>(
+    query: &Q,
+    paging: Option<&Paging>,
+    mut arguments: QueryArguments,
+) -> fubst::Result<QueryArguments> {
     if Q::PAGING_FIRST {
         append_paging::<Q>(&mut arguments, paging)?;
     }
@@ -52,25 +105,53 @@ pub(crate) fn encode_query<Q: Query>(query: &Q, paging: Option<&Paging>) -> Resu
     if !Q::PAGING_FIRST {
         append_paging::<Q>(&mut arguments, paging)?;
     }
-    encode(Q::NAME, &arguments.values)
+    Ok(arguments)
 }
 
 pub(crate) fn decode_reply<Q: Query>(message: &Message) -> Result<Q::Output> {
-    Q::Reply::decode(message, Q::validate_record)
+    decode_message::<Q::Reply>(message, Q::validate_record)
 }
 
-fn append_paging<Q: Query>(arguments: &mut QueryArguments, paging: Option<&Paging>) -> Result<()> {
+fn decode_message<R: Reply>(
+    message: &Message,
+    validate: fn(R::Record) -> std::result::Result<R::Record, &'static str>,
+) -> Result<R::Output> {
+    crate::protocol::check_failure(message)?;
+    let properties = message.properties()?;
+    R::ENVELOPE
+        .check(
+            message
+                .headers
+                .iter()
+                .any(|h| h.id == ACTOR)
+                .then_some(properties.actor),
+            message
+                .headers
+                .iter()
+                .any(|h| h.id == ACTION)
+                .then(|| properties.action.encode_utf16()),
+        )
+        .map_err(Error::Protocol)?;
+    R::decode_body(from_slice(&message.body)?, validate).map_err(Into::into)
+}
+
+fn append_paging<Q: Query>(
+    arguments: &mut QueryArguments,
+    paging: Option<&Paging>,
+) -> fubst::Result<()> {
     let Some(paging) = paging else {
         return Ok(());
     };
     if paging.max_results.is_some() && !Q::SUPPORTS_MAX_RESULTS {
-        return Err(Error::InvalidInput("query does not support MaxResults"));
+        return Err(fubst::Error::InvalidInput(
+            "query does not support MaxResults",
+        ));
     }
     if paging
         .max_results
         .is_some_and(|max| max.get() > i64::MAX as u64)
     {
-        return Err(Error::InvalidInput(
+        return Err(fubst::Error::InvalidInput(
             "MaxResults exceeds native signed range",
         ));
     }
@@ -78,6 +159,17 @@ fn append_paging<Q: Query>(arguments: &mut QueryArguments, paging: Option<&Pagin
 }
 
 fn encode(name: &str, args: &[(String, String)]) -> Result<Vec<u8>> {
+    if args.len() > MAX_COLLECTION_COUNT {
+        return Err(Error::InvalidInput("object-array count limit exceeded"));
+    }
+    Ok(encode_body(name, args, fubst::Limits::default())?)
+}
+
+fn encode_body(
+    name: &str,
+    args: &[(String, String)],
+    limits: fubst::Limits,
+) -> fubst::Result<Vec<u8>> {
     #[derive(Serialize)]
     struct Key<'a> {
         value: &'a str,
@@ -90,29 +182,102 @@ fn encode(name: &str, args: &[(String, String)]) -> Result<Vec<u8>> {
     }
     #[derive(Serialize)]
     struct Request<'a, T>(Arguments<T>, &'a str);
-    if args.len() > MAX_COLLECTION_COUNT {
-        return Err(Error::InvalidInput("object-array count limit exceeded"));
-    }
     let pairs: Vec<_> = args
         .iter()
         .map(|(key, value)| Pair(Key { value: key }, value))
         .collect();
-    Ok(to_vec(&Request(
-        Arguments {
-            values: ObjectArray(pairs),
-        },
-        name,
-    ))?)
+    to_vec_with_limits(
+        &Request(
+            Arguments {
+                values: ObjectArray(pairs),
+            },
+            name,
+        ),
+        limits,
+    )
+}
+
+pub(crate) enum ReplyError {
+    Protocol(&'static str),
+    Domain(DomainFailure),
+}
+
+pub(crate) type ReplyResult<T> = std::result::Result<T, ReplyError>;
+
+impl From<&'static str> for ReplyError {
+    fn from(reason: &'static str) -> Self {
+        Self::Protocol(reason)
+    }
+}
+
+impl From<ReplyError> for Error {
+    fn from(error: ReplyError) -> Self {
+        match error {
+            ReplyError::Protocol(reason) => Self::Protocol(reason),
+            ReplyError::Domain(failure) => Self::Remote {
+                code: failure.code,
+                message: failure.message,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ReplyEnvelope {
+    List(i64),
+    Item(i64),
+    Empty(i64),
+}
+
+impl ReplyEnvelope {
+    pub(crate) fn check(
+        self,
+        actor: Option<i64>,
+        action: Option<impl Iterator<Item = u16>>,
+    ) -> std::result::Result<(), &'static str> {
+        match self {
+            Self::List(expected) => {
+                if actor.is_some_and(|actor| actor != expected) {
+                    return Err(if expected == 5 {
+                        "list reply is not from NamingGateway"
+                    } else {
+                        "unexpected unpaged list reply actor"
+                    });
+                }
+                if action.is_some_and(|action| !action.eq("QueryReply".encode_utf16())) {
+                    return Err("unexpected list reply action");
+                }
+            }
+            Self::Item(expected) => {
+                if actor != Some(expected)
+                    || !action
+                        .is_some_and(|action| action.eq("OperationSuccessAction".encode_utf16()))
+                {
+                    return Err("unexpected item success envelope");
+                }
+            }
+            Self::Empty(expected) => {
+                if actor.is_some_and(|actor| actor != expected)
+                    || action.is_some_and(|action| !action.eq("QueryReply".encode_utf16()))
+                {
+                    return Err("movement query requires RS actor 13 and QueryReply");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) trait Reply {
     type Record: DeserializeOwned;
+    type Body: DeserializeOwned + Send;
     type Output: Send + 'static;
+    const ENVELOPE: ReplyEnvelope;
 
-    fn decode(
-        message: &Message,
-        validate: fn(Self::Record) -> Result<Self::Record>,
-    ) -> Result<Self::Output>;
+    fn decode_body(
+        body: Self::Body,
+        validate: fn(Self::Record) -> std::result::Result<Self::Record, &'static str>,
+    ) -> ReplyResult<Self::Output>;
 }
 
 /// NamingGateway list aggregate with optional, checked actor/action headers.
@@ -122,10 +287,15 @@ impl<T: DeserializeOwned + Send + 'static, const TAG: i32, const STRICT_PAGING: 
     for ListReply<T, TAG, STRICT_PAGING>
 {
     type Record = T;
+    type Body = QueryResultEnvelope<FixedTag<ListPayload<T>, TAG>>;
     type Output = QueryPage<T>;
+    const ENVELOPE: ReplyEnvelope = ReplyEnvelope::List(5);
 
-    fn decode(message: &Message, validate: fn(T) -> Result<T>) -> Result<Self::Output> {
-        decode_list::<T, TAG, STRICT_PAGING, 5>(message, validate, true)
+    fn decode_body(
+        body: Self::Body,
+        validate: fn(T) -> std::result::Result<T, &'static str>,
+    ) -> ReplyResult<Self::Output> {
+        decode_list::<T, TAG, STRICT_PAGING>(body, validate, true)
     }
 }
 
@@ -136,59 +306,45 @@ impl<T: DeserializeOwned + Send + 'static, const TAG: i32, const ACTOR_ID: i64> 
     for UnpagedListReply<T, TAG, ACTOR_ID>
 {
     type Record = T;
+    type Body = QueryResultEnvelope<FixedTag<ListPayload<T>, TAG>>;
     type Output = Vec<T>;
+    const ENVELOPE: ReplyEnvelope = ReplyEnvelope::List(ACTOR_ID);
 
-    fn decode(message: &Message, validate: fn(T) -> Result<T>) -> Result<Vec<T>> {
-        decode_list::<T, TAG, true, ACTOR_ID>(message, validate, false).map(|page| page.items)
+    fn decode_body(
+        body: Self::Body,
+        validate: fn(T) -> std::result::Result<T, &'static str>,
+    ) -> ReplyResult<Vec<T>> {
+        decode_list::<T, TAG, true>(body, validate, false).map(|page| page.items)
     }
 }
 
-fn decode_list<
-    T: DeserializeOwned,
-    const TAG: i32,
-    const STRICT_PAGING: bool,
-    const ACTOR_ID: i64,
->(
-    message: &Message,
-    validate: fn(T) -> Result<T>,
+fn decode_list<T: DeserializeOwned, const TAG: i32, const STRICT_PAGING: bool>(
+    body: QueryResultEnvelope<FixedTag<ListPayload<T>, TAG>>,
+    validate: fn(T) -> std::result::Result<T, &'static str>,
     allow_paging: bool,
-) -> Result<QueryPage<T>> {
-    crate::protocol::check_failure(message)?;
-    let properties = message.properties()?;
-    // Native list aggregates can omit actor/action; validate them if present.
-    if message.headers.iter().any(|h| h.id == ACTOR) && properties.actor != ACTOR_ID {
-        return Err(Error::Protocol(if ACTOR_ID == 5 {
-            "list reply is not from NamingGateway"
-        } else {
-            "unexpected unpaged list reply actor"
-        }));
-    }
-    if message.headers.iter().any(|h| h.id == ACTION) && properties.action != "QueryReply" {
-        return Err(Error::Protocol("unexpected list reply action"));
-    }
+) -> ReplyResult<QueryPage<T>> {
     let result = decode::<FixedTag<ListPayload<T>, TAG>, _>(
-        &message.body,
+        body,
         STRICT_PAGING,
         allow_paging,
         |FixedTag(payload)| {
             if payload.item.0.is_some() {
-                return Err(Error::Protocol("list has a single-item payload"));
+                return Err("list has a single-item payload".into());
             }
             payload
                 .items
                 .0
                 .into_iter()
                 .map(validate)
-                .collect::<Result<Vec<_>>>()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
         },
     )?;
     if result.kind != 2 {
-        return Err(Error::Protocol("query result is not a List"));
+        return Err("query result is not a List".into());
     }
     Ok(QueryPage {
-        items: result
-            .payload
-            .ok_or(Error::Protocol("list has no typed wrapper"))?,
+        items: result.payload.ok_or("list has no typed wrapper")?,
         continuation_token: result.paging.filter(|s| !s.is_empty()),
     })
 }
@@ -200,58 +356,53 @@ impl<T: DeserializeOwned + Send + 'static, const TAG: i32, const ACTOR_ID: i64> 
     for ItemReply<T, TAG, ACTOR_ID>
 {
     type Record = T;
+    type Body = QueryResultEnvelope<FixedTag<ItemPayload<T>, TAG>>;
     type Output = T;
+    const ENVELOPE: ReplyEnvelope = ReplyEnvelope::Item(ACTOR_ID);
 
-    fn decode(message: &Message, validate: fn(T) -> Result<T>) -> Result<T> {
-        crate::protocol::check_failure(message)?;
-        let properties = message.properties()?;
-        if !message.headers.iter().any(|header| header.id == ACTOR)
-            || properties.actor != ACTOR_ID
-            || properties.action != "OperationSuccessAction"
-        {
-            return Err(Error::Protocol("unexpected item success envelope"));
-        }
-        let result = decode::<FixedTag<ItemPayload<T>, TAG>, _>(
-            &message.body,
-            false,
-            true,
-            |FixedTag(payload)| validate(payload.item.0.ok_or(Error::Protocol("null query item"))?),
-        )?;
+    fn decode_body(
+        body: Self::Body,
+        validate: fn(T) -> std::result::Result<T, &'static str>,
+    ) -> ReplyResult<T> {
+        let result =
+            decode::<FixedTag<ItemPayload<T>, TAG>, _>(body, false, true, |FixedTag(payload)| {
+                validate(payload.item.0.ok_or("null query item")?).map_err(Into::into)
+            })?;
         if result.kind != 1 || result.paging.is_some() {
-            return Err(Error::Protocol("query result is not an unpaged Item"));
+            return Err("query result is not an unpaged Item".into());
         }
         result
             .payload
-            .ok_or(Error::Protocol("item has no typed wrapper"))
+            .ok_or_else(|| "item has no typed wrapper".into())
     }
 }
 
 #[derive(Deserialize)]
-struct Empty {}
+pub(crate) struct Empty {}
 
 #[derive(Deserialize)]
-struct ListPayload<T> {
-    items: ObjectArray<Vec<T>>,
-    item: Pointer<Empty>,
+pub(crate) struct ListPayload<T> {
+    pub items: ObjectArray<Vec<T>>,
+    pub item: Pointer<Empty>,
 }
 
 #[derive(Deserialize)]
-struct ItemPayload<T> {
+pub(crate) struct ItemPayload<T> {
     _list: EmptyObjectArray,
     item: Pointer<T>,
 }
 
 #[derive(Deserialize)]
-struct PagingStatus {
-    token: String,
+pub(crate) struct PagingStatus {
+    pub token: String,
 }
 
 #[derive(Deserialize)]
-struct QueryResultEnvelope<T> {
-    kind: i64,
-    payload: Pointer<T>,
-    error: i64,
-    paging: Pointer<RawTagged<PagingStatus>>,
+pub(crate) struct QueryResultEnvelope<T> {
+    pub kind: i64,
+    pub payload: Pointer<T>,
+    pub error: i64,
+    pub paging: Pointer<RawTagged<PagingStatus>>,
 }
 
 struct QueryResult<T> {
@@ -260,34 +411,33 @@ struct QueryResult<T> {
     paging: Option<String>,
 }
 
-fn decode<T: DeserializeOwned, U>(
-    body: &[u8],
+fn decode<T, U>(
+    envelope: QueryResultEnvelope<T>,
     strict_paging: bool,
     allow_paging: bool,
-    validate: impl FnOnce(T) -> Result<U>,
-) -> Result<QueryResult<U>> {
-    let envelope: QueryResultEnvelope<T> = from_slice(body)?;
+    validate: impl FnOnce(T) -> ReplyResult<U>,
+) -> ReplyResult<QueryResult<U>> {
     // A native query error must not hide a malformed payload and allow reuse
     // of a connection that previously failed protocol validation.
     let payload = envelope.payload.0.map(validate).transpose()?;
     if !allow_paging && envelope.paging.0.is_some() {
-        return Err(Error::Protocol("unpaged list has paging status"));
+        return Err("unpaged list has paging status".into());
     }
     let paging = envelope
         .paging
         .0
         .map(|status| {
             if strict_paging && !status.type_info.is_empty() {
-                return Err(Error::Protocol("unexpected paging status type"));
+                return Err(ReplyError::Protocol("unexpected paging status type"));
             }
             Ok(status.value.token)
         })
         .transpose()?;
     if envelope.error != 0 {
-        return Err(Error::Remote {
+        return Err(ReplyError::Domain(DomainFailure {
             code: envelope.error,
             message: String::new(),
-        });
+        }));
     }
     Ok(QueryResult {
         kind: envelope.kind,
@@ -398,9 +548,9 @@ pub(crate) mod tests {
         type Reply = ListReply<ReplyRecord, 23>;
         const NAME: &'static str = "DeclaredList";
 
-        fn validate_record(record: ReplyRecord) -> Result<ReplyRecord> {
+        fn validate_record(record: ReplyRecord) -> std::result::Result<ReplyRecord, &'static str> {
             if record.value == "invalid" {
-                return Err(Error::Protocol("invalid fixture record"));
+                return Err("invalid fixture record");
             }
             Ok(record)
         }
@@ -423,7 +573,7 @@ pub(crate) mod tests {
         type Reply = UnpagedListReply<ReplyRecord, 23>;
         const NAME: &'static str = "DeclaredUnpagedList";
 
-        fn validate_record(record: ReplyRecord) -> Result<ReplyRecord> {
+        fn validate_record(record: ReplyRecord) -> std::result::Result<ReplyRecord, &'static str> {
             DeclaredListQuery::validate_record(record)
         }
     }
@@ -454,9 +604,9 @@ pub(crate) mod tests {
             type Reply = ListReply<ReplyRecord, 23>;
             const NAME: &'static str = "CheckedQuery";
 
-            fn validate_parameters(&self) -> Result<()> {
+            fn validate_parameters(&self) -> fubst::Result<()> {
                 if self.invalid {
-                    return Err(Error::InvalidInput("invalid fixture parameters"));
+                    return Err(fubst::Error::InvalidInput("invalid fixture parameters"));
                 }
                 Ok(())
             }
@@ -588,11 +738,11 @@ pub(crate) mod tests {
             Header::actor(13).unwrap(),
             Header::action("QueryReply").unwrap(),
         ];
-        UnpagedListReply::<ReplyRecord, 23, 13>::decode(&message, Ok).unwrap();
+        decode_message::<UnpagedListReply<ReplyRecord, 23, 13>>(&message, Ok).unwrap();
         for actor in [5, 12, 15] {
             message.headers[0] = Header::actor(actor).unwrap();
             assert!(matches!(
-                UnpagedListReply::<ReplyRecord, 23, 13>::decode(&message, Ok),
+                decode_message::<UnpagedListReply<ReplyRecord, 23, 13>>(&message, Ok),
                 Err(Error::Protocol(_))
             ));
         }
@@ -673,11 +823,11 @@ pub(crate) mod tests {
         let mut message = reply_fixture(1, Some(37), &[], Some("only"), 0, None);
         message.headers = vec![Header::action("OperationSuccessAction").unwrap()];
         assert!(matches!(
-            ItemReply::<ReplyRecord, 37, 0>::decode(&message, Ok),
+            decode_message::<ItemReply<ReplyRecord, 37, 0>>(&message, Ok),
             Err(Error::Protocol(_))
         ));
         message.headers.push(Header::actor(0).unwrap());
-        ItemReply::<ReplyRecord, 37, 0>::decode(&message, Ok).unwrap();
+        decode_message::<ItemReply<ReplyRecord, 37, 0>>(&message, Ok).unwrap();
     }
 
     #[test]
@@ -728,7 +878,7 @@ pub(crate) mod tests {
             reply_fixture(1, Some(37), &["unexpected"], Some("only"), REMOTE, None),
         ] {
             assert!(matches!(
-                ItemReply::<ReplyRecord, 37, 99>::decode(
+                decode_message::<ItemReply<ReplyRecord, 37, 99>>(
                     &item_envelope(message),
                     DeclaredListQuery::validate_record,
                 ),

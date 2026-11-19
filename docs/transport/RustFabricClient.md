@@ -35,18 +35,26 @@ SHA256 comparison passed. Repeated native SDK copy reliability is not claimed.
 ### Separate furpc-backed client
 
 `FurpcClient` is a new, minimal client alongside `FabricClient`, not a backend
-switch on the existing client. Its only remote API is
-`ping(Request<()>, deadline)`, returning `Response<GatewayDescription>`.
+switch on the existing client. It implements three read-only native operations:
+
+| Method | Typed request body | Typed response body |
+|---|---|---|
+| `ping` | `()` (zero native bytes) | `GatewayDescription` |
+| `name_exists` | `NamingUri` | `bool` |
+| `get_node_list` | `NodeQueryDescription` | `NodeListPage` |
+
+Each method accepts `furpc::Request<T>` and an absolute deadline, and returns
+`furpc::Response<U>`.
 It follows tonic's generated-client style: `FurpcClient<T = furpc::Channel>`
 wraps a byte-facing Tower service, methods borrow `&mut self`, and callers
 explicitly clone cloneable clients for concurrency. `new(transport)` is local
 and inert; Endpoint still owns connection setup. Custom transports need not be
-Clone, Sync or static. Only the Ping/failure body schemas and public result
-models are shared with the existing client. No legacy Message, channel, typed
-budget or lifecycle is adopted.
+Clone, Sync or static. Native Ping/naming/query body schemas, validation and
+public models are shared with the existing client. No legacy Message, channel,
+typed budget or lifecycle is adopted.
 
 ```rust,no_run
-use fube_client::FurpcClient;
+use fube_client::{FurpcClient, NamingUri, NodeQueryDescription};
 use furpc::Request;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -57,7 +65,12 @@ let channel = FurpcClient::endpoint_clear("127.0.0.1:19000".parse()?)?
 let mut client = FurpcClient::new(channel);
 let deadline = Instant::now() + Duration::from_secs(30);
 let gateway = client.ping(Request::new(()), deadline).await?.into_body();
-# let _ = gateway;
+let name: NamingUri = "fabric:/Example".parse()?;
+let exists = client.name_exists(Request::new(name), deadline).await?.into_body();
+let page = client.get_node_list(
+    Request::new(NodeQueryDescription::default()), deadline,
+).await?.into_body();
+# let _ = (gateway, exists, page);
 # Ok(())
 # }
 ```
@@ -65,10 +78,34 @@ let gateway = client.ping(Request::new(()), deadline).await?.into_body();
 The stub owns `RpcClient<GatewayService<T>>`. The gateway byte-service adapter
 forwards readiness to that exact transport instance, adds the remaining Timeout
 header after readiness, and captures reply validation in each call's future.
-It validates the reply envelope or decodes ClientOperationFailure before the
-success body codec. Ping's codec encodes unit to zero bytes, not a serialized
-unit object, and uses the native Fubst decoder for the successful Ping body.
+The method selects its validator through `RpcClient::get_mut` before invoking
+the RPC; validators are neither inferred from an edited reply nor shared between
+clones. The adapter validates the reply envelope or decodes
+ClientOperationFailure before the success body codec. Ping uses the standard
+`FubstCodec<(), PingReplyBody>`: fubst's root unit maps to zero body bytes, while
+the reply uses its native object schema. Nested unit values remain unsupported
+and empty structs retain native object framing.
 Gateway Actor, activity and protocol 1.1 remain method-owned native headers.
+NameExists sends the structured native NamingUri and requires NamingGateway's
+NameOperationReply. GetNodeList uses the shared native query envelope and typed
+node schema; aggregate Actor/Action headers are optional but checked when present.
+Query error codes remain domain failures, and malformed typed payloads or
+disagreeing repeated node IDs cannot be hidden behind a nonzero query error.
+
+GetNodeList delegates to the private generic `query` helper and `QueryCodec<Q>`.
+Query declarations supply the native name, Serde arguments, parameter checks,
+typed reply profile and record validation. Both clients share these declarations
+and transport-independent reply validation; only the legacy adapter consumes a
+legacy Message. Profiles retain their own payload tags, list/item/empty shapes,
+required or optional Actor/Action headers, and strict or absent paging rules.
+The generic path supports paged and unpaged request descriptions without adding
+public methods for unmigrated queries.
+
+Node filters and paging retain their native values and empty-string omission
+semantics. The new query codec does not adopt legacy standalone string/count
+ceilings. Signed native MaxResults, codec byte limits and actual transport
+admission still apply. Each call returns one page; only the caller follows
+continuation tokens. No typed-retention ledger or second RPC engine is introduced.
 
 The client preserves native Fault, domain failure, malformed-body and protocol
 errors separately, including original error sources. Response mapping preserves
@@ -82,15 +119,21 @@ and the final owner drop closes it. This replaces the original immutable
 The existing `onebox_ping_name_exists_and_node_list` test now also sends three
 overlapping pings on the new client and compares every full gateway identity with
 fresh HTTP management observations and the independent legacy native result.
-Its `furpc_ping` evidence is required by the existing onebox report validator;
-no separate fixture, test partition, or HTTP execution fallback was added.
-The original direct-Peer Ping implementation passed against a fresh five-node
-Service Fabric **11.8.121.4** onebox, including all three furpc pings and the
-existing seven baseline cases. The generic typed-stub refactor has local
-service/transport coverage and the same baseline updated for its API; a new live
-onebox run is still required. The earlier result qualifies only the initiating
-clear-TCP Ping profile, not native notifications, accepted-side serving, TLS,
-or other furpc management operations.
+Its `furpc_ping` and `furpc_management` evidence is required by the existing onebox
+report validator; no separate fixture, test partition, or HTTP execution fallback
+was added. The generic typed Ping was first requalified against a fresh five-node
+Service Fabric **11.8.121.4** onebox. The extended baseline then passed NameExists
+true/false, native node identities and stable fields compared with HTTP and the
+legacy decoder, exact-name/status selection, real 2/2/1 server paging, native
+invalid-token error and healthy reuse on the original furpc generation, and
+concurrent Ping/NameExists/GetNodeList on clones. The existing seven legacy
+baseline cases also passed. Reports retain actual node identities, page lengths,
+native error provenance and native observation times; offline negative models
+reject missing, boolean-substituted or mismatched evidence.
+
+This qualifies only these three initiating clear-TCP operations on the observed
+runtime, not native notifications, accepted-side serving, TLS, other gateway
+operations, or the rest of the client migration.
 
 ### Existing client
 

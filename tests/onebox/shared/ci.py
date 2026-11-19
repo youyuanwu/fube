@@ -1421,6 +1421,65 @@ def validate_notification_retry(retry):
             "fresh native retry ID for dropped target and exactly correlated success ACK")
 
 
+def validate_furpc_management(clear):
+    value = clear.get("furpc_management")
+    require(type(value) is dict and value.get("existing_name") is True
+            and value.get("absent_name") is False, "furpc independently observed naming results")
+    true_fields(value, ("stable_fields_match_http_and_legacy", "exact_name_and_status_filters",
+                        "same_generation_after_error", "mixed_results_match"))
+    require(type(value.get("mixed_concurrent_operations")) is int
+            and value["mixed_concurrent_operations"] == 3 and integer(value.get("generation"), 1),
+            "three mixed furpc operations on the original native generation")
+    require(type(value.get("native_error_code")) is int
+            and value["native_error_code"] in (-2147024809, -2147017462)
+            and value.get("native_error_origin") in ("domain", "native_fault"),
+            "furpc malformed continuation must retain its native error")
+    lengths = value.get("page_lengths")
+    require(type(lengths) is list and all(type(n) is int and 1 <= n <= 2 for n in lengths)
+            and sum(lengths) == 5 and type(value.get("server_token_count")) is int
+            and value["server_token_count"] == len(lengths) - 1 >= 1,
+            "furpc must follow real server paging across five nodes")
+
+    def identity(node):
+        require(type(node) is dict and text(node.get("name"))
+                and type(node.get("node_id")) is str
+                and re.fullmatch(r"[a-fA-F0-9]{1,32}", node["node_id"])
+                and integer(node.get("node_instance")) and node["node_instance"] <= 0xffffffffffffffff,
+                "furpc complete native node identity")
+        return node["name"], int(node["node_id"], 16), node["node_instance"]
+
+    native, legacy = value.get("native_nodes"), value.get("legacy_nodes")
+    require(type(native) is list and type(legacy) is list and len(native) == len(legacy) == 5,
+            "furpc and legacy five-node observations required")
+    actual, previous = [identity(node) for node in native], [identity(node) for node in legacy]
+    require(actual == previous and len({node[0] for node in actual}) == 5
+            and len({node[1] for node in actual}) == 5,
+            "furpc identities must match the independent legacy decoder without duplicates")
+    observed = clear["node_list"].get("independent_nodes")
+    require(type(observed) is list and len(observed) == 5, "independent HTTP five-node identities")
+    independent = []
+    for node in observed:
+        require(type(node) is dict and type(node.get("Id")) is dict
+                and type(node.get("InstanceId")) is str
+                and re.fullmatch(r"[0-9]{1,20}", node["InstanceId"]),
+                "independent HTTP node identity fields")
+        independent.append(identity({
+            "name": node.get("Name"), "node_id": node["Id"].get("Id"),
+            "node_instance": int(node["InstanceId"]),
+        }))
+    require(set(actual) == set(independent), "furpc nodes must match independent HTTP identities")
+    require(identity({
+        "name": clear["gateway"].get("node_name"),
+        "node_id": clear["gateway"].get("node_id"),
+        "node_instance": clear["gateway"].get("node_instance"),
+    }) in actual, "furpc gateway must belong to the independently observed node set")
+    require(all(integer(value.get(key), 1) for key in
+                ("native_observation_start_unix_ms", "native_observation_end_unix_ms")),
+            "furpc native observation timestamps must be integer milliseconds")
+    return [stamp / 1000 for stamp in interval(
+        value, "native_observation_start_unix_ms", "native_observation_end_unix_ms")]
+
+
 def validate_native(reports, archive, allocation):
     clear, health, name, lists, notification = [reports[file] for file in NATIVE_FILES]
     for value in (clear, health, name, notification):
@@ -1453,6 +1512,7 @@ def validate_native(reports, archive, allocation):
                        "exact_name_hit_miss_case_prefix", "status_default_all_up_down",
                        "empty_name_token_omitted", "valid_continuation_after_final_id_is_empty",
                        "connection_survives_native_error"))
+    furpc_window = validate_furpc_management(clear)
     require([case.get("case") for case in health["cases"]] == list(HEALTH_CASES)
             and integer(health.get("concurrent_operations")) and health["concurrent_operations"] == 8
             and type(health.get("initially_pending_count")) is int and health["initially_pending_count"] == 8
@@ -1490,6 +1550,7 @@ def validate_native(reports, archive, allocation):
         "clear_node_queries": [stamp / 1000 for stamp in interval(
             nodes, "native_observation_start_unix_ms", "native_observation_end_unix_ms")],
         "native_move_primary": movement_window,
+        "furpc_gateway_methods": furpc_window,
     }
     require(all(integer(nodes.get(key), 1) for key in
                 ("native_observation_start_unix_ms", "native_observation_end_unix_ms")),

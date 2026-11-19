@@ -2,11 +2,10 @@
 //! Source: client/FabricClientImpl.cpp:1354-1393 and FM QueryHelper.cpp:16-60.
 use crate::{
     query_arguments::validate_node_name,
-    query_protocol::{Query, Reply},
-    Error, Result,
+    query_protocol::{Query, Reply, ReplyEnvelope, ReplyError, ReplyResult},
+    DomainFailure,
 };
-use fube_transport::message::{Message, ACTION, ACTOR};
-use fubst::serde::{from_slice, Pointer, RawTagged};
+use fubst::serde::{Pointer, RawTagged};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -22,22 +21,22 @@ impl Query for MovePrimary {
     type Reply = EmptyReply;
     const NAME: &'static str = "MovePrimary";
     const SUPPORTS_MAX_RESULTS: bool = false;
-    fn validate_parameters(&self) -> Result<()> {
+    fn validate_parameters(&self) -> fubst::Result<()> {
         validate_node_name(
             &self.target,
             "primary target must be an explicit native node",
         )?;
         if self.partition.is_nil() {
-            return Err(Error::InvalidInput("primary move needs a partition"));
+            return Err(fubst::Error::InvalidInput("primary move needs a partition"));
         }
         Ok(())
     }
 }
 pub(crate) struct EmptyReply;
 #[derive(Deserialize)]
-struct Empty {}
+pub(crate) struct Empty {}
 #[derive(Deserialize)]
-struct Envelope {
+pub(crate) struct Envelope {
     kind: i64,
     payload: Pointer<RawTagged<Empty>>,
     error: i64,
@@ -45,30 +44,23 @@ struct Envelope {
 }
 impl Reply for EmptyReply {
     type Record = ();
+    type Body = Envelope;
     type Output = ();
-    fn decode(message: &Message, _: fn(()) -> Result<()>) -> Result<()> {
-        crate::protocol::check_failure(message)?;
-        let properties = message.properties()?;
-        // This is a direct FM query, not a NamingGateway list aggregate:
-        // RSMessage::QueryReply uses CreateFMToCommonMessage / RSActor (13).
-        if (message.headers.iter().any(|h| h.id == ACTOR) && properties.actor != 13)
-            || (message.headers.iter().any(|h| h.id == ACTION) && properties.action != "QueryReply")
-        {
-            return Err(Error::Protocol(
-                "movement query requires RS actor 13 and QueryReply",
-            ));
-        }
-        let result: Envelope = from_slice(&message.body)?;
+    // RSMessage::QueryReply uses CreateFMToCommonMessage / RSActor (13).
+    const ENVELOPE: ReplyEnvelope = ReplyEnvelope::Empty(13);
+
+    fn decode_body(
+        result: Envelope,
+        _: fn(()) -> std::result::Result<(), &'static str>,
+    ) -> ReplyResult<()> {
         if result.kind != 0 || result.payload.0.is_some() || result.paging.0.is_some() {
-            return Err(Error::Protocol(
-                "movement reply is not an empty QueryResult",
-            ));
+            return Err("movement reply is not an empty QueryResult".into());
         }
         if result.error != 0 {
-            return Err(Error::Remote {
+            return Err(ReplyError::Domain(DomainFailure {
                 code: result.error,
                 message: "native primary movement".into(),
-            });
+            }));
         }
         Ok(())
     }
@@ -77,7 +69,11 @@ impl Reply for EmptyReply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_protocol::{decode_reply, tests::assert_request};
+    use crate::{
+        query_protocol::{decode_reply, tests::assert_request},
+        Error,
+    };
+    use fube_transport::message::Message;
     use fubst::Encoder;
     fn reply(kind: i64, error: i64, payload: bool, paging: bool) -> Message {
         let mut e = Encoder::new();

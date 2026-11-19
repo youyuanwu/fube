@@ -38,17 +38,23 @@ Deterministic I/O cases, backpressured in-memory exchange, and a loopback clear-
 exchange exercise this foundation. They are not native interoperability
 qualification.
 
-The original `fube-client::FurpcClient` qualified native Ping through
-this driver against a fresh Service Fabric 11.8.121.4 onebox. The existing baseline
-test runs three overlapping pings on one Channel and compares complete gateway
-identities with fresh independent HTTP observations and the legacy native client.
-Its required `furpc_ping` report records all three results' successful comparison.
-The client is now a generic typed stub over byte-facing Tower services, using
-RpcClient, a gateway adapter with call-local reply validation and an empty-request Ping
-codec. Its baseline call sites are updated, but that refactor has not yet been
-rerun against a live onebox.
-The earlier result is initiating clear-TCP Ping evidence only; it does not qualify
-accepted-side serving, notifications, TLS, or the rest of the gateway API. See the
+The generic `fube-client::FurpcClient` now qualifies Ping, NameExists and
+GetNodeList through RpcClient and byte-facing Tower services against a fresh
+Service Fabric 11.8.121.4 onebox. The existing baseline compares three cloned
+Pings and full native node identities with independent HTTP observations and
+the legacy native client. It also checks naming true/false, node filters,
+real server paging, native invalid-token failure and original-generation
+healthy reuse, and mixed-method concurrency. Required `furpc_ping` and
+`furpc_management` report fields retain those observations.
+The gateway adapter captures each method's selected reply validator before
+success-body decoding; shared native schemas do not route through legacy
+Messages, channels or retained-allocation budgets.
+GetNodeList uses a generic typed query codec with shared declarations and
+transport-independent list/item/empty reply profiles. Profile-specific actor,
+action, payload-tag and paging checks remain distinct; other query methods have
+not yet been exposed or native-qualified through FurpcClient.
+This is initiating clear-TCP evidence for those three operations only; it does
+not qualify accepted-side serving, notifications, TLS, or the rest of the gateway API. See the
 [client slice](../../RustFabricClient.md#separate-furpc-backed-client).
 
 The public facade supports managed byte RPC by default and explicitly selected

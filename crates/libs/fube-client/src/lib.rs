@@ -3,7 +3,8 @@
 //! This package does not use the native Service Fabric client library.
 //! Existing [`FabricClient`] connections support bounded concurrency without
 //! automatic reconnect. The separate [`FurpcClient`] is a typed stub over a
-//! byte-facing Tower service, defaulting to furpc's Channel, and provides only Ping.
+//! byte-facing Tower service, defaulting to furpc's Channel, and provides Ping,
+//! NameExists and single-page GetNodeList.
 //! Native connections require an explicitly selected unsecured development gateway.
 
 mod applications;
@@ -407,7 +408,7 @@ impl FabricClient {
             target_node,
             "primary target must be an explicit native node",
         )
-        .map_err(ClientError::Local)?;
+        .map_err(|error| ClientError::Local(error.into()))?;
         self.call(
             QueryDescription::new(movement::MovePrimary {
                 partition,

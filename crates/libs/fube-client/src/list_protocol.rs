@@ -4,12 +4,14 @@ use crate::{
     applications::*,
     query_protocol::{result_tags, ListReply, Query},
     services::*,
-    Error, HealthState, Result,
+    HealthState,
 };
 
-fn validate_type_selector(value: &str) -> Result<()> {
+fn validate_type_selector(value: &str) -> fubst::Result<()> {
     if value.is_empty() {
-        return Err(Error::InvalidInput("selected type name must not be empty"));
+        return Err(fubst::Error::InvalidInput(
+            "selected type name must not be empty",
+        ));
     }
     Ok(())
 }
@@ -19,30 +21,26 @@ impl Query for ApplicationQueryParameters {
     type Reply = ListReply<Application, { result_tags::APPLICATION }>;
     const NAME: &'static str = "GetApplicationList";
 
-    fn validate_parameters(&self) -> Result<()> {
+    fn validate_parameters(&self) -> fubst::Result<()> {
         match &self.filter {
             ApplicationListFilter::TypeName(name) => {
                 validate_type_selector(name)?;
             }
             ApplicationListFilter::DefinitionKind(filter) => {
-                ApplicationDefinitionKindFilter::try_from_bits(filter.bits())?;
+                filter.validate()?;
             }
             _ => {}
         }
         Ok(())
     }
 
-    fn validate_record(application: Application) -> Result<Application> {
+    fn validate_record(application: Application) -> std::result::Result<Application, &'static str> {
         validate_list_health(application.health_state)?;
         if !application.upgrade_type_version.is_empty() {
-            return Err(Error::Protocol(
-                "nonempty deprecated application upgrade version",
-            ));
+            return Err("nonempty deprecated application upgrade version");
         }
         if !application.upgrade_parameters.is_empty() {
-            return Err(Error::Protocol(
-                "nonempty deprecated application upgrade parameters",
-            ));
+            return Err("nonempty deprecated application upgrade parameters");
         }
         Ok(application)
     }
@@ -53,9 +51,9 @@ impl Query for ServiceQueryParameters {
     type Reply = ListReply<Service, { result_tags::SERVICE }>;
     const NAME: &'static str = "GetApplicationServiceList";
 
-    fn validate_parameters(&self) -> Result<()> {
+    fn validate_parameters(&self) -> fubst::Result<()> {
         if self.application_name.as_str() == "fabric:/System" {
-            return Err(Error::InvalidInput(
+            return Err(fubst::Error::InvalidInput(
                 "System service-list profile is unsupported",
             ));
         }
@@ -65,20 +63,20 @@ impl Query for ServiceQueryParameters {
         Ok(())
     }
 
-    fn validate_record(service: Service) -> Result<Service> {
+    fn validate_record(service: Service) -> std::result::Result<Service, &'static str> {
         if service.kind == ServiceKind::Invalid
             || (service.kind == ServiceKind::Stateless && service.has_persisted_state)
         {
-            return Err(Error::Protocol("unsupported service kind/persistence"));
+            return Err("unsupported service kind/persistence");
         }
         validate_list_health(service.health_state)?;
         Ok(service)
     }
 }
 
-fn validate_list_health(value: HealthState) -> Result<HealthState> {
+fn validate_list_health(value: HealthState) -> std::result::Result<HealthState, &'static str> {
     if matches!(value, HealthState::Unrecognized(_)) {
-        return Err(Error::Protocol("unsupported list health state"));
+        return Err("unsupported list health state");
     }
     Ok(value)
 }
@@ -86,15 +84,16 @@ fn validate_list_health(value: HealthState) -> Result<HealthState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Error, Result};
     use fubst::{serde::from_fields, Decoder, Encoder};
 
     fn application(bytes: &[u8]) -> Result<Application> {
         let value = Decoder::new(bytes).object(from_fields::<Application>)?;
-        ApplicationQueryParameters::validate_record(value)
+        ApplicationQueryParameters::validate_record(value).map_err(Error::Protocol)
     }
     fn service(bytes: &[u8]) -> Result<Service> {
         let value = Decoder::new(bytes).object(from_fields::<Service>)?;
-        ServiceQueryParameters::validate_record(value)
+        ServiceQueryParameters::validate_record(value).map_err(Error::Protocol)
     }
 
     fn application_base(e: &mut Encoder) -> fubst::Result<()> {

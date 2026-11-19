@@ -1,6 +1,7 @@
 use std::{
     fmt,
     future::Future,
+    marker::PhantomData,
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
@@ -14,7 +15,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::time::Instant;
 use tower_service::Service;
 
-use crate::{protocol, DomainFailure, GatewayDescription};
+use crate::{
+    protocol,
+    query_protocol::{self, Query, QueryRequest, Reply},
+    DomainFailure, GatewayDescription, NamingUri, NodeListPage, NodeQueryDescription,
+};
 
 const ACTIVITY: u16 = 0x8020;
 const TIMEOUT: u16 = 0x8023;
@@ -58,6 +63,14 @@ impl From<fubst::Error> for FurpcClientError {
         Self::Decode(error)
     }
 }
+impl From<query_protocol::ReplyError> for FurpcClientError {
+    fn from(error: query_protocol::ReplyError) -> Self {
+        match error {
+            query_protocol::ReplyError::Protocol(reason) => Self::Protocol(reason),
+            query_protocol::ReplyError::Domain(failure) => Self::Domain(failure),
+        }
+    }
+}
 impl FurpcClientError {
     fn from_rpc(error: furpc::Error) -> Self {
         // RpcClient preserves byte-service and codec errors as their original sources.
@@ -88,7 +101,8 @@ type Result<T> = std::result::Result<T, FurpcClientError>;
 
 /// Typed gateway stub over a byte-facing Tower service.
 ///
-/// Only read-only Ping is implemented, separately from [`crate::FabricClient`].
+/// Ping, NameExists and single-page GetNodeList are implemented, separately from
+/// [`crate::FabricClient`].
 /// The default transport is a furpc Channel; clones share its lifecycle and
 /// dropping the last owner closes it. Later calls may reconnect, but a submitted
 /// call is never replayed. Custom transports need not be Clone, Sync or static.
@@ -152,13 +166,92 @@ where
         request: Request<()>,
         deadline: Instant,
     ) -> Result<Response<GatewayDescription>> {
+        let response = self
+            .unary(
+                request,
+                FubstCodec::<(), protocol::PingReplyBody>::default(),
+                "PingRequest",
+                check_ping_reply,
+                deadline,
+            )
+            .await?;
+        let (parts, body) = response.into_parts();
+        let gateway = body.into_gateway().map_err(FurpcClientError::Protocol)?;
+        Ok(Response::from_parts(parts, gateway))
+    }
+
+    /// Test a checked naming URI without retry or a user-service state query.
+    pub async fn name_exists(
+        &mut self,
+        request: Request<NamingUri>,
+        deadline: Instant,
+    ) -> Result<Response<bool>> {
+        let response = self
+            .unary(
+                request,
+                FubstCodec::<NamingUri, protocol::NameExistsReplyBody>::default(),
+                "NameExistsRequest",
+                check_name_reply,
+                deadline,
+            )
+            .await?;
+        Ok(response.map(|body| body.exists))
+    }
+
+    /// Get one best-effort native node page, without automatic paging or retries.
+    ///
+    /// Inspect the returned continuation token even when no page size was supplied.
+    /// Name/status selectors and paging use the existing native query models.
+    pub async fn get_node_list(
+        &mut self,
+        request: Request<NodeQueryDescription>,
+        deadline: Instant,
+    ) -> Result<Response<NodeListPage>> {
+        self.query(request, deadline).await
+    }
+
+    async fn query<Q: QueryRequest>(
+        &mut self,
+        request: Request<Q>,
+        deadline: Instant,
+    ) -> Result<Response<<Q::Parameters as Query>::Output>> {
+        let response = self
+            .unary(
+                request,
+                QueryCodec::<Q>::new(),
+                "QueryRequest",
+                check_query_reply::<Q>,
+                deadline,
+            )
+            .await?;
+        let (parts, body) = response.into_parts();
+        let output =
+            <Q::Parameters as Query>::Reply::decode_body(body, Q::Parameters::validate_record)?;
+        Ok(Response::from_parts(parts, output))
+    }
+
+    async fn unary<C>(
+        &mut self,
+        request: Request<C::Encode>,
+        codec: C,
+        action: &'static str,
+        validate_reply: fn(&Response<Body>) -> Result<()>,
+        deadline: Instant,
+    ) -> Result<Response<C::Decode>>
+    where
+        C: Codec + Send,
+        C::Encode: Send,
+        C::Decode: Send,
+        C::Encoder: Send,
+        C::Decoder: Send,
+    {
         let deadline = request
             .deadline()
             .map_or(deadline, |local| local.min(deadline));
         timeout_ticks(deadline)?;
         let request = request
             .append_header(header::actor(ActorId::new(5)?)?)?
-            .append_header(header::action("PingRequest")?)?
+            .append_header(header::action(action)?)?
             .append_header(HeaderRecord::native(
                 HeaderId::new(ACTIVITY)?,
                 &ActivityHeader {
@@ -169,14 +262,11 @@ where
                 HeaderId::new(CLIENT_VERSION)?,
                 &ProtocolVersion(1, 1),
             )?)?;
-        let response = self
-            .inner
-            .call(request, PingCodec, deadline)
+        self.inner.get_mut().validate_reply = validate_reply;
+        self.inner
+            .call(request, codec, deadline)
             .await
-            .map_err(FurpcClientError::from_rpc)?;
-        let (parts, body) = response.into_parts();
-        let gateway = body.into_gateway().map_err(FurpcClientError::Protocol)?;
-        Ok(Response::from_parts(parts, gateway))
+            .map_err(FurpcClientError::from_rpc)
     }
 }
 
@@ -263,26 +353,51 @@ fn stamp_timeout(request: Request<Body>) -> furpc::Result<Request<Body>> {
     )?)
 }
 
-struct PingCodec;
-impl Codec for PingCodec {
-    type Encode = ();
-    type Decode = protocol::PingReplyBody;
+type QueryBody<Q> = <<<Q as QueryRequest>::Parameters as Query>::Reply as Reply>::Body;
+
+struct QueryCodec<Q>(PhantomData<fn(Q)>);
+
+impl<Q> QueryCodec<Q> {
+    fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<Q: QueryRequest> Codec for QueryCodec<Q> {
+    type Encode = Q;
+    type Decode = QueryBody<Q>;
     type Encoder = Self;
-    type Decoder = <FubstCodec<(), protocol::PingReplyBody> as Codec>::Decoder;
+    type Decoder = <FubstCodec<(), QueryBody<Q>> as Codec>::Decoder;
 
     fn encoder(&mut self) -> Self::Encoder {
-        Self
+        Self::new()
     }
 
     fn decoder(&mut self) -> Self::Decoder {
-        FubstCodec::<(), protocol::PingReplyBody>::default().decoder()
+        FubstCodec::<(), QueryBody<Q>>::default().decoder()
     }
 }
-impl Encoder for PingCodec {
-    type Item = ();
+impl<Q: QueryRequest> Encoder for QueryCodec<Q> {
+    type Item = Q;
 
-    fn encode(&mut self, (): (), _: &mut EncodeBuf<'_>) -> std::result::Result<(), CodecError> {
-        Ok(())
+    fn encode(
+        &mut self,
+        query: Self::Item,
+        dst: &mut EncodeBuf<'_>,
+    ) -> std::result::Result<(), CodecError> {
+        let bytes = query_protocol::encode_query_body(
+            query.parameters(),
+            query.paging(),
+            fubst::Limits {
+                max_bytes: dst.remaining(),
+                ..Default::default()
+            },
+        )?;
+        let body = Body::from_bytes(bytes).map_err(|error| match error {
+            furpc::Error::ResourceLimit(_) => CodecError::resource_limit(error),
+            _ => CodecError::invalid_payload(error),
+        })?;
+        dst.append_body(body)
     }
 }
 
@@ -315,16 +430,19 @@ fn decode_body<T: DeserializeOwned>(body: &Body) -> Result<T> {
     Ok(fubst::serde::from_slice(&bytes)?)
 }
 
-fn check_ping_reply(response: &Response<Body>) -> Result<()> {
-    let headers = response.headers();
-    let common = headers.effective();
-    if common.actor != ActorId::new(5)? {
-        return Err(FurpcClientError::Protocol(
-            "reply is not from NamingGateway",
-        ));
-    }
-    let action_is = |action: &str| common.action().iter().copied().eq(action.encode_utf16());
-    if action_is("ClientOperationFailure") {
+fn action_is(response: &Response<Body>, action: &str) -> bool {
+    response
+        .headers()
+        .effective()
+        .action()
+        .iter()
+        .copied()
+        .eq(action.encode_utf16())
+}
+
+fn check_gateway_failure(response: &Response<Body>) -> Result<()> {
+    if action_is(response, "ClientOperationFailure") {
+        check_gateway_actor(response)?;
         let failure: protocol::GatewayFailureBody = decode_body(response.body())?;
         if failure.code == 0 {
             return Err(FurpcClientError::Protocol(
@@ -336,11 +454,27 @@ fn check_ping_reply(response: &Response<Body>) -> Result<()> {
             message: failure.diagnostic,
         }));
     }
-    if !action_is("PingRequest") {
+    Ok(())
+}
+
+fn check_gateway_actor(response: &Response<Body>) -> Result<()> {
+    if response.headers().effective().actor != ActorId::new(5)? {
+        return Err(FurpcClientError::Protocol(
+            "reply is not from NamingGateway",
+        ));
+    }
+    Ok(())
+}
+
+fn check_ping_reply(response: &Response<Body>) -> Result<()> {
+    check_gateway_actor(response)?;
+    check_gateway_failure(response)?;
+    if !action_is(response, "PingRequest") {
         return Err(FurpcClientError::Protocol("unexpected ping reply action"));
     }
     let mut version = None;
-    for record in headers
+    for record in response
+        .headers()
         .raw_records()
         .filter(|record| record.id().get() == CLIENT_VERSION)
     {
@@ -352,6 +486,30 @@ fn check_ping_reply(response: &Response<Body>) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn check_name_reply(response: &Response<Body>) -> Result<()> {
+    check_gateway_actor(response)?;
+    check_gateway_failure(response)?;
+    if !action_is(response, "NameOperationReply") {
+        return Err(FurpcClientError::Protocol("unexpected naming reply action"));
+    }
+    Ok(())
+}
+
+fn check_query_reply<Q: QueryRequest>(response: &Response<Body>) -> Result<()> {
+    check_gateway_failure(response)?;
+    let headers = response.headers();
+    <Q::Parameters as Query>::Reply::ENVELOPE
+        .check(
+            headers
+                .first_raw(header::ACTOR)
+                .map(|_| headers.effective().actor.get()),
+            headers
+                .first_raw(header::ACTION)
+                .map(|_| headers.effective().action().iter().copied()),
+        )
+        .map_err(FurpcClientError::Protocol)
 }
 
 #[cfg(test)]

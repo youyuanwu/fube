@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     query_arguments::validate_node_name,
     query_protocol::{result_tags, ListReply, Query},
-    Error, HealthState, NamingUri, PagedQuery, QueryPage, Result,
+    HealthState, NamingUri, PagedQuery, QueryPage,
 };
 
 /// Native paged deployed-application parameters in facade argument order.
@@ -91,18 +91,18 @@ impl Query for DeployedApplicationQueryParameters {
     type Reply = ListReply<DeployedApplication, { result_tags::DEPLOYED_APPLICATION }>;
     const NAME: &'static str = "GetApplicationPagedListDeployedOnNode";
 
-    fn validate_parameters(&self) -> Result<()> {
+    fn validate_parameters(&self) -> fubst::Result<()> {
         validate_node_name(
             &self.node_name,
             "deployed application node name must be 1..=4096 UTF-16 units without NUL",
         )
     }
 
-    fn validate_record(record: DeployedApplication) -> Result<DeployedApplication> {
+    fn validate_record(
+        record: DeployedApplication,
+    ) -> std::result::Result<DeployedApplication, &'static str> {
         if matches!(record.health_state, HealthState::Unrecognized(_)) {
-            return Err(Error::Protocol(
-                "unsupported deployed application health state",
-            ));
+            return Err("unsupported deployed application health state");
         }
         Ok(record)
     }
@@ -113,7 +113,7 @@ mod tests {
     use super::*;
     use crate::{
         query_protocol::{encode_query, tests::assert_request},
-        Paging,
+        Error, Paging, Result,
     };
     use fubst::{
         serde::{from_fields, from_slice, to_vec},
@@ -147,6 +147,7 @@ mod tests {
 
     fn decode_record(bytes: &[u8]) -> Result<DeployedApplication> {
         DeployedApplicationQueryParameters::validate_record(from_slice(bytes)?)
+            .map_err(Error::Protocol)
     }
 
     #[test]

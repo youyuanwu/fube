@@ -66,6 +66,11 @@ impl<T> RpcClient<T> {
     pub fn into_inner(self) -> T {
         self.transport
     }
+
+    /// Configure the wrapped service between calls without replacing its readiness state.
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
 }
 
 impl<T> RpcClient<T>

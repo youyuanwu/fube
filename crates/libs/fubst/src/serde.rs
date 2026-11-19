@@ -6,7 +6,11 @@
 //! `bitflags` types with Serde enabled use their underlying integer directly
 //! when its width is supported. Unknown bits are retained; validate domain rules
 //! separately. Both encoding and decoding are non-human-readable.
-//! Bare sequences, tuples, maps, Option, enums, unit, floats, chars and other
+//! A root `()` denotes no serialized body and maps to zero bytes; transparent
+//! newtypes preserve that mapping. Nonempty input cannot decode as `()`.
+//! Unit fields and unit structs remain unsupported; an empty struct still has
+//! native object framing.
+//! Bare sequences, tuples, maps, Option, enums, floats, chars and other
 //! integer widths are unsupported. Owned decoding is supported; strings/bytes
 //! are not borrowed from the UTF-16/native input.
 //!
@@ -201,7 +205,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for ObjectArray<Vec<T>> {
     }
 }
 
-/// Encode one native value. Struct roots include object framing; scalar roots do not.
+/// Encode one root. Unit means no body; structs include framing and scalars do not.
 pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     to_vec_with_limits(value, Limits::default())
 }
@@ -212,11 +216,12 @@ pub fn to_vec_with_limits<T: Serialize + ?Sized>(value: &T, limits: Limits) -> R
     value.serialize(Serializer {
         encoder: &mut encoder,
         mode: Mode::Value,
+        root: true,
     })?;
     Ok(encoder.finish())
 }
 
-/// Decode exactly one native value, rejecting bytes remaining outside that value.
+/// Decode one root, rejecting trailing bytes. Unit requires an empty input.
 pub fn from_slice<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T> {
     from_slice_with_budget(bytes, &mut |_| Ok(()))
 }
@@ -258,6 +263,7 @@ pub fn from_slice_with_limits_and_budget<'de, T: Deserialize<'de>>(
         reserve,
         mode: Mode::Value,
         type_info: None,
+        root: true,
     })?;
     decoder.finish()?;
     Ok(value)
@@ -275,6 +281,7 @@ pub fn to_fields<T: Serialize + ?Sized>(encoder: &mut Encoder, value: &T) -> Res
     let result = value.serialize(Serializer {
         encoder,
         mode: Mode::Fields,
+        root: false,
     });
     if result.is_err() {
         encoder.rollback(start, depth);
@@ -295,6 +302,7 @@ pub fn from_fields<'de, T: Deserialize<'de>>(decoder: &mut Decoder<'de>) -> Resu
         reserve: &mut |_| Ok(()),
         mode: Mode::Fields,
         type_info: None,
+        root: false,
     })
 }
 
@@ -364,6 +372,7 @@ fn variant_name(
 struct Serializer<'a> {
     encoder: &'a mut Encoder,
     mode: Mode,
+    root: bool,
 }
 
 struct BoundedText {
@@ -486,7 +495,13 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
         serialize_i8(v: i8); serialize_i16(v: i16); serialize_u8(v: u8);
         serialize_i128(v: i128); serialize_u128(v: u128);
         serialize_f32(v: f32); serialize_char(v: char);
-        serialize_unit(); serialize_unit_struct(n: &'static str);
+        serialize_unit_struct(n: &'static str);
+    }
+    fn serialize_unit(self) -> Result<()> {
+        if !self.root || self.mode != Mode::Value {
+            return Err(encode_error());
+        }
+        Ok(())
     }
     fn serialize_unit_variant(self, _: &'static str, _: u32, variant: &'static str) -> Result<()> {
         if self.mode == Mode::NumericEnum {
@@ -547,6 +562,7 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
         value.serialize(Self {
             encoder: self.encoder,
             mode,
+            root: false,
         })
     }
     fn serialize_newtype_struct<T: Serialize + ?Sized>(
@@ -584,6 +600,7 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
         value.serialize(Self {
             encoder: self.encoder,
             mode,
+            root: self.root,
         })
     }
     fn serialize_newtype_variant<T: Serialize + ?Sized>(
@@ -597,6 +614,7 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
         value.serialize(Serializer {
             encoder: compound.encoder,
             mode: Mode::Fields,
+            root: false,
         })?;
         compound.finish()
     }
@@ -790,6 +808,7 @@ impl Compound<'_> {
         value.serialize(Serializer {
             encoder: self.encoder,
             mode,
+            root: false,
         })?;
         Ok(())
     }
@@ -867,6 +886,7 @@ struct Deserializer<'a, 'de> {
     reserve: &'a mut dyn FnMut(usize) -> Result<()>,
     mode: Mode,
     type_info: Option<&'de [u8]>,
+    root: bool,
 }
 
 macro_rules! deserialize_scalar {
@@ -909,11 +929,16 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
         deserialize_u128,
         deserialize_f32,
         deserialize_char,
-        deserialize_unit,
         deserialize_map,
         deserialize_identifier,
         deserialize_ignored_any
     );
+    fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        if !self.root || self.mode != Mode::Value || !self.decoder.bytes.is_empty() {
+            return Err(decode_error());
+        }
+        visitor.visit_unit()
+    }
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         self.deserialize_string(visitor)
     }
@@ -936,6 +961,7 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
                             reserve: self.reserve,
                             mode: Mode::Contents,
                             type_info: Some(type_info),
+                            root: false,
                         })
                 })?;
                 match value {
@@ -949,6 +975,7 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
                 reserve: self.reserve,
                 mode: Mode::Value,
                 type_info: None,
+                root: false,
             }),
             _ => Err(decode_error()),
         }
@@ -988,6 +1015,7 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
                         reserve: self.reserve,
                         mode: Mode::EnumContents,
                         type_info: Some(type_info),
+                        root: false,
                     })
                 }),
                 Mode::Contents => visitor.visit_newtype_struct(Self {
@@ -995,6 +1023,7 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
                     reserve: self.reserve,
                     mode: Mode::EnumContents,
                     type_info: self.type_info,
+                    root: false,
                 }),
                 _ => Err(decode_error()),
             };
@@ -1046,6 +1075,7 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
             reserve: self.reserve,
             mode,
             type_info: self.type_info,
+            root: self.root,
         })
     }
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
@@ -1199,6 +1229,7 @@ impl<'de> SeqAccess<'de> for Access<'_, 'de> {
             reserve: self.reserve,
             mode: self.mode,
             type_info: None,
+            root: false,
         })
         .map(Some)
     }
@@ -1238,6 +1269,7 @@ impl<'de> VariantAccess<'de> for NativeEnumAccess<'_, 'de> {
             reserve: self.reserve,
             mode: Mode::Fields,
             type_info: None,
+            root: false,
         })
     }
     fn tuple_variant<V: Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value> {
@@ -1249,6 +1281,7 @@ impl<'de> VariantAccess<'de> for NativeEnumAccess<'_, 'de> {
             reserve: self.reserve,
             mode: Mode::Fields,
             type_info: None,
+            root: false,
         }
         .structure(len, visitor)
     }
@@ -1286,6 +1319,7 @@ impl<'de> SeqAccess<'de> for TypeAccess<'_, 'de> {
                     reserve: self.reserve,
                     mode: Mode::Fields,
                     type_info: None,
+                    root: false,
                 })
                 .map(Some)
             }

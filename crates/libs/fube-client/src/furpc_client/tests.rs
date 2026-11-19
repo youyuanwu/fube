@@ -17,6 +17,9 @@ use std::{
 use tokio::sync::oneshot;
 use tower_service::Service;
 
+mod methods;
+mod queries;
+
 fn deadline() -> Instant {
     Instant::now() + crate::DEFAULT_TIMEOUT
 }

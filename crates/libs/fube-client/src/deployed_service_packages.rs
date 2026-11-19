@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     query_arguments::validate_node_name,
     query_protocol::{result_tags, Query, UnpagedListReply},
-    DeploymentStatus, NamingUri, QueryDescription, Result,
+    DeploymentStatus, NamingUri, QueryDescription,
 };
 
 /// Native service-package selectors in facade argument order.
@@ -57,7 +57,7 @@ impl Query for DeployedServicePackageQueryParameters {
         UnpagedListReply<DeployedServicePackage, { result_tags::DEPLOYED_SERVICE_PACKAGE }>;
     const NAME: &'static str = "GetServiceManifestListDeployedOnNode";
 
-    fn validate_parameters(&self) -> Result<()> {
+    fn validate_parameters(&self) -> fubst::Result<()> {
         validate_node_name(
             &self.node_name,
             "deployed service package node name must be 1..=4096 UTF-16 units without NUL",

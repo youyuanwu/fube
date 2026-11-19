@@ -192,6 +192,55 @@ async fn client_is_inert_and_supports_per_call_codecs_on_the_same_borrowed_servi
 }
 
 #[tokio::test]
+async fn fubst_unit_bodies_work_with_zero_limits_but_reject_nonempty_responses() {
+    let calls = AtomicUsize::new(0);
+    let transport = service(|request: Request<Body>| {
+        assert!(request.body().is_empty());
+        let body = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Body::empty()
+        } else {
+            Body::from_bytes(fubst::serde::to_vec(&false).unwrap()).unwrap()
+        };
+        ready(Ok(Response::new(body)))
+    });
+    let mut rpc = RpcClient::new(transport)
+        .codec_limits(ClientCodecLimits {
+            max_encoded_body_bytes: 0,
+            max_response_body_bytes: 0,
+        })
+        .unwrap();
+    rpc.call(
+        Request::new(()),
+        FubstCodec::<(), ()>::with_limits(fubst::Limits {
+            max_bytes: 0,
+            max_depth: 0,
+        }),
+        deadline(),
+    )
+    .await
+    .unwrap()
+    .into_body();
+    let mut rpc = rpc
+        .codec_limits(ClientCodecLimits {
+            max_encoded_body_bytes: 0,
+            max_response_body_bytes: 1,
+        })
+        .unwrap();
+    assert!(matches!(
+        rpc.call(
+            Request::new(()),
+            FubstCodec::<(), ()>::default(),
+            deadline()
+        )
+        .await,
+        Err(Error::Codec {
+            phase: "decode",
+            source: CodecError::InvalidPayload { .. },
+        })
+    ));
+}
+
+#[tokio::test]
 async fn explicit_body_limits_apply_before_submission_and_before_decode_including_zero() {
     for (out, input, text, expect_encode, expect_call) in [
         (0, 0, "", true, true),

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, HealthState, NamingUri, PagedQuery, QueryPage, Result};
+use crate::{HealthState, NamingUri, PagedQuery, QueryPage, Result};
 
 bitflags::bitflags! {
     /// Native definition-kind selection bits, distinct from result enum numbers.
@@ -27,15 +27,21 @@ bitflags::bitflags! {
 impl ApplicationDefinitionKindFilter {
     /// Reject unnamed bits rather than accepting native's ignored-bit behavior.
     pub fn try_from_bits(bits: u32) -> Result<Self> {
+        let filter = Self::from_bits_retain(bits);
+        filter.validate()?;
+        Ok(filter)
+    }
+
+    pub(crate) fn validate(self) -> fubst::Result<()> {
         let kinds = Self::SERVICE_FABRIC_APPLICATION_DESCRIPTION
             | Self::COMPOSE
             | Self::MESH_APPLICATION_DESCRIPTION;
-        if bits != Self::ALL.bits() && bits & !kinds.bits() != 0 {
-            return Err(Error::InvalidInput(
+        if self.bits() != Self::ALL.bits() && self.bits() & !kinds.bits() != 0 {
+            return Err(fubst::Error::InvalidInput(
                 "unsupported application definition filter bits",
             ));
         }
-        Ok(Self::from_bits_retain(bits))
+        Ok(())
     }
 }
 

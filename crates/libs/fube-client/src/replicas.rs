@@ -2,7 +2,7 @@
 
 use crate::{
     query_protocol::{result_tags, ListReply, Query},
-    Error, HealthState, PagedQuery, QueryPage, Result, ServiceKind,
+    HealthState, PagedQuery, QueryPage, ServiceKind,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -111,12 +111,12 @@ impl Query for ReplicaQueryParameters {
     const NAME: &'static str = "GetServicePartitionReplicaList";
     const SUPPORTS_MAX_RESULTS: bool = false;
 
-    fn validate_record(replica: Replica) -> Result<Replica> {
+    fn validate_record(replica: Replica) -> std::result::Result<Replica, &'static str> {
         if replica.kind == ServiceKind::Invalid {
-            return Err(Error::Protocol("unsupported replica service kind"));
+            return Err("unsupported replica service kind");
         }
         if matches!(replica.health_state, HealthState::Unrecognized(_)) {
-            return Err(Error::Protocol("unsupported replica health state"));
+            return Err("unsupported replica health state");
         }
         Ok(replica)
     }
@@ -128,7 +128,7 @@ mod tests {
     use crate::{
         partitions::tests::ID,
         query_protocol::{encode_query, tests::assert_request},
-        Paging,
+        Error, Paging, Result,
     };
     use fubst::{serde::from_slice, Encoder};
     use std::num::NonZeroU64;
@@ -173,7 +173,7 @@ mod tests {
     fn decode_fields(fields: impl FnOnce(&mut Encoder) -> fubst::Result<()>) -> Result<Replica> {
         let mut e = Encoder::new();
         e.object(fields)?;
-        ReplicaQueryParameters::validate_record(from_slice(&e.finish())?)
+        ReplicaQueryParameters::validate_record(from_slice(&e.finish())?).map_err(Error::Protocol)
     }
 
     #[test]

@@ -6,8 +6,7 @@ use uuid::Uuid;
 use crate::{
     query_arguments::validate_node_name,
     query_protocol::{result_tags, Query, UnpagedListReply},
-    Error, NamingUri, NodeTimestamp, QueryDescription, ReplicaRole, ReplicaStatus, Result,
-    ServiceKind,
+    NamingUri, NodeTimestamp, QueryDescription, ReplicaRole, ReplicaStatus, ServiceKind,
 };
 
 /// Native facade selectors, in argument order. There is no paging or
@@ -145,16 +144,18 @@ impl Query for DeployedReplicaQueryParameters {
     const NAME: &'static str = "GetServiceReplicaListDeployedOnNode";
     const SUPPORTS_MAX_RESULTS: bool = false;
 
-    fn validate_parameters(&self) -> Result<()> {
+    fn validate_parameters(&self) -> fubst::Result<()> {
         validate_node_name(
             &self.node_name,
             "deployed replica node name must be 1..=4096 UTF-16 units without NUL",
         )
     }
 
-    fn validate_record(record: DeployedReplica) -> Result<DeployedReplica> {
+    fn validate_record(
+        record: DeployedReplica,
+    ) -> std::result::Result<DeployedReplica, &'static str> {
         if record.kind == ServiceKind::Invalid {
-            return Err(Error::Protocol("unsupported deployed replica service kind"));
+            return Err("unsupported deployed replica service kind");
         }
         Ok(record)
     }
@@ -163,7 +164,10 @@ impl Query for DeployedReplicaQueryParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_protocol::{encode_query, tests::assert_request};
+    use crate::{
+        query_protocol::{encode_query, tests::assert_request},
+        Error, Result,
+    };
     use fubst::{
         serde::{from_slice, to_vec},
         Encoder, MAX_STRING_UNITS,
@@ -260,7 +264,7 @@ mod tests {
     }
 
     fn decode_record(bytes: &[u8]) -> Result<DeployedReplica> {
-        DeployedReplicaQueryParameters::validate_record(from_slice(bytes)?)
+        DeployedReplicaQueryParameters::validate_record(from_slice(bytes)?).map_err(Error::Protocol)
     }
 
     fn parameters() -> DeployedReplicaQueryParameters {

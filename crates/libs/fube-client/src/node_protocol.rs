@@ -1,7 +1,6 @@
 use crate::{
     nodes::*,
     query_protocol::{result_tags, ListReply, Query},
-    Error, Result,
 };
 
 impl Query for NodeQueryParameters {
@@ -10,9 +9,9 @@ impl Query for NodeQueryParameters {
     const NAME: &'static str = "GetNodeList";
     const PAGING_FIRST: bool = true;
 
-    fn validate_record(node: Node) -> Result<Node> {
+    fn validate_record(node: Node) -> std::result::Result<Node, &'static str> {
         if node.id_copy != node.id {
-            return Err(Error::Protocol("node ID copies disagree"));
+            return Err("node ID copies disagree");
         }
         Ok(node)
     }

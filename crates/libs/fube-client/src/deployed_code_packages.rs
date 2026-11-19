@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     query_arguments::validate_node_name,
     query_protocol::{result_tags, Query, UnpagedListReply},
-    DeploymentStatus, NamingUri, NodeTimestamp, QueryDescription, Result,
+    DeploymentStatus, NamingUri, NodeTimestamp, QueryDescription,
 };
 
 /// Native unpaged code-package parameters in facade argument order.
@@ -168,7 +168,7 @@ impl Query for DeployedCodePackageQueryParameters {
     type Reply = UnpagedListReply<DeployedCodePackage, { result_tags::DEPLOYED_CODE_PACKAGE }>;
     const NAME: &'static str = "GetCodePackageListDeployedOnNode";
 
-    fn validate_parameters(&self) -> Result<()> {
+    fn validate_parameters(&self) -> fubst::Result<()> {
         validate_node_name(
             &self.node_name,
             "deployed code package node name must be 1..=4096 UTF-16 units without NUL",

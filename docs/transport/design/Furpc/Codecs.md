@@ -141,6 +141,13 @@ not an assumption that every Serde data model has a native encoding. Users
 can implement another codec for their own types and protocol, or use raw
 messages without a typed codec at all.
 
+`fubst` maps a root `()` to an absent body: encoding writes zero bytes and
+decoding requires empty input. Transparent newtypes preserve that root mapping;
+unit fields, unit structs and unit-valued container elements remain unsupported.
+An empty struct still encodes as a framed native object. Consequently
+`FubstCodec<(), ReplyBody>` handles native empty-request operations such as Ping
+without a method-specific codec, including when encoded-body byte limits are zero.
+
 The extension point does not replace the fixed native frame, CRC, header,
 control, correlation, or security formats. Native headers and transport-control
 bodies still use their native `fubst` schemas regardless of the application

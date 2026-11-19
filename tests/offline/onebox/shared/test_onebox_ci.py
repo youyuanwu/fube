@@ -408,8 +408,24 @@ class ProofFiles(fixtures.ProjectFiles):
         nodes["native_observation_end_unix_ms"] = int(start * 1000) + 10
         gateway = {"address": "172.30.91.11:19000", "node_name": "N0010",
                    "node_id": "123", "node_instance": 456}
+        furpc_nodes = [{"name": f"N00{index + 1}0", "node_id": f"{0x123 + index:x}",
+                        "node_instance": 456 + index} for index in range(5)]
+        nodes["independent_nodes"] = [
+            {"Name": node["name"], "Id": {"Id": node["node_id"]},
+             "InstanceId": str(node["node_instance"])} for node in furpc_nodes]
         clear = {**common, "executed_cases": cases, "node_list": nodes, "gateway": gateway,
-                 "furpc_ping": {"operation_count": 3, "gateway": copy.deepcopy(gateway)}}
+                 "furpc_ping": {"operation_count": 3, "gateway": copy.deepcopy(gateway)},
+                 "furpc_management": {
+                     "existing_name": True, "absent_name": False,
+                     "native_nodes": furpc_nodes, "legacy_nodes": copy.deepcopy(furpc_nodes),
+                     "stable_fields_match_http_and_legacy": True, "exact_name_and_status_filters": True,
+                     "page_lengths": [2, 2, 1], "server_token_count": 2,
+                     "native_error_code": -2147024809, "native_error_origin": "domain",
+                     "same_generation_after_error": True, "mixed_concurrent_operations": 3,
+                     "mixed_results_match": True, "generation": 1,
+                     "native_observation_start_unix_ms": int(start * 1000) + 1,
+                     "native_observation_end_unix_ms": int(start * 1000) + 10,
+                 }}
         # Clear really has no archive field; the successful command binds it.
         del clear["archive_sha256"]
         health = {
@@ -1443,6 +1459,37 @@ class WorkerTests(ProofFiles):
             self.emit(path, broken)
             self.assertEqual(self.checking("client-runtime", directory), 1)
         self.emit(path, original)
+
+    def test_furpc_methods_require_independent_nodes_paging_and_native_error_reuse(self):
+        directory = self.worker("client-runtime")
+        path = directory / "client" / ci.NATIVE_FILES[0]
+        original = ci.read(path)
+        for change in (
+            lambda value: value.update(existing_name=1),
+            lambda value: value.update(absent_name=0),
+            lambda value: value.update(mixed_concurrent_operations=True),
+            lambda value: value.update(page_lengths=[True, 2, 2]),
+            lambda value: value.update(server_token_count=True),
+            lambda value: value.update(native_error_code=0),
+            lambda value: value.update(native_error_code=True),
+            lambda value: value.update(same_generation_after_error=False),
+            lambda value: value.update(native_observation_start_unix_ms=True),
+            lambda value: value["native_nodes"][0].update(node_instance=True),
+            lambda value: value["native_nodes"][0].update(node_id="ffff"),
+            lambda value: (
+                value["native_nodes"][0].update(node_id="ffff"),
+                value["legacy_nodes"][0].update(node_id="ffff")),
+        ):
+            broken = copy.deepcopy(original)
+            change(broken["furpc_management"])
+            self.emit(path, broken)
+            self.assertEqual(self.checking("client-runtime", directory), 1)
+        broken = copy.deepcopy(original)
+        broken.pop("furpc_management")
+        self.emit(path, broken)
+        self.assertEqual(self.checking("client-runtime", directory), 1)
+        self.emit(path, original)
+        self.assertEqual(self.checking("client-runtime", directory), 0)
 
 class BoundedParserTests(fixtures.ProjectFiles):
     def test_selected_content_digest_is_canonical_local_strict_and_bounded(self):

@@ -135,10 +135,13 @@ pub(crate) struct GatewayFailureBody {
 
 pub(crate) fn decode_name_exists(message: &Message) -> Result<bool> {
     check_reply(message, &["NameOperationReply"])?;
-    #[derive(Deserialize)]
-    struct Reply(bool, i64);
-    let Reply(exists, _user_service_state) = from_slice(&message.body)?;
-    Ok(exists)
+    Ok(from_slice::<NameExistsReplyBody>(&message.body)?.exists)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct NameExistsReplyBody {
+    pub exists: bool,
+    _user_service_state: i64,
 }
 
 pub(crate) fn decode_name_write(message: &Message) -> Result<()> {

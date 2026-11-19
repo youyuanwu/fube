@@ -2,7 +2,7 @@
 
 use crate::{
     query_protocol::{result_tags, ListReply, Query},
-    Error, HealthState, NamingUri, PagedQuery, QueryPage, Result, ServiceKind,
+    HealthState, NamingUri, PagedQuery, QueryPage, ServiceKind,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -109,18 +109,18 @@ impl Query for PartitionQueryParameters {
     const NAME: &'static str = "GetServicePartitionList";
     const SUPPORTS_MAX_RESULTS: bool = false;
 
-    fn validate_record(partition: Partition) -> Result<Partition> {
+    fn validate_record(partition: Partition) -> std::result::Result<Partition, &'static str> {
         if partition.kind == ServiceKind::Invalid {
-            return Err(Error::Protocol("unsupported partition service kind"));
+            return Err("unsupported partition service kind");
         }
         if matches!(partition.health_state, HealthState::Unrecognized(_)) {
-            return Err(Error::Protocol("unsupported partition health state"));
+            return Err("unsupported partition health state");
         }
         let information = &partition.partition_information;
         if information.kind == PartitionKind::Int64Range
             && information.low_key > information.high_key
         {
-            return Err(Error::Protocol("partition key range is inverted"));
+            return Err("partition key range is inverted");
         }
         Ok(partition)
     }
@@ -129,7 +129,10 @@ impl Query for PartitionQueryParameters {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::query_protocol::{encode_query, tests::assert_request};
+    use crate::{
+        query_protocol::{encode_query, tests::assert_request},
+        Error, Result,
+    };
     use fubst::{serde::from_slice, Encoder};
     use std::num::NonZeroU64;
 
@@ -181,7 +184,7 @@ pub(crate) mod tests {
     fn decode_fields(fields: impl FnOnce(&mut Encoder) -> fubst::Result<()>) -> Result<Partition> {
         let mut e = Encoder::new();
         e.object(fields)?;
-        PartitionQueryParameters::validate_record(from_slice(&e.finish())?)
+        PartitionQueryParameters::validate_record(from_slice(&e.finish())?).map_err(Error::Protocol)
     }
 
     #[test]

@@ -7,10 +7,10 @@ use std::{
 };
 
 use fube_client::{
-    ClientError, ClientOptions, DomainFailure, FabricClient, FurpcClient, GatewayDescription,
-    HealthState, Node, NodeDeactivationIntent, NodeDeactivationStatus, NodeListPage,
-    NodeQueryDescription, NodeQueryParameters, NodeStatus, NodeStatusFilter, Paging,
-    DEFAULT_TIMEOUT,
+    ClientError, ClientOptions, DomainFailure, FabricClient, FurpcClient, FurpcClientError,
+    GatewayDescription, HealthState, NamingUri, Node, NodeDeactivationIntent,
+    NodeDeactivationStatus, NodeListPage, NodeQueryDescription, NodeQueryParameters, NodeStatus,
+    NodeStatusFilter, Paging, DEFAULT_TIMEOUT,
 };
 use serde::Deserialize;
 use tokio::{
@@ -522,6 +522,232 @@ fn assert_independent_gateway(gateway: &GatewayDescription, config: &Config, nod
     assert_eq!(gateway.node_instance, config.expected_node_instance);
 }
 
+fn furpc_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + DEFAULT_TIMEOUT
+}
+
+fn furpc_body<T>(response: furpc::Response<T>, generation: u64) -> T {
+    assert_eq!(
+        response
+            .source()
+            .expect("native furpc response source")
+            .generation(),
+        generation,
+        "operation must reuse the original native generation, not reconnect"
+    );
+    response.into_body()
+}
+
+fn node_identities(page: &NodeListPage) -> serde_json::Value {
+    let mut nodes: Vec<_> = page.items.iter().collect();
+    nodes.sort_by_key(|node| node.id);
+    nodes
+        .into_iter()
+        .map(|node| serde_json::json!({
+            "name": node.name, "node_id": node.id.to_string(), "node_instance": node.instance_id,
+        }))
+        .collect()
+}
+
+async fn assert_furpc_management(
+    client: &mut FurpcClient,
+    legacy: &FabricClient,
+    gateway: &GatewayDescription,
+    config: &Config,
+    generation: u64,
+) -> serde_json::Value {
+    assert_fresh(config);
+    let native_observation_start_unix_ms = support::unix_millis();
+    let existing: NamingUri = config.existing_name.parse().unwrap();
+    let absent: NamingUri = config.absent_name.parse().unwrap();
+    let existing_result = furpc_body(
+        client
+            .name_exists(furpc::Request::new(existing.clone()), furpc_deadline())
+            .await
+            .expect("furpc existing name"),
+        generation,
+    );
+    let absent_result = furpc_body(
+        client
+            .name_exists(furpc::Request::new(absent), furpc_deadline())
+            .await
+            .expect("furpc absent name"),
+        generation,
+    );
+    assert!(existing_result && !absent_result);
+    assert_eq!(
+        existing_result,
+        legacy
+            .name_exists(&config.existing_name, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        absent_result,
+        legacy.name_exists(&config.absent_name, None).await.unwrap()
+    );
+    let baseline = furpc_body(
+        client
+            .get_node_list(
+                furpc::Request::new(NodeQueryDescription::default()),
+                furpc_deadline(),
+            )
+            .await
+            .expect("furpc native GetNodeList"),
+        generation,
+    );
+    assert_membership(&baseline, config);
+    let legacy_page = legacy
+        .get_node_list(&NodeQueryDescription::default(), None)
+        .await
+        .unwrap();
+    assert_membership(&legacy_page, config);
+    let mut native = baseline.items.clone();
+    let mut old = legacy_page.items.clone();
+    for node in native.iter_mut().chain(old.iter_mut()) {
+        node.up_time_seconds = 0;
+        node.down_time_seconds = 0;
+    }
+    native.sort_by_key(|node| node.id);
+    old.sort_by_key(|node| node.id);
+    assert_eq!(
+        native, old,
+        "all stable native fields must match the independent legacy decoder"
+    );
+    for (name, status, expected_count) in [
+        (
+            Some(config.expected_node_name.clone()),
+            NodeStatusFilter::UP,
+            1,
+        ),
+        (Some("furpc-no-such-node".into()), NodeStatusFilter::ALL, 0),
+        (None, NodeStatusFilter::DOWN, 0),
+    ] {
+        let query = NodeQueryDescription::new(NodeQueryParameters {
+            node_name: name,
+            status_filter: status,
+        });
+        let page = furpc_body(
+            client
+                .get_node_list(furpc::Request::new(query), furpc_deadline())
+                .await
+                .expect("furpc native node selector"),
+            generation,
+        );
+        assert_eq!(page.items.len(), expected_count);
+        assert!(page.continuation_token.is_none());
+        for node in &page.items {
+            assert_independent_node(
+                node,
+                config
+                    .expected_nodes
+                    .iter()
+                    .find(|observed| observed.name == node.name)
+                    .unwrap(),
+            );
+        }
+    }
+    let mut token = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut all = Vec::new();
+    let mut page_lengths = Vec::new();
+    for _ in 0..16 {
+        let query = NodeQueryDescription {
+            paging: Paging {
+                continuation_token: token.take(),
+                max_results: std::num::NonZeroU64::new(2),
+            },
+            ..Default::default()
+        };
+        let page = furpc_body(
+            client
+                .get_node_list(furpc::Request::new(query), furpc_deadline())
+                .await
+                .expect("furpc server-issued node continuation"),
+            generation,
+        );
+        assert!(!page.items.is_empty() && page.items.len() <= 2);
+        page_lengths.push(page.items.len());
+        all.extend(page.items);
+        token = page.continuation_token;
+        if let Some(token) = &token {
+            assert!(seen.insert(token.clone()), "continuation must advance");
+        } else {
+            break;
+        }
+    }
+    assert!(
+        token.is_none() && !seen.is_empty(),
+        "follow a real native continuation to completion"
+    );
+    assert!(all.windows(2).all(|pair| pair[0].id < pair[1].id));
+    assert_membership(
+        &NodeListPage {
+            items: all,
+            continuation_token: None,
+        },
+        config,
+    );
+    let invalid = NodeQueryDescription {
+        paging: Paging {
+            continuation_token: Some("this-is-not-a-node-id".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let error = client
+        .get_node_list(furpc::Request::new(invalid), furpc_deadline())
+        .await
+        .expect_err("furpc malformed continuation must remain a native error");
+    let (native_error_code, native_error_origin) = match error {
+        FurpcClientError::Domain(failure) => (failure.code, "domain"),
+        FurpcClientError::Native(furpc::Error::RemoteFault(fault)) => {
+            (fault.code(), "native_fault")
+        }
+        other => panic!("unexpected furpc native error category: {other:?}"),
+    };
+    assert!([-2147024809, -2147017462].contains(&native_error_code));
+    let reused = furpc_body(
+        client
+            .get_node_list(
+                furpc::Request::new(NodeQueryDescription::default()),
+                furpc_deadline(),
+            )
+            .await
+            .expect("furpc same-generation reuse after native error"),
+        generation,
+    );
+    assert_membership(&reused, config);
+    let mut ping = client.clone();
+    let mut naming = client.clone();
+    let mut nodes = client.clone();
+    let deadline = furpc_deadline();
+    let (ping, naming, nodes) = tokio::try_join!(
+        ping.ping(furpc::Request::new(()), deadline),
+        naming.name_exists(furpc::Request::new(existing), deadline),
+        nodes.get_node_list(
+            furpc::Request::new(NodeQueryDescription::default()),
+            deadline
+        ),
+    )
+    .expect("mixed concurrent furpc calls over clones");
+    assert_eq!(&furpc_body(ping, generation), gateway);
+    assert!(furpc_body(naming, generation));
+    assert_membership(&furpc_body(nodes, generation), config);
+    serde_json::json!({
+        "existing_name": existing_result, "absent_name": absent_result,
+        "native_observation_start_unix_ms": native_observation_start_unix_ms,
+        "native_observation_end_unix_ms": support::unix_millis(),
+        "native_nodes": node_identities(&baseline), "legacy_nodes": node_identities(&legacy_page),
+        "stable_fields_match_http_and_legacy": true,
+        "exact_name_and_status_filters": true,
+        "page_lengths": page_lengths, "server_token_count": seen.len(),
+        "native_error_code": native_error_code, "native_error_origin": native_error_origin,
+        "same_generation_after_error": true, "mixed_concurrent_operations": 3,
+        "mixed_results_match": true, "generation": generation,
+    })
+}
+
 async fn assert_idle_proxy_disconnect(
     endpoint: SocketAddr,
     baseline: &GatewayDescription,
@@ -654,6 +880,9 @@ async fn onebox_ping_name_exists_and_node_list() {
         furpc_third.ping(furpc::Request::new(()), deadline),
     )
     .expect("three furpc native pings on the shared channel");
+    let furpc_generation = furpc_gateway.source().unwrap().generation();
+    assert_eq!(second.source().unwrap().generation(), furpc_generation);
+    assert_eq!(third.source().unwrap().generation(), furpc_generation);
     let furpc_gateway = furpc_gateway.into_body();
     let second = second.into_body();
     let third = third.into_body();
@@ -661,7 +890,6 @@ async fn onebox_ping_name_exists_and_node_list() {
         assert_independent_gateway(actual, &config, node_id);
         assert_eq!(actual, &gateway, "furpc and legacy native identities match");
     }
-    drop((furpc_client, furpc_clone, furpc_third));
     assert!(client
         .name_exists(&config.existing_name, None)
         .await
@@ -671,6 +899,15 @@ async fn onebox_ping_name_exists_and_node_list() {
         .await
         .expect("absent native name"));
     let node_evidence = assert_node_queries(&client, &config).await;
+    let furpc_management = assert_furpc_management(
+        &mut furpc_client,
+        &client,
+        &gateway,
+        &config,
+        furpc_generation,
+    )
+    .await;
+    drop((furpc_client, furpc_clone, furpc_third));
     let mut pending_operations = Vec::with_capacity(CONCURRENT_OPERATIONS);
     for index in 0..CONCURRENT_OPERATIONS {
         let handle = client.clone();
@@ -789,6 +1026,7 @@ async fn onebox_ping_name_exists_and_node_list() {
                 "node_instance": furpc_gateway.node_instance
             }
         },
+        "furpc_management": furpc_management,
         "executed_cases": [
             {"case": "native_ping", "passed": true},
             {"case": "native_name_exists_existing", "result": true, "passed": true},
