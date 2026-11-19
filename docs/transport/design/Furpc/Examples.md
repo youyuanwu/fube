@@ -8,7 +8,7 @@ compilable programs or native-interoperability evidence. Use the
 
 ## End-to-end API sketches
 
-The examples use the proposed root exports and Tokio time types. Application
+The examples use the crate's root exports and Tokio time types. Application
 actor codes/actions and schemas below describe an owned echo protocol, not a
 native gateway operation. `RequestPolicy` is supplied by trusted application
 composition and must authorize the intended request/response envelopes.
@@ -183,7 +183,7 @@ an empty response or fallback success.
 The service future stays pending, so the runner retains reply authority,
 HandlerLimits, and the original deadline until the worker responds or the
 invocation is cancelled. Request context and shared byte storage move through
-the application queue unchanged; no ReplyGrant is transferred to the worker.
+the application queue unchanged; no completion ticket is transferred to the worker.
 Late/cancelled responses cannot revive a ticket. Queued storage stays alive
 through ordinary references, not allocation-budget charges.
 
@@ -221,8 +221,9 @@ remain in the application, not this transport hook.
 
 Native RPC completions and the installed ingress service continue running
 while bootstrap waits. A server can omit ordinary `service` when it needs
-only native RPC completion or separately configured special-duplex ingress;
-ordinary semantic replies such as ReplicaUp still need the matching service.
+only native RPC/notification acknowledgment correlation. Notification ingress
+and ordinary semantic replies such as ReplicaUp need their respective service
+bindings; neither has a separate receive registration.
 The hook's Peer remains nonowning,
 restricted, and generation-bound; no accepted Channel or reconnect is added.
 Hook failure/timeout retires that connection, and success sends no automatic
@@ -316,6 +317,70 @@ used here only for `service_fn`; the public boundaries use `tower-service`.
 Applications needing queued processing can compose the bounded work-queue
 service above. The router and runner still own invocation/reply completion;
 there is no separate ordinary native receive loop.
+
+### Native notification services
+
+Notification bindings use the same byte service and typed unary adapter, not
+a separate receive loop or public acknowledgment grant. Notification, Ack,
+acknowledge, and the header policies below are application-supplied; the handler
+returns Reply<Ack> only after its domain acknowledgment condition is satisfied.
+The acknowledgment can carry application-defined data and headers, subject to
+the acknowledgment policy. The runner supplies native correlation and flags.
+
+```rust,ignore
+let notification_service = tower::service_fn(|request: Request<Body>| async move {
+    server::Rpc::new(FubstCodec::<Ack, Notification>::default())
+        .unary(tower::service_fn(acknowledge), request).await
+});
+let policy = NotificationPolicy::new(check_notification, check_acknowledgment);
+let ingress = Router::new()
+    .notification(
+        actor, "Changed",
+        NotificationRouteOptions::new(policy.clone(), IngressLimits::default()),
+        notification_service,
+    )?
+    .into_service()?;
+```
+
+Install ingress through Endpoint::service or ServerBuilder::service, exactly
+like ordinary request/one-way services. A byte caller originates the native
+notification on an already acquired, authorized Peer:
+
+```rust,ignore
+let acknowledgment = peer.notify(byte_request, policy.clone(), deadline).await?;
+```
+
+Alternatively, a typed caller reuses RpcClient over an explicit byte-service
+adapter. The adapter selects the native operation; the generic client still
+owns encoding/decoding and the original call deadline:
+
+```rust,ignore
+let target = peer.clone();
+let transport = tower::service_fn(move |request: Request<Body>| {
+    let peer = target.clone();
+    let policy = policy.clone();
+    async move {
+        let deadline = request.deadline()
+            .ok_or(Error::InvalidInput("notification call requires a deadline"))?;
+        peer.notify(request, policy, deadline).await
+    }
+});
+let mut client = RpcClient::new(transport);
+let acknowledgment = client.call(
+    typed_request, FubstCodec::<Notification, Ack>::default(), deadline,
+).await?;
+```
+
+Retain the originating Channel or server execution: this adapter captures only
+a nonowning Peer. It adds no socket, reader, retry or native correlation table.
+Typed calls retain normal RpcClient future semantics without an Attempt; byte
+notify callers retain the native Operation/Attempt contract. The adapter
+preserves the native response and never silently chooses another generation.
+The runner, not the handler's Reply data, owns acknowledgment correlation,
+flags and original-generation submission. NoReply, failure and cancellation
+send no automatic acknowledgment. Ordinary and notification routes may use
+equal Actor/Action keys, but their native traffic classes and policies stay
+separate; there is no fallback between them.
 
 ### Default fubst and an external non-Serde codec
 
@@ -419,7 +484,8 @@ SocketAddr-to-URI convenience, not a second destination model.
 
 The same RpcClient and all its Channel clones remain usable after a physical
 disconnect. Readiness for a later independent call can share one reconnect
-attempt with other callers, raw receives, and `channel.peer(deadline).await`.
+attempt with other callers and channel.peer(deadline).await.
+Installed notification services or application queue receives do not redial.
 The original call deadline still includes that readiness wait. A failed
 connection attempt returns its cause for that wait instead of retrying
 indefinitely; a later fresh demand can try again.
@@ -428,7 +494,8 @@ A call already bound to the failed generation returns an error, even if its
 output had not committed; the example's `?` propagates that failure. It is not
 automatically submitted again. Applications that continue using the logical
 client handle/report the failure at their domain boundary, and decide whether
-any retry is safe. Old Peer/ReplyGrant/SendPermit/DuplexClient values do not
+any retry is safe. Old Peer/SendPermit values, notification attempts and private
+completion tickets do not
 follow the replacement. For new native work, explicitly acquire a fresh Peer
 with its own deadline and perform required domain/session recovery first.
 

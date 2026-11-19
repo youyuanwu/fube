@@ -48,7 +48,7 @@ representation, with no universal body trait or Serde bound:
 
 | Boundary | Request body |
 | --- | --- |
-| Outbound RPC or duplex notification | `Request<C::Encode>`, before body encoding. |
+| Typed outbound RPC or native notification | `Request<C::Encode>`, before body encoding. |
 | Client transport service / Channel | `Request<Body>`, after application encoding and before native request/correlation processing. |
 | Channel/server ingress service and router entry | `Request<Body>`, containing the admitted native message's shared, segmented bytes. |
 | Typed request or one-way handler | `Request<C::Decode>`, after its selected body codec. |
@@ -113,7 +113,7 @@ Only core ingress can create `RequestContext`. On either Channel or Server's ing
 authorized optional Peer, and the effective absolute handler deadline.
 Raw response construction uses `Message::builder`, not received context.
 Outbound `context()` is None; absence is explicit, never a fabricated source
-or received deadline. The context contains no `ReplyGrant`, admission permit,
+or received deadline. The context contains no public reply/acknowledgment ticket, admission permit,
 or lifecycle owner. No public context setter, mutable context view, or source-to-peer
 lookup is provided.
 
@@ -148,9 +148,9 @@ Retaining parts or a context-derived Peer cannot extend the invocation
 deadline, revive its private completion ticket, or hold graceful drain open.
 
 There is no public `ServerRequest` wrapper or alias and no separate
-`RequestContext` handler parameter. Message remains immutable raw data;
-ReceivedMessage is the direct native special-duplex delivery boundary.
-Ordinary ingress uses `Request<B>` and runner-owned reply authority, including
+`RequestContext` handler parameter. Message remains immutable raw data.
+All application ingress, including native notifications, uses `Request<B>` and
+runner-owned reply/acknowledgment authority, including
 through application work queues. `Response<T>`, `Reply<T>`, and `IngressResponse::NoReply` keep
 their distinct existing roles. A generic extensions bag, extractor framework,
 and streaming-body trait are not required for this initial envelope.
@@ -335,7 +335,7 @@ extra depth/work cap. The fixed native serializer's settings remain independent.
 
 Generic client codec work is application-future-owned and cannot implicitly
 acquire an arbitrary T's private transport state. Channel applies native frame,
-send-queue and pending-operation policy at submission. Server and duplex
+send-queue and pending-operation policy at submission. Server and Peer notification
 adapters retain their own execution/deadline rules. No aggregate heap quota or
 allocation-budget handoff is implied; see the
 [resource boundary](Resources.md#serialization-and-body-budgets).
@@ -404,22 +404,39 @@ sharing an RPC connection must use its allocator when an ID is required.
 
 The shared messaging core does not perform general ingress deduplication.
 Repeated semantic work and notification pages belong to their domain protocol.
-A consuming reply grant authorizes one local attempt for one accepted delivery,
+A private runner ticket authorizes one local response attempt for one accepted delivery,
 not exactly-once remote processing.
 
-## Duplex and reply authority
+## Notification and reply authority
 
 Special uncorrelated-reply notifications need an independently authorized
 origination API and their own correlated acknowledgment lifetime. They are
-not enabled by removing raw-send flag guards.
+not enabled by removing raw-send flag guards. The
+[Peer notification operation](Actors.md#native-notifications) parallels the existing
+byte request operation, with explicit NotificationPolicy. It shares managed IDs,
+pending-only correlation, source and settlement metadata, commitment/cancellation
+semantics, and generation failure. Peer stays byte-facing.
+Typed notification callers reuse RpcClient<T> over an explicit byte service
+delegating to Peer::notify, forwarding the original absolute deadline and native
+response unchanged. They use ClientCodecLimits and ordinary-future semantics,
+not a second codec API or native Attempt. Generic RpcClient never implicitly
+changes a Channel request into a notification; the supplied byte service
+explicitly selects that native operation and policy.
 
-A consuming reply grant captures the original peer generation, request ID, and
-response policy. It cannot be forged from public headers or redirected through
-a replacement connection. Dropping it sends nothing. Submission consumes
-its single attempt even when the returned future is never polled.
+Notification handlers use the same Request<Body>/IngressResponse service
+boundary as ordinary handlers. `server::Rpc::unary` accepts either original
+replying kind; `one_way` accepts neither. IngressOptions/route options explicitly
+select notification authorization before body retention. Their private ticket
+captures the original notification MessageId, generation, acknowledgment policy,
+native flags and deadline before editable request publication.
 
-This consuming Rust contract is intentionally stronger than the reusable native
-receiver-context API; it must not be described as ABI equivalence.
+Only the runner may consume that ticket to submit acknowledgment data.
+It cannot be forged from public headers, transferred into application queues,
+or redirected through a replacement connection. NoReply, errors, dropped
+work and cancellation generate no implicit acknowledgment. Admitted
+acknowledgments drain like ordinary replies; retained request parts do not
+keep a cancelled ticket live. This private single-completion contract is a Rust
+adaptation, not ABI equivalence to reusable native receiver contexts.
 
 [http-request]: https://docs.rs/http/latest/http/request/struct.Request.html
 [http-response]: https://docs.rs/http/latest/http/response/struct.Response.html

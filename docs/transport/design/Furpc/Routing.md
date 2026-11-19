@@ -10,26 +10,29 @@ It owns no socket, independent execution scope, or hidden inbox.
 
 ## Minimal service router
 
-Router, RequestRouteOptions, OneWayRouteOptions and whole-Actor service bindings
-are implemented. This section describes the current minimal contract; the
-remaining deferred work is listed below.
+Router, RequestRouteOptions, OneWayRouteOptions, NotificationRouteOptions and
+whole-Actor service bindings are implemented. Notification routes use a separate
+native traffic class with the same service runner.
 
 `Router` implements the [server service boundary](Services.md#service-boundary-and-native-bindings).
 Configuration is fallible and immutable after installation. Cloning shares
 route/service configuration, not duplicated live work.
 `into_service` returns `IngressService<Self>` for `Endpoint::service`,
 `Channel::register_service`, or `ServerBuilder::service`. It selects Actor-dispatched
-application ingress and cannot be combined with a raw binding in that scope. The shared
-transport does not require this router or ordinary Actor dispatch.
+application ingress and cannot be combined with a raw binding in the same
+traffic class. Custom IngressService composition may select different
+dispatchers for ordinary and notification classes; Router-generated bindings
+are Actor-based. The shared transport does not require this router or ordinary
+Actor dispatch.
 
 Follow [axum's service routing][axum-router] and [tonic's service
 router][tonic-router]: the router selects an already-constructed service.
 It neither constructs typed handlers nor selects a body format. A raw service
-can be registered without a body serializer. The native request/one-way kinds
-retain distinct option types for ingress and reply authorization; those are
+can be registered without a body serializer. Native request, one-way and
+notification kinds retain distinct option types for ingress and reply authorization; those are
 not codec choices or HTTP methods.
 
-Public signatures with complete service bounds:
+Signatures with complete service bounds:
 
 ```rust,ignore
 impl RequestRouteOptions {
@@ -39,6 +42,11 @@ impl RequestRouteOptions {
 
 impl OneWayRouteOptions {
     pub fn new(check: EnvelopeCheck, limits: IngressLimits) -> Self;
+    pub fn with_send_policy(self, policy: SendPolicy) -> Self;
+}
+
+impl NotificationRouteOptions {
+    pub fn new(policy: NotificationPolicy, limits: IngressLimits) -> Self;
     pub fn with_send_policy(self, policy: SendPolicy) -> Self;
 }
 
@@ -58,6 +66,16 @@ impl Router {
     pub fn one_way<S>(
         self, actor: ActorId, action: impl Into<String>,
         options: OneWayRouteOptions, service: S,
+    ) -> Result<Self>
+    where
+        S: tower_service::Service<Request<Body>, Response = IngressResponse>
+            + Clone + Send + Sync + 'static,
+        S::Future: Send + 'static,
+        S::Error: Into<BoxError>;
+
+    pub fn notification<S>(
+        self, actor: ActorId, action: impl Into<String>,
+        options: NotificationRouteOptions, service: S,
     ) -> Result<Self>
     where
         S: tower_service::Service<Request<Body>, Response = IngressResponse>
@@ -89,8 +107,9 @@ service may use `server::Rpc`, custom byte processing, or compatible middleware;
 that choice is opaque to routing.
 
 Request routes accept only `RequestRouteOptions`; one-way routes accept only
-`OneWayRouteOptions`. The wrong option type is a Rust type error, not a runtime
-configuration branch. Both reuse existing ingress limits and send policies.
+`OneWayRouteOptions`; native notification routes accept only
+`NotificationRouteOptions`. Interchanging these is a Rust type error, not a
+runtime configuration branch. All reuse existing ingress limits and send policies.
 `HandlerLimits` remains owner-scope-wide for one logical Channel or server,
 not a per-route, per-clone, or per-generation execution pool.
 Actor registration and `ServiceBinding::actor` use the shared `IngressOptions`
@@ -122,19 +141,28 @@ one invocation. Cancellation drops unused readiness state.
 The router checks live received provenance and validates the current edited
 header view against the original scope before dispatch. A request route
 invokes its service only after independent normal-request authorization has
-produced the runner's reply ticket. The required request ID, reply expectation,
-and grant must come from the original admitted invocation, not the current
-editable header view. Missing original authorization rejects before user
-work. One-way routes do not acquire a grant merely from flags, and neither
-route kind reclassifies special duplex traffic. The router returns response
+produced the runner's reply ticket. A notification route instead requires
+original native-notification authorization and its acknowledgment ticket.
+The required native ID, exchange kind and ticket come from the original
+admitted invocation, not the current editable header view.
+Missing original authorization rejects before user
+work. One-way routes do not acquire a ticket merely from flags, and no
+route kind can reclassify traffic by editing headers. The router returns response
 data; only the runner completes the original reply. A service returning the
 wrong response kind is an explicit handler contract failure, not a fabricated
 ACK.
 
 ### Matching and unknown routes
 
-Match exact `(ActorId, Action)` using the current validated effective native
-common properties. Header edits do not change the original admitted binding,
+Select ordinary or notification traffic class from the private native
+classification first, then match exact `(ActorId, Action)` using the validated
+effective native common properties. Ordinary request and one-way routes still
+share one namespace; they cannot claim the same key. A notification may use
+the same Actor/Action as an ordinary route because it has a distinct native
+traffic class, authorization and immutable route identity. This is not a
+user-editable routing field.
+
+Header edits do not change the original admitted binding,
 route identity, or exchange kind. For router-generated exact-action bindings,
 an edit selecting a different key, whether registered or not, is a handler
 contract error before any target service is invoked. Never borrow another
@@ -147,7 +175,10 @@ occurrence; the first matching duplicate is not an alternative route. Compare
 Action as exact native UTF-16 content, without case folding, normalization,
 or lossy conversion. Missing Action cannot match a nonempty configured action.
 
-Reject duplicate route keys and native control actors at configuration time.
+Reject duplicate route keys within a traffic class and native control actors
+at configuration time. Whole-Actor and exact-action claims cannot overlap
+within that class. Raw/Actor conflicts are likewise class-local; no miss falls
+through to the other class.
 Keep exact route matching above native parsing. There are no extra fixed
 route-count, Actor-count or action-storage construction ceilings, and no
 wildcard, prefix, or implicit fallback routes in the initial router.
@@ -179,7 +210,7 @@ Routing cannot widen native connection/frame/send-queue limits.
 Cover actor/action selection, native duplicate-property semantics, duplicate
 and conflicting registrations, raw service dispatch, private reply binding,
 and absence of fabricated ACKs or generic error replies. Request/one-way
-option interchange must fail to typecheck. Exercise native width boundaries,
+and notification option interchange must fail to typecheck. Exercise native width boundaries,
 invalid durations and checked arithmetic. Runtime
 cases use the [handler execution limits](Services.md#handler-limits), not
 another router-owned admission pool.
@@ -196,14 +227,17 @@ widen send/reply policy, or extend admitted work through shutdown.
 Exercise chosen-service readiness/call instance affinity, shared waiter
 exhaustion, timeout/commit races, service errors, graceful drain, dropped
 execution, bounded application queue composition without duplicate delivery,
-and separation from native special-duplex ingress.
+and separation of native notification routes from ordinary one-way/request
+routes, including equal Actor/Action keys in different classes. Notification
+handler replies must use the original runner-owned acknowledgment ticket;
+NoReply, cancellation and errors must never fabricate an acknowledgment.
 Composition cases with the separate RPC adapters cover typed bodies and their
 budgets; routing must also work without those adapters. Native exchanges remain
 required for claimed runtime/protocol support.
 
 Keep the router above the shared native messaging core. Replication uses
 explicit raw ingress and its own ReplicationActor demultiplexing, while
-client reverse ingress may use raw, Actor-dispatched, or special-duplex APIs; a
+client reverse ingress may use raw or Actor-dispatched ordinary/notification services; a
 future client service integration reuses these components rather than forks
 the protocol. State extractors, macros, wildcard/fallback routing, automatic
 domain error mapping, and actor lifecycle machinery are deferred.

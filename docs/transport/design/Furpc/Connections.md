@@ -37,8 +37,8 @@ similarly named connection-metadata type.
 Use one canonical inbound trait, `Accept`. `StreamAcceptor` adapts a stream to
 that trait, following [tonic's accepted-I/O stream support][tonic-streams] and
 [axum's listener abstraction][axum-listener], rather than defining a second
-connection-input trait. ReceivedMessage names the separate validated
-special-duplex message/source/reply envelope; ordinary ingress uses `Request<Body>`.
+connection-input trait. All application ingress, including native notifications,
+uses Request<Body> with private received context and runner-owned completion.
 Furpc connection-source types use `Acceptor` terminology; do not reuse an
 ecosystem-specific name for a different abstraction.
 
@@ -410,10 +410,11 @@ for unrelated peers.
 
 An optional configured service/router makes this a complete handler-serving
 path: execution owns its readiness, admitted handler futures, and response
-completion. No separate ordinary application receive loop is exposed.
+completion. No separate application receive loop is exposed.
 Without an ordinary service, unbound ordinary application messages are
-diagnosed/dropped; native controls, correlation, an optional peer-ready hook,
-and independently configured special-duplex ingress remain available.
+diagnosed/dropped; native controls, correlation and an optional peer-ready hook
+remain available. Notification-only ingress still installs an IngressService
+with explicit notification bindings; it is not a separate receive facility.
 
 Dropping a polled execution future stops acceptance and initiates irreversible
 whole-scope cancellation, not graceful completion. Its acceptor is disposed;
@@ -447,8 +448,8 @@ the actual driver; the runner retains reply authority. A handler can send semant
 ACKs through that handle without an owner-level connection lookup, address
 parsing, or dialing. By default no raw send handle is granted;
 [ingress policy](Actors.md#ingress-policies-and-send-capabilities) defines
-the independent send restriction. Ordinary correlated replies remain
-runner-owned; direct ReplyGrant delivery is limited to special duplex.
+the independent send restriction. Ordinary replies and native notification
+acknowledgments remain runner-owned; context exposes no completion ticket.
 The optional [peer-ready hook](#accepted-peer-readiness-hook) can instead receive
 an independently authorized Peer without waiting for application ingress.
 
@@ -471,8 +472,8 @@ returns InvalidInput; without a hook there is no callback or extra send grant.
 
 After native hello and all configured security/authorization release gates
 complete, the server admits one hook execution for that accepted generation.
-Any configured ordinary service/bindings and special-duplex queue are already
-installed. No application message needs to arrive first. The runner
+All configured ordinary/notification service bindings are already installed.
+No application message needs to arrive first. The runner
 clones the service before readiness,
 polls readiness, and calls that same instance at most once with a restricted,
 nonowning Peer. It never clones a readiness reservation. Failed establishment
@@ -481,9 +482,10 @@ does not invoke the hook; dialed Channel connects/reconnects do not invoke it.
 The explicit SendPolicy is captured on the supplied Peer and checked for every
 outbound operation, just as on a received Peer. It can allow bootstrap requests,
 one-way announcements, or notifications without widening any ingress binding's
-policy. Hook installation grants no inbound acceptance, ReplyGrant, source
+policy. Hook installation grants no inbound acceptance, acknowledgment ticket, source
 authentication, managed-field bypass, or lifetime ownership. Raw-only mode
-still rejects `Peer::request`; policy cannot enable an unavailable capability.
+still rejects Peer::request and Peer::notify origination; policy
+cannot enable an unavailable capability.
 Escaped/cloned Peers remain restricted to this generation and never reconnect.
 
 Hook readiness and application code run in server-owned work outside the
@@ -577,16 +579,16 @@ impl tower_service::Service<Request<Body>> for Channel {
 
 All dialed policy/configuration lives on Endpoint, including
 [preconfigured reverse service ingress](Services.md#service-boundary-and-native-bindings)
-and optional [native special-duplex ingress](Actors.md#duplex-origination-and-ingress).
+with explicit [native notification bindings](Actors.md#native-notifications).
 Initial connect creates a private logical scope with its first driver, retained
-connector, bounded ingress-service execution, and any special-duplex queue.
+connector and bounded ingress-service execution for all configured traffic classes.
 Ingress services are installed before application traffic and need no
 `take` step; dynamic `register_service` cannot recover earlier dropped traffic.
 Channel clones and submitted outbound service futures
 share that owner; there is no separate public owner to retain or move. Later
 demand can establish replacement generations inside this same scope. A second
 explicit Endpoint connect still creates a separate Channel and ingress
-registrations, with native receive queues only for configured special duplex.
+registries, without a transport-owned application receive queue.
 Each connect also has an independent ingress runner and HandlerLimits, even
 when application service clones intentionally share domain state.
 Multiple Channels can share accounting without sharing lifetime, connector
@@ -597,14 +599,13 @@ Channel is the only built-in client Tower transport. `peer(deadline)` explicitly
 opts into native messaging: it awaits a currently established generation under
 the caller's absolute deadline and returns a nonowning, generation-bound capability
 for raw sends, reservations, native byte requests/attempt receipts, and
-special duplex origination. Peer has no constructor, dial, readiness, or
+native notification origination. Peer has no constructor, dial, readiness, or
 Service API; it is not an alternate generic RPC transport or public socket
 wrapper. Accepted ingress exposes an optional restricted Peer through its
 received context; `on_peer_ready` can supply one under its own configured
 policy before application ingress. Neither path exposes an owning Channel.
-Neither a Peer, source, receiver,
-reply grant, native operation, nor DuplexClient can keep that driver/scope
-alive. Retain the originating Channel or keep server execution running while
+Neither a Peer, source, received request, completion data, nor native operation
+can keep that driver/scope alive. Retain the originating Channel or keep server execution running while
 using those capabilities.
 
 `Channel::peer` shares demand-driven establishment with RPC readiness and works
@@ -675,8 +676,9 @@ across physical disconnects. Its private coordinator moves through
 `Connected(generation) -> Disconnected -> Connecting -> Connected(new generation)`.
 This is not a public lifecycle controller or transparent domain recovery.
 
-Later RPC readiness, `Channel::peer(deadline)`, or a pending Channel-backed
-`DuplexReceiver::recv` can demand reconnection. All clones and these demand paths share at most one
+Later RPC readiness or Channel::peer(deadline) can demand reconnection.
+Notification service registration and waiting on application queues do not
+create reconnect demand. All clones and these demand paths share at most one
 in-progress attempt. Idle disconnected Channels do not redial continuously.
 An attempt performs fresh connector readiness/acquisition, native hello, and
 any future configured security negotiation; it publishes no generation until
@@ -700,8 +702,8 @@ It is not a successful RPC or a false capacity grant. Repeated polls of the
 same ready instance retain the same outcome, never start another attempt;
 cloning does not copy it. Permanent service invalidity, such as raw-only RPC
 mode or a closed logical scope, may return `poll_ready` Err directly.
-Peer acquisition and Channel-backed `DuplexReceiver::recv` return reconnect
-errors directly.
+Peer acquisition returns reconnect errors directly. Peer-bound notification
+operations never dial or retarget another generation.
 
 Waiter exhaustion or zero-waiter fail-fast retains no request and reports
 ResourceExhausted. Demand may still start the one bounded shared establishment
@@ -721,13 +723,14 @@ Already-settled results do not change. Readiness demand waiting before a native
 attempt is created is not replay of a request; it must still meet its original
 deadline when finally admitted.
 
-Peer, Source, SendPermit, ReplyGrant, DuplexClient, and every native Attempt
+Peer, Source, SendPermit, private completion tickets, and every native Attempt
 remain pinned to their original physical generation. Native submission through
 retired capabilities fails Closed with an available cause; passive Source
 metadata and Attempt dispositions remain inspectable. Acquiring a fresh Peer
 does not revive or redirect old capabilities. Accepted connections never dial
 replacements through a received Peer.
-Reconnection reuses the logical registry and bounded queues as specified by
+Reconnection reuses the logical service registry, including notification
+bindings but no failed-generation invocations, as specified by
 [ingress across generations](Actors.md#ingress-across-connection-generations).
 Old/current/retiring generations, results, and reconnect state all remain under
 the same [scope accounting](Resources.md#bounded-admission); replacing a socket

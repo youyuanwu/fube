@@ -410,8 +410,14 @@ impl Service<Request<Body>> for Channel {
                     let deadline = request
                         .deadline()
                         .ok_or(Error::InvalidInput("byte RPC requires a deadline"))?;
-                    Operation::request(reservation.peer, request, deadline, Some(reservation.slot))
-                        .await
+                    Operation::request(
+                        reservation.peer,
+                        request,
+                        deadline,
+                        Some(reservation.slot),
+                        None,
+                    )
+                    .await
                 }
                 Some(Prepared::Failed(error, _permit)) => Err(error),
                 None => Err(Error::InvalidInput("Channel call without readiness")),

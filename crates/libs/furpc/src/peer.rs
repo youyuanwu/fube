@@ -11,8 +11,8 @@ use crate::{
     rpc,
     service::Registry,
     transport::IoInfo,
-    Body, EnvelopeCheck, Error, Headers, Message, MessageId, Operation, Request, Response, Result,
-    WriteReceipt,
+    Body, EnvelopeCheck, Error, Headers, Message, MessageId, NotificationPolicy, Operation,
+    Request, Response, Result, WriteReceipt,
 };
 
 #[derive(Debug, Clone)]
@@ -112,8 +112,7 @@ impl Generation {
             message.headers().clone(),
             message.into_body(),
             rpc::next_id(),
-            Some(id),
-            false,
+            rpc::EnvelopeKind::Reply(id),
         )?;
         let authorization = SendAuthorization {
             headers: message.headers().clone(),
@@ -121,6 +120,7 @@ impl Generation {
             policy: None,
             registry: Arc::downgrade(&self.registry),
             kind: SendKind::OneWay,
+            notification: None,
             reply: Some(check),
             _reply_slot: Some(slot),
         };
@@ -169,7 +169,35 @@ impl Peer {
         Operation::send(self.clone(), message, deadline)
     }
     pub fn request(&self, request: Request<Body>, deadline: Instant) -> Operation<Response<Body>> {
-        Operation::request(self.clone(), request, deadline, None)
+        Operation::request(self.clone(), request, deadline, None, None)
+    }
+    /// Send a native notification and await its service-defined acknowledgment.
+    /// Requires managed mode and does not reconnect or replay on generation loss.
+    ///
+    /// Either connection role may originate notifications. The receiving service
+    /// returns [`crate::IngressResponse::Reply`] with application-defined data;
+    /// the transport supplies the acknowledgment's native correlation and flags.
+    ///
+    /// ```no_run
+    /// use furpc::{Body, NotificationPolicy, Peer, Request};
+    /// use tokio::time::{Duration, Instant};
+    ///
+    /// async fn push(peer: &Peer) -> furpc::Result<Body> {
+    ///     let policy = NotificationPolicy::new(|_, _| Ok(()), |_, _| Ok(()));
+    ///     let response = peer.notify(
+    ///         Request::new(Body::from_bytes(vec![1, 2, 3])?),
+    ///         policy, Instant::now() + Duration::from_secs(5),
+    ///     ).await?;
+    ///     Ok(response.into_body())
+    /// }
+    /// ```
+    pub fn notify(
+        &self,
+        request: Request<Body>,
+        policy: NotificationPolicy,
+        deadline: Instant,
+    ) -> Operation<Response<Body>> {
+        Operation::request(self.clone(), request, deadline, None, Some(policy))
     }
     fn core(&self) -> Result<Arc<Generation>> {
         if let Some(error) = self.connection.error() {
@@ -202,6 +230,7 @@ impl Peer {
         request: Request<Body>,
         deadline: Instant,
         slot: Option<OwnedSemaphorePermit>,
+        notification: Option<NotificationPolicy>,
     ) -> Result<(SendReceipt, rpc::Registration)> {
         let core = self.core()?;
         if !core.registry.managed {
@@ -213,14 +242,29 @@ impl Peer {
         };
         let id = rpc::next_id();
         let (parts, body) = request.into_parts();
-        let message = rpc::envelope(parts.headers, body, id, None, true)?;
-        let registration = core.rpc.insert(id, slot, deadline)?;
+        let kind = if notification.is_some() {
+            rpc::EnvelopeKind::Notification
+        } else {
+            rpc::EnvelopeKind::Request
+        };
+        let message = rpc::envelope(parts.headers, body, id, kind)?;
+        let registration = core.rpc.insert(
+            id,
+            slot,
+            deadline,
+            notification.map(|policy| policy.acknowledgment),
+        )?;
         let authorization = SendAuthorization {
             headers: message.headers().clone(),
             source: self.source.clone(),
             policy: self.policy,
             registry: Arc::downgrade(&core.registry),
-            kind: SendKind::Request,
+            kind: if notification.is_some() {
+                SendKind::Notification
+            } else {
+                SendKind::Request
+            },
+            notification: notification.map(|policy| policy.notification),
             reply: None,
             _reply_slot: None,
         };
@@ -250,8 +294,7 @@ impl Peer {
                 message.headers().clone(),
                 message.into_body(),
                 rpc::next_id(),
-                None,
-                false,
+                rpc::EnvelopeKind::OneWay,
             )?
         } else {
             message
@@ -262,6 +305,7 @@ impl Peer {
             policy: self.policy,
             registry: Arc::downgrade(&core.registry),
             kind: SendKind::OneWay,
+            notification: None,
             reply: None,
             _reply_slot: None,
         };
@@ -277,6 +321,7 @@ pub(crate) struct SendAuthorization {
     policy: Option<SendPolicy>,
     registry: Weak<Registry>,
     kind: SendKind,
+    notification: Option<EnvelopeCheck>,
     reply: Option<EnvelopeCheck>,
     _reply_slot: Option<OwnedSemaphorePermit>,
 }
@@ -298,6 +343,9 @@ impl SendAuthorization {
         }
         if let Some(policy) = self.policy {
             (policy.check)(self.kind, &self.headers, &self.source)?;
+        }
+        if let Some(check) = self.notification {
+            check(&self.headers, &self.source)?;
         }
         Ok(())
     }

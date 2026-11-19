@@ -34,7 +34,6 @@ pub(crate) enum DropReason {
     UnknownActor,
     RouteMiss,
     UnmatchedReply,
-    SpecialDuplexUnavailable,
     Draining,
     PolicyRejected,
     Capacity,
@@ -45,6 +44,7 @@ pub(crate) enum ConnectionEvent {
     Opened(ListenInstance),
     IngressAdmitted,
     Reply(Message),
+    Notification(Message),
     ReadClosed,
     InstanceUpdated(ListenInstance),
     Message(Message),
@@ -89,6 +89,7 @@ enum ReceiveKind {
     Hello,
     Application,
     Reply,
+    Notification,
     Discard(DropReason),
 }
 
@@ -538,7 +539,10 @@ where
             FrameReadStep::Headers(prefix) => {
                 let headers = Headers::from_received(prefix.area, &self.config.headers)?;
                 let mut kind = self.classify(&headers)?;
-                if matches!(kind, ReceiveKind::Application | ReceiveKind::Reply) {
+                if matches!(
+                    kind,
+                    ReceiveKind::Application | ReceiveKind::Reply | ReceiveKind::Notification
+                ) {
                     if let Err(reason) = admit(&headers, prefix.header.body_len() as usize) {
                         kind = ReceiveKind::Discard(reason);
                     }
@@ -562,7 +566,7 @@ where
                 if notify_admission
                     && matches!(
                         self.provisional.as_ref().unwrap().kind,
-                        ReceiveKind::Application | ReceiveKind::Reply
+                        ReceiveKind::Application | ReceiveKind::Reply | ReceiveKind::Notification
                     )
                 {
                     Ok(ReceiveProgress::Event(ConnectionEvent::IngressAdmitted))
@@ -588,7 +592,7 @@ where
                             Ok(ReceiveProgress::Progress)
                         }
                     }
-                    ReceiveKind::Application => {
+                    ReceiveKind::Application | ReceiveKind::Notification => {
                         let state = self.shared.state.lock().unwrap();
                         if let Some(error) = &state.terminal {
                             return Err(error.clone());
@@ -598,9 +602,14 @@ where
                                 DropReason::Draining,
                             )))
                         } else {
-                            Ok(ReceiveProgress::Event(ConnectionEvent::Message(
-                                Message::from_received(headers, verified.body),
-                            )))
+                            let message = Message::from_received(headers, verified.body);
+                            Ok(ReceiveProgress::Event(
+                                if matches!(provisional.kind, ReceiveKind::Notification) {
+                                    ConnectionEvent::Notification(message)
+                                } else {
+                                    ConnectionEvent::Message(message)
+                                },
+                            ))
                         }
                     }
                     ReceiveKind::Reply => Ok(ReceiveProgress::Event(ConnectionEvent::Reply(
@@ -648,9 +657,16 @@ where
                 "security/send-target control",
             )));
         }
-        let reason = if common.uncorrelated_reply {
-            Some(DropReason::SpecialDuplexUnavailable)
-        } else if common.relates_to != MessageId::default() && !self.rpc {
+        if common.uncorrelated_reply {
+            return Ok(if state.phase == Phase::Draining {
+                ReceiveKind::Discard(DropReason::Draining)
+            } else if matches!(self.config.ingress, Ingress::None) {
+                ReceiveKind::Discard(DropReason::NoDestination)
+            } else {
+                ReceiveKind::Notification
+            });
+        }
+        let reason = if common.relates_to != MessageId::default() && !self.rpc {
             Some(DropReason::UnmatchedReply)
         } else if common.relates_to != MessageId::default() {
             return Ok(ReceiveKind::Reply);

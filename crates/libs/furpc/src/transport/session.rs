@@ -146,9 +146,14 @@ impl<I: TransportIo> Session<I> {
                     result?;
                 }
                 event = poll_fn(|cx| self.driver.poll_event_with_admission(cx, &mut |headers, body_bytes| {
-                    let id = headers.effective().relates_to;
-                    provisional = Some(if id != crate::MessageId::default() {
+                    let common = headers.effective();
+                    let id = common.relates_to;
+                    provisional = Some(if !common.uncorrelated_reply && id != crate::MessageId::default() {
                         let pending = self.core.rpc.lookup(id).ok_or(DropReason::UnmatchedReply)?;
+                        if let Err(error) = pending.check(headers, &self.core.source) {
+                            registry.diagnose("acknowledgment authorization", &error);
+                            return Err(DropReason::PolicyRejected);
+                        }
                         Admission::Reply { id, pending }
                     } else { Admission::Ingress(registry.admit(&self.core, headers, body_bytes)?) });
                     Ok(())
@@ -168,7 +173,7 @@ impl<I: TransportIo> Session<I> {
                             };
                             self.core.rpc.complete(id, &pending, message, self.core.source.clone());
                         }
-                        Some(ConnectionEvent::Message(message)) => {
+                        Some(ConnectionEvent::Message(message) | ConnectionEvent::Notification(message)) => {
                             let Some(Admission::Ingress(dispatch)) = provisional.take() else {
                                 return Err(Error::Internal("verified ingress lost its admission"));
                             };
@@ -184,7 +189,6 @@ impl<I: TransportIo> Session<I> {
                                 DropReason::RouteMiss => Error::InvalidInput("unknown ingress Action"),
                                 DropReason::PolicyRejected => Error::Protocol("ingress policy rejected"),
                                 DropReason::UnmatchedReply => Error::Protocol("unmatched reply"),
-                                DropReason::SpecialDuplexUnavailable => Error::Unsupported("special duplex"),
                             };
                             registry.diagnose("discard", &error);
                         }

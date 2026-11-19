@@ -97,7 +97,9 @@ impl Attempt {
 ```
 
 `Operation<T>` implements `Future<Output = Result<T>>` for native sends,
-`Peer::request` byte RPCs, replies, and specialized duplex notifications.
+`Peer::request` byte RPCs and byte-facing Peer::notify
+notification exchanges. Service replies/acknowledgments
+remain runner-owned completion work, not public grant operations.
 Construction moves the input and captures inert handles/configuration; first
 poll starts work. A byte-service call may additionally transfer a count
 reservation already acquired by that same instance's `poll_ready`; it creates
@@ -109,8 +111,10 @@ These operations do not borrow a receiver or lifecycle facade for their lifetime
 Attempt, so the generic client does not expose `attempt()` or claim confirmed
 retraction. Dropping its future drops the transport future; native commitment
 still determines whether output can be retracted. Callers requiring explicit
-native disposition use `Peer::request` and decode its byte response
-separately. Middleware must not manufacture retraction success from dropping
+native disposition use Peer::request or Peer::notify and decode the byte
+response separately. Typed notifications over an explicit notify byte-service
+adapter have these same RpcClient future semantics, not an exposed native Attempt.
+Middleware must not manufacture retraction success from dropping
 a future or sending a cancellation command.
 
 `CancelOutcome` distinguishes confirmed retraction from commitment and already

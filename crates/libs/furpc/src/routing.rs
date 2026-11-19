@@ -9,7 +9,7 @@ use crate::{
     service::{InvocationState, RouteKey, ServiceFactory},
     transport::BoxFuture,
     ActorId, Body, BoxError, EnvelopeCheck, Error, IngressLimits, IngressOptions, IngressResponse,
-    IngressService, Request, RequestPolicy, Result, SendPolicy, ServiceBinding,
+    IngressService, NotificationPolicy, Request, RequestPolicy, Result, SendPolicy, ServiceBinding,
 };
 
 /// Independent request/reply authorization for one exact Actor/Action route.
@@ -31,6 +31,19 @@ pub struct OneWayRouteOptions(IngressOptions);
 impl OneWayRouteOptions {
     pub fn new(check: EnvelopeCheck, limits: IngressLimits) -> Self {
         Self(IngressOptions::one_way(check, limits))
+    }
+    pub fn with_send_policy(mut self, policy: SendPolicy) -> Self {
+        self.0 = self.0.with_send_policy(policy);
+        self
+    }
+}
+
+/// Native notification authorization, separate from ordinary route kinds.
+#[derive(Clone)]
+pub struct NotificationRouteOptions(IngressOptions);
+impl NotificationRouteOptions {
+    pub fn new(policy: NotificationPolicy, limits: IngressLimits) -> Self {
+        Self(IngressOptions::notifications(policy, limits))
     }
     pub fn with_send_policy(mut self, policy: SendPolicy) -> Self {
         self.0 = self.0.with_send_policy(policy);
@@ -142,6 +155,39 @@ impl Router {
         self.insert(actor, action.into(), options.0, service)
     }
 
+    /// Register a native notification and its service-defined acknowledgment.
+    /// Ordinary routes may use the same Actor/Action in their own traffic class.
+    ///
+    /// ```compile_fail
+    /// use furpc::*;
+    /// use tower_service::Service;
+    /// fn wrong<S>(service: S)
+    /// where
+    ///     S: Service<Request<Body>, Response = IngressResponse> + Clone + Send + Sync + 'static,
+    ///     S::Future: Send + 'static,
+    ///     S::Error: Into<BoxError>,
+    /// {
+    ///     let options = RequestRouteOptions::new(
+    ///         RequestPolicy::new(|_, _| Ok(()), |_, _| Ok(())), IngressLimits::default(),
+    ///     );
+    ///     let _ = Router::new().notification(ActorId::new(7).unwrap(), "x", options, service);
+    /// }
+    /// ```
+    pub fn notification<S>(
+        self,
+        actor: ActorId,
+        action: impl Into<String>,
+        options: NotificationRouteOptions,
+        service: S,
+    ) -> Result<Self>
+    where
+        S: Service<Request<Body>, Response = IngressResponse> + Clone + Send + Sync + 'static,
+        S::Future: Send + 'static,
+        S::Error: Into<BoxError>,
+    {
+        self.insert(actor, action.into(), options.0, service)
+    }
+
     fn insert<S>(
         mut self,
         actor: ActorId,
@@ -160,12 +206,17 @@ impl Router {
             .map_err(|_| Error::ResourceLimit("route action allocation"))?;
         units.extend(action.encode_utf16());
         let key = Arc::new(RouteKey {
+            class: options.class(),
             actor,
             action: units,
         });
         let position = self.routes.binary_search_by(|route| {
-            (route.key.actor.get(), route.key.action.as_slice())
-                .cmp(&(actor.get(), key.action.as_slice()))
+            (
+                route.key.class,
+                route.key.actor.get(),
+                route.key.action.as_slice(),
+            )
+                .cmp(&(key.class, actor.get(), key.action.as_slice()))
         });
         let index = position
             .err()
@@ -219,8 +270,16 @@ impl Service<Request<Body>> for Router {
             let common = request.headers().effective();
             let index = routes
                 .binary_search_by(|route| {
-                    (route.key.actor.get(), route.key.action.as_slice())
-                        .cmp(&(common.actor.get(), common.action()))
+                    (
+                        route.key.class,
+                        route.key.actor.get(),
+                        route.key.action.as_slice(),
+                    )
+                        .cmp(&(
+                            state.class(),
+                            common.actor.get(),
+                            common.action(),
+                        ))
                 })
                 .map_err(|_| Error::InvalidInput("request has no admitted router target"))?;
             let route = &routes[index];

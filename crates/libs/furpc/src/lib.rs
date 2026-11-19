@@ -1,6 +1,7 @@
 //! Service Fabric native RPC transport.
 //!
-//! Shared native messages, one-way sends, and managed byte RPC over clear transport.
+//! Shared native messages, one-way sends, managed byte RPC, and native
+//! notifications with service-defined acknowledgments over clear transport.
 //!
 //! [`Endpoint`] establishes an owning [`Channel`]; its [`Peer`] sends on one
 //! generation. [`Server::serve_with_shutdown`] runs accepted I/O with the same
@@ -97,11 +98,11 @@ pub use peer::{Peer, PeerInfo, SendCheck, SendKind, SendPolicy, Source};
 pub use reply::Reply;
 pub use request::{Request, RequestContext, RequestParts};
 pub use response::{Response, ResponseParts};
-pub use routing::{OneWayRouteOptions, RequestRouteOptions, Router};
+pub use routing::{NotificationRouteOptions, OneWayRouteOptions, RequestRouteOptions, Router};
 pub use rpc::RemoteFault;
 pub use service::{
     EnvelopeCheck, HandlerLimits, IngressLimits, IngressOptions, IngressResponse, IngressService,
-    RequestPolicy, ServiceBinding,
+    NotificationPolicy, RequestPolicy, ServiceBinding,
 };
 pub use transport::{
     Accept, Accepted, Channel, Connected, ConnectionOptions, Endpoint, IoInfo, Server,

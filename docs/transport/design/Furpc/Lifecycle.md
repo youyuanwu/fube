@@ -13,11 +13,12 @@ current/reconnecting/retiring physical work plus ingress-service execution
 through shared handles; server
 execution owns accepted work, optional peer-ready futures, and configured
 service invocations. Peer
-capabilities, sources, receivers, native operations, messages, and reply grants
+capabilities, sources, native operations, messages, and received requests
 do not keep either scope open. RpcClient inherits ownership from its transport;
 the built-in Channel owns dialed work, while arbitrary services have their own
-ownership contracts. Application queue workers and direct special-duplex consumers have
-their own owners. Buffer lifetime and transport queue accounting are distinct.
+ownership contracts. Application queue workers have their own owners.
+Notification ingress shares the service runner, not a separately owned native
+receiver. Buffer lifetime and transport queue accounting are distinct.
 
 Each physical generation retains the irreversible states:
 
@@ -50,16 +51,17 @@ or an idle connection could keep itself alive forever.
 
 Physical failure retires that generation and fails its unsettled native work;
 it does not dispose the Channel's connector, registry, or bounded ingress.
-The selected raw or Actor dispatcher and ordinary bindings remain fixed for
-that logical scope; reconnect cannot switch dispatchers or redirect old deliveries.
+The class-local raw or Actor dispatchers and ordinary/notification bindings
+remain fixed for that logical scope; reconnect cannot switch dispatchers or
+redirect old deliveries.
 IngressService configuration survives, but its old-generation invocations and
-private reply tickets are invalidated/cancelled, not replayed. Special-duplex
-queues may retain old deliveries through shared storage ownership; application
-queues retain requests only under the original context/deadline and cancellation.
-Later readiness, peer acquisition, or a pending Channel-backed
-`DuplexReceiver::recv` can share a new attempt. Started reconnect work may
-continue after one waiter drops while
-owners remain, under its finite establishment timeout; no detached per-waiter
+private reply/acknowledgment tickets are invalidated/cancelled, not replayed.
+Application queues retain requests only under the original context/deadline
+and cancellation; retained bytes cannot preserve a live completion ticket.
+Later readiness or peer acquisition can share a new attempt. Notification
+ingress and application queue waits are not reconnect demands. Started reconnect
+work may continue after one waiter drops while owners remain, under its finite
+establishment timeout; no detached per-waiter
 connector task is created. Last-owner release cancels current establishment,
 closes logical admission/registrations, prevents new publication/redial, and
 retires all current/retiring work without a universal join guarantee.
@@ -68,16 +70,16 @@ They retain no public owner guard; installing a reverse service cannot itself
 keep the Channel alive or demand an idle reconnect. Application configuration
 must avoid a cycle by capturing its own owning Channel.
 
-Raw users retain that same Channel while awaiting `channel.peer(deadline)`, using native
-operations, or a DuplexReceiver. Peer and DuplexClient never retain a dialed or
-accepted owner. Retaining them cannot prevent last-owner cancellation or
+Native users retain that same Channel while awaiting channel.peer(deadline)
+or using send/request/notification operations. Peer never retains a dialed or
+accepted owner. Retaining it cannot prevent last-owner cancellation or
 server shutdown. Endpoint clones contain only configuration
 references and cannot keep an earlier Channel alive. Multiple Channels have
 independent lifetimes.
 Endpoint clones may retain inert service prototypes, never live handler
 futures or another connect's ingress runner.
-Receiving a physical error does not make old Peer/ReplyGrant/SendPermit values
-follow a new generation; they remain retired capabilities.
+Receiving a physical error does not make old Peer/SendPermit values or private
+completion tickets follow a new generation; they remain retired capabilities.
 
 Await a send's write receipt, an RPC response, or a protocol-specific semantic
 ACK before releasing the last Channel owner when that completion matters.
@@ -90,15 +92,17 @@ The single [serving API](Connections.md#endpoint-server-and-built-in-adapters)
 follows [tonic's shutdown model][tonic-serve]. Completion of the supplied signal
 drops the acceptor immediately, stops new application dispatch/submission, and
 begins graceful drain under one configured finite `drain_timeout`.
-Already-admitted service futures and their original replies may complete;
-native controls and pending RPC completions continue as needed.
+Already-admitted service futures and their original replies or notification
+acknowledgments may complete; native controls and pending RPC/notification
+correlation continue as needed.
 No new peer-ready hook is admitted after shutdown begins. Previously admitted
 hooks remain tracked within the earlier of their original peer-ready deadline
 and the drain deadline; they are cancelled on connection failure or forced
 scope cancellation. They do not gain permission for new application sends
 during drain.
 
-Reply completion uses the runner's existing private tickets. A context-derived
+Reply and notification-acknowledgment completion use the runner's existing
+private tickets and protected completion counts. A context-derived
 Peer has no special drain exemption: new one-way sends, requests, and
 notifications through it are rejected once general submission closes.
 The same applies to a Peer obtained from `on_peer_ready`.
@@ -109,9 +113,10 @@ separately owned scope.
 Awaiting serving waits for admitted service/peer-ready work and active connection
 completion, not just accept-loop exit. Application queue workers are separately
 owned, but keep them available while admitted service responses drain and
-stop/dispose them explicitly. Separately deferred one-way and direct duplex
-processing needing new semantic sends must quiesce before signaling if those
-sends must complete. Application-spawned tasks are not automatically adopted
+stop/dispose them explicitly. Separately deferred one-way processing needing
+new semantic sends must quiesce before signaling if those sends must complete.
+Notification acknowledgments use the original admitted tickets instead of
+new general sends. Application-spawned tasks are not automatically adopted
 or awaited.
 
 Clean finite accept-source exhaustion stops acceptance but lets yielded

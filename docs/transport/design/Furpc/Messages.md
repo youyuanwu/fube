@@ -20,10 +20,10 @@ modify or submit them:
 | Category | Public access and ownership |
 | --- | --- |
 | Actor, Action, Activity, Timeout, and domain extension headers | Inspect raw received values, edit service-facing request metadata, and append outgoing records through generic header APIs. |
-| MessageId, RelatesTo, ExpectsReply, and special duplex flags | Inspectable on messages; managed RPC, reply, and duplex APIs own their outgoing values. See the [raw-only ID contract](Requests.md#correlation-and-native-ids). |
+| MessageId, RelatesTo, ExpectsReply, and special notification flags | Inspectable on messages; managed RPC, notification, and runner reply/acknowledgment paths own their outgoing values. See the [raw-only ID contract](Requests.md#correlation-and-native-ids). |
 | Fixed frame lengths, CRCs, provider masks, and connection/security control envelopes | Internal encoding and processing; not user-mutable application headers. |
 
-Raw Message and direct special-duplex ReceivedMessage expose immutable header views.
+Raw Message exposes immutable header views.
 The service-facing `Request<B>` instead exposes an editable header collection,
 with trusted ingress context kept separate. Provide ordered raw-record iteration,
 typed native lookups, and outgoing message/header builders. Users can add domain
@@ -230,12 +230,13 @@ Normal send is lazy and capacity exhaustion is explicit. Its success receipt
 means a complete local write only. No destination argument is required because
 the handle already selects the connection. For semantic ACKs, the service
 binding must explicitly grant a bound Peer through RequestContext::peer;
-special-duplex delivery can independently grant ReceivedMessage::peer.
+notification bindings use that same independently configured SendPolicy.
 That handle preserves its captured outbound policy on every send, RPC, and
 notification operation, including through clones and typed adapters. It cannot
 forge an ordinary RPC reply by supplying RelatesTo.
-Ordinary correlated responses are IngressResponse data completed through the
-runner's private grant. Direct special-duplex acknowledgment uses ReplyGrant.
+Ordinary correlated responses and native notification acknowledgments are
+IngressResponse data completed through the runner's original private ticket.
+The service-facing Message cannot mint or retarget that authority.
 
 In managed mode, caller-supplied transport correlation fields reject before
 transmission, including preserved records that conflict with managed

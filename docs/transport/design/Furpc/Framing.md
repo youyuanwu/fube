@@ -233,9 +233,10 @@ Complete transfers a `VerifiedBody` containing the frame identity and the
 complete shared Body. It is not an application `Message` yet. The driver
 matches it with that frame's retained decoded headers and provisional
 admission record, applies remaining native/security checks, then publishes
-the complete Message to control, correlation, a Channel/server ingress service,
-or separately configured native special-duplex ingress. Ordinary services do not require a
-receiver queue, forwarding task, or second native reader.
+the complete Message to control, correlation, or a Channel/server ingress
+service under its original ordinary/notification binding and private completion
+ticket. Notification classification remains separate; its delivery uses the
+same runner rather than a receiver queue, forwarding task, or second reader.
 Discarded confirms frame consumption/integrity and carries only bounded
 diagnostic bookkeeping. Neither event processes the next frame implicitly.
 

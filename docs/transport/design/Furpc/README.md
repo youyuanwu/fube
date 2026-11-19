@@ -1,9 +1,10 @@
 # furpc design
 
-**Status:** proposed design for `crates/libs/furpc`. The crate is not
-implemented or added to the workspace by these documents. Signatures and
-examples are sketches, not compilation or interoperability evidence.
-Existing transport behavior and support claims remain unchanged.
+**Status:** design contract for `crates/libs/furpc`, now in the workspace.
+See [current implementation](Implementation.md#current-implementation) for
+delivered functionality and remaining qualification. Signatures and examples
+are not independent native interoperability evidence. Existing legacy transport
+support claims remain unchanged; TLS/claims implementation is deferred.
 
 ## Summary
 
@@ -23,13 +24,13 @@ substitute HTTP/2 or gRPC or reproduce the entire ecosystem's abstractions.
 | Connections | URI-based Endpoint configures a stable logical Channel. Reusable `Service<http::Uri>` connectors establish/re-establish generations using the original URI on shared demand. Built-in TCP requires `tcp://host:port`; no HTTP wire semantics or implicit port/TLS defaults. Channel is the sole built-in client transport; Peer stays generation-bound. No replay/pooling/balancing. |
 | Requests | http-shaped, body-first `Request<B>` is shared by outbound calls, server middleware, and decoded handlers. Requests and parts allow bounded ordered-header edits; trusted context and original admission remain protected. Message/request/reply envelopes use generic header insertion; Actor/Action helpers are not special envelope fields. Body adaptation preserves current headers and context. |
 | Responses | http-shaped `Response<T>` body access and parts reassembly preserve editable headers, read-only native provenance/settlement, and accounting. No HTTP status/version semantics. |
-| Codecs | Native header/control serialization is fixed internally using `fubst`. `RpcClient<T>` wraps a byte-facing Tower transport (default Channel), uses ordinary mutable async calls, and consumes codecs per call under explicit client codec limits. Native duplex retains scope-admitted operations. Server method services construct `server::Rpc<C>`; routers are codec-free. |
-| Ingress | IngressService is canonical on Endpoint/Channel and Server: `Service<Request<Body>, Response = IngressResponse>` with shared bindings and scope-owned HandlerLimits. Explicit raw delivery or optional Actor dispatch is independent of managed/raw-only correlation mode. Actor is optional; replication uses ReplicationActor without a synthetic Actor header or Actor-0 binding. |
-| Capabilities | IngressOptions configures raw/Actor authorization, not implicit send/reply authority. Restricted context/peer-ready Peers remain independent; ordinary replies stay runner-owned. No ordinary native pull API or hidden inbox: bounded application work queues compose inside services. Direct receiver/grant delivery is limited to specialized native duplex. |
+| Codecs | Native header/control serialization is fixed internally using `fubst`. `RpcClient<T>` wraps a byte-facing Tower transport (default Channel), uses ordinary mutable async calls, and consumes codecs per call under explicit client codec limits. Peer request/notify operations remain byte-facing; typed notifications reuse RpcClient over an explicit notify byte-service adapter. Server method services construct `server::Rpc<C>`; routers are codec-free. |
+| Ingress | IngressService is canonical on Endpoint/Channel and Server: `Service<Request<Body>, Response = IngressResponse>` with shared bindings and scope-owned HandlerLimits. Ordinary and notification classes retain distinct authorization and class-local raw/Actor dispatch. Actor is optional; replication uses ReplicationActor without a synthetic Actor header or Actor-0 binding. |
+| Capabilities | IngressOptions configures one-way/request/notification authorization, not implicit general send authority. Restricted context/peer-ready Peers remain independent; replies and notification acknowledgments stay runner-owned. No native application pull API or hidden inbox: bounded application work queues compose inside services. |
 | Serving | The same raw service or optional Actor/Action Router installs on dialed and accepted owners. Separate RPC adapters provide typed handlers; the runner retains reply authority. Optional `on_peer_ready` work initiates accepted-side bootstrap after establishment. No full actor framework is introduced. |
 | Resources | Native frame/send-queue limits and explicit execution/backpressure policy are separate from wire validity. Shared storage uses reference counting, not allocation leases or aggregate heap quotas. No extra standalone construction ceilings. |
 | Framing | Internal incremental parsing and segmented output; applications receive complete messages, not streaming fragments or public frame objects. |
-| Lifecycle | Tonic-shaped signal-and-await server shutdown returns `Result<()>`; Channels close on last-owner release. Peer handles, native operations, and receivers are nonowning. No independent closure observers or public client drain/abort methods. Errors/cancellation do not guarantee joined background cleanup. |
+| Lifecycle | Tonic-shaped signal-and-await server shutdown returns `Result<()>`; Channels close on last-owner release. Peer handles, native operations, and received requests are nonowning. Admitted replies/notification acknowledgments participate in runner drain. No independent closure observers or public client drain/abort methods. Errors/cancellation do not guarantee joined background cleanup. |
 | Security | Initial delivery is Linux/Tokio clear TCP. TLS/claims implementation is deferred, but native negotiation and protection boundaries are designed. No downgrade. |
 | Domain protocols | Discovery, readiness, replication operation queues/ACK scheduling/retry, session recovery, and application errors stay in consumers. Replication follows native's framework-owned flow control above furpc. Physical reconnect restores no domain session and replays no calls. |
 | Migration | Introduce a new crate alongside `fube-transport`; migrate adapters independently and qualify native support explicitly. |
@@ -47,7 +48,7 @@ monolithic API document.
 | [Messages](Messages.md) | Native header fidelity, raw `Message`/`Body`, standalone bounded construction, and raw sends. |
 | [Requests](Requests.md) | `Request<B>`/parts/context, transport-generic `RpcClient<T>`, client codec limits, `Response<T>`/parts, native IDs, and correlation/reply authority. |
 | [Codecs](Codecs.md) | Native serialization, public body-codec traits, and bounded encode/decode behavior. |
-| [Ingress](Actors.md) | Native classification, raw versus Actor service dispatch, ingress policies/send capabilities, generation binding, and specialized duplex receiver/grant delivery. |
+| [Ingress](Actors.md) | Native classification, raw versus Actor service dispatch, ingress policies/send capabilities, generation binding, and Peer notifications with service-managed acknowledgments. |
 | [Services](Services.md) | Canonical IngressService/IngressResponse on Endpoint, Channel, and Server; native bindings, typed method adapters, private reply completion, HandlerLimits, and lifecycle. |
 | [Routing](Routing.md) | Byte-facing Actor/Action service routes, route options, exact matching, and routing limits. |
 | [Resources](Resources.md) | Shared storage ownership, native send-queue accounting, admission, and scheduling. |
