@@ -152,7 +152,7 @@ impl<'a> NativeUtf16<'a> {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct MessageId {
     /// Native GUID field order, not UUID network order.
     #[serde(with = "fubst::serde::guid")]

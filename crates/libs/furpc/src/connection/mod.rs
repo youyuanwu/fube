@@ -201,6 +201,7 @@ struct State {
     handles: usize,
     drain_deadline: Option<Instant>,
     waker: Option<Waker>,
+    drain_holds: usize,
 }
 
 struct Shared {
@@ -269,6 +270,9 @@ impl ConnectionHandle {
         deadline: Instant,
         authorization: Option<crate::peer::SendAuthorization>,
     ) -> ConnectionResult<SendReceipt> {
+        let reply = authorization
+            .as_ref()
+            .is_some_and(crate::peer::SendAuthorization::is_reply);
         if let Some(authorization) = &authorization {
             authorization.check()?;
         }
@@ -285,7 +289,7 @@ impl ConnectionHandle {
         if let Some(error) = &state.terminal {
             return Err(error.clone());
         }
-        if state.phase != Phase::Open {
+        if state.phase != Phase::Open && !(reply && state.phase == Phase::Draining) {
             return Err(Arc::new(ConnectionError::Closed));
         }
         let after = state
@@ -298,7 +302,7 @@ impl ConnectionHandle {
             config.send_queue_bytes
         };
         if (after > limit && (config.max_send_frame_bytes.is_some() || state.queued_bytes != 0))
-            || state.pending_sends == config.max_pending_sends
+            || (!reply && state.pending_sends >= config.max_pending_sends)
         {
             return Err(Error::ResourceLimit("send queue").into());
         }
@@ -331,6 +335,7 @@ impl ConnectionHandle {
         if let Some(error) = &state.terminal {
             return Err(error.clone());
         }
+
         match state.phase {
             Phase::Open => {
                 state.phase = Phase::Draining;
@@ -345,12 +350,28 @@ impl ConnectionHandle {
         Ok(())
     }
 
+    pub(crate) fn hold_drain(&self) -> DrainHold {
+        self.shared.state.lock().unwrap().drain_holds += 1;
+        DrainHold(self.shared.clone())
+    }
+
     pub(crate) fn abort(&self, error: Arc<ConnectionError>) {
         let mut state = self.shared.state.lock().unwrap();
         if state.phase != Phase::Closed {
             state.terminal.get_or_insert(error);
             state.phase = Phase::Aborting;
         }
+        let wake = state.waker.take();
+        drop(state);
+        wake_if_some(wake);
+    }
+}
+
+pub(crate) struct DrainHold(Arc<Shared>);
+impl Drop for DrainHold {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.drain_holds -= 1;
         let wake = state.waker.take();
         drop(state);
         wake_if_some(wake);

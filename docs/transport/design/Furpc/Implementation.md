@@ -38,13 +38,40 @@ Deterministic I/O cases, backpressured in-memory exchange, and a loopback clear-
 exchange exercise this foundation. They are not native interoperability
 qualification.
 
-The initial public facade now supports explicitly selected
-`ConnectionOptions::raw_only()` and one-way messages. Endpoint owns inert URI,
+The public facade supports managed byte RPC by default and explicitly selected
+`ConnectionOptions::raw_only()` for caller-owned one-way IDs. Endpoint owns inert URI,
 limit and service configuration; connect returns an owning Channel. Channel
 clones share one retained URI-input Tower connector and demand-driven reconnect
 attempt, without replay. Peer, Source, native Operation and Attempt values never
 own that logical lifetime or retarget another physical generation.
-Default managed mode fails Unsupported before I/O rather than falling back.
+Raw-only mode rejects RPC/readiness explicitly rather than enabling correlation.
+
+The managed core allocates process-scoped GUID/index IDs, rotating the GUID
+namespace before index reuse. Its generation-bound request tables contain only
+pending entries, installed before queued output can commit. Request expiry is
+driver-owned, not dependent on continued observer polling; cancellation,
+generation retirement and successful completion remove correlation without
+lifetime tombstones or replay. Replies are matched by final effective RelatesTo,
+admitted before body storage independently of HandlerLimits, and settled only
+after complete-frame integrity. Unknown/late replies are diagnosed/discarded
+without a consecutive-reply terminal cutoff.
+
+`Peer::request` returns an inert native Operation and Channel is the sole
+`Service<Request<Body>, Response = Response<Body>>`. Each ready Channel instance
+owns one generation-bound operation/result reservation; clones copy neither a
+ready permit nor a failed-attempt outcome. Transient reconnect/capacity outcomes
+are delivered by the next call without native submission. Byte-service calls
+require local deadline metadata and retain a Channel owner guard, while native
+Peer operations remain nonowners. Response parts/body mapping preserve original
+source and settlement metadata; synthetic responses have neither. On-time native
+settlement remains on time when observed after the deadline or generation exit.
+
+Native nonzero Faults are returned as RemoteFault with header/effective codes,
+raw UTF-16 diagnostic text and the shared received body. As in native RequestTable,
+a valid RejectFaultBody overrides error details only when its message is nonempty;
+malformed bodies retain the header failure and expose their decode error rather
+than creating a successful empty response. Application bodies are never decoded
+by this layer.
 
 TCP/custom connectors, Accept, TCP/stream acceptors and
 `Server::serve_with_shutdown` use the same physical engine. Canonical raw
@@ -56,11 +83,20 @@ waiting. Dynamic Channel service installation survives reconnect. Received
 Request parts preserve their original read-only source/deadline/context through
 header edits and body mapping. Only an independently configured SendPolicy
 supplies a source-bound Peer; policy is rechecked at the commitment gate.
+`IngressOptions::requests(RequestPolicy, ...)` separately authorizes request and
+response envelopes. Private runner-owned tickets capture the original request
+ID, generation, response policy and deadline before editable Request publication.
+Only those tickets can send IngressResponse::Reply; missing responses and replies
+without a ticket are diagnosed handler failures and generate no automatic Fault.
 
 The optional accepted-peer hook runs once after establishment, with its own
 timeout and no handler-slot dependency. Shutdown drops acceptance, rejects
-new sends/dispatch and waits for admitted one-way handlers, hook work and
-output under one drain deadline. Finite accept-source exhaustion is not a
+new sends/dispatch and waits for admitted handlers, hook work, pending RPC and
+output under one drain deadline. Native shutdown is held until original-path
+replies finish; general Peers have no drain exemption. Reply count credit is
+reserved from handler capacity and follows the driver's queued frame after
+commitment, independently of a timed-out handler or dropped observer. Native
+queue-byte accounting still applies. Finite accept-source exhaustion is not a
 shutdown signal. Dropping initial connect or the last Channel owner cancels
 owned work; retaining Endpoint configuration or a Peer does not keep it alive.
 Runtime errors are cloneable and retain original sources, so Error is no longer
@@ -69,17 +105,17 @@ arbitrary handler/connector error text or custom URI paths/queries.
 
 Current TransportLimits defaults use native u32 frame capacity, a disabled
 queue-byte limit, and no retained-allocation accounting. Execution defaults are
-explicit Rust policy: 1,024 pending sends, 128 server connections, 16 simultaneous
+explicit Rust policy: 1,024 pending sends, 1,024 pending RPC/results per logical
+scope, 128 server connections, 16 simultaneous
 handshakes, 128 peer waiters, 64 KiB/32-step cooperative turns, 30-second frame
 and committed-write watchdogs, and a 5-second discard watchdog. Connect, server
 handshake, peer-ready and server drain default to 30 seconds; HandlerLimits
 retain their documented 8 in-flight/4 readiness-waiter/30-second defaults.
 These are not native constants or performance qualification.
 
-Managed correlation/byte RPC, specialized duplex, application body codecs,
-Actor routing and TLS remain unimplemented. Raw one-way admission rejects
-request/reply flags; returning IngressResponse::Reply without a grant is a
-diagnosed handler contract error and emits nothing.
+Specialized duplex, application body codecs, Actor routing and TLS remain
+unimplemented. The raw one-way binding still rejects request/reply flags; it
+does not gain reply authority by sharing the managed connection.
 
 ## Gap ownership and implementation order
 

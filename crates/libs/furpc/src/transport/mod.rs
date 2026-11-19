@@ -19,7 +19,7 @@ pub use server::{Server, ServerBuilder};
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
-/// Managed correlation is reserved but unavailable in this first raw-only slice.
+/// Select managed IDs/correlation or caller-owned raw one-way IDs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConnectionOptions {
     raw_only: bool,
@@ -33,12 +33,8 @@ impl ConnectionOptions {
         Self { raw_only: true }
     }
 
-    fn validate(&self) -> Result<()> {
-        if self.raw_only {
-            Ok(())
-        } else {
-            Err(Error::Unsupported("managed RPC/correlation"))
-        }
+    pub(crate) fn is_managed(&self) -> bool {
+        !self.raw_only
     }
 }
 
@@ -49,6 +45,7 @@ pub struct TransportLimits {
     pub max_send_frame_bytes: Option<usize>,
     pub send_queue_bytes: usize,
     pub max_pending_sends: usize,
+    pub max_pending_requests: usize,
     pub max_connections: usize,
     pub max_handshakes: usize,
     pub max_peer_waiters: usize,
@@ -67,6 +64,7 @@ impl Default for TransportLimits {
             max_send_frame_bytes: Some(u32::MAX as usize),
             send_queue_bytes: 0,
             max_pending_sends: 1024,
+            max_pending_requests: 1024,
             max_connections: 128,
             max_handshakes: 16,
             max_peer_waiters: 128,
@@ -85,7 +83,11 @@ impl TransportLimits {
         self.connection(Duration::from_secs(30))
             .validate()
             .map_err(Error::from)?;
-        for value in [self.max_connections, self.max_handshakes] {
+        for value in [
+            self.max_connections,
+            self.max_handshakes,
+            self.max_pending_requests,
+        ] {
             if value == 0 || value > tokio::sync::Semaphore::MAX_PERMITS {
                 return Err(Error::InvalidInput("invalid connection/handshake count"));
             }
