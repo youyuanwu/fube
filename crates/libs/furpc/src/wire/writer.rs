@@ -1,7 +1,10 @@
 //! Immutable segmented output. Preparation is owned work, not send
 //! authority or commitment; the future neither spawns nor polls any I/O.
 
-#![allow(dead_code, reason = "Private framing awaits the connection driver")]
+#![allow(
+    dead_code,
+    reason = "Private transport awaits public connection integration"
+)]
 
 use std::{future::poll_fn, io::IoSlice, task::Poll};
 
@@ -178,20 +181,30 @@ impl FrameCursor {
     /// Caller-owned scratch bounds the number of segments offered. The driver
     /// also validates write counts against the bytes actually offered to I/O.
     pub(crate) fn io_slices<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
+        self.io_slices_bounded(dst, usize::MAX)
+    }
+
+    pub(crate) fn io_slices_bounded<'a>(
+        &'a self,
+        dst: &mut [IoSlice<'a>],
+        mut max_bytes: usize,
+    ) -> usize {
         let segments = std::iter::once(self.frame.fixed.as_slice())
             .chain(std::iter::once(self.frame.headers.bytes()))
             .chain(self.frame.body.segments());
         let mut skip = self.written;
         let mut count = 0;
         for segment in segments {
-            if count == dst.len() {
+            if count == dst.len() || max_bytes == 0 {
                 break;
             }
             if skip >= segment.len() {
                 skip -= segment.len();
                 continue;
             }
-            dst[count] = IoSlice::new(&segment[skip..]);
+            let len = (segment.len() - skip).min(max_bytes);
+            dst[count] = IoSlice::new(&segment[skip..skip + len]);
+            max_bytes -= len;
             count += 1;
             skip = 0;
         }

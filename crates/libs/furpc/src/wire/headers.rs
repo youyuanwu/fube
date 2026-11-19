@@ -13,7 +13,7 @@
 
 #![allow(
     dead_code,
-    reason = "Private header foundation awaits the connection driver"
+    reason = "Private transport awaits public connection integration"
 )]
 
 use std::fmt;
@@ -111,6 +111,13 @@ impl HeaderDecodeContext {
 
     pub(crate) fn max_records(&self) -> usize {
         self.limits.max_records
+    }
+
+    pub(crate) fn control_limits(&self, max_bytes: usize) -> Limits {
+        Limits {
+            max_bytes,
+            max_depth: self.limits.max_depth,
+        }
     }
 
     pub(crate) fn validate_area(&self, len: usize) -> HeaderResult<()> {

@@ -109,6 +109,10 @@ pub struct Message {
 }
 
 impl Message {
+    pub(crate) fn from_received(headers: Headers, body: Body) -> Self {
+        Self { headers, body }
+    }
+
     pub fn builder() -> MessageBuilder {
         MessageBuilder::default()
     }

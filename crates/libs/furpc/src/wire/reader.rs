@@ -2,7 +2,10 @@
 //! classification, destination admission, deadlines and delivery remain outside
 //! this module. A retained body currently uses one shared allocation.
 
-#![allow(dead_code, reason = "Private framing awaits the connection driver")]
+#![allow(
+    dead_code,
+    reason = "Private transport awaits public connection integration"
+)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
