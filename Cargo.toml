@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/libs/fube-core",
   "crates/libs/fubst",
+  "crates/libs/furpc",
   "crates/libs/fube-transport",
   "crates/libs/fube-client",
   "crates/libs/fube-test-host",
