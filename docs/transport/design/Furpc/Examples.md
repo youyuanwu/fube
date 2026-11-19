@@ -48,7 +48,7 @@ async fn raw_client(destination: String) -> Result<WriteReceipt> {
 ```
 
 The body is opaque bytes; no body codec is required. The header uses the
-fixed native serializer under finite standalone construction ceilings.
+fixed native serializer under native representation limits.
 Message/header construction needs no client or runtime. Submission separately
 applies the Endpoint's configured native-header and resource limits.
 Actor/Action use typed native header constructors plus generic ordered
@@ -105,14 +105,11 @@ let ingress = IngressService::new(
             .with_send_policy(ack_policy),
     )?],
 )?;
-let budget = ResourceBudget::new(AggregateLimits::default())?;
 let endpoint = Endpoint::from_shared(destination)?
     .connection_options(ConnectionOptions::raw_only())
     .handler_limits(HandlerLimits::default())
-    .resource_budget(budget.clone())
     .service(ingress.clone())?;
 let server = Server::builder()
-    .resource_budget(budget)
     .service(ingress)?
     .build()?;
 ```
@@ -185,10 +182,10 @@ an empty response or fallback success.
 
 The service future stays pending, so the runner retains reply authority,
 HandlerLimits, and the original deadline until the worker responds or the
-invocation is cancelled. Request context and native byte leases move through
+invocation is cancelled. Request context and shared byte storage move through
 the application queue unchanged; no ReplyGrant is transferred to the worker.
-Late/cancelled responses cannot revive a ticket, and queued storage stays
-charged until its actual owner releases it.
+Late/cancelled responses cannot revive a ticket. Queued storage stays alive
+through ordinary references, not allocation-budget charges.
 
 Furpc creates neither this queue nor its workers. Keep workers available while
 admitted calls drain and coordinate their shutdown explicitly. For one-way
@@ -397,14 +394,12 @@ application controls server shutdown independently. Real native operations still
 schemas; the UTF-8 codec is not a
 substitute for a native gateway body's Fabric serialization.
 
-Configure transport limits, shared budgets, timeout, and native reverse ingress
+Configure transport limits, timeout, and native reverse ingress
 directly on Endpoint before connecting:
 
 ```rust,ignore
-let budget = ResourceBudget::new(AggregateLimits::default())?;
 let channel = Endpoint::from_shared("tcp://node.example:19000")?
     .limits(TransportLimits::default())
-    .resource_budget(budget)
     .connect_timeout(Duration::from_secs(10))
     .connect().await?;
 let mut rpc = RpcClient::new(channel).codec_limits(ClientCodecLimits::default())?;
@@ -464,10 +459,10 @@ the request's absolute deadline and cancellation contract. The same client
 adapter can wrap a Tower middleware stack over Channel. Physical connections
 are private, and Peer deliberately has no Service implementation; native
 operations are explicit capabilities rather than another generic RPC client.
-Response parts preserve headers, optional provenance, settlement metadata, and
-tracked charges during body adaptation. For fallible conversion, propagate the
-conversion error before reassembly; dropping parts does not detach leases from
-retained byte views. Only application metadata and the body are mutable.
+Response parts preserve headers, optional provenance and settlement metadata
+during body adaptation. Propagate fallible conversion errors before reassembly;
+shared byte views retain their backing storage independently of parts.
+Only application metadata and the body are mutable.
 
 ### Bounded shutdown with outstanding operations
 
@@ -484,8 +479,7 @@ Fatal serving errors and drain expiry return structured errors but do not
 promise every background task has exited. Ordinary request/peer failures remain
 in their own paths and diagnostics. There is no second result conversion.
 A peer supervisor finishes required client operations before dropping that
-owner and signals/awaits its server independently. A shared budget does not
-control either lifetime.
+owner and signals/awaits its server independently.
 
 An outer timeout is deliberately different: it polls the actual serving
 future, but cancels that execution if its own deadline wins.
@@ -572,12 +566,10 @@ impl Accept for MemoryAcceptor {
 fn memory_setup()
     -> Result<(Endpoint, MemoryConnector, Server, MemoryAcceptor)>
 {
-    let budget = ResourceBudget::new(AggregateLimits::default())?;
-    let server = Server::builder().resource_budget(budget.clone()).build()?;
+    let server = Server::builder().build()?;
     let (tx, rx) = mpsc::channel(4);
     let acceptor = MemoryAcceptor { accepted: rx };
-    let endpoint = Endpoint::from_shared("memory://echo")?
-        .resource_budget(budget);
+    let endpoint = Endpoint::from_shared("memory://echo")?;
     let connector = MemoryConnector { accepted: tx };
     Ok((endpoint, connector, server, acceptor))
 }

@@ -27,7 +27,7 @@ substitute HTTP/2 or gRPC or reproduce the entire ecosystem's abstractions.
 | Ingress | IngressService is canonical on Endpoint/Channel and Server: `Service<Request<Body>, Response = IngressResponse>` with shared bindings and scope-owned HandlerLimits. Explicit raw delivery or optional Actor dispatch is independent of managed/raw-only correlation mode. Actor is optional; replication uses ReplicationActor without a synthetic Actor header or Actor-0 binding. |
 | Capabilities | IngressOptions configures raw/Actor authorization, not implicit send/reply authority. Restricted context/peer-ready Peers remain independent; ordinary replies stay runner-owned. No ordinary native pull API or hidden inbox: bounded application work queues compose inside services. Direct receiver/grant delivery is limited to specialized native duplex. |
 | Serving | The same raw service or optional Actor/Action Router installs on dialed and accepted owners. Separate RPC adapters provide typed handlers; the runner retains reply authority. Optional `on_peer_ready` work initiates accepted-side bootstrap after establishment. No full actor framework is introduced. |
-| Resources | Finite native local/shared budgets are separate from wire validity. Client codec work uses per-call limits above transport admission. Native controls/RPC completion retain internal protection. No unbounded transport queues, waiter lists, or hidden read-ahead. |
+| Resources | Native frame/send-queue limits and explicit execution/backpressure policy are separate from wire validity. Shared storage uses reference counting, not allocation leases or aggregate heap quotas. No extra standalone construction ceilings. |
 | Framing | Internal incremental parsing and segmented output; applications receive complete messages, not streaming fragments or public frame objects. |
 | Lifecycle | Tonic-shaped signal-and-await server shutdown returns `Result<()>`; Channels close on last-owner release. Peer handles, native operations, and receivers are nonowning. No independent closure observers or public client drain/abort methods. Errors/cancellation do not guarantee joined background cleanup. |
 | Security | Initial delivery is Linux/Tokio clear TCP. TLS/claims implementation is deferred, but native negotiation and protection boundaries are designed. No downgrade. |
@@ -50,7 +50,7 @@ monolithic API document.
 | [Ingress](Actors.md) | Native classification, raw versus Actor service dispatch, ingress policies/send capabilities, generation binding, and specialized duplex receiver/grant delivery. |
 | [Services](Services.md) | Canonical IngressService/IngressResponse on Endpoint, Channel, and Server; native bindings, typed method adapters, private reply completion, HandlerLimits, and lifecycle. |
 | [Routing](Routing.md) | Byte-facing Actor/Action service routes, route options, exact matching, and routing limits. |
-| [Resources](Resources.md) | Storage leases, local/shared quotas, bounded reservations, admission, and scheduling. |
+| [Resources](Resources.md) | Shared storage ownership, native send-queue accounting, admission, and scheduling. |
 | [Operations](Operations.md) | Commitment, cancellation, deadlines, receipts, and error categories. |
 | [Lifecycle](Lifecycle.md) | Channel lifetime, graceful server completion, drop/cancellation, and cooperative cleanup. |
 | [Framing](Framing.md) | Private header codec, receive gates, integrity, discard, EOF, frame preparation, and write cursors. |

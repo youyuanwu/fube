@@ -27,6 +27,10 @@ pub(crate) enum FrameError {
     BodyChecksumMismatch { expected: u32, actual: u32 },
     UnsupportedProvider { mask: u8 },
     ProviderMismatch { expected: u8, actual: u8 },
+    SizeLimit { frame_len: u32, limit: usize },
+    InvalidState(&'static str),
+    Truncated { stage: &'static str, missing: usize },
+    Storage(crate::Error),
 }
 
 impl fmt::Display for FrameError {
@@ -58,11 +62,32 @@ impl fmt::Display for FrameError {
                 f,
                 "native security provider mismatch: expected {expected:#04x}, received {actual:#04x}"
             ),
+            Self::SizeLimit { frame_len, limit } => {
+                write!(f, "native frame length {frame_len} exceeds local limit {limit}")
+            }
+            Self::InvalidState(message) => write!(f, "native framing invariant: {message}"),
+            Self::Truncated { stage, missing } => {
+                write!(f, "truncated native {stage}: missing {missing} bytes")
+            }
+            Self::Storage(source) => source.fmt(f),
         }
     }
 }
 
-impl std::error::Error for FrameError {}
+impl std::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Storage(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::Error> for FrameError {
+    fn from(source: crate::Error) -> Self {
+        Self::Storage(source)
+    }
+}
 
 /// Validated local profile; checksum settings control sending, not receiving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -29,7 +29,7 @@ Deliver the initial clear-TCP implementation in this order:
 2. Extend `fubst` and implement pure frames/headers/messages. Native
    header/control/Fault decode paths use one internal context derived from
    `TransportLimits`; no higher layer compensates for broken shared decoding.
-   Add standalone message/header constructors with finite construction limits;
+   Add standalone message/header constructors with native width/schema checks;
    send/reply admission must still validate the actual scope policy.
    Add the public body-codec contract and default `FubstCodec` with separate
    body-specific operation budgets, not inherited native decode settings.
@@ -38,7 +38,7 @@ Deliver the initial clear-TCP implementation in this order:
    Establish the security transition design early rather than retrofitting a
    `TlsStream` abstraction later.
 4. Implement URI-based Endpoint configuration for destination, native options, finite
-   limits, timeout, shared budget, and reverse-ingress descriptors; default TCP connect,
+   limits, timeout, and reverse-ingress descriptors; default TCP connect,
    reusable connector injection through `connect_with_connector`, public Accept, TCP/stream adapters, and
    bounded raw listeners/connections; connect a replication adapter.
    Endpoint establishes an owning Channel through that same dialed engine;
@@ -125,18 +125,18 @@ Acceptance evidence has distinct levels:
   completion. Deferred operation processing, ACK scheduling, and retry have
   explicit domain ownership and shutdown. An intentional queue-full data drop
   is diagnosed and cannot advance acknowledgment for unadmitted operations;
-  truthful ACKs for earlier progress remain valid. Native leases survive
-  retention outside a completed handler. Exercise ordinary generic-limit
+  truthful ACKs for earlier progress remain valid. Shared buffers survive
+  retention outside a completed handler. Exercise ordinary frame/queue-limit
   exhaustion with its documented error/drop/retirement outcome. Preserve internal native
   control, managed RPC-completion, and authorized-reply protection.
 - Public header views/builders and raw/Actor-dispatched receive, including
   preserved unknown records, rejection of conflicting managed fields, bounded
   registrations, and no authority gained by setting Actor or RelatesTo.
-  Exercise standalone construction without a facade/runtime, bounded encoding
-  and retained backing, sticky builder errors, and combined native-header
+  Exercise standalone construction without a facade/runtime, native-width encoding,
+  shared backing ownership, sticky builder errors, and combined native-header
   limits including managed-field overhead. A successfully built message must
   still reject under stricter submission limits without committing output.
-  Reused received storage keeps its leases through construction and admission.
+  Reused received storage stays shared through construction and submission.
   Verify body-first request construction, generic ordered Actor/Action
   insertion on messages/requests/replies, typed helper encodings against native
   schemas, and first-visible versus effective duplicate lookup. Action views
@@ -182,21 +182,21 @@ Acceptance evidence has distinct levels:
   last-owner/failed-connect cancellation must retire unpublished/active work
   without adding a client drain API or post-drop join promise.
   Application work-queue composition preserves Request context, absolute
-  deadlines, and native leases while the runner retains reply authority.
+  deadlines, and shared storage while the runner retains reply authority.
   Enqueue/worker/oneshot waits stay inside existing bounded handler capacity;
   no second transport queue or waiting pool is created. Closed queue/worker
   channels surface as service errors. Timeout, disconnect, and shutdown races
   invalidate the original ticket; late output cannot resurrect it, forge a
   NoReply handoff, or send a duplicate response. Retained queued storage stays
-  charged until dropped. Workers are application-owned and must remain usable
+  alive through ordinary references. Workers are application-owned and must remain usable
   during admitted service drain, then be explicitly stopped/disposed.
 - http-shaped request decomposition and reassembly, including mutable headers
   on received requests and public parts headers while trusted context stays
   read-only. Exercise append, remove-all, explicit replacement, failed-edit
-  atomicity, current duplicate lookups, bounded copy-on-write metadata, and
-  retained leases without mutating shared raw messages. Repeated edits cannot
-  accumulate unbounded tombstones/backing. Header swaps and edited records
-  must pass original-scope validation/accounting before routing/adaptation;
+  atomicity, current duplicate lookups, copy-on-write metadata, and
+  shared ownership without mutating raw messages. Repeated edits do not
+  accumulate hidden tombstones. Header swaps and edited records
+  must pass original-scope validation before routing/adaptation;
   edits cannot retarget an admitted route, change classification/correlation,
   mint a reply grant, widen policies/limits, or extend the original deadline.
 - http-shaped response body mutation, decomposition, reassembly, and mapping
@@ -204,11 +204,9 @@ Acceptance evidence has distinct levels:
   read-only optional source, preserved original settlement timing, and
   explicit propagation of fallible body-conversion errors. Header/body edits
   must not change native Fault classification or mint provenance/reply authority.
-  Splitting a decoded response retains its tracked charge in the parts;
-  reassembly transfers it without double-charging. Retaining parts keeps the
-  charge, while parts drop/into_body is explicit plain-value handoff and
-  embedded leased views stay charged independently. Body replacement cannot
-  silently grant a larger codec allowance or release still-retained storage.
+  Splitting/reassembling responses preserves metadata and ordinary decoded-value
+  ownership without hidden charges. Shared byte views retain their backing
+  independently. Body replacement cannot silently grant native authority.
 - Channel byte service composition beneath `RpcClient<T>`, including
   middleware and an external non-Clone/non-Sync transport that constructs
   `Response::new` without private Source access. Generic clients must not
@@ -250,8 +248,8 @@ Acceptance evidence has distinct levels:
   failure without a post-drop join promise. Record that post-establishment
   timing is deliberately later than native's connection-accepted callback.
 - URI Endpoint construction from shared text/bytes, parsed http::Uri, and
-  optional SocketAddr conversion. Verify pure/fallible construction, finite
-  input/retained-backing checks, absolute scheme/authority requirements,
+  optional SocketAddr conversion. Verify pure/fallible construction,
+  parser errors, absolute scheme/authority requirements,
   userinfo rejection, and from_shared fragment rejection before parser truncation.
   Built-in TCP accepts explicit valid ports, hostnames, IPv4, and bracketed
   supported IPv6 with empty/root path and no query. Missing/zero/overflow ports,
@@ -290,8 +288,8 @@ Acceptance evidence has distinct levels:
   without fabricating IPC registration, notification, or replication readiness.
   Connection-bound domain initialization/submission must use the same Peer,
   even if Channel changes generation between separate application awaits.
-  Reconnect/current/retiring state and pinned old results share the same local/
-  aggregate ledgers; no stale allocation can be freed early to admit a socket.
+  Reconnect/current/retiring work keeps its actual owners; old results retain
+  byte storage without occupying allocation-budget or new-generation queue credit.
 - Preconfigured Endpoint services and optional special-duplex descriptor
   install bounded execution or the duplex queue before application traffic.
   Ordinary ingress invokes services directly; special-duplex traffic survives
@@ -311,7 +309,7 @@ Acceptance evidence has distinct levels:
   ordinary request/peer errors do not poison normal shutdown. Distinguish a
   configured drain timeout from an outer timeout dropping the execution.
   Neither errors nor cancellation imply every background task has exited;
-  retained work stays charged until actually released.
+  retained work and byte views follow their ordinary owners.
 - Raw service bindings or optional router Actor/Action selection, conflicting
   or duplicate ordinary bindings,
   request versus one-way reply rules, byte-facing services, bounded readiness,
@@ -325,7 +323,8 @@ Acceptance evidence has distinct levels:
   exempt new application sends from shutdown.
 - Reverse client ingress and server-originated sends over the same shared
   messaging components, explicit received-context send grants that cannot be
-  widened through typed adapters, and combined peer limits across both facades.
+  widened through typed adapters, and independent native queue/frame limits
+  for initiating and accepted roles.
 - External connector/acceptor implementations and stream input, including
   a non-Clone/non-Sync reusable URI-input connector transferred once into Channel,
   repeated serialized readiness/call on that same retained instance without
@@ -350,14 +349,13 @@ Acceptance evidence has distinct levels:
   their own instance and must release it if dropped unpolled.
   Generic RPC calls return ordinary futures without Attempt guarantees; native
   byte request/duplex operations retain synchronized retraction receipts.
-  Client codec work uses finite explicit per-call input/output/allocation
-  limits outside arbitrary T's scope, while Channel must admit full encoded
-  backing/metadata before driver retention. Preserve inherited byte leases
-  through decoding and native settlement timing through response mapping.
+  Client codecs may use explicit per-call input/output restrictions outside T's
+  scope, while Channel applies native frame/send-queue policy on submission.
+  Preserve shared backing through decoding and native settlement timing through response mapping.
   Synthetic responses have no source/settlement receipt and use service-result
   observation; result-holding middleware may cause its own wait timeout.
-  Verify the decoded-charge handoff
-  for plain values and continued leases for zero-copy body views.
+  Verify ordinary decoded-value ownership and shared backing for zero-copy views,
+  with no decoded-allocation ledger or constructor-only depth/work ceilings.
 - Native limit changes leave body-codec settings unchanged and vice versa;
   default/custom body codecs satisfy their invocation budgets while fixed
   native serialization continues to enforce its own resource ceilings.

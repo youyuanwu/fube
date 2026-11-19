@@ -40,7 +40,6 @@ impl OneWayRouteOptions {
 
 impl Router {
     pub fn new() -> Self;
-    pub fn limits(self, limits: RoutingLimits) -> Self;
 
     pub fn request<S>(
         self, actor: ActorId, action: impl Into<String>,
@@ -145,9 +144,9 @@ Action as exact native UTF-16 content, without case folding, normalization,
 or lossy conversion. Missing Action cannot match a nonempty configured action.
 
 Reject duplicate route keys and native control actors at configuration time.
-Bound routes, distinct actors, action storage, and matching work through
-`RoutingLimits`. There are no wildcard, prefix, or implicit fallback routes in
-the initial router.
+Keep exact route matching above native parsing. There are no extra fixed
+route-count, Actor-count or action-storage construction ceilings, and no
+wildcard, prefix, or implicit fallback routes in the initial router.
 
 Within Actor-dispatched ingress, unknown actors retain native diagnosed-drop
 behavior.
@@ -163,55 +162,26 @@ semantics do not create a routing requirement for explicitly raw protocols.
 
 ## Routing limits
 
-```rust,ignore
-#[derive(Clone, Debug)]
-pub struct RoutingLimits {
-    pub max_routes: usize,
-    pub max_actors: usize,
-    pub max_action_units: usize,
-    pub max_total_action_bytes: usize,
-}
+Route construction validates keys and conflicts and reports allocation errors.
+It does not impose a retained-capacity quota. Applications own the size of
+their route configuration.
 
-impl RoutingLimits {
-    pub fn validate(&self) -> Result<()>;
-}
-```
-
-`RoutingLimits` implements `Default`. These are initial Rust-host configuration
-ceilings, not native wire limits, eager allocation, or performance evidence:
-
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `max_routes` | 256 | Total distinct Actor/Action route keys. |
-| `max_actors` | 64 | Distinct application actors represented by those routes; control actors remain forbidden. |
-| `max_action_units` | 256 | UTF-16 code units in one configured action key. A longer valid wire action cannot match; it is not thereby malformed. |
-| `max_total_action_bytes` | 64 KiB | Actual retained UTF-16 action-key storage across the route table. Fixed metadata is separately bounded by route/actor counts. |
-
-KiB means 1024 bytes. Validation requires positive count/action-storage
-ceilings. Use checked count/byte arithmetic; overflow is InvalidInput.
-`Router::limits` sets configuration, route insertion checks its current
-ceilings, and `into_service` revalidates the final table. Lowering a limit below
-already configured routes/actors/action storage rejects explicitly without
-truncating entries. Do not retain a caller's oversized spare string/vector
-capacity as unchecked route-table storage.
-
-Runtime handler concurrency, readiness, decoded/output budgets, and request
+Runtime handler concurrency, readiness, explicit output restrictions, and request
 deadlines are separately bounded by [HandlerLimits](Services.md#handler-limits).
-Neither configuration ceiling widens connection or shared resource limits.
+Routing cannot widen native connection/frame/send-queue limits.
 
 ## Acceptance and deferred work
 
 Cover actor/action selection, native duplicate-property semantics, duplicate
 and conflicting registrations, raw service dispatch, private reply binding,
 and absence of fabricated ACKs or generic error replies. Request/one-way
-option interchange must fail to typecheck. Exercise each limit at its boundary,
-including zero-cap meanings, aggregate intersections, invalid durations,
-checked arithmetic, and lowering route limits after configuration. Runtime
+option interchange must fail to typecheck. Exercise native width boundaries,
+invalid durations and checked arithmetic. Runtime
 cases use the [handler execution limits](Services.md#handler-limits), not
 another router-owned admission pool.
 
 Cover preservation of unedited ordered/unknown headers, source, restricted
-connection, deadline, and storage charges through body mapping and parts
+connection, deadline, and shared storage through body mapping and parts
 reconstruction. Bounded header edits must work on received requests and parts,
 with current duplicate lookups and no mutation of shared raw messages.
 Malformed edits, route/binding retargeting, and context-free router calls must

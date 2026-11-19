@@ -1,6 +1,6 @@
 use std::fmt;
 
-/// A native representation, construction-policy, or resource failure.
+/// A native representation, configured-limit, or allocation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     InvalidInput(&'static str),
@@ -44,6 +44,32 @@ impl From<crate::wire::headers::HeaderError> for Error {
             HeaderError::ResourceLimit(resource) => Self::ResourceLimit(resource),
             HeaderError::Decode { id, source } => Self::NativeHeader { id, source },
             HeaderError::UnsupportedSchema { id, reason } => Self::UnsupportedSchema { id, reason },
+        }
+    }
+}
+
+impl From<crate::wire::frame::FrameError> for Error {
+    fn from(error: crate::wire::frame::FrameError) -> Self {
+        use crate::wire::frame::FrameError;
+        match error {
+            FrameError::Storage(source) => source,
+            FrameError::InvalidState(message) => Self::Internal(message),
+            FrameError::SizeLimit { .. } => Self::ResourceLimit("frame bytes"),
+            FrameError::HeaderLengthOverflow { .. } | FrameError::FrameLengthOverflow => {
+                Self::InvalidInput("native frame length overflow")
+            }
+            FrameError::UnsupportedProvider { .. } => {
+                Self::InvalidInput("unsupported security provider")
+            }
+            FrameError::InvalidFrameLength { .. } => Self::Protocol("invalid native frame length"),
+            FrameError::HeaderChecksumMismatch { .. } => {
+                Self::Protocol("native header CRC mismatch")
+            }
+            FrameError::BodyChecksumMismatch { .. } => Self::Protocol("native body CRC mismatch"),
+            FrameError::ProviderMismatch { .. } => {
+                Self::Protocol("native security provider mismatch")
+            }
+            FrameError::Truncated { .. } => Self::Protocol("truncated native frame"),
         }
     }
 }

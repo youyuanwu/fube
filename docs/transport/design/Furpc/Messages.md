@@ -2,9 +2,9 @@
 
 **Status:** proposed; see the [design summary](README.md).
 
-Defines immutable native messages, leased bodies, header semantics, and
+Defines immutable native messages, shared bodies, header semantics, and
 raw sends. [Requests](Requests.md) add typed envelopes;
-[resources](Resources.md) define storage accounting.
+[resources](Resources.md) distinguish storage ownership from queue accounting.
 
 `Message` belongs to raw native messaging, above private framing and below
 typed RPC/body codecs and services. Raw protocols construct it directly;
@@ -153,56 +153,49 @@ lookup and validation of every recognized duplicate remain unchanged.
 
 ### Construction and submission limits
 
-The initial standalone implementation publishes its profile in
-`furpc::construction`: 65,535 combined header bytes (including four bytes per
-record), at most 13,107 records, native depth 64, 65,535 aggregate declared
-Serde fields/sequence elements per header encode, and 4 MiB of retained header
-storage/bookkeeping. Body construction permits payloads up to the native u32
-frame capacity minus the 12-byte fixed header, approximately 4 GiB of retained
-storage, and 1,024 segments. Newly constructed allocations preallocate room for
-eight distinct local/shared ledger attachments. These are construction policy,
-not shared `fubst` defaults or transport admission settings.
+Standalone construction enforces native widths: 65,535 combined header bytes
+(including four bytes per record), nonzero record payloads, and a u32 total
+frame length including the 12-byte fixed header. There is no separate
+construction profile or `furpc::construction` module, retained-capacity ceiling,
+segment-count ceiling, native-depth cap, or declared-field/element work quota.
 `Body::from_bytes`, `Body::try_from(Vec<u8>)`, and `Body::from_segments(Vec<Body>)`
 are fallible; the segmented constructor does not copy payload bytes. Body
-slices retain the parent's entire segment table and backing charges.
+slices share the parent's segment table and backing storage.
 
 The initial implementation explicitly reports incomplete MessageId/RelatesTo
 schemas as unsupported rather than synthesizing their native constructor-time
 process IDs. Supporting those generated defaults is deferred.
 
-Standalone construction uses documented, finite crate-level construction
-ceilings, not a facade's `TransportLimits` or a silently selected copy of its
-defaults. Bound native encoding output, nesting/collection work, record count,
-and builder-owned header storage before growth. These are construction policy,
-not new wire rules or a selectable native codec. The combined encoded header
-area must also fit the native 16-bit length, including record overhead.
+Standalone construction does not capture a facade's `TransportLimits`.
+The combined encoded header area must fit the native 16-bit length, including
+record overhead. Native-representable nesting and collections are not rejected
+by additional constructor-only resource limits.
 
-`native` writes into a bounded encoder; it must not encode an unbounded
-temporary and check afterward. `from_encoded` checks lengths and retained
-backing capacity before adoption or copying; it cannot bound allocations the
-caller already made. Builder methods retain the first construction error and
+`native` bounds encoding output by the native header-area capacity.
+`from_encoded` checks native lengths, not spare backing capacity.
+Builder methods retain the first construction error and
 stop accumulating header data after failure; `build` returns that error.
 Known record sizes/counts are checked before growing builder storage.
 
-Successful construction validates local structure and construction limits,
+Successful construction validates local native structure,
 not eligibility on any particular connection. Send/reply admission applies
 the actual scope's native-header/resource limits and recognized-field checks,
 then rechecks the complete envelope after adding transport-managed headers.
 It also checks mode, terminal state, authority, and deadline before commitment.
 These checks use the scope's validated internal context, never the standalone
-construction profile as a substitute.
+constructor settings as a substitute.
 
 Consequently, a locally valid message may fail submission under a stricter
 connection policy or lack room for managed headers. This deferred policy check
-is explicit; construction never reserves transport capacity. Caller-owned
-construction storage and the preservation/admission of existing leases follow
-the [storage accounting contract](Resources.md#immutable-storage-and-accounting).
+is explicit; construction never reserves transport capacity. Shared storage
+follows ordinary reference-counted ownership, independently of
+[send-queue accounting](Resources.md#immutable-storage-and-accounting).
 
 `append_header` appends in order. Any replacement API must explicitly name its
 occurrence/removal behavior; no map-like `set` silently erases native
 duplicates. Common typed views distinguish first occurrence from effective
 received values. `HeaderRef` exposes borrowed ID/value views, never a mutable
-record or an uncharged clone of its backing bytes.
+record. Owned forwarding shares its immutable backing bytes.
 
 `Headers::append` adds one record at the end; `remove_all` removes every visible
 occurrence of that ID and returns the count, preserving all other records'
@@ -213,16 +206,14 @@ operations, not an atomic replacement. Neither inserts native defaults.
 These mutations require exclusive access to the collection, available through
 `Request::headers_mut` or public `RequestParts::headers`, not through an
 immutable raw message. Each operation validates affected native records and
-checks finite construction storage/work ceilings before allocating or changing
-the collection. Failure leaves that operation's collection unchanged.
+checks native widths before changing the collection.
+Failure leaves that operation's collection unchanged.
 Recompute derived common properties from the current ordered sequence; do not
 keep stale first-visible/effective caches or mask a malformed occurrence.
-Copy-on-write metadata and new record storage must remain bounded; unchanged
-encoded bytes stay shared with their existing leases. Removing a record does
-not release a backing-allocation charge until its storage is actually freed,
-and repeated edits cannot accumulate unbounded hidden tombstones or spare
-capacity. Editing an admitted request is subject to the original-scope
-[accounting and validation boundary](Requests.md#request-envelope).
+Unchanged encoded bytes stay shared. Removed records disappear from the new
+collection without accumulating hidden tombstones; older aliases keep their
+own storage alive. Editing an admitted request preserves its original-scope
+[validation boundary](Requests.md#request-envelope), not an allocation ledger.
 
 Header collection mutation never modifies trusted context or reruns native
 classification. Managed fields remain subject to the selected outgoing API's
@@ -232,8 +223,8 @@ Construction does not invent Actor/Action values. Application/domain helpers
 may construct an agreed envelope above this API; transport submission still
 checks the actual headers and policy.
 
-`Body` accepts owned bytes and bounded segments; its public borrowed segment
-iterator does not detach allocation leases. Message clones share that storage.
+`Body` accepts owned bytes and shared segments; its public borrowed segment
+iterator cannot outlive the backing storage. Message clones share that storage.
 
 Normal send is lazy and capacity exhaustion is explicit. Its success receipt
 means a complete local write only. No destination argument is required because

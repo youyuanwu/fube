@@ -11,7 +11,7 @@ adapter bounds and [examples](Examples.md) for a custom codec.
 
 | Layer | Serialization contract | Configuration |
 | --- | --- | --- |
-| Native messaging | Built-in native headers, connection controls, and transport Fault schemas using `fubst`. | Scope resource ceilings in `TransportLimits`, plus finite standalone construction ceilings; no public native-serializer selection. |
+| Native messaging | Built-in native headers, connection controls, and transport Fault schemas using `fubst`. | Native widths and configured transport policy; no extra constructor ceilings or public native-serializer selection. |
 | Service routing | Dispatch byte-facing services without body transformation. | Native route keys and ingress policies; no body format or schema selection. |
 | Client transport services | Channel or custom Tower services exchange native byte envelopes without application decoding. Peer is a separate native capability, not a service. | Transport admission, deadlines, and native correlation where applicable; no application schema/codec. |
 | Typed RPC adapters | Public application-body `Codec`, with `FubstCodec` as the default native convenience choice. | Codec consumed per client call or constructed in the server method service; explicit client codec limits or admitted native duplex/server budgets, plus codec-local work limits. |
@@ -34,7 +34,7 @@ The transport constructs its scope-owned serialization context from validated
 native limits in `TransportLimits`. Public callers configure finite resource
 policy, not an encoder/decoder factory or native format override.
 Standalone `Message::builder` and `HeaderRecord` constructors use the same
-fixed implementation under finite construction-only ceilings; they do not
+fixed implementation under native representation limits; they do not
 capture a client's or server's limits. Submission applies the actual scope
 context as specified by
 [message construction](Messages.md#construction-and-submission-limits).
@@ -157,56 +157,22 @@ framing layer or an HTTP body dependency.
 
 ## Bounded buffers and failures
 
-Every typed call or ingress invocation has a body-specific allocation/work
-policy. Generic client RPC uses explicit
-[`ClientCodecLimits`](Requests.md#codec-and-call-behavior), independently of
-T's hidden transport configuration. Native duplex and server method adapters
-use their actual admitted operation/invocation budgets, including server::Rpc
-handling reverse traffic on a Channel under Endpoint-configured HandlerLimits. The
-[resource boundary](Resources.md#serialization-and-body-budgets) distinguishes
-per-call client codec limits from aggregate native transport admission.
-`FubstCodec` creates its per-call `fubst` state under the applicable policy and its
-body-format/work limits; it does not inherit native header/control decoding
-settings. Custom codecs receive the same bounded buffers and cannot widen the
-applicable call/invocation allowances. Changing native decode ceilings must not
-silently change either the default or a custom body codec's limits.
+`EncodeBuf` supports fallible writes and shared segments without flattening.
+Native message representability and any explicitly selected codec restrictions
+bound encoded output; there is no additional mandatory construction profile.
+Encoding finishes before submission, so failure cannot leave a partial frame.
 
-`EncodeBuf` supports bounded fallible writes and retained segments without
-requiring a flattened body. Reserve metadata and encoding capacity before
-invoking the encoder; charge growth, segment bookkeeping, and retained storage
-against the operation budget. Encoding must finish successfully before its
-message is eligible for transmission. Failure releases temporary reservations
-and cannot leave a partial frame on the connection.
+`DecodeBuf` exposes exactly one complete body. Its
+`copy_remaining() -> Result<Vec<u8>, CodecError>` consumes and fallibly copies
+that range, without attaching a charge to the resulting value. Decoded values
+and custom codec allocations are ordinary application-owned Rust data.
+Request/response parts preserve metadata and provenance, not hidden allocation
+reservations. Zero-copy byte views retain backing storage by reference counting.
 
-`DecodeBuf` exposes bounded body access and a reservation context for decoded
-allocations. Built-in codecs honor these limits. User codecs are trusted,
-cooperative code: their private allocations and CPU work cannot be universally
-bounded by the transport. Run both directions outside the socket driver and
-within the caller's owned operation scope, without detached workers.
-
-The buffer API includes fallible `EncodeBuf::write_all(&[u8])` and
-`DecodeBuf::copy_remaining() -> Result<Vec<u8>, CodecError>`. The latter
-charges a bounded decoded allocation before copying and consumes that body
-range. Its charge is recorded in call/invocation state, not attached to
-the plain `Vec`; converting that allocation to a `String` does not release the
-charge. The ingress-owning Channel/server scope retains it until its invocation
-settles. Generic RPC
-decoding transfers its application-owned per-call charge into `Response<T>`;
-native duplex completion transfers its scope-admitted charge. Dropping that
-response releases the charge with its owned decoded value. Fallible response
-adaptation uses `into_parts`/`from_parts`; the private tracked charge moves with
-the parts and survives reassembly, while leased byte views retain their own
-charges. Decomposition alone is not extraction. `into_body`, or dropping parts
-while retaining a plain decoded value, releases the tracked allowance and
-transfers that value to application-managed ownership. The transport does not
-promise to track arbitrary decoded values after extraction.
-
-Zero-copy codecs may instead retain leased body views, whose allocations stay
-charged through every clone/slice even after application handoff. Retained
-completed-but-undelivered results remain charged in completion state. Extra
-private allocations or values retained outside the invocation/response are
-the application's responsibility. These are cooperative storage allowances,
-not universal heap accounting or tonic-style message-size limits.
+Run codec work outside the socket driver, without detached workers. Custom
+code is trusted and cooperative; the transport does not universally bound its
+CPU work or heap usage. Explicit codec-specific limits remain independent of
+native frame/send-queue policy.
 
 Preserve codec failure phase, source, and resource-exhaustion category through
 `CodecError`. A malformed application body fails its typed call or handler;

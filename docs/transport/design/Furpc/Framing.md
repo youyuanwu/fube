@@ -38,12 +38,12 @@ per-frame task, or independent I/O owner is required.
 | Fixed-header codec | Checked native layout and checksum interpretation. | Allocation, resource policy, authentication, or actor routing. |
 | `FrameReader` | One frame's parse offsets, running CRC, and admitted body assembly or discard progress. | Socket polling, timers, native common-header decoding, or application delivery. |
 | Connection driver | Bounded read storage, header decoding/classification, admission decisions, security state, and final message handoff. | Application-body decoding or domain processing. |
-| `PreparedFrame` / `FrameCursor` | Encoded fixed header, leased message segments, and exact output offsets. | Socket lifetime, operation authority, scheduling, cancellation arbitration, or receipt settlement. |
+| `PreparedFrame` / `FrameCursor` | Encoded fixed header, shared message segments, and exact output offsets. | Socket lifetime, operation authority, scheduling, cancellation arbitration, or receipt settlement. |
 
 Names below pin ownership and transitions, not a required private layout.
-Opaque permits refer to the existing resource ledger, not separate quotas or
-public capabilities. All storage and work remain in the connection/operation
-scope described by the architecture.
+Permits express private frame-bound admission decisions, not allocation-budget
+quotas or public capabilities. Storage uses ordinary shared ownership; queue
+accounting belongs to the driver.
 
 ## Fixed-header codec
 
@@ -130,11 +130,11 @@ impl FrameReader {
         &mut self, frame: FrameKey, decision: BodyDecision,
     ) -> FrameResult<()>;
 
-    pub(crate) fn finish_eof(&self) -> FrameResult<()>;
+    pub(crate) fn finish_eof(&mut self, input: &ReceiveInput) -> FrameResult<()>;
 }
 ```
 
-`ReceiveInput` is a consumable view of driver-owned, already charged receive
+`ReceiveInput` is a consumable view of driver-owned receive
 storage. It is not an unbounded byte accumulator. `step` performs no I/O,
 waits on no semaphore, and invokes no application callback. A positive finite
 `WorkBudget` bounds consumed bytes and transitions per turn; return Yield
@@ -165,9 +165,9 @@ later frame or another connection.
 ### Fixed header and header storage
 
 The reader initially consumes at most the 12 fixed-header bytes. After the
-FixedHeader event, the driver checks frame-size policy and reserves bounded
-native-header storage, decoding work/metadata, and provisional bookkeeping
-before calling `admit_headers`. `HeaderPermit` carries those allowances.
+FixedHeader event, the driver checks frame-size policy and prepares native-header
+storage before calling `admit_headers`. `HeaderPermit` binds that storage to
+the current frame.
 The reader cannot allocate or retain bytes proportional to the declared body
 length at this stage.
 
@@ -178,7 +178,7 @@ explicit bounded wait/backpressure policy or retires the connection; it
 does not silently consume body bytes without a decision.
 
 The Headers event transfers an owned `HeaderPrefix`: frame identity,
-checked fixed-header information, and leased encoded native-header storage.
+checked fixed-header information, and shared encoded native-header storage.
 The driver decodes it using the fixed internal native serializer and the
 scope's validated native-header limits, preserving ordered/unknown records
 and validating all recognized duplicate properties. Application-body codecs
@@ -206,7 +206,7 @@ The driver then chooses exactly one disposition:
 
 | Disposition | Contract |
 | --- | --- |
-| Retain | Supply a `BodyPermit` covering body storage/backing capacity, segment metadata, and the selected bounded completion/ingress destination. Transfer existing charges rather than charging the same allocation twice. |
+| Retain | Supply a frame-bound `BodyPermit` after classification and destination admission; assemble the body with ordinary shared ownership. |
 | Discard | Supply a bounded diagnostic reason; incrementally consume the remaining frame with bounded scratch and verify applicable CRCs. Do not construct a Body, deliver a message, or emit an ACK. |
 | Retire connection | Do not resume the reader. Cancel/close that connection under the normal lifecycle contract; arbitrary unread bytes cannot be resynchronized. |
 
@@ -218,11 +218,10 @@ retires the connection instead of keeping drain open indefinitely.
 
 ### Storage, progress, and completion
 
-Accumulate body data as leased segments or adopt already leased input
-segments where possible. Any new allocation reserves its actual backing
-capacity and bookkeeping before growth. Small retained slices keep the
-backing allocation charged. Retained headers and decoded header state remain
-charged while the driver waits for the matching completion.
+Accumulate body data as shared segments or adopt input segments where possible.
+Small retained slices can keep the full backing allocation alive. Retain the
+headers and decoded state while waiting for completion; there is no allocation
+ledger or backing-capacity charge.
 
 The running body CRC covers encoded native headers and every body byte
 exactly once, including discarded bytes. Segmentation does not change it.
@@ -231,7 +230,7 @@ events without an extra socket read. NeedInput always requests a positive,
 stage-bounded amount only when bytes are genuinely missing.
 
 Complete transfers a `VerifiedBody` containing the frame identity and the
-complete leased Body. It is not an application `Message` yet. The driver
+complete shared Body. It is not an application `Message` yet. The driver
 matches it with that frame's retained decoded headers and provisional
 admission record, applies remaining native/security checks, then publishes
 the complete Message to control, correlation, a Channel/server ingress service,
@@ -248,7 +247,7 @@ discard is not a way to turn corruption into a successful route miss.
 
 Coalesced input remains in `ReceiveInput` for the next turn. Do not consume
 bytes from the next frame, or from a new security wire phase, as part of the
-current frame. Any read-ahead is independently bounded/charged; stop further
+current frame. Any read-ahead is independently bounded by the driver; stop further
 reads while an admission gate is blocked. Kernel/TLS read granularity does
 not authorize extra body retention.
 
@@ -268,7 +267,7 @@ even if the last decoded native frame was complete.
 ```rust,ignore
 impl PreparedFrame {
     pub(crate) async fn prepare(
-        message: Message, wire: FrameWireContext, permit: FrameWritePermit,
+        message: Message, wire: FrameWireContext, limits: FrameWriteLimits,
     ) -> FrameResult<Self>;
 
     pub(crate) fn header(&self) -> &FrameHeader;
@@ -287,21 +286,20 @@ impl FrameCursor {
 ```
 
 Preparation consumes an immutable Message after native headers, managed
-correlation fields, and operation authority have been resolved. The
-`FrameWritePermit` comes from existing send/reply/control admission and
-covers required output metadata/storage; it cannot grant permission to
-originate a message. Preparation validates native widths, configured frame
+correlation fields, and operation authority have been resolved. The driver
+performs send/reply/control queue admission separately; preparation cannot
+grant permission to originate a message. It validates native widths, configured frame
 limits, and checked combined lengths before producing output.
 
-The result owns a fixed-header array plus leased native-header/body segments,
+The result owns a fixed-header array plus shared native-header/body segments,
 not a flattened `Vec<u8>`. Calculate CRCs over those segments. Any required
-new header storage or segment metadata is reserved before allocation.
+new header storage or segment metadata uses fallible allocation.
 Preparation invokes no application codec or callback and cooperatively yields
 after bounded work, including within a large segment while computing CRCs.
 Its future is driven as owned admitted work; the driver can poll it alongside
 other progress without requiring a per-frame task. The async method spawns
-no worker and performs no I/O; its future owns and releases temporary
-reservations on failure or cancellation. Preparation does not commit the
+no worker and performs no I/O; its future owns and drops temporary
+storage on failure or cancellation. Preparation does not commit the
 message.
 
 The driver rechecks cancellation, expiry, terminal state, authority, and wire
@@ -331,7 +329,7 @@ the first positive socket write commits through the same gate as cancellation;
 the driver then retains the suffix until complete write or whole-connection
 retirement. Dropping an observer cannot drop that suffix or allow another
 frame to interleave. Before commitment, dropping a cancelled plan releases
-its leases/reservations normally.
+its temporary storage normally.
 
 `is_complete` means all native-frame bytes were accepted by the next layer.
 Only the driver can settle the operation's complete-local-write receipt.
@@ -377,8 +375,8 @@ outbound secured:  PreparedFrame -> TLS protection -> ordered socket output
 The driver/security state machine, not `FrameReader`, owns phase transitions,
 authentication, negotiation verification, and authorization release. Preserve
 unread bytes at a transition and feed them to the new phase exactly once.
-Bound and charge ciphertext, plaintext, and security bookkeeping separately
-where they are distinct allocations. No frame or application-body codec
+Keep ciphertext, plaintext, and security bookkeeping explicitly owned and
+apply security-phase buffer/queue limits. No frame or application-body codec
 implements TLS. Unsupported protection profiles reject explicitly; these
 contracts require no TLS dependency or placeholder in the initial crate.
 
@@ -393,7 +391,7 @@ network timing as the only oracle:
 - Fragmentation at each fixed/header/body boundary, empty headers/bodies,
   multiple frames in one input, exact leftover bytes, and per-turn work caps.
 - Both admission gates, stale/wrong-state decisions, allocation refusal before
-  body retention, backing-allocation charges, and bounded header decode work.
+  body retention, shared-buffer lifetime, and native header validation.
 - Retain versus discard with identical CRC outcomes, corrupted/truncated
   discarded bodies, bounded-drain expiry, and no delivery/ACK on rejection.
 - No published authority, RPC settlement, native control transition, or handler

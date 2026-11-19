@@ -208,28 +208,7 @@ pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
 
 /// Encode one value under explicit byte and nesting limits.
 pub fn to_vec_with_limits<T: Serialize + ?Sized>(value: &T, limits: Limits) -> Result<Vec<u8>> {
-    encode_with_work(value, limits, None)
-}
-
-/// Bound aggregate declared Serde fields and sequence elements before invoking
-/// their callbacks. This optional work policy also covers zero-byte fields.
-/// It does not bound arbitrary work or recursion inside custom Serialize code.
-/// Ordinary encoding entry points impose no additional field/element budget.
-pub fn to_vec_with_limits_and_work<T: Serialize + ?Sized>(
-    value: &T,
-    limits: Limits,
-    max_fields_and_elements: usize,
-) -> Result<Vec<u8>> {
-    encode_with_work(value, limits, Some(max_fields_and_elements))
-}
-
-fn encode_with_work<T: Serialize + ?Sized>(
-    value: &T,
-    limits: Limits,
-    work: Option<usize>,
-) -> Result<Vec<u8>> {
     let mut encoder = Encoder::with_limits(limits);
-    encoder.remaining_work = work;
     value.serialize(Serializer {
         encoder: &mut encoder,
         mode: Mode::Value,
@@ -630,7 +609,6 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
         }
         let len = len.ok_or_else(encode_error)?;
         self.encoder.check_count(len)?;
-        self.encoder.reserve_work(len)?;
         let start = self.encoder.bytes.len();
         let depth = self.encoder.objects.len();
         let framing = if self.mode == Mode::Array {
@@ -704,7 +682,6 @@ impl<'a> Serializer<'a> {
             .ok_or_else(encode_error)?
             .try_into()
             .map_err(|_| encode_error())?;
-        self.encoder.reserve_work(len)?;
         let pointer = self.mode == Mode::EnumPointer;
         let start = self.encoder.bytes.len();
         let depth = self.encoder.objects.len();
@@ -741,7 +718,6 @@ impl<'a> Serializer<'a> {
         ) {
             return Err(encode_error());
         }
-        self.encoder.reserve_work(len)?;
         let depth = self.encoder.objects.len();
         let start = self.encoder.bytes.len();
         let framing = match self.mode {

@@ -32,7 +32,7 @@ admission; neither routes through an additional inbox.
 
 The Channel's private logical scope or the `serve_with_shutdown` execution
 owns ingress-service readiness, handler futures, response completion, and
-their resource charges. Channel's outbound RPC Service remains a separate
+their ordinary storage ownership. Channel's outbound RPC Service remains a separate
 direction; inbound services do not call it or create another correlation table.
 User code never runs in the socket driver beyond the existing bounded
 nonblocking header/source authorization checks.
@@ -277,7 +277,7 @@ readiness, codec, handler, and encoding error phases/sources; no automatic
 native Fault or application error response is generated.
 
 `Reply<T>` supplies a body and ordered headers through generic `append_header`.
-Appending is fallible under standalone construction limits; scope-specific
+Appending is fallible under native representation limits; scope-specific
 policy is checked on submission. Actor/Action values are explicit domain
 headers, never inferred from request names.
 
@@ -288,7 +288,7 @@ serves both outbound calls and inbound service dispatch. Services receive
 `Request<Body>`; typed request and one-way handlers receive `Request<Q>`.
 There is no separate `ServerRequest` type or context handler argument.
 Headers and optional received context are accessed through the request.
-`Body` is the existing leased segmented native body, not an HTTP stream.
+`Body` is the existing shared segmented native body, not an HTTP stream.
 
 ```rust,ignore
 pub enum IngressResponse {
@@ -312,7 +312,7 @@ admission, changes the captured binding/correlation, or resets its deadline.
 Trusted context stays private and read-only; only application metadata is
 mutable. RPC-adapter decoding uses the existing bounded codec buffers,
 moving the parts to `Request<Q>` without copying headers or adding a staging copy
-of the encoded body. Codec decoding allocations remain separately charged.
+of the encoded body. Decoded values use ordinary application ownership.
 Decode failure retires the original ticket.
 
 Tower services/middleware are trusted cooperative application code, not a
@@ -364,12 +364,12 @@ result, and only the original runner completes correlation and output.
 There is no core grant transfer/disarm path for ordinary messages.
 
 The original HandlerLimits slot, absolute invocation deadline, context, and
-native storage leases remain in force across enqueue, worker processing,
+shared storage ownership remain in force across enqueue, worker processing,
 response waiting, and reply completion. Queue-capacity waits are inside that
 already bounded invocation, not an unbounded waiter pool. Queueing preserves
 Request parts/context; it does not reconstruct a request or renew admission.
-Native byte leases remain charged while an application queue/worker retains
-them, even after a timeout or cancellation.
+Application queues/workers may keep byte storage alive after timeout or
+cancellation; this does not keep transport queue credit occupied.
 
 The application owns the finite queue and workers; furpc creates no queue or
 forwarding task for it. Keep workers running while admitted service futures
@@ -395,7 +395,6 @@ ACK policy follow the [replication boundary](#replication-service-admission).
 pub struct HandlerLimits {
     pub max_in_flight: usize,
     pub max_readiness_waiters: usize,
-    pub max_decoded_bytes_per_request: usize,
     pub max_encoded_body_bytes_per_response: usize,
     pub timeout: Duration,
 }
@@ -407,41 +406,33 @@ impl HandlerLimits {
 
 `HandlerLimits` implements `Default`. These are explicit initial Rust-host
 defaults, not native SF constants, hard wire limits, eager allocations, or
-performance qualification. [Routing limits](Routing.md#routing-limits) bound
-configuration separately.
+performance qualification. [Route configuration](Routing.md#routing-limits)
+validates keys/conflicts without another construction-only quota.
 
 These limits configure all installed user-service ingress in one logical
 Channel or server scope as a whole, not independent per-clone, per-route, or
 per-generation pools. Endpoint configures them for dialed ingress; ServerBuilder
 configures them for accepted ingress. Route options supply native ingress/send
-policies, not additional handler timeout or decoded-allocation limits.
+policies, not additional handler timeout or allocation limits.
 
 | Handler field | Default | Meaning |
 | --- | --- | --- |
 | `max_in_flight` | 8 | Admitted service invocations, including body/readiness wait, decoding, execution, encoding, and response completion. |
 | `max_readiness_waiters` | 4 | Subset of in-flight invocations waiting for service readiness. Zero selects fail-fast readiness; the effective ceiling is also bounded by `max_in_flight`. |
-| `max_decoded_bytes_per_request` | 8 MiB | Tracked decoding allocations for one invocation, not arbitrary handler/application state. |
-| `max_encoded_body_bytes_per_response` | 4 MiB | Encoded response-body storage for one invocation, including retained backing capacity. Native headers, framing, and security buffers have their own charges/limits. |
+| `max_encoded_body_bytes_per_response` | Native frame body capacity | Optional caller-selected encoded-output restriction, not backing capacity or a heap quota. The full frame must still fit after headers. |
 | `timeout` | 30 seconds | One total service-invocation budget, not a timeout restarted for each phase. |
 
 MiB means a power-of-1024 unit. Count/byte arithmetic is checked, including
 derived per-invocation/count ceilings; overflow is InvalidInput. Server build
 and Endpoint connect validate limits before starting ingress: in-flight
 capacity must be positive, and timeout must be positive and fit the monotonic clock range. Readiness
-waiters are a subset, not additional unaccounted requests. Zero decoded/
-encoded byte caps permit allocation-free decoding/empty output respectively;
-they never mean unlimited.
+waiters are a subset, not additional requests. A zero encoded-body cap permits
+empty output. Decoded Rust allocations are not tracked.
 
-Per-invocation body-byte limits intersect with connection framing, local
-body admission, codec-local format/work limits, and shared `ResourceBudget`
-limits; they never widen them. Native header/control decode ceilings apply
-separately to their own stages and are not inherited by a body codec.
-In particular, the encoded-body cap is not a total-frame allowance: native
-headers and the fixed frame header still have to fit. Aggregate retained
-decoded/output storage remains bounded by admitted count and the actual
-resource ledger. User codecs/handlers must account for cooperative tracked
-allocations; these fields cannot universally measure an arbitrary Rust value.
-Larger legitimate native schemas may require an explicit profile increase.
+Explicit per-invocation output limits cannot widen native frame or send-queue
+policy. They are not a total-frame allowance: native headers and the fixed
+header must still fit. No aggregate retained-allocation guarantee is made,
+and custom codecs/handlers own their heap usage and cooperative execution.
 
 ### Invocation lifetime
 
@@ -456,11 +447,11 @@ A protocol-specific timeout header may narrow this budget through explicit
 domain policy. It does not silently select infinity or control every raw
 protocol. Partial-frame and committed-write watchdogs remain separate.
 
-Reserve ingress/handler metadata and required completion allowances before
-accepting work. The native driver hands off once into bounded service work;
+Check ingress/handler capacity before accepting work.
+The native driver hands off once into bounded service work;
 do not introduce an unbounded router inbox, task-per-message admission bypass,
-or a second copy of the message. Charges transfer through readiness, decoding,
-handler state, and completed-but-unsent responses.
+or a second copy of the message. Ordinary ownership follows readiness, decoding,
+handler state, and completed-but-unsent responses, without allocation charges.
 
 Service readiness and body/handler code run outside the socket driver.
 Pending service capacity must not stop unrelated native control/reply
@@ -479,7 +470,7 @@ only domain queue admission, not completion of the replicated operation.
 
 Timeouts retire the ticket once and dispose cooperative handler work. They do
 not undo application side effects. An already committed reply retains its
-writer and charge until completion or irreversible connection failure.
+writer and native send-queue occupancy until completion or irreversible connection failure.
 
 ### Replication service admission
 
@@ -493,10 +484,10 @@ For replication data, validate and try to admit the operation into a bounded,
 replication-owned queue, then promptly return IngressResponse::NoReply.
 Do not occupy HandlerLimits while waiting for later state-provider processing,
 application acknowledgment, or quorum completion. The domain owns that work,
-ACK timers, and retry. It may retain leased storage and an independently
+ACK timers, and retry. It may retain shared storage and an independently
 authorized original-generation Peer for later semantic sends, but not a live
-invocation ticket; retained native storage keeps its actual leases after the
-handler returns.
+invocation ticket. Reference counting keeps retained storage alive after the
+handler returns without transport allocation charges.
 
 If the operation queue is full, an explicit native-compatible domain policy
 can diagnose/drop the unadmitted one-way data without falsely advancing
@@ -527,8 +518,8 @@ On physical generation failure, invalidate and cancel its unsettled ingress
 invocations and original reply tickets; do not replay them on a replacement.
 Channel retains only the configured service/registry for later-generation
 messages. Completed results are not reclassified. Active/retiring work and
-leases remain under the same logical HandlerLimits and local/shared ledger
-until released. A service configuration being installed does not itself
+shared storage retain their normal owners; HandlerLimits belong to the same
+logical runner. A service configuration being installed does not itself
 redial an idle disconnected Channel.
 
 Ingress services and their runner futures retain no public Channel owner

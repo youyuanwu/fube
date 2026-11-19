@@ -17,7 +17,7 @@ capabilities, sources, receivers, native operations, messages, and reply grants
 do not keep either scope open. RpcClient inherits ownership from its transport;
 the built-in Channel owns dialed work, while arbitrary services have their own
 ownership contracts. Application queue workers and direct special-duplex consumers have
-their own owners. A shared budget accounts for resources, not scope lifetime.
+their own owners. Buffer lifetime and transport queue accounting are distinct.
 
 Each physical generation retains the irreversible states:
 
@@ -54,7 +54,7 @@ The selected raw or Actor dispatcher and ordinary bindings remain fixed for
 that logical scope; reconnect cannot switch dispatchers or redirect old deliveries.
 IngressService configuration survives, but its old-generation invocations and
 private reply tickets are invalidated/cancelled, not replayed. Special-duplex
-queues may retain old deliveries under their original leases; application
+queues may retain old deliveries through shared storage ownership; application
 queues retain requests only under the original context/deadline and cancellation.
 Later readiness, peer acquisition, or a pending Channel-backed
 `DuplexReceiver::recv` can share a new attempt. Started reconnect work may
@@ -71,9 +71,9 @@ must avoid a cycle by capturing its own owning Channel.
 Raw users retain that same Channel while awaiting `channel.peer(deadline)`, using native
 operations, or a DuplexReceiver. Peer and DuplexClient never retain a dialed or
 accepted owner. Retaining them cannot prevent last-owner cancellation or
-server shutdown. Endpoint clones contain only configuration/accounting
+server shutdown. Endpoint clones contain only configuration
 references and cannot keep an earlier Channel alive. Multiple Channels have
-independent lifetimes even when they share one ResourceBudget.
+independent lifetimes.
 Endpoint clones may retain inert service prototypes, never live handler
 futures or another connect's ingress runner.
 Receiving a physical error does not make old Peer/ReplyGrant/SendPermit values
@@ -82,7 +82,7 @@ follow a new generation; they remain retired capabilities.
 Await a send's write receipt, an RPC response, or a protocol-specific semantic
 ACK before releasing the last Channel owner when that completion matters.
 None is a general client-shutdown receipt. Retained messages and results keep their
-storage leases until their actual owners release them.
+shared backing storage alive until the last reference is dropped.
 
 ## Server drain
 
@@ -135,8 +135,8 @@ handle, not a furpc shutdown receipt.
 
 This relaxation does not weaken native stream safety. Once a connection is
 aborted its stream is never reused, and an abandoned committed frame cannot
-be followed by another frame on that stream. Retained allocations remain
-charged until released; requesting cancellation does not release their leases.
+be followed by another frame on that stream. Retained allocations follow their
+ordinary owners; cancellation does not invalidate surviving byte views.
 An outer `timeout_at` cancels the caller's wait and drops serving on expiry;
 use the shutdown signal instead when graceful completion is required.
 
@@ -186,8 +186,8 @@ supervision as another application protocol:
 - Owner/execution drop signals or aborts already-registered work; it must not
   require spawning a cleanup coordinator from `Drop`. Do not launch an
   untracked worker for every cancellation.
-- Keep leases with the tasks, futures, and storage that actually retain the
-  resources, including work still exiting after cancellation or an error.
+- Keep tasks, futures and buffers owned until their work exits, including after
+  cancellation or an error; do not attach allocation-budget leases.
 
 User code remains cooperative. Blocking handlers cannot be forcibly preempted;
 application-owned tasks require application-owned cancellation and waiting.
