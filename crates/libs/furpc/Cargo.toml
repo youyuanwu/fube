@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Service Fabric native RPC transport"
+
+[dependencies]
+fubst.workspace = true
