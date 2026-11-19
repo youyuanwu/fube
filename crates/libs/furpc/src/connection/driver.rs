@@ -31,6 +31,8 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DropReason {
     NoDestination,
+    UnknownActor,
+    RouteMiss,
     UnmatchedReply,
     SpecialDuplexUnavailable,
     Draining,

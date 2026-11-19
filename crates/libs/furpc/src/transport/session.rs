@@ -180,6 +180,8 @@ impl<I: TransportIo> Session<I> {
                                 DropReason::Capacity => Error::ResourceLimit("handler capacity"),
                                 DropReason::Draining => Error::Closed,
                                 DropReason::NoDestination => Error::Protocol("no ingress destination"),
+                                DropReason::UnknownActor => Error::InvalidInput("unknown ingress Actor"),
+                                DropReason::RouteMiss => Error::InvalidInput("unknown ingress Action"),
                                 DropReason::PolicyRejected => Error::Protocol("ingress policy rejected"),
                                 DropReason::UnmatchedReply => Error::Protocol("unmatched reply"),
                                 DropReason::SpecialDuplexUnavailable => Error::Unsupported("special duplex"),

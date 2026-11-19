@@ -53,6 +53,9 @@ capabilities available to a consumer.
 
 ## Application dispatcher selection
 
+Raw and Actor-dispatched ingress, whole-Actor bindings, and the optional exact
+Actor/Action Router are implemented. Specialized duplex remains deferred.
+
 Each logical Channel or server scope has at most one ordinary application
 dispatcher: raw ingress or Actor dispatch. A raw dispatcher has one
 [`ServiceBinding::raw`](Services.md#service-boundary-and-native-bindings).
