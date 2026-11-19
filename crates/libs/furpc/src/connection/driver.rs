@@ -34,11 +34,14 @@ pub(crate) enum DropReason {
     UnmatchedReply,
     SpecialDuplexUnavailable,
     Draining,
+    PolicyRejected,
+    Capacity,
 }
 
 #[derive(Debug)]
 pub(crate) enum ConnectionEvent {
     Opened(ListenInstance),
+    IngressAdmitted,
     InstanceUpdated(ListenInstance),
     Message(Message),
     Discarded(DropReason),
@@ -152,6 +155,7 @@ where
                 deadline: establishment_deadline,
                 operation: Operation::new(),
                 hello: true,
+                authorization: None,
             },
             config.wire,
             &config,
@@ -188,6 +192,23 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<ConnectionResult<Option<ConnectionEvent>>> {
+        self.poll_event_inner(cx, &mut |_, _| Ok(()), false)
+    }
+
+    pub(crate) fn poll_event_with_admission(
+        &mut self,
+        cx: &mut Context<'_>,
+        admit: &mut impl FnMut(&Headers, usize) -> Result<(), DropReason>,
+    ) -> Poll<ConnectionResult<Option<ConnectionEvent>>> {
+        self.poll_event_inner(cx, admit, true)
+    }
+
+    fn poll_event_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+        admit: &mut impl FnMut(&Headers, usize) -> Result<(), DropReason>,
+        notify_admission: bool,
+    ) -> Poll<ConnectionResult<Option<ConnectionEvent>>> {
         {
             let mut state = self.shared.state.lock().unwrap();
             if state.phase == Phase::Closed {
@@ -198,7 +219,7 @@ where
             }
             state.waker = Some(cx.waker().clone());
         }
-        match self.poll_running(cx) {
+        match self.poll_running(cx, admit, notify_admission) {
             Ok(Poll::Ready(None)) => Poll::Ready(match self.retire(None) {
                 Some(error) => Err(error),
                 None => Ok(None),
@@ -216,6 +237,8 @@ where
     fn poll_running(
         &mut self,
         cx: &mut Context<'_>,
+        admit: &mut impl FnMut(&Headers, usize) -> Result<(), DropReason>,
+        notify_admission: bool,
     ) -> ConnectionResult<Poll<Option<ConnectionEvent>>> {
         for _ in 0..self.config.work_steps {
             self.check_watchdogs()?;
@@ -258,7 +281,7 @@ where
             }
 
             if !self.read_eof && (!self.remote_received || self.hello_written) {
-                match self.poll_receive(cx)? {
+                match self.poll_receive(cx, admit, notify_admission)? {
                     ReceiveProgress::Event(event) => return Ok(Poll::Ready(Some(event))),
                     ReceiveProgress::Progress => progress = true,
                     ReceiveProgress::Pending => {}
@@ -331,6 +354,16 @@ where
             drop(state);
             self.finish_send(Err(error));
             return Ok(true);
+        }
+        if !operation.committed {
+            if let Some(authorization) = &active.job.authorization {
+                if let Err(error) = authorization.check() {
+                    drop(operation);
+                    drop(state);
+                    self.finish_send(Err(error.into()));
+                    return Ok(true);
+                }
+            }
         }
         let cursor = active.cursor.as_mut().expect("prepared send owns a cursor");
         if cursor.wire() != self.tx_wire {
@@ -420,7 +453,12 @@ where
         true
     }
 
-    fn poll_receive(&mut self, cx: &mut Context<'_>) -> ConnectionResult<ReceiveProgress> {
+    fn poll_receive(
+        &mut self,
+        cx: &mut Context<'_>,
+        admit: &mut impl FnMut(&Headers, usize) -> Result<(), DropReason>,
+        notify_admission: bool,
+    ) -> ConnectionResult<ReceiveProgress> {
         let work = WorkBudget::new(self.config.work_bytes, self.config.work_steps)?;
         match self.reader.step(&mut self.input, &self.rx_wire, work)? {
             FrameReadStep::NeedInput { max_bytes } => {
@@ -480,7 +518,12 @@ where
             }
             FrameReadStep::Headers(prefix) => {
                 let headers = Headers::from_received(prefix.area, &self.config.headers)?;
-                let kind = self.classify(&headers)?;
+                let mut kind = self.classify(&headers)?;
+                if matches!(kind, ReceiveKind::Application) {
+                    if let Err(reason) = admit(&headers, prefix.header.body_len() as usize) {
+                        kind = ReceiveKind::Discard(reason);
+                    }
+                }
                 let retained = !matches!(kind, ReceiveKind::Discard(_));
                 let decision = if retained {
                     BodyDecision::Retain(BodyPermit::new(prefix.frame, prefix.header)?)
@@ -497,7 +540,16 @@ where
                     headers: retained.then_some(headers),
                     kind,
                 });
-                Ok(ReceiveProgress::Progress)
+                if notify_admission
+                    && matches!(
+                        self.provisional.as_ref().unwrap().kind,
+                        ReceiveKind::Application
+                    )
+                {
+                    Ok(ReceiveProgress::Event(ConnectionEvent::IngressAdmitted))
+                } else {
+                    Ok(ReceiveProgress::Progress)
+                }
             }
             FrameReadStep::Complete(verified) => {
                 let provisional = self.take_provisional(verified.frame)?;

@@ -1,14 +1,45 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
-/// A native representation, configured-limit, or allocation failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Shared original error; equality identifies the same retained source.
+#[derive(Debug, Clone)]
+pub struct ErrorSource(Arc<dyn std::error::Error + Send + Sync>);
+
+impl PartialEq for ErrorSource {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for ErrorSource {}
+
+/// A native construction, transport, execution, or configured-policy failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     InvalidInput(&'static str),
     Protocol(&'static str),
     ResourceLimit(&'static str),
     Internal(&'static str),
-    NativeHeader { id: u16, source: fubst::Error },
-    UnsupportedSchema { id: u16, reason: &'static str },
+    NativeHeader {
+        id: u16,
+        source: fubst::Error,
+    },
+    UnsupportedSchema {
+        id: u16,
+        reason: &'static str,
+    },
+    Unsupported(&'static str),
+    Timeout(&'static str),
+    Closed,
+    Cancelled,
+    Transport {
+        phase: &'static str,
+        source: ErrorSource,
+    },
+    Handler {
+        phase: &'static str,
+        source: ErrorSource,
+    },
 }
 
 impl fmt::Display for Error {
@@ -22,6 +53,13 @@ impl fmt::Display for Error {
             Self::UnsupportedSchema { id, reason } => {
                 write!(f, "unsupported native header {id:#06x} schema: {reason}")
             }
+            Self::Unsupported(message) => write!(f, "unsupported native transport: {message}"),
+            Self::Timeout(phase) => write!(f, "native transport {phase} timed out"),
+            Self::Closed => f.write_str("native transport closed"),
+            Self::Cancelled => f.write_str("native operation cancelled"),
+            Self::Transport { phase, source } | Self::Handler { phase, source } => {
+                write!(f, "native transport {phase}: {}", source.0)
+            }
         }
     }
 }
@@ -30,7 +68,74 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NativeHeader { source, .. } => Some(source),
+            Self::Transport { source, .. } | Self::Handler { source, .. } => {
+                Some(source.0.as_ref())
+            }
             _ => None,
+        }
+    }
+}
+
+impl Error {
+    pub(crate) fn diagnostic(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::InvalidInput(detail) => ("invalid input", detail),
+            Self::Protocol(detail) => ("protocol", detail),
+            Self::ResourceLimit(detail) => ("resource limit", detail),
+            Self::Internal(detail) => ("internal", detail),
+            Self::NativeHeader { .. } => ("native header", "codec"),
+            Self::UnsupportedSchema { reason, .. } => ("unsupported schema", reason),
+            Self::Unsupported(detail) => ("unsupported", detail),
+            Self::Timeout(phase) => ("timeout", phase),
+            Self::Closed => ("closed", "retirement"),
+            Self::Cancelled => ("cancelled", "operation"),
+            Self::Transport { phase, .. } => ("transport", phase),
+            Self::Handler { phase, .. } => ("handler", phase),
+        }
+    }
+
+    pub(crate) fn transport(phase: &'static str, source: impl Into<BoxError>) -> Self {
+        Self::sourced(phase, source.into(), false)
+    }
+
+    pub(crate) fn handler(phase: &'static str, source: impl Into<BoxError>) -> Self {
+        Self::sourced(phase, source.into(), true)
+    }
+
+    fn sourced(phase: &'static str, source: BoxError, handler: bool) -> Self {
+        match source.downcast::<Self>() {
+            Ok(error) => *error,
+            Err(error) => {
+                let source = ErrorSource(Arc::from(error));
+                if handler {
+                    Self::Handler { phase, source }
+                } else {
+                    Self::Transport { phase, source }
+                }
+            }
+        }
+    }
+}
+
+impl From<Arc<crate::connection::ConnectionError>> for Error {
+    fn from(error: Arc<crate::connection::ConnectionError>) -> Self {
+        use crate::connection::ConnectionError;
+        match error.as_ref() {
+            ConnectionError::Native(error) => error.clone(),
+            ConnectionError::Frame(error) => error.clone().into(),
+            ConnectionError::Control(error) => match error {
+                fubst::Error::Protocol(message) => Self::Protocol(message),
+                fubst::Error::InvalidInput(message) => Self::InvalidInput(message),
+                fubst::Error::ResourceLimit(resource) => Self::ResourceLimit(resource),
+            },
+            ConnectionError::Timeout(phase) => Self::Timeout(phase),
+            ConnectionError::Unsupported(feature) => Self::Unsupported(feature),
+            ConnectionError::Cancelled => Self::Cancelled,
+            ConnectionError::Closed => Self::Closed,
+            ConnectionError::Io { phase, .. } => Self::Transport {
+                phase,
+                source: ErrorSource(error),
+            },
         }
     }
 }

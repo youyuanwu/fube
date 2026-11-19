@@ -125,7 +125,7 @@ pub(crate) struct ConnectionConfig {
 }
 
 impl ConnectionConfig {
-    fn validate(&self) -> ConnectionResult<()> {
+    pub(crate) fn validate(&self) -> ConnectionResult<()> {
         let valid_frame = |len| (FIXED_HEADER_LEN..=u32::MAX as usize).contains(&len);
         if !valid_frame(self.max_receive_frame_bytes)
             || self
@@ -157,6 +157,7 @@ struct Operation {
     committed: bool,
     cancelled: bool,
     result: Option<ConnectionResult<()>>,
+    settled_at: Option<Instant>,
     waker: Option<Waker>,
 }
 
@@ -166,6 +167,7 @@ impl Operation {
             committed: false,
             cancelled: false,
             result: None,
+            settled_at: None,
             waker: None,
         }))
     }
@@ -173,6 +175,7 @@ impl Operation {
     fn settle(&mut self, result: ConnectionResult<()>) -> Option<Waker> {
         if self.result.is_none() {
             self.result = Some(result);
+            self.settled_at = Some(Instant::now());
             self.waker.take()
         } else {
             None
@@ -186,6 +189,7 @@ struct SendJob {
     deadline: Instant,
     operation: Arc<Mutex<Operation>>,
     hello: bool,
+    authorization: Option<crate::peer::SendAuthorization>,
 }
 
 struct State {
@@ -237,6 +241,12 @@ impl Drop for ConnectionHandle {
 }
 
 impl ConnectionHandle {
+    pub(crate) fn observer(&self) -> ConnectionObserver {
+        ConnectionObserver {
+            shared: self.shared.clone(),
+        }
+    }
+
     pub(crate) fn phase(&self) -> Phase {
         self.shared.state.lock().unwrap().phase
     }
@@ -250,6 +260,18 @@ impl ConnectionHandle {
         message: Message,
         deadline: Instant,
     ) -> ConnectionResult<SendReceipt> {
+        self.send_authorized(message, deadline, None)
+    }
+
+    pub(crate) fn send_authorized(
+        &self,
+        message: Message,
+        deadline: Instant,
+        authorization: Option<crate::peer::SendAuthorization>,
+    ) -> ConnectionResult<SendReceipt> {
+        if let Some(authorization) = &authorization {
+            authorization.check()?;
+        }
         let config = &self.shared.config;
         message.validate(&config.headers, config.send_frame_limit())?;
         if native::is_control_actor(message.headers().effective().actor.get()) {
@@ -291,6 +313,7 @@ impl ConnectionHandle {
             deadline,
             operation: operation.clone(),
             hello: false,
+            authorization,
         });
         state.queued_bytes = after;
         state.pending_sends += 1;
@@ -334,6 +357,16 @@ impl ConnectionHandle {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ConnectionObserver {
+    shared: Arc<Shared>,
+}
+impl ConnectionObserver {
+    pub(crate) fn error(&self) -> Option<Arc<ConnectionError>> {
+        self.shared.state.lock().unwrap().terminal.clone()
+    }
+}
+
 /// Complete-local-write observation. Cancellation wins only before the first
 /// positive write under the same gate; dropping an observer cannot lose a suffix.
 pub(crate) struct SendReceipt {
@@ -342,6 +375,25 @@ pub(crate) struct SendReceipt {
 }
 
 impl SendReceipt {
+    pub(crate) fn attempt(&self) -> SendAttempt {
+        SendAttempt {
+            shared: self.shared.clone(),
+            operation: self.operation.clone(),
+        }
+    }
+
+    pub(crate) fn cancel(&self) -> bool {
+        self.attempt().cancel()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SendAttempt {
+    shared: Arc<Shared>,
+    operation: Arc<Mutex<Operation>>,
+}
+
+impl SendAttempt {
     pub(crate) fn cancel(&self) -> bool {
         // Lock order is always connection -> operation, including socket polling.
         let mut state = self.shared.state.lock().unwrap();
@@ -355,6 +407,27 @@ impl SendReceipt {
         drop(state);
         wake_if_some(wake);
         cancelled
+    }
+
+    pub(crate) fn settled_at(&self) -> Option<Instant> {
+        self.operation.lock().unwrap().settled_at
+    }
+
+    pub(crate) fn disposition(&self) -> crate::AttemptDisposition {
+        use crate::AttemptDisposition;
+        let operation = self.operation.lock().unwrap();
+        if operation.cancelled && !operation.committed {
+            AttemptDisposition::Retracted
+        } else {
+            match &operation.result {
+                Some(Ok(())) => AttemptDisposition::LocallyWritten,
+                Some(Err(_)) => AttemptDisposition::Retired {
+                    committed: operation.committed,
+                },
+                None if operation.committed => AttemptDisposition::Committed,
+                None => AttemptDisposition::Uncommitted,
+            }
+        }
     }
 }
 
