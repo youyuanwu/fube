@@ -121,7 +121,7 @@ commit gate, not delivery of a cancellation command, decides the result.
 committed, locally written, or retired with its commitment history.
 
 Drop is local abandonment, not remote cancellation. After commitment, the
-driver retains output and its charge independently of observers. An attempt
+driver retains output and its send-queue occupancy independently of observers. An attempt
 observer retains only bounded status, not the result payload or socket owner.
 
 ## Errors

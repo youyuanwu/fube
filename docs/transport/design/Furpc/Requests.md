@@ -50,7 +50,7 @@ representation, with no universal body trait or Serde bound:
 | --- | --- |
 | Outbound RPC or duplex notification | `Request<C::Encode>`, before body encoding. |
 | Client transport service / Channel | `Request<Body>`, after application encoding and before native request/correlation processing. |
-| Channel/server ingress service and router entry | `Request<Body>`, containing the admitted native message's leased, segmented bytes. |
+| Channel/server ingress service and router entry | `Request<Body>`, containing the admitted native message's shared, segmented bytes. |
 | Typed request or one-way handler | `Request<C::Decode>`, after its selected body codec. |
 
 `Request::new(body)` creates an outbound envelope with empty headers and no
@@ -103,8 +103,8 @@ policies, resource allowances, and deadline in private invocation state.
 Header edits cannot change them, repeat ingress authorization, mint a reply
 grant, or turn a one-way invocation into a request. A changed Timeout header
 does not extend the admitted deadline. Furpc dispatch/adaptation boundaries
-validate edited headers and account for newly retained storage under the
-original scope before using them; malformed records and exhausted limits
+validate edited headers under the original scope before using them;
+malformed records and exceeded native/configured limits
 return explicit errors. Routing remains within the
 [original admitted binding](Routing.md#matching-and-unknown-routes).
 
@@ -141,9 +141,8 @@ provenance. Replacing or swapping header collections never transfers context,
 admission, or reply authority with them.
 
 Request/parts do not initially implement `Clone`. Moving them preserves
-allocation leases and private context; retained header/body storage stays
-charged even after invocation completion. Body adaptation must use the existing
-bounded codec buffers and transfer charges rather than duplicate unaccounted storage.
+shared backing storage and private context. Body adaptation uses the existing
+codec buffers without adding allocation accounting.
 Arbitrary application allocations remain the application's responsibility.
 Retaining parts or a context-derived Peer cannot extend the invocation
 deadline, revive its private completion ticket, or hold graceful drain open.
@@ -191,7 +190,6 @@ where
 pub struct ClientCodecLimits {
     pub max_encoded_body_bytes: usize,
     pub max_response_body_bytes: usize,
-    pub max_decoded_bytes: usize,
 }
 
 impl<T> Response<T> {
@@ -220,7 +218,7 @@ impl ResponseParts {
 `Peer::request` is the explicit native byte-RPC capability: it captures the
 request and earlier explicit/local deadline without doing I/O at construction.
 First poll validates managed mode, captured request send policy, headers, and
-actual local/shared admission before any native transmission. Raw-only mode
+actual connection/queue admission before any native transmission. Raw-only mode
 fails Unsupported. It returns an owned native Operation with an Attempt;
 unlike generic RPC, it performs no application encoding or decoding. It neither
 implements Tower Service nor owns the driver. Dialed native callers obtain it
@@ -235,7 +233,7 @@ Follow [`http::Response<T>`][http-response]'s head/body ownership pattern,
 not its HTTP semantics. `ResponseParts::headers` is public and editable through
 the same bounded, fallible collection operations as `Response::headers_mut`.
 Source remains read-only. The parts sketch above omits additional private
-native settlement and accounting fields; there is no public constructor,
+native settlement fields; there is no public constructor,
 source setter, or mutable provenance view. Obtain synthetic parts by splitting
 `Response::new(body)`. Responses and their parts do not initially implement
 `Clone`.
@@ -249,7 +247,7 @@ metadata but cannot manufacture it.
 `into_parts` consumes the response and separates its head and body;
 `from_parts` reassembles those parts with a possibly different body type.
 `map` changes only the body. All three preserve current headers, private
-provenance, original native settlement timing, and applicable accounting.
+provenance and original native settlement timing.
 Use parts for fallible body conversion, propagating conversion errors rather
 than constructing a successful fallback. Neither reassembly nor header/body
 edits rerun native Fault classification, change correlation, or create send or
@@ -257,22 +255,15 @@ reply authority. Provenance describes the original exchange, not authentication
 of application-transformed headers or bodies. There are no HTTP status/version
 fields or unrestricted extensions bag.
 
-The returned `Response<T>` keeps its per-call tracked decoded-allocation
-charges. `into_parts` moves those charges into the parts, without treating
-decomposition as an application-ownership handoff; `from_parts` transfers them
-back. Retaining parts keeps the charges even while the plain body is separate.
-Dropping the response or parts releases their tracked charges; keeping a plain
-decoded value after dropping its parts is explicit application-managed
-ownership, just like extracting it with `into_body`. `into_body` returns only
-the body and drops the head. Embedded leased byte views always retain their
-own allocation leases, even after parts/head drop or extraction.
+The returned `Response<T>` owns an ordinary decoded value. `into_parts` and
+`from_parts` preserve metadata while moving that value; no hidden allocation
+charge follows the parts. `into_body` returns the body and drops the head.
+Shared byte views independently keep their backing storage alive.
 
 `body_mut` provides exclusive body access without exposing mutable trusted
-metadata. Body replacement and mapping do not implicitly admit arbitrary new
-allocations or erase existing tracked charges. Codec adapters still use their
-applicable bounded buffers and transfer charges on success; on conversion
-failure they release parts and temporary reservations unless explicitly
-retained by the caller. Arbitrary application allocations remain the
+metadata. Body replacement and mapping grant no native send or reply authority.
+On conversion failure, ordinary ownership drops parts and temporary storage
+unless the caller retains them. Application allocations remain the
 application's responsibility.
 
 ## Codec and call behavior
@@ -311,7 +302,7 @@ send authority, assigns managed IDs, installs pending correlation, and
 processes native Faults before returning a successful body. RPC adaptation
 neither inserts native correlation fields nor creates another reply pump.
 Custom transports must honor the same deadline and error contract; middleware
-must preserve request metadata, response provenance/leases, and cancellation
+must preserve request metadata, response provenance/storage, and cancellation
 rather than insert hidden retries or unbounded queues. A custom service may
 produce a response without a native source; see below.
 
@@ -336,23 +327,18 @@ cannot open another socket or create a competing reply pump. Domain success
 and any required Actor/Action on replies remain the domain adapter's responsibility.
 
 Client codec limits belong to `RpcClient<T>`, not T's hidden configuration.
-`ClientCodecLimits::default()` proposes 4 MiB encoded requests, 4 MiB response
-body input, and 8 MiB tracked decoded allocation per call. These are finite
-Rust policies, not native or tonic defaults. `codec_limits` checks arithmetic
-and representable sizes; zero means empty/allocation-free, not unlimited.
-Check response input before invoking its decoder, and bound encoding and
-tracked decoded growth before allocation. The fixed native serializer's
-limits remain independent.
+`ClientCodecLimits::default()` adds no ceiling below native frame capacity.
+Applications may explicitly narrow encoded request and response-input sizes;
+zero permits an empty body. Check response input before decoding and encoded
+output before submission. There is no decoded-allocation budget or mandatory
+extra depth/work cap. The fixed native serializer's settings remain independent.
 
 Generic client codec work is application-future-owned and cannot implicitly
-acquire an arbitrary T's private transport budget. Its per-call limits do not
-promise aggregate admission across concurrent caller futures. Channel admits
-the encoded storage, metadata, pending RPC, and retained byte response under
-its actual local/shared limits before retaining them. Already-leased storage
-keeps its charges without double-counting. Server and native duplex adapters
-still use their actual invocation/operation budgets. This explicit
-[budget handoff](Resources.md#serialization-and-body-budgets) replaces the old
-assumption that every typed client has direct access to a private connection budget.
+acquire an arbitrary T's private transport state. Channel applies native frame,
+send-queue and pending-operation policy at submission. Server and duplex
+adapters retain their own execution/deadline rules. No aggregate heap quota or
+allocation-budget handoff is implied; see the
+[resource boundary](Resources.md#serialization-and-body-budgets).
 
 `Request` exposes outbound domain envelope construction, not setters for
 managed IDs, reply flags, or source identity. Encoding and decoding run outside

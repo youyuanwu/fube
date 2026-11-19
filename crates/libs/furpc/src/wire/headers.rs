@@ -6,14 +6,14 @@
 //! Input storage is borrowed, not copied or admitted. All common occurrences
 //! are eagerly validated; unknown/deleted payloads stay opaque. Native strings
 //! remain borrowed UTF-16 bytes. Only fubst's bounded traversal scratch may
-//! allocate; this is not yet a leased, storage-owning message API.
+//! allocate; shared message ownership is implemented above this borrowed parser.
 //!
 //! Missing MessageId/RelatesTo components are explicitly unsupported for now:
 //! native initializes them with process-local generated IDs, not zero values.
 
 #![allow(
     dead_code,
-    reason = "Private header foundation awaits leased messages and the connection driver"
+    reason = "Private header foundation awaits the connection driver"
 )]
 
 use std::fmt;
@@ -88,6 +88,17 @@ pub(crate) struct HeaderDecodeContext {
 }
 
 impl HeaderDecodeContext {
+    pub(crate) fn native() -> Self {
+        Self {
+            limits: HeaderDecodeLimits {
+                max_bytes: MAX_NATIVE_HEADER_BYTES,
+                max_records: usize::MAX,
+                max_depth: usize::MAX,
+                max_work_bytes: usize::MAX,
+            },
+        }
+    }
+
     pub(crate) fn new(limits: HeaderDecodeLimits) -> HeaderResult<Self> {
         if limits.max_bytes > MAX_NATIVE_HEADER_BYTES {
             return Err(HeaderError::InvalidInput("header byte limit exceeds u16"));

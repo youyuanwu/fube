@@ -1,61 +1,56 @@
 use std::ops::Range;
 
 use crate::{
-    body::Body as StoredBody,
-    construction as policy,
-    resource::{admit_allocations, AllocationRef, ByteScope},
-    wire::headers::HeaderDecodeContext,
-    Error, HeaderRecord, Headers, Result,
+    body::Body as StoredBody, wire::headers::HeaderDecodeContext, Error, HeaderRecord, Headers,
+    Result,
 };
 
-/// Immutable segmented native bytes. Clones/slices preserve allocation leases.
+/// Immutable segmented native bytes. Clones and slices share backing storage.
 #[derive(Debug, Clone)]
 pub struct Body {
     inner: StoredBody,
 }
 
 impl Body {
+    pub(crate) fn from_stored(inner: StoredBody) -> Self {
+        Self { inner }
+    }
+
     pub const fn empty() -> Self {
         Self {
             inner: StoredBody::empty(),
         }
     }
 
-    /// Adopt caller bytes under standalone construction policy, without admission.
+    /// Adopt caller bytes without copying their payload.
     /// Empty inputs are discarded, including any unused capacity.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         Ok(Self {
-            inner: StoredBody::from_bytes(bytes, policy::BODY_LIMITS)?,
+            inner: StoredBody::from_bytes(bytes)?,
         })
     }
 
-    /// Compose bounded visible segments without copying payload bytes.
-    /// Existing leases survive; new segment bookkeeping remains unadmitted.
+    /// Compose visible segments without copying payload bytes.
     pub fn from_segments(segments: Vec<Body>) -> Result<Self> {
-        if segments.len() > policy::MAX_BODY_SEGMENTS {
-            return Err(Error::ResourceLimit("body segment count"));
-        }
         segments.iter().try_fold(0usize, |total, body| {
             total
                 .checked_add(body.len())
-                .filter(|len| *len <= policy::MAX_BODY_BYTES)
-                .ok_or(Error::ResourceLimit("constructed body bytes"))
+                .filter(|len| *len <= crate::body::MAX_BODY_BYTES)
+                .ok_or(Error::InvalidInput(
+                    "native body length exceeds frame capacity",
+                ))
         })?;
         let count = segments
             .iter()
             .flat_map(|body| body.inner.owned_segments())
-            .take(policy::MAX_BODY_SEGMENTS + 1)
             .count();
-        if count > policy::MAX_BODY_SEGMENTS {
-            return Err(Error::ResourceLimit("body segment count"));
-        }
         let mut stored = Vec::new();
         stored
             .try_reserve_exact(count)
             .map_err(|_| Error::ResourceLimit("body segment allocation"))?;
         stored.extend(segments.iter().flat_map(|body| body.inner.owned_segments()));
         Ok(Self {
-            inner: StoredBody::from_segments(stored, policy::BODY_LIMITS)?,
+            inner: StoredBody::from_segments(stored)?,
         })
     }
 
@@ -65,11 +60,6 @@ impl Body {
 
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
-    }
-
-    /// Full backing/metadata charge, not visible slice length or process RSS.
-    pub fn retained_bytes(&self) -> usize {
-        self.inner.retained_bytes()
     }
 
     /// A zero-copy view retaining the parent's entire segment table/backing.
@@ -82,10 +72,6 @@ impl Body {
     /// Borrowed views cannot outlive this body's allocation owners.
     pub fn segments(&self) -> impl Iterator<Item = &[u8]> {
         self.inner.segments()
-    }
-
-    fn allocations(&self) -> impl Iterator<Item = AllocationRef<'_>> + Clone {
-        self.inner.allocations()
     }
 }
 
@@ -139,25 +125,18 @@ impl Message {
         self.body
     }
 
-    /// Storage/preparation seam, not operation or authority admission. The driver
-    /// must call after resolving managed headers and recheck all send gates.
-    #[allow(dead_code, reason = "Preparation seam for the upcoming frame writer")]
-    pub(crate) fn admit_storage(
+    /// Native validation after managed headers are resolved, not send authority.
+    pub(crate) fn validate(
         &self,
         context: &HeaderDecodeContext,
         max_frame_bytes: usize,
-        scope: &ByteScope,
     ) -> Result<()> {
         self.headers.validate(context)?;
-        validate_envelope(self.headers.encoded_len(), self.body.len(), max_frame_bytes)?;
-        admit_allocations(
-            self.headers.allocations().chain(self.body.allocations()),
-            scope,
-        )
+        validate_envelope(self.headers.encoded_len(), self.body.len(), max_frame_bytes)
     }
 }
 
-/// Standalone bounded construction with a sticky first error.
+/// Standalone native envelope construction with a sticky first error.
 #[derive(Debug, Default)]
 pub struct MessageBuilder {
     headers: Headers,

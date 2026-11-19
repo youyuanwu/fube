@@ -119,7 +119,7 @@ continue to progress; it creates no new connection owner.
 
 The physical connection and generic supervisor remain internal. Replication
 composes Channels and a server under its domain supervisor, sharing protocol
-configuration and an aggregate resource budget where required. It does not
+configuration but keeping connection queue accounting independent. It does not
 need another public dialed-scope owner, protocol stack, or implicit pool.
 Channel's private supervisor retains one reusable connector and can replace a
 failed physical generation for later demand. Logical destination/registry and
@@ -147,7 +147,6 @@ crates/libs/furpc/src/
     server.rs            server configuration, execution, Rpc adapter re-export
     service.rs           method RPC adapters, bindings, responses, handler scope
     routing.rs           Actor/Action routing to byte-facing services
-    resource.rs          shared aggregate budgets and allocation leases
     wire/
         frame.rs          fixed header, CRC, incremental parsing
         headers.rs        records, public header namespace, typed native views
@@ -196,8 +195,7 @@ do not add a trait, boxed future, task, or queue for each conceptual boundary.
 | `Channel` | Cheap Clone, Send + Sync; sole built-in client Tower transport with mutable readiness/call. | Stable logical scope with a retained connector, current/retiring generations, and at most one reconnect attempt. Clones/service futures share ownership; no native request replay. |
 | `Server` | Not `Clone`; configuration and registration before execution. | Consumed by its single async serve API. |
 | Future returned by `serve_with_shutdown` | Owned `Send + 'static` future returning `Result<()>`, not a separate public wrapper type. | Drives acceptance and normal drain; drop requests cancellation without a post-drop join guarantee. |
-| `ResourceBudget` | `Clone`, `Send + Sync`. | Shared quota accounting, not I/O or lifecycle ownership. |
-| `Endpoint` | Clone, Send + Sync; URI/native policy, timeouts, shared budget, HandlerLimits, inert ingress service prototype, and optional special-duplex descriptor. Prototype synchronization permits Send-only service configuration without requiring Sync. | Inert configuration; constructors validate without DNS/I/O. Explicit connects clone unprepared service configuration into independent scopes; Endpoint clones create no runners or queues. |
+| `Endpoint` | Clone, Send + Sync; URI/native policy, timeouts, HandlerLimits, inert ingress service prototype, and optional special-duplex descriptor. Prototype synchronization permits Send-only service configuration without requiring Sync. | Inert configuration; constructors validate without DNS/I/O. Explicit connects clone unprepared service configuration into independent scopes; Endpoint clones create no runners or queues. |
 | Connector service | Reusable `Service<http::Uri>`, Send, with no Clone/Sync requirement; transferred once into Channel. | Retained for serialized initial/reconnect attempts. Each attempt receives the original parsed URI and polls/calls the same instance for fresh I/O/DNS; private supervision owns native setup/progress. |
 | `Accept` implementation | `Send`; polled through one mutable accept scope. | Transferred into a server when attached. |
 | `Connected<I>`, `Accepted<I>` | Not `Clone`; own an I/O object and metadata. | Transfer one unpublished byte stream into native establishment. |
@@ -208,18 +206,18 @@ do not add a trait, boxed future, task, or queue for each conceptual boundary.
 | `DuplexReceiver` | Not Clone; recv requires &mut self; unregister/drop ends its special-duplex registration. | Owns that separate registration/queue, independent of ordinary service dispatch, not a connection. |
 | `ReceivedMessage` | Not Clone; immutable direct special-duplex delivery and consumable reply authority. | Carries validated source, optional authorized Peer, and optional reply grant; no socket/task ownership. Ordinary services receive `Request<Body>` instead. |
 | `ReplyGrant` | Not Clone; public direct grants are limited to special-duplex delivery; reply consumes it. | One authorized attempt on the original connection. Ordinary ingress replies retain the grant privately in the runner, including through application queue processing. |
-| `Message`, `Body` | Immutable, shared storage; clones retain allocation leases. | Own byte storage, never socket/task lifetime. |
-| `Headers` | Ordered collection with bounded, fallible mutation through exclusive access; encoded records stay immutable and shared. Clones retain leases and edits cannot affect other views. | Owns header data, not provenance or admission; raw messages expose read-only access. |
-| `MessageBuilder` / `HeaderRecord` constructors | Standalone construction under finite construction ceilings. | Caller-owned data, not transport admission; submission applies the actual scope policy. |
+| `Message`, `Body` | Immutable, reference-counted shared storage. | Own byte storage, never socket/task lifetime or queue credit. |
+| `Headers` | Ordered collection with fallible atomic edits under native widths; encoded records stay immutable and shared. | Owns header data, not provenance or admission; raw messages expose read-only access. |
+| `MessageBuilder` / `HeaderRecord` constructors | Standalone construction under native representation limits only. | Caller-owned data, not transport admission; submission applies the actual scope policy. |
 | `Router` / `IngressService<S>` | Cloneable byte-facing configuration/bindings; IngressService needs Clone + Send, not Sync; Router retains its immutable route-sharing bounds. Raw or Actor dispatch. | Canonically installed on Endpoint, Channel, or ServerBuilder; owner tracks execution/replies under shared HandlerLimits. No public owner or mandatory inbox. |
 | `server::Rpc<C>` | Per-invocation codec adapter; methods take `&mut self`. No Clone/Sync requirement on its codec. | Decodes/calls/encodes within the supplied service future; no socket, admission pool, or reply grant. |
 | `RequestRouteOptions` / `OneWayRouteOptions` | Distinct immutable route-kind configuration with existing authorization and ingress/send limits. | A request option cannot be supplied to a one-way route or vice versa. |
-| `Request<B>` / `RequestParts` | http-shaped body-first envelope with editable headers and optional local deadline. No initial `Clone` implementation; context stays private and read-only. | Body adaptation preserves metadata, leases, and received context. Metadata edits cannot change original admission, correlation, policies, or server deadline; no reply grant or lifecycle ownership. |
+| `Request<B>` / `RequestParts` | http-shaped body-first envelope with editable headers and optional local deadline. No initial `Clone` implementation; context stays private and read-only. | Body adaptation preserves metadata, storage ownership, and received context. Metadata edits cannot change original admission, correlation, policies, or server deadline; no reply grant or lifecycle ownership. |
 | `RequestContext` | Read-only received context with private constructors; accessed through the request or its parts. | Original source/deadline and optional restricted Peer; not a message-construction dependency, reply authority, or a separate handler argument. |
 | `Reply<T>` / `IngressResponse` | Shared inbound-handler output data, not a send capability. | Channel/server ingress runner applies the original generation-bound response grant and completes transmission. |
 | `RpcClient<T>` | Clone when T is Clone; ordinary async calls use `&mut self`. T need not be Clone/Sync/static. | Owns a byte-facing transport and finite codec-limit policy, not a codec instance or native correlation. Channel is the default transport; lifetime follows T. Each call consumes a codec. |
-| `ClientCodecLimits` | Finite per-call codec policy, copied with client configuration. | Bounds application-owned encoding, response input, and tracked decoded allocation; does not expose a transport's private scope budget. |
-| `Response<T>` / `ResponseParts` | http-shaped body access, decomposition, and reassembly with editable ordered headers; no initial Clone. Native provenance/settlement stays private and read-only. | Parts preserve metadata and tracked decoded charges through body adaptation; embedded byte views retain leases independently. Synthetic services construct source-free responses. No socket/scope ownership. |
+| `ClientCodecLimits` | Optional per-call payload restrictions; defaults add no ceiling below native frame capacity. | Restricts encoded output and response input, not decoded heap allocation or a private transport budget. |
+| `Response<T>` / `ResponseParts` | http-shaped body access, decomposition, and reassembly with editable ordered headers; no initial Clone. Native provenance/settlement stays private and read-only. | Parts preserve metadata; decoded values have ordinary ownership and byte views share backing storage. Synthetic services construct source-free responses. |
 | `DuplexClient` | Clone, Send + Sync; notifications use `&self` and native owned operations. | Nonowning Peer plus explicit duplex policy; each notification owns its codec. This native-specific capability is separate from generic RPC transport. |
 | `Operation<T>` | Not `Clone`; owned `Send` future when its types are `Send`. | Observes one operation; driver owns admitted work independently. |
 | `Attempt` | `Clone`, nonowning. | Observes/retracts an uncommitted attempt without retaining its payload/result. |
@@ -227,10 +225,10 @@ do not add a trait, boxed future, task, or queue for each conceptual boundary.
 
 Channel already provides shared dialed ownership, without another public owner
 or Arc wrapper. A server is moved into its execution future; sharing application
-state does not require sharing a live Server owner. A Peer, message, receiver,
-or budget does not own either running scope. A Channel clone shares its dialed
+state does not require sharing a live Server owner. A Peer, message or receiver
+does not own either running scope. A Channel clone shares its dialed
 owner; RpcClient ownership follows its transport.
-Stopping one scope does not implicitly stop another sharing its budget.
+Stopping one scope does not implicitly stop another.
 Physical disconnect does not close the logical Channel or its ingress registry.
 Current, retiring, and reconnecting work share that scope's limits; only new
 calls can use a successfully published replacement generation.
@@ -266,7 +264,7 @@ Configuration has distinct responsibilities:
 | Configuration | Responsibility |
 | --- | --- |
 | Wire/security support | Selected source baseline and supported protection mode. |
-| Standalone construction | Finite construction-only header byte/work ceilings; no owner or transport reservation. Submission still applies scope policy. |
+| Standalone construction | Native widths and schema checks only; no extra capacity, segment, nesting or work quotas. Submission still applies scope policy. |
 | Native decode limits | Finite `TransportLimits` ceilings for native header/control strings, collections, objects, nesting, and extensions; no serializer selection. |
 | Application-body policy | Per-call client codecs and server method RPC adapters above messaging; routers only dispatch byte-facing services. Body-specific per-call/handler budgets and codec-local format/work limits remain separate. |
 | Connection limits | Frame admission, queued bytes, operation counts, handshake state, and timers. |
@@ -279,7 +277,7 @@ manual/Serde decoding use one internal validated context derived from
 `TransportLimits`. Native helpers must not silently reconstruct default
 decoders and lose the applicable limits or schema behavior.
 Standalone message/header constructors use the same fixed implementation with
-explicit finite construction-only ceilings; they do not capture scope policy.
+native representation limits; they do not capture scope policy.
 Submission validates against the actual scope before commitment. See the
 [construction/submission boundary](Messages.md#construction-and-submission-limits).
 
@@ -288,9 +286,9 @@ Application-body codecs belong above byte transport/native messaging.
 to a private connection budget; Channel applies actual transport admission to the
 encoded storage. Server and native duplex codecs use admitted invocation/
 operation budgets. Reusing `fubst` does not couple those configurations.
-Transport-retained storage remains charged to its actual local/shared ledger;
-generic client codec work is application-future-owned, not an implicit
-extension of that ledger. See the
+Shared byte storage follows reference-counted ownership independently of
+native send-queue byte counters. Generic client codec work and decoded values
+are application-owned. See the
 [budget boundary](Resources.md#serialization-and-body-budgets).
 
 Native semantics are the baseline, not a collection of unrelated `Native`

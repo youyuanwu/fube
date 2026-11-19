@@ -236,14 +236,14 @@ generations, not recreated as fresh per-generation capacity. An installed
 service is not a new public owner or continuous-reconnect demand.
 
 Queued old-generation special-duplex deliveries retain their immutable source, optional Peer,
-reply grant, leases, and original policy/deadline. They may be drained without
+reply grant, shared storage, and original policy/deadline. They may be drained without
 being reassigned to the replacement. Replying or ACKing through a retired
 generation fails with its cause; never send that work through a fresh Peer
 automatically. Source checks run for each newly admitted delivery. There is
 no total order across generations and no implicit domain-session continuity.
 Ingress limits cover the combined old/current special-duplex queue, not a new
 allowance per connection. Application-owned queues are outside the registry;
-queued requests retain their original context/leases and cannot keep a
+queued requests retain their original context/storage and cannot keep a
 cancelled service invocation live or replay it on a new generation.
 
 When its queue is empty, a pending Channel-backed DuplexReceiver::recv may demand

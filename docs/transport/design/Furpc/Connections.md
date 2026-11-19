@@ -12,7 +12,7 @@ shutdown and [services](Services.md) for canonical scope-owned ingress handlers.
 Follow [tonic's endpoint/custom-connector pattern][tonic-endpoint] and
 [hyper-util's connector model][hyper-connectors]: `Endpoint` is a configuration
 struct containing a destination `http::Uri`, native profile, finite transport limits,
-establishment timeout, optional shared budget, and ingress configuration.
+establishment timeout and ingress configuration.
 `Endpoint::connect` establishes an owning `Channel` using the built-in TCP
 connector; `connect_with_connector` transfers a reusable custom connector into
 that logical Channel for initial establishment and later reconnection. Both
@@ -148,7 +148,6 @@ impl Server {
 
 impl ServerBuilder {
     pub fn limits(self, limits: TransportLimits) -> Self;
-    pub fn resource_budget(self, budget: ResourceBudget) -> Self;
     pub fn handshake_timeout(self, timeout: Duration) -> Self;
     pub fn peer_ready_timeout(self, timeout: Duration) -> Self;
     pub fn on_peer_ready<S>(self, send_policy: SendPolicy, service: S) -> Result<Self>
@@ -167,7 +166,6 @@ impl Endpoint {
     pub fn uri(&self) -> &http::Uri;
 
     pub fn limits(self, limits: TransportLimits) -> Self;
-    pub fn resource_budget(self, budget: ResourceBudget) -> Self;
     pub fn connect_timeout(self, timeout: Duration) -> Self;
     pub fn connection_options(self, options: ConnectionOptions) -> Self;
 
@@ -333,14 +331,9 @@ Common construction rules:
   validate only components still present; it cannot recover text already
   discarded by the caller's parser. Percent-encoded component bytes are not a
   fragment delimiter and are not decoded into routing or security policy.
-- Bound input bytes and retained URI backing/metadata under documented finite
-  endpoint-construction ceilings before scanning/parsing/adoption/copying. Parsing
-  failure preserves its source as InvalidInput. An already allocated Uri or
-  byte buffer is caller-owned input; the API cannot undo that allocation or
-  retain oversized backing unchecked. If its retained backing cannot be
-  established, copy bounded URI components rather than adopting an unchecked
-  shared slice; preserve parsed component semantics. No constructor performs
-  DNS or I/O.
+- Preserve parsing failures as InvalidInput and retain the original URI
+  semantics for each connection attempt. Do not impose extra URI-construction
+  byte/work or backing-capacity quotas. No constructor performs DNS or I/O.
 
 The selected connector applies additional rules before I/O:
 
@@ -503,8 +496,8 @@ implement it above core without blocking the traffic needed to establish it.
 
 There is at most one admitted hook execution per accepted connection, including
 its readiness wait. Its service clone, future, timer, and completion metadata
-are reserved under the existing finite server connection/local/shared budget
-before retention. No unbounded ready-event queue or detached worker is added.
+are owned by that accepted connection. No separate allocation budget,
+unbounded ready-event queue or detached worker is added.
 Hook executions do not consume request-service `HandlerLimits` slots or readiness
 permits: holding those while waiting for a service-handled bootstrap response
 could exhaust the very handlers needed for progress. Outbound operations and
@@ -652,7 +645,7 @@ with a local absolute deadline. Calling without readiness returns InvalidInput
 with a service-contract phase, not an unbounded queue or a hidden wait.
 Missing/expired deadlines fail explicitly. Before driver retention/commit,
 validate headers, managed fields, send authority, actual frame size, and
-local/shared byte capacity. Capacity known
+native send-queue capacity. Capacity known
 only after seeing the request may still fail even after readiness succeeds.
 If the ready generation retires before native admission, fail this call with
 its cause instead of silently resubmitting to a replacement. A cached failed
@@ -666,7 +659,7 @@ committed native output remains driver-owned. Ordinary typed calls expose
 async cancellation, not a generic retraction receipt. Low-level byte operations
 retain [Attempt inspection](Operations.md#observation-and-cancellation).
 Application middleware/custom services must preserve absolute deadlines,
-native response metadata/leases, and cancellation, and must not silently retry
+native response metadata/storage, and cancellation, and must not silently retry
 or replay calls. Service readiness/call errors preserve their sources and
 phase; existing structured furpc errors retain their categories and disposition.
 Inbound ingress-service futures are separately tracked by that same logical
@@ -783,8 +776,8 @@ establishment or any hook-issued operation's deadline.
 
 ## Identity and domain recovery
 
-Peers that both dial and accept can [share a resource budget](Resources.md#peers-and-aggregate-resource-limits)
-without sharing connection state or merging their shutdown scopes.
+Peers that both dial and accept keep independent connection state, native
+send-queue counters and shutdown scopes. See [peer queue policy](Resources.md#peers-and-queue-limits).
 
 URI/logical destination, resolved socket address, physical generation, authenticated peer,
 advertised ListenInstance, and domain session identity are distinct. Equal
