@@ -4,15 +4,22 @@ use furpc::{
     ServiceBinding, TcpAcceptor,
 };
 use std::{
-    future::{ready, Ready},
+    cell::Cell,
+    future::{ready, Future, Ready},
+    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::sync::oneshot;
 use tower_service::Service;
+
+fn deadline() -> Instant {
+    Instant::now() + crate::DEFAULT_TIMEOUT
+}
 
 #[derive(Serialize)]
 struct NodeInstance(crate::NodeId, u64);
@@ -31,6 +38,62 @@ fn body(address: &str) -> Vec<u8> {
         ),
     })
     .unwrap()
+}
+
+fn response(body: Body) -> Response<Body> {
+    let mut response = Response::new(body);
+    for record in [
+        header::actor(ActorId::new(5).unwrap()).unwrap(),
+        header::action("PingRequest").unwrap(),
+        HeaderRecord::native(
+            HeaderId::new(CLIENT_VERSION).unwrap(),
+            &ProtocolVersion(1, 2),
+        )
+        .unwrap(),
+    ] {
+        response.headers_mut().append(record).unwrap();
+    }
+    response
+}
+
+struct Function<F> {
+    f: F,
+    ready: Cell<bool>,
+    delay: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+fn service<F>(f: F) -> Function<F> {
+    Function {
+        f,
+        ready: Cell::new(false),
+        delay: None,
+    }
+}
+
+impl<F, Fut, E> Service<Request<Body>> for Function<F>
+where
+    F: FnMut(Request<Body>) -> Fut,
+    Fut: Future<Output = std::result::Result<Response<Body>, E>>,
+{
+    type Response = Response<Body>;
+    type Error = E;
+    type Future = Fut;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), E>> {
+        if let Some(delay) = &mut self.delay {
+            std::task::ready!(delay.as_mut().poll(cx));
+        }
+        self.ready.set(true);
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        assert!(
+            self.ready.replace(false),
+            "same-instance readiness required"
+        );
+        (self.f)(request)
+    }
 }
 
 #[derive(Clone)]
@@ -171,22 +234,36 @@ async fn ping_preserves_error_categories_and_reuses_the_connection_after_bad_rep
                 stopped.await.unwrap();
             }),
     );
-    let client = FurpcClient::new(
+    let mut client = FurpcClient::new(
         FurpcClient::endpoint_clear(address)
             .unwrap()
             .connect()
             .await
             .unwrap(),
     );
-    for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
+    let now = Instant::now();
+    for expired in [now, now - Duration::from_nanos(1)] {
         assert!(matches!(
-            client.ping(Some(timeout)).await,
+            client.ping(Request::new(()), expired).await,
+            Err(FurpcClientError::Native(furpc::Error::Timeout(_)))
+        ));
+    }
+    if let Some(excessive) = now.checked_add(Duration::from_secs(i64::MAX as u64 / 10_000_000 + 1))
+    {
+        assert!(matches!(
+            client.ping(Request::new(()), excessive).await,
             Err(FurpcClientError::Native(furpc::Error::InvalidInput(_)))
         ));
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     for case in 0..11 {
-        let result = client.ping(None).await;
+        let result = client
+            .ping(Request::new(()), deadline())
+            .await
+            .map(|response| {
+                assert!(response.source().is_some());
+                response.into_body()
+            });
         match (case, result) {
             (0 | 10, Ok(gateway)) => {
                 assert_eq!(gateway.address, "gateway:19000");
@@ -206,25 +283,42 @@ async fn ping_preserves_error_categories_and_reuses_the_connection_after_bad_rep
             (case, result) => panic!("case {case}: {result:?}"),
         }
     }
-    let other = client.clone();
-    let (a, b) = tokio::try_join!(client.ping(None), other.ping(None)).unwrap();
-    assert_eq!(a, b);
+    let mut other = client.clone();
+    let (a, b) = tokio::try_join!(
+        client.ping(Request::new(()), deadline()),
+        other.ping(Request::new(()), deadline())
+    )
+    .unwrap();
+    assert_eq!(a.into_body(), b.into_body());
     assert_eq!(calls.load(Ordering::SeqCst), 13);
     drop(other);
-    assert!(client.ping(None).await.is_ok());
+    assert!(client.ping(Request::new(()), deadline()).await.is_ok());
+    let mut raw = FurpcClient::new(
+        FurpcClient::endpoint_clear(address)
+            .unwrap()
+            .connection_options(furpc::ConnectionOptions::raw_only())
+            .connect()
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        raw.ping(Request::new(()), deadline()).await,
+        Err(FurpcClientError::Native(furpc::Error::Unsupported(_)))
+    ));
+    drop((raw, client));
     stop.send(()).unwrap();
     serving.await.unwrap().unwrap();
 }
 
-#[test]
-fn segmented_ping_bodies_and_effective_version_keep_the_native_schema() {
+#[tokio::test]
+async fn segmented_ping_bodies_and_effective_version_keep_the_native_schema() {
     let encoded = body("native");
     let body = Body::from_segments(vec![
         Body::from_bytes(encoded[..7].to_vec()).unwrap(),
         Body::from_bytes(encoded[7..].to_vec()).unwrap(),
     ])
     .unwrap();
-    let mut response = Response::new(body);
+    let mut valid = Response::new(body);
     for record in [
         header::actor(ActorId::new(5).unwrap()).unwrap(),
         header::action("PingRequest").unwrap(),
@@ -239,17 +333,147 @@ fn segmented_ping_bodies_and_effective_version_keep_the_native_schema() {
         )
         .unwrap(),
     ] {
-        response.headers_mut().append(record).unwrap();
+        valid.headers_mut().append(record).unwrap();
     }
-    assert_eq!(decode_ping(&response).unwrap().address, "native");
-    response
+    let mut malformed = response(Body::from_bytes(encoded).unwrap());
+    malformed
         .headers_mut()
         .append(
             HeaderRecord::from_encoded(HeaderId::new(CLIENT_VERSION).unwrap(), vec![0xff]).unwrap(),
         )
         .unwrap();
+    let mut replies = [valid, malformed].into_iter();
+    let mut client = FurpcClient::new(service(move |_| {
+        ready(Ok::<_, furpc::Error>(replies.next().unwrap()))
+    }));
+    assert_eq!(
+        client
+            .ping(Request::new(()), deadline())
+            .await
+            .unwrap()
+            .body()
+            .address,
+        "native"
+    );
     assert!(matches!(
-        decode_ping(&response),
+        client.ping(Request::new(()), deadline()).await,
         Err(FurpcClientError::Decode(_))
     ));
+}
+
+#[tokio::test]
+async fn generic_ping_is_lazy_borrows_a_send_only_service_and_preserves_metadata() {
+    fn send<T: Send>(value: T) -> T {
+        value
+    }
+    let address = String::from("borrowed");
+    let calls = AtomicUsize::new(0);
+    let effective = deadline();
+    let extension = HeaderId::new(0x9000).unwrap();
+    let transport = service(|request: Request<Body>| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        assert!(request.body().is_empty());
+        assert_eq!(request.deadline(), Some(effective));
+        assert_eq!(request.headers().first_raw(extension).unwrap().value(), [7]);
+        let address = &address;
+        async move {
+            let mut response = response(Body::from_bytes(body(address)).unwrap());
+            response
+                .headers_mut()
+                .append(HeaderRecord::from_encoded(extension, vec![8]).unwrap())
+                .unwrap();
+            Ok::<_, furpc::Error>(response)
+        }
+    });
+    let mut client = FurpcClient::new(transport);
+    drop(client.ping(Request::new(()), effective));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let mut request = Request::new(())
+        .append_header(HeaderRecord::from_encoded(extension, vec![7]).unwrap())
+        .unwrap();
+    request.set_deadline(effective);
+    let response = send(client.ping(request, effective + Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(response.body().address, address);
+    assert!(response.source().is_none());
+    assert_eq!(
+        response.headers().first_raw(extension).unwrap().value(),
+        [8]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_uses_the_same_deadline_and_timeout_header_contains_remaining_time() {
+    let effective = Instant::now() + Duration::from_secs(5);
+    let transport = service(|request: Request<Body>| {
+        assert_eq!(request.deadline(), Some(effective));
+        #[derive(Deserialize)]
+        struct Timeout {
+            ticks: i64,
+        }
+        let timeout: Timeout = fubst::serde::from_slice(
+            request
+                .headers()
+                .first_raw(HeaderId::new(TIMEOUT).unwrap())
+                .unwrap()
+                .value(),
+        )
+        .unwrap();
+        assert_eq!(timeout.ticks, 30_000_000);
+        ready(Ok::<_, furpc::Error>(response(
+            Body::from_bytes(body("ready")).unwrap(),
+        )))
+    });
+    let mut client = FurpcClient::new(Function {
+        delay: Some(Box::pin(tokio::time::sleep(Duration::from_secs(2)))),
+        ..transport
+    });
+    let mut request = Request::new(());
+    request.set_deadline(effective);
+    assert!(client
+        .ping(request, effective + Duration::from_secs(30))
+        .await
+        .is_ok());
+
+    let calls = AtomicUsize::new(0);
+    let transport = service(|_: Request<Body>| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        ready(Ok::<_, furpc::Error>(response(Body::empty())))
+    });
+    let mut client = FurpcClient::new(Function {
+        delay: Some(Box::pin(tokio::time::sleep(Duration::from_secs(6)))),
+        ..transport
+    });
+    assert!(matches!(
+        client
+            .ping(Request::new(()), Instant::now() + Duration::from_secs(5))
+            .await,
+        Err(FurpcClientError::Native(furpc::Error::Timeout(_)))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn custom_transport_errors_keep_the_original_source() {
+    use std::error::Error;
+
+    let mut client = FurpcClient::new(service(|_: Request<Body>| {
+        ready(Err::<Response<Body>, _>(std::io::Error::other(
+            "custom transport",
+        )))
+    }));
+    let error = client.ping(Request::new(()), deadline()).await.unwrap_err();
+    let FurpcClientError::Native(furpc::Error::Transport { .. }) = &error else {
+        panic!("lost transport error: {error:?}");
+    };
+    let original = error
+        .source()
+        .unwrap()
+        .source()
+        .unwrap()
+        .downcast_ref::<std::io::Error>()
+        .unwrap();
+    assert_eq!(original.to_string(), "custom transport");
 }

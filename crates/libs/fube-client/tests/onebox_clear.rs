@@ -644,19 +644,24 @@ async fn onebox_ping_name_exists_and_node_list() {
         .connect()
         .await
         .expect("establish furpc with native gateway");
-    let furpc_client = FurpcClient::new(furpc_channel);
-    let furpc_clone = furpc_client.clone();
+    let mut furpc_client = FurpcClient::new(furpc_channel);
+    let mut furpc_clone = furpc_client.clone();
+    let mut furpc_third = furpc_client.clone();
+    let deadline = tokio::time::Instant::now() + DEFAULT_TIMEOUT;
     let (furpc_gateway, second, third) = tokio::try_join!(
-        furpc_client.ping(None),
-        furpc_clone.ping(None),
-        furpc_client.ping(None),
+        furpc_client.ping(furpc::Request::new(()), deadline),
+        furpc_clone.ping(furpc::Request::new(()), deadline),
+        furpc_third.ping(furpc::Request::new(()), deadline),
     )
     .expect("three furpc native pings on the shared channel");
+    let furpc_gateway = furpc_gateway.into_body();
+    let second = second.into_body();
+    let third = third.into_body();
     for actual in [&furpc_gateway, &second, &third] {
         assert_independent_gateway(actual, &config, node_id);
         assert_eq!(actual, &gateway, "furpc and legacy native identities match");
     }
-    drop((furpc_client, furpc_clone));
+    drop((furpc_client, furpc_clone, furpc_third));
     assert!(client
         .name_exists(&config.existing_name, None)
         .await

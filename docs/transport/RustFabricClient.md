@@ -35,41 +35,62 @@ SHA256 comparison passed. Repeated native SDK copy reliability is not claimed.
 ### Separate furpc-backed client
 
 `FurpcClient` is a new, minimal client alongside `FabricClient`, not a backend
-switch on the existing client. Its only remote API is `ping(timeout)`, returning
-the same GatewayDescription. It owns a furpc Channel and uses its native byte
-request/reply path directly; only the Ping/failure body schemas and public result
+switch on the existing client. Its only remote API is
+`ping(Request<()>, deadline)`, returning `Response<GatewayDescription>`.
+It follows tonic's generated-client style: `FurpcClient<T = furpc::Channel>`
+wraps a byte-facing Tower service, methods borrow `&mut self`, and callers
+explicitly clone cloneable clients for concurrency. `new(transport)` is local
+and inert; Endpoint still owns connection setup. Custom transports need not be
+Clone, Sync or static. Only the Ping/failure body schemas and public result
 models are shared with the existing client. No legacy Message, channel, typed
 budget or lifecycle is adopted.
 
 ```rust,no_run
 use fube_client::FurpcClient;
+use furpc::Request;
+use std::time::Duration;
+use tokio::time::Instant;
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let channel = FurpcClient::endpoint_clear("127.0.0.1:19000".parse()?)?
     .connect().await?;
-let client = FurpcClient::new(channel);
-let gateway = client.ping(None).await?;
+let mut client = FurpcClient::new(channel);
+let deadline = Instant::now() + Duration::from_secs(30);
+let gateway = client.ping(Request::new(()), deadline).await?.into_body();
 # let _ = gateway;
 # Ok(())
 # }
 ```
 
-The client sends an empty native PingRequest body with gateway Actor, activity,
-protocol 1.1 and remaining-time headers. It validates the effective reply
-Actor/Action and protocol version, and preserves native Fault, domain failure,
-malformed-body and protocol errors separately. One deadline covers Peer acquisition
-and RPC; a failed invocation is never replayed. Clones share Channel ownership
-and pending capacity, and the final owner drop closes it.
+The stub owns `RpcClient<GatewayService<T>>`. The gateway byte-service adapter
+forwards readiness to that exact transport instance, adds the remaining Timeout
+header after readiness, and captures reply validation in each call's future.
+It validates the reply envelope or decodes ClientOperationFailure before the
+success body codec. Ping's codec encodes unit to zero bytes, not a serialized
+unit object, and uses the native Fubst decoder for the successful Ping body.
+Gateway Actor, activity and protocol 1.1 remain method-owned native headers.
+
+The client preserves native Fault, domain failure, malformed-body and protocol
+errors separately, including original error sources. Response mapping preserves
+headers, native source and settlement metadata. The earlier explicit/request-local
+deadline covers encoding, readiness/reconnect, submission and receipt under
+furpc's on-time settlement rules; a failed invocation is never replayed.
+With the default transport, clones share Channel ownership and pending capacity,
+and the final owner drop closes it. This replaces the original immutable
+`ping(timeout) -> GatewayDescription` API, not the existing FabricClient API.
 
 The existing `onebox_ping_name_exists_and_node_list` test now also sends three
 overlapping pings on the new client and compares every full gateway identity with
 fresh HTTP management observations and the independent legacy native result.
 Its `furpc_ping` evidence is required by the existing onebox report validator;
 no separate fixture, test partition, or HTTP execution fallback was added.
-The baseline passed against a fresh five-node Service Fabric **11.8.121.4**
-onebox, including all three furpc pings and the existing seven baseline cases.
-This qualifies only the initiating clear-TCP Ping profile, not native
-notifications, accepted-side serving, TLS, or other furpc management operations.
+The original direct-Peer Ping implementation passed against a fresh five-node
+Service Fabric **11.8.121.4** onebox, including all three furpc pings and the
+existing seven baseline cases. The generic typed-stub refactor has local
+service/transport coverage and the same baseline updated for its API; a new live
+onebox run is still required. The earlier result qualifies only the initiating
+clear-TCP Ping profile, not native notifications, accepted-side serving, TLS,
+or other furpc management operations.
 
 ### Existing client
 

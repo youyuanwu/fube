@@ -2,9 +2,9 @@
 //!
 //! This package does not use the native Service Fabric client library.
 //! Existing [`FabricClient`] connections support bounded concurrency without
-//! automatic reconnect. The separate [`FurpcClient`] uses furpc's Channel lifecycle
-//! and currently provides only Ping. Both require an explicitly selected unsecured
-//! development gateway.
+//! automatic reconnect. The separate [`FurpcClient`] is a typed stub over a
+//! byte-facing Tower service, defaulting to furpc's Channel, and provides only Ping.
+//! Native connections require an explicitly selected unsecured development gateway.
 
 mod applications;
 mod channel_adapter;
