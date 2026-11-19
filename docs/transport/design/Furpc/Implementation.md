@@ -38,22 +38,30 @@ Deterministic I/O cases, backpressured in-memory exchange, and a loopback clear-
 exchange exercise this foundation. They are not native interoperability
 qualification.
 
-The generic `fube-client::FurpcClient` now qualifies Ping, NameExists and
-GetNodeList through RpcClient and byte-facing Tower services against a fresh
-Service Fabric 11.8.121.4 onebox. The existing baseline compares three cloned
-Pings and full native node identities with independent HTTP observations and
-the legacy native client. It also checks naming true/false, node filters,
+The generic `fube-client::FurpcClient` now qualifies Ping, NameExists,
+GetNodeList, application/service lists and node health through RpcClient and
+byte-facing Tower services against a fresh Service Fabric 11.8.121.4 onebox.
+The existing baseline compares three cloned
+Pings and full native node identities with independent HTTP observations.
+It also checks naming true/false, node filters,
 real server paging, native invalid-token failure and original-generation
 healthy reuse, and mixed-method concurrency. Required `furpc_ping` and
 `furpc_management` report fields retain those observations.
 The gateway adapter captures each method's selected reply validator before
 success-body decoding; shared native schemas do not route through legacy
 Messages, channels or retained-allocation budgets.
-GetNodeList uses a generic typed query codec with shared declarations and
+All four queries use a generic typed query codec with shared declarations and
 transport-independent list/item/empty reply profiles. Profile-specific actor,
-action, payload-tag and paging checks remain distinct; other query methods have
-not yet been exposed or native-qualified through FurpcClient.
-This is initiating clear-TCP evidence for those three operations only; it does
+action, payload-tag and paging checks remain distinct. The existing owned
+list/health scenarios also compare nonempty application/service fields, real
+continuations, parameter exclusion and all 17 health policy/filter cases against
+independent HTTP. Their evidence checks native errors,
+original-generation reuse and concurrent clones without new codecs or fixtures.
+The six legacy read methods and their typed-request adapters are retired;
+remaining legacy operations keep their own transport. Current proof gates use
+canonical furpc results and independent HTTP/source-derived expectations, not
+retained legacy implementations as comparison oracles.
+This is initiating clear-TCP evidence for those six operations only; it does
 not qualify accepted-side serving, notifications, TLS, or the rest of the gateway API. See the
 [client slice](../../RustFabricClient.md#separate-furpc-backed-client).
 

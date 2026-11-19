@@ -10,11 +10,13 @@ have been demonstrated against the repository's Ubuntu onebox running
 Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
 
-**Ordinary-channel migration:** all 16 existing ordinary operations now use
-GatewayChannel through a shared, sealed typed-call layer. Naming, all nine
-list/deployed-list queries, node health, resolution and MovePrimary retain their
-native schemas. `FabricClient` explicitly owns the channel; `GatewayClient`
-borrows a supplied binding. ServiceNotificationClient owns its **own**
+**Client migration:** Ping, NameExists, node/application/service lists and node
+health are implemented only by `FurpcClient` over furpc. Their old `FabricClient`
+methods, `PingRequest`, Exists naming variant and legacy query `ClientRequest`
+implementations have been removed. There is no compatibility wrapper or fallback.
+`FabricClient` and borrowed `GatewayClient` retain the legacy typed-call layer
+for naming writes, partition/replica/deployment queries, resolution and MovePrimary.
+ServiceNotificationClient owns its **own**
 notification-enabled GatewayChannel/native session; it does not adopt an
 ordinary client's channel or lifecycle. ImageStoreClient owns an independent
 GatewayChannel with registered raw ACK actors. Each client installs its own
@@ -34,14 +36,17 @@ SHA256 comparison passed. Repeated native SDK copy reliability is not claimed.
 
 ### Separate furpc-backed client
 
-`FurpcClient` is a new, minimal client alongside `FabricClient`, not a backend
-switch on the existing client. It implements three read-only native operations:
+`FurpcClient` is the canonical implementation of six read-only native operations.
+The remaining `FabricClient` API does not expose these operations:
 
 | Method | Typed request body | Typed response body |
 |---|---|---|
 | `ping` | `()` (zero native bytes) | `GatewayDescription` |
 | `name_exists` | `NamingUri` | `bool` |
 | `get_node_list` | `NodeQueryDescription` | `NodeListPage` |
+| `get_application_list` | `ApplicationQueryDescription` | `ApplicationListPage` |
+| `get_service_list` | `ServiceQueryDescription` | `ServiceListPage` |
+| `get_node_health` | `NodeHealthQueryDescription` | `NodeHealth` |
 
 Each method accepts `furpc::Request<T>` and an absolute deadline, and returns
 `furpc::Response<U>`.
@@ -49,8 +54,8 @@ It follows tonic's generated-client style: `FurpcClient<T = furpc::Channel>`
 wraps a byte-facing Tower service, methods borrow `&mut self`, and callers
 explicitly clone cloneable clients for concurrency. `new(transport)` is local
 and inert; Endpoint still owns connection setup. Custom transports need not be
-Clone, Sync or static. Native Ping/naming/query body schemas, validation and
-public models are shared with the existing client. No legacy Message, channel,
+Clone, Sync or static. Native body schemas, validation and public models are
+reused without legacy typed-request implementations. No legacy Message, channel,
 typed budget or lifecycle is adopted.
 
 ```rust,no_run
@@ -92,14 +97,20 @@ node schema; aggregate Actor/Action headers are optional but checked when presen
 Query error codes remain domain failures, and malformed typed payloads or
 disagreeing repeated node IDs cannot be hidden behind a nonzero query error.
 
-GetNodeList delegates to the private generic `query` helper and `QueryCodec<Q>`.
+All four queries delegate to the private generic `query` helper and `QueryCodec<Q>`.
 Query declarations supply the native name, Serde arguments, parameter checks,
-typed reply profile and record validation. Both clients share these declarations
-and transport-independent reply validation; only the legacy adapter consumes a
+typed reply profile and record validation. The remaining legacy query families
+reuse the same transport-independent framing and validation; only their adapter consumes a
 legacy Message. Profiles retain their own payload tags, list/item/empty shapes,
 required or optional Actor/Action headers, and strict or absent paging rules.
 The generic path supports paged and unpaged request descriptions without adding
 public methods for unmigrated queries.
+
+Application and ordinary application-scoped service lists use strict paging
+metadata and optional checked NamingGateway/QueryReply headers. Node health is
+an unpaged item requiring Actor 16 and OperationSuccessAction. It preserves the
+distinction between omitted and explicit policy overrides, and sends event
+filters as numeric-mask JSON. An unhealthy aggregate is successful data.
 
 Node filters and paging retain their native values and empty-string omission
 semantics. The new query codec does not adopt legacy standalone string/count
@@ -114,35 +125,52 @@ deadline covers encoding, readiness/reconnect, submission and receipt under
 furpc's on-time settlement rules; a failed invocation is never replayed.
 With the default transport, clones share Channel ownership and pending capacity,
 and the final owner drop closes it. This replaces the original immutable
-`ping(timeout) -> GatewayDescription` API, not the existing FabricClient API.
+`ping(timeout) -> GatewayDescription` API. The duplicate legacy read APIs have
+also been retired; callers must use this typed request/deadline interface.
 
 The existing `onebox_ping_name_exists_and_node_list` test now also sends three
 overlapping pings on the new client and compares every full gateway identity with
-fresh HTTP management observations and the independent legacy native result.
+fresh HTTP management observations.
 Its `furpc_ping` and `furpc_management` evidence is required by the existing onebox
 report validator; no separate fixture, test partition, or HTTP execution fallback
 was added. The generic typed Ping was first requalified against a fresh five-node
 Service Fabric **11.8.121.4** onebox. The extended baseline then passed NameExists
 true/false, native node identities and stable fields compared with HTTP and the
-legacy decoder, exact-name/status selection, real 2/2/1 server paging, native
+source-derived binary-port checks, exact-name/status selection, real 2/2/1 server paging, native
 invalid-token error and healthy reuse on the original furpc generation, and
-concurrent Ping/NameExists/GetNodeList on clones. The existing seven legacy
-baseline cases also passed. Reports retain actual node identities, page lengths,
+concurrent Ping/NameExists/GetNodeList on clones. Reports retain actual node identities, page lengths,
 native error provenance and native observation times; offline negative models
 reject missing, boolean-substituted or mismatched evidence.
 
-This qualifies only these three initiating clear-TCP operations on the observed
+The existing application/service-list and node-health scenarios also qualify
+the new client using owned fixtures and independent HTTP observations.
+The initial six-method archived run passed nonempty two-application/four-service
+comparisons, real 1/1 server paging for applications and each application's
+services, selectors and parameter exclusion, and all 17 node-health policy/filter
+cases including unhealthy success results. Missing application and node-health
+queries retained native errors **-2147017763** and **-2147017705**. Each scenario
+checked mixed concurrent clones and healthy reuse on its original furpc generation.
+Reports now retain one canonical furpc result plus the independent HTTP
+observations, not a second legacy implementation. CI compares complete list
+fields, health events/evaluations, TTLs and timestamps directly with those
+observations. Only native health-event LastModified timestamps may advance
+within the actual observation window. Legacy typed-slot/explicit-close cases
+are not imposed on furpc; its own transport suite covers managed lifecycle.
+The initial three archived scenarios passed together on Service Fabric
+**11.8.121.4**, also requalifying Ping, NameExists and GetNodeList after the
+generic-codec refactor.
+
+This qualifies only these six initiating clear-TCP operations on the observed
 runtime, not native notifications, accepted-side serving, TLS, other gateway
 operations, or the rest of the client migration.
 
-### Existing client
+### Remaining legacy client and operation inventory
 
 `fube-transport` implements bounded Fabric serialization, clear frames and CRCs,
 ordered native headers, client-only ListenInstance establishment, and
 continuously driven, bounded concurrent Tokio request/reply I/O. `fube-client`
-adds native gateway ping, NameExists, typed node/application/service pages, node health and
-single-name creation/deletion, with owned results and explicit errors. Additional
-typed pages cover service partitions, partition replicas/stateless instances and
+retains single-name creation/deletion, with owned results and explicit errors.
+Legacy typed pages cover service partitions, partition replicas/stateless instances and
 node-local deployed applications. Unpaged node/application-scoped lists inspect
 service packages, code packages and deployed replicas.
 Uncached resolution and independent notification sessions add endpoint discovery
@@ -173,9 +201,9 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 | Service notifications | Standalone noncloneable `ServiceNotificationClient`, independent connection/session/receiver, many owning RAII filter guards. Exact/prefix/primary-only registration, native updates, endpoint-count changes, primary replacement, empty invalidations, unregister and independent close qualified on 11.8.121.4. A lost successful ACK caused a real native retry without duplicate delivery. Distinct-address primary-only delivery remains separately unqualified. |
 | Native ImageStore package copy | Dedicated `ImageStoreClient`, v1.2 session/chunk/commit protocol and native AtomicCopy root replacement. Rust's complete inventory matched one native SDK predecessor minus a deliberate obsolete file, and independently matched local files/zero-byte postorder `_.dir` markers. Nested Unicode/space paths, empty files/directories, 7 MiB data, a 132 MiB binary, stale removal, provisioning/creation, independent live application contact and deployed Data SHA256 comparison passed on 11.8.121.4. Repeated native SDK copy reliability is not claimed. |
 | MovePrimary | Constraint-enforced native FM query with RS13/QueryReply and empty QueryResult. No force/ignore option. Current owned-fixture qualification records independent native/HTTP primary transition and cleanup. |
-| Native faults/errors | Typed Local/Transport/Protocol/Domain origins. Transport Fault retains its exact header code with a generic diagnostic, not optional native-body enrichment. Domain failures retain required native codes and valid diagnostic data. |
+| Native faults/errors | Remaining legacy methods use typed Local/Transport/Protocol/Domain origins. Furpc reads preserve Native/Decode/Protocol/Domain categories, including native Fault bodies and original sources. |
 | Concurrent operations | Mixed ping, NameExists, node-list and node-health queries on clones sharing one connection; real onebox coverage. Deterministic cancellation/late-reply safety remains model-covered. |
-| Idle disconnect | Real native ping through a test-owned proxy, followed by proxy cutoff; closure detected without another operation. |
+| Idle disconnect | Historical legacy proxy qualification is retired with its read façade; managed furpc lifecycle has its own transport coverage. |
 | Controls and stream lifecycle | Idle ListenInstance, deadlines, fragmentation, backpressure, correlation, cancellation, and close/drop; offline model-peer coverage. |
 
 Ordinary management requests advertise protocol **1.1**; native ImageStore
@@ -205,9 +233,9 @@ let client = FabricClient::new(channel.clone(), ClientOptions {
     ..ClientOptions::default()
 })?;
 let other = client.clone();
-let (gateway, exists) = tokio::try_join!(
-    client.ping(None),
-    other.name_exists("fabric:/Example", Some(Duration::from_secs(5))),
+let (created, deleted) = tokio::try_join!(
+    client.create_name("fabric:/First", None),
+    other.delete_name("fabric:/Second", Some(Duration::from_secs(5))),
 )?;
 channel.close(deadline_after(Duration::from_secs(30))?).await?;
 # Ok(())
@@ -349,16 +377,16 @@ let endpoint = "127.0.0.1:19000".parse().expect("IP socket endpoint");
 let channel = FabricClient::endpoint_clear(endpoint)?.connect().await?;
 let client = FabricClient::new(channel, ClientOptions::default())?;
 let clone = client.clone();
-let (gateway, exists) = tokio::try_join!(
-    client.ping(None),
-    clone.name_exists("fabric:/app/service", None),
+let (created, deleted) = tokio::try_join!(
+    client.create_name("fabric:/First", None),
+    clone.delete_name("fabric:/Second", None),
 )?;
 client.close().await?;
 # Ok(())
 # }
 ```
 
-The explicit owner is **cloneable**; operations take `&self` and share one
+The remaining legacy owner is **cloneable**; its operations take `&self` and share one
 GatewayChannel, target and typed budget. Default admission is **eight** retained
 calls, including ready-undelivered replies. The ninth fails immediately with a
 local resource error; there is no admission-waiter queue. Default lifetime
@@ -737,10 +765,10 @@ the emitted native request bytes, validation and CLI arguments are unchanged.
 ```rust,no_run
 use std::num::NonZeroU64;
 use fube_client::{
-    FabricClient, NodeQueryDescription, NodeQueryParameters, NodeStatusFilter, Paging,
+    FurpcClient, NodeQueryDescription, NodeQueryParameters, NodeStatusFilter, Paging,
 };
 
-# async fn pages(client: &FabricClient) -> Result<(), Box<dyn std::error::Error>> {
+# async fn pages(client: &mut FurpcClient, deadline: tokio::time::Instant) -> Result<(), Box<dyn std::error::Error>> {
 let mut query = NodeQueryDescription {
     parameters: NodeQueryParameters {
         status_filter: NodeStatusFilter::UP | NodeStatusFilter::DOWN,
@@ -752,7 +780,7 @@ let mut query = NodeQueryDescription {
     },
 };
 loop {
-    let page = client.get_node_list(&query, None).await?;
+    let page = client.get_node_list(furpc::Request::new(query.clone()), deadline).await?.into_body();
     for node in page.items {
         println!("{} {} {:?}", node.name, node.id, node.status);
     }
@@ -766,8 +794,8 @@ loop {
 ```
 
 The operation returns an owned `NodeListPage`; callers choose traversal and
-overall budgets. `get_node_list(&query, Some(duration))` supplies a per-request
-timeout, not a whole-traversal deadline. Nodes can change between pages; native
+overall budgets. Reusing the same absolute deadline bounds the whole traversal;
+choosing a new deadline gives each request a separate budget. Nodes can change between pages; native
 aggregation is best-effort when individual subqueries fail. **No continuation
 means paging ended, not proof that every aggregation source answered.**
 
@@ -795,15 +823,15 @@ call, without aborting the owner. Nonempty deactivation/safety variants have sou
 
 ```rust,no_run
 use fube_client::{
-    FabricClient, HealthEventsFilter, NodeHealthPolicy, NodeHealthQueryDescription,
+    FurpcClient, HealthEventsFilter, NodeHealthPolicy, NodeHealthQueryDescription,
     NodeHealthQueryParameters,
 };
 
-# async fn health(client: &FabricClient) -> Result<(), Box<dyn std::error::Error>> {
+# async fn health(client: &mut FurpcClient, deadline: tokio::time::Instant) -> Result<(), Box<dyn std::error::Error>> {
 let mut query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("N0020"));
 query.parameters.events_filter = Some(HealthEventsFilter::ERROR.into());
 query.parameters.health_policy = Some(NodeHealthPolicy { consider_warning_as_error: true });
-let health = client.get_node_health(&query, None).await?;
+let health = client.get_node_health(furpc::Request::new(query), deadline).await?.into_body();
 println!("{:?}", health.aggregated_health_state);
 for evaluation in health.unhealthy_evaluations {
     println!("{evaluation:?}");
@@ -812,8 +840,8 @@ for evaluation in health.unhealthy_evaluations {
 # }
 ```
 
-`get_node_health` uses one deadline from preparation through typed-observer
-decode, like node-list. `NodeHealth` owns its node name, event vector, aggregate
+`get_node_health` uses furpc's absolute deadline and on-time settlement rules,
+like node-list. `NodeHealth` owns its node name, event vector, aggregate
 `HealthState` and unhealthy evaluations. This is **actual detail health**, not
 `Node.health_state` from GetNodeList. Unhealthy aggregate is successful data;
 unknown node returns native `FABRIC_E_HEALTH_ENTITY_NOT_FOUND`
@@ -870,11 +898,12 @@ public C API pointer layout or safety-check-style derived scope.
 ```rust,no_run
 use std::{num::NonZeroU64, time::Duration};
 use fube_client::{
-    ApplicationListFilter, ApplicationQueryDescription, ApplicationQueryParameters, FabricClient,
+    ApplicationListFilter, ApplicationQueryDescription, ApplicationQueryParameters, FurpcClient,
     Paging, ServiceListFilter, ServiceQueryDescription, ServiceQueryParameters,
 };
 
-# async fn workloads(client: &FabricClient) -> Result<(), Box<dyn std::error::Error>> {
+# async fn workloads(client: &mut FurpcClient) -> Result<(), Box<dyn std::error::Error>> {
+let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 let mut applications = ApplicationQueryDescription {
     parameters: ApplicationQueryParameters {
         filter: ApplicationListFilter::TypeName("MyApplicationType".into()),
@@ -885,7 +914,7 @@ let mut applications = ApplicationQueryDescription {
         ..Default::default()
     },
 };
-let page = client.get_application_list(&applications, None).await?;
+let page = client.get_application_list(furpc::Request::new(applications.clone()), deadline).await?.into_body();
 for application in page.items {
     println!("{} {} {:?}", application.name, application.type_version, application.health_state);
 }
@@ -894,7 +923,7 @@ applications.paging.continuation_token = page.continuation_token;
 
 let mut services = ServiceQueryDescription::new(ServiceQueryParameters::new("fabric:/MyApplication".parse()?));
 services.parameters.filter = ServiceListFilter::TypeName("MyServiceType".into());
-let page = client.get_service_list(&services, Some(Duration::from_secs(5))).await?;
+let page = client.get_service_list(furpc::Request::new(services), deadline).await?.into_body();
 for service in page.items {
     println!("{} {:?} {:?}", service.name, service.kind, service.status);
 }
@@ -903,13 +932,11 @@ println!("continuation={:?}", page.continuation_token);
 # }
 ```
 
-`get_application_list` / `get_service_list` use the connection's configured
-default operation timeout when passed `None`, or an override with `Some(duration)`.
-Both use one deadline from preparation through admission, write waiting and
-typed-observer decode. Neither
-automatically pages, retries, reconnects or replays. Native errors stay
-`ClientError::Domain` and permit same-owner reuse; malformed successful domain
-results return `ClientError::Protocol` without failing independent neighbors.
+`get_application_list` / `get_service_list` take typed requests and absolute
+deadlines under furpc settlement rules. Neither automatically pages or replays
+a submitted operation; later independent calls may reconnect. Domain errors stay
+`FurpcClientError::Domain`, transport Faults remain native, and malformed bodies
+or protocol violations remain operation-local without failing independent neighbors.
 
 | Description | Selector and independent controls |
 |---|---|
@@ -1430,8 +1457,11 @@ structured URI object. Application/service result `name` fields,
 These field/constructor changes require callers to parse their names explicitly;
 Names remain strings in query JSON, with invalid names rejected earlier; the
 query-field JSON migration is described above.
-Naming methods accept `impl AsRef<str>`, so both existing string calls and
-`client.name_exists(&name, None)` with a `NamingUri` are supported.
+Legacy naming writes accept `impl AsRef<str>`. NameExists instead requires
+`FurpcClient::name_exists(Request::new(name), deadline)` with a checked `NamingUri`.
+
+The limits below belong to the remaining legacy transport/adapters, not the
+migrated furpc reads, which use their native frame/codec limits.
 
 | Resource | Limit |
 |---|---:|

@@ -1,4 +1,5 @@
 use super::*;
+use super::{legacy_reusable_reply as reusable_reply, write_probe};
 use std::{
     future::{poll_fn, Future},
     task::Poll,
@@ -190,13 +191,10 @@ async fn invalid_uri_and_budget_never_send_writes_and_keep_connection() {
     let server = tokio::spawn(async move {
         let mut stream = establish(listener).await;
         let request = read_message(&mut stream).await.unwrap();
-        assert_eq!(request.properties().unwrap().action, "NameExistsRequest");
-        write_message(
-            &mut stream,
-            &reply(&request, "NameOperationReply", naming_body(false, 0)),
-        )
-        .await
-        .unwrap();
+        assert_eq!(request.properties().unwrap().action, "CreateNameRequest");
+        write_message(&mut stream, &reply(&request, "NameOperationReply", vec![]))
+            .await
+            .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
     let channel = FabricClient::endpoint_clear(endpoint)
@@ -237,7 +235,10 @@ async fn invalid_uri_and_budget_never_send_writes_and_keep_connection() {
             ));
         }
     }
-    assert!(!client.name_exists("fabric:/neighbor", None).await.unwrap());
+    client
+        .create_name("fabric:/App_1/Name-2", None)
+        .await
+        .unwrap();
     client.close().await.unwrap();
     server.await.unwrap();
 }
@@ -262,7 +263,7 @@ async fn malformed_write_body_and_domain_envelope_are_call_local() {
             assert!(matches!(result, Err(ClientError::Protocol(_))));
             assert!(!client.is_closed());
             assert!(client.terminal_error().is_none());
-            client.ping(None).await.unwrap();
+            client.create_name("fabric:/Probe", None).await.unwrap();
             client.close().await.unwrap();
             server.await.unwrap();
         }
@@ -285,14 +286,11 @@ async fn malformed_write_is_call_local_and_pending_neighbor_succeeds() {
         write_message(&mut stream, &reply(&request, "NameOperationReply", vec![0]))
             .await
             .unwrap();
-        write_message(
-            &mut stream,
-            &reply(&neighbor, "NameOperationReply", naming_body(true, 0)),
-        )
-        .await
-        .unwrap();
+        write_message(&mut stream, &reply(&neighbor, "NameOperationReply", vec![]))
+            .await
+            .unwrap();
         let reuse = read_message(&mut stream).await.unwrap();
-        write_message(&mut stream, &ping_reply(&reuse))
+        write_message(&mut stream, &write_probe(&reuse))
             .await
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
@@ -312,7 +310,7 @@ async fn malformed_write_is_call_local_and_pending_neighbor_succeeds() {
     )
     .unwrap();
     let mutation = client.delete_name("fabric:/App_1/Name-2", None);
-    let neighbor = client.name_exists("fabric:/neighbor", None);
+    let neighbor = client.create_name("fabric:/App_1/Name-2", None);
     tokio::pin!(mutation, neighbor);
     poll_fn(|cx| {
         assert!(mutation.as_mut().poll(cx).is_pending());
@@ -321,16 +319,16 @@ async fn malformed_write_is_call_local_and_pending_neighbor_succeeds() {
     })
     .await;
     assert!(matches!(mutation.await, Err(ClientError::Protocol(_))));
-    assert!(neighbor.await.unwrap());
+    neighbor.await.unwrap();
     assert!(!client.is_closed());
     assert!(client.terminal_error().is_none());
-    client.ping(None).await.unwrap();
+    client.create_name("fabric:/Probe", None).await.unwrap();
     client.close().await.unwrap();
     server.await.unwrap();
 }
 
 #[tokio::test]
-async fn reordered_concurrent_writes_and_read_share_one_driver() {
+async fn reordered_concurrent_writes_share_one_driver() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -340,15 +338,11 @@ async fn reordered_concurrent_writes_and_read_share_one_driver() {
             requests.push(read_message(&mut stream).await.unwrap());
         }
         for request in requests.into_iter().rev() {
-            let body = if request.properties().unwrap().action == "NameExistsRequest" {
-                naming_body(true, 0)
-            } else {
-                check_request(
-                    &request,
-                    request.properties().unwrap().action == "DeleteNameRequest",
-                );
-                vec![]
-            };
+            check_request(
+                &request,
+                request.properties().unwrap().action == "DeleteNameRequest",
+            );
+            let body = vec![];
             write_message(&mut stream, &reply(&request, "NameOperationReply", body))
                 .await
                 .unwrap();
@@ -372,11 +366,11 @@ async fn reordered_concurrent_writes_and_read_share_one_driver() {
     let (create, delete, exists) = tokio::join!(
         client.create_name("fabric:/App_1/Name-2", None),
         client.delete_name("fabric:/App_1/Name-2", None),
-        client.name_exists("fabric:/neighbor", None),
+        client.create_name("fabric:/App_1/Name-2", None),
     );
     create.unwrap();
     delete.unwrap();
-    assert!(exists.unwrap());
+    exists.unwrap();
     client.close().await.unwrap();
     server.await.unwrap();
 }
@@ -403,13 +397,10 @@ async fn peer_observed_cancel_and_timeout_never_replay_writes_or_decode_late_rep
                 .unwrap();
                 // The next frame must be the survivor, never a replay.
                 let survivor = read_message(&mut stream).await.unwrap();
-                assert_eq!(survivor.properties().unwrap().action, "NameExistsRequest");
-                write_message(
-                    &mut stream,
-                    &reply(&survivor, "NameOperationReply", naming_body(true, 0)),
-                )
-                .await
-                .unwrap();
+                assert_eq!(survivor.properties().unwrap().action, "CreateNameRequest");
+                write_message(&mut stream, &reply(&survivor, "NameOperationReply", vec![]))
+                    .await
+                    .unwrap();
                 assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
             });
             let channel = FabricClient::endpoint_clear(endpoint)
@@ -453,10 +444,286 @@ async fn peer_observed_cancel_and_timeout_never_replay_writes_or_decode_late_rep
                 ));
             }
             release.send(()).unwrap();
-            assert!(client.name_exists("fabric:/neighbor", None).await.unwrap());
+            client
+                .create_name("fabric:/App_1/Name-2", None)
+                .await
+                .unwrap();
             assert!(!client.is_closed());
             client.close().await.unwrap();
             server.await.unwrap();
         }
+    }
+}
+
+#[tokio::test]
+async fn naming_deadline_precedes_and_includes_caller_conversion() {
+    struct InvalidConversion;
+    impl AsRef<str> for InvalidConversion {
+        fn as_ref(&self) -> &str {
+            panic!("invalid timeout must precede conversion")
+        }
+    }
+    struct SlowConversion;
+    impl AsRef<str> for SlowConversion {
+        fn as_ref(&self) -> &str {
+            std::thread::sleep(Duration::from_millis(20));
+            "fabric:/SlowConversion"
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = establish(listener).await;
+        let request = read_message(&mut stream).await.unwrap();
+        assert_eq!(request.properties().unwrap().action, "CreateNameRequest");
+        write_message(&mut stream, &write_probe(&request))
+            .await
+            .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
+        .await
+        .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        client
+            .create_name(InvalidConversion, Some(Duration::ZERO))
+            .await,
+        Err(ClientError::Local(Error::InvalidInput(_)))
+    ));
+    assert!(matches!(
+        client
+            .delete_name(InvalidConversion, Some(Duration::ZERO))
+            .await,
+        Err(ClientError::Local(Error::InvalidInput(_)))
+    ));
+    let tiny = Some(Duration::from_millis(5));
+    assert!(matches!(
+        client.create_name(SlowConversion, tiny).await,
+        Err(ClientError::Local(Error::Timeout))
+    ));
+    assert!(matches!(
+        client.delete_name(SlowConversion, tiny).await,
+        Err(ClientError::Local(Error::Timeout))
+    ));
+    client.create_name("fabric:/Probe", None).await.unwrap();
+    client.close().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn naming_conversion_input_is_not_retained_across_rpc() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    struct Input(Arc<AtomicBool>);
+    impl AsRef<str> for Input {
+        fn as_ref(&self) -> &str {
+            "fabric:/OwnedSnapshot"
+        }
+    }
+    impl Drop for Input {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let released = Arc::new(AtomicBool::new(false));
+    let observed = released.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = establish(listener).await;
+        let request = read_message(&mut stream).await.unwrap();
+        assert_eq!(request.properties().unwrap().action, "CreateNameRequest");
+        assert!(observed.load(Ordering::SeqCst));
+        write_message(&mut stream, &reply(&request, "NameOperationReply", vec![]))
+            .await
+            .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
+        .await
+        .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(client.create_name(Input(released), None).await.is_ok());
+    client.close().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn all_operations_select_optional_timeout_and_reject_invalid_overrides_without_sending() {
+    use fube_client::{
+        DeployedApplicationQueryDescription, DeployedApplicationQueryParameters,
+        DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
+        DeployedReplicaQueryDescription, DeployedReplicaQueryParameters,
+        DeployedServicePackageQueryDescription, DeployedServicePackageQueryParameters,
+        PartitionQueryDescription, PartitionQueryParameters, ReplicaQueryDescription,
+        ReplicaQueryParameters,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = establish(listener).await;
+        for budget in [
+            TIMEOUT_DURATION,
+            Duration::from_secs(1),
+            Duration::from_secs(6),
+        ] {
+            for _ in 0..8 {
+                let request = read_message(&mut stream).await.unwrap();
+                let ticks = request
+                    .headers
+                    .iter()
+                    .find(|header| header.id == TIMEOUT)
+                    .unwrap()
+                    .read(|decoder| decoder.i64())
+                    .unwrap();
+                let lower = (budget - Duration::from_secs(1)).as_nanos() as i64 / 100;
+                let upper = budget.as_nanos() as i64 / 100;
+                assert!(
+                    ticks > lower && ticks <= upper,
+                    "{ticks}: budget {budget:?}"
+                );
+                let mut response = reply(&request, "ClientOperationFailure", vec![]);
+                response.headers.push(
+                    Header::object(FAULT, |encoder| {
+                        encoder.i64(REMOTE_CODE).unwrap();
+                        encoder.boolean(false).unwrap();
+                        Ok(())
+                    })
+                    .unwrap(),
+                );
+                write_message(&mut stream, &response).await.unwrap();
+            }
+        }
+        let request = read_message(&mut stream).await.unwrap();
+        assert_eq!(request.properties().unwrap().action, "CreateNameRequest");
+        let mut response = write_probe(&request);
+        response.headers.push(Header::version(1, 1).unwrap());
+        write_message(&mut stream, &response).await.unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
+        .await
+        .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for (timeout, valid) in [
+        (None, true),
+        (Some(Duration::from_secs(1)), true),
+        (Some(Duration::from_secs(6)), true),
+        (Some(Duration::ZERO), false),
+        (Some(Duration::from_nanos(99)), false),
+        (Some(Duration::MAX), false),
+    ] {
+        macro_rules! check {
+            ($method:ident $(, $argument:expr)?) => {
+                let result = client.$method($($argument,)? timeout).await;
+                if valid {
+                    assert!(matches!(
+                        result,
+                        Err(ClientError::Transport(Error::Remote { code: REMOTE_CODE, .. }))
+                    ), "{}: {result:?}", stringify!($method));
+                } else {
+                    assert!(matches!(result, Err(ClientError::Local(Error::InvalidInput(_)))),
+                        "{}: {result:?}", stringify!($method));
+                }
+                assert!(!client.is_closed());
+            };
+        }
+
+        check!(create_name, "fabric:/Model");
+        check!(delete_name, "fabric:/Model");
+
+        check!(
+            get_partition_list,
+            &PartitionQueryDescription::new(PartitionQueryParameters::new(
+                "fabric:/Model/Service".parse().unwrap()
+            ))
+        );
+        check!(
+            get_replica_list,
+            &ReplicaQueryDescription::new(ReplicaQueryParameters::new(
+                uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap()
+            ))
+        );
+        check!(
+            get_deployed_application_list,
+            &DeployedApplicationQueryDescription::new(DeployedApplicationQueryParameters::new(
+                "N0010"
+            ))
+        );
+        check!(
+            get_deployed_service_package_list,
+            &DeployedServicePackageQueryDescription::new(
+                DeployedServicePackageQueryParameters::new(
+                    "N0010",
+                    "fabric:/Model".parse().unwrap()
+                )
+            )
+        );
+        check!(
+            get_deployed_code_package_list,
+            &DeployedCodePackageQueryDescription::new(DeployedCodePackageQueryParameters::new(
+                "N0010",
+                "fabric:/Model".parse().unwrap()
+            ))
+        );
+        check!(
+            get_deployed_replica_list,
+            &DeployedReplicaQueryDescription::new(DeployedReplicaQueryParameters::new(
+                "N0010",
+                "fabric:/Model".parse().unwrap()
+            ))
+        );
+    }
+    client.create_name("fabric:/Probe", None).await.unwrap();
+    client.close().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn client_validates_timeout_before_connecting() {
+    let endpoint: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
+        assert!(matches!(
+            FabricClient::endpoint_clear(endpoint)
+                .unwrap()
+                .connect_timeout(timeout)
+                .connect()
+                .await,
+            Err(Error::InvalidInput(_))
+        ));
     }
 }

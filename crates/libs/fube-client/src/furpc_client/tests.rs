@@ -19,6 +19,7 @@ use tower_service::Service;
 
 mod methods;
 mod queries;
+mod read_queries;
 
 fn deadline() -> Instant {
     Instant::now() + crate::DEFAULT_TIMEOUT

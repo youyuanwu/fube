@@ -1,4 +1,4 @@
-//! Bounded handwritten adapters for ordinary gateway calls.
+//! Legacy bounded adapters for the remaining ordinary gateway calls.
 //!
 //! [`GatewayClient`] borrows a foundation; it never clones, adopts or closes its
 //! channel. [`crate::FabricClient`] is the separate designated lifecycle owner.
@@ -51,8 +51,8 @@ pub type ClientResult<T> = std::result::Result<T, ClientError<DomainFailure>>;
 /// The sealed schemas contain no recursive user-defined visitors. The static
 /// table below checks each allocating element against its minimum consumed wire
 /// extent (32 bytes of element per byte). Object-array records consume >=12
-/// bytes; counted strings consume >=1. Node's 21 required fields and code
-/// package's two required embedded objects strengthen their minimums.
+/// bytes; counted strings consume >=1. The code package's two required embedded
+/// objects strengthen its minimum.
 ///
 /// Per decoded tree, geometric Vec growth/overlap is <=8x element storage
 /// (256x wire), including the native pointer-slot conversion. Pairs-to-BTreeMap
@@ -74,26 +74,19 @@ const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 // fubst checks array framing before allocating.
 // Even null native pointer slots occupy their enclosing 12-byte object. The
-// two larger records have required, non-optional minimum extents as documented
-// above; absent version suffixes do not remove those fields/embedded objects.
+// code-package record has required embedded objects as documented above;
+// absent version suffixes do not remove those embedded objects.
 macro_rules! element_bound {
     ($type:ty, $minimum:expr) => {
         const _: () = assert!(size_of::<$type>() <= 32 * $minimum);
     };
 }
-element_bound!(Node, 12 + 21);
 element_bound!(DeployedCodePackage, 12 + 2 * 12);
-element_bound!(NodeDeactivationTask, 12);
-element_bound!(Option<SafetyCheck>, 12);
-element_bound!(Application, 12);
-element_bound!(Service, 12);
 element_bound!(Partition, 12);
 element_bound!(Replica, 12);
 element_bound!(DeployedApplication, 12);
 element_bound!(DeployedServicePackage, 12);
 element_bound!(DeployedReplica, 12);
-element_bound!(HealthEvent, 12);
-element_bound!(Option<HealthEvaluation>, 12);
 element_bound!(ServiceEndpoint, 1);
 element_bound!(String, 1);
 element_bound!((String, String), 12);
@@ -358,31 +351,7 @@ fn decode_domain<T>(
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct PingRequest;
-impl sealed::Request for PingRequest {
-    fn input_bytes(&self) -> usize {
-        size_of::<Self>()
-    }
-}
-impl ClientRequest for PingRequest {
-    type Response = GatewayDescription;
-    type ReplyState = ();
-    type DomainError = DomainFailure;
-    fn encode(self, context: &CallContext) -> Result<(Message, ())> {
-        Ok((wire("PingRequest", vec![], vec![], context)?, ()))
-    }
-    fn decode(
-        _: (),
-        reply: Message,
-        _: &CallContext,
-    ) -> std::result::Result<Self::Response, ReplyError<DomainFailure>> {
-        decode_domain(&reply, protocol::decode_ping)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
 pub enum NameOperation {
-    Exists,
     Create,
     Delete,
 }
@@ -397,19 +366,17 @@ impl sealed::Request for NameRequest {
         size_of::<Self>() + self.name.capacity()
     }
 }
-/// Naming results distinguish reads from explicit writes.
+/// Successful completion of an explicit naming write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameResponse {
-    Exists(bool),
     Written,
 }
 impl ClientRequest for NameRequest {
     type Response = NameResponse;
-    type ReplyState = NameOperation;
+    type ReplyState = ();
     type DomainError = DomainFailure;
-    fn encode(self, context: &CallContext) -> Result<(Message, NameOperation)> {
+    fn encode(self, context: &CallContext) -> Result<(Message, ())> {
         let (action, headers) = match self.operation {
-            NameOperation::Exists => ("NameExistsRequest", vec![]),
             NameOperation::Create => ("CreateNameRequest", vec![]),
             NameOperation::Delete => (
                 "DeleteNameRequest",
@@ -423,17 +390,16 @@ impl ClientRequest for NameRequest {
                 protocol::encode_name(self.name.as_str())?,
                 context,
             )?,
-            self.operation,
+            (),
         ))
     }
     fn decode(
-        operation: NameOperation,
+        _: (),
         reply: Message,
         _: &CallContext,
     ) -> std::result::Result<NameResponse, ReplyError<DomainFailure>> {
-        decode_domain(&reply, |reply| match operation {
-            NameOperation::Exists => protocol::decode_name_exists(reply).map(NameResponse::Exists),
-            _ => protocol::decode_name_write(reply).map(|()| NameResponse::Written),
+        decode_domain(&reply, |reply| {
+            protocol::decode_name_write(reply).map(|()| NameResponse::Written)
         })
     }
 }
@@ -470,27 +436,6 @@ macro_rules! queries {
     };
 }
 queries!(
-    NodeQueryDescription,
-    NodeQueryParameters,
-    NodeListPage,
-    self,
-    Some(&self.paging)
-);
-queries!(
-    ApplicationQueryDescription,
-    ApplicationQueryParameters,
-    ApplicationListPage,
-    self,
-    Some(&self.paging)
-);
-queries!(
-    ServiceQueryDescription,
-    ServiceQueryParameters,
-    ServiceListPage,
-    self,
-    Some(&self.paging)
-);
-queries!(
     PartitionQueryDescription,
     PartitionQueryParameters,
     PartitionListPage,
@@ -510,13 +455,6 @@ queries!(
     DeployedApplicationListPage,
     self,
     Some(&self.paging)
-);
-queries!(
-    NodeHealthQueryDescription,
-    NodeHealthQueryParameters,
-    NodeHealth,
-    self,
-    None
 );
 queries!(
     DeployedServicePackageQueryDescription,
@@ -557,27 +495,6 @@ macro_rules! inputs {
 fn optional(value: &Option<String>) -> usize {
     value.as_ref().map_or(0, String::capacity)
 }
-inputs!(NodeQueryParameters, self, optional(&self.node_name));
-inputs!(NodeHealthQueryParameters, self, self.node_name.capacity());
-inputs!(
-    ApplicationQueryParameters,
-    self,
-    match &self.filter {
-        ApplicationListFilter::Name(name) => name.capacity(),
-        ApplicationListFilter::TypeName(name) => name.capacity(),
-        _ => 0,
-    }
-);
-inputs!(
-    ServiceQueryParameters,
-    self,
-    self.application_name.capacity()
-        + match &self.filter {
-            ServiceListFilter::Name(name) => name.capacity(),
-            ServiceListFilter::TypeName(name) => name.capacity(),
-            _ => 0,
-        }
-);
 inputs!(PartitionQueryParameters, self, self.service_name.capacity());
 inputs!(ReplicaQueryParameters, self, 0);
 inputs!(
@@ -946,12 +863,28 @@ mod tests {
             .unwrap(),
         )));
         assert!(matches!(
-            client.call(PingRequest, context()).await,
+            client
+                .call(
+                    NameRequest {
+                        name: "fabric:/Probe".parse().unwrap(),
+                        operation: NameOperation::Create
+                    },
+                    context()
+                )
+                .await,
             Err(ClientError::Domain(DomainFailure { code: -456, .. }))
         ));
         *channel.result.lock().unwrap() = Some(Ok(failure(vec![])));
         assert!(matches!(
-            client.call(PingRequest, context()).await,
+            client
+                .call(
+                    NameRequest {
+                        name: "fabric:/Probe".parse().unwrap(),
+                        operation: NameOperation::Create
+                    },
+                    context()
+                )
+                .await,
             Err(ClientError::Protocol(_))
         ));
         let mut oversized = String::with_capacity(MAX_INPUT_BYTES + 1);
@@ -959,7 +892,9 @@ mod tests {
         assert!(matches!(
             client
                 .call(
-                    NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(oversized)),
+                    DeployedApplicationQueryDescription::new(
+                        DeployedApplicationQueryParameters::new(oversized)
+                    ),
                     context()
                 )
                 .await,
@@ -986,19 +921,12 @@ mod tests {
     #[test]
     fn fixed_schema_allocation_elements_fit_the_documented_bound() {
         for size in [
-            size_of::<Node>(),
-            size_of::<NodeDeactivationTask>(),
-            size_of::<SafetyCheck>(),
-            size_of::<Application>(),
-            size_of::<Service>(),
             size_of::<Partition>(),
             size_of::<Replica>(),
             size_of::<DeployedApplication>(),
             size_of::<DeployedServicePackage>(),
             size_of::<DeployedCodePackage>(),
             size_of::<DeployedReplica>(),
-            size_of::<HealthEvent>(),
-            size_of::<HealthEvaluation>(),
             size_of::<ServiceEndpoint>(),
         ] {
             assert!(size <= 1024, "fixed heap element is {size} bytes");
@@ -1015,15 +943,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_allocating_lengths_are_rejected_before_unbounded_decode() {
-        use fubst::{serde::to_vec, Encoder, MAX_STRING_UNITS};
-        #[derive(serde::Serialize)]
-        struct Instance(NodeId, u64);
-        #[derive(serde::Serialize)]
-        struct Gateway(String, Instance, String);
-        #[derive(serde::Serialize)]
-        struct Ping {
-            gateway: Gateway,
-        }
+        use fubst::{Encoder, MAX_STRING_UNITS};
         let channel = Stub::new(true);
         let client = GatewayClient::new(
             ClientBinding {
@@ -1035,29 +955,43 @@ mod tests {
         .unwrap();
         // A valid maximum string, then same-sized count edits. Outer scopes
         // remain well framed: rejection must reach the allocating length check.
-        let body = to_vec(&Ping {
-            gateway: Gateway(
-                "g".repeat(MAX_STRING_UNITS),
-                Instance(NodeId { high: 1, low: 2 }, 3),
-                "N0010".into(),
-            ),
-        })
-        .unwrap();
-        let ping = |body| Message {
+        let mut encoder = Encoder::new();
+        encoder
+            .object(|e| {
+                e.i64(2)?;
+                e.pointer(Some(&10i32.to_le_bytes()), |e| {
+                    e.object_array(&[()], |e, _| {
+                        e.string(&"g".repeat(MAX_STRING_UNITS))?;
+                        e.string("Type")?;
+                        e.i64(1)?;
+                        for _ in 0..3 {
+                            e.string("")?;
+                        }
+                        e.i64(1)
+                    })?;
+                    e.pointer(None, |_| Ok(()))
+                })?;
+                e.i64(0)?;
+                e.pointer(None, |_| Ok(()))
+            })
+            .unwrap();
+        let body = encoder.finish();
+        let reply = |body| Message {
             headers: vec![
                 Header::actor(5).unwrap(),
-                Header::action("PingRequest").unwrap(),
-                Header::version(1, 1).unwrap(),
+                Header::action("QueryReply").unwrap(),
             ],
             body,
         };
-        *channel.result.lock().unwrap() = Some(Ok(ping(body.clone())));
+        let request = || {
+            DeployedApplicationQueryDescription::new(DeployedApplicationQueryParameters::new(
+                "N0010",
+            ))
+        };
+        *channel.result.lock().unwrap() = Some(Ok(reply(body.clone())));
         assert_eq!(
-            client
-                .call(PingRequest, context())
-                .await
-                .unwrap()
-                .address
+            client.call(request(), context()).await.unwrap().items[0]
+                .name
                 .len(),
             MAX_STRING_UNITS
         );
@@ -1068,9 +1002,9 @@ mod tests {
         for ending in [1, 0x7f] {
             let mut invalid = body.clone();
             invalid[count + 3] = ending;
-            *channel.result.lock().unwrap() = Some(Ok(ping(invalid)));
+            *channel.result.lock().unwrap() = Some(Ok(reply(invalid)));
             assert!(matches!(
-                client.call(PingRequest, context()).await,
+                client.call(request(), context()).await,
                 Err(ClientError::Protocol(_))
             ));
             assert_eq!(client.budget.usage.lock().unwrap().calls, 0);
@@ -1080,7 +1014,7 @@ mod tests {
         encoder
             .object(|e| {
                 e.i64(2).unwrap();
-                e.pointer(Some(&1i32.to_le_bytes()), |e| {
+                e.pointer(Some(&10i32.to_le_bytes()), |e| {
                     e.object_array(&[(); 4096], |_, _| Ok(()))?;
                     e.pointer(None, |_| Ok(()))
                 })?;
@@ -1102,9 +1036,7 @@ mod tests {
             body: invalid,
         }));
         assert!(matches!(
-            client
-                .call(NodeQueryDescription::default(), context())
-                .await,
+            client.call(request(), context()).await,
             Err(ClientError::Protocol(_))
         ));
         assert_eq!(client.budget.usage.lock().unwrap().calls, 0);

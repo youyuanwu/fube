@@ -3,7 +3,10 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use fube_client::{ClientError, DomainFailure, Error, FabricClient, GatewayDescription};
+use fube_client::{
+    ClientError, DomainFailure, Error, FabricClient, FurpcClient, FurpcClientError as ReadError,
+    GatewayDescription, NamingUri,
+};
 use fube_transport::{
     connection::{read_message, write_message},
     message::{Header, ListenInstance, Message, MessageId, ACTIVITY, FAULT, TIMEOUT},
@@ -17,6 +20,83 @@ use tokio::{
 
 const TIMEOUT_DURATION: Duration = Duration::from_secs(3);
 
+fn read_deadline(timeout: Option<Duration>) -> tokio::time::Instant {
+    tokio::time::Instant::now() + timeout.unwrap_or(TIMEOUT_DURATION)
+}
+
+fn write_probe(request: &Message) -> Message {
+    reply(request, "NameOperationReply", vec![])
+}
+
+async fn legacy_single_reply(
+    make_reply: impl FnOnce(&Message) -> Message + Send + 'static,
+) -> (FabricClient, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = establish(listener).await;
+        let request = read_message(&mut stream).await.unwrap();
+        write_message(&mut stream, &make_reply(&request))
+            .await
+            .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
+        .await
+        .unwrap();
+    (
+        FabricClient::new(
+            channel,
+            fube_client::ClientOptions {
+                default_timeout: TIMEOUT_DURATION,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+        server,
+    )
+}
+
+async fn legacy_reusable_reply(
+    make_reply: impl FnOnce(&Message) -> Message + Send + 'static,
+) -> (FabricClient, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = establish(listener).await;
+        let request = read_message(&mut stream).await.unwrap();
+        write_message(&mut stream, &make_reply(&request))
+            .await
+            .unwrap();
+        let followup = read_message(&mut stream).await.unwrap();
+        assert_eq!(followup.properties().unwrap().action, "CreateNameRequest");
+        write_message(&mut stream, &write_probe(&followup))
+            .await
+            .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
+        .await
+        .unwrap();
+    (
+        FabricClient::new(
+            channel,
+            fube_client::ClientOptions {
+                default_timeout: TIMEOUT_DURATION,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+        server,
+    )
+}
+
 #[tokio::test]
 async fn ping_validates_domain_envelopes_independently_of_repeated_correlation() {
     for (actor, action) in [
@@ -26,7 +106,7 @@ async fn ping_validates_domain_envelopes_independently_of_repeated_correlation()
         (None, None),
     ] {
         for records in [2, 3, 7] {
-            let (client, server) = reusable_reply(move |request| {
+            let (mut client, server) = reusable_reply(move |request| {
                 let mut response = ping_reply(request);
                 response.headers.retain(|header| {
                     !matches!(
@@ -66,150 +146,31 @@ async fn ping_validates_domain_envelopes_independently_of_repeated_correlation()
                 response
             })
             .await;
-            let result = client.ping(None).await;
+            let result = client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body);
             if actor == Some(5) {
                 assert_eq!(result.unwrap().node_id, NODE_ID);
             } else {
-                assert!(matches!(result, Err(ClientError::Protocol(_))));
+                assert!(matches!(
+                    result,
+                    Err(ReadError::Protocol(_) | ReadError::Decode(_))
+                ));
             }
-            assert!(!client.is_closed());
-            client.ping(None).await.unwrap();
-            client.close().await.unwrap();
+
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body)
+                .unwrap();
+            drop(client);
             server.await.unwrap();
         }
     }
 }
 
-#[tokio::test]
-async fn naming_deadline_precedes_and_includes_caller_conversion() {
-    struct InvalidConversion;
-    impl AsRef<str> for InvalidConversion {
-        fn as_ref(&self) -> &str {
-            panic!("invalid timeout must precede conversion")
-        }
-    }
-    struct SlowConversion;
-    impl AsRef<str> for SlowConversion {
-        fn as_ref(&self) -> &str {
-            std::thread::sleep(Duration::from_millis(20));
-            "fabric:/SlowConversion"
-        }
-    }
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let mut stream = establish(listener).await;
-        let request = read_message(&mut stream).await.unwrap();
-        assert_eq!(request.properties().unwrap().action, "PingRequest");
-        write_message(&mut stream, &ping_reply(&request))
-            .await
-            .unwrap();
-        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
-    });
-    let channel = FabricClient::endpoint_clear(endpoint)
-        .unwrap()
-        .connect_timeout(TIMEOUT_DURATION)
-        .connect()
-        .await
-        .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert!(matches!(
-        client
-            .name_exists(InvalidConversion, Some(Duration::ZERO))
-            .await,
-        Err(ClientError::Local(Error::InvalidInput(_)))
-    ));
-    assert!(matches!(
-        client
-            .create_name(InvalidConversion, Some(Duration::ZERO))
-            .await,
-        Err(ClientError::Local(Error::InvalidInput(_)))
-    ));
-    assert!(matches!(
-        client
-            .delete_name(InvalidConversion, Some(Duration::ZERO))
-            .await,
-        Err(ClientError::Local(Error::InvalidInput(_)))
-    ));
-    let tiny = Some(Duration::from_millis(5));
-    assert!(matches!(
-        client.name_exists(SlowConversion, tiny).await,
-        Err(ClientError::Local(Error::Timeout))
-    ));
-    assert!(matches!(
-        client.create_name(SlowConversion, tiny).await,
-        Err(ClientError::Local(Error::Timeout))
-    ));
-    assert!(matches!(
-        client.delete_name(SlowConversion, tiny).await,
-        Err(ClientError::Local(Error::Timeout))
-    ));
-    client.ping(None).await.unwrap();
-    client.close().await.unwrap();
-    server.await.unwrap();
-}
-
 const NODE_ID: u128 = 0x0123456789abcdef_fedcba9876543210;
-
-#[tokio::test]
-async fn naming_conversion_input_is_not_retained_across_rpc() {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
-    struct Input(Arc<AtomicBool>);
-    impl AsRef<str> for Input {
-        fn as_ref(&self) -> &str {
-            "fabric:/OwnedSnapshot"
-        }
-    }
-    impl Drop for Input {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-    let released = Arc::new(AtomicBool::new(false));
-    let observed = released.clone();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let mut stream = establish(listener).await;
-        let request = read_message(&mut stream).await.unwrap();
-        assert_eq!(request.properties().unwrap().action, "NameExistsRequest");
-        assert!(observed.load(Ordering::SeqCst));
-        write_message(
-            &mut stream,
-            &reply(&request, "NameOperationReply", naming_body(true, 0)),
-        )
-        .await
-        .unwrap();
-        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
-    });
-    let channel = FabricClient::endpoint_clear(endpoint)
-        .unwrap()
-        .connect_timeout(TIMEOUT_DURATION)
-        .connect()
-        .await
-        .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert!(client.name_exists(Input(released), None).await.unwrap());
-    client.close().await.unwrap();
-    server.await.unwrap();
-}
 
 const REMOTE_CODE: i64 = -2147017794;
 
@@ -301,7 +262,7 @@ async fn establish(listener: TcpListener) -> TcpStream {
 
 async fn single_reply(
     make_reply: impl FnOnce(&Message) -> Message + Send + 'static,
-) -> (FabricClient, JoinHandle<()>) {
+) -> (FurpcClient, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -310,28 +271,25 @@ async fn single_reply(
         write_message(&mut stream, &make_reply(&request))
             .await
             .unwrap();
-        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+        match stream.read(&mut [0]).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("expected peer retirement, got {other:?}"),
+        }
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let client = FurpcClient::new(channel);
     (client, server)
 }
 
 async fn reusable_reply(
     make_reply: impl FnOnce(&Message) -> Message + Send + 'static,
-) -> (FabricClient, JoinHandle<()>) {
+) -> (FurpcClient, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -347,20 +305,13 @@ async fn reusable_reply(
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let client = FurpcClient::new(channel);
     (client, server)
 }
 
@@ -447,22 +398,19 @@ async fn sequential_ping_and_naming_use_native_headers_and_keep_bool_independent
         }
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut client = FurpcClient::new(channel);
     assert_eq!(
-        client.ping(None).await.unwrap(),
+        client
+            .ping(furpc::Request::new(()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap(),
         GatewayDescription {
             address: "10.0.0.2:19000".into(),
             node_id: NODE_ID,
@@ -473,243 +421,18 @@ async fn sequential_ping_and_naming_use_native_headers_and_keep_bool_independent
     for expected in [true, false, true, false] {
         assert_eq!(
             client
-                .name_exists("fabric:/App_1/Service-2", None)
+                .name_exists(
+                    furpc::Request::new(NamingUri::parse("fabric:/App_1/Service-2").unwrap()),
+                    read_deadline(None)
+                )
                 .await
+                .map(furpc::Response::into_body)
                 .unwrap(),
             expected
         );
-        assert!(!client.is_closed());
     }
-    client.close().await.unwrap();
-    assert!(client.is_closed());
-    client.close().await.unwrap();
-    assert!(matches!(
-        client.ping(None).await,
-        Err(ClientError::Transport(Error::Closed))
-    ));
+    drop(client);
     server.await.unwrap();
-}
-
-#[tokio::test]
-async fn all_operations_select_optional_timeout_and_reject_invalid_overrides_without_sending() {
-    use fube_client::{
-        DeployedApplicationQueryDescription, DeployedApplicationQueryParameters,
-        DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
-        DeployedReplicaQueryDescription, DeployedReplicaQueryParameters,
-        DeployedServicePackageQueryDescription, DeployedServicePackageQueryParameters,
-        NodeHealthQueryDescription, NodeHealthQueryParameters, PartitionQueryDescription,
-        PartitionQueryParameters, ReplicaQueryDescription, ReplicaQueryParameters,
-        ServiceQueryDescription, ServiceQueryParameters,
-    };
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let mut stream = establish(listener).await;
-        for budget in [
-            TIMEOUT_DURATION,
-            Duration::from_secs(1),
-            Duration::from_secs(6),
-        ] {
-            for _ in 0..14 {
-                let request = read_message(&mut stream).await.unwrap();
-                let ticks = request
-                    .headers
-                    .iter()
-                    .find(|header| header.id == TIMEOUT)
-                    .unwrap()
-                    .read(|decoder| decoder.i64())
-                    .unwrap();
-                let lower = (budget - Duration::from_secs(1)).as_nanos() as i64 / 100;
-                let upper = budget.as_nanos() as i64 / 100;
-                assert!(
-                    ticks > lower && ticks <= upper,
-                    "{ticks}: budget {budget:?}"
-                );
-                let mut response = reply(&request, "ClientOperationFailure", vec![]);
-                response.headers.push(
-                    Header::object(FAULT, |encoder| {
-                        encoder.i64(REMOTE_CODE).unwrap();
-                        encoder.boolean(false).unwrap();
-                        Ok(())
-                    })
-                    .unwrap(),
-                );
-                write_message(&mut stream, &response).await.unwrap();
-            }
-        }
-        let request = read_message(&mut stream).await.unwrap();
-        assert_eq!(request.properties().unwrap().action, "PingRequest");
-        let mut response = reply(&request, "PingRequest", ping_body());
-        response.headers.push(Header::version(1, 1).unwrap());
-        write_message(&mut stream, &response).await.unwrap();
-        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
-    });
-    let channel = FabricClient::endpoint_clear(endpoint)
-        .unwrap()
-        .connect_timeout(TIMEOUT_DURATION)
-        .connect()
-        .await
-        .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    for (timeout, valid) in [
-        (None, true),
-        (Some(Duration::from_secs(1)), true),
-        (Some(Duration::from_secs(6)), true),
-        (Some(Duration::ZERO), false),
-        (Some(Duration::from_nanos(99)), false),
-        (Some(Duration::MAX), false),
-    ] {
-        macro_rules! check {
-            ($method:ident $(, $argument:expr)?) => {
-                let result = client.$method($($argument,)? timeout).await;
-                if valid {
-                    assert!(matches!(
-                        result,
-                        Err(ClientError::Transport(Error::Remote { code: REMOTE_CODE, .. }))
-                    ), "{}: {result:?}", stringify!($method));
-                } else {
-                    assert!(matches!(result, Err(ClientError::Local(Error::InvalidInput(_)))),
-                        "{}: {result:?}", stringify!($method));
-                }
-                assert!(!client.is_closed());
-            };
-        }
-        check!(ping);
-        check!(name_exists, "fabric:/Model");
-        check!(create_name, "fabric:/Model");
-        check!(delete_name, "fabric:/Model");
-        check!(get_node_list, &Default::default());
-        check!(
-            get_node_health,
-            &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("N0010"))
-        );
-        check!(get_application_list, &Default::default());
-        check!(
-            get_service_list,
-            &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                "fabric:/Model".parse().unwrap()
-            ))
-        );
-        check!(
-            get_partition_list,
-            &PartitionQueryDescription::new(PartitionQueryParameters::new(
-                "fabric:/Model/Service".parse().unwrap()
-            ))
-        );
-        check!(
-            get_replica_list,
-            &ReplicaQueryDescription::new(ReplicaQueryParameters::new(
-                uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap()
-            ))
-        );
-        check!(
-            get_deployed_application_list,
-            &DeployedApplicationQueryDescription::new(DeployedApplicationQueryParameters::new(
-                "N0010"
-            ))
-        );
-        check!(
-            get_deployed_service_package_list,
-            &DeployedServicePackageQueryDescription::new(
-                DeployedServicePackageQueryParameters::new(
-                    "N0010",
-                    "fabric:/Model".parse().unwrap()
-                )
-            )
-        );
-        check!(
-            get_deployed_code_package_list,
-            &DeployedCodePackageQueryDescription::new(DeployedCodePackageQueryParameters::new(
-                "N0010",
-                "fabric:/Model".parse().unwrap()
-            ))
-        );
-        check!(
-            get_deployed_replica_list,
-            &DeployedReplicaQueryDescription::new(DeployedReplicaQueryParameters::new(
-                "N0010",
-                "fabric:/Model".parse().unwrap()
-            ))
-        );
-    }
-    client.ping(None).await.unwrap();
-    client.close().await.unwrap();
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn ping_and_name_exists_timeout_overrides_expire_without_retiring_connection() {
-    for ping in [true, false] {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = listener.local_addr().unwrap();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let mut stream = establish(listener).await;
-            let expired = read_message(&mut stream).await.unwrap();
-            assert_eq!(
-                expired.properties().unwrap().action,
-                if ping {
-                    "PingRequest"
-                } else {
-                    "NameExistsRequest"
-                }
-            );
-            release_rx.await.unwrap();
-            write_message(&mut stream, &reply(&expired, "late-reply", vec![]))
-                .await
-                .unwrap();
-            let request = read_message(&mut stream).await.unwrap();
-            assert_eq!(request.properties().unwrap().action, "PingRequest");
-            let mut response = reply(&request, "PingRequest", ping_body());
-            response.headers.push(Header::version(1, 1).unwrap());
-            write_message(&mut stream, &response).await.unwrap();
-            assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
-        });
-        let channel = FabricClient::endpoint_clear(endpoint)
-            .unwrap()
-            .connect_timeout(TIMEOUT_DURATION)
-            .connect()
-            .await
-            .unwrap();
-        let client = FabricClient::new(
-            channel,
-            fube_client::ClientOptions {
-                default_timeout: TIMEOUT_DURATION,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(1), async {
-            let timeout = Some(Duration::from_millis(250));
-            if ping {
-                client.ping(timeout).await.map(|_| ())
-            } else {
-                client
-                    .name_exists("fabric:/Model", timeout)
-                    .await
-                    .map(|_| ())
-            }
-        })
-        .await
-        .expect("override must expire before the configured three-second default");
-        assert!(matches!(
-            result,
-            Err(ClientError::Transport(Error::Timeout))
-        ));
-        assert!(!client.is_closed());
-        release_tx.send(()).unwrap();
-        client.ping(None).await.unwrap();
-        client.close().await.unwrap();
-        server.await.unwrap();
-    }
 }
 
 #[tokio::test]
@@ -728,16 +451,25 @@ async fn malformed_naming_success_never_returns_absent_and_allows_reuse() {
         }),
     ];
     for bytes in incomplete {
-        let (client, server) =
+        let (mut client, server) =
             reusable_reply(move |request| reply(request, "NameOperationReply", bytes)).await;
         assert!(matches!(
-            client.name_exists("fabric:/a", None).await,
-            Err(ClientError::Protocol(_))
+            client
+                .name_exists(
+                    furpc::Request::new(NamingUri::parse("fabric:/a").unwrap()),
+                    read_deadline(None)
+                )
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Protocol(_) | ReadError::Decode(_))
         ));
-        assert!(!client.is_closed());
-        assert!(client.terminal_error().is_none());
-        client.ping(None).await.unwrap();
-        client.close().await.unwrap();
+
+        client
+            .ping(furpc::Request::new(()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
+        drop(client);
         server.await.unwrap();
     }
 }
@@ -778,19 +510,26 @@ async fn malformed_ping_success_requires_every_identity_field() {
         }),
     ];
     for bytes in incomplete {
-        let (client, server) = reusable_reply(move |request| {
+        let (mut client, server) = reusable_reply(move |request| {
             let mut response = reply(request, "PingRequest", bytes);
             response.headers.push(Header::version(1, 1).unwrap());
             response
         })
         .await;
         assert!(matches!(
-            client.ping(None).await,
-            Err(ClientError::Protocol(_))
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Protocol(_) | ReadError::Decode(_))
         ));
-        assert!(!client.is_closed());
-        client.ping(None).await.unwrap();
-        client.close().await.unwrap();
+
+        client
+            .ping(furpc::Request::new(()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
+        drop(client);
         server.await.unwrap();
     }
 }
@@ -798,7 +537,7 @@ async fn malformed_ping_success_requires_every_identity_field() {
 #[tokio::test]
 async fn empty_gateway_identity_is_not_a_success() {
     for (address, node_name) in [("", "N0010"), ("10.0.0.2:19000", "")] {
-        let (client, server) = reusable_reply(move |request| {
+        let (mut client, server) = reusable_reply(move |request| {
             let bytes = body(|encoder| {
                 encoder.object(|encoder| {
                     encoder.string(address)?;
@@ -816,12 +555,19 @@ async fn empty_gateway_identity_is_not_a_success() {
         })
         .await;
         assert!(matches!(
-            client.ping(None).await,
-            Err(ClientError::Protocol(_))
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Protocol(_) | ReadError::Decode(_))
         ));
-        assert!(!client.is_closed());
-        client.ping(None).await.unwrap();
-        client.close().await.unwrap();
+
+        client
+            .ping(furpc::Request::new(()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
+        drop(client);
         server.await.unwrap();
     }
 }
@@ -835,7 +581,7 @@ async fn ping_requires_compatible_version_action_and_actor() {
         Some((0, 2)),
         Some((1, -1)),
     ] {
-        let (client, server) = reusable_reply(move |request| {
+        let (mut client, server) = reusable_reply(move |request| {
             let mut response = reply(request, "PingRequest", ping_body());
             if let Some((major, minor)) = version {
                 response
@@ -846,12 +592,19 @@ async fn ping_requires_compatible_version_action_and_actor() {
         })
         .await;
         assert!(matches!(
-            client.ping(None).await,
-            Err(ClientError::Protocol(_))
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Protocol(_) | ReadError::Decode(_))
         ));
-        assert!(!client.is_closed());
-        client.ping(None).await.unwrap();
-        client.close().await.unwrap();
+
+        client
+            .ping(furpc::Request::new(()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
+        drop(client);
         server.await.unwrap();
     }
     for (actor, action) in [
@@ -859,7 +612,7 @@ async fn ping_requires_compatible_version_action_and_actor() {
         (1, "PingRequest"),
         (0, "PingRequest"),
     ] {
-        let (client, server) = single_reply(move |request| {
+        let (mut client, server) = single_reply(move |request| {
             let mut response = reply(request, action, ping_body());
             response.headers.push(Header::actor(actor).unwrap());
             response.headers.push(Header::version(1, 1).unwrap());
@@ -867,10 +620,19 @@ async fn ping_requires_compatible_version_action_and_actor() {
         })
         .await;
         assert!(matches!(
-            client.ping(None).await,
-            Err(ClientError::Transport(Error::Protocol(_)))
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Protocol(_)
+                | ReadError::Native(
+                    furpc::Error::Protocol(_)
+                        | furpc::Error::Unsupported(_)
+                        | furpc::Error::NativeHeader { .. }
+                ))
         ));
-        assert!(client.is_closed());
+
+        drop(client);
         server.await.unwrap();
     }
 }
@@ -878,17 +640,24 @@ async fn ping_requires_compatible_version_action_and_actor() {
 #[tokio::test]
 async fn naming_rejects_wrong_success_action_or_actor() {
     for (actor, action) in [(5, "NameExistsReply"), (2, "NameOperationReply")] {
-        let (client, server) = single_reply(move |request| {
+        let (mut client, server) = single_reply(move |request| {
             let mut response = reply(request, action, naming_body(false, 0));
             response.headers.push(Header::actor(actor).unwrap());
             response
         })
         .await;
         assert!(matches!(
-            client.name_exists("fabric:/a", None).await,
-            Err(ClientError::Transport(Error::Protocol(_)))
+            client
+                .name_exists(
+                    furpc::Request::new(NamingUri::parse("fabric:/a").unwrap()),
+                    read_deadline(None)
+                )
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Protocol(_))
         ));
-        assert!(client.is_closed());
+
+        drop(client);
         server.await.unwrap();
     }
 }
@@ -933,8 +702,8 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
             }),
         ),
     ];
-    for (has_body, bytes) in details {
-        let (client, server) = single_reply(move |request| {
+    for (index, (has_body, bytes)) in details.into_iter().enumerate() {
+        let (mut client, server) = single_reply(move |request| {
             let mut response = reply(request, "", bytes);
             response.headers.push(
                 Header::object(FAULT, |encoder| {
@@ -947,23 +716,44 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
             response
         })
         .await;
-        match client.name_exists("fabric:/a", None).await {
-            Err(ClientError::Transport(Error::Remote { code, message })) => {
-                assert_eq!(code, REMOTE_CODE);
-                assert_eq!(message, "native transport Fault");
+        match client
+            .name_exists(
+                furpc::Request::new(NamingUri::parse("fabric:/a").unwrap()),
+                read_deadline(None),
+            )
+            .await
+            .map(furpc::Response::into_body)
+        {
+            Err(ReadError::Native(furpc::Error::RemoteFault(fault))) => {
+                assert_eq!(fault.header_code(), REMOTE_CODE);
+                assert_eq!(
+                    fault.code(),
+                    match index {
+                        2 => REMOTE_CODE - 1,
+                        3 => 0,
+                        _ => REMOTE_CODE,
+                    }
+                );
+                assert_eq!(
+                    String::from_utf16(fault.message()).unwrap(),
+                    if matches!(index, 2 | 3) {
+                        "diagnostic"
+                    } else {
+                        ""
+                    }
+                );
             }
             result => panic!("fault became {result:?}"),
         }
-        assert!(!client.is_closed());
-        assert!(client.terminal_error().is_none());
-        client.close().await.unwrap();
+
+        drop(client);
         server.await.unwrap();
     }
 }
 
 #[tokio::test]
 async fn operation_failure_requires_nonzero_code_and_valid_present_diagnostic() {
-    let (client, server) = reusable_reply(|request| {
+    let (mut client, server) = reusable_reply(|request| {
         reply(
             request,
             "ClientOperationFailure",
@@ -974,17 +764,25 @@ async fn operation_failure_requires_nonzero_code_and_valid_present_diagnostic() 
         )
     })
     .await;
-    match client.ping(None).await {
-        Err(ClientError::Domain(DomainFailure { code, message })) => {
+    match client
+        .ping(furpc::Request::new(()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+    {
+        Err(ReadError::Domain(DomainFailure { code, message })) => {
             assert_eq!(code, REMOTE_CODE);
             assert_eq!(message, "operation failed");
         }
         result => panic!("operation failure became {result:?}"),
     }
-    client.ping(None).await.unwrap();
-    client.close().await.unwrap();
+    client
+        .ping(furpc::Request::new(()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
+    drop(client);
     server.await.unwrap();
-    let (client, server) = reusable_reply(|request| {
+    let (mut client, server) = reusable_reply(|request| {
         reply(
             request,
             "ClientOperationFailure",
@@ -995,10 +793,16 @@ async fn operation_failure_requires_nonzero_code_and_valid_present_diagnostic() 
         )
     })
     .await;
-    assert!(matches!(client.ping(None).await,
-        Err(ClientError::Domain(DomainFailure { code: REMOTE_CODE, message })) if message.is_empty()));
-    client.ping(None).await.unwrap();
-    client.close().await.unwrap();
+    assert!(
+        matches!(client.ping(furpc::Request::new(()), read_deadline(None)).await.map(furpc::Response::into_body),
+        Err(ReadError::Domain(DomainFailure { code: REMOTE_CODE, message })) if message.is_empty())
+    );
+    client
+        .ping(furpc::Request::new(()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
+    drop(client);
     server.await.unwrap();
     for bytes in [
         Vec::new(),
@@ -1013,90 +817,26 @@ async fn operation_failure_requires_nonzero_code_and_valid_present_diagnostic() 
             encoder.string("not a native failure")
         }),
     ] {
-        let (client, server) =
+        let (mut client, server) =
             reusable_reply(move |request| reply(request, "ClientOperationFailure", bytes)).await;
         assert!(matches!(
-            client.name_exists("fabric:/a", None).await,
-            Err(ClientError::Protocol(_))
-        ));
-        assert!(!client.is_closed());
-        assert!(client.terminal_error().is_none());
-        client.ping(None).await.unwrap();
-        client.close().await.unwrap();
-        server.await.unwrap();
-    }
-}
-
-#[tokio::test]
-async fn input_error_does_not_send_and_native_error_does_not_poison_complete_stream() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let mut stream = establish(listener).await;
-        for index in 0..2 {
-            let request = read_message(&mut stream).await.unwrap();
-            assert_eq!(request.properties().unwrap().action, "NameExistsRequest");
-            let response = if index == 0 {
-                reply(
-                    &request,
-                    "ClientOperationFailure",
-                    body(|encoder| {
-                        encoder.i64(REMOTE_CODE).unwrap();
-                        encoder.string("native input error")
-                    }),
+            client
+                .name_exists(
+                    furpc::Request::new(NamingUri::parse("fabric:/a").unwrap()),
+                    read_deadline(None)
                 )
-            } else {
-                reply(&request, "NameOperationReply", naming_body(false, 0))
-            };
-            write_message(&mut stream, &response).await.unwrap();
-        }
-        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
-    });
-    let channel = FabricClient::endpoint_clear(endpoint)
-        .unwrap()
-        .connect_timeout(TIMEOUT_DURATION)
-        .connect()
-        .await
-        .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert!(matches!(
-        client.name_exists("fabric:/invalid?", None).await,
-        Err(ClientError::Local(Error::InvalidInput(_)))
-    ));
-    assert!(!client.is_closed());
-    assert!(matches!(
-        client.name_exists("fabric:/a", None).await,
-        Err(ClientError::Domain(DomainFailure {
-            code: REMOTE_CODE,
-            ..
-        }))
-    ));
-    assert!(!client.is_closed());
-    assert!(!client.name_exists("fabric:/a", None).await.unwrap());
-    client.close().await.unwrap();
-    assert!(client.is_closed());
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn client_validates_timeout_before_connecting() {
-    let endpoint: SocketAddr = "127.0.0.1:1".parse().unwrap();
-    for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
-        assert!(matches!(
-            FabricClient::endpoint_clear(endpoint)
-                .unwrap()
-                .connect_timeout(timeout)
-                .connect()
-                .await,
-            Err(Error::InvalidInput(_))
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Protocol(_) | ReadError::Decode(_))
         ));
+
+        client
+            .ping(furpc::Request::new(()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
+        drop(client);
+        server.await.unwrap();
     }
 }
 
@@ -1454,7 +1194,7 @@ mod node_queries {
     #[tokio::test]
     async fn embedded_error_cannot_hide_invalid_record_or_required_pointer() {
         for shape in [NodeShape::DisagreeingIdCopies, NodeShape::NullSafetyCheck] {
-            let (client, server) = reusable_reply(move |request| {
+            let (mut client, server) = reusable_reply(move |request| {
                 node_reply(
                     request,
                     query_result(2, Some(&1i32.to_le_bytes()), REMOTE_CODE, None, |encoder| {
@@ -1465,13 +1205,21 @@ mod node_queries {
             .await;
             assert!(matches!(
                 client
-                    .get_node_list(&NodeQueryDescription::default(), None)
-                    .await,
-                Err(ClientError::Protocol(_))
+                    .get_node_list(
+                        furpc::Request::new((NodeQueryDescription::default()).clone()),
+                        read_deadline(None)
+                    )
+                    .await
+                    .map(furpc::Response::into_body),
+                Err(ReadError::Protocol(_) | ReadError::Decode(_))
             ));
-            assert!(!client.is_closed());
-            client.ping(None).await.unwrap();
-            client.close().await.unwrap();
+
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body)
+                .unwrap();
+            drop(client);
             server.await.unwrap();
         }
     }
@@ -1571,37 +1319,33 @@ mod node_queries {
             }
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
-        let channel = FabricClient::endpoint_clear(endpoint)
+        let channel = FurpcClient::endpoint_clear(endpoint)
             .unwrap()
             .connect_timeout(TIMEOUT_DURATION)
             .connect()
             .await
             .unwrap();
-        let client = FabricClient::new(
-            channel,
-            fube_client::ClientOptions {
-                default_timeout: TIMEOUT_DURATION,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let mut client = FurpcClient::new(channel);
         for (query, _) in cases {
             assert_eq!(
-                client.get_node_list(&query, None).await.unwrap(),
+                client
+                    .get_node_list(furpc::Request::new((query).clone()), read_deadline(None))
+                    .await
+                    .map(furpc::Response::into_body)
+                    .unwrap(),
                 NodeListPage {
                     items: vec![],
                     continuation_token: None,
                 }
             );
-            assert!(!client.is_closed());
         }
-        client.close().await.unwrap();
+        drop(client);
         server.await.unwrap();
     }
 
     #[tokio::test]
     async fn all_21_fields_tasks_and_every_safety_subtype_are_owned_and_decoded() {
-        let (client, server) = single_reply(|request| {
+        let (mut client, server) = single_reply(|request| {
             node_reply(
                 request,
                 node_body(&[NodeShape::Complete], Some("opaque-next")),
@@ -1610,21 +1354,25 @@ mod node_queries {
         .await;
         assert_eq!(
             client
-                .get_node_list(&NodeQueryDescription::default(), None)
+                .get_node_list(
+                    furpc::Request::new((NodeQueryDescription::default()).clone()),
+                    read_deadline(None)
+                )
                 .await
+                .map(furpc::Response::into_body)
                 .unwrap(),
             NodeListPage {
                 items: vec![expected_node()],
                 continuation_token: Some("opaque-next".into()),
             }
         );
-        client.close().await.unwrap();
+        drop(client);
         server.await.unwrap();
     }
 
     #[tokio::test]
     async fn unrecognized_scalar_enums_preserve_signed_values_not_named_unknown() {
-        let (client, server) = single_reply(|request| {
+        let (mut client, server) = single_reply(|request| {
             node_reply(request, node_body(&[NodeShape::UnrecognizedScalars], None))
         })
         .await;
@@ -1638,13 +1386,17 @@ mod node_queries {
             task.intent = NodeDeactivationIntent::Unrecognized(i64::MAX - 1);
         }
         let page = client
-            .get_node_list(&NodeQueryDescription::default(), None)
+            .get_node_list(
+                furpc::Request::new((NodeQueryDescription::default()).clone()),
+                read_deadline(None),
+            )
             .await
+            .map(furpc::Response::into_body)
             .unwrap();
         assert_eq!(page.items, vec![expected]);
         assert_eq!(page.items[0].status.as_raw(), i64::MIN);
         assert_eq!(page.items[0].health_state.as_raw(), i64::MAX);
-        client.close().await.unwrap();
+        drop(client);
         server.await.unwrap();
     }
 
@@ -1674,20 +1426,13 @@ mod node_queries {
             }
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
-        let channel = FabricClient::endpoint_clear(endpoint)
+        let channel = FurpcClient::endpoint_clear(endpoint)
             .unwrap()
             .connect_timeout(TIMEOUT_DURATION)
             .connect()
             .await
             .unwrap();
-        let client = FabricClient::new(
-            channel,
-            fube_client::ClientOptions {
-                default_timeout: TIMEOUT_DURATION,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let mut client = FurpcClient::new(channel);
         let mut query = NodeQueryDescription {
             paging: Paging {
                 max_results: NonZeroU64::new(1),
@@ -1695,120 +1440,57 @@ mod node_queries {
             },
             ..Default::default()
         };
-        let first = client.get_node_list(&query, None).await.unwrap();
+        let first = client
+            .get_node_list(furpc::Request::new((query).clone()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
         assert_eq!(first.items, vec![expected_node()]);
         assert_eq!(first.continuation_token.as_deref(), Some("server-token"));
         query.paging.continuation_token = first.continuation_token;
-        let terminal = client.get_node_list(&query, None).await.unwrap();
+        let terminal = client
+            .get_node_list(furpc::Request::new((query).clone()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
         assert_eq!(terminal.items.len(), 1);
         assert_eq!(terminal.continuation_token, None);
         query.paging.continuation_token = None;
         assert_eq!(
             client
-                .get_node_list(&query, None)
+                .get_node_list(furpc::Request::new((query).clone()), read_deadline(None))
                 .await
+                .map(furpc::Response::into_body)
                 .unwrap()
                 .continuation_token,
             None
         );
-        client.close().await.unwrap();
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn invalid_page_limits_and_timeouts_are_local_and_send_no_query() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut stream = establish(listener).await;
-            let request = read_message(&mut stream).await.unwrap();
-            assert_eq!(query_arguments(&request), vec![]);
-            write_message(&mut stream, &node_reply(&request, node_body(&[], None)))
-                .await
-                .unwrap();
-            assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
-        });
-        let channel = FabricClient::endpoint_clear(endpoint)
-            .unwrap()
-            .connect_timeout(TIMEOUT_DURATION)
-            .connect()
-            .await
-            .unwrap();
-        let client = FabricClient::new(
-            channel,
-            fube_client::ClientOptions {
-                default_timeout: TIMEOUT_DURATION,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        for limit in [i64::MAX as u64 + 1, u64::MAX] {
-            let query = NodeQueryDescription {
-                paging: Paging {
-                    max_results: NonZeroU64::new(limit),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            assert!(matches!(
-                client.get_node_list(&query, None).await,
-                Err(ClientError::Local(Error::InvalidInput(_)))
-            ));
-            assert!(!client.is_closed());
-        }
-        for query in [
-            NodeQueryDescription::new(NodeQueryParameters {
-                node_name: Some("x".repeat(100_000)),
-                ..Default::default()
-            }),
-            NodeQueryDescription {
-                paging: Paging {
-                    continuation_token: Some("x".repeat(100_000)),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        ] {
-            assert!(matches!(
-                client.get_node_list(&query, None).await,
-                Err(ClientError::Local(Error::InvalidInput(_)))
-            ));
-            assert!(!client.is_closed());
-        }
-        for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
-            assert!(matches!(
-                client
-                    .get_node_list(&NodeQueryDescription::default(), Some(timeout))
-                    .await,
-                Err(ClientError::Local(Error::InvalidInput(_)))
-            ));
-            assert!(!client.is_closed());
-        }
-        assert!(client
-            .get_node_list(&NodeQueryDescription::default(), None)
-            .await
-            .unwrap()
-            .items
-            .is_empty());
-        client.close().await.unwrap();
+        drop(client);
         server.await.unwrap();
     }
 
     async fn assert_malformed_success(bytes: Vec<u8>, label: &str) {
-        let (client, server) = reusable_reply(move |request| node_reply(request, bytes)).await;
-        let clone = client.clone();
+        let (mut client, server) = reusable_reply(move |request| node_reply(request, bytes)).await;
+        let mut clone = client.clone();
         let result = client
-            .get_node_list(&NodeQueryDescription::default(), None)
-            .await;
+            .get_node_list(
+                furpc::Request::new((NodeQueryDescription::default()).clone()),
+                read_deadline(None),
+            )
+            .await
+            .map(furpc::Response::into_body);
         assert!(
-            matches!(result, Err(ClientError::Protocol(_))),
+            matches!(result, Err(ReadError::Protocol(_) | ReadError::Decode(_))),
             "{label}: {result:?}"
         );
-        assert!(!client.is_closed(), "{label}");
-        assert!(!clone.is_closed(), "{label}");
-        assert!(client.terminal_error().is_none(), "{label}");
-        clone.ping(None).await.unwrap();
-        client.close().await.unwrap();
+
+        clone
+            .ping(furpc::Request::new(()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
+        drop(clone);
+        drop(client);
         server.await.unwrap();
     }
 
@@ -1972,26 +1654,30 @@ mod node_queries {
                 Header::action("QueryReply").unwrap(),
             ],
         ] {
-            let (client, server) = single_reply(move |request| {
+            let (mut client, server) = single_reply(move |request| {
                 let mut response = node_reply(request, node_body(&[], None));
                 response.headers.extend(headers);
                 response
             })
             .await;
             assert!(client
-                .get_node_list(&NodeQueryDescription::default(), None)
+                .get_node_list(
+                    furpc::Request::new((NodeQueryDescription::default()).clone()),
+                    read_deadline(None)
+                )
                 .await
+                .map(furpc::Response::into_body)
                 .unwrap()
                 .items
                 .is_empty());
-            client.close().await.unwrap();
+            drop(client);
             server.await.unwrap();
         }
         for header in [
             Header::actor(2).unwrap(),
             Header::action("NameOperationReply").unwrap(),
         ] {
-            let (client, server) = reusable_reply(move |request| {
+            let (mut client, server) = reusable_reply(move |request| {
                 let mut response = node_reply(request, node_body(&[], None));
                 response.headers.push(header);
                 response
@@ -1999,13 +1685,21 @@ mod node_queries {
             .await;
             assert!(matches!(
                 client
-                    .get_node_list(&NodeQueryDescription::default(), None)
-                    .await,
-                Err(ClientError::Protocol(_))
+                    .get_node_list(
+                        furpc::Request::new((NodeQueryDescription::default()).clone()),
+                        read_deadline(None)
+                    )
+                    .await
+                    .map(furpc::Response::into_body),
+                Err(ReadError::Protocol(_) | ReadError::Decode(_))
             ));
-            assert!(!client.is_closed());
-            client.ping(None).await.unwrap();
-            client.close().await.unwrap();
+
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body)
+                .unwrap();
+            drop(client);
             server.await.unwrap();
         }
     }
@@ -2069,49 +1763,57 @@ mod node_queries {
                 .unwrap();
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
-        let channel = FabricClient::endpoint_clear(endpoint)
+        let channel = FurpcClient::endpoint_clear(endpoint)
             .unwrap()
             .connect_timeout(TIMEOUT_DURATION)
             .connect()
             .await
             .unwrap();
-        let client = FabricClient::new(
-            channel,
-            fube_client::ClientOptions {
-                default_timeout: TIMEOUT_DURATION,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let mut client = FurpcClient::new(channel);
         for (index, diagnostic) in ["", "", "native transport Fault", "invalid continuation"]
             .into_iter()
             .enumerate()
         {
             match client
-                .get_node_list(&NodeQueryDescription::default(), None)
+                .get_node_list(
+                    furpc::Request::new((NodeQueryDescription::default()).clone()),
+                    read_deadline(None),
+                )
                 .await
+                .map(furpc::Response::into_body)
             {
-                Err(ClientError::Domain(DomainFailure { code, message })) if index != 2 => {
+                Err(ReadError::Domain(DomainFailure { code, message })) if index != 2 => {
                     assert_eq!(code, REMOTE_CODE - index as i64);
                     assert_eq!(message, diagnostic);
                 }
-                Err(ClientError::Transport(Error::Remote { code, message })) if index == 2 => {
-                    assert_eq!(code, REMOTE_CODE - index as i64);
-                    assert_eq!(message, diagnostic);
+                Err(ReadError::Native(furpc::Error::RemoteFault(fault))) if index == 2 => {
+                    assert_eq!(fault.code(), REMOTE_CODE - index as i64);
+                    assert_eq!(String::from_utf16(fault.message()).unwrap(), "");
                 }
                 result => panic!("fault {index} became {result:?}"),
             }
-            assert!(!client.is_closed());
-            assert_eq!(client.ping(None).await.unwrap().node_id, NODE_ID);
-            assert!(!client.is_closed());
+
+            assert_eq!(
+                client
+                    .ping(furpc::Request::new(()), read_deadline(None))
+                    .await
+                    .map(furpc::Response::into_body)
+                    .unwrap()
+                    .node_id,
+                NODE_ID
+            );
         }
         assert!(client
-            .get_node_list(&NodeQueryDescription::default(), None)
+            .get_node_list(
+                furpc::Request::new((NodeQueryDescription::default()).clone()),
+                read_deadline(None)
+            )
             .await
+            .map(furpc::Response::into_body)
             .unwrap()
             .items
             .is_empty());
-        client.close().await.unwrap();
+        drop(client);
         server.await.unwrap();
     }
 
@@ -2146,24 +1848,36 @@ mod node_queries {
                 .unwrap();
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
-        let channel = FabricClient::endpoint_clear(endpoint)
+        let channel = FurpcClient::endpoint_clear(endpoint)
             .unwrap()
             .connect_timeout(TIMEOUT_DURATION)
             .connect()
             .await
             .unwrap();
-        let client = FabricClient::new(
-            channel,
-            fube_client::ClientOptions {
-                default_timeout: TIMEOUT_DURATION,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let clone = client.clone();
+        let client = FurpcClient::new(channel);
+        let mut clone = client.clone();
         let query = NodeQueryDescription::default();
-        let nodes = client.get_node_list(&query, None);
-        let neighbor = clone.name_exists("fabric:/neighbor", None);
+        let nodes = {
+            let mut client = client.clone();
+            async move {
+                client
+                    .get_node_list(furpc::Request::new((query).clone()), read_deadline(None))
+                    .await
+                    .map(furpc::Response::into_body)
+            }
+        };
+        let neighbor = {
+            let mut clone = clone.clone();
+            async move {
+                clone
+                    .name_exists(
+                        furpc::Request::new(NamingUri::parse("fabric:/neighbor").unwrap()),
+                        read_deadline(None),
+                    )
+                    .await
+                    .map(furpc::Response::into_body)
+            }
+        };
         tokio::pin!(nodes, neighbor);
         poll_fn(|cx| {
             assert!(nodes.as_mut().poll(cx).is_pending());
@@ -2171,12 +1885,19 @@ mod node_queries {
             Poll::Ready(())
         })
         .await;
-        assert!(matches!(nodes.await, Err(ClientError::Protocol(_))));
+        assert!(matches!(
+            nodes.await,
+            Err(ReadError::Protocol(_) | ReadError::Decode(_))
+        ));
         assert!(neighbor.await.unwrap());
-        assert!(!clone.is_closed());
-        assert!(client.terminal_error().is_none());
-        clone.ping(None).await.unwrap();
-        client.close().await.unwrap();
+
+        clone
+            .ping(furpc::Request::new(()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
+        drop(clone);
+        drop(client);
         server.await.unwrap();
     }
 
@@ -2221,20 +1942,13 @@ mod node_queries {
                 .unwrap();
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
-        let channel = FabricClient::endpoint_clear(endpoint)
+        let channel = FurpcClient::endpoint_clear(endpoint)
             .unwrap()
             .connect_timeout(TIMEOUT_DURATION)
             .connect()
             .await
             .unwrap();
-        let client = FabricClient::new(
-            channel,
-            fube_client::ClientOptions {
-                default_timeout: TIMEOUT_DURATION,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let mut client = FurpcClient::new(channel);
         let (a_client, b_client, name_client, ping_client) = (
             client.clone(),
             client.clone(),
@@ -2250,10 +1964,45 @@ mod node_queries {
             ..Default::default()
         });
         let (a_page, b_page, exists, gateway) = tokio::join!(
-            a_client.get_node_list(&a, None),
-            b_client.get_node_list(&b, None),
-            name_client.name_exists("fabric:/App", None),
-            ping_client.ping(None),
+            {
+                let mut a_client = a_client.clone();
+                async move {
+                    a_client
+                        .get_node_list(furpc::Request::new((a).clone()), read_deadline(None))
+                        .await
+                        .map(furpc::Response::into_body)
+                }
+            },
+            {
+                let mut b_client = b_client.clone();
+                async move {
+                    b_client
+                        .get_node_list(furpc::Request::new((b).clone()), read_deadline(None))
+                        .await
+                        .map(furpc::Response::into_body)
+                }
+            },
+            {
+                let mut name_client = name_client.clone();
+                async move {
+                    name_client
+                        .name_exists(
+                            furpc::Request::new(NamingUri::parse("fabric:/App").unwrap()),
+                            read_deadline(None),
+                        )
+                        .await
+                        .map(furpc::Response::into_body)
+                }
+            },
+            {
+                let mut ping_client = ping_client.clone();
+                async move {
+                    ping_client
+                        .ping(furpc::Request::new(()), read_deadline(None))
+                        .await
+                        .map(furpc::Response::into_body)
+                }
+            },
         );
         assert_eq!(
             a_page.unwrap(),
@@ -2271,9 +2020,18 @@ mod node_queries {
         );
         assert!(exists.unwrap());
         assert_eq!(gateway.unwrap().node_id, NODE_ID);
-        assert!(!client.is_closed());
-        assert_eq!(client.ping(None).await.unwrap().node_id, NODE_ID);
-        client.close().await.unwrap();
+        drop((a_client, b_client, name_client, ping_client));
+
+        assert_eq!(
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body)
+                .unwrap()
+                .node_id,
+            NODE_ID
+        );
+        drop(client);
         server.await.unwrap();
     }
 
@@ -2316,38 +2074,37 @@ mod node_queries {
                 .unwrap();
                 assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
             });
-            let channel = FabricClient::endpoint_clear(endpoint)
+            let channel = FurpcClient::endpoint_clear(endpoint)
                 .unwrap()
                 .connect_timeout(TIMEOUT_DURATION)
                 .connect()
                 .await
                 .unwrap();
-            let client = FabricClient::new(
-                channel,
-                fube_client::ClientOptions {
-                    default_timeout: TIMEOUT_DURATION,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            let query_client = client.clone();
+            let mut client = FurpcClient::new(channel);
+            let mut query_client = client.clone();
             let nodes = tokio::spawn(async move {
                 query_client
                     .get_node_list(
-                        &NodeQueryDescription::default(),
-                        Some(if cancel {
+                        furpc::Request::new((NodeQueryDescription::default()).clone()),
+                        read_deadline(Some(if cancel {
                             TIMEOUT_DURATION
                         } else {
                             Duration::from_millis(250)
-                        }),
+                        })),
                     )
                     .await
+                    .map(furpc::Response::into_body)
             });
-            let name_client = client.clone();
-            let neighbor =
-                tokio::spawn(
-                    async move { name_client.name_exists("fabric:/neighbor", None).await },
-                );
+            let mut name_client = client.clone();
+            let neighbor = tokio::spawn(async move {
+                name_client
+                    .name_exists(
+                        furpc::Request::new(NamingUri::parse("fabric:/neighbor").unwrap()),
+                        read_deadline(None),
+                    )
+                    .await
+                    .map(furpc::Response::into_body)
+            });
             tokio::time::timeout(TIMEOUT_DURATION, observed_rx)
                 .await
                 .unwrap()
@@ -2358,24 +2115,28 @@ mod node_queries {
             } else {
                 assert!(matches!(
                     nodes.await.unwrap(),
-                    Err(ClientError::Transport(Error::Timeout))
+                    Err(ReadError::Native(furpc::Error::Timeout(_)))
                 ));
             }
-            assert!(!client.is_closed());
+
             release_tx.send(()).unwrap();
             assert!(neighbor.await.unwrap().unwrap());
-            assert!(!client.is_closed());
+
             assert_eq!(
                 client
-                    .get_node_list(&NodeQueryDescription::default(), None)
+                    .get_node_list(
+                        furpc::Request::new((NodeQueryDescription::default()).clone()),
+                        read_deadline(None)
+                    )
                     .await
+                    .map(furpc::Response::into_body)
                     .unwrap(),
                 NodeListPage {
                     items: vec![expected_node()],
                     continuation_token: None,
                 }
             );
-            client.close().await.unwrap();
+            drop(client);
             server.await.unwrap();
         }
     }

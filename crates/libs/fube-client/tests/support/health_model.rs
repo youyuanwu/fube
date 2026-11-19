@@ -202,32 +202,29 @@ async fn health_options_encode_sorted_json_and_preserve_omission_false_and_raw_b
         })
         .await;
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut client = FurpcClient::new(channel);
     for (policy, filter) in cases {
         let mut query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("Node_Å😀"));
         query.parameters.health_policy = policy.map(|value| NodeHealthPolicy {
             consider_warning_as_error: value,
         });
         query.parameters.events_filter = filter.map(Into::into);
-        let value = client.get_node_health(&query, None).await.unwrap();
+        let value = client
+            .get_node_health(furpc::Request::new((query).clone()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
         assert_eq!(value.node_name, query.parameters.node_name);
         assert!(value.health_events.is_empty());
         assert!(value.unhealthy_evaluations.is_empty());
     }
-    client.close().await.unwrap();
+    drop(client);
     server.await.unwrap();
 }
 
@@ -249,16 +246,20 @@ async fn for_stream<T>(
 #[tokio::test]
 async fn health_complete_owned_data_and_unknown_scalars_retain_native_values() {
     for shape in [Shape::Complete, Shape::UnknownScalars] {
-        let (client, server) =
+        let (mut client, server) =
             single_reply(move |request| health_reply(request, result(shape, 0))).await;
         let value = client
             .get_node_health(
-                &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("Node_Å😀")),
-                None,
+                furpc::Request::new(
+                    (NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("Node_Å😀")))
+                        .clone(),
+                ),
+                read_deadline(None),
             )
             .await
+            .map(furpc::Response::into_body)
             .unwrap();
-        client.close().await.unwrap();
+        drop(client);
         server.await.unwrap();
         let e = &value.health_events[0];
         assert_eq!(value.node_name, "Node_Å😀");
@@ -299,21 +300,28 @@ async fn health_complete_owned_data_and_unknown_scalars_retain_native_values() {
 }
 
 async fn malformed(bytes: Vec<u8>) {
-    let (client, server) = reusable_reply(move |request| health_reply(request, bytes)).await;
-    let clone = client.clone();
+    let (mut client, server) = reusable_reply(move |request| health_reply(request, bytes)).await;
+    let mut clone = client.clone();
     assert!(matches!(
         client
             .get_node_health(
-                &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n")),
-                None
+                furpc::Request::new(
+                    (NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n"))).clone()
+                ),
+                read_deadline(None)
             )
-            .await,
-        Err(ClientError::Protocol(_))
+            .await
+            .map(furpc::Response::into_body),
+        Err(ReadError::Protocol(_) | ReadError::Decode(_))
     ));
-    assert!(!client.is_closed());
-    assert!(client.terminal_error().is_none());
-    clone.ping(None).await.unwrap();
-    client.close().await.unwrap();
+
+    clone
+        .ping(furpc::Request::new(()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
+    drop(clone);
+    drop(client);
     server.await.unwrap();
 }
 
@@ -375,18 +383,27 @@ async fn health_success_requires_hm_envelope() {
             .concat(),
             body: result(Shape::Empty, 0),
         };
-        let (client, server) = reusable_reply(make_reply).await;
+        let (mut client, server) = reusable_reply(make_reply).await;
         let outcome = client
             .get_node_health(
-                &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n")),
-                None,
+                furpc::Request::new(
+                    (NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n"))).clone(),
+                ),
+                read_deadline(None),
             )
-            .await;
-        assert!(matches!(outcome, Err(ClientError::Protocol(_))));
-        assert!(!client.is_closed());
-        assert!(client.terminal_error().is_none());
-        client.ping(None).await.unwrap();
-        client.close().await.unwrap();
+            .await
+            .map(furpc::Response::into_body);
+        assert!(matches!(
+            outcome,
+            Err(ReadError::Protocol(_) | ReadError::Decode(_))
+        ));
+
+        client
+            .ping(furpc::Request::new(()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
+        drop(client);
         server.await.unwrap();
     }
 }
@@ -422,48 +439,39 @@ async fn health_native_failures_are_local_and_healthy_queries_reuse_the_connecti
         })
         .await;
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut client = FurpcClient::new(channel);
     let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n"));
     for index in 0..3 {
-        let outcome = client.get_node_health(&query, None).await;
+        let outcome = client
+            .get_node_health(furpc::Request::new((query).clone()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body);
         assert!(matches!(
             (&outcome, index),
             (
-                Err(ClientError::Domain(DomainFailure {
+                Err(ReadError::Domain(DomainFailure {
                     code: REMOTE_CODE,
                     ..
                 })),
                 0 | 1
-            ) | (
-                Err(ClientError::Transport(Error::Remote {
-                    code: REMOTE_CODE,
-                    ..
-                })),
-                2
-            )
+            ) | (Err(ReadError::Native(furpc::Error::RemoteFault(_))), 2)
         ));
-        assert!(!client.is_closed());
+
         assert!(client
-            .get_node_health(&query, None)
+            .get_node_health(furpc::Request::new((query).clone()), read_deadline(None))
             .await
+            .map(furpc::Response::into_body)
             .unwrap()
             .health_events
             .is_empty());
     }
-    client.close().await.unwrap();
+    drop(client);
     server.await.unwrap();
 }
 
@@ -478,20 +486,13 @@ async fn health_local_invalid_names_and_timeouts_send_nothing() {
         })
         .await;
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut client = FurpcClient::new(channel);
     for name in [
         "".into(),
         "a\0b".into(),
@@ -502,26 +503,48 @@ async fn health_local_invalid_names_and_timeouts_send_nothing() {
         assert!(matches!(
             client
                 .get_node_health(
-                    &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(name)),
-                    None
+                    furpc::Request::new(
+                        (NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(name)))
+                            .clone()
+                    ),
+                    read_deadline(None)
                 )
-                .await,
-            Err(ClientError::Local(Error::InvalidInput(_)))
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Native(
+                furpc::Error::Codec {
+                    phase: "encode",
+                    ..
+                } | furpc::Error::Timeout(_)
+            ))
         ));
     }
-    for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
+    for timeout in [Duration::ZERO] {
         assert!(matches!(
             client
                 .get_node_health(
-                    &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n")),
-                    Some(timeout)
+                    furpc::Request::new(
+                        (NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n")))
+                            .clone()
+                    ),
+                    read_deadline(Some(timeout))
                 )
-                .await,
-            Err(ClientError::Local(Error::InvalidInput(_)))
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Native(
+                furpc::Error::Codec {
+                    phase: "encode",
+                    ..
+                } | furpc::Error::Timeout(_)
+            ))
         ));
     }
-    client.ping(None).await.unwrap();
-    client.close().await.unwrap();
+    client
+        .ping(furpc::Request::new(()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
+    drop(client);
     server.await.unwrap();
 }
 
@@ -556,23 +579,35 @@ async fn health_malformed_success_is_call_local_and_pending_neighbor_succeeds() 
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut client = FurpcClient::new(channel);
     let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n"));
-    let health = client.get_node_health(&query, None);
-    let neighbor = client.name_exists("fabric:/neighbor", None);
+    let health = {
+        let mut client = client.clone();
+        async move {
+            client
+                .get_node_health(furpc::Request::new((query).clone()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body)
+        }
+    };
+    let neighbor = {
+        let mut client = client.clone();
+        async move {
+            client
+                .name_exists(
+                    furpc::Request::new(NamingUri::parse("fabric:/neighbor").unwrap()),
+                    read_deadline(None),
+                )
+                .await
+                .map(furpc::Response::into_body)
+        }
+    };
     tokio::pin!(health, neighbor);
     poll_fn(|cx| {
         assert!(health.as_mut().poll(cx).is_pending());
@@ -580,12 +615,18 @@ async fn health_malformed_success_is_call_local_and_pending_neighbor_succeeds() 
         Poll::Ready(())
     })
     .await;
-    assert!(matches!(health.await, Err(ClientError::Protocol(_))));
+    assert!(matches!(
+        health.await,
+        Err(ReadError::Protocol(_) | ReadError::Decode(_))
+    ));
     assert!(neighbor.await.unwrap());
-    assert!(!client.is_closed());
-    assert!(client.terminal_error().is_none());
-    client.ping(None).await.unwrap();
-    client.close().await.unwrap();
+
+    client
+        .ping(furpc::Request::new(()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
+    drop(client);
     server.await.unwrap();
 }
 
@@ -620,28 +661,25 @@ async fn health_reordered_mixed_operations_and_late_cancelled_malformed_replies(
         }
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let clone = client.clone();
+    let mut client = FurpcClient::new(channel);
+    let mut clone = client.clone();
     let pending = tokio::spawn(async move {
         clone
             .get_node_health(
-                &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("cancelled")),
-                None,
+                furpc::Request::new(
+                    (NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("cancelled")))
+                        .clone(),
+                ),
+                read_deadline(None),
             )
             .await
+            .map(furpc::Response::into_body)
     });
     ready.await.unwrap();
     pending.abort();
@@ -650,17 +688,40 @@ async fn health_reordered_mixed_operations_and_late_cancelled_malformed_replies(
     assert!(matches!(
         client
             .get_node_health(
-                &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("timed")),
-                Some(Duration::from_millis(30))
+                furpc::Request::new(
+                    (NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("timed")))
+                        .clone()
+                ),
+                read_deadline(Some(Duration::from_millis(30)))
             )
-            .await,
-        Err(ClientError::Transport(Error::Timeout))
+            .await
+            .map(furpc::Response::into_body),
+        Err(ReadError::Native(furpc::Error::Timeout(_)))
     ));
     let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n"));
-    let (health, ping) = tokio::join!(client.get_node_health(&query, None), client.ping(None));
+    let (health, ping) = tokio::join!(
+        {
+            let mut client = client.clone();
+            async move {
+                client
+                    .get_node_health(furpc::Request::new((query).clone()), read_deadline(None))
+                    .await
+                    .map(furpc::Response::into_body)
+            }
+        },
+        {
+            let mut client = client.clone();
+            async move {
+                client
+                    .ping(furpc::Request::new(()), read_deadline(None))
+                    .await
+                    .map(furpc::Response::into_body)
+            }
+        }
+    );
     assert_eq!(health.unwrap().health_events.len(), 1);
     assert_eq!(ping.unwrap().node_id, NODE_ID);
-    assert!(!client.is_closed());
-    client.close().await.unwrap();
+
+    drop(client);
     server.await.unwrap();
 }

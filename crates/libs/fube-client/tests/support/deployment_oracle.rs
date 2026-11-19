@@ -256,10 +256,13 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
             let mut replica_query = DeployedReplicaQueryDescription::new(
                 DeployedReplicaQueryParameters::new(node_name, application.parse()?),
             );
+            let deployment_query = DeployedApplicationQueryDescription::new(
+                DeployedApplicationQueryParameters::new(node_name),
+            );
             let (code, replicas, _) = tokio::try_join!(
                 client.get_deployed_code_package_list(&code_query, None),
                 client.get_deployed_replica_list(&replica_query, None),
-                client.ping(None),
+                client.get_deployed_application_list(&deployment_query, None),
             )?;
             assert_eq!(code.len(), observed_code.len());
             let native_ids: BTreeSet<_> = code
@@ -417,7 +420,14 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
             }
         }
         assert!(!client.is_closed());
-        client.ping(None).await?;
+        client
+            .get_deployed_application_list(
+                &DeployedApplicationQueryDescription::new(DeployedApplicationQueryParameters::new(
+                    "N0010",
+                )),
+                None,
+            )
+            .await?;
     }
     Ok(json!({
         "service_package_count": service_package_count,

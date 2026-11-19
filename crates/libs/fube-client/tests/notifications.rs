@@ -597,12 +597,7 @@ async fn independent_public_clients_survive_other_client_close_and_connection_fa
                 return;
             }
             while let Ok(req) = read_message(&mut s).await {
-                let data = body(|e| {
-                    e.boolean(true).unwrap();
-                    e.i64(0).unwrap();
-                    Ok(())
-                });
-                write_message(&mut s, &peer::reply(&req, "NameOperationReply", data))
+                write_message(&mut s, &peer::reply(&req, "NameOperationReply", vec![]))
                     .await
                     .unwrap();
             }
@@ -671,7 +666,7 @@ async fn independent_public_clients_survive_other_client_close_and_connection_fa
             notification_peer.await.unwrap();
             assert!(matches!(client.recv().await, Some(Err(_))));
             drop(client);
-            assert!(ordinary.name_exists("fabric:/App", None).await.unwrap());
+            ordinary.create_name("fabric:/App", None).await.unwrap();
             ordinary.close().await.unwrap();
             normal_peer.await.unwrap();
         }

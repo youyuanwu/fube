@@ -6,6 +6,13 @@ partition resolution and independently owned notification sessions, with
 recorded SF 11.8.121.4 coverage and explicit limitations. This does not complete
 the TLS/authentication/recovery requirements below.
 
+**Current API split:** this broader design is not the current façade contract.
+Migrated Ping, NameExists, node/application/service lists and node health exist
+only on `FurpcClient` over furpc; their legacy methods and typed-request adapters
+have been removed. `FabricClient` remains for unmigrated operations. Proposed
+builder examples below are not compatibility wrappers; see the linked subset
+guide for current typed requests and absolute deadlines.
+
 ## 1. Goal and protocol baseline
 
 Build an asynchronous, pure Rust client for the Service Fabric **native

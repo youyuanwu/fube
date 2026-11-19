@@ -1,3 +1,4 @@
+use super::write_probe;
 use super::*;
 use fube_client::{ChannelLimits, ClientLimits, ClientOptions, Endpoint, CLIENT_SLOT_BYTES};
 use fube_transport::{
@@ -96,11 +97,11 @@ async fn stub_failure_is_pre_application_and_drops_only_its_consumed_owner() {
     assert!(timeout(Duration::from_millis(20), read_message(&mut peer))
         .await
         .is_err());
-    let mut ping = Box::pin(client.ping(None));
+    let mut ping = Box::pin(client.create_name("fabric:/Probe", None));
     pending(ping.as_mut()).await;
     let request = read_message(&mut peer).await.unwrap();
-    assert_eq!(request.properties().unwrap().action, "PingRequest");
-    write_message(&mut peer, &ping_reply(&request))
+    assert_eq!(request.properties().unwrap().action, "CreateNameRequest");
+    write_message(&mut peer, &write_probe(&request))
         .await
         .unwrap();
     ping.await.unwrap();
@@ -149,7 +150,7 @@ async fn stub_binding_never_grants_installed_policy_or_sends_an_extra_handshake(
     let (channel, mut peer) = tokio::join!(endpoint.connect(), establish(listener));
     let client = FabricClient::new(channel.unwrap(), options(1)).unwrap();
     assert!(matches!(
-        client.ping(None).await,
+        client.create_name("fabric:/Probe", None).await,
         Err(ClientError::Transport(Error::InvalidInput(
             "test denies all submissions"
         )))
@@ -175,14 +176,14 @@ async fn clone_and_distinct_stubs_keep_local_budgets_but_share_transport_admissi
     let cloned = first.clone();
     let second = FabricClient::new(channel.clone(), options(1)).unwrap();
     let third = FabricClient::new(channel.clone(), options(1)).unwrap();
-    let mut a = Box::pin(first.ping(None));
+    let mut a = Box::pin(first.create_name("fabric:/Probe", None));
     pending(a.as_mut()).await;
     let request_a = read_message(&mut peer).await.unwrap();
     assert!(matches!(
-        cloned.ping(None).await,
+        cloned.create_name("fabric:/Probe", None).await,
         Err(ClientError::Local(Error::ResourceLimit(_)))
     ));
-    let mut b = Box::pin(second.ping(None));
+    let mut b = Box::pin(second.create_name("fabric:/Probe", None));
     pending(b.as_mut()).await;
     let request_b = read_message(&mut peer).await.unwrap();
     assert_ne!(
@@ -190,30 +191,30 @@ async fn clone_and_distinct_stubs_keep_local_budgets_but_share_transport_admissi
         request_b.properties().unwrap().id
     );
     assert!(matches!(
-        third.ping(None).await,
+        third.create_name("fabric:/Probe", None).await,
         Err(ClientError::Transport(Error::ResourceLimit(_)))
     ));
-    write_message(&mut peer, &ping_reply(&request_a))
+    write_message(&mut peer, &write_probe(&request_a))
         .await
         .unwrap();
     a.await.unwrap();
     // A transport rejection released third's local slot; a's completion released
     // both layers, while second remains pending on the shared connection.
-    let mut c = Box::pin(third.ping(None));
+    let mut c = Box::pin(third.create_name("fabric:/Probe", None));
     pending(c.as_mut()).await;
     let request_c = read_message(&mut peer).await.unwrap();
-    write_message(&mut peer, &ping_reply(&request_c))
+    write_message(&mut peer, &write_probe(&request_c))
         .await
         .unwrap();
     c.await.unwrap();
-    write_message(&mut peer, &ping_reply(&request_b))
+    write_message(&mut peer, &write_probe(&request_b))
         .await
         .unwrap();
     b.await.unwrap();
     cloned.close().await.unwrap();
     assert!(second.is_closed());
     assert!(matches!(
-        third.ping(None).await,
+        third.create_name("fabric:/Probe", None).await,
         Err(ClientError::Transport(Error::Closed))
     ));
     channel
@@ -248,7 +249,7 @@ async fn connect_default_and_override_budgets_are_independent_and_start_per_oper
             assert!(ticks > minimum.as_nanos() as i64 / 100);
             assert!(ticks <= maximum.as_nanos() as i64 / 100);
             if respond {
-                write_message(&mut peer, &ping_reply(&request))
+                write_message(&mut peer, &write_probe(&request))
                     .await
                     .unwrap();
             }
@@ -266,10 +267,13 @@ async fn connect_default_and_override_budgets_are_independent_and_start_per_oper
     .unwrap();
     sleep(Duration::from_millis(150)).await;
     assert!(matches!(
-        client.ping(None).await,
+        client.create_name("fabric:/Probe", None).await,
         Err(ClientError::Transport(Error::Timeout))
     ));
-    client.ping(Some(Duration::from_secs(2))).await.unwrap();
+    client
+        .create_name("fabric:/Probe", Some(Duration::from_secs(2)))
+        .await
+        .unwrap();
     let distinct = FabricClient::new(
         channel,
         ClientOptions {
@@ -278,7 +282,7 @@ async fn connect_default_and_override_budgets_are_independent_and_start_per_oper
         },
     )
     .unwrap();
-    distinct.ping(None).await.unwrap();
+    distinct.create_name("fabric:/Probe", None).await.unwrap();
     client.close().await.unwrap();
     server.await.unwrap();
 }

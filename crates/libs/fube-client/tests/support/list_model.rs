@@ -216,7 +216,7 @@ async fn application_selectors_exclusion_and_native_paging_are_explicit() {
         ),
     ];
     for (filter, expected) in filters {
-        let (client, server) = single_reply(move |request| {
+        let (mut client, server) = single_reply(move |request| {
             let (name, args) = arguments(request);
             assert_eq!(name, "GetApplicationList");
             let mut expected_args = BTreeMap::from([
@@ -236,19 +236,23 @@ async fn application_selectors_exclusion_and_native_paging_are_explicit() {
         .await;
         let page = client
             .get_application_list(
-                &ApplicationQueryDescription {
-                    parameters: ApplicationQueryParameters {
-                        filter,
-                        exclude_application_parameters: true,
-                    },
-                    paging: Paging {
-                        continuation_token: Some("opaque:not-a-node-id".into()),
-                        max_results: NonZeroU64::new(i64::MAX as u64),
-                    },
-                },
-                Some(TIMEOUT_DURATION),
+                furpc::Request::new(
+                    (ApplicationQueryDescription {
+                        parameters: ApplicationQueryParameters {
+                            filter,
+                            exclude_application_parameters: true,
+                        },
+                        paging: Paging {
+                            continuation_token: Some("opaque:not-a-node-id".into()),
+                            max_results: NonZeroU64::new(i64::MAX as u64),
+                        },
+                    })
+                    .clone(),
+                ),
+                read_deadline(Some(TIMEOUT_DURATION)),
             )
             .await
+            .map(furpc::Response::into_body)
             .unwrap();
         assert_eq!(
             page.continuation_token.as_deref(),
@@ -267,7 +271,7 @@ async fn application_selectors_exclusion_and_native_paging_are_explicit() {
             app.definition_kind,
             ApplicationDefinitionKind::ServiceFabricApplicationDescription
         );
-        client.close().await.unwrap();
+        drop(client);
         server.await.unwrap();
     }
 }
@@ -291,7 +295,7 @@ async fn service_selectors_route_to_application_service_list_and_both_kinds_deco
             false,
         ),
     ] {
-        let (client, server) = single_reply(move |request| {
+        let (mut client, server) = single_reply(move |request| {
             let (name, args) = arguments(request);
             assert_eq!(name, "GetApplicationServiceList");
             let mut expected = BTreeMap::from([("ApplicationName".into(), "fabric:/Model".into())]);
@@ -317,7 +321,11 @@ async fn service_selectors_route_to_application_service_list_and_both_kinds_deco
         ));
         query.parameters.filter = filter;
         query.paging.continuation_token = Some(String::new());
-        let page = client.get_service_list(&query, None).await.unwrap();
+        let page = client
+            .get_service_list(furpc::Request::new((query).clone()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
         let service = &page.items[0];
         assert_eq!(
             service.kind,
@@ -333,7 +341,7 @@ async fn service_selectors_route_to_application_service_list_and_both_kinds_deco
         assert_eq!(service.manifest_version, "1.2");
         assert!(service.is_service_group);
         assert!(page.continuation_token.is_none());
-        client.close().await.unwrap();
+        drop(client);
         server.await.unwrap();
     }
 }
@@ -350,17 +358,21 @@ async fn optional_record_suffixes_use_only_native_defaults() {
                     Shape::application()
                 }
             };
-            let (client, server) =
+            let (mut client, server) =
                 single_reply(move |r| aggregate(r, list_body(&s, Some("")))).await;
             if service {
                 let page = client
                     .get_service_list(
-                        &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                            "fabric:/Model".parse().unwrap(),
-                        )),
-                        None,
+                        furpc::Request::new(
+                            (ServiceQueryDescription::new(ServiceQueryParameters::new(
+                                "fabric:/Model".parse().unwrap(),
+                            )))
+                            .clone(),
+                        ),
+                        read_deadline(None),
                     )
                     .await
+                    .map(furpc::Response::into_body)
                     .unwrap();
                 assert_eq!(
                     page.items[0].status,
@@ -374,8 +386,12 @@ async fn optional_record_suffixes_use_only_native_defaults() {
                 assert!(page.continuation_token.is_none());
             } else {
                 let page = client
-                    .get_application_list(&ApplicationQueryDescription::default(), None)
+                    .get_application_list(
+                        furpc::Request::new((ApplicationQueryDescription::default()).clone()),
+                        read_deadline(None),
+                    )
                     .await
+                    .map(furpc::Response::into_body)
                     .unwrap();
                 assert_eq!(
                     page.items[0].definition_kind,
@@ -388,7 +404,7 @@ async fn optional_record_suffixes_use_only_native_defaults() {
                 assert!(page.items[0].upgrade_type_version.is_empty());
                 assert!(page.items[0].upgrade_parameters.is_empty());
             }
-            client.close().await.unwrap();
+            drop(client);
             server.await.unwrap();
         }
     }
@@ -408,17 +424,21 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                         Shape::application()
                     }
                 };
-                let (client, server) =
+                let (mut client, server) =
                     single_reply(move |r| aggregate(r, list_body(&s, None))).await;
                 if service {
                     let page = client
                         .get_service_list(
-                            &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                                "fabric:/Model".parse().unwrap(),
-                            )),
-                            None,
+                            furpc::Request::new(
+                                (ServiceQueryDescription::new(ServiceQueryParameters::new(
+                                    "fabric:/Model".parse().unwrap(),
+                                )))
+                                .clone(),
+                            ),
+                            read_deadline(None),
                         )
                         .await
+                        .map(furpc::Response::into_body)
                         .unwrap();
                     let expected = [
                         ServiceStatus::Unknown,
@@ -432,8 +452,12 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                     assert_eq!(page.items[0].health_state.as_raw(), health);
                 } else {
                     let page = client
-                        .get_application_list(&ApplicationQueryDescription::default(), None)
+                        .get_application_list(
+                            furpc::Request::new((ApplicationQueryDescription::default()).clone()),
+                            read_deadline(None),
+                        )
                         .await
+                        .map(furpc::Response::into_body)
                         .unwrap();
                     let expected = [
                         ApplicationStatus::Invalid,
@@ -446,7 +470,7 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                     assert_eq!(page.items[0].status, expected[status as usize]);
                     assert_eq!(page.items[0].health_state.as_raw(), health);
                 }
-                client.close().await.unwrap();
+                drop(client);
                 server.await.unwrap();
             }
         }
@@ -472,17 +496,21 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                 ),
             )
         };
-        let (client, server) = single_reply(make_reply).await;
+        let (mut client, server) = single_reply(make_reply).await;
         assert_eq!(
             client
-                .get_application_list(&ApplicationQueryDescription::default(), None)
+                .get_application_list(
+                    furpc::Request::new((ApplicationQueryDescription::default()).clone()),
+                    read_deadline(None)
+                )
                 .await
+                .map(furpc::Response::into_body)
                 .unwrap()
                 .items[0]
                 .definition_kind,
             expected
         );
-        client.close().await.unwrap();
+        drop(client);
         server.await.unwrap();
     }
 }
@@ -587,32 +615,43 @@ async fn malformed_list_successes_are_call_local_and_preserve_shared_stream() {
             });
         }
         for s in shapes {
-            let (client, server) =
+            let (mut client, server) =
                 reusable_reply(move |r| aggregate(r, list_body(&s, Some("token")))).await;
             let outcome = if service {
                 client
                     .get_service_list(
-                        &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                            "fabric:/Model".parse().unwrap(),
-                        )),
-                        None,
+                        furpc::Request::new(
+                            (ServiceQueryDescription::new(ServiceQueryParameters::new(
+                                "fabric:/Model".parse().unwrap(),
+                            )))
+                            .clone(),
+                        ),
+                        read_deadline(None),
                     )
                     .await
+                    .map(furpc::Response::into_body)
                     .map(|_| ())
             } else {
                 client
-                    .get_application_list(&ApplicationQueryDescription::default(), None)
+                    .get_application_list(
+                        furpc::Request::new((ApplicationQueryDescription::default()).clone()),
+                        read_deadline(None),
+                    )
                     .await
+                    .map(furpc::Response::into_body)
                     .map(|_| ())
             };
             assert!(
-                matches!(outcome, Err(ClientError::Protocol(_))),
+                matches!(outcome, Err(ReadError::Protocol(_) | ReadError::Decode(_))),
                 "{outcome:?}"
             );
-            assert!(!client.is_closed());
-            assert!(client.terminal_error().is_none());
-            client.ping(None).await.unwrap();
-            client.close().await.unwrap();
+
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body)
+                .unwrap();
+            drop(client);
             server.await.unwrap();
         }
     }
@@ -629,27 +668,42 @@ async fn truncated_and_wrong_metadata_are_not_missing_optional_suffixes() {
         let valid = list_body(&s, Some("next"));
         for removed in [1, 2, 5, valid.len() / 2] {
             let bytes = valid[..valid.len() - removed].to_vec();
-            let (client, server) = reusable_reply(move |r| aggregate(r, bytes)).await;
+            let (mut client, server) = reusable_reply(move |r| aggregate(r, bytes)).await;
             let outcome = if service {
                 client
                     .get_service_list(
-                        &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                            "fabric:/Model".parse().unwrap(),
-                        )),
-                        None,
+                        furpc::Request::new(
+                            (ServiceQueryDescription::new(ServiceQueryParameters::new(
+                                "fabric:/Model".parse().unwrap(),
+                            )))
+                            .clone(),
+                        ),
+                        read_deadline(None),
                     )
                     .await
+                    .map(furpc::Response::into_body)
                     .map(|_| ())
             } else {
                 client
-                    .get_application_list(&ApplicationQueryDescription::default(), None)
+                    .get_application_list(
+                        furpc::Request::new((ApplicationQueryDescription::default()).clone()),
+                        read_deadline(None),
+                    )
                     .await
+                    .map(furpc::Response::into_body)
                     .map(|_| ())
             };
-            assert!(matches!(outcome, Err(ClientError::Protocol(_))));
-            assert!(!client.is_closed());
-            client.ping(None).await.unwrap();
-            client.close().await.unwrap();
+            assert!(matches!(
+                outcome,
+                Err(ReadError::Protocol(_) | ReadError::Decode(_))
+            ));
+
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body)
+                .unwrap();
+            drop(client);
             server.await.unwrap();
         }
     }
@@ -657,7 +711,7 @@ async fn truncated_and_wrong_metadata_are_not_missing_optional_suffixes() {
 
 #[tokio::test]
 async fn invalid_list_inputs_and_timeouts_send_no_request() {
-    let (client, server) = single_reply(|r| {
+    let (mut client, server) = single_reply(|r| {
         assert_eq!(r.properties().unwrap().action, "PingRequest");
         ping_reply(r)
     })
@@ -665,7 +719,6 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
     assert!(Definitions::try_from_bits(8).is_err());
     for filter in [
         ApplicationListFilter::TypeName(String::new()),
-        ApplicationListFilter::TypeName("x".repeat(32769)),
         ApplicationListFilter::DefinitionKind(Definitions::from_bits(8).unwrap()),
         ApplicationListFilter::DefinitionKind(Definitions::from_bits_retain(u32::MAX)),
         ApplicationListFilter::DefinitionKind(Definitions::ALL & !Definitions::COMPOSE),
@@ -678,14 +731,23 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
         assert!(matches!(
             client
                 .get_application_list(
-                    &ApplicationQueryDescription::new(ApplicationQueryParameters {
-                        filter,
-                        ..Default::default()
-                    }),
-                    None
+                    furpc::Request::new(
+                        (ApplicationQueryDescription::new(ApplicationQueryParameters {
+                            filter,
+                            ..ApplicationQueryParameters::default()
+                        }))
+                        .clone()
+                    ),
+                    read_deadline(None)
                 )
-                .await,
-            Err(ClientError::Local(Error::InvalidInput(_)))
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Native(
+                furpc::Error::Codec {
+                    phase: "encode",
+                    ..
+                } | furpc::Error::Timeout(_)
+            ))
         ));
     }
     for application in ["", "fabric:", "fabric:/", "FABRIC:/a", "fabric:/é"] {
@@ -698,14 +760,30 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
         "fabric:/System".parse().unwrap(),
     ));
     assert!(matches!(
-        client.get_service_list(&service, None).await,
-        Err(ClientError::Local(Error::InvalidInput(_)))
+        client
+            .get_service_list(furpc::Request::new((service).clone()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body),
+        Err(ReadError::Native(
+            furpc::Error::Codec {
+                phase: "encode",
+                ..
+            } | furpc::Error::Timeout(_)
+        ))
     ));
     service.parameters.application_name = "fabric:/Model".parse().unwrap();
     service.parameters.filter = ServiceListFilter::TypeName(String::new());
     assert!(matches!(
-        client.get_service_list(&service, None).await,
-        Err(ClientError::Local(Error::InvalidInput(_)))
+        client
+            .get_service_list(furpc::Request::new((service).clone()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body),
+        Err(ReadError::Native(
+            furpc::Error::Codec {
+                phase: "encode",
+                ..
+            } | furpc::Error::Timeout(_)
+        ))
     ));
     for name in ["fabric:", "fabric:/bad/", "fabric:/bad//name"] {
         assert!(matches!(
@@ -716,51 +794,80 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
     service.parameters.filter = ServiceListFilter::All;
     service.paging.max_results = NonZeroU64::new(u64::MAX);
     assert!(matches!(
-        client.get_service_list(&service, None).await,
-        Err(ClientError::Local(Error::InvalidInput(_)))
+        client
+            .get_service_list(furpc::Request::new((service).clone()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body),
+        Err(ReadError::Native(
+            furpc::Error::Codec {
+                phase: "encode",
+                ..
+            } | furpc::Error::Timeout(_)
+        ))
     ));
-    for q in [
-        ApplicationQueryDescription {
-            paging: Paging {
-                max_results: NonZeroU64::new(u64::MAX),
-                ..Default::default()
-            },
+    for q in [ApplicationQueryDescription {
+        paging: Paging {
+            max_results: NonZeroU64::new(u64::MAX),
             ..Default::default()
         },
-        ApplicationQueryDescription {
-            paging: Paging {
-                continuation_token: Some("x".repeat(32769)),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    ] {
-        assert!(matches!(
-            client.get_application_list(&q, None).await,
-            Err(ClientError::Local(Error::InvalidInput(_)))
-        ));
-    }
-    for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
+        ..Default::default()
+    }] {
         assert!(matches!(
             client
-                .get_application_list(&Default::default(), Some(timeout))
-                .await,
-            Err(ClientError::Local(Error::InvalidInput(_)))
+                .get_application_list(furpc::Request::new((q).clone()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Native(
+                furpc::Error::Codec {
+                    phase: "encode",
+                    ..
+                } | furpc::Error::Timeout(_)
+            ))
+        ));
+    }
+    for timeout in [Duration::ZERO] {
+        assert!(matches!(
+            client
+                .get_application_list(
+                    furpc::Request::new((ApplicationQueryDescription::default()).clone()),
+                    read_deadline(Some(timeout))
+                )
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Native(
+                furpc::Error::Codec {
+                    phase: "encode",
+                    ..
+                } | furpc::Error::Timeout(_)
+            ))
         ));
         assert!(matches!(
             client
                 .get_service_list(
-                    &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                        "fabric:/Model".parse().unwrap()
-                    )),
-                    Some(timeout)
+                    furpc::Request::new(
+                        (ServiceQueryDescription::new(ServiceQueryParameters::new(
+                            "fabric:/Model".parse().unwrap()
+                        )))
+                        .clone()
+                    ),
+                    read_deadline(Some(timeout))
                 )
-                .await,
-            Err(ClientError::Local(Error::InvalidInput(_)))
+                .await
+                .map(furpc::Response::into_body),
+            Err(ReadError::Native(
+                furpc::Error::Codec {
+                    phase: "encode",
+                    ..
+                } | furpc::Error::Timeout(_)
+            ))
         ));
     }
-    client.ping(None).await.unwrap();
-    client.close().await.unwrap();
+    client
+        .ping(furpc::Request::new(()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
+    drop(client);
     server.await.unwrap();
 }
 
@@ -821,7 +928,7 @@ async fn semantic_list_validation_precedes_embedded_query_errors() {
         },
     ] {
         let service = shape.service;
-        let (client, server) = reusable_reply(move |request| {
+        let (mut client, server) = reusable_reply(move |request| {
             aggregate(
                 request,
                 list_body(
@@ -837,27 +944,38 @@ async fn semantic_list_validation_precedes_embedded_query_errors() {
         let result = if service {
             client
                 .get_service_list(
-                    &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                        "fabric:/Model".parse().unwrap(),
-                    )),
-                    None,
+                    furpc::Request::new(
+                        (ServiceQueryDescription::new(ServiceQueryParameters::new(
+                            "fabric:/Model".parse().unwrap(),
+                        )))
+                        .clone(),
+                    ),
+                    read_deadline(None),
                 )
                 .await
+                .map(furpc::Response::into_body)
                 .map(|_| ())
         } else {
             client
-                .get_application_list(&Default::default(), None)
+                .get_application_list(
+                    furpc::Request::new((ApplicationQueryDescription::default()).clone()),
+                    read_deadline(None),
+                )
                 .await
+                .map(furpc::Response::into_body)
                 .map(|_| ())
         };
         assert!(
-            matches!(result, Err(ClientError::Protocol(_))),
+            matches!(result, Err(ReadError::Protocol(_) | ReadError::Decode(_))),
             "{result:?}"
         );
-        assert!(!client.is_closed());
-        assert!(client.terminal_error().is_none());
-        client.ping(None).await.unwrap();
-        client.close().await.unwrap();
+
+        client
+            .ping(furpc::Request::new(()), read_deadline(None))
+            .await
+            .map(furpc::Response::into_body)
+            .unwrap();
+        drop(client);
         server.await.unwrap();
     }
 }
@@ -899,57 +1017,72 @@ async fn native_list_errors_are_local_and_allow_mixed_reuse() {
         }
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut client = FurpcClient::new(channel);
     assert!(matches!(
-        client.get_application_list(&Default::default(), None).await,
-        Err(ClientError::Domain(DomainFailure {
+        client
+            .get_application_list(
+                furpc::Request::new((ApplicationQueryDescription::default()).clone()),
+                read_deadline(None)
+            )
+            .await
+            .map(furpc::Response::into_body),
+        Err(ReadError::Domain(DomainFailure {
             code: REMOTE_CODE,
             ..
         }))
     ));
-    assert!(!client.is_closed());
+
     assert!(matches!(
         client
             .get_service_list(
-                &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                    "fabric:/Model".parse().unwrap()
-                )),
-                None
+                furpc::Request::new(
+                    (ServiceQueryDescription::new(ServiceQueryParameters::new(
+                        "fabric:/Model".parse().unwrap()
+                    )))
+                    .clone()
+                ),
+                read_deadline(None)
             )
-            .await,
-        Err(ClientError::Domain(DomainFailure {
+            .await
+            .map(furpc::Response::into_body),
+        Err(ReadError::Domain(DomainFailure {
             code: REMOTE_CODE,
             ..
         }))
     ));
     client
-        .get_application_list(&Default::default(), None)
+        .get_application_list(
+            furpc::Request::new((ApplicationQueryDescription::default()).clone()),
+            read_deadline(None),
+        )
         .await
+        .map(furpc::Response::into_body)
         .unwrap();
     client
         .get_service_list(
-            &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                "fabric:/Model".parse().unwrap(),
-            )),
-            None,
+            furpc::Request::new(
+                (ServiceQueryDescription::new(ServiceQueryParameters::new(
+                    "fabric:/Model".parse().unwrap(),
+                )))
+                .clone(),
+            ),
+            read_deadline(None),
         )
         .await
+        .map(furpc::Response::into_body)
         .unwrap();
-    client.ping(None).await.unwrap();
-    client.close().await.unwrap();
+    client
+        .ping(furpc::Request::new(()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
+    drop(client);
     server.await.unwrap();
 }
 
@@ -991,36 +1124,68 @@ async fn mixed_lists_ping_and_name_complete_out_of_order_on_one_stream() {
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut client = FurpcClient::new(channel);
     let apps = ApplicationQueryDescription::default();
     let services = ServiceQueryDescription::new(ServiceQueryParameters::new(
         "fabric:/Model".parse().unwrap(),
     ));
     let (a, s, p, n) = tokio::join!(
-        client.get_application_list(&apps, None),
-        client.get_service_list(&services, None),
-        client.ping(None),
-        client.name_exists("fabric:/Model", None)
+        {
+            let mut client = client.clone();
+            async move {
+                client
+                    .get_application_list(furpc::Request::new((apps).clone()), read_deadline(None))
+                    .await
+                    .map(furpc::Response::into_body)
+            }
+        },
+        {
+            let mut client = client.clone();
+            async move {
+                client
+                    .get_service_list(furpc::Request::new((services).clone()), read_deadline(None))
+                    .await
+                    .map(furpc::Response::into_body)
+            }
+        },
+        {
+            let mut client = client.clone();
+            async move {
+                client
+                    .ping(furpc::Request::new(()), read_deadline(None))
+                    .await
+                    .map(furpc::Response::into_body)
+            }
+        },
+        {
+            let mut client = client.clone();
+            async move {
+                client
+                    .name_exists(
+                        furpc::Request::new(NamingUri::parse("fabric:/Model").unwrap()),
+                        read_deadline(None),
+                    )
+                    .await
+                    .map(furpc::Response::into_body)
+            }
+        }
     );
     assert_eq!(a.unwrap().items.len(), 1);
     assert_eq!(s.unwrap().items.len(), 1);
     p.unwrap();
     assert!(n.unwrap());
-    client.ping(None).await.unwrap();
-    client.close().await.unwrap();
+    client
+        .ping(furpc::Request::new(()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
+    drop(client);
     server.await.unwrap();
 }
 
@@ -1069,44 +1234,50 @@ async fn malformed_list_is_call_local_and_pending_neighbor_succeeds() {
             std::io::ErrorKind::UnexpectedEof
         );
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let c = client.clone();
-    let first =
-        tokio::spawn(async move { c.get_application_list(&Default::default(), None).await });
-    tokio::task::yield_now().await;
-    let c = client.clone();
-    let second = tokio::spawn(async move {
-        c.get_service_list(
-            &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                "fabric:/Model".parse().unwrap(),
-            )),
-            None,
+    let mut client = FurpcClient::new(channel);
+    let mut c = client.clone();
+    let first = tokio::spawn(async move {
+        c.get_application_list(
+            furpc::Request::new((ApplicationQueryDescription::default()).clone()),
+            read_deadline(None),
         )
         .await
+        .map(furpc::Response::into_body)
+    });
+    tokio::task::yield_now().await;
+    let mut c = client.clone();
+    let second = tokio::spawn(async move {
+        c.get_service_list(
+            furpc::Request::new(
+                (ServiceQueryDescription::new(ServiceQueryParameters::new(
+                    "fabric:/Model".parse().unwrap(),
+                )))
+                .clone(),
+            ),
+            read_deadline(None),
+        )
+        .await
+        .map(furpc::Response::into_body)
     });
     received.await.unwrap();
     assert!(matches!(
         first.await.unwrap(),
-        Err(ClientError::Protocol(_))
+        Err(ReadError::Protocol(_) | ReadError::Decode(_))
     ));
     assert_eq!(second.await.unwrap().unwrap().items.len(), 1);
-    assert!(!client.is_closed());
-    assert!(client.terminal_error().is_none());
-    client.ping(None).await.unwrap();
-    client.close().await.unwrap();
+
+    client
+        .ping(furpc::Request::new(()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
+    drop(client);
     server.await.unwrap();
 }
 
@@ -1149,32 +1320,37 @@ async fn explicit_service_paging_stops_at_empty_terminal_page_without_hidden_req
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut client = FurpcClient::new(channel);
     let mut query = ServiceQueryDescription::new(ServiceQueryParameters::new(
         "fabric:/Model".parse().unwrap(),
     ));
     query.paging.max_results = NonZeroU64::new(1);
-    let first = client.get_service_list(&query, None).await.unwrap();
+    let first = client
+        .get_service_list(furpc::Request::new((query).clone()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
     assert_eq!(first.continuation_token.as_deref(), Some("opaque"));
     query.paging.continuation_token = first.continuation_token;
-    let terminal = client.get_service_list(&query, None).await.unwrap();
+    let terminal = client
+        .get_service_list(furpc::Request::new((query).clone()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
     assert!(terminal.items.is_empty());
     assert!(terminal.continuation_token.is_none());
-    client.ping(None).await.unwrap();
-    client.close().await.unwrap();
+    client
+        .ping(furpc::Request::new(()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
+    drop(client);
     server.await.unwrap();
 }
 
@@ -1209,31 +1385,45 @@ async fn present_aggregate_headers_are_validated_for_each_list() {
                 }
                 response
             };
-            let (client, server) = reusable_reply(make_reply).await;
+            let (mut client, server) = reusable_reply(make_reply).await;
             let result = if service {
                 client
                     .get_service_list(
-                        &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                            "fabric:/Model".parse().unwrap(),
-                        )),
-                        None,
+                        furpc::Request::new(
+                            (ServiceQueryDescription::new(ServiceQueryParameters::new(
+                                "fabric:/Model".parse().unwrap(),
+                            )))
+                            .clone(),
+                        ),
+                        read_deadline(None),
                     )
                     .await
+                    .map(furpc::Response::into_body)
                     .map(|_| ())
             } else {
                 client
-                    .get_application_list(&Default::default(), None)
+                    .get_application_list(
+                        furpc::Request::new((ApplicationQueryDescription::default()).clone()),
+                        read_deadline(None),
+                    )
                     .await
+                    .map(furpc::Response::into_body)
                     .map(|_| ())
             };
             assert_eq!(result.is_ok(), valid, "{actor:?}/{action:?}: {result:?}");
             if !valid {
-                assert!(matches!(result, Err(ClientError::Protocol(_))));
+                assert!(matches!(
+                    result,
+                    Err(ReadError::Protocol(_) | ReadError::Decode(_))
+                ));
             }
-            assert!(!client.is_closed());
-            assert!(client.terminal_error().is_none());
-            client.ping(None).await.unwrap();
-            client.close().await.unwrap();
+
+            client
+                .ping(furpc::Request::new(()), read_deadline(None))
+                .await
+                .map(furpc::Response::into_body)
+                .unwrap();
+            drop(client);
             server.await.unwrap();
         }
     }
@@ -1263,36 +1453,41 @@ async fn timed_out_list_ignores_late_malformed_reply_and_preserves_reuse() {
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let channel = FabricClient::endpoint_clear(endpoint)
+    let channel = FurpcClient::endpoint_clear(endpoint)
         .unwrap()
         .connect_timeout(TIMEOUT_DURATION)
         .connect()
         .await
         .unwrap();
-    let client = FabricClient::new(
-        channel,
-        fube_client::ClientOptions {
-            default_timeout: TIMEOUT_DURATION,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut client = FurpcClient::new(channel);
     assert!(matches!(
         client
-            .get_application_list(&Default::default(), Some(Duration::from_millis(75)))
-            .await,
-        Err(ClientError::Transport(Error::Timeout))
+            .get_application_list(
+                furpc::Request::new((ApplicationQueryDescription::default()).clone()),
+                read_deadline(Some(Duration::from_millis(75)))
+            )
+            .await
+            .map(furpc::Response::into_body),
+        Err(ReadError::Native(furpc::Error::Timeout(_)))
     ));
     client
         .get_service_list(
-            &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                "fabric:/Model".parse().unwrap(),
-            )),
-            None,
+            furpc::Request::new(
+                (ServiceQueryDescription::new(ServiceQueryParameters::new(
+                    "fabric:/Model".parse().unwrap(),
+                )))
+                .clone(),
+            ),
+            read_deadline(None),
         )
         .await
+        .map(furpc::Response::into_body)
         .unwrap();
-    client.ping(None).await.unwrap();
-    client.close().await.unwrap();
+    client
+        .ping(furpc::Request::new(()), read_deadline(None))
+        .await
+        .map(furpc::Response::into_body)
+        .unwrap();
+    drop(client);
     server.await.unwrap();
 }

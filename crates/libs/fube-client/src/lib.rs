@@ -4,7 +4,9 @@
 //! Existing [`FabricClient`] connections support bounded concurrency without
 //! automatic reconnect. The separate [`FurpcClient`] is a typed stub over a
 //! byte-facing Tower service, defaulting to furpc's Channel, and provides Ping,
-//! NameExists and single-page GetNodeList.
+//! NameExists, single-page node/application/service lists and node health.
+//! These reads are no longer available on FabricClient or its ClientRequest
+//! adapters. FabricClient retains the remaining, unmigrated operations.
 //! Native connections require an explicitly selected unsecured development gateway.
 
 mod applications;
@@ -108,6 +110,9 @@ pub struct GatewayDescription {
 
 /// Cloneable client for the native clear-TCP development profile.
 ///
+/// Legacy implementation for naming writes, partition/replica/deployment
+/// queries and service resolution. Migrated reads use [`FurpcClient`] only.
+///
 /// Clones explicitly share one Channel lifecycle owner, typed budget and terminal state.
 /// A [`GatewayClient`] instead borrows a supplied foundation without adopting it.
 /// Eight admitted typed calls are retained through result transfer/drop; excess
@@ -127,9 +132,9 @@ pub struct GatewayDescription {
 /// let channel = endpoint.connect().await?;
 /// let client = FabricClient::new(channel.clone(), ClientOptions::default())?;
 /// let cloned = client.clone(); // same typed admission budget, no new handshake
-/// let (gateway, exists) = tokio::try_join!(
-///     client.ping(None),
-///     cloned.name_exists("fabric:/MyApplication", Some(Duration::from_secs(5))),
+/// let (created, deleted) = tokio::try_join!(
+///     client.create_name("fabric:/First", None),
+///     cloned.delete_name("fabric:/Second", Some(Duration::from_secs(5))),
 /// )?;
 /// channel.close(deadline_after(DEFAULT_TIMEOUT)?).await?; // shared shutdown
 /// # Ok(())
@@ -183,35 +188,9 @@ impl FabricClient {
         .await
     }
 
-    /// Discover the native gateway's full node identity.
-    pub async fn ping(&self, timeout: Option<Duration>) -> ClientResult<GatewayDescription> {
-        self.operation(PingRequest, timeout).await
-    }
-
-    /// Test naming-store existence, independently of user-service state.
-    ///
-    /// Supported inputs are literal `fabric:/` followed by nonempty ASCII
-    /// `[A-Za-z0-9_-]+` segments separated by single slashes, at most 4096 bytes.
-    /// Root, authority, escapes, query, fragment, whitespace, Unicode, and
-    /// trailing or repeated slashes are rejected rather than normalized.
-    /// Accepts a [`NamingUri`] or a string checked before sending.
-    pub async fn name_exists(
-        &self,
-        name: impl AsRef<str>,
-        timeout: Option<Duration>,
-    ) -> ClientResult<bool> {
-        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
-        let request = self.name_request(name.as_ref(), NameOperation::Exists, deadline)?;
-        drop(name);
-        match self.call(request, CallContext { deadline }).await? {
-            NameResponse::Exists(exists) => Ok(exists),
-            _ => Err(ClientError::Protocol("unexpected naming result")),
-        }
-    }
-
     /// Explicitly create a naming entry with one deadline from preparation through decode.
     ///
-    /// Uses the same supported URI profile as [`Self::name_exists`]. Native
+    /// Accepts a checked [`NamingUri`] or a string parsed before sending. Native
     /// creation may create implicit ancestors or promote an implicit entry;
     /// an already explicitly created entry returns a native error.
     ///
@@ -233,7 +212,7 @@ impl FabricClient {
 
     /// Explicitly delete one naming entry with one deadline from preparation through decode.
     ///
-    /// Uses the same URI profile as [`Self::name_exists`]. This is not recursive:
+    /// Accepts a checked [`NamingUri`] or a string parsed before sending. This is not recursive:
     /// native missing-name and nonempty-name failures remain errors. The service
     /// may also remove empty implicit ancestors.
     ///
@@ -251,57 +230,6 @@ impl FabricClient {
         self.call(request, CallContext { deadline })
             .await
             .map(|_| ())
-    }
-
-    /// Get one native node page. Inspect `continuation_token` even without an
-    /// explicit page limit: the server can also page by message size.
-    ///
-    /// This is best-effort native aggregation, not a membership snapshot.
-    /// No automatic paging, retry, reconnect or replay occurs.
-    pub async fn get_node_list(
-        &self,
-        query: &NodeQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<NodeListPage> {
-        self.query(query, timeout).await
-    }
-
-    /// Query actual single-node health, events and unhealthy explanations.
-    /// This is not GetNodeList's summary. No paging or automatic retries occur.
-    ///
-    /// Native and malformed domain replies are operation-local; transport
-    /// envelope failures can terminate the channel. See [`NodeHealthQueryDescription`].
-    pub async fn get_node_health(
-        &self,
-        query: &NodeHealthQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<NodeHealth> {
-        self.query(query, timeout).await
-    }
-
-    /// Get one native application page with one whole-operation deadline.
-    /// Filters are mutually exclusive; parameters are included by default.
-    ///
-    /// No retries or automatic traversal. Domain validation errors are local to
-    /// this call; the channel independently owns transport failure policy.
-    pub async fn get_application_list(
-        &self,
-        query: &ApplicationQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<ApplicationListPage> {
-        self.query(query, timeout).await
-    }
-
-    /// Get one ordinary application-scoped service page with one whole-operation deadline.
-    /// Ad-hoc/root and System profiles are explicitly unsupported.
-    ///
-    /// Count is a native per-subquery limit, not a strict CM/FM union cap.
-    pub async fn get_service_list(
-        &self,
-        query: &ServiceQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<ServiceListPage> {
-        self.query(query, timeout).await
     }
 
     /// Get one partition page for a service with one whole-operation deadline.
@@ -431,20 +359,6 @@ impl FabricClient {
         let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
         typed::check_input(query).map_err(ClientError::Local)?;
         self.call(query.clone(), CallContext { deadline }).await
-    }
-
-    async fn operation<R: ClientRequest<DomainError = DomainFailure>>(
-        &self,
-        request: R,
-        timeout: Option<Duration>,
-    ) -> ClientResult<R::Response> {
-        self.call(
-            request,
-            CallContext {
-                deadline: self.deadline(timeout).map_err(ClientError::Local)?,
-            },
-        )
-        .await
     }
 
     fn name_request(

@@ -9,6 +9,10 @@
 //! Both implement [`Client`] through the shared call layer. Notification and
 //! image-transfer clients and runtime IPC compositions remain independently owned.
 //!
+//! This is the legacy adapter boundary for unmigrated operations. Ping,
+//! NameExists, node/application/service lists and node health are provided only
+//! by [`FurpcClient`](crate::FurpcClient), not by these sealed request adapters.
+//!
 //! # Native boundary (source facts)
 //!
 //! All native links pin locally inspected SF revision

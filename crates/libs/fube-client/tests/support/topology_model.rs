@@ -1,12 +1,15 @@
 //! Shared transport behavior for the additional native list query families.
 use super::*;
+use super::{
+    legacy_reusable_reply as reusable_reply, legacy_single_reply as single_reply, write_probe,
+};
 use fube_client::{
     DeployedApplicationQueryDescription, DeployedApplicationQueryParameters,
     DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
     DeployedReplicaQueryDescription, DeployedReplicaQueryParameters,
     DeployedServicePackageQueryDescription, DeployedServicePackageQueryParameters,
-    NodeHealthQueryDescription, NodeHealthQueryParameters, PartitionQueryDescription,
-    PartitionQueryParameters, ReplicaQueryDescription, ReplicaQueryParameters,
+    PartitionQueryDescription, PartitionQueryParameters, ReplicaQueryDescription,
+    ReplicaQueryParameters,
 };
 use fube_transport::message::{ACTION, ACTOR, IPC, RELATES_TO};
 use fubst::serde::{EmptyObjectArray, FixedTag, Pointer};
@@ -14,63 +17,50 @@ use serde::Serialize;
 
 #[tokio::test]
 async fn forwarded_body_only_aggregate_lists_use_their_typed_profile() {
-    for deployed in [false, true] {
-        for records in [2, 3] {
-            let (client, server) = reusable_reply(move |request| {
-                let outer = request.properties().unwrap().id;
-                let mut headers = vec![
-                    Header::relates_to(MessageId {
-                        guid: [91; 16],
-                        index: 900,
-                    })
-                    .unwrap(),
-                    Header::relates_to(outer).unwrap(),
-                    // Native forwarded aggregates repeat this opaque flag.
-                    // It never grants the Rust client retry/replay authority.
-                    Header::boolean(0x8008, true).unwrap(),
-                    Header::boolean(0x8008, true).unwrap(),
-                ];
-                if records == 3 {
-                    headers.push(Header::relates_to(outer).unwrap());
-                }
-                let tag: i32 = if deployed { 10 } else { 4 };
-                Message {
-                    headers,
-                    body: body(|e| {
-                        e.i64(2).unwrap();
-                        e.pointer(Some(&tag.to_le_bytes()), |e| {
-                            e.object_array::<()>(&[], |_, _| Ok(()))?;
-                            e.pointer(None, |_| Ok(()))
-                        })?;
-                        e.i64(0).unwrap();
-                        e.pointer(None, |_| Ok(()))
-                    }),
-                }
-            })
-            .await;
-            if deployed {
-                client
-                    .get_deployed_application_list(
-                        &DeployedApplicationQueryDescription::new(
-                            DeployedApplicationQueryParameters::new("N0010"),
-                        ),
-                        None,
-                    )
-                    .await
-                    .unwrap();
-            } else {
-                client
-                    .get_application_list(
-                        &fube_client::ApplicationQueryDescription::default(),
-                        None,
-                    )
-                    .await
-                    .unwrap();
+    for records in [2, 3] {
+        let (client, server) = reusable_reply(move |request| {
+            let outer = request.properties().unwrap().id;
+            let mut headers = vec![
+                Header::relates_to(MessageId {
+                    guid: [91; 16],
+                    index: 900,
+                })
+                .unwrap(),
+                Header::relates_to(outer).unwrap(),
+                // Native forwarded aggregates repeat this opaque flag.
+                // It never grants the Rust client retry/replay authority.
+                Header::boolean(0x8008, true).unwrap(),
+                Header::boolean(0x8008, true).unwrap(),
+            ];
+            if records == 3 {
+                headers.push(Header::relates_to(outer).unwrap());
             }
-            client.ping(None).await.unwrap();
-            client.close().await.unwrap();
-            server.await.unwrap();
-        }
+            Message {
+                headers,
+                body: body(|e| {
+                    e.i64(2).unwrap();
+                    e.pointer(Some(&10i32.to_le_bytes()), |e| {
+                        e.object_array::<()>(&[], |_, _| Ok(()))?;
+                        e.pointer(None, |_| Ok(()))
+                    })?;
+                    e.i64(0).unwrap();
+                    e.pointer(None, |_| Ok(()))
+                }),
+            }
+        })
+        .await;
+        client
+            .get_deployed_application_list(
+                &DeployedApplicationQueryDescription::new(DeployedApplicationQueryParameters::new(
+                    "N0010",
+                )),
+                None,
+            )
+            .await
+            .unwrap();
+        client.create_name("fabric:/Probe", None).await.unwrap();
+        client.close().await.unwrap();
+        server.await.unwrap();
     }
 }
 
@@ -278,7 +268,7 @@ async fn unpaged_deployment_continuations_are_call_local_even_with_native_error(
                 ));
                 assert!(!client.is_closed());
                 assert!(client.terminal_error().is_none());
-                client.ping(None).await.unwrap();
+                client.create_name("fabric:/Probe", None).await.unwrap();
                 client.close().await.unwrap();
                 server.await.unwrap();
             }
@@ -299,8 +289,8 @@ async fn native_errors_from_each_new_query_leave_shared_connection_usable() {
                 .await
                 .unwrap();
             let request = read_message(&mut stream).await.unwrap();
-            assert_eq!(request.properties().unwrap().action, "PingRequest");
-            write_message(&mut stream, &ping_reply(&request))
+            assert_eq!(request.properties().unwrap().action, "CreateNameRequest");
+            write_message(&mut stream, &write_probe(&request))
                 .await
                 .unwrap();
         }
@@ -329,7 +319,7 @@ async fn native_errors_from_each_new_query_leave_shared_connection_usable() {
             }))
         ));
         assert!(!client.is_closed());
-        client.ping(None).await.unwrap();
+        client.create_name("fabric:/Probe", None).await.unwrap();
     }
     client.close().await.unwrap();
     server.await.unwrap();
@@ -346,7 +336,7 @@ async fn malformed_new_query_successes_are_call_local() {
         ));
         assert!(!client.is_closed());
         assert!(client.terminal_error().is_none());
-        client.ping(None).await.unwrap();
+        client.create_name("fabric:/Probe", None).await.unwrap();
         client.close().await.unwrap();
         server.await.unwrap();
     }
@@ -395,7 +385,7 @@ async fn partition_field_adapters_reject_bad_tags_and_guid_metadata_before_nativ
             ));
             assert!(!client.is_closed());
             assert!(client.terminal_error().is_none());
-            client.ping(None).await.unwrap();
+            client.create_name("fabric:/Probe", None).await.unwrap();
             client.close().await.unwrap();
             server.await.unwrap();
         }
@@ -409,8 +399,8 @@ async fn invalid_new_query_options_send_nothing_and_preserve_connection() {
     let server = tokio::spawn(async move {
         let mut stream = establish(listener).await;
         let request = read_message(&mut stream).await.unwrap();
-        assert_eq!(request.properties().unwrap().action, "PingRequest");
-        write_message(&mut stream, &ping_reply(&request))
+        assert_eq!(request.properties().unwrap().action, "CreateNameRequest");
+        write_message(&mut stream, &write_probe(&request))
             .await
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
@@ -508,7 +498,7 @@ async fn invalid_new_query_options_send_nothing_and_preserve_connection() {
         ));
         assert!(!client.is_closed());
     }
-    client.ping(None).await.unwrap();
+    client.create_name("fabric:/Probe", None).await.unwrap();
     client.close().await.unwrap();
     server.await.unwrap();
 }
@@ -517,18 +507,16 @@ async fn invalid_new_query_options_send_nothing_and_preserve_connection() {
 enum NativeCompletion {
     Replicas,
     Hosting,
-    Health,
     Movement,
 }
 
 impl NativeCompletion {
-    const ALL: [Self; 4] = [Self::Replicas, Self::Hosting, Self::Health, Self::Movement];
+    const ALL: [Self; 3] = [Self::Replicas, Self::Hosting, Self::Movement];
 
     fn actor_action(self) -> (i64, &'static str) {
         match self {
             Self::Replicas | Self::Movement => (13, "QueryReply"),
             Self::Hosting => (5, "QueryReply"),
-            Self::Health => (16, "OperationSuccessAction"),
         }
     }
 
@@ -536,16 +524,6 @@ impl NativeCompletion {
         match self {
             Self::Replicas => QueryKind::DeployedReplicas.call(client, None).await,
             Self::Hosting => QueryKind::ServicePackages.call(client, None).await,
-            Self::Health => client
-                .get_node_health(
-                    &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("N0010")),
-                    None,
-                )
-                .await
-                .map(|health| {
-                    assert_eq!(health.node_name, "N0010");
-                    assert!(health.health_events.is_empty());
-                }),
             Self::Movement => {
                 client
                     .move_primary(
@@ -562,28 +540,17 @@ impl NativeCompletion {
         assert_eq!(request.properties().unwrap().action, "QueryRequest");
         let bytes = body(|e| {
             e.i64(match self {
-                Self::Health => 1,
                 Self::Movement => 0,
                 _ => 2,
             })?;
             let tag = match self {
                 Self::Replicas => Some(12i32.to_le_bytes()),
                 Self::Hosting => Some(11i32.to_le_bytes()),
-                Self::Health => Some(16i32.to_le_bytes()),
                 Self::Movement => None,
             };
             e.pointer(tag.as_ref().map(|tag| tag.as_slice()), |e| {
                 e.object_array::<()>(&[], |_, _| Ok(()))?;
-                if matches!(self, Self::Health) {
-                    e.pointer(Some(&[]), |e| {
-                        e.string("N0010")?;
-                        e.object_array::<()>(&[], |_, _| Ok(()))?;
-                        e.i64(1).unwrap();
-                        e.object_array::<()>(&[], |_, _| Ok(()))
-                    })
-                } else {
-                    e.pointer(None, |_| Ok(()))
-                }
+                e.pointer(None, |_| Ok(()))
             })?;
             e.i64(error).unwrap();
             e.pointer(None, |_| Ok(()))
@@ -647,7 +614,7 @@ async fn native_query_presence_matrix_accepts_rs_hosting_and_move_primary() {
                 .await
                 .unwrap_or_else(|error| panic!("{profile:?}, presence {presence}: {error}"));
             assert!(client.terminal_error().is_none());
-            client.ping(None).await.unwrap();
+            client.create_name("fabric:/Probe", None).await.unwrap();
             client.close().await.unwrap();
             server.await.unwrap();
         }
@@ -718,7 +685,7 @@ async fn native_query_presence_matrix_rejects_wrong_values_ipc_and_duplicate_hea
                     "{profile:?}, case {case}: {result:?}"
                 );
                 assert!(client.terminal_error().is_none());
-                client.ping(None).await.unwrap();
+                client.create_name("fabric:/Probe", None).await.unwrap();
             }
             client.close().await.unwrap();
             server.await.unwrap();
@@ -741,7 +708,7 @@ async fn native_query_identical_two_record_correlation_and_expects_reply_baselin
         .await;
         profile.call(&client).await.unwrap();
         assert!(client.terminal_error().is_none());
-        client.ping(None).await.unwrap();
+        client.create_name("fabric:/Probe", None).await.unwrap();
         client.close().await.unwrap();
         server.await.unwrap();
     }
@@ -771,7 +738,7 @@ async fn native_query_domain_header_duplicates_remain_call_local_even_when_forwa
                     "{profile:?}, forwarded {forwarded}: {result:?}"
                 );
                 assert!(client.terminal_error().is_none());
-                client.ping(None).await.unwrap();
+                client.create_name("fabric:/Probe", None).await.unwrap();
                 client.close().await.unwrap();
                 server.await.unwrap();
             }
@@ -803,7 +770,7 @@ async fn native_query_success_and_domain_errors_accept_repeated_correlation() {
                     );
                 }
                 assert!(client.terminal_error().is_none());
-                client.ping(None).await.unwrap();
+                client.create_name("fabric:/Probe", None).await.unwrap();
                 client.close().await.unwrap();
                 server.await.unwrap();
             }
@@ -820,7 +787,7 @@ async fn native_forwarded_queries_still_decode_the_selected_operations_profile()
                     let mut response = profile.forwarded_reply(request, records, 0);
                     let other = match profile {
                         NativeCompletion::Replicas | NativeCompletion::Movement => {
-                            NativeCompletion::Health
+                            NativeCompletion::Hosting
                         }
 
                         _ => NativeCompletion::Replicas,
@@ -842,7 +809,7 @@ async fn native_forwarded_queries_still_decode_the_selected_operations_profile()
                     "{profile:?}, {records}, wrong body {wrong_body}: {result:?}"
                 );
                 assert!(client.terminal_error().is_none());
-                client.ping(None).await.unwrap();
+                client.create_name("fabric:/Probe", None).await.unwrap();
                 client.close().await.unwrap();
                 server.await.unwrap();
             }

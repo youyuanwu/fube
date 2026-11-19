@@ -7,6 +7,8 @@ the caller's original capability, including when input validation has failed.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+from decimal import Decimal
 import hashlib
 import json
 import math
@@ -33,11 +35,6 @@ ONEBOX_SUITES = {name: suite for name, suite in suites.MANIFEST.suites.items()
 FIXTURE_PHASES = ("validate", "create", "ready", "suites", "diagnostics", "destroy")
 NATIVE_FILES = tuple(Path(report).name for suite in ONEBOX_SUITES.values()
                      if suite["kind"] == "nextest" for report in suite["reports"])
-CLEAR_CASES = (
-    "native_ping", "native_name_exists_existing", "native_name_exists_absent",
-    "native_concurrent_mixed", "clone_drop_preserves_original_connection",
-    "explicit_close", "test_owned_proxy_idle_disconnect",
-)
 HEALTH_CASES = (
     "healthy", "inherited", "false-omitted", "true-omitted", "default", "all", "none",
     "ok", "warning", "error-false", "combined", "error-true", "warning-true",
@@ -1425,7 +1422,7 @@ def validate_furpc_management(clear):
     value = clear.get("furpc_management")
     require(type(value) is dict and value.get("existing_name") is True
             and value.get("absent_name") is False, "furpc independently observed naming results")
-    true_fields(value, ("stable_fields_match_http_and_legacy", "exact_name_and_status_filters",
+    true_fields(value, ("stable_fields_match_http", "exact_name_and_status_filters",
                         "same_generation_after_error", "mixed_results_match"))
     require(type(value.get("mixed_concurrent_operations")) is int
             and value["mixed_concurrent_operations"] == 3 and integer(value.get("generation"), 1),
@@ -1448,13 +1445,12 @@ def validate_furpc_management(clear):
                 "furpc complete native node identity")
         return node["name"], int(node["node_id"], 16), node["node_instance"]
 
-    native, legacy = value.get("native_nodes"), value.get("legacy_nodes")
-    require(type(native) is list and type(legacy) is list and len(native) == len(legacy) == 5,
-            "furpc and legacy five-node observations required")
-    actual, previous = [identity(node) for node in native], [identity(node) for node in legacy]
-    require(actual == previous and len({node[0] for node in actual}) == 5
+    native = value.get("native_nodes")
+    require(type(native) is list and len(native) == 5, "furpc five-node observations required")
+    actual = [identity(node) for node in native]
+    require(len({node[0] for node in actual}) == 5
             and len({node[1] for node in actual}) == 5,
-            "furpc identities must match the independent legacy decoder without duplicates")
+            "furpc node identities must not contain duplicates")
     observed = clear["node_list"].get("independent_nodes")
     require(type(observed) is list and len(observed) == 5, "independent HTTP five-node identities")
     independent = []
@@ -1480,6 +1476,194 @@ def validate_furpc_management(clear):
         value, "native_observation_start_unix_ms", "native_observation_end_unix_ms")]
 
 
+def validate_furpc_lists(lists):
+    value = lists.get("furpc")
+    require(type(value) is dict and integer(value.get("generation"), 1),
+            "furpc native list generation required")
+    true_fields(value, ("filters_and_parameter_exclusion", "typed_fields_match_http",
+                        "same_generation_after_error"))
+    require(type(value.get("mixed_concurrent_operations")) is int
+            and value["mixed_concurrent_operations"] == 3,
+            "three mixed furpc list operations")
+    require(type(value.get("native_missing_application_code")) is int
+            and value["native_missing_application_code"] == -2147017763
+            and value["native_missing_application_code"] == lists.get("native_missing_application_code")
+            and value.get("native_error_origin") in ("domain", "native_fault"),
+            "furpc missing application must retain the independent native error")
+    pages = [value.get("application_page_lengths")]
+    services = value.get("service_page_lengths")
+    require(type(services) is list and len(services) == 2, "furpc service paging per owned application")
+    pages.extend(services)
+    require(all(type(page) is list and page == [1, 1]
+                and all(type(count) is int for count in page) for page in pages),
+            "furpc must follow real application and service continuations")
+    for key, count in (("applications", 2), ("services", 4)):
+        actual = lists.get("native_" + key)
+        independent = lists.get("independent_" + key)
+        require(type(actual) is list and type(independent) is list
+                and len(actual) == len(independent) == count,
+                "nonempty furpc and independent HTTP list observations")
+        for records, name in ((actual, "name"), (independent, "Name")):
+            require(all(type(record) is dict and text(record.get(name)) for record in records)
+                    and len({record[name] for record in records}) == count,
+                    "distinct observed native list identities")
+        require({record["name"] for record in actual} == {record["Name"] for record in independent},
+                "furpc list identities must match independent HTTP")
+        fields = ({"type_name": "TypeName", "type_version": "TypeVersion", "status": "Status",
+                   "health_state": "HealthState"} if key == "applications" else
+                  {"type_name": "TypeName", "manifest_version": "ManifestVersion",
+                   "kind": "ServiceKind", "status": "ServiceStatus", "health_state": "HealthState",
+                   "is_service_group": "IsServiceGroup"})
+        for record in actual:
+            observed = next(item for item in independent if item["Name"] == record["name"])
+            require(all(local in record and remote in observed and same(record[local], observed[remote])
+                        for local, remote in fields.items()), "typed list fields must match HTTP")
+            if key == "applications":
+                parameters = observed.get("Parameters")
+                require(type(parameters) is list
+                        and all(type(pair) is dict and type(pair.get("Key")) is str
+                                and type(pair.get("Value")) is str for pair in parameters)
+                        and len({pair["Key"] for pair in parameters}) == len(parameters)
+                        and same(record.get("parameters"), {pair["Key"]: pair["Value"] for pair in parameters})
+                        and record.get("definition_kind") == "ServiceFabricApplicationDescription",
+                        "native application parameter map and source-derived definition kind")
+            else:
+                require(type(record.get("has_persisted_state")) is bool
+                        and (record["has_persisted_state"] is False if record["kind"] == "Stateless"
+                             else same(record["has_persisted_state"], observed.get("HasPersistedState"))),
+                        "native service persistence must match its kind and HTTP")
+    require(all(integer(value.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+            "furpc native list observation timestamps")
+    return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
+
+
+def health_against_http(native, observed, end_ms):
+    states = {"Invalid": 0, "Ok": 1, "Warning": 2, "Error": 3, "Unknown": 65535}
+
+    def state(actual, expected):
+        require(type(actual) is int and type(expected) is str
+                and expected in states and actual == states[expected],
+                "native health scalar must match independent HTTP")
+
+    def event(actual, expected):
+        require(type(actual) is dict and type(expected) is dict, "native and HTTP health events")
+        for local, remote in (("source_id", "SourceId"), ("property", "Property"),
+                              ("description", "Description"), ("sequence_number", "SequenceNumber"),
+                              ("is_expired", "IsExpired"), ("remove_when_expired", "RemoveWhenExpired")):
+            require(local in actual and remote in expected and same(actual[local], expected[remote]),
+                    "native health event fields must match HTTP")
+        state(actual.get("health_state"), expected.get("HealthState"))
+        ttl = expected.get("TimeToLiveInMilliSeconds")
+        require(type(ttl) is str and 0 < len(ttl) <= 128, "HTTP event TTL required")
+        duration = re.fullmatch(r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?", ttl)
+        require((duration is not None and any(duration.groups()))
+                or re.fullmatch(r"[0-9]+", ttl) is not None, "HTTP event TTL format")
+        if duration:
+            days, hours, minutes, seconds = (Decimal(part or "0") for part in duration.groups())
+            ticks = int((days * 86400 + hours * 3600 + minutes * 60 + seconds) * 10_000_000)
+        else:
+            ticks = int(ttl) * 10_000
+        require(0 <= ticks <= 2**63 - 1 and actual.get("time_to_live_ticks") == str(ticks),
+                "native event TTL ticks")
+        epoch = datetime(1601, 1, 1, tzinfo=timezone.utc)
+        for local, remote in (("source_utc_timestamp", "SourceUtcTimestamp"),
+                              ("last_modified_utc_timestamp", "LastModifiedUtcTimestamp"),
+                              ("last_ok_transition_at", "LastOkTransitionAt"),
+                              ("last_warning_transition_at", "LastWarningTransitionAt"),
+                              ("last_error_transition_at", "LastErrorTransitionAt")):
+            stamp = expected.get(remote)
+            raw = actual.get(local)
+            require(type(stamp) is str and len(stamp) <= 64
+                    and type(raw) is str and len(raw) <= 20 and re.fullmatch(r"-?[0-9]+", raw)
+                    and -(2**63) <= int(raw) < 2**63,
+                    "native and independent health timestamps required")
+            if stamp.startswith("0001-01-01T00:00:00"):
+                require(int(raw) == 0, "native default timestamp")
+                continue
+            try:
+                date = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ProofError("invalid independent health timestamp") from error
+            require(date.tzinfo is not None, "independent health timestamp timezone")
+            delta = date - epoch
+            ticks = (delta.days * 86400 + delta.seconds) * 10_000_000 + delta.microseconds * 10
+            require(abs(int(raw) - ticks) < 10_000
+                    or (local == "last_modified_utc_timestamp" and ticks > 0
+                        and ticks <= int(raw) <= (end_ms + 11644473600000) * 10_000 + 10_000),
+                    "native health timestamps must match their independent observation window")
+
+    require(type(native) is dict and type(observed) is dict
+            and native.get("node_name") == observed.get("Name") and text(native.get("node_name")),
+            "native health node identity must match HTTP")
+    state(native.get("aggregated_health_state"), observed.get("AggregatedHealthState"))
+    events, expected_events = native.get("health_events"), observed.get("HealthEvents")
+    require(type(events) is list and type(expected_events) is list and len(events) == len(expected_events),
+            "native health event inventory must match HTTP")
+    require(all(type(item) is dict and type(item.get("SourceId")) is str
+                and type(item.get("Property")) is str for item in expected_events),
+            "independent HTTP health event identities")
+    expected_by_id = {(item["SourceId"], item["Property"]): item for item in expected_events}
+    require(len(expected_by_id) == len(expected_events), "distinct HTTP health event identities")
+    seen = set()
+    for actual in events:
+        require(type(actual) is dict and type(actual.get("source_id")) is str
+                and type(actual.get("property")) is str, "typed native health event")
+        identity = actual.get("source_id"), actual.get("property")
+        require(identity in expected_by_id and identity not in seen, "distinct native health events")
+        seen.add(identity)
+        event(actual, expected_by_id[identity])
+    evaluations, expected_evaluations = native.get("unhealthy_evaluations"), observed.get("UnhealthyEvaluations")
+    require(type(evaluations) is list and type(expected_evaluations) is list
+            and len(evaluations) == len(expected_evaluations), "native health evaluation inventory")
+    for actual, expected in zip(evaluations, expected_evaluations):
+        require(type(actual) is dict and type(expected) is dict
+                and type(expected.get("HealthEvaluation")) is dict, "HTTP event evaluation wrapper")
+        expected = expected["HealthEvaluation"]
+        require(actual.get("kind") == expected.get("Kind") == "Event"
+                and actual.get("description") == expected.get("Description")
+                and type(actual.get("consider_warning_as_error")) is bool
+                and same(actual["consider_warning_as_error"], expected.get("ConsiderWarningAsError")),
+                "native event evaluation must match HTTP")
+        state(actual.get("aggregated_health_state"), expected.get("AggregatedHealthState"))
+        event(actual.get("unhealthy_event"), expected.get("UnhealthyEvent"))
+
+
+def validate_furpc_health(health):
+    value = health
+    require(type(value) is dict and integer(value.get("generation"), 1),
+            "furpc native health generation required")
+    true_fields(value, ("same_generation_after_error",))
+    require(type(value.get("concurrent_operations")) is int
+            and value["concurrent_operations"] == 3
+            and type(value.get("unknown_node_code")) is int
+            and value["unknown_node_code"] == -2147017705
+            and value.get("native_error_origin") in ("domain", "native_fault"),
+            "furpc native health error and mixed-operation evidence")
+    cases = value.get("cases")
+    require(type(cases) is list and all(type(case) is dict for case in cases)
+            and [case.get("case") for case in cases] == list(HEALTH_CASES),
+            "furpc native health policy/filter case inventory")
+    windows = {}
+    for actual in cases:
+        require(all(integer(actual.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+                "furpc health observation timestamps")
+        expected = actual.get("expected")
+        require(type(expected) is dict and expected.get("label") == actual["case"]
+                and type(expected.get("health")) is dict
+                and integer(expected.get("start_ms"), 1) and integer(expected.get("end_ms"), 1)
+                and expected["start_ms"] <= expected["end_ms"] <= actual["native_start_ms"]
+                and actual["native_end_ms"] - expected["start_ms"] <= 120_000,
+                "fresh independent HTTP health snapshot")
+        health_against_http(actual.get("native"), expected["health"], actual["native_end_ms"])
+        windows["furpc_health/" + actual["case"]] = [
+            stamp / 1000 for stamp in interval(actual, "native_start_ms", "native_end_ms")]
+    require(integer(health.get("completed_at_unix_ms"), 1), "health completion endpoint")
+    for field in ("healthy_reuse_after_error", "final_healthy_reuse"):
+        health_against_http(value.get(field), cases[0]["expected"]["health"], health["completed_at_unix_ms"])
+        require(value[field]["aggregated_health_state"] == 1, "independently healthy native reuse")
+    return windows
+
+
 def validate_native(reports, archive, allocation):
     clear, health, name, lists, notification = [reports[file] for file in NATIVE_FILES]
     for value in (clear, health, name, notification):
@@ -1489,17 +1673,6 @@ def validate_native(reports, archive, allocation):
     require(len({value["runtime_version"] for value in reports.values()}) == 1, "native runtime mismatch")
     for value in (health, name, lists, notification):
         require(value.get("archive_sha256") == archive, "actual native archive hash mismatch")
-    cases = clear["executed_cases"]
-    require(type(cases) is list and [case.get("case") for case in cases] == list(CLEAR_CASES),
-            "clear seven internal cases are not five archived tests")
-    for case in cases:
-        true_fields(case, ("passed",))
-    require(cases[1].get("result") is True and cases[2].get("result") is False
-            and type(cases[3].get("operation_count")) is int and cases[3]["operation_count"] == 8
-            and type(cases[3].get("initially_pending_count")) is int
-            and cases[3]["initially_pending_count"] == 8, "clear native concurrency/name results")
-    true_fields(cases[3], ("ninth_call_rejected_locally", "reuse_after_slot_release"))
-    true_fields(cases[-1], ("native_ping_passed", "closed_without_operation", "terminal_error_observed"))
     furpc_ping = clear.get("furpc_ping")
     require(type(furpc_ping) is dict, "furpc native ping observations required")
     require(type(furpc_ping.get("operation_count")) is int and furpc_ping["operation_count"] == 3
@@ -1508,37 +1681,30 @@ def validate_native(reports, archive, allocation):
     nodes = clear["node_list"]
     require(type(nodes.get("native_node_count")) is int and nodes["native_node_count"] == 5,
             "native five-node observation")
-    true_fields(nodes, ("typed_stable_fields_match", "binary_ports_match_onebox_manifest",
+    true_fields(nodes, ("typed_fields_match_http", "binary_ports_match_onebox_manifest",
                        "exact_name_hit_miss_case_prefix", "status_default_all_up_down",
                        "empty_name_token_omitted", "valid_continuation_after_final_id_is_empty",
                        "connection_survives_native_error"))
     furpc_window = validate_furpc_management(clear)
-    require([case.get("case") for case in health["cases"]] == list(HEALTH_CASES)
-            and integer(health.get("concurrent_operations")) and health["concurrent_operations"] == 8
-            and type(health.get("initially_pending_count")) is int and health["initially_pending_count"] == 8
-            and type(health.get("unknown_node_code")) is int and health["unknown_node_code"] == -2147017705
-            and health.get("unknown_node_management_code") == "FABRIC_E_HEALTH_ENTITY_NOT_FOUND",
-            "heterogeneous native health case/error inventory")
-    true_fields(health, ("cancelled_after_first_poll",))
-    for field in ("healthy_reuse_after_error", "final_healthy_reuse"):
-        require(type(health[field].get("aggregated_health_state")) is int
-                and health[field]["aggregated_health_state"] == 1, "native healthy reuse")
-    require(integer(health.get("completed_at_unix_ms"), 1), "health completion endpoint")
+    furpc_health_windows = validate_furpc_health(health)
+    require(health.get("unknown_node_management_code") == "FABRIC_E_HEALTH_ENTITY_NOT_FOUND",
+            "independent missing health entity error")
     true_fields(name, ("initial_http_absent", "native_create_succeeded", "http_present_after_create",
                       "reuse_after_duplicate", "native_delete_succeeded", "http_absent_after_delete",
-                      "reuse_after_missing", "shared_native_client", "owned_cleanup_confirmed"))
+                      "reuse_after_missing", "writes_share_native_client", "owned_cleanup_confirmed"))
     require(type(name.get("duplicate_create_code")) is int and name["duplicate_create_code"] == -2147017792
             and type(name.get("missing_delete_code")) is int and name["missing_delete_code"] == -2147017791,
             "native name negative error codes")
     true_fields(lists, ("initial_absence_confirmed", "application_native_continuation_followed",
                        "service_native_continuation_followed", "filters_and_parameter_exclusion",
-                       "mixed_shared_native_connection", "reuse_after_native_error", "owned_cleanup_confirmed"))
+                       "mixed_furpc_connection", "reuse_after_native_error", "owned_cleanup_confirmed"))
     require(type(lists.get("application_count")) is int and lists["application_count"] == 2
             and type(lists.get("service_count")) is int and lists["service_count"] == 4
             and all(nonempty(lists.get(key)) for key in ("topology", "deployment_inspection",
                     "independent_applications", "independent_services", "native_applications", "native_services")),
             "native application/service/topology/deployment observations")
     movement_window = validate_native_movement(lists, health.get("owner"))
+    furpc_lists_window = validate_furpc_lists(lists)
     true_fields(notification, ("owned_cleanup_confirmed",))
     require(notification.get("allocation") == allocation["name"]
             and notification.get("passed") == list(NOTIFICATION_CASES)
@@ -1551,6 +1717,8 @@ def validate_native(reports, archive, allocation):
             nodes, "native_observation_start_unix_ms", "native_observation_end_unix_ms")],
         "native_move_primary": movement_window,
         "furpc_gateway_methods": furpc_window,
+        "furpc_application_service_lists": furpc_lists_window,
+        **furpc_health_windows,
     }
     require(all(integer(nodes.get(key), 1) for key in
                 ("native_observation_start_unix_ms", "native_observation_end_unix_ms")),

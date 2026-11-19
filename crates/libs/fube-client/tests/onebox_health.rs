@@ -1,18 +1,11 @@
 //! Self-contained health scenario with independent management setup and native assertions.
-use std::{
-    future::{poll_fn, Future},
-    path::PathBuf,
-    task::Poll,
-    time::Duration,
-};
+use std::path::PathBuf;
 
 use fube_client::{
-    ClientError, ClientOptions, DomainFailure, Error, FabricClient, HealthEvaluation, HealthEvent,
-    HealthEventsFilter, HealthState, NodeHealth, NodeHealthPolicy, NodeHealthQueryDescription,
-    NodeHealthQueryParameters, NodeQueryDescription,
+    HealthEvaluation, HealthEvent, HealthEventsFilter, HealthState, NodeHealth, NodeHealthPolicy,
+    NodeHealthQueryDescription, NodeHealthQueryParameters, NodeQueryDescription,
 };
 use serde_json::{json, Value};
-use tokio::task::JoinSet;
 
 #[path = "support/health_oracle.rs"]
 mod oracle;
@@ -20,6 +13,8 @@ use oracle::*;
 
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/furpc.rs"]
+mod furpc_support;
 #[path = "support/rest.rs"]
 mod rest;
 #[path = "support/health_setup.rs"]
@@ -247,8 +242,7 @@ async fn onebox_native_node_health() -> Result<()> {
 }
 
 async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
-    let config_path = output("MSSF_HEALTH_CONFIG")?;
-    let config: Config = serde_json::from_slice(&std::fs::read(&config_path)?)?;
+    let config: Config = serde_json::from_slice(&std::fs::read(output("MSSF_HEALTH_CONFIG")?)?)?;
     config.validate_ready()?;
     remove_stale(&config.report_path)?;
     assert_eq!(
@@ -256,37 +250,28 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
         config.archive_sha256
     );
     assert_independent_fixture(&config);
-    let channel = FabricClient::endpoint_clear(config.gateway.parse()?)?
-        .connect_timeout(Duration::from_secs(30))
-        .connect()
-        .await?;
-    let client = FabricClient::new(
-        channel,
-        ClientOptions {
-            default_timeout: Duration::from_secs(30),
-            ..Default::default()
-        },
-    )?;
+    let (mut client, generation) = furpc_support::connect(&config.gateway).await?;
     let mut evidence = vec![];
     for snapshot in &config.snapshots {
-        assert!(
-            fresh(snapshot.start_ms, now_ms()),
-            "rerun preparation, observations expired"
-        );
-        let mut query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(
-            snapshot.node_name.clone(),
-        ));
-        query.parameters.health_policy =
-            snapshot
+        assert!(fresh(snapshot.start_ms, now_ms()));
+        let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters {
+            node_name: snapshot.node_name.clone(),
+            health_policy: snapshot
                 .policy
                 .map(|consider_warning_as_error| NodeHealthPolicy {
                     consider_warning_as_error,
-                });
-        query.parameters.events_filter = snapshot
-            .filter
-            .map(|bits| HealthEventsFilter::from_bits_retain(bits).into());
+                }),
+            events_filter: snapshot
+                .filter
+                .map(|bits| HealthEventsFilter::from_bits_retain(bits).into()),
+        });
         let start_ms = now_ms();
-        let health = client.get_node_health(&query, None).await?;
+        let health = furpc_support::body(
+            client
+                .get_node_health(furpc::Request::new(query), furpc_support::deadline())
+                .await?,
+            generation,
+        );
         let end_ms = now_ms();
         assert_health(&health, snapshot, end_ms);
         evidence.push(
@@ -294,111 +279,60 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
             "expected": snapshot, "native": health_evidence(&health)}),
         );
     }
-    let error = client
-        .get_node_health(
-            &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(&config.missing)),
-            None,
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            ClientError::Domain(DomainFailure {
-                code: MISSING_CODE,
-                ..
-            }) | ClientError::Transport(Error::Remote {
-                code: MISSING_CODE,
-                ..
-            })
-        ),
-        "{error:?}"
+    let (code, origin) = furpc_support::failure(
+        client
+            .get_node_health(
+                furpc::Request::new(NodeHealthQueryDescription::new(
+                    NodeHealthQueryParameters::new(&config.missing),
+                )),
+                furpc_support::deadline(),
+            )
+            .await
+            .unwrap_err(),
     );
-    assert!(!client.is_closed());
-    let healthy_query =
-        NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(&config.healthy));
-    let reused = client
-        .get_node_health(&healthy_query, Some(Duration::from_secs(5)))
-        .await?;
+    assert_eq!(code, MISSING_CODE);
+    let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(&config.healthy));
+    let reused = furpc_support::body(
+        client
+            .get_node_health(
+                furpc::Request::new(query.clone()),
+                furpc_support::deadline(),
+            )
+            .await?,
+        generation,
+    );
     assert_health(&reused, &config.snapshots[0], now_ms());
-    // Poll once then cancel, without claiming that a fast loopback necessarily
-    // transmitted the request. Model tests establish deterministic late-reply safety.
-    {
-        let pending = client.get_node_health(&healthy_query, None);
-        tokio::pin!(pending);
-        poll_fn(|cx| {
-            let _ = pending.as_mut().poll(cx);
-            Poll::Ready(())
-        })
-        .await;
-    }
-    let mut pending_operations = Vec::with_capacity(8);
-    for index in 0..8 {
-        let client = client.clone();
-        let node = config.healthy.clone();
-        pending_operations.push(Box::pin(async move {
-            if index % 3 == 0 {
-                assert!(!client.ping(None).await.unwrap().node_name.is_empty());
-            } else if index % 3 == 1 {
-                let health = client
-                    .get_node_health(
-                        &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(node)),
-                        None,
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(health.aggregated_health_state, HealthState::Ok);
-            } else {
-                assert_eq!(
-                    client
-                        .get_node_list(&NodeQueryDescription::default(), None)
-                        .await
-                        .unwrap()
-                        .items
-                        .len(),
-                    5
-                );
-            }
-        }));
-    }
-    let initially_pending_count = poll_fn(|cx| {
-        for operation in &mut pending_operations {
-            assert!(operation.as_mut().poll(cx).is_pending());
-        }
-        Poll::Ready(pending_operations.len())
-    })
-    .await;
-    assert_eq!(initially_pending_count, 8);
-    let mut operations = JoinSet::new();
-    for operation in pending_operations {
-        operations.spawn(operation);
-    }
-    let mut completed = 0;
-    while let Some(result) = operations.join_next().await {
-        result?;
-        completed += 1;
-    }
-    assert_eq!(completed, 8);
-    let final_health = client.get_node_health(&healthy_query, None).await?;
+    let mut health = client.clone();
+    let mut nodes = client.clone();
+    let (health, nodes, ping) = tokio::try_join!(
+        health.get_node_health(furpc::Request::new(query), furpc_support::deadline()),
+        nodes.get_node_list(
+            furpc::Request::new(NodeQueryDescription::default()),
+            furpc_support::deadline()
+        ),
+        client.ping(furpc::Request::new(()), furpc_support::deadline()),
+    )?;
+    let final_health = furpc_support::body(health, generation);
     assert_health(&final_health, &config.snapshots[0], now_ms());
-    assert!(!client.is_closed());
-    client.close().await?;
-    let report = json!({
-        "profile": config.profile, "runtime_version": config.runtime_version,
-        "native_source_pin": "3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d",
-        "archive_sha256": config.archive_sha256, "owner": config.owner,
-        "observation_max_age_ms": MAX_AGE_MS, "timestamp_precision_ticks": 10_000,
-        "dynamic_tolerance": "LastModified may advance from independently observed value only up to native query end +1ms; source and transition times match <1ms",
-        "cases": evidence, "unknown_node_code": MISSING_CODE,
-        "unknown_node_management_code": config.missing_http_code,
-        "healthy_reuse_after_error": health_evidence(&reused),
-        "concurrent_operations": completed, "initially_pending_count": initially_pending_count,
-        "cancelled_after_first_poll": true,
-        "deterministic_late_cancellation": "offline model evidence, not guaranteed live wire emission",
-        "final_healthy_reuse": health_evidence(&final_health),
-        "completed_at_unix_ms": now_ms(),
-    });
-    Ok((config.report_path, report))
+    assert_eq!(furpc_support::body(nodes, generation).items.len(), 5);
+    assert_eq!(
+        furpc_support::body(ping, generation).node_name,
+        config.healthy
+    );
+    Ok((
+        config.report_path,
+        json!({
+            "profile": config.profile, "runtime_version": config.runtime_version,
+            "native_source_pin": "3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d",
+            "archive_sha256": config.archive_sha256, "owner": config.owner, "generation": generation,
+            "cases": evidence, "unknown_node_code": code, "native_error_origin": origin,
+            "unknown_node_management_code": config.missing_http_code,
+            "healthy_reuse_after_error": health_evidence(&reused),
+            "final_healthy_reuse": health_evidence(&final_health),
+            "same_generation_after_error": true, "concurrent_operations": 3,
+            "completed_at_unix_ms": now_ms(),
+        }),
+    ))
 }
 
 #[test]

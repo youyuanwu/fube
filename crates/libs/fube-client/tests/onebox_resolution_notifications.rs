@@ -242,7 +242,9 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
             .await,
         Err(ClientError::Domain(_) | ClientError::Transport(Error::Remote { .. }))
     ));
-    ordinary.ping(None).await?;
+    ordinary
+        .resolve_service_partition(&stateless, &PartitionKey::Singleton, None, None)
+        .await?;
     // Only a service under the exact owned application journal is mutated.
     let management = rest::configuration(Duration::from_secs(60))?;
     management

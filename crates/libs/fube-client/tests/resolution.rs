@@ -246,18 +246,10 @@ async fn groups_malformed_and_mismatched_replies_are_call_local() {
             let req = read_message(&mut s).await.unwrap();
             let neighbor = read_message(&mut s).await.unwrap();
             assert_eq!(req.properties().unwrap().action, "ResolveServiceRequest");
-            assert_eq!(neighbor.properties().unwrap().action, "NameExistsRequest");
+            assert_eq!(neighbor.properties().unwrap().action, "CreateNameRequest");
             write_message(
                 &mut s,
-                &peer::reply(
-                    &neighbor,
-                    "NameOperationReply",
-                    body(|e| {
-                        e.boolean(true).unwrap();
-                        e.i64(0).unwrap();
-                        Ok(())
-                    }),
-                ),
+                &peer::reply(&neighbor, "NameOperationReply", vec![]),
             )
             .await
             .unwrap();
@@ -294,13 +286,13 @@ async fn groups_malformed_and_mismatched_replies_are_call_local() {
         let name = "fabric:/App/Service".parse().unwrap();
         let (outcome, neighbor) = tokio::join!(
             client.resolve_service_partition(&name, &PartitionKey::Singleton, None, None),
-            client.name_exists("fabric:/neighbor", None)
+            client.create_name("fabric:/neighbor", None)
         );
         assert!(
             matches!(outcome, Err(ClientError::Protocol(_))),
             "{outcome:?}"
         );
-        assert!(neighbor.unwrap());
+        neighbor.unwrap();
         assert!(!client.is_closed());
         assert!(client.terminal_error().is_none());
         client

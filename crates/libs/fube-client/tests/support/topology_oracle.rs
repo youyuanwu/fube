@@ -523,7 +523,14 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
         }
     };
     assert!(!client.is_closed());
-    client.ping(None).await?;
+    client
+        .get_partition_list(
+            &PartitionQueryDescription::new(PartitionQueryParameters::new(
+                format!("{}/Stateless", journal.applications[0]).parse()?,
+            )),
+            None,
+        )
+        .await?;
     let absent_node = format!("missing-{}", journal.owner);
     assert!(!nodes.iter().any(|node| node["Name"] == absent_node));
     let missing_node = DeployedApplicationQueryDescription::new(
@@ -540,7 +547,14 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
         other => return Err(format!("missing node must return a native error: {other:?}").into()),
     };
     assert!(!client.is_closed());
-    client.ping(None).await?;
+    client
+        .get_partition_list(
+            &PartitionQueryDescription::new(PartitionQueryParameters::new(
+                format!("{}/Stateless", journal.applications[0]).parse()?,
+            )),
+            None,
+        )
+        .await?;
     Ok(json!({
         "partition_count": partition_count,
         "replica_instance_count": replica_count,

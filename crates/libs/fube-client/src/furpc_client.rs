@@ -18,7 +18,9 @@ use tower_service::Service;
 use crate::{
     protocol,
     query_protocol::{self, Query, QueryRequest, Reply},
-    DomainFailure, GatewayDescription, NamingUri, NodeListPage, NodeQueryDescription,
+    ApplicationListPage, ApplicationQueryDescription, DomainFailure, GatewayDescription, NamingUri,
+    NodeHealth, NodeHealthQueryDescription, NodeListPage, NodeQueryDescription, ServiceListPage,
+    ServiceQueryDescription,
 };
 
 const ACTIVITY: u16 = 0x8020;
@@ -101,8 +103,8 @@ type Result<T> = std::result::Result<T, FurpcClientError>;
 
 /// Typed gateway stub over a byte-facing Tower service.
 ///
-/// Ping, NameExists and single-page GetNodeList are implemented, separately from
-/// [`crate::FabricClient`].
+/// Ping, NameExists, node/application/service lists and node health are
+/// implemented separately from [`crate::FabricClient`].
 /// The default transport is a furpc Channel; clones share its lifecycle and
 /// dropping the last owner closes it. Later calls may reconnect, but a submitted
 /// call is never replayed. Custom transports need not be Clone, Sync or static.
@@ -207,6 +209,42 @@ where
         request: Request<NodeQueryDescription>,
         deadline: Instant,
     ) -> Result<Response<NodeListPage>> {
+        self.query(request, deadline).await
+    }
+
+    /// Get one native application page, without automatic paging or retries.
+    ///
+    /// Selectors and parameter exclusion follow the shared application profile.
+    /// Inspect the continuation token even when no page size was supplied.
+    pub async fn get_application_list(
+        &mut self,
+        request: Request<ApplicationQueryDescription>,
+        deadline: Instant,
+    ) -> Result<Response<ApplicationListPage>> {
+        self.query(request, deadline).await
+    }
+
+    /// Get one native service page scoped to an ordinary application.
+    ///
+    /// The System application profile is unsupported. Inspect the continuation
+    /// token; native subquery count limits do not guarantee an aggregate page cap.
+    pub async fn get_service_list(
+        &mut self,
+        request: Request<ServiceQueryDescription>,
+        deadline: Instant,
+    ) -> Result<Response<ServiceListPage>> {
+        self.query(request, deadline).await
+    }
+
+    /// Get unpaged native node health with optional policy and event filtering.
+    ///
+    /// An unhealthy aggregate is successful data, not a domain error. Omitted
+    /// policy inherits cluster policy; an explicit false policy overrides it.
+    pub async fn get_node_health(
+        &mut self,
+        request: Request<NodeHealthQueryDescription>,
+        deadline: Instant,
+    ) -> Result<Response<NodeHealth>> {
         self.query(request, deadline).await
     }
 

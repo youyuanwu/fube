@@ -86,22 +86,6 @@ pub(crate) fn check_reply(message: &Message, actions: &[&str]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn decode_ping(message: &Message) -> Result<GatewayDescription> {
-    // Native NamingTcpMessage::GetPingReply uses PingRequest, not PingReply.
-    check_reply(message, &["PingRequest"])?;
-    match message.protocol_version()? {
-        Some((1, minor)) if minor >= 1 => {}
-        _ => {
-            return Err(Error::Protocol(
-                "ping reply requires protocol version 1.1 or newer 1.x",
-            ))
-        }
-    }
-    from_slice::<PingReplyBody>(&message.body)?
-        .into_gateway()
-        .map_err(Error::Protocol)
-}
-
 #[derive(Deserialize)]
 struct PingNodeInstance(NodeId, u64);
 #[derive(Deserialize)]
@@ -131,11 +115,6 @@ pub(crate) struct GatewayFailureBody {
     pub(crate) code: i64,
     #[serde(deserialize_with = "crate::native::trailing_default::deserialize")]
     pub(crate) diagnostic: String,
-}
-
-pub(crate) fn decode_name_exists(message: &Message) -> Result<bool> {
-    check_reply(message, &["NameOperationReply"])?;
-    Ok(from_slice::<NameExistsReplyBody>(&message.body)?.exists)
 }
 
 #[derive(Deserialize)]

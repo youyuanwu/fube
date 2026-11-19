@@ -9,6 +9,8 @@ mod oracle;
 use oracle::*;
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/furpc.rs"]
+mod furpc_support;
 #[path = "support/rest.rs"]
 mod rest;
 
@@ -86,20 +88,54 @@ async fn lifecycle() -> Result<Value> {
             ..Default::default()
         },
     )?;
-    assert!(!client.name_exists(&journal.name, None).await?);
+    let (mut reads, generation) = furpc_support::connect("127.0.0.1:19000").await?;
+    let name: fube_client::NamingUri = journal.name.parse()?;
+    assert!(!furpc_support::body(
+        reads
+            .name_exists(furpc::Request::new(name.clone()), furpc_support::deadline())
+            .await?,
+        generation
+    ));
     mutate(&client, &mut journal, &path, false, None).await?;
     assert!(http.exists(&journal.name).await?);
-    assert!(client.name_exists(&journal.name, None).await?);
+    assert!(furpc_support::body(
+        reads
+            .name_exists(furpc::Request::new(name.clone()), furpc_support::deadline())
+            .await?,
+        generation
+    ));
     let duplicate = mutate(&client, &mut journal, &path, false, Some(DUPLICATE)).await?;
     assert!(!client.is_closed());
-    assert!(client.name_exists(&journal.name, None).await?);
+    assert!(furpc_support::body(
+        reads
+            .name_exists(furpc::Request::new(name.clone()), furpc_support::deadline())
+            .await?,
+        generation
+    ));
     mutate(&client, &mut journal, &path, true, None).await?;
     assert!(!http.exists(&journal.name).await?);
-    assert!(!client.name_exists(&journal.name, None).await?);
+    assert!(!furpc_support::body(
+        reads
+            .name_exists(furpc::Request::new(name.clone()), furpc_support::deadline())
+            .await?,
+        generation
+    ));
     let missing = mutate(&client, &mut journal, &path, true, Some(MISSING)).await?;
     assert!(!client.is_closed());
-    assert!(!client.name_exists(&journal.name, None).await?);
-    client.ping(None).await?;
+    mutate(&client, &mut journal, &path, false, None).await?;
+    mutate(&client, &mut journal, &path, true, None).await?;
+    assert!(!furpc_support::body(
+        reads
+            .name_exists(furpc::Request::new(name), furpc_support::deadline())
+            .await?,
+        generation
+    ));
+    furpc_support::body(
+        reads
+            .ping(furpc::Request::new(()), furpc_support::deadline())
+            .await?,
+        generation,
+    );
     client.close().await?;
     Ok(json!({
         "profile": "clear",
@@ -115,7 +151,7 @@ async fn lifecycle() -> Result<Value> {
         "http_absent_after_delete": true,
         "missing_delete_code": missing,
         "reuse_after_missing": true,
-        "shared_native_client": true,
+        "writes_share_native_client": true,
     }))
 }
 
