@@ -1441,6 +1441,11 @@ def validate_native(reports, archive, allocation):
             and cases[3]["initially_pending_count"] == 8, "clear native concurrency/name results")
     true_fields(cases[3], ("ninth_call_rejected_locally", "reuse_after_slot_release"))
     true_fields(cases[-1], ("native_ping_passed", "closed_without_operation", "terminal_error_observed"))
+    furpc_ping = clear.get("furpc_ping")
+    require(type(furpc_ping) is dict, "furpc native ping observations required")
+    require(type(furpc_ping.get("operation_count")) is int and furpc_ping["operation_count"] == 3
+            and furpc_ping.get("gateway") == clear["gateway"],
+            "three furpc pings must match the independently observed native gateway identity")
     nodes = clear["node_list"]
     require(type(nodes.get("native_node_count")) is int and nodes["native_node_count"] == 5,
             "native five-node observation")

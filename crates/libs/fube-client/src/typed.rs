@@ -338,13 +338,7 @@ fn domain_failure(reply: &Message) -> Result<()> {
     }
     // The domain code is required. Native's code-only trailing suffix is valid;
     // a present diagnostic must decode. Runtime IPC/domain error policy is separate.
-    #[derive(serde::Deserialize)]
-    struct Failure {
-        code: i64,
-        #[serde(deserialize_with = "crate::native::trailing_default::deserialize")]
-        diagnostic: String,
-    }
-    let Failure { code, diagnostic } = fubst::serde::from_slice(&reply.body)?;
+    let protocol::GatewayFailureBody { code, diagnostic } = fubst::serde::from_slice(&reply.body)?;
     if code == 0 {
         return Err(Error::Protocol(
             "operation failure has no nonzero error code",

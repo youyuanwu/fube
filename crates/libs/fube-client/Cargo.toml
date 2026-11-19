@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 bitflags.workspace = true
 fube-transport.workspace = true
+furpc.workspace = true
 fubst.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -18,3 +19,4 @@ tokio = { workspace = true, features = ["test-util"] }
 time.workspace = true
 reqwest.workspace = true
 openapi-service-fabric.workspace = true
+tower-service = "0.3"

@@ -319,12 +319,14 @@ dependencies = [
  "clap",
  "fube-transport",
  "fubst",
+ "furpc",
  "openapi-service-fabric",
  "reqwest",
  "serde",
  "serde_json",
  "time",
  "tokio",
+ "tower-service",
  "uuid",
 ]
 

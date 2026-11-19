@@ -38,6 +38,15 @@ Deterministic I/O cases, backpressured in-memory exchange, and a loopback clear-
 exchange exercise this foundation. They are not native interoperability
 qualification.
 
+The separate `fube-client::FurpcClient` now qualifies native Ping through this
+driver against a fresh Service Fabric 11.8.121.4 onebox. The existing baseline
+test runs three overlapping pings on one Channel and compares complete gateway
+identities with fresh independent HTTP observations and the legacy native client.
+Its required `furpc_ping` report records all three results' successful comparison.
+This is initiating clear-TCP Ping evidence only; it does not qualify accepted-side
+serving, notifications, TLS, or the rest of the gateway API. See the
+[client slice](../../RustFabricClient.md#separate-furpc-backed-client).
+
 The public facade supports managed byte RPC by default and explicitly selected
 `ConnectionOptions::raw_only()` for caller-owned one-way IDs. Endpoint owns inert URI,
 limit and service configuration; connect returns an owning Channel. Channel
@@ -199,7 +208,8 @@ Source qualification at the pinned native baseline covers BeginNotification,
 DuplexRequestReply's special-first dispatch, and ReceiverContext::Reply.
 In-memory exchanges cover both directions, typed ACK data, class-local routing,
 policy rejection/commit checks, shared capacity, cancellation, Faults and drain;
-independent native interoperability remains unqualified. TLS remains unimplemented.
+independent native notification interoperability remains unqualified. TLS remains
+unimplemented.
 
 ## Gap ownership and implementation order
 

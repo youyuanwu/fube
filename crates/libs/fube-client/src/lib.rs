@@ -1,8 +1,10 @@
 //! Experimental pure Rust, clear-TCP FabricClient subset.
 //!
 //! This package does not use the native Service Fabric client library.
-//! Connections support bounded concurrency, have no automatic reconnect, and must only be
-//! used with an explicitly selected unsecured development gateway.
+//! Existing [`FabricClient`] connections support bounded concurrency without
+//! automatic reconnect. The separate [`FurpcClient`] uses furpc's Channel lifecycle
+//! and currently provides only Ping. Both require an explicitly selected unsecured
+//! development gateway.
 
 mod applications;
 mod channel_adapter;
@@ -11,6 +13,7 @@ mod deployed_applications;
 mod deployed_code_packages;
 mod deployed_replicas;
 mod deployed_service_packages;
+mod furpc_client;
 mod health;
 mod health_protocol;
 mod image_store;
@@ -40,6 +43,7 @@ pub use deployed_applications::*;
 pub use deployed_code_packages::*;
 pub use deployed_replicas::*;
 pub use deployed_service_packages::*;
+pub use furpc_client::{FurpcClient, FurpcClientError};
 pub use health::*;
 pub use image_store::{ImageStoreClient, ImageStoreClientOptions};
 pub use naming_uri::NamingUri;
