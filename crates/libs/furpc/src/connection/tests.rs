@@ -891,6 +891,57 @@ async fn controls_and_malformed_headers_cannot_enter_raw_ingress() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn routing_misses_classify_before_body_input_and_verify_discard_integrity() {
+    let config = config();
+    for reason in [DropReason::UnknownActor, DropReason::RouteMiss] {
+        for corrupt in [false, true] {
+            let (handle, mut driver, probe) = opened(config, true).await;
+            let message = Message::builder()
+                .append_header(header::actor(ActorId::new(70000).unwrap()).unwrap())
+                .append_header(header::action("miss").unwrap())
+                .body(Body::from_bytes(vec![7; 1024]).unwrap())
+                .build()
+                .unwrap();
+            let mut frame = encoded(message, config).await;
+            let prefix = frame.len() - 1024;
+            let mut classifications = 0;
+            let mut classify = |_: &crate::Headers, bytes| {
+                assert_eq!(bytes, 1024);
+                classifications += 1;
+                Err(reason)
+            };
+            probe.feed(&frame[..prefix]);
+            for _ in 0..128 {
+                assert!(driver
+                    .poll_event_with_admission(
+                        &mut Context::from_waker(Waker::noop()),
+                        &mut classify
+                    )
+                    .is_pending());
+            }
+            assert_eq!(probe.0.lock().unwrap().bytes_read, prefix);
+            if corrupt {
+                *frame.last_mut().unwrap() ^= 1;
+            }
+            probe.feed(&frame[prefix..]);
+            let result = poll_fn(|cx| driver.poll_event_with_admission(cx, &mut classify)).await;
+            assert_eq!(classifications, 1);
+            if corrupt {
+                assert!(matches!(
+                    &*result.unwrap_err(),
+                    ConnectionError::Frame(FrameError::BodyChecksumMismatch { .. })
+                ));
+            } else {
+                assert!(
+                    matches!(result.unwrap(), Some(ConnectionEvent::Discarded(actual)) if actual == reason)
+                );
+                assert_eq!(handle.phase(), Phase::Open);
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn invalid_hello_and_wrong_provider_never_publish_an_open_connection() {
     let config = config();
     for case in 0..4 {

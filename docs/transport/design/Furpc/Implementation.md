@@ -26,7 +26,7 @@ not construction or retained-allocation quotas.
 
 One scope-owned poll loop consumes private verified-message/discard events;
 there is no built-in application inbox, per-frame task, or second I/O owner.
-The provisional raw/no-destination classifier handles controls first, diagnoses
+The native classifier handles controls first, diagnoses
 unmatched replies and unavailable special-duplex deliveries without exposing
 them as ordinary ingress, and checks discarded-frame integrity. Unsupported
 security/send-target controls and transport actions fail explicitly.
@@ -112,7 +112,7 @@ remains trusted and cooperative. Admitted typed replies can complete during
 graceful drain without a general-purpose Peer.
 
 TCP/custom connectors, Accept, TCP/stream acceptors and
-`Server::serve_with_shutdown` use the same physical engine. Canonical raw
+`Server::serve_with_shutdown` use the same physical engine. Canonical
 IngressService bindings admit bounded work at the header gate, before body
 storage, and run readiness/handlers outside the driver. Header authorization
 and HandlerLimits are shared by all connections in a server or generations in
@@ -126,6 +126,26 @@ response envelopes. Private runner-owned tickets capture the original request
 ID, generation, response policy and deadline before editable Request publication.
 Only those tickets can send IngressResponse::Reply; missing responses and replies
 without a ticket are diagnosed handler failures and generate no automatic Fault.
+
+Ordinary ingress now selects one explicit raw binding or multiple disjoint
+whole-Actor/exact-action bindings. Header-stage matching uses sorted native
+Actor/UTF-16 Action keys before body retention, policy checks, handler permits
+or reply tickets. Unknown actors/actions are diagnosed and discarded with full
+frame integrity rather than becoming connection-fatal errors or falling back
+to raw delivery. Correlation/control classification remains earlier and separate
+from application routing, including in raw-only mode.
+
+The codec-free Router installs immutable exact-action bindings and distinct
+RequestRouteOptions/OneWayRouteOptions. Each invocation retains its original
+private binding and route identity: edited keys and independently configured
+router tables cannot borrow another route's permissions. Whole-Actor services
+may rewrite Action within their original Actor; explicit raw services remain
+actor-less when appropriate. Routed and typed services share the existing
+readiness allowance, original deadline and runner-owned reply completion.
+Configuration rejects reserved control actors, duplicate/overlapping bindings
+and raw/Actor mixtures without adding route-count or action-storage quotas.
+Router clones share configuration, not prepared services; selected services
+are cloned before readiness and called on that same instance.
 
 The optional accepted-peer hook runs once after establishment, with its own
 timeout and no handler-slot dependency. Shutdown drops acceptance, rejects
@@ -151,8 +171,8 @@ handshake, peer-ready and server drain default to 30 seconds; HandlerLimits
 retain their documented 8 in-flight/4 readiness-waiter/30-second defaults.
 These are not native constants or performance qualification.
 
-Specialized duplex, Actor routing and TLS remain
-unimplemented. The raw one-way binding still rejects request/reply flags; it
+Specialized duplex and TLS remain unimplemented.
+The raw one-way binding still rejects request/reply flags; it
 does not gain reply authority by sharing the managed connection.
 
 ## Gap ownership and implementation order

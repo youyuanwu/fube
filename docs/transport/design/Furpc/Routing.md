@@ -10,6 +10,10 @@ It owns no socket, independent execution scope, or hidden inbox.
 
 ## Minimal service router
 
+Router, RequestRouteOptions, OneWayRouteOptions and whole-Actor service bindings
+are implemented. This section describes the current minimal contract; the
+remaining deferred work is listed below.
+
 `Router` implements the [server service boundary](Services.md#service-boundary-and-native-bindings).
 Configuration is fallible and immutable after installation. Cloning shares
 route/service configuration, not duplicated live work.
@@ -25,7 +29,7 @@ can be registered without a body serializer. The native request/one-way kinds
 retain distinct option types for ingress and reply authorization; those are
 not codec choices or HTTP methods.
 
-Proposed signatures with complete service bounds:
+Public signatures with complete service bounds:
 
 ```rust,ignore
 impl RequestRouteOptions {
@@ -110,7 +114,7 @@ Normalize readiness/call errors with their sources and route phase.
 
 Selected-service readiness runs inside the existing admitted invocation and
 its deadline. Pending readiness consumes the runner's shared bounded waiter
-allowance; zero means fail-fast and exhaustion returns ResourceExhausted.
+allowance; zero means fail-fast and exhaustion returns `Error::ResourceLimit`.
 Outer middleware, routed services, and any inner method service reuse that
 accounting instead of creating independent waiting pools or double-counting
 one invocation. Cancellation drops unused readiness state.

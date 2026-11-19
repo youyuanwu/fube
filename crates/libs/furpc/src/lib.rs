@@ -8,7 +8,8 @@
 //! default; [`ConnectionOptions::raw_only`] keeps caller-owned one-way IDs.
 //! [`RpcClient`] adapts that byte service with a consumed application [`Codec`]
 //! per call. [`server::Rpc`] adapts typed handlers inside byte-facing services.
-//! Actor routing and TLS are not implemented.
+//! [`Router`] optionally selects exact native Actor/Action services; raw ingress
+//! remains independent. TLS is not implemented.
 //!
 //! ```no_run
 //! use furpc::{Body, ConnectionOptions, Endpoint, Message};
@@ -79,6 +80,7 @@ mod peer;
 mod reply;
 mod request;
 mod response;
+mod routing;
 mod rpc;
 pub mod server;
 mod service;
@@ -95,6 +97,7 @@ pub use peer::{Peer, PeerInfo, SendCheck, SendKind, SendPolicy, Source};
 pub use reply::Reply;
 pub use request::{Request, RequestContext, RequestParts};
 pub use response::{Response, ResponseParts};
+pub use routing::{OneWayRouteOptions, RequestRouteOptions, Router};
 pub use rpc::RemoteFault;
 pub use service::{
     EnvelopeCheck, HandlerLimits, IngressLimits, IngressOptions, IngressResponse, IngressService,

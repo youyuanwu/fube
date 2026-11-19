@@ -81,35 +81,137 @@ impl IngressOptions {
 
 #[derive(Clone)]
 pub struct ServiceBinding {
+    target: BindingTarget,
     options: IngressOptions,
 }
 impl ServiceBinding {
     pub fn raw(options: IngressOptions) -> Result<Self> {
+        Self::new(BindingTarget::Raw, options)
+    }
+    pub fn actor(actor: ActorId, options: IngressOptions) -> Result<Self> {
+        validate_actor(actor)?;
+        Self::new(BindingTarget::Actor(actor), options)
+    }
+    pub(crate) fn route(key: Arc<RouteKey>, options: IngressOptions) -> Result<Self> {
+        validate_actor(key.actor)?;
+        Self::new(BindingTarget::Route(key), options)
+    }
+    fn new(target: BindingTarget, options: IngressOptions) -> Result<Self> {
         if options.limits.max_body_bytes > u32::MAX as usize - 12 {
             return Err(Error::InvalidInput(
                 "ingress body limit exceeds native frame capacity",
             ));
         }
-        Ok(Self { options })
+        Ok(Self { target, options })
     }
-    pub fn actor(actor: ActorId, _options: IngressOptions) -> Result<Self> {
-        if matches!(actor.get(), 1 | 29 | 35) {
-            return Err(Error::InvalidInput("native control Actor is reserved"));
+}
+
+fn validate_actor(actor: ActorId) -> Result<()> {
+    if matches!(actor.get(), 1 | 29 | 35) {
+        return Err(Error::InvalidInput("native control Actor is reserved"));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct RouteKey {
+    pub(crate) actor: ActorId,
+    pub(crate) action: Vec<u16>,
+}
+
+#[derive(Debug, Clone)]
+enum BindingTarget {
+    Raw,
+    Actor(ActorId),
+    Route(Arc<RouteKey>),
+}
+impl BindingTarget {
+    fn key(&self) -> (i64, Option<&[u16]>) {
+        match self {
+            Self::Raw => (0, None),
+            Self::Actor(actor) => (actor.get(), None),
+            Self::Route(key) => (key.actor.get(), Some(&key.action)),
         }
-        Err(Error::Unsupported("Actor dispatcher"))
+    }
+
+    fn matches_current(&self, headers: &Headers) -> bool {
+        let common = headers.effective();
+        match self {
+            Self::Raw => true,
+            Self::Actor(actor) => *actor == common.actor,
+            Self::Route(key) => key.actor == common.actor && key.action == common.action(),
+        }
+    }
+}
+
+struct Bindings(Vec<ServiceBinding>);
+impl Bindings {
+    fn new(mut bindings: Vec<ServiceBinding>) -> Result<Self> {
+        if bindings.is_empty() {
+            return Err(Error::InvalidInput("at least one ingress binding required"));
+        }
+        if bindings
+            .iter()
+            .any(|binding| matches!(binding.target, BindingTarget::Raw))
+        {
+            if bindings.len() != 1 {
+                return Err(Error::InvalidInput(
+                    "raw and Actor bindings cannot be combined",
+                ));
+            }
+        } else {
+            bindings.sort_unstable_by(|left, right| left.target.key().cmp(&right.target.key()));
+            for pair in bindings.windows(2) {
+                let left = pair[0].target.key();
+                let right = pair[1].target.key();
+                if left.0 == right.0 && (left.1.is_none() || left == right) {
+                    return Err(Error::InvalidInput(
+                        "duplicate or overlapping Actor bindings",
+                    ));
+                }
+            }
+        }
+        Ok(Self(bindings))
+    }
+
+    fn select(&self, headers: &Headers) -> std::result::Result<&ServiceBinding, DropReason> {
+        if matches!(self.0[0].target, BindingTarget::Raw) {
+            return Ok(&self.0[0]);
+        }
+        let common = headers.effective();
+        let start = self
+            .0
+            .partition_point(|binding| binding.target.key().0 < common.actor.get());
+        let Some(first) = self
+            .0
+            .get(start)
+            .filter(|binding| binding.target.key().0 == common.actor.get())
+        else {
+            return Err(DropReason::UnknownActor);
+        };
+        if matches!(first.target, BindingTarget::Actor(_)) {
+            return Ok(first);
+        }
+        let end = start
+            + self.0[start..]
+                .partition_point(|binding| binding.target.key().0 == common.actor.get());
+        self.0[start..end]
+            .binary_search_by(|binding| binding.target.key().1.cmp(&Some(common.action())))
+            .map(|index| &self.0[start + index])
+            .map_err(|_| DropReason::RouteMiss)
     }
 }
 
 /// Inert, cloneable configuration for the same Tower ingress on either role.
 pub struct IngressService<S> {
     service: S,
-    binding: ServiceBinding,
+    bindings: Arc<Bindings>,
 }
 impl<S: Clone> Clone for IngressService<S> {
     fn clone(&self) -> Self {
         Self {
             service: self.service.clone(),
-            binding: self.binding.clone(),
+            bindings: self.bindings.clone(),
         }
     }
 }
@@ -119,15 +221,10 @@ where
     S::Future: Send + 'static,
     S::Error: Into<BoxError>,
 {
-    pub fn new(service: S, mut bindings: Vec<ServiceBinding>) -> Result<Self> {
-        if bindings.len() != 1 {
-            return Err(Error::InvalidInput(
-                "exactly one raw ingress binding required",
-            ));
-        }
+    pub fn new(service: S, bindings: Vec<ServiceBinding>) -> Result<Self> {
         Ok(Self {
             service,
-            binding: bindings.pop().expect("one binding"),
+            bindings: Arc::new(Bindings::new(bindings)?),
         })
     }
     pub fn map_service<T>(self, layer: impl FnOnce(S) -> T) -> IngressService<T>
@@ -138,13 +235,13 @@ where
     {
         IngressService {
             service: layer(self.service),
-            binding: self.binding,
+            bindings: self.bindings,
         }
     }
     pub(crate) fn erase(self) -> Arc<StoredService> {
         Arc::new(StoredService {
-            binding: self.binding,
-            factory: Mutex::new(Box::new(Prototype(self.service))),
+            bindings: self.bindings,
+            factory: ServiceFactory::new(self.service),
         })
     }
 }
@@ -215,6 +312,8 @@ trait Factory: Send {
         &mut self,
         request: Request<Body>,
         readiness: Arc<Semaphore>,
+        readiness_phase: &'static str,
+        handler_phase: &'static str,
     ) -> BoxFuture<Result<IngressResponse>>;
 }
 struct Prototype<S>(S);
@@ -228,21 +327,50 @@ where
         &mut self,
         request: Request<Body>,
         readiness: Arc<Semaphore>,
+        readiness_phase: &'static str,
+        handler_phase: &'static str,
     ) -> BoxFuture<Result<IngressResponse>> {
         let mut service = self.0.clone();
         Box::pin(async move {
-            ready(&mut service, readiness, "service readiness").await?;
+            let state = InvocationState::live_context(&request)?;
+            ready(&mut service, readiness, readiness_phase).await?;
+            state.check()?;
             service
                 .call(request)
                 .await
-                .map_err(|error| Error::handler("handler", error))
+                .map_err(|error| Error::handler(handler_phase, error))
         })
     }
 }
 
+pub(crate) struct ServiceFactory(Mutex<Box<dyn Factory>>);
+impl ServiceFactory {
+    pub(crate) fn new<S>(service: S) -> Self
+    where
+        S: Service<Request<Body>, Response = IngressResponse> + Clone + Send + 'static,
+        S::Future: Send + 'static,
+        S::Error: Into<BoxError>,
+    {
+        Self(Mutex::new(Box::new(Prototype(service))))
+    }
+
+    pub(crate) fn invoke(
+        &self,
+        request: Request<Body>,
+        readiness: Arc<Semaphore>,
+        readiness_phase: &'static str,
+        handler_phase: &'static str,
+    ) -> BoxFuture<Result<IngressResponse>> {
+        self.0
+            .lock()
+            .unwrap()
+            .make(request, readiness, readiness_phase, handler_phase)
+    }
+}
+
 pub(crate) struct StoredService {
-    binding: ServiceBinding,
-    factory: Mutex<Box<dyn Factory>>,
+    bindings: Arc<Bindings>,
+    factory: ServiceFactory,
 }
 
 pub(crate) struct Registry {
@@ -361,7 +489,8 @@ impl Registry {
             .unwrap()
             .clone()
             .ok_or(DropReason::NoDestination)?;
-        let options = &service.binding.options;
+        let binding = service.bindings.select(headers)?;
+        let options = &binding.options;
         let common = headers.effective();
         let valid_kind = if options.request.is_some() {
             common.expects_reply && common.message_id != crate::MessageId::default()
@@ -409,7 +538,9 @@ impl Registry {
             max_body_bytes: options.limits.max_body_bytes,
             max_receive_frame_bytes: self.max_receive_frame_bytes,
             max_response_body_bytes: self.limits.max_encoded_body_bytes_per_response,
+            target: binding.target.clone(),
         });
+        let sends = options.sends;
         Ok(Dispatch {
             service,
             guard: Invocation {
@@ -417,6 +548,7 @@ impl Registry {
                 _permit: permit,
             },
             reply,
+            sends,
         })
     }
 }
@@ -437,17 +569,19 @@ pub(crate) struct InvocationState {
     max_body_bytes: usize,
     max_receive_frame_bytes: usize,
     pub(crate) max_response_body_bytes: usize,
+    target: BindingTarget,
 }
 impl InvocationState {
     pub(crate) fn for_request(request: &Request<Body>, kind: InvocationKind) -> Result<Arc<Self>> {
-        let context = request.context().ok_or(Error::InvalidInput(
-            "typed ingress requires received context",
-        ))?;
-        let state = context.invocation.upgrade().ok_or(Error::Closed)?;
-        state.check()?;
+        let state = Self::received(request)?;
         if state.kind != kind {
             return Err(Error::InvalidInput("typed ingress exchange kind mismatch"));
         }
+        Ok(state)
+    }
+
+    pub(crate) fn received(request: &Request<Body>) -> Result<Arc<Self>> {
+        let state = Self::live_context(request)?;
         if request.body().len() > state.max_body_bytes {
             return Err(Error::ResourceLimit("ingress body bytes"));
         }
@@ -455,7 +589,43 @@ impl InvocationState {
             &HeaderDecodeContext::native(),
             state.max_receive_frame_bytes,
         )?;
+        if !state.target.matches_current(request.headers()) {
+            return Err(Error::InvalidInput(
+                "edited headers retarget the admitted binding",
+            ));
+        }
         Ok(state)
+    }
+
+    fn live_context(request: &Request<Body>) -> Result<Arc<Self>> {
+        let context = request.context().ok_or(Error::InvalidInput(
+            "service dispatch requires received context",
+        ))?;
+        let state = context.invocation.upgrade().ok_or(Error::Closed)?;
+        state.check()?;
+        Ok(state)
+    }
+
+    pub(crate) fn authorize_route(&self, key: &Arc<RouteKey>) -> Result<()> {
+        if !matches!(&self.target, BindingTarget::Route(original) if Arc::ptr_eq(original, key)) {
+            return Err(Error::InvalidInput(
+                "router requires its original admitted route",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn route_call(
+        &self,
+        factory: &ServiceFactory,
+        request: Request<Body>,
+    ) -> BoxFuture<Result<IngressResponse>> {
+        factory.invoke(
+            request,
+            self.readiness.clone(),
+            "route readiness",
+            "route handler",
+        )
     }
 
     pub(crate) fn is_live(&self) -> bool {
@@ -512,6 +682,7 @@ pub(crate) struct Dispatch {
     service: Arc<StoredService>,
     guard: Invocation,
     reply: Option<(crate::MessageId, EnvelopeCheck, OwnedSemaphorePermit)>,
+    sends: Option<SendPolicy>,
 }
 impl Dispatch {
     pub(crate) fn deadline(&self) -> Instant {
@@ -523,12 +694,7 @@ impl Dispatch {
         request.parts.headers = message.headers().clone();
         request.parts.context = Some(RequestContext {
             source: core.source.clone(),
-            peer: self
-                .service
-                .binding
-                .options
-                .sends
-                .map(|policy| core.peer(Some(policy))),
+            peer: self.sends.map(|policy| core.peer(Some(policy))),
             deadline: self.deadline(),
             invocation: Arc::downgrade(&self.guard.state),
         });
@@ -544,12 +710,10 @@ impl Dispatch {
             if !request.context().is_some_and(RequestContext::is_live) {
                 return Err(Error::Closed);
             }
-            let future = self
-                .service
-                .factory
-                .lock()
-                .unwrap()
-                .make(request, readiness);
+            let future =
+                self.service
+                    .factory
+                    .invoke(request, readiness, "service readiness", "handler");
             match timeout_at(deadline, future)
                 .await
                 .map_err(|_| Error::Timeout("handler"))??

@@ -191,8 +191,8 @@ capacity or block its dispatch.
 ## Typed RPC adapters
 
 `server::Rpc<C>`, `unary`, `one_way`, and `Reply<T>` are implemented. They work
-inside raw ingress services on either connection role without requiring the
-still-unimplemented router.
+inside raw, whole-Actor, or routed ingress services on either connection role.
+The optional codec-free Router is implemented independently of these adapters.
 
 Keep typed body adaptation outside `Router`, following
 [tonic's method-level `server::Grpc<C>`][tonic-server-rpc]. A byte-facing method

@@ -27,6 +27,8 @@ use tokio::{
 };
 use tower_service::Service;
 
+#[path = "transport/routing.rs"]
+mod routing;
 #[path = "transport/typed_server.rs"]
 mod typed_server;
 
