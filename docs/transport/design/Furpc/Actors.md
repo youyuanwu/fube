@@ -4,9 +4,10 @@
 
 Application ingress selects either explicit raw delivery or optional ordinary
 Actor dispatch, with [Tower-service handlers](Services.md) as the canonical
-API for both dialed reverse traffic and accepted connections. Ordinary ingress
-has no built-in pull receiver; applications can compose a bounded queue inside
-their service. Specialized native duplex ingress remains separate.
+API for both dialed reverse traffic and accepted connections. Native
+notifications use that same service boundary, with distinct classification
+and authorization. There is no built-in application pull receiver; applications
+can compose a bounded queue inside their service.
 An ActorId is a native numeric routing code, not a Reliable
 Actors identity, task, or durable mailbox. Registration capacity is resource
 policy, not a native 32-actor limit. No implicit per-actor serialization,
@@ -20,16 +21,21 @@ classification using effective common properties:
 
 ```text
 native control                         -> connection driver
-special duplex                         -> authorized duplex machinery
-nonempty RelatesTo                     -> ordinary reply table
-otherwise                              -> configured application dispatcher
+native special notification            -> notification bindings/services
+nonempty RelatesTo                     -> RPC/notification reply table
+otherwise                              -> ordinary bindings/services
 ```
 
-Only the last branch selects raw delivery or Actor dispatch. Raw ingress does
-not expose native controls, special duplex, or unmatched ordinary replies.
+Native notification classification precedes ordinary correlation and dispatch.
+Each application traffic class selects its own configured raw delivery or Actor
+dispatch. Ordinary bindings never receive native notifications, controls, or
+unmatched replies; notification bindings never catch an ordinary route miss.
+Acknowledgments are correlated replies, not new notification deliveries.
 Unknown correlation never falls back to an earlier RelatesTo occurrence or to
-application ingress. `raw_only` disables managed correlation/ID ownership; it
-does not select a dispatcher or turn replies into ordinary application messages.
+application ingress. `raw_only` disables outgoing managed RPC/notification
+correlation and leaves ordinary one-way IDs caller-owned; it does not select
+a dispatcher, authorize notification ingress, or turn replies into application
+messages. Explicit incoming acknowledgment tickets remain private to the runner.
 
 Actor dispatch uses effective native Actor properties and does not depend on
 Action or ExpectsReply. It diagnoses and drops unknown actors. With explicit raw
@@ -54,31 +60,39 @@ capabilities available to a consumer.
 ## Application dispatcher selection
 
 Raw and Actor-dispatched ingress, whole-Actor bindings, and the optional exact
-Actor/Action Router are implemented. Specialized duplex remains deferred.
+Actor/Action Router are implemented for ordinary and notification traffic.
+Notification origination, service-defined acknowledgments, and typed unary
+adaptation use the same managed core and service runner.
 
-Each logical Channel or server scope has at most one ordinary application
-dispatcher: raw ingress or Actor dispatch. A raw dispatcher has one
-[`ServiceBinding::raw`](Services.md#service-boundary-and-native-bindings).
-Actor dispatch can contain multiple actor bindings owned by the installed
-IngressService/Router. No new public dispatcher trait, driver, or staging queue
-is needed.
+Each logical Channel or server scope installs at most one IngressService.
+Within each traffic class, its bindings choose raw ingress or Actor dispatch.
+A raw dispatcher has one
+[`ServiceBinding::raw`](Services.md#service-boundary-and-native-bindings)
+for that class.
+Actor dispatch can contain multiple actor bindings owned by that same service
+or Router. Ordinary and notification bindings have disjoint namespaces, but
+share the runner and HandlerLimits. No new public dispatcher trait, driver,
+or staging queue is needed.
 
 `Endpoint::service`, `Channel::register_service`, and `ServerBuilder::service`
 install the same IngressService adapter and select its raw or Actor bindings.
 The installed service's bindings select the dispatcher: ServiceBinding::raw
 selects raw delivery; ServiceBinding::actor and Router::into_service select
-Actor dispatch. Raw and Actor bindings cannot be mixed in one scope.
+Actor dispatch. Raw and Actor bindings cannot be mixed within one traffic class.
+An ordinary raw binding may coexist with notification Actor bindings, or vice
+versa, without creating a fallback between classes.
 Conflicting or duplicate service/binding installation returns InvalidInput
 without changing existing configuration; server build/serve and Endpoint connect revalidate
-before enabling traffic. A second raw binding rejects, never broadcasts.
-Ordinary RPC correlation, special-duplex registration, and `on_peer_ready`
-are independent of this choice.
+before enabling traffic. A second raw binding in the same class rejects,
+never broadcasts.
+Ordinary RPC/notification correlation and `on_peer_ready` are independent of
+that dispatcher choice.
 
-Without ordinary ingress configuration, application delivery remains
-unconfigured, not implicitly raw. A Channel may select its dispatcher by later
+Without bindings for a traffic class, its application delivery remains
+unconfigured, not implicitly raw. A Channel may select its dispatchers by later
 service installation, but cannot recover previously dropped traffic. Once
-installed, the ordinary service and bindings are fixed for that logical scope;
-there is no live replacement/unregistration API. Reconnection
+installed, the service and both classes' bindings are fixed for that logical
+scope; there is no live replacement/unregistration API. Reconnection
 preserves the selection and current registry; it cannot switch dispatchers or
 redeliver an old registration's messages to a different target.
 
@@ -101,6 +115,7 @@ not another native receiver API.
 impl IngressOptions {
     pub fn one_way(check: EnvelopeCheck, limits: IngressLimits) -> Self;
     pub fn requests(policy: RequestPolicy, limits: IngressLimits) -> Self;
+    pub fn notifications(policy: NotificationPolicy, limits: IngressLimits) -> Self;
     pub fn with_send_policy(self, policy: SendPolicy) -> Self;
 }
 
@@ -116,7 +131,14 @@ impl SendPolicy {
 impl RequestPolicy {
     pub fn new(request: EnvelopeCheck, response: EnvelopeCheck) -> Self;
 }
+
+impl NotificationPolicy {
+    pub fn new(notification: EnvelopeCheck, acknowledgment: EnvelopeCheck) -> Self;
+}
 ```
+
+NotificationPolicy is cloneable immutable configuration; cloning copies checks,
+not live invocation or correlation state.
 
 `IngressOptions` configures authorization/admission for the installed service.
 Endpoint stores inert service configuration and bounds binding metadata,
@@ -137,9 +159,11 @@ Wire order is preserved within an individual connection's admitted delivery;
 no cross-connection total order, service processing order, or handler-completion
 order is promised.
 
-`one_way` authorizes delivery without a reply grant. `requests` separately
-authorizes request and response envelopes; core MessageId/ExpectsReply and
-normal-versus-special classification checks remain mandatory. User checks are
+`one_way` authorizes ordinary delivery without a reply ticket. `requests`
+separately authorizes ordinary request and response envelopes.
+`notifications` separately authorizes native notification and acknowledgment
+envelopes; it is not an alias for either ordinary kind. Core native fields and
+ordinary-versus-notification classification checks remain mandatory. User checks are
 trusted nonblocking header/source checks, not body decoders or driver callbacks
 that may await. Raw or Actor registration alone never authorizes sending.
 
@@ -155,11 +179,11 @@ The check is captured with the original driver/generation and re-applied to
 every outbound envelope before commitment. `SendKind` is selected by the
 method used, never a wire field. A policy can allow only semantic one-way ACKs,
 or explicitly permit requests/notifications too. It cannot waive managed IDs,
-reply-grant rules, or native control restrictions. `Peer::duplex` adds
-its operation policy; it cannot replace a captured send restriction.
+reply-ticket rules, or native control restrictions. `Peer::notify` adds its
+explicit NotificationPolicy; it cannot replace a captured send restriction.
 
 Without this opt-in, RequestContext::peer returns None even when the runner
-holds a reply grant. Ordinary services return IngressResponse data and never
+holds a reply ticket. All services return IngressResponse data and never
 extract that grant, including when application work is queued.
 `Source` remains passive provenance, not a way to recover more send authority.
 The same rules apply to reverse ingress received by a client.
@@ -192,7 +216,7 @@ Malformed recognized occurrences still fail native validation in either path.
 The Actor dispatcher continues to use effective native properties; an absent
 or unregistered actor is not an implicit request to try raw delivery.
 
-An explicitly configured raw binding receives authorized ordinary application
+An explicitly configured ordinary raw binding receives authorized application
 messages with or without a valid ordinary Actor header. It is not a fallback
 for rejected actor routes, native controls, special traffic, or unknown
 correlation. Its check runs before body retention, with the same bounded
@@ -222,161 +246,139 @@ Session behavior still needs its own replication-framework qualification.
 
 ## Ingress across connection generations
 
-Channel IngressService configuration and optional special-duplex registration
-survive a physical disconnect. Service readiness/handler invocations already
-admitted to the failed generation are
-cancelled and never replayed; only configuration persists for new messages.
+Channel IngressService configuration, including notification bindings, survives
+a physical disconnect. Service readiness/handler invocations and private
+reply/acknowledgment tickets admitted to the failed generation are cancelled
+and never replayed; only configuration persists for new messages.
 Reconnection binds the current logical registry before releasing application
-traffic on its new generation.
-It preserves the installed ordinary service and chosen dispatcher. Special
-duplex queues/receivers are not recreated; take_duplex remains take-once.
-Runtime service installation remains effective, while dropped/unregistered
-special-duplex entries are not resurrected from Endpoint configuration. A separate
-explicit Endpoint connect still creates a completely independent registry.
-Registration epochs and physical connection generations are distinct.
-The service runner and HandlerLimits are shared by all Channel clones and
-generations, not recreated as fresh per-generation capacity. An installed
-service is not a new public owner or continuous-reconnect demand.
+traffic on its new generation. Runtime service installation remains effective.
+A separate explicit Endpoint connect creates a completely independent registry.
+The runner and HandlerLimits are shared by all Channel clones, traffic classes
+and generations, not recreated as fresh per-generation capacity.
 
-Queued old-generation special-duplex deliveries retain their immutable source, optional Peer,
-reply grant, shared storage, and original policy/deadline. They may be drained without
-being reassigned to the replacement. Replying or ACKing through a retired
-generation fails with its cause; never send that work through a fresh Peer
-automatically. Source checks run for each newly admitted delivery. There is
-no total order across generations and no implicit domain-session continuity.
-Ingress limits cover the combined old/current special-duplex queue, not a new
-allowance per connection. Application-owned queues are outside the registry;
-queued requests retain their original context/storage and cannot keep a
-cancelled service invocation live or replay it on a new generation.
+Application-owned queues may retain old requests, source metadata, optional
+Peers and shared bytes, but cannot keep a cancelled invocation or its private
+completion ticket live. Late worker output cannot acknowledge on a replacement
+generation. There is no total order across generations or implicit domain-session
+continuity. Source checks run for each newly admitted delivery.
 
-When its queue is empty, a pending Channel-backed DuplexReceiver::recv may demand
-the same bounded reconnect attempt as RPC readiness or Channel peer acquisition.
-It is a nonowning demand: last-owner release closes it. Cancellation consumes
-no queued message and grants no replay authority. Reconnect failure is returned
-explicitly for that wait, leaving the registration usable for later receives;
-a physical disconnect alone is not terminal registration Closed. Already
-queued messages can still be consumed with their original provenance.
-An accepted-server DuplexReceiver never originates a reconnect.
+Installing notification ingress or waiting on an application queue does not
+demand reconnect. Later RPC readiness or Channel peer acquisition may join the
+same bounded reconnect attempt; a Peer notification never reconnects itself.
+Retain an owning Channel or live server execution while native work is needed.
 
 Transport establishment does not restore IPC registration, notification
 subscriptions, replication sessions, or earned semantic ACK state. Consumers
 must gate domain work and recover those protocols explicitly on a fresh Peer
 or new source generation; transport does not fabricate a session-ready event.
 
-## Duplex origination and ingress
+## Native notifications
 
-Special duplex origination and delivery have explicit entry points:
+Native push notifications are request/acknowledgment exchanges, not ordinary
+one-way delivery or arbitrary reverse RPC. Their native special flags, including
+UncorrelatedReply, select a distinct traffic class. That name means the push is
+not answering an earlier request; it does not mean fire-and-forget.
+
+Use the same native-operation and service programming model as existing sends
+and requests. Do not add a separate notification client, transport-owned
+receiver/queue, received-message wrapper, or public acknowledgment grant.
+These APIs replace the previous separate duplex design. They are implemented;
+independent native interoperability is not yet qualified.
+
+The wire mapping follows native [BeginNotification][sf-notification],
+[request setup][sf-notification-request],
+[special notification dispatch][sf-duplex], and
+[ReceiverContext::Reply][sf-receiver-reply]: the originator adds
+UncorrelatedReply and ExpectsReply, while the acknowledgment relates to the
+original MessageId without those flags. Ingress special classification does
+not itself require ExpectsReply; it requires a nonempty original MessageId
+and explicit notification authorization, even when RelatesTo is also present.
 
 ```rust,ignore
-impl Endpoint {
-    pub fn duplex_ingress(
-        self, policy: DuplexPolicy, limits: IngressLimits,
-        sends: Option<SendPolicy>,
-    ) -> Result<Self>;
-}
-
-impl Channel {
-    pub fn take_duplex(&self) -> Result<DuplexReceiver>;
-    pub fn register_duplex(
-        &self, policy: DuplexPolicy, limits: IngressLimits,
-        sends: Option<SendPolicy>,
-    ) -> Result<DuplexReceiver>;
-}
-
-impl Server {
-    pub fn register_duplex(
-        &self, policy: DuplexPolicy, limits: IngressLimits,
-        sends: Option<SendPolicy>,
-    ) -> Result<DuplexReceiver>;
-}
-
-impl DuplexReceiver {
-    pub async fn recv(&mut self, deadline: Instant) -> Result<ReceivedMessage>;
-    pub fn unregister(&mut self);
-}
-
-impl ReceivedMessage {
-    pub fn message(&self) -> &Message;
-    pub fn source(&self) -> &Source;
-    pub fn peer(&self) -> Option<&Peer>;
-    pub fn take_reply(&mut self) -> Option<ReplyGrant>;
-    pub fn into_message(self) -> Message;
-}
-
-impl ReplyGrant {
-    pub fn reply(self, message: Message, deadline: Instant)
-        -> Operation<WriteReceipt>;
-}
-
 impl Peer {
-    pub fn duplex(&self, policy: DuplexPolicy) -> Result<DuplexClient>;
-}
-
-impl DuplexPolicy {
-    pub fn new(notification: EnvelopeCheck, acknowledgment: EnvelopeCheck) -> Self;
-}
-
-impl DuplexClient {
-    pub fn notify<C>(
-        &self, request: Request<C::Encode>, codec: C, deadline: Instant,
-    ) -> Operation<Response<C::Decode>>
-    where
-        C: Codec + Send + 'static,
-        C::Encode: Send + 'static,
-        C::Decode: Send + 'static,
-        C::Encoder: Send + 'static,
-        C::Decoder: Send + 'static;
+    pub fn notify(
+        &self, request: Request<Body>, policy: NotificationPolicy, deadline: Instant,
+    ) -> Operation<Response<Body>>;
 }
 ```
 
-Initially one bounded special-duplex receiver may be registered per Channel
-or server scope; its policy selects authorized notification envelopes.
-`Endpoint::duplex_ingress` preconfigures it before application traffic;
-it stores an inert descriptor and connect installs the bounded queue before
-special traffic is released. `Channel::take_duplex` transfers that receiver
-once; missing/already-taken is InvalidInput. Clones share one registration
-and cannot obtain duplicate receivers. Dynamic Channel registration remains explicit.
-Duplicate duplex configuration/registration rejects instead of silently
-replacing its policy.
-Server registers before serving; the application drives its separately owned
-duplex processing concurrently with the live Channel/server.
+`notify` parallels `Peer::request`: it is inert until polled, uses the earlier
+explicit/local deadline, is bound to the Peer generation, and retains
+Operation/Attempt cancellation and commitment semantics. It requires managed
+mode and an explicit NotificationPolicy. The notification check and any captured
+SendPolicy apply to submission; the acknowledgment check applies to matched
+responses. Neither can waive native field/control rules.
+At the caller, a matched acknowledgment's header/source check runs before body
+retention. Rejected envelopes are diagnosed and integrity-checked on discard;
+they do not settle the pending operation or fall back to ingress.
 
-DuplexReceiver and ReceivedMessage are not Clone and retain no scope owner.
-Cancellation/timeout of recv consumes no message; exclusive mutable receive
-permits no unbounded receive-waiter list. Unregister stops new admission,
-leaving already assigned/queued work on its original registration epoch until
-drained, then recv returns Closed. Drop unregisters and discards retained work
-without acknowledgment. New registration cannot inherit old deliveries.
+The core assigns the native ID and special flags, registers correlation before
+commitment, and awaits the acknowledgment using the shared pending-only table
+and existing pending-request/result allowance, not a separate notification pool.
+Caller-supplied managed fields reject; special flags are not enabled by editing
+raw send headers. Acknowledgment lookup remains generation-bound, verifies
+complete frame integrity, and processes native Faults before successful body
+decoding. Timeout, cancellation and generation retirement remove pending state
+without replay or lifetime ID history.
 
-ReceivedMessage is the direct special-duplex delivery envelope, not ordinary
-service ingress. Its constructors are private; extracting a Message cannot
-reconstruct validation or manufacture reply authority. take_reply moves the
-original grant once, while into_message drops unused context/grant without
-emitting output. ReplyGrant::reply consumes the grant even when its lazy
-operation is unpolled, applies captured response policy/flags and original
-RelatesTo, and never targets a replacement generation. Owner shutdown rejects
-unused grants; retaining a grant cannot hold drain open.
+Peer remains byte-facing, like Peer::request; it has no body-codec convenience
+method. Typed notification callers reuse RpcClient<T> over an explicit
+byte-facing Tower service that delegates to Peer::notify with its captured
+NotificationPolicy. That adapter forwards the Request's original absolute
+deadline, native Response parts and errors, and adds no replay, correlation
+table or driver. It does not make Peer implement Service or introduce another
+built-in transport. RpcClient never infers native notification kind from edited
+flags or changes the ordinary Channel service's request semantics.
 
-Special duplex remains separately classified with either ordinary dispatcher.
-Origination requires managed mode
-and explicit policy; the notification and acknowledgment checks apply in their
-respective directions. `notify` owns the special flags and awaits correlation.
-`duplex` returns a cloneable codec-independent adapter retaining only its
-bound Peer and explicit policy. Each `notify` consumes a codec for that
-notification/acknowledgment pair, using the same lazy operation, body budgets,
-and native per-call ownership rules. This specialized Peer-bound path
-retains `Operation`/Attempt and actual scope-owned codec admission; it is not
-the generic `RpcClient<T>` transport service, whose codecs run above byte
-admission. Both paths reuse the same Codec traits without storing a codec on
-the adapter; client codecs need neither Clone nor Sync. DuplexClient and its
-operations are nonowning; keep the originating Channel or server execution
-alive. Native convenience methods
-may supply `FubstCodec` explicitly, without imposing its schemas on unrelated
-notifications.
-Receiving special traffic does not use `IngressOptions::requests`. This shares
-body codecs and attempt receipts, not an unrestricted raw flag setter.
-The optional send policy controls whether those received contexts also expose
-a restricted Peer; None grants only the separately authorized reply.
+Typed notification calls therefore use the existing per-call Codec and
+ClientCodecLimits contract, encoding before byte-service/native admission and
+decoding outside the driver. They return ordinary RpcClient futures without an
+Attempt; callers needing native disposition use the byte notify operation.
+Response parts preserve native source and settlement timing. An adapter that
+captures only a Peer remains nonowning, so retain the originating Channel or
+server execution. No allocation ledger or additional construction cap is added.
+
+Ingress uses `IngressOptions::notifications(policy, limits)` with
+ServiceBinding::raw or ServiceBinding::actor, or the Router's
+`notification(..., NotificationRouteOptions, service)` registration.
+Install these through the existing Endpoint::service, Channel::register_service
+or ServerBuilder::service APIs. There is no separate take/register/unregister
+notification-receiver lifecycle. Duplicate/conflicting bindings reject within
+their traffic class before serving.
+
+At header admission, the core validates the original native notification kind
+and required ID, selects only an authorized notification binding, and reserves
+the existing handler and reply-completion capacity before body retention.
+Ordinary one-way/request flags or mutable Actor/Action values cannot mint this
+admission. After integrity verification the service receives Request<Body> with
+the same private original-source, kind, route, policy and deadline context.
+
+The service returns IngressResponse::Reply as acknowledgment data.
+`server::Rpc::unary` adapts its typed Request<Q> -> Reply<R> inside that same
+invocation; it accepts either an originally authorized ordinary request or
+notification. The runner alone canonicalizes the acknowledgment's native
+flags/RelatesTo using the notification's original MessageId and generation.
+NotificationPolicy's acknowledgment check is applied at submission and
+commitment. `one_way` adaptation rejects notification invocations;
+NoReply for a notification is a missing-acknowledgment handler error.
+Failures, cancellation and dropped work send no implicit acknowledgment or Fault.
+
+On ingress, notification readiness, codec work, handlers, queue waits and
+acknowledgment writes use the original invocation deadline and shared HandlerLimits.
+Application-owned bounded queues compose inside services while the runner
+retains its ticket. They receive no send authority, and late worker output
+cannot revive a cancelled invocation. The optional SendPolicy alone decides
+whether RequestContext also exposes a restricted Peer.
+
+Graceful server drain includes already-admitted notification handlers and their
+ticket-authorized acknowledgments just like ordinary replying handlers.
+General Peers gain no drain exemption for new notifications or semantic sends.
+Dropping the owner/execution cancels notification work; retaining requests,
+parts, a Peer or an unpolled operation cannot keep the scope alive.
 
 [sf-replication-demuxer]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/ReplicationDemuxer.cpp#L12-L28
 [sf-replication-headers]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/ReplicationTransport.cpp#L919-L929
+[sf-notification]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/requestreply.cpp#L263-L271
+[sf-notification-request]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/requestreply.cpp#L61-L105
+[sf-duplex]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/DuplexRequestReply.cpp#L35-L77
+[sf-receiver-reply]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/ReceiverContext.cpp#L25-L41

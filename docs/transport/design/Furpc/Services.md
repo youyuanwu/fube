@@ -13,22 +13,26 @@ Applications needing queued processing compose a
 
 ```text
 native connection driver
-    -> common-header/control/reply classification
-        -> raw binding OR optional Actor dispatcher
-            -> header-only binding authorization and bounded admission
-                -> scope-owned service readiness and handler work
-                    -> optional Router: Actor + Action
-                        -> selected Service<Request<Body>>
-                            -> optional server::Rpc<C> method adapter
-                                -> decode -> typed service -> encode
-                -> private original-connection reply completion
+    -> common-header/control/reply/notification classification
+        -> ordinary OR notification bindings
+            -> class-local raw binding OR optional Actor dispatcher
+                -> header-only authorization and bounded admission
+                    -> complete-frame integrity verification
+                        -> scope-owned service readiness and handler work
+                            -> optional Router: native class + Actor + Action
+                                -> selected Service<Request<Body>>
+                                    -> optional server::Rpc<C> method adapter
+                                        -> decode -> typed service -> encode
+                        -> private original-connection reply/ack completion
 ```
 
-Native controls, ordinary correlated replies, and special duplex traffic do
-not enter this application service path. A raw binding requires no ordinary
-Actor header. Actor/Action routing is an optional application dispatcher, not
-a mandatory native classification stage. Both paths use the same runner and
-admission; neither routes through an additional inbox.
+Native controls and correlated replies do not enter this application service
+path. Native notifications do, but only through explicitly authorized
+notification bindings, never ordinary request/one-way bindings.
+A raw binding requires no ordinary Actor header. Actor/Action routing is an
+optional class-local application dispatcher, not a replacement for native
+classification. All bindings share the same runner and admission; no path
+routes through an additional inbox.
 
 The Channel's private logical scope or the `serve_with_shutdown` execution
 owns ingress-service readiness, handler futures, response completion, and
@@ -126,7 +130,8 @@ only configuration/bindings, never live invocation or readiness state.
 Each scope installs at most one explicit user
 ingress service; compose its routes or domain dispatch inside that service.
 Repeated installation rejects explicitly. There is initially no live service
-replacement/unregistration API; all ordinary bindings belong to this service.
+replacement/unregistration API; ordinary and notification bindings belong to
+this same service.
 
 `Endpoint::service` stores an inert cloneable prototype and bounded binding
 metadata. Constructors, setters, and unpolled connect futures perform no
@@ -134,7 +139,7 @@ readiness polling, handler invocation, I/O, or task startup. Each explicit
 connect clones unprepared service configuration into an independent logical
 scope, installs bindings and reserves execution metadata before application
 traffic is released, then drives reverse handlers without a user receive loop.
-There is no receiver handoff, hidden inbox, or native ordinary-message pull API.
+There is no receiver handoff, hidden inbox, or native application-message pull API.
 Initial connect failure/cancellation retires its unpublished ingress work too.
 
 Endpoint remains Clone + Send + Sync without requiring S to be Sync. Its
@@ -154,35 +159,39 @@ avoid early reverse-ingress races. Server installs the same adapter before
 serving through its existing builder method.
 
 Bindings select the [application dispatcher](Actors.md#application-dispatcher-selection).
-Raw service composition has one `ServiceBinding::raw` and no Actor bindings.
-Its check authorizes ordinary
-application envelopes independently of Actor presence. This is explicit scope
-configuration, not a wildcard fallback for a missed route.
+Within each native traffic class, raw service composition has one
+ServiceBinding::raw and no Actor bindings. IngressOptions selects ordinary
+one-way, ordinary request, or notification authorization. Its check authorizes
+only that original class/kind independently of Actor presence. This is explicit
+configuration, not a wildcard fallback for a missed route or traffic class.
 
 With Actor dispatch, all actor bindings belong to the installed service.
 A custom service can bind a whole actor and
 interpret Action itself. A router generates Actor bindings with immutable
-action selectors from its routes. Conflicting raw/Actor or duplicate binding claims
-reject before serving, never race to consume the same message or silently
-widen a binding. `IngressService::new` validates its raw-versus-Actor bindings;
-installing it and serving revalidate scope-wide compatibility.
+action selectors and traffic classes from its routes. Class-local conflicting
+raw/Actor or duplicate binding claims reject before serving, never race to
+consume the same message or silently widen a binding. IngressService::new
+validates its class-local raw-versus-Actor bindings; installing it and serving
+revalidate scope-wide compatibility.
 
 These bindings perform only header/source matching, independent authorization,
 and generic native admission. They do not decode domain bodies or invoke
-async services. Request policies mint reply authority only after core envelope
-checks; Actor, Action, and ExpectsReply alone grant nothing.
+async services. Request and notification policies create private completion
+tickets only after their respective core envelope checks; Actor, Action,
+ExpectsReply and special flags alone grant nothing.
 Before handing a request to middleware, the runner records the selected
 binding/route identity, native classification, exchange kind, correlation,
 policies, limits, and deadline independently of its editable headers.
 Later metadata edits never replace this admission snapshot or select another
 binding's permissions.
 
-No ordinary ingress service is required for outbound-only or special-duplex-only
-composition. A custom raw service can interpret ReplicationActor or another domain key without a generic Router
-or Actor binding. Domain demultiplexing and body work run outside the driver;
+No ingress service is required for outbound-only composition. A notification-only
+scope installs a service with only notification bindings; there is no separate
+receive registration. A custom raw service can interpret ReplicationActor or
+another domain key without a generic Router or Actor binding. Domain
+demultiplexing and body work run outside the driver;
 its original raw binding still fixes native classification, policies, limits,
-and response authority. Special duplex pull registration remains separate
-from either ordinary dispatcher.
+and response authority.
 Likewise, peer-ready work does not require installing a request service.
 When it needs a response handled by a raw or Actor service, that service remains
 independently runnable while the hook waits; the hook cannot hold its handler
@@ -193,6 +202,9 @@ capacity or block its dispatch.
 `server::Rpc<C>`, `unary`, `one_way`, and `Reply<T>` are implemented. They work
 inside raw, whole-Actor, or routed ingress services on either connection role.
 The optional codec-free Router is implemented independently of these adapters.
+Unary accepts authorized native notifications as well as ordinary requests;
+notification bindings and origination are implemented with runner-owned
+acknowledgment tickets.
 
 Keep typed body adaptation outside `Router`, following
 [tonic's method-level `server::Grpc<C>`][tonic-server-rpc]. A byte-facing method
@@ -247,14 +259,17 @@ Clone or Sync; sharing requirements apply only to stored outer service
 configuration. Constructing a method adapter cannot create live invocation
 context.
 
-`unary` adapts one native request/reply exchange. Before typed-service work,
-verify live core-created context and the request-kind authorization already
-recorded by the runner, and validate/account for the current header collection
+`unary` adapts one replying exchange: an ordinary native request or an explicitly
+authorized native notification requiring acknowledgment. Before typed-service
+work, verify live core-created context and the original replying-kind
+authorization recorded by the runner, and validate the current header collection
 under its original scope. Do not infer authorization from editable flags or
 IDs. Use that invocation's actual body budgets and original deadline,
 not defaults captured when the service was constructed. Decode into
 `Request<C::Decode>` while preserving parts, then invoke the typed service and
 encode its `Reply<C::Encode>` into `IngressResponse::Reply(Message)`.
+The runner's private ticket, not the codec or typed service, chooses ordinary
+reply versus native notification acknowledgment canonicalization.
 Native convenience method code supplies `FubstCodec<R, Q>::default()` for a
 `Request<Q>` / `Reply<R>` handler; custom protocols supply their own codec.
 Supported fubst serialization/deserialization schemas are required only by
@@ -268,7 +283,8 @@ queue or independent handler task is introduced. Decoding/encoding and user
 work remain outside the socket driver.
 
 `one_way` applies the same live-state and edited-header validation using the
-original one-way admission, decodes once, calls a typed service returning `()`,
+original ordinary one-way admission, rejects notification/request contexts,
+decodes once, calls a typed service returning `()`,
 and produces `IngressResponse::NoReply`. It does not construct an encoder or
 impose bounds on unused encode types. Successful handler completion is not a
 semantic ACK; domain processing and an authorized send remain explicit.
@@ -289,7 +305,8 @@ headers, never inferred from request names.
 
 The shared [`Request<B>` envelope](Requests.md#request-envelope)
 serves both outbound calls and inbound service dispatch. Services receive
-`Request<Body>`; typed request and one-way handlers receive `Request<Q>`.
+Request<Body> for ordinary messages and notifications; typed handlers receive
+Request<Q>.
 There is no separate `ServerRequest` type or context handler argument.
 Headers and optional received context are accessed through the request.
 `Body` is the existing shared segmented native body, not an HTTP stream.
@@ -302,8 +319,8 @@ pub enum IngressResponse {
 ```
 
 The runner converts admitted ingress into a service request while retaining
-the consuming `ReplyGrant` in its private dispatch ticket. Every live inbound
-service request has immutable core-created context; public outbound
+the single-use reply/acknowledgment authority in its private dispatch ticket.
+Every live inbound service request has immutable core-created context; public outbound
 construction supplies none. Context is data and any independently authorized
 send capability, not proof of reply authority. A custom service cannot
 manufacture, duplicate, or redirect the runner's grant.
@@ -336,36 +353,37 @@ the original grant, applying captured response policy, correlation, deadline,
 and complete-local-write semantics. Reply headers supplied by user code cannot
 override this association.
 
-`NoReply` is successful only for delivery without a reply grant. Returning it
-for an authorized request is an explicit missing-response handler failure,
-not a fabricated acknowledgment. Returning Reply without a grant similarly
+`NoReply` is successful only for delivery without a reply ticket. Returning it
+for an authorized request or notification is an explicit missing-response or
+missing-acknowledgment handler failure, not a fabricated acknowledgment.
+Returning Reply without a ticket similarly
 fails without sending. Dropping a failed/timed-out ticket sends no response.
 
 `request.context()` exposes read-only source/deadline information;
 its `RequestContext::peer` exposes only a capability independently granted
 by the binding's `SendPolicy`. All of its send restrictions remain in force;
-it is not a way around ordinary reply grants. The service context does not
+it is not a way around private completion tickets. The service context does not
 offer a source-to-peer lookup.
 Constructing response data uses standalone `Message::builder` and header
 constructors; it needs no context or live scope owner. The runner applies its
 actual scope policy and original grant during response submission.
 
-Ordinary services cannot extract the runner's grant: they return
+Services cannot extract the runner's ticket: they return
 IngressResponse data and the runner completes it on the original generation.
 Normal server drain includes those service responses; Channel last-owner
 release cancels ingress work rather than creating a client drain API.
-Direct ReceivedMessage/ReplyGrant delivery remains only on the separately
-classified [native special-duplex path](Actors.md#duplex-origination-and-ingress).
+The separately classified [native notification path](Actors.md#native-notifications)
+uses this same runner; it exposes no public receiver or acknowledgment grant.
 
 ## Application-owned work queues
 
 Pull-style application processing is ordinary service composition: put the
 admitted Request into a bounded application queue and return a future waiting
 for that worker's response, for example through a per-request Tokio oneshot.
-The worker returns `Result<IngressResponse, E>`; it receives no ReplyGrant or
+The worker returns `Result<IngressResponse, E>`; it receives no completion ticket or
 authority to transmit a native reply itself. The service future returns that
 result, and only the original runner completes correlation and output.
-There is no core grant transfer/disarm path for ordinary messages.
+There is no core ticket transfer/disarm path for either traffic class.
 
 The original HandlerLimits slot, absolute invocation deadline, context, and
 shared storage ownership remain in force across enqueue, worker processing,
@@ -535,7 +553,7 @@ or public client shutdown controller is added.
 Graceful server shutdown must include the service scope:
 
 1. Stop acceptance and new application dispatch, while continuing native
-   controls and ordinary RPC completions needed by admitted work.
+   controls and RPC/notification acknowledgment completions needed by admitted work.
 2. Drain already-admitted readiness/handler work within the original request
    deadlines capped by the single server drain deadline.
 3. Permit the retained tickets' original replies despite closure of new general
@@ -549,8 +567,10 @@ The private ticket is the bridge between admitted work and allowed completion
 traffic. Context does not carry a separate drain-time send capability.
 Application queue workers remain separately owned: keep them available for
 admitted service responses during drain, then stop/dispose them explicitly.
-Deferred one-way or special-duplex processing needing new semantic sends
+Deferred one-way processing needing new semantic sends
 must quiesce before signaling shutdown if those sends must complete.
+Admitted notification acknowledgments instead complete through their original
+runner tickets under the same drain rules as ordinary replies.
 
 Normal serving completion waits for admitted service work and responses,
 not merely accept-loop exit. Dropping serving or returning a serving error

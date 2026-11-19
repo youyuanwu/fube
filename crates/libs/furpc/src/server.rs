@@ -49,6 +49,7 @@ impl<C: Codec> Rpc<C> {
     }
 
     /// Decode, call the same prepared typed service, and encode response data.
+    /// Accepts authorized ordinary requests or native notifications.
     /// The original runner alone correlates and sends the authorized reply.
     pub async fn unary<S>(
         &mut self,
@@ -65,7 +66,7 @@ impl<C: Codec> Rpc<C> {
         S::Future: Send + 'static,
         S::Error: Into<BoxError>,
     {
-        let state = InvocationState::for_request(&request, InvocationKind::Request)?;
+        let state = InvocationState::for_reply(&request)?;
         state
             .run(async {
                 let (parts, body) = request.into_parts();

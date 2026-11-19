@@ -72,7 +72,7 @@ fube-client       fube-runtime / Hosting       fube-data       future actor36
                 |                         optional service Router
                 +----------------------------------+
                             |
-       request/reply + duplex              raw one-way + semantic ACKs
+       requests + native notifications     raw one-way + semantic ACKs
                     \                       /
           raw application ingress / optional Actor dispatch
                             |
@@ -98,17 +98,18 @@ message capability. Endpoint configures and establishes an owning Channel.
 Ordinary RPC uses its Tower service; native messaging explicitly uses Peer.
 `Server::serve_with_shutdown` consumes configuration, an accept source, and a
 shutdown future. Both dialed and accepted paths reuse the
-same connection driver and raw/RPC/duplex/actor components.
+same connection driver and raw/RPC/notification/actor components.
 Clients can receive reverse traffic, and servers can originate authorized
 messages. These are native-transport facades, not FabricClient or actor36 APIs.
 Each scope explicitly selects raw application ingress or optional Actor
-dispatch. Raw receivers/services need no ordinary Actor header; replication
+dispatch. Raw services need no ordinary Actor header; replication
 performs its own ReplicationActor demultiplexing above the shared driver.
-IngressService is the sole ordinary ingress handler adapter on
+IngressService is the sole application ingress handler adapter on
 Endpoint/Channel and Server. Both owners use the same service runner and
-original-grant completion, with no native ordinary receive queue or second
-reply pump. Application queues compose inside services; native special-duplex
-delivery remains a separate explicit extension.
+original-ticket completion, with no native application receive queue or second
+reply pump. Native notifications have distinct classification/policies but use
+that same service runner and runner-owned acknowledgment tickets.
+Application queues compose inside services, not through a second public receiver.
 The dispatcher choice is independent of managed/raw-only correlation mode.
 Header-stage matching and authorization still precede bounded body retention;
 there is no extra dispatcher inbox or implicit raw fallback.
@@ -171,7 +172,7 @@ crates/libs/furpc/src/
     messaging/
         demux.rs          native classification, raw binding / optional Actor dispatch
         request_reply.rs  pending requests and transport Faults
-        duplex.rs         special notifications and reply grants
+        notification.rs   native notification operations and acknowledgment rules
 ```
 
 These are proposed files, not a requirement to create empty modules. Implement
@@ -195,37 +196,34 @@ do not add a trait, boxed future, task, or queue for each conceptual boundary.
 | `Channel` | Cheap Clone, Send + Sync; sole built-in client Tower transport with mutable readiness/call. | Stable logical scope with a retained connector, current/retiring generations, and at most one reconnect attempt. Clones/service futures share ownership; no native request replay. |
 | `Server` | Not `Clone`; configuration and registration before execution. | Consumed by its single async serve API. |
 | Future returned by `serve_with_shutdown` | Owned `Send + 'static` future returning `Result<()>`, not a separate public wrapper type. | Drives acceptance and normal drain; drop requests cancellation without a post-drop join guarantee. |
-| `Endpoint` | Clone, Send + Sync; URI/native policy, timeouts, HandlerLimits, inert ingress service prototype, and optional special-duplex descriptor. Prototype synchronization permits Send-only service configuration without requiring Sync. | Inert configuration; constructors validate without DNS/I/O. Explicit connects clone unprepared service configuration into independent scopes; Endpoint clones create no runners or queues. |
+| `Endpoint` | Clone, Send + Sync; URI/native policy, timeouts, HandlerLimits, and inert ingress service prototype including notification bindings. Prototype synchronization permits Send-only service configuration without requiring Sync. | Inert configuration; constructors validate without DNS/I/O. Explicit connects clone unprepared service configuration into independent scopes; Endpoint clones create no runners or queues. |
 | Connector service | Reusable `Service<http::Uri>`, Send, with no Clone/Sync requirement; transferred once into Channel. | Retained for serialized initial/reconnect attempts. Each attempt receives the original parsed URI and polls/calls the same instance for fresh I/O/DNS; private supervision owns native setup/progress. |
 | `Accept` implementation | `Send`; polled through one mutable accept scope. | Transferred into a server when attached. |
 | `Connected<I>`, `Accepted<I>` | Not `Clone`; own an I/O object and metadata. | Transfer one unpublished byte stream into native establishment. |
 | Peer-ready service | Optional `Service<Peer, Response = ()>`; Clone + Send configuration and Send futures, no Sync requirement. | At most one readiness/execution per accepted generation, tracked by serving under finite connection capacity and its own startup deadline. No request-handler permit, public connection owner, or unbounded event queue. |
-| `Peer` | Clone, Send + Sync; native send/request/reservation/duplex methods, no constructor, dial, readiness, or Service API. | Nonowning generation-bound capability, retaining captured send restrictions. Cannot become an owning Channel or expose physical connection machinery. |
+| `Peer` | Clone, Send + Sync; native send/request/reservation/notify methods, no constructor, dial, readiness, or Service API. | Nonowning generation-bound capability, retaining captured send restrictions. Notifications additionally require explicit NotificationPolicy. Cannot become an owning Channel or expose physical connection machinery. |
 | `Source` | `Clone`, `Send + Sync`. | Nonowning original-connection identity/capability; cannot be constructed from an address. |
-| `IngressOptions` | Shared raw/Actor envelope checks, ingress limits, and optional independent SendPolicy. | Configures authorization/admission, not body codecs, source identity, or a lifecycle owner. |
-| `DuplexReceiver` | Not Clone; recv requires &mut self; unregister/drop ends its special-duplex registration. | Owns that separate registration/queue, independent of ordinary service dispatch, not a connection. |
-| `ReceivedMessage` | Not Clone; immutable direct special-duplex delivery and consumable reply authority. | Carries validated source, optional authorized Peer, and optional reply grant; no socket/task ownership. Ordinary services receive `Request<Body>` instead. |
-| `ReplyGrant` | Not Clone; public direct grants are limited to special-duplex delivery; reply consumes it. | One authorized attempt on the original connection. Ordinary ingress replies retain the grant privately in the runner, including through application queue processing. |
+| `IngressOptions` | Raw/Actor envelope checks for one-way, request, or notification delivery, ingress limits, and optional independent SendPolicy. | Configures class-specific authorization/admission, not body codecs, source identity, or a lifecycle owner. |
+| `NotificationPolicy` | Explicit header/source checks for notification and acknowledgment envelopes. | Captured by an outgoing Peer notification or incoming notification binding; cannot waive native flags, correlation, or a Peer send restriction. |
 | `Message`, `Body` | Immutable, reference-counted shared storage. | Own byte storage, never socket/task lifetime or queue credit. |
 | `Headers` | Ordered collection with fallible atomic edits under native widths; encoded records stay immutable and shared. | Owns header data, not provenance or admission; raw messages expose read-only access. |
 | `MessageBuilder` / `HeaderRecord` constructors | Standalone construction under native representation limits only. | Caller-owned data, not transport admission; submission applies the actual scope policy. |
-| `Router` / `IngressService<S>` | Cloneable byte-facing configuration/bindings; IngressService needs Clone + Send, not Sync; Router retains its immutable route-sharing bounds. Raw or Actor dispatch. | Canonically installed on Endpoint, Channel, or ServerBuilder; owner tracks execution/replies under shared HandlerLimits. No public owner or mandatory inbox. |
+| `Router` / `IngressService<S>` | Cloneable byte-facing configuration/bindings; IngressService needs Clone + Send, not Sync; Router retains its immutable route-sharing bounds. Raw or Actor dispatch within ordinary and notification classes. | Canonically installed on Endpoint, Channel, or ServerBuilder; owner tracks all execution/replies/acknowledgments under shared HandlerLimits. No public owner or mandatory inbox. |
 | `server::Rpc<C>` | Per-invocation codec adapter; methods take `&mut self`. No Clone/Sync requirement on its codec. | Decodes/calls/encodes within the supplied service future; no socket, admission pool, or reply grant. |
-| `RequestRouteOptions` / `OneWayRouteOptions` | Distinct immutable route-kind configuration with existing authorization and ingress/send limits. | A request option cannot be supplied to a one-way route or vice versa. |
+| `RequestRouteOptions` / `OneWayRouteOptions` / `NotificationRouteOptions` | Distinct immutable route-kind configuration with existing authorization and ingress/send limits. | Options cannot be interchanged to gain another kind's reply/acknowledgment authority. |
 | `Request<B>` / `RequestParts` | http-shaped body-first envelope with editable headers and optional local deadline. No initial `Clone` implementation; context stays private and read-only. | Body adaptation preserves metadata, storage ownership, and received context. Metadata edits cannot change original admission, correlation, policies, or server deadline; no reply grant or lifecycle ownership. |
 | `RequestContext` | Read-only received context with private constructors; accessed through the request or its parts. | Original source/deadline and optional restricted Peer; not a message-construction dependency, reply authority, or a separate handler argument. |
 | `Reply<T>` / `IngressResponse` | Shared inbound-handler output data, not a send capability. | Channel/server ingress runner applies the original generation-bound response grant and completes transmission. |
 | `RpcClient<T>` | Clone when T is Clone; ordinary async calls use `&mut self`. T need not be Clone/Sync/static. | Owns a byte-facing transport and finite codec-limit policy, not a codec instance or native correlation. Channel is the default transport; lifetime follows T. Each call consumes a codec. |
 | `ClientCodecLimits` | Optional per-call payload restrictions; defaults add no ceiling below native frame capacity. | Restricts encoded output and response input, not decoded heap allocation or a private transport budget. |
 | `Response<T>` / `ResponseParts` | http-shaped body access, decomposition, and reassembly with editable ordered headers; no initial Clone. Native provenance/settlement stays private and read-only. | Parts preserve metadata; decoded values have ordinary ownership and byte views share backing storage. Synthetic services construct source-free responses. |
-| `DuplexClient` | Clone, Send + Sync; notifications use `&self` and native owned operations. | Nonowning Peer plus explicit duplex policy; each notification owns its codec. This native-specific capability is separate from generic RPC transport. |
 | `Operation<T>` | Not `Clone`; owned `Send` future when its types are `Send`. | Observes one operation; driver owns admitted work independently. |
 | `Attempt` | `Clone`, nonowning. | Observes/retracts an uncommitted attempt without retaining its payload/result. |
 | `SendPermit` | Not `Clone`; consumed by one send. | Owns a bounded reservation, not the connection. |
 
 Channel already provides shared dialed ownership, without another public owner
 or Arc wrapper. A server is moved into its execution future; sharing application
-state does not require sharing a live Server owner. A Peer, message or receiver
+state does not require sharing a live Server owner. A Peer, message or received request
 does not own either running scope. A Channel clone shares its dialed
 owner; RpcClient ownership follows its transport.
 Stopping one scope does not implicitly stop another.
@@ -284,8 +282,10 @@ Submission validates against the actual scope before commitment. See the
 Application-body codecs belong above byte transport/native messaging.
 `RpcClient<T>` uses explicit per-call codec limits without reaching through T
 to a private connection budget; Channel applies actual transport admission to the
-encoded storage. Server and native duplex codecs use admitted invocation/
-operation budgets. Reusing `fubst` does not couple those configurations.
+encoded storage. Typed notifications reuse RpcClient over an explicit Peer::notify
+byte-service adapter, with the same client codec limits before native handoff.
+Peer methods do not select a body codec; server codecs use admitted invocation
+budgets. Reusing `fubst` does not couple those configurations.
 Shared byte storage follows reference-counted ownership independently of
 native send-queue byte counters. Generic client codec work and decoded values
 are application-owned. See the

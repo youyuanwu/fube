@@ -476,15 +476,15 @@ async fn header_classification_precedes_body_and_publishes_only_after_integrity(
 }
 
 #[tokio::test(start_paused = true)]
-async fn unmatched_and_special_replies_never_fall_through_raw_ingress() {
+async fn unmatched_replies_discard_and_notifications_keep_their_native_class() {
     let config = config();
     let (_handle, mut driver, probe) = opened(config, true).await;
     #[derive(serde::Serialize)]
     struct Flag {
         value: bool,
     }
-    for (record, expected) in [
-        (
+    let reply = Message::builder()
+        .append_header(
             HeaderRecord::native(
                 header::RELATES_TO,
                 &MessageId {
@@ -493,22 +493,36 @@ async fn unmatched_and_special_replies_never_fall_through_raw_ingress() {
                 },
             )
             .unwrap(),
-            DropReason::UnmatchedReply,
-        ),
-        (
+        )
+        .body(Body::from_bytes(vec![1; 50]).unwrap())
+        .build()
+        .unwrap();
+    probe.feed(&encoded(reply, config).await);
+    assert!(matches!(
+        ready(&mut driver).unwrap(),
+        Some(ConnectionEvent::Discarded(DropReason::UnmatchedReply))
+    ));
+    let notification = Message::builder()
+        .append_header(
             HeaderRecord::native(header::UNCORRELATED_REPLY, &Flag { value: true }).unwrap(),
-            DropReason::SpecialDuplexUnavailable,
-        ),
-    ] {
-        let reply = Message::builder()
-            .append_header(record)
-            .body(Body::from_bytes(vec![1; 50]).unwrap())
-            .build()
-            .unwrap();
-        probe.feed(&encoded(reply, config).await);
-        assert!(matches!(ready(&mut driver).unwrap(),
-            Some(ConnectionEvent::Discarded(reason)) if reason == expected));
-    }
+        )
+        .append_header(
+            HeaderRecord::native(
+                header::RELATES_TO,
+                &MessageId {
+                    guid: [2; 16],
+                    index: 2,
+                },
+            )
+            .unwrap(),
+        )
+        .build()
+        .unwrap();
+    probe.feed(&encoded(notification, config).await);
+    assert!(matches!(
+        ready(&mut driver).unwrap(),
+        Some(ConnectionEvent::Notification(_))
+    ));
     probe.feed(&encoded(message(b"ordinary"), config).await);
     assert!(matches!(
         ready(&mut driver).unwrap(),
@@ -893,19 +907,39 @@ async fn controls_and_malformed_headers_cannot_enter_raw_ingress() {
 #[tokio::test(start_paused = true)]
 async fn routing_misses_classify_before_body_input_and_verify_discard_integrity() {
     let config = config();
-    for reason in [DropReason::UnknownActor, DropReason::RouteMiss] {
+    for (reason, notification) in [
+        (DropReason::UnknownActor, false),
+        (DropReason::RouteMiss, false),
+        (DropReason::UnknownActor, true),
+        (DropReason::RouteMiss, true),
+        (DropReason::PolicyRejected, true),
+    ] {
         for corrupt in [false, true] {
+            #[derive(serde::Serialize)]
+            struct Flag {
+                value: bool,
+            }
             let (handle, mut driver, probe) = opened(config, true).await;
-            let message = Message::builder()
+            let builder = Message::builder()
                 .append_header(header::actor(ActorId::new(70000).unwrap()).unwrap())
-                .append_header(header::action("miss").unwrap())
+                .append_header(header::action("miss").unwrap());
+            let builder = if notification {
+                builder.append_header(
+                    HeaderRecord::native(header::UNCORRELATED_REPLY, &Flag { value: true })
+                        .unwrap(),
+                )
+            } else {
+                builder
+            };
+            let message = builder
                 .body(Body::from_bytes(vec![7; 1024]).unwrap())
                 .build()
                 .unwrap();
             let mut frame = encoded(message, config).await;
             let prefix = frame.len() - 1024;
             let mut classifications = 0;
-            let mut classify = |_: &crate::Headers, bytes| {
+            let mut classify = |headers: &crate::Headers, bytes| {
+                assert_eq!(headers.effective().uncorrelated_reply, notification);
                 assert_eq!(bytes, 1024);
                 classifications += 1;
                 Err(reason)
@@ -939,6 +973,118 @@ async fn routing_misses_classify_before_body_input_and_verify_discard_integrity(
             }
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn notification_admission_requires_original_id_and_shares_ordinary_handler_capacity() {
+    use crate::{
+        peer::Generation, service::Registry, ConnectionOptions, HandlerLimits, IngressLimits,
+        IngressOptions, IngressService, NotificationPolicy, Request, ServiceBinding,
+        TransportLimits,
+    };
+    #[derive(Clone)]
+    struct Service;
+    impl tower_service::Service<Request<Body>> for Service {
+        type Response = crate::IngressResponse;
+        type Error = Error;
+        type Future = std::future::Ready<crate::Result<Self::Response>>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<crate::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, _: Request<Body>) -> Self::Future {
+            unreachable!("header admission must not invoke application code")
+        }
+    }
+    let service = IngressService::new(
+        Service,
+        vec![
+            ServiceBinding::raw(IngressOptions::one_way(
+                |_, _| Ok(()),
+                IngressLimits::default(),
+            ))
+            .unwrap(),
+            ServiceBinding::raw(IngressOptions::notifications(
+                NotificationPolicy::new(|_, _| Ok(()), |_, _| Ok(())),
+                IngressLimits::default(),
+            ))
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+    .erase();
+    let registry = Registry::new(
+        Some(service),
+        HandlerLimits {
+            max_in_flight: 1,
+            ..Default::default()
+        },
+        ConnectionOptions::managed(),
+        &TransportLimits::default(),
+    )
+    .unwrap();
+    let (handle, _driver, _probe) = opened(config(), true).await;
+    let core = Generation::new(
+        handle,
+        crate::IoInfo::unknown(),
+        ListenInstance {
+            address: vec![],
+            instance: 1,
+            nonce: [1; 16],
+        },
+        registry.clone(),
+    )
+    .unwrap();
+    #[derive(serde::Serialize)]
+    struct Flag {
+        value: bool,
+    }
+    let notification = Message::builder()
+        .append_header(
+            HeaderRecord::native(header::UNCORRELATED_REPLY, &Flag { value: true }).unwrap(),
+        )
+        .append_header(
+            HeaderRecord::native(
+                header::RELATES_TO,
+                &MessageId {
+                    guid: [3; 16],
+                    index: 3,
+                },
+            )
+            .unwrap(),
+        )
+        .build()
+        .unwrap();
+    assert!(matches!(
+        registry.admit(&core, notification.headers(), 0),
+        Err(DropReason::PolicyRejected)
+    ));
+    let mut headers = notification.headers().clone();
+    headers
+        .append(
+            HeaderRecord::native(
+                header::MESSAGE_ID,
+                &MessageId {
+                    guid: [2; 16],
+                    index: 2,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let ordinary = registry.admit(&core, message(b"").headers(), 0).unwrap();
+    assert!(matches!(
+        registry.admit(&core, &headers, 0),
+        Err(DropReason::Capacity)
+    ));
+    drop(ordinary);
+    // Native special classification does not depend on ExpectsReply or RelatesTo.
+    let notification = registry.admit(&core, &headers, 0).unwrap();
+    assert!(matches!(
+        registry.admit(&core, message(b"").headers(), 0),
+        Err(DropReason::Capacity)
+    ));
+    drop(notification);
+    assert!(registry.admit(&core, message(b"").headers(), 0).is_ok());
 }
 
 #[tokio::test(start_paused = true)]

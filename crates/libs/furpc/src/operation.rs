@@ -1,7 +1,7 @@
 use crate::{
     connection::{SendAttempt, SendReceipt},
     transport::BoxFuture,
-    Body, Error, Message, Peer, Request, Response, Result,
+    Body, Error, Message, NotificationPolicy, Peer, Request, Response, Result,
 };
 use std::{
     future::Future,
@@ -149,6 +149,7 @@ impl Operation<Response<Body>> {
         request: Request<Body>,
         deadline: Instant,
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
+        notification: Option<NotificationPolicy>,
     ) -> Self {
         let deadline = request
             .deadline()
@@ -160,7 +161,7 @@ impl Operation<Response<Body>> {
                 if Instant::now() >= deadline {
                     return Err(Error::Timeout("RPC"));
                 }
-                peer.start_request(request, deadline, slot)
+                peer.start_request(request, deadline, slot, notification)
             })?;
             let pending = registration.pending.clone();
             let mut written = false;

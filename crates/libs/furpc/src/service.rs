@@ -37,6 +37,21 @@ impl RequestPolicy {
     }
 }
 
+/// Independently authorizes native notifications and their acknowledgments.
+#[derive(Clone, Copy)]
+pub struct NotificationPolicy {
+    pub(crate) notification: EnvelopeCheck,
+    pub(crate) acknowledgment: EnvelopeCheck,
+}
+impl NotificationPolicy {
+    pub fn new(notification: EnvelopeCheck, acknowledgment: EnvelopeCheck) -> Self {
+        Self {
+            notification,
+            acknowledgment,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IngressLimits {
     pub max_body_bytes: usize,
@@ -54,7 +69,8 @@ pub struct IngressOptions {
     check: EnvelopeCheck,
     limits: IngressLimits,
     sends: Option<SendPolicy>,
-    request: Option<RequestPolicy>,
+    response: Option<EnvelopeCheck>,
+    kind: InvocationKind,
 }
 impl IngressOptions {
     pub fn one_way(check: EnvelopeCheck, limits: IngressLimits) -> Self {
@@ -62,7 +78,8 @@ impl IngressOptions {
             check,
             limits,
             sends: None,
-            request: None,
+            response: None,
+            kind: InvocationKind::OneWay,
         }
     }
     pub fn requests(policy: RequestPolicy, limits: IngressLimits) -> Self {
@@ -70,8 +87,21 @@ impl IngressOptions {
             check: policy.request,
             limits,
             sends: None,
-            request: Some(policy),
+            response: Some(policy.response),
+            kind: InvocationKind::Request,
         }
+    }
+    pub fn notifications(policy: NotificationPolicy, limits: IngressLimits) -> Self {
+        Self {
+            check: policy.notification,
+            limits,
+            sends: None,
+            response: Some(policy.acknowledgment),
+            kind: InvocationKind::Notification,
+        }
+    }
+    pub(crate) fn class(&self) -> TrafficClass {
+        self.kind.class()
     }
     pub fn with_send_policy(mut self, policy: SendPolicy) -> Self {
         self.sends = Some(policy);
@@ -85,6 +115,11 @@ pub struct ServiceBinding {
     options: IngressOptions,
 }
 impl ServiceBinding {
+    fn key(&self) -> (TrafficClass, i64, Option<&[u16]>) {
+        let (actor, action) = self.target.key();
+        (self.options.class(), actor, action)
+    }
+
     pub fn raw(options: IngressOptions) -> Result<Self> {
         Self::new(BindingTarget::Raw, options)
     }
@@ -115,6 +150,7 @@ fn validate_actor(actor: ActorId) -> Result<()> {
 
 #[derive(Debug)]
 pub(crate) struct RouteKey {
+    pub(crate) class: TrafficClass,
     pub(crate) actor: ActorId,
     pub(crate) action: Vec<u16>,
 }
@@ -150,40 +186,44 @@ impl Bindings {
         if bindings.is_empty() {
             return Err(Error::InvalidInput("at least one ingress binding required"));
         }
-        if bindings
-            .iter()
-            .any(|binding| matches!(binding.target, BindingTarget::Raw))
-        {
-            if bindings.len() != 1 {
+        bindings.sort_unstable_by(|left, right| left.key().cmp(&right.key()));
+        for pair in bindings.windows(2) {
+            if pair[0].options.class() != pair[1].options.class() {
+                continue;
+            }
+            if matches!(pair[0].target, BindingTarget::Raw)
+                || matches!(pair[1].target, BindingTarget::Raw)
+            {
                 return Err(Error::InvalidInput(
                     "raw and Actor bindings cannot be combined",
                 ));
             }
-        } else {
-            bindings.sort_unstable_by(|left, right| left.target.key().cmp(&right.target.key()));
-            for pair in bindings.windows(2) {
-                let left = pair[0].target.key();
-                let right = pair[1].target.key();
-                if left.0 == right.0 && (left.1.is_none() || left == right) {
-                    return Err(Error::InvalidInput(
-                        "duplicate or overlapping Actor bindings",
-                    ));
-                }
+            let left = pair[0].target.key();
+            let right = pair[1].target.key();
+            if left.0 == right.0 && (left.1.is_none() || left == right) {
+                return Err(Error::InvalidInput(
+                    "duplicate or overlapping Actor bindings",
+                ));
             }
         }
         Ok(Self(bindings))
     }
 
     fn select(&self, headers: &Headers) -> std::result::Result<&ServiceBinding, DropReason> {
-        if matches!(self.0[0].target, BindingTarget::Raw) {
-            return Ok(&self.0[0]);
-        }
-        let common = headers.effective();
+        let class = TrafficClass::of(headers);
         let start = self
             .0
-            .partition_point(|binding| binding.target.key().0 < common.actor.get());
-        let Some(first) = self
-            .0
+            .partition_point(|binding| binding.options.class() < class);
+        let end =
+            start + self.0[start..].partition_point(|binding| binding.options.class() == class);
+        let bindings = &self.0[start..end];
+        let first = bindings.first().ok_or(DropReason::NoDestination)?;
+        if matches!(first.target, BindingTarget::Raw) {
+            return Ok(first);
+        }
+        let common = headers.effective();
+        let start = bindings.partition_point(|binding| binding.target.key().0 < common.actor.get());
+        let Some(first) = bindings
             .get(start)
             .filter(|binding| binding.target.key().0 == common.actor.get())
         else {
@@ -193,11 +233,11 @@ impl Bindings {
             return Ok(first);
         }
         let end = start
-            + self.0[start..]
+            + bindings[start..]
                 .partition_point(|binding| binding.target.key().0 == common.actor.get());
-        self.0[start..end]
+        bindings[start..end]
             .binary_search_by(|binding| binding.target.key().1.cmp(&Some(common.action())))
-            .map(|index| &self.0[start + index])
+            .map(|index| &bindings[start + index])
             .map_err(|_| DropReason::RouteMiss)
     }
 }
@@ -248,7 +288,9 @@ where
 
 #[derive(Debug)]
 pub enum IngressResponse {
+    /// Application-defined reply or notification ACK; the runner supplies correlation.
     Reply(Message),
+    /// Complete a one-way invocation. Invalid for requests and notifications.
     NoReply,
 }
 
@@ -492,15 +534,17 @@ impl Registry {
         let binding = service.bindings.select(headers)?;
         let options = &binding.options;
         let common = headers.effective();
-        let valid_kind = if options.request.is_some() {
-            common.expects_reply && common.message_id != crate::MessageId::default()
-        } else {
-            !common.expects_reply
+        let valid_kind = match options.kind {
+            InvocationKind::Request => {
+                common.expects_reply && common.message_id != crate::MessageId::default()
+            }
+            InvocationKind::Notification => common.message_id != crate::MessageId::default(),
+            InvocationKind::OneWay => !common.expects_reply,
         };
         if body_bytes > options.limits.max_body_bytes || !valid_kind {
             self.diagnose(
                 "ingress policy",
-                &Error::Protocol("one-way envelope/body rejected"),
+                &Error::Protocol("ingress envelope/body rejected"),
             );
             return Err(DropReason::PolicyRejected);
         }
@@ -514,25 +558,21 @@ impl Registry {
             .try_acquire_owned()
             .map_err(|_| DropReason::Capacity)?;
         let reply = options
-            .request
+            .response
             .map(|policy| {
                 let slot = self
                     .reply_slots
                     .clone()
                     .try_acquire_owned()
                     .map_err(|_| DropReason::Capacity)?;
-                Ok((common.message_id, policy.response, slot))
+                Ok((common.message_id, policy, slot))
             })
             .transpose()?;
         let deadline = Instant::now() + self.limits.timeout;
         let state = Arc::new(InvocationState {
             live: AtomicBool::new(true),
             stopped: Notify::new(),
-            kind: if reply.is_some() {
-                InvocationKind::Request
-            } else {
-                InvocationKind::OneWay
-            },
+            kind: options.kind,
             deadline,
             readiness: self.readiness.clone(),
             max_body_bytes: options.limits.max_body_bytes,
@@ -557,6 +597,30 @@ impl Registry {
 pub(crate) enum InvocationKind {
     Request,
     OneWay,
+    Notification,
+}
+impl InvocationKind {
+    fn class(self) -> TrafficClass {
+        match self {
+            Self::Notification => TrafficClass::Notification,
+            Self::Request | Self::OneWay => TrafficClass::Ordinary,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TrafficClass {
+    Ordinary,
+    Notification,
+}
+impl TrafficClass {
+    fn of(headers: &Headers) -> Self {
+        if headers.effective().uncorrelated_reply {
+            Self::Notification
+        } else {
+            Self::Ordinary
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -572,6 +636,18 @@ pub(crate) struct InvocationState {
     target: BindingTarget,
 }
 impl InvocationState {
+    pub(crate) fn for_reply(request: &Request<Body>) -> Result<Arc<Self>> {
+        let state = Self::received(request)?;
+        if state.kind == InvocationKind::OneWay {
+            return Err(Error::InvalidInput("typed ingress exchange kind mismatch"));
+        }
+        Ok(state)
+    }
+
+    pub(crate) fn class(&self) -> TrafficClass {
+        self.kind.class()
+    }
+
     pub(crate) fn for_request(request: &Request<Body>, kind: InvocationKind) -> Result<Arc<Self>> {
         let state = Self::received(request)?;
         if state.kind != kind {

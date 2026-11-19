@@ -1,5 +1,6 @@
 use crate::{
-    header, Body, Error, HeaderRecord, Headers, Message, MessageId, Response, Result, Source,
+    header, Body, EnvelopeCheck, Error, HeaderRecord, Headers, Message, MessageId, Response,
+    Result, Source,
 };
 use std::{
     collections::HashMap,
@@ -63,22 +64,34 @@ pub(crate) fn check_managed(headers: &Headers) -> Result<()> {
     }
     Ok(())
 }
+pub(crate) enum EnvelopeKind {
+    OneWay,
+    Request,
+    Notification,
+    Reply(MessageId),
+}
+
 pub(crate) fn envelope(
     mut headers: Headers,
     body: Body,
     id: MessageId,
-    relates_to: Option<MessageId>,
-    request: bool,
+    kind: EnvelopeKind,
 ) -> Result<Message> {
     check_managed(&headers)?;
     headers.append(HeaderRecord::native(header::MESSAGE_ID, &id)?)?;
-    if request {
+    if matches!(kind, EnvelopeKind::Request | EnvelopeKind::Notification) {
         headers.append(HeaderRecord::native(
             header::EXPECTS_REPLY,
             &Flag { value: true },
         )?)?;
     }
-    if let Some(id) = relates_to {
+    if matches!(kind, EnvelopeKind::Notification) {
+        headers.append(HeaderRecord::native(
+            header::UNCORRELATED_REPLY,
+            &Flag { value: true },
+        )?)?;
+    }
+    if let EnvelopeKind::Reply(id) = kind {
         headers.append(HeaderRecord::native(header::RELATES_TO, &id)?)?;
     }
     Ok(Message::from_received(headers, body))
@@ -191,8 +204,16 @@ pub(crate) struct Pending {
     state: Mutex<PendingState>,
     _slot: OwnedSemaphorePermit,
     deadline: Instant,
+    acknowledgment: Option<EnvelopeCheck>,
 }
 impl Pending {
+    pub(crate) fn check(&self, headers: &Headers, source: &Source) -> Result<()> {
+        if let Some(check) = self.acknowledgment {
+            check(headers, source)?;
+        }
+        Ok(())
+    }
+
     fn finish(&self, result: Result<Response<Body>>, now: Instant) {
         let mut state = self.state.lock().unwrap();
         if state.result.is_some() {
@@ -243,6 +264,7 @@ impl Table {
         id: MessageId,
         slot: OwnedSemaphorePermit,
         deadline: Instant,
+        acknowledgment: Option<EnvelopeCheck>,
     ) -> Result<Registration> {
         let mut table = self.0.lock().unwrap();
         if let Some(error) = &table.closed {
@@ -262,6 +284,7 @@ impl Table {
             }),
             _slot: slot,
             deadline,
+            acknowledgment,
         });
         table.entries.insert(id, pending.clone());
         drop(table);

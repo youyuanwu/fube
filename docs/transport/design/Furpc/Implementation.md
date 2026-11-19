@@ -26,9 +26,9 @@ not construction or retained-allocation quotas.
 
 One scope-owned poll loop consumes private verified-message/discard events;
 there is no built-in application inbox, per-frame task, or second I/O owner.
-The native classifier handles controls first, diagnoses
-unmatched replies and unavailable special-duplex deliveries without exposing
-them as ordinary ingress, and checks discarded-frame integrity. Unsupported
+The native classifier handles controls first, routes authorized native
+notifications separately from ordinary ingress/correlation, diagnoses unmatched
+replies and unconfigured delivery, and checks discarded-frame integrity. Unsupported
 security/send-target controls and transport actions fail explicitly.
 Send expiry/cancellation retracts only uncommitted output; a committed suffix
 remains owned until full write or connection retirement. Drain rejects new
@@ -171,9 +171,35 @@ handshake, peer-ready and server drain default to 30 seconds; HandlerLimits
 retain their documented 8 in-flight/4 readiness-waiter/30-second defaults.
 These are not native constants or performance qualification.
 
-Specialized duplex and TLS remain unimplemented.
-The raw one-way binding still rejects request/reply flags; it
-does not gain reply authority by sharing the managed connection.
+Native notifications are implemented through byte-facing Peer::notify,
+NotificationPolicy, IngressOptions::notifications, and
+Router::notification/NotificationRouteOptions. They share managed pending-call
+and result capacity with RPC, and keep native correlation installed before
+commitment. Both initiating and accepted Peers can originate notifications
+under their captured send policy; raw-only mode rejects origination.
+
+Ordinary and notification bindings select raw or Actor dispatch independently.
+Notification classification precedes ordinary RelatesTo lookup; native controls
+still take precedence. Matched ACK policies run at header admission before
+retention. A rejected ACK is diagnosed/discarded with full integrity and leaves
+the pending operation awaiting an authorized response or expiry.
+
+The existing service runner reserves notification handler/reply capacity and
+owns the original acknowledgment ticket. IngressResponse::Reply(Message) or
+typed unary Reply<T> supplies application-defined ACK data; only the ticket
+supplies native RelatesTo and ordinary reply flags. Edited flags cannot change
+the original route class or turn notification context into one-way authority.
+NoReply, failure, cancellation and dropped work send no automatic ACK or Fault.
+Admitted ACK writes retain the ordinary protected completion/drain behavior.
+No public notification receiver/grant, hidden queue or extra execution pool
+was introduced. Typed callers reuse RpcClient::call over an explicit byte
+service forwarding Peer::notify and the original deadline.
+
+Source qualification at the pinned native baseline covers BeginNotification,
+DuplexRequestReply's special-first dispatch, and ReceiverContext::Reply.
+In-memory exchanges cover both directions, typed ACK data, class-local routing,
+policy rejection/commit checks, shared capacity, cancellation, Faults and drain;
+independent native interoperability remains unqualified. TLS remains unimplemented.
 
 ## Gap ownership and implementation order
 
@@ -186,7 +212,7 @@ does not gain reply authority by sharing the managed connection.
 | Lifetime ID history and unmatched-reply cutoff | Managed allocator and pending-only correlation. |
 | Unknown-actor terminal behavior | Native demux plus separately named domain/resource policy. |
 | Close discarding queued accepted work | Connection drain state and owned shutdown. |
-| Missing notification origination | Authorized duplex request/acknowledgment API. |
+| Missing notification origination | Authorized Peer notification operations and runner-owned service acknowledgments. |
 | Body flattening and repeated copies | Immutable storage, segmented preparation, vectored writer. |
 | Listener/connection/recovery duplication | `transport` supervision over Endpoint values, connector services, and Accept, with domain recovery above it. |
 | TLS/claims and unsupported controls | Explicit driver security/control phases; TLS/claims implementation and qualification are deferred. |
@@ -228,20 +254,23 @@ Deliver the initial clear-TCP implementation in this order:
    canonical IngressService execution through Endpoint::service,
    Channel::register_service, and ServerBuilder::service. Share native bindings,
    IngressResponse, HandlerLimits, and runner-owned reply completion across
-   dialed reverse ingress and accepted connections. Ordinary ingress exposes
-   services only; bounded application work queues retain runner-owned replies.
-   Direct native receiver/grant delivery remains limited to special duplex.
-   Include explicit raw ingress and optional Actor dispatch, duplex
+   dialed reverse ingress and accepted connections. All application ingress
+   exposes services only; bounded application work queues retain runner-owned
+   replies/acknowledgments. Notification ingress uses explicit bindings within
+   that same service, without a separate receiver or public completion grant.
+   Include explicit raw ingress and optional Actor dispatch, notification
    origination, and gateway/IPC adapters. `RpcClient<T>` adapts any conforming byte service through normal
    readiness and mutable async calls, with bounded application-owned codecs
-   and native admission at transport handoff. Specialized duplex retains
-   scope-admitted operations. Each call consumes its codec; native convenience
+   and native admission at transport handoff. Peer notifications retain
+   byte-facing native operations; typed notifications reuse RpcClient over an
+   explicit notify byte-service adapter. Each typed call consumes its codec; domain convenience
    methods supply `FubstCodec`. Preserve domain/capability boundaries.
    Keep application dispatcher selection independent of managed/raw-only
    correlation mode. Qualify actor-less replication in initiating and accepted
    roles without synthesizing ordinary Actor headers or installing Actor 0.
 6. Add the optional codec-free service router and separate `server::Rpc<C>`
-   request/one-way method adapters inside byte-facing services. Qualify shared
+   ordinary request/one-way and notification method adaptation inside byte-facing
+   services. Qualify shared
    bounded readiness, handler lifetime/response completion, and graceful
    shutdown without forcing raw peers through typed adaptation.
 
@@ -286,7 +315,7 @@ Acceptance evidence has distinct levels:
   retention, slow peers, drain/abort, and actual task/resource release. Internal
   cleanup tests do not imply a public post-drop retirement barrier.
 - Consumer cases for raw replication, correlated requests, accepted-server
-  traffic, IPC identity, and duplex acknowledgment without competing readers.
+  traffic, IPC identity, and native notification acknowledgment without competing readers.
 - Native-aligned replication service flow control: dispatch ACK/RequestAck
   independently of replicated-operation queues, keep service readiness free
   of data-queue-space waits, and return NoReply promptly after a bounded domain
@@ -322,11 +351,12 @@ Acceptance evidence has distinct levels:
   and restricted original-generation ACK sends retain existing contracts.
   Verify managed RPC plus raw ingress and raw-only plus Actor dispatch to
   prove dispatcher selection and correlation mode are independent.
-  Raw/Actor mixed configuration, duplicate raw targets or Actor bindings,
+  Class-local raw/Actor mixtures, duplicate raw targets or Actor bindings,
   repeated service installation, and dispatcher replacement reject
-  atomically. No configuration means no implicit raw catch-all. Special
-  duplex and on_peer_ready remain independently usable; native controls and
-  unmatched replies never leak into raw delivery. Check before-traffic
+  atomically. Cross-class raw/Actor composition is allowed without fallback.
+  No configuration means no implicit raw catch-all. Notification bindings and
+  on_peer_ready are independently authorized; native controls and
+  unmatched replies never leak into application delivery. Check before-traffic
   service installation, binding/byte bounds,
   stable dispatcher selection/registry across reconnect, and no new queue,
   decoder, or reader beneath the existing admission path.
@@ -388,12 +418,12 @@ Acceptance evidence has distinct levels:
 - Endpoint TCP/custom connects share one native establishment path and finite
   timeout, with no second public owner or Channel connect API. Channel
   clones/submitted service futures retain their private dialed scope;
-  extracted Peer/source/receiver/response values and native operations do not.
+  extracted Peer/source/request/response values and native operations do not.
   Last-owner release requests cancellation without an idle driver ownership
   cycle or a post-drop join promise. Peer cannot implement the built-in
   transport service, dial, widen captured policy, or become an owning Channel.
   Dropping an unpublished connect retires its scope/result, ingress-service
-  work, and any configured special-duplex queue.
+  work, including all configured notification-service execution.
 - Accepted-side initiation through `on_peer_ready` without any incoming
   application message, including finite single-stream acceptance and the
   RA-node harness's NodeUp/NodeUpAck then ReplicaUp/semantic-reply workflow.
@@ -431,7 +461,7 @@ Acceptance evidence has distinct levels:
   within each unchanged establishment budget; resolved SocketAddr/source is
   not logical identity. TCP listener binding retains SocketAddr.
 - Stable logical Channel reconnection through one retained reusable connector.
-  Concurrent RPC readiness, Peer acquisition, and raw-receive demand must
+  Concurrent RPC readiness and Peer acquisition must
   coalesce into one attempt; idle disconnected handles must not redial in a
   loop. Verify eager initial failure, fresh per-attempt connect budgets,
   unchanged caller deadlines, shorter-waiter cancellation without aborting
@@ -443,32 +473,46 @@ Acceptance evidence has distinct levels:
 - Disconnect races with held readiness, unpolled native operations, pending
   correlation, and complete settled replies. Readiness reserved for one
   generation cannot silently target another; admitted requests never replay,
-  including uncommitted ones. Peer/Source/Attempt/SendPermit/ReplyGrant/
-  DuplexClient provenance stays generation-bound, while an existing RpcClient
+  including uncommitted ones. Peer/Source/Attempt/SendPermit provenance,
+  notification operations and private completion tickets stay generation-bound,
+  while an existing RpcClient
   can issue a later independent call. Accepted capabilities must never dial.
   Preserve old settled results and reject cross-generation late replies.
-- Stable ingress-service configuration and optional special-duplex receiver
+- Stable ingress-service configuration, including notification bindings,
   survive physical reconnect with the current registry, not a replay of the
-  initial Endpoint descriptors or failed-generation invocations. Dynamic entries
-  survive, removed entries stay removed, and take-once receiver ownership is
-  unchanged. Queue limits cover all generations; old queued deliveries keep
-  their actual Source/Peer/grant and cannot ACK on a replacement automatically.
+  initial Endpoint descriptors or failed-generation invocations. Dynamic service
+  installation survives; there is no notification receiver or registration epoch
+  to recreate. Shared HandlerLimits cover all classes/generations. Old
+  application-queued requests retain source/storage but cannot keep cancelled
+  acknowledgment tickets live or ACK on a replacement automatically.
   Revalidate native setup/security and per-delivery policies on each generation
   without fabricating IPC registration, notification, or replication readiness.
   Connection-bound domain initialization/submission must use the same Peer,
   even if Channel changes generation between separate application awaits.
   Reconnect/current/retiring work keeps its actual owners; old results retain
   byte storage without occupying allocation-budget or new-generation queue credit.
-- Preconfigured Endpoint services and optional special-duplex descriptor
-  install bounded execution or the duplex queue before application traffic.
-  Ordinary ingress invokes services directly; special-duplex traffic survives
-  until its receiver is taken. Channel clones transfer that receiver only once;
-  missing/already-taken receivers fail explicitly. Endpoint clones/connects
-  never share live registrations or queues. Exercise unclaimed-queue overflow,
-  configuration limit lowering, dynamic registration, re-registration
-  generations, last-owner drop, and separate-channel receiver multiplexing.
+- Preconfigured Endpoint services install ordinary/notification bindings and
+  bounded execution before application traffic. Both classes invoke canonical
+  services without a transport-owned notification queue or receiver handoff.
+  Endpoint clones/connects never share live invocation state. Exercise
+  configuration limit lowering, dynamic service installation, shared readiness
+  exhaustion, last-owner drop, and application-owned bounded notification queues.
+  Notifications use distinct route-option types and class-qualified keys:
+  equal Actor/Action values may coexist with ordinary routes without policy
+  borrowing, fallback, or retargeting through edited flags/headers.
+- Peer::notify requires managed mode, explicit notification/
+  acknowledgment checks and captured send restrictions. Verify native special
+  flags and managed IDs, pending correlation before commitment, header-stage
+  admission, acknowledgment policy/integrity, native Faults, timeout/cancellation
+  and generation failure without replay. Notification services use Request<Body>
+  and return IngressResponse::Reply; typed handlers reuse unary. NoReply, wrong-kind
+  adaptation, failed/dropped handlers and stale queue output must never fabricate
+  an acknowledgment. Admitted acknowledgments share reply-completion counts
+  and drain with the original ticket; general notification sends gain no drain
+  exemption. Installed notification services and application queue waits do not
+  demand reconnect or own a Channel.
 - End-to-end consumers of the public API sketches, including client/server ownership,
-  repeated service rejection, special-duplex registration epochs, connection/source affinity, explicit capacity
+  repeated service rejection, notification classification/policies, connection/source affinity, explicit capacity
   exhaustion, client-owner drop, and signal-and-await server shutdown without
   separate closure observers.
 - Awaitable server execution with no hidden startup, concurrent handler work,
@@ -480,7 +524,7 @@ Acceptance evidence has distinct levels:
   Neither errors nor cancellation imply every background task has exited;
   retained work and byte views follow their ordinary owners.
 - Raw service bindings or optional router Actor/Action selection, conflicting
-  or duplicate ordinary bindings,
+  or duplicate class-local bindings,
   request versus one-way reply rules, byte-facing services, bounded readiness,
   and handler-aware drain without fabricated ACKs or generic error replies.
   Routing has no application serialization bounds or format defaults. Verify
@@ -505,7 +549,8 @@ Acceptance evidence has distinct levels:
 - Default `fubst` and externally implemented non-Serde body codecs over the same
   driver, including distinct encode/decode types, bounded output, malformed
   payloads, and call-local codec failures without connection corruption.
-  RPC and native duplex clients must each support unrelated per-call codecs and
+  RPC calls and typed notifications through RpcClient byte-service adapters must
+  support unrelated per-call codecs and
   body types, including a non-Clone/non-Sync client codec. Cloneable RPC
   transports support concurrent calls through independent client clones;
   codec state must not be shared.
@@ -516,8 +561,11 @@ Acceptance evidence has distinct levels:
   Unpolled calls must not execute codecs or acquire new transport admission.
   Byte-service futures may only transfer a readiness slot already reserved by
   their own instance and must release it if dropped unpolled.
-  Generic RPC calls return ordinary futures without Attempt guarantees; native
-  byte request/duplex operations retain synchronized retraction receipts.
+  Generic typed RPC/notification calls return ordinary futures without Attempt
+  guarantees; byte request/notification operations retain synchronized retraction
+  receipts. Notification byte-service adapters must preserve the Request deadline,
+  native Response parts/source/settlement, error categories, and cancellation
+  without adding replay or a hidden native pump.
   Client codecs may use explicit per-call input/output restrictions outside T's
   scope, while Channel applies native frame/send-queue policy on submission.
   Preserve shared backing through decoding and native settlement timing through response mapping.

@@ -14,7 +14,7 @@ adapter bounds and [examples](Examples.md) for a custom codec.
 | Native messaging | Built-in native headers, connection controls, and transport Fault schemas using `fubst`. | Native widths and configured transport policy; no extra constructor ceilings or public native-serializer selection. |
 | Service routing | Dispatch byte-facing services without body transformation. | Native route keys and ingress policies; no body format or schema selection. |
 | Client transport services | Channel or custom Tower services exchange native byte envelopes without application decoding. Peer is a separate native capability, not a service. | Transport admission, deadlines, and native correlation where applicable; no application schema/codec. |
-| Typed RPC adapters | Public application-body `Codec`, with `FubstCodec` as the default native convenience choice. | Codec consumed per client call or constructed in the server method service; explicit client codec limits or admitted native duplex/server budgets, plus codec-local work limits. |
+| Typed RPC adapters | Public application-body `Codec`, with `FubstCodec` as the default native convenience choice. | Codec consumed per RpcClient call or constructed in the server method service; explicit client codec limits or admitted server budgets, plus codec-local work limits. |
 
 Raw clients and servers need native serialization for headers and connection
 setup even when they never decode an application body. That implementation
@@ -104,18 +104,26 @@ Use tonic's distinct client/server ownership patterns:
   Furpc's `RpcClient<T>` likewise wraps a byte-facing Tower service; Channel is
   the sole built-in transport, with custom middleware/services also supported.
   Calls are ordinary async methods using `&mut self`, with no stored codec or
-  schema type parameters. The separate native DuplexClient retains a bound
-  Peer and consumes a codec per notification.
+  schema type parameters. Typed notifications use this same RpcClient adapter
+  over a byte service explicitly delegating to Peer::notify; Peer itself remains
+  byte-facing and does not implement Service. Generic codec work precedes native
+  admission and has the same ClientCodecLimits and cancellation contract as RPC.
 - Server [`Grpc<C>`][tonic-server] wraps a codec at the method adapter.
   Furpc's [`server::Rpc<C>`](Services.md#typed-rpc-adapters) is constructed
   inside a byte-facing method service and adapts a typed service. Ordinary
   Tower composition creates the codec per invocation; the router merely
   dispatches that outer service, without codec-specific configuration or bounds.
 
+The notification service path reuses `server::Rpc::unary` for typed
+notification/acknowledgment bodies. The private runner ticket, not the codec,
+distinguishes an ordinary reply from a native notification acknowledgment.
+
 Different body types and codecs can share the current native generation and
-its pending table. RpcClient remains usable across Channel reconnection for
-later independent calls; failed invocations and their codec state are not
-re-encoded or replayed. Encoder/decoder state belongs to the operation/invocation,
+its pending table. RpcClient<Channel> remains usable across Channel reconnection
+for later independent calls; failed invocations and their codec state are not
+re-encoded or replayed. A notification adapter capturing a Peer remains bound
+to that generation; it must not silently acquire a replacement Peer or replay
+an invocation. Encoder/decoder state belongs to the call/invocation,
 never to the socket parser. Client and per-invocation server codecs need Send and owned Send
 encode/decode state, not Clone or Sync. Stored outer route services may need
 Clone/Sync; those bounds do not apply to codecs or typed services created
