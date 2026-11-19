@@ -94,6 +94,7 @@ pub struct Encoder {
     bytes: Vec<u8>,
     objects: Vec<ObjectState>,
     limits: Limits,
+    remaining_work: Option<usize>,
 }
 
 struct ObjectState {
@@ -116,6 +117,15 @@ impl Encoder {
 
     pub fn finish(self) -> Vec<u8> {
         self.bytes
+    }
+
+    fn reserve_work(&mut self, units: usize) -> Result<()> {
+        if let Some(remaining) = &mut self.remaining_work {
+            *remaining = remaining
+                .checked_sub(units)
+                .ok_or(Error::ResourceLimit("serialization work"))?;
+        }
+        Ok(())
     }
 
     pub fn object(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {

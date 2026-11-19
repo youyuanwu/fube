@@ -153,6 +153,23 @@ lookup and validation of every recognized duplicate remain unchanged.
 
 ### Construction and submission limits
 
+The initial standalone implementation publishes its profile in
+`furpc::construction`: 65,535 combined header bytes (including four bytes per
+record), at most 13,107 records, native depth 64, 65,535 aggregate declared
+Serde fields/sequence elements per header encode, and 4 MiB of retained header
+storage/bookkeeping. Body construction permits payloads up to the native u32
+frame capacity minus the 12-byte fixed header, approximately 4 GiB of retained
+storage, and 1,024 segments. Newly constructed allocations preallocate room for
+eight distinct local/shared ledger attachments. These are construction policy,
+not shared `fubst` defaults or transport admission settings.
+`Body::from_bytes`, `Body::try_from(Vec<u8>)`, and `Body::from_segments(Vec<Body>)`
+are fallible; the segmented constructor does not copy payload bytes. Body
+slices retain the parent's entire segment table and backing charges.
+
+The initial implementation explicitly reports incomplete MessageId/RelatesTo
+schemas as unsupported rather than synthesizing their native constructor-time
+process IDs. Supporting those generated defaults is deferred.
+
 Standalone construction uses documented, finite crate-level construction
 ceilings, not a facade's `TransportLimits` or a silently selected copy of its
 defaults. Bound native encoding output, nesting/collection work, record count,

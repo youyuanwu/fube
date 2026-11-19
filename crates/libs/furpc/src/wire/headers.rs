@@ -97,6 +97,23 @@ impl HeaderDecodeContext {
         }
         Ok(Self { limits })
     }
+
+    pub(crate) fn max_records(&self) -> usize {
+        self.limits.max_records
+    }
+
+    pub(crate) fn validate_area(&self, len: usize) -> HeaderResult<()> {
+        if len > MAX_NATIVE_HEADER_BYTES {
+            return Err(HeaderError::Protocol("combined header area exceeds u16"));
+        }
+        if len > self.limits.max_bytes {
+            return Err(HeaderError::ResourceLimit("encoded header bytes"));
+        }
+        if len > self.limits.max_work_bytes {
+            return Err(HeaderError::ResourceLimit("decode work bytes"));
+        }
+        Ok(())
+    }
 }
 
 /// An unaligned little-endian view; no normalization or surrogate validation.
@@ -117,17 +134,18 @@ impl<'a> NativeUtf16<'a> {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MessageId {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct MessageId {
     /// Native GUID field order, not UUID network order.
-    pub(crate) guid: [u8; 16],
-    pub(crate) index: u32,
+    #[serde(with = "fubst::serde::guid")]
+    pub guid: [u8; 16],
+    pub index: u32,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Fault {
-    pub(crate) code: i64,
-    pub(crate) has_body: bool,
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Fault {
+    pub code: i64,
+    pub has_body: bool,
 }
 
 /// Effective received values after a complete ordered scan, not first matches.
@@ -152,6 +170,10 @@ pub(crate) struct HeaderRef<'a> {
 }
 
 impl<'a> HeaderRef<'a> {
+    pub(crate) fn new(id: u16, value: &'a [u8]) -> Self {
+        Self { id, value }
+    }
+
     pub(crate) fn id(self) -> u16 {
         self.id
     }
@@ -213,39 +235,47 @@ impl<'a> HeaderRef<'a> {
 }
 
 #[derive(Debug)]
-pub(crate) struct Headers<'a> {
-    encoded: &'a [u8],
-    effective: CommonHeaders<'a>,
-    first_actor: Option<i64>,
-    first_action: Option<NativeUtf16<'a>>,
+pub(crate) struct HeaderProperties<'a> {
+    pub(crate) effective: CommonHeaders<'a>,
+    pub(crate) first_actor: Option<i64>,
+    pub(crate) first_action: Option<NativeUtf16<'a>>,
 }
 
-impl<'a> Headers<'a> {
-    pub(crate) fn decode(encoded: &'a [u8], context: &HeaderDecodeContext) -> HeaderResult<Self> {
-        if encoded.len() > MAX_NATIVE_HEADER_BYTES {
+impl<'a> HeaderProperties<'a> {
+    pub(crate) fn decode(
+        encoded_len: usize,
+        records: impl Iterator<Item = HeaderResult<HeaderRef<'a>>>,
+        context: &HeaderDecodeContext,
+    ) -> HeaderResult<Self> {
+        if encoded_len > MAX_NATIVE_HEADER_BYTES {
             return Err(HeaderError::Protocol("combined header area exceeds u16"));
         }
-        if encoded.len() > context.limits.max_bytes {
+        if encoded_len > context.limits.max_bytes {
             return Err(HeaderError::ResourceLimit("encoded header bytes"));
         }
         let mut remaining_work = context
             .limits
             .max_work_bytes
-            .checked_sub(encoded.len())
+            .checked_sub(encoded_len)
             .ok_or(HeaderError::ResourceLimit("decode work bytes"))?;
         let mut headers = Self {
-            encoded,
             effective: CommonHeaders::default(),
             first_actor: None,
             first_action: None,
         };
-        let mut input = encoded;
-        let mut count = 0;
-        while let Some(record) = take_record(&mut input)? {
+        let mut actual_len = 0usize;
+        for (count, record) in records.enumerate() {
+            let record = record?;
+            if record.value.is_empty() || record.value.len() > MAX_NATIVE_HEADER_BYTES {
+                return Err(HeaderError::Protocol("invalid record length"));
+            }
+            actual_len = actual_len
+                .checked_add(RECORD_PREFIX_LEN + record.value.len())
+                .filter(|len| *len <= encoded_len)
+                .ok_or(HeaderError::InvalidInput("record area length mismatch"))?;
             if count == context.limits.max_records {
                 return Err(HeaderError::ResourceLimit("record count"));
             }
-            count += 1;
             match record.id {
                 ACTOR => {
                     let value = record.read(context, &mut remaining_work, |decoder| {
@@ -304,7 +334,41 @@ impl<'a> Headers<'a> {
                 _ => {}
             }
         }
+        if actual_len != encoded_len {
+            return Err(HeaderError::InvalidInput("record area length mismatch"));
+        }
         Ok(headers)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Headers<'a> {
+    encoded: &'a [u8],
+    properties: HeaderProperties<'a>,
+}
+
+impl<'a> Headers<'a> {
+    pub(crate) fn decode(encoded: &'a [u8], context: &HeaderDecodeContext) -> HeaderResult<Self> {
+        Ok(Self {
+            encoded,
+            properties: HeaderProperties::decode(
+                encoded.len(),
+                Self::encoded_records(encoded),
+                context,
+            )?,
+        })
+    }
+
+    pub(crate) fn encoded_records(
+        mut encoded: &[u8],
+    ) -> impl Iterator<Item = HeaderResult<HeaderRef<'_>>> {
+        std::iter::from_fn(move || match take_record(&mut encoded) {
+            Ok(record) => record.map(Ok),
+            Err(error) => {
+                encoded = &[];
+                Some(Err(error))
+            }
+        })
     }
 
     pub(crate) fn encoded(&self) -> &'a [u8] {
@@ -328,15 +392,15 @@ impl<'a> Headers<'a> {
     }
 
     pub(crate) fn first_actor(&self) -> Option<i64> {
-        self.first_actor
+        self.properties.first_actor
     }
 
     pub(crate) fn first_action(&self) -> Option<NativeUtf16<'a>> {
-        self.first_action
+        self.properties.first_action
     }
 
     pub(crate) fn effective(&self) -> &CommonHeaders<'a> {
-        &self.effective
+        &self.properties.effective
     }
 }
 
