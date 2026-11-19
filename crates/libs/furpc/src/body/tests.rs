@@ -21,7 +21,7 @@ fn bytes(body: &Body) -> Vec<u8> {
 
 fn scratch_bytes(body: &Body) -> usize {
     let owner = body.owner.as_ref().unwrap();
-    (owner.data().unique.len() + 1) * size_of::<Option<AllocationAdmission<'_>>>()
+    crate::resource::admission_scratch_bytes(owner.data().unique.len() + 1).unwrap()
 }
 
 #[test]

@@ -8,7 +8,9 @@
 
 use std::{mem::size_of, ops::Range, sync::Arc};
 
-use crate::resource::{AllocationAdmission, ByteScope, Error, Result, SharedAllocation};
+use crate::resource::{
+    admit_allocations, AllocationRef, ByteScope, Error, Result, SharedAllocation,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BodyLimits {
@@ -71,8 +73,20 @@ impl Segment {
         })
     }
 
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         &self.owner.data()[self.range.clone()]
+    }
+
+    pub(crate) fn allocation(&self) -> AllocationRef<'_> {
+        self.owner.allocation()
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.owner.retained_bytes()
+    }
+
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner)
     }
 }
 
@@ -226,6 +240,18 @@ impl Body {
     }
 
     pub(crate) fn segments(&self) -> impl Iterator<Item = &[u8]> {
+        self.visible_segments()
+            .map(|(segment, range)| &segment.bytes()[range])
+    }
+
+    pub(crate) fn owned_segments(&self) -> impl Iterator<Item = Segment> + '_ {
+        self.visible_segments().map(|(segment, range)| Segment {
+            owner: segment.owner.clone(),
+            range: segment.range.start + range.start..segment.range.start + range.end,
+        })
+    }
+
+    fn visible_segments(&self) -> impl Iterator<Item = (&Segment, Range<usize>)> {
         let mut position = 0;
         self.owner
             .iter()
@@ -235,52 +261,27 @@ impl Body {
                 position += segment.range.len();
                 let left = self.range.start.max(start);
                 let right = self.range.end.min(position);
-                (left < right).then(|| &segment.bytes()[left - start..right - start])
+                (left < right).then(|| (segment, left - start..right - start))
             })
+    }
+
+    pub(crate) fn allocations(&self) -> impl Iterator<Item = AllocationRef<'_>> + Clone {
+        self.owner.iter().flat_map(|owner| {
+            std::iter::once(owner.allocation()).chain(
+                owner
+                    .data()
+                    .unique
+                    .iter()
+                    .map(move |index| owner.data().segments[*index].allocation()),
+            )
+        })
     }
 
     /// Charge backing/metadata once per ledger, retaining all inherited leases.
     /// Temporary lock-table storage also needs local/shared byte headroom.
     /// No quota waiters, operation authority, connection state, or scope owner.
     pub(crate) fn admit(&self, scope: &ByteScope) -> Result<()> {
-        let Some(owner) = &self.owner else {
-            return Ok(());
-        };
-        let data = owner.data();
-        let mut already_admitted = owner.is_admitted(scope)?;
-        for index in &data.unique {
-            if !already_admitted {
-                break;
-            }
-            already_admitted = data.segments[*index].owner.is_admitted(scope)?;
-        }
-        if already_admitted {
-            return Ok(());
-        }
-        let count = data
-            .unique
-            .len()
-            .checked_add(1)
-            .ok_or(Error::ResourceLimit("admission metadata size"))?;
-        let scratch_bytes = capacity_bytes::<Option<AllocationAdmission<'_>>>(count)?;
-        let _scratch = scope.try_reserve(scratch_bytes)?;
-        let mut admissions = Vec::new();
-        admissions
-            .try_reserve_exact(count)
-            .map_err(|_| Error::ResourceLimit("admission metadata allocation"))?;
-        admissions.resize_with(count, || None);
-        let mut admissions = admissions.into_boxed_slice();
-        admissions[0] = Some(owner.begin_admission()?);
-        for (slot, index) in admissions[1..].iter_mut().zip(&data.unique) {
-            *slot = Some(data.segments[*index].owner.begin_admission()?);
-        }
-        for admission in admissions.iter_mut().flatten() {
-            admission.reserve(scope)?;
-        }
-        for admission in admissions.iter_mut().flatten() {
-            admission.commit();
-        }
-        Ok(())
+        admit_allocations(self.allocations(), scope)
     }
 }
 

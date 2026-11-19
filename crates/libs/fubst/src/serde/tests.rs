@@ -5,6 +5,49 @@ use std::{cell::Cell, fmt::Write};
 
 mod enums;
 
+#[test]
+fn optional_encoding_work_budget_checks_aggregate_counts_before_callbacks() {
+    struct Probe<'a>(&'a Cell<usize>);
+    impl Serialize for Probe<'_> {
+        fn serialize<S: ::serde::Serializer>(
+            &self,
+            serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            self.0.set(self.0.get() + 1);
+            Trailing::<u32>(None).serialize(serializer)
+        }
+    }
+    #[derive(Serialize)]
+    struct Groups<T> {
+        first: CountedValues<Vec<T>>,
+        second: CountedValues<Vec<T>>,
+    }
+    let visited = Cell::new(0);
+    let value = Groups {
+        first: CountedValues(vec![Probe(&visited), Probe(&visited)]),
+        second: CountedValues(vec![Probe(&visited), Probe(&visited)]),
+    };
+    let expected = to_vec(&value).unwrap();
+    assert_eq!(visited.get(), 4);
+    visited.set(0);
+    assert!(matches!(
+        to_vec_with_limits_and_work(&value, Limits::default(), 3),
+        Err(Error::ResourceLimit("serialization work"))
+    ));
+    assert_eq!(visited.get(), 0);
+    assert!(matches!(
+        to_vec_with_limits_and_work(&value, Limits::default(), 5),
+        Err(Error::ResourceLimit("serialization work"))
+    ));
+    assert_eq!(visited.get(), 2);
+    visited.set(0);
+    assert_eq!(
+        to_vec_with_limits_and_work(&value, Limits::default(), 6).unwrap(),
+        expected
+    );
+    assert_eq!(visited.get(), 4);
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct Row {
     text: String,

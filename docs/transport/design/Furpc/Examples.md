@@ -39,7 +39,7 @@ async fn raw_client(destination: String) -> Result<WriteReceipt> {
         .append_header(header::actor(ActorId::new(70000)?)?)
         .append_header(header::action("OneWay")?)
         .append_header(tag)
-        .body(Body::from(vec![1, 2, 3]))
+        .body(Body::from_bytes(vec![1, 2, 3])?)
         .build()?;
     let written = peer.send(message, deadline).await?;
 

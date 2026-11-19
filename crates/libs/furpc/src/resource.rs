@@ -10,7 +10,6 @@
 )]
 
 use std::{
-    fmt,
     mem::size_of,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -18,26 +17,7 @@ use std::{
     },
 };
 
-pub(crate) type Result<T> = std::result::Result<T, Error>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Error {
-    InvalidInput(&'static str),
-    ResourceLimit(&'static str),
-    Internal(&'static str),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidInput(message) => write!(f, "invalid storage input: {message}"),
-            Self::ResourceLimit(resource) => write!(f, "native storage resource limit: {resource}"),
-            Self::Internal(message) => write!(f, "native storage invariant: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+pub(crate) use crate::{Error, Result};
 
 #[derive(Debug)]
 struct Ledger {
@@ -188,7 +168,26 @@ impl<T> SharedAllocation<T> {
         self.retained_bytes
     }
 
-    pub(crate) fn is_admitted(&self, scope: &ByteScope) -> Result<bool> {
+    pub(crate) fn allocation(&self) -> AllocationRef<'_> {
+        AllocationRef {
+            leases: &self.leases,
+            retained_bytes: self.retained_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AllocationRef<'a> {
+    leases: &'a Mutex<LeaseSet>,
+    retained_bytes: usize,
+}
+
+impl AllocationRef<'_> {
+    pub(crate) fn identity(self) -> usize {
+        (self.leases as *const Mutex<LeaseSet>).addr()
+    }
+
+    fn is_admitted(self, scope: &ByteScope) -> Result<bool> {
         let state = self
             .leases
             .lock()
@@ -201,7 +200,7 @@ impl<T> SharedAllocation<T> {
         }))
     }
 
-    pub(crate) fn begin_admission(&self) -> Result<AllocationAdmission<'_>> {
+    fn begin_admission(&self) -> Result<AllocationAdmission<'_>> {
         let state = self
             .leases
             .lock()
@@ -214,6 +213,55 @@ impl<T> SharedAllocation<T> {
             committed: false,
         })
     }
+}
+
+pub(crate) fn admission_scratch_bytes(count: usize) -> Result<usize> {
+    count
+        .checked_mul(size_of::<AllocationRef<'_>>() + size_of::<Option<AllocationAdmission<'_>>>())
+        .ok_or(Error::ResourceLimit("admission metadata size"))
+}
+
+/// One transaction across heterogeneous allocation owners. Lock ordering is
+/// global allocation identity order, including header/body metadata owners.
+pub(crate) fn admit_allocations<'a>(
+    allocations: impl Iterator<Item = AllocationRef<'a>> + Clone,
+    scope: &ByteScope,
+) -> Result<()> {
+    let mut admitted = true;
+    for allocation in allocations.clone() {
+        if !allocation.is_admitted(scope)? {
+            admitted = false;
+            break;
+        }
+    }
+    if admitted {
+        return Ok(());
+    }
+    let count = allocations.clone().count();
+    let _scratch = scope.try_reserve(admission_scratch_bytes(count)?)?;
+    let mut owners = Vec::new();
+    owners
+        .try_reserve_exact(count)
+        .map_err(|_| Error::ResourceLimit("admission owner allocation"))?;
+    owners.extend(allocations);
+    owners.sort_unstable_by_key(|owner| owner.identity());
+    owners.dedup_by_key(|owner| owner.identity());
+    let mut admissions = Vec::new();
+    admissions
+        .try_reserve_exact(count)
+        .map_err(|_| Error::ResourceLimit("admission metadata allocation"))?;
+    admissions.resize_with(count, || None);
+    let mut admissions = admissions.into_boxed_slice();
+    for (slot, owner) in admissions.iter_mut().zip(&owners) {
+        *slot = Some(owner.begin_admission()?);
+    }
+    for admission in admissions.iter_mut().flatten() {
+        admission.reserve(scope)?;
+    }
+    for admission in admissions.iter_mut().flatten() {
+        admission.commit();
+    }
+    Ok(())
 }
 
 pub(crate) struct AllocationAdmission<'a> {

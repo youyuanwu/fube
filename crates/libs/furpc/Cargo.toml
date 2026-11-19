@@ -7,3 +7,4 @@ description = "Service Fabric native RPC transport"
 
 [dependencies]
 fubst.workspace = true
+serde.workspace = true
