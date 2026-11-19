@@ -32,26 +32,26 @@ enum Shape {
 fn event(e: &mut Encoder, shape: Shape) -> fubst::Result<()> {
     e.string("health-model-owner")?;
     e.string("fixture-property")?;
-    e.i64(i64::MAX);
+    e.i64(i64::MAX).unwrap();
     if matches!(shape, Shape::WrongEventField) {
-        e.u32(2);
+        e.u32(2).unwrap();
     } else {
         e.i64(if matches!(shape, Shape::UnknownScalars) {
             -99
         } else {
             2
-        });
+        })?;
     }
     e.string("owned event Å😀")?;
-    e.i64(i64::MIN);
-    e.i64(133000000000000001);
-    e.i64(133000000000000002);
-    e.boolean(false);
-    e.boolean(true);
-    e.i64(0);
-    e.i64(-1);
+    e.i64(i64::MIN).unwrap();
+    e.i64(133000000000000001).unwrap();
+    e.i64(133000000000000002).unwrap();
+    e.boolean(false).unwrap();
+    e.boolean(true).unwrap();
+    e.i64(0).unwrap();
+    e.i64(-1).unwrap();
     if !matches!(shape, Shape::MissingEventField) {
-        e.i64(i64::MAX);
+        e.i64(i64::MAX).unwrap();
     }
     Ok(())
 }
@@ -68,7 +68,7 @@ fn health(e: &mut Encoder, shape: Shape) -> fubst::Result<()> {
         987654321
     } else {
         2
-    });
+    })?;
     e.object_array(&entries, |e, _| {
         let tag = match shape {
             Shape::UnknownEvaluation => 99i32.to_le_bytes().to_vec(),
@@ -83,19 +83,19 @@ fn health(e: &mut Encoder, shape: Shape) -> fubst::Result<()> {
                     2
                 } else {
                     1
-                });
+                })?;
                 e.string("representative event evaluation")?;
                 e.object(|e| event(e, shape))?;
                 if matches!(shape, Shape::WrongEvaluationField) {
-                    e.i64(1);
+                    e.i64(1).unwrap();
                 } else {
-                    e.boolean(true);
+                    e.boolean(true).unwrap();
                 }
                 e.i64(if matches!(shape, Shape::UnknownScalars) {
                     -77
                 } else {
                     3
-                });
+                })?;
                 Ok(())
             },
         )
@@ -110,7 +110,7 @@ fn result(shape: Shape, error: i64) -> Vec<u8> {
             2
         } else {
             1
-        });
+        })?;
         let tag = if matches!(shape, Shape::WrongWrapper) {
             1i32
         } else {
@@ -137,7 +137,7 @@ fn result(shape: Shape, error: i64) -> Vec<u8> {
                 )
             },
         )?;
-        e.i64(error);
+        e.i64(error).unwrap();
         e.pointer(matches!(shape, Shape::Paging).then_some(&[][..]), |e| {
             e.string("")
         })
@@ -402,7 +402,7 @@ async fn health_native_failures_are_local_and_healthy_queries_reuse_the_connecti
                 request,
                 "ClientOperationFailure",
                 body(|e| {
-                    e.i64(REMOTE_CODE);
+                    e.i64(REMOTE_CODE).unwrap();
                     e.string("missing node")
                 }),
             ),
@@ -410,8 +410,8 @@ async fn health_native_failures_are_local_and_healthy_queries_reuse_the_connecti
                 let mut response = health_reply(request, vec![]);
                 response.headers.push(
                     Header::object(FAULT, |e| {
-                        e.i64(REMOTE_CODE);
-                        e.boolean(false);
+                        e.i64(REMOTE_CODE).unwrap();
+                        e.boolean(false).unwrap();
                         Ok(())
                     })
                     .unwrap(),

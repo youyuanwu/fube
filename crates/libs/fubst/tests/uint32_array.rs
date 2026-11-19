@@ -4,7 +4,7 @@
 // at Service Fabric 3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d.
 use fubst::{
     serde::{from_slice, from_slice_with_budget, to_vec, UInt32Array},
-    Decoder, Encoder, MAX_COLLECTION_COUNT,
+    Decoder, Encoder, Limits, MAX_COLLECTION_COUNT,
 };
 use serde::{Deserialize, Serialize};
 
@@ -41,7 +41,10 @@ fn counts_extents_overflow_truncation_and_allocation_are_checked() {
             "{bad:?}"
         );
     }
-    let mut encoder = Encoder::new();
+    let mut encoder = Encoder::with_limits(Limits {
+        max_bytes: MAX_COLLECTION_COUNT + 1,
+        ..Limits::default()
+    });
     assert!(encoder
         .u32_array(&vec![0; MAX_COLLECTION_COUNT + 1])
         .is_err());

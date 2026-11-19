@@ -1,5 +1,5 @@
 use super::*;
-use crate::{MAX_COLLECTION_COUNT, MAX_DEPTH, MAX_STRING_UNITS};
+use crate::{MAX_COLLECTION_COUNT, MAX_DEPTH, MAX_OBJECT_SIZE, MAX_STRING_UNITS};
 use ::serde::ser::SerializeStruct;
 use std::{cell::Cell, fmt::Write};
 
@@ -31,8 +31,8 @@ fn row() -> Row {
 }
 fn write_row(e: &mut Encoder, value: &Row) -> Result<()> {
     e.string(&value.text)?;
-    e.i64(value.number);
-    e.guid(&value.guid.0);
+    e.i64(value.number).unwrap();
+    e.guid(&value.guid.0).unwrap();
     Ok(())
 }
 #[test]
@@ -54,11 +54,11 @@ fn derived_bytes_match_independent_native_schema() {
         };
         let mut old = Encoder::new();
         old.object(|e| {
-            e.u16(value.small);
-            e.i32(value.signed);
-            e.u32(value.unsigned);
-            e.u64(value.large);
-            e.boolean(value.yes);
+            e.u16(value.small).unwrap();
+            e.i32(value.signed).unwrap();
+            e.u32(value.unsigned).unwrap();
+            e.u64(value.large).unwrap();
+            e.boolean(value.yes).unwrap();
             e.object(|e| write_row(e, &value.row))?;
             e.byte_array(&value.bytes.0)?;
             e.object_array(&value.rows.0, write_row)
@@ -100,7 +100,7 @@ macro_rules! bitflags_case {
                 let flags = Flags::from_bits_retain(bits);
                 let bytes = to_vec(&flags).unwrap();
                 let mut native = Encoder::new();
-                native.$method(bits);
+                native.$method(bits).unwrap();
                 assert_eq!(bytes, native.finish());
                 assert_eq!(from_slice::<Flags>(&bytes).unwrap().bits(), bits);
 
@@ -109,8 +109,8 @@ macro_rules! bitflags_case {
                 let mut native = Encoder::new();
                 native
                     .object(|e| {
-                        e.$method(bits);
-                        e.boolean(true);
+                        e.$method(bits)?;
+                        e.boolean(true).unwrap();
                         Ok(())
                     })
                     .unwrap();
@@ -150,7 +150,7 @@ fn tuple_struct_newtype_and_explicit_empty_kinds() {
     let value = Newtype(Pair(128, String::new()));
     let mut old = Encoder::new();
     old.object(|e| {
-        e.u32(128);
+        e.u32(128).unwrap();
         e.string("")
     })
     .unwrap();
@@ -211,9 +211,9 @@ fn guid_field_adapter_preserves_native_metadata_bytes_and_inline_framing() {
         let mut native = Encoder::new();
         native
             .object(|e| {
-                e.u32(record.before);
-                e.guid(&value);
-                e.boolean(record.after);
+                e.u32(record.before).unwrap();
+                e.guid(&value).unwrap();
+                e.boolean(record.after).unwrap();
                 Ok(())
             })
             .unwrap();
@@ -256,9 +256,9 @@ fn guid_field_adapter_rejects_wrong_native_metadata_and_lengths() {
     let mut native = Encoder::new();
     native
         .object(|e| {
-            e.u32(1);
+            e.u32(1).unwrap();
             e.byte_array(&[1; 16])?;
-            e.boolean(true);
+            e.boolean(true).unwrap();
             Ok(())
         })
         .unwrap();
@@ -287,12 +287,12 @@ fn field_bridges_preserve_pointer_tags_scopes_and_continuation() {
     e.object(|e| {
         e.pointer(None, |_| panic!("null callback"))?;
         e.pointer(Some(&1i32.to_le_bytes()), |e| {
-            e.i64(1);
+            e.i64(1).unwrap();
             to_fields(e, &row())?;
             e.next_scope()?;
             to_fields(e, &Pair(7, "derived".into()))
         })?;
-        e.boolean(true);
+        e.boolean(true).unwrap();
         Ok(())
     })
     .unwrap();
@@ -335,7 +335,7 @@ fn native_double_golden_zero_ieee_truncation_and_unknown_tail() {
         f64::NAN,
     ] {
         let mut e = Encoder::new();
-        e.f64(value);
+        e.f64(value).unwrap();
         let bytes = e.finish();
         if value == 0.0 {
             assert_eq!(bytes, [0x4b]);
@@ -369,7 +369,7 @@ fn native_double_golden_zero_ieee_truncation_and_unknown_tail() {
 fn failed_fields_and_nested_objects_roll_back_prior_bytes_and_depth() {
     let mut e = Encoder::new();
     e.object(|e| {
-        e.u32(9);
+        e.u32(9).unwrap();
         assert!(matches!(
             to_fields(e, &Bad { good: 1, bad: 3.0 }),
             Err(Error::InvalidInput(_))
@@ -379,8 +379,8 @@ fn failed_fields_and_nested_objects_roll_back_prior_bytes_and_depth() {
     .unwrap();
     let mut old = Encoder::new();
     old.object(|e| {
-        e.u32(9);
-        e.u32(7);
+        e.u32(9).unwrap();
+        e.u32(7).unwrap();
         e.string("after")
     })
     .unwrap();
@@ -427,15 +427,20 @@ fn generated_display_is_bounded_before_buffering_and_preserves_native_bytes() {
             writes: Cell::new(0),
             swallow: false,
         };
-        assert_eq!(
-            to_vec(&value).unwrap(),
-            to_vec(&text.repeat(count)).unwrap()
-        );
+        let bytes = to_vec(&value).unwrap();
+        assert_eq!(bytes, to_vec(&text.repeat(count)).unwrap());
+        let limits = Limits {
+            max_bytes: bytes.len(),
+            ..Limits::default()
+        };
         let over = Generated {
             count: count + 1,
             ..value
         };
-        assert!(matches!(to_vec(&over), Err(Error::InvalidInput(_))));
+        assert!(matches!(
+            to_vec_with_limits(&over, limits),
+            Err(Error::ResourceLimit(_))
+        ));
         assert_eq!(over.writes.get(), count * 2 + 1); // valid call then early rejected call
     }
     let generated = Generated {
@@ -444,10 +449,17 @@ fn generated_display_is_bounded_before_buffering_and_preserves_native_bytes() {
         writes: Cell::new(0),
         swallow: false,
     };
-    assert!(to_vec(&generated).is_err());
+    assert!(to_vec_with_limits(
+        &generated,
+        Limits {
+            max_bytes: 1 + unsigned_payload_len(MAX_STRING_UNITS as u64) + MAX_STRING_UNITS * 2,
+            ..Limits::default()
+        }
+    )
+    .is_err());
     assert_eq!(generated.writes.get(), MAX_STRING_UNITS + 1);
     // An oversized single write must fail before copying or reserving a buffer.
-    let mut bounded = BoundedText::default();
+    let mut bounded = BoundedText::new(MAX_STRING_UNITS);
     assert!(bounded
         .write_str(&"a".repeat(MAX_STRING_UNITS * 3 + 1))
         .is_err());
@@ -464,10 +476,14 @@ fn generated_display_is_bounded_before_buffering_and_preserves_native_bytes() {
         writes: Cell::new(0),
         swallow: true,
     };
-    assert!(to_vec(&swallowed).is_err());
-    let mut e = Encoder::new();
+    let limits = Limits {
+        max_bytes: 64,
+        ..Limits::default()
+    };
+    assert!(to_vec_with_limits(&swallowed, limits).is_err());
+    let mut e = Encoder::with_limits(limits);
     e.object(|e| {
-        e.u32(5);
+        e.u32(5).unwrap();
         assert!(to_fields(
             e,
             &Fields {
@@ -481,8 +497,8 @@ fn generated_display_is_bounded_before_buffering_and_preserves_native_bytes() {
     .unwrap();
     let mut old = Encoder::new();
     old.object(|e| {
-        e.u32(5);
-        e.u32(2);
+        e.u32(5).unwrap();
+        e.u32(2).unwrap();
         e.string("after")
     })
     .unwrap();
@@ -549,18 +565,16 @@ fn unsupported_standard_serde_shapes_fail_in_both_directions() {
 }
 
 #[test]
-fn exact_string_byte_array_object_array_and_type_info_limits() {
-    let text = "🦀".repeat(MAX_STRING_UNITS / 2);
+fn legacy_field_ceilings_do_not_reject_native_values() {
+    let text = "🦀".repeat(MAX_STRING_UNITS / 2) + "a";
     assert_eq!(from_slice::<String>(&to_vec(&text).unwrap()).unwrap(), text);
-    assert!(to_vec(&(text + "a")).is_err());
-    let bytes = ByteArray(vec![1; MAX_COLLECTION_COUNT]);
+    let bytes = ByteArray(vec![1; MAX_COLLECTION_COUNT + 1]);
     assert_eq!(
         from_slice::<ByteArray>(&to_vec(&bytes).unwrap()).unwrap(),
         bytes
     );
-    assert!(to_vec(&ByteArray(vec![0; MAX_COLLECTION_COUNT + 1])).is_err());
     let objects = ObjectArray(
-        (0..MAX_COLLECTION_COUNT)
+        (0..=MAX_COLLECTION_COUNT)
             .map(|_| Empty {})
             .collect::<Vec<_>>(),
     );
@@ -568,13 +582,7 @@ fn exact_string_byte_array_object_array_and_type_info_limits() {
         from_slice::<ObjectArray<Vec<Empty>>>(&to_vec(&objects).unwrap()).unwrap(),
         objects
     );
-    assert!(to_vec(&ObjectArray(
-        (0..=MAX_COLLECTION_COUNT)
-            .map(|_| Empty {})
-            .collect::<Vec<_>>()
-    ))
-    .is_err());
-    let tag = vec![0x1f; MAX_COLLECTION_COUNT];
+    let tag = vec![0x1f; MAX_COLLECTION_COUNT + 1];
     let mut e = Encoder::new();
     e.typed_object(&tag, |e| to_fields(e, &row())).unwrap();
     let bytes = e.finish();
@@ -586,12 +594,7 @@ fn exact_string_byte_array_object_array_and_type_info_limits() {
     })
     .unwrap();
     d.finish().unwrap();
-    let mut e = Encoder::new();
-    assert!(e
-        .typed_object(&vec![0; MAX_COLLECTION_COUNT + 1], |e| to_fields(e, &row()))
-        .is_err());
-    assert!(e.finish().is_empty());
-    // Advertised oversized or truncated counts are rejected before allocation.
+    // Counts outside the supplied extent still fail before allocation.
     for data in [
         &[0x84, 0xa0, 0x01][..],
         &[0x80, 0xa0, 0x01],
@@ -646,18 +649,26 @@ impl<'de, const N: usize> Deserialize<'de> for ReadNested<N> {
 }
 #[test]
 fn depth_exact_and_over_bound_and_skipping() {
-    let bytes = to_vec(&Nested(MAX_DEPTH)).unwrap();
-    from_slice::<ReadNested<MAX_DEPTH>>(&bytes).unwrap();
-    from_slice::<Empty>(&bytes).unwrap(); // bounded unknown-tail skip
-    assert!(to_vec(&Nested(MAX_DEPTH + 1)).is_err());
-    // Independently wrap the valid depth32 fixture in one extent-correct object.
+    let limits = Limits {
+        max_depth: MAX_DEPTH,
+        ..Limits::default()
+    };
+    let bytes = to_vec_with_limits(&Nested(MAX_DEPTH), limits).unwrap();
+    from_slice_with_limits::<ReadNested<MAX_DEPTH>>(&bytes, limits).unwrap();
+    from_slice_with_limits::<Empty>(&bytes, limits).unwrap(); // bounded unknown-tail skip
+    assert!(to_vec_with_limits(&Nested(MAX_DEPTH + 1), limits).is_err());
+    // Independently wrap the valid fixture in one extent-correct object.
     let mut too_deep = vec![0; 9];
     too_deep[1..5].copy_from_slice(&((bytes.len() + 11) as u32).to_le_bytes());
     too_deep.push(0x1f);
     too_deep.extend(bytes);
     too_deep.extend([0x2f, 0x3f]);
-    assert!(from_slice::<ReadNested<33>>(&too_deep).is_err());
-    assert!(from_slice::<Empty>(&too_deep).is_err());
+    assert!(from_slice_with_limits::<ReadNested<33>>(&too_deep, limits).is_err());
+    assert!(from_slice_with_limits::<Empty>(&too_deep, limits).is_err());
+
+    let bytes = to_vec(&Nested(101)).unwrap();
+    from_slice::<ReadNested<101>>(&bytes).unwrap();
+    from_slice::<Empty>(&bytes).unwrap();
 }
 
 struct Fill(usize);
@@ -672,18 +683,22 @@ impl Serialize for Fill {
 }
 #[test]
 fn object_size_accounting_exact_and_over_bound() {
-    let exact = to_vec(&Fill(MAX_OBJECT_SIZE - 11)).unwrap();
+    let limits = Limits {
+        max_bytes: MAX_OBJECT_SIZE + 1,
+        ..Limits::default()
+    };
+    let exact = to_vec_with_limits(&Fill(MAX_OBJECT_SIZE - 11), limits).unwrap();
     assert_eq!(exact.len(), MAX_OBJECT_SIZE + 1);
     // Empty derived schema exercises validated typed skipping of all remaining fields.
     from_slice::<Empty>(&exact).unwrap();
-    assert!(to_vec(&Fill(MAX_OBJECT_SIZE - 10)).is_err());
+    assert!(to_vec_with_limits(&Fill(MAX_OBJECT_SIZE - 10), limits).is_err());
     let mut over = exact;
     over[1..5].copy_from_slice(&((MAX_OBJECT_SIZE + 1) as u32).to_le_bytes());
     assert!(from_slice::<Empty>(&over).is_err());
 }
 
 #[test]
-fn root_array_has_per_object_not_aggregate_object_size_limit() {
+fn byte_budget_replaces_legacy_per_object_size_ceiling() {
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct Large {
         text: String,
@@ -706,15 +721,25 @@ fn root_array_has_per_object_not_aggregate_object_size_limit() {
     struct Enclosing<'a> {
         rows: ObjectArray<&'a [Large]>,
     }
-    assert!(to_vec(&Enclosing {
-        rows: ObjectArray(&rows.0)
+    let enclosed = to_vec(&Enclosing {
+        rows: ObjectArray(&rows.0),
     })
-    .is_err());
+    .unwrap();
     let mut old = Encoder::new();
-    assert!(old
-        .object(|e| e.object_array(&rows.0, |e, row| e.string(&row.text)))
-        .is_err());
-    assert!(old.finish().is_empty());
+    old.object(|e| e.object_array(&rows.0, |e, row| e.string(&row.text)))
+        .unwrap();
+    assert_eq!(enclosed, old.finish());
+    let limits = Limits {
+        max_bytes: enclosed.len() - 1,
+        ..Limits::default()
+    };
+    assert!(to_vec_with_limits(
+        &Enclosing {
+            rows: ObjectArray(&rows.0)
+        },
+        limits
+    )
+    .is_err());
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -726,15 +751,15 @@ struct Suffix {
 fn missing_truncated_wrong_metadata_and_supported_unknown_tails() {
     let mut e = Encoder::new();
     e.object(|e| {
-        e.u32(1);
+        e.u32(1).unwrap();
         Ok(())
     })
     .unwrap();
     assert!(from_slice::<Suffix>(&e.finish()).is_err());
     let mut e = Encoder::new();
     e.object(|e| {
-        e.u32(1);
-        e.boolean(true);
+        e.u32(1).unwrap();
+        e.boolean(true).unwrap();
         Ok(())
     })
     .unwrap();
@@ -837,8 +862,8 @@ fn dynamic(derived: bool) -> Dynamic {
     }
 }
 fn write_dynamic(e: &mut Encoder, derived: bool) -> Result<()> {
-    e.i64(if derived { 2 } else { 1 });
-    e.u32(7);
+    e.i64(if derived { 2 } else { 1 }).unwrap();
+    e.u32(7).unwrap();
     e.string("base")?;
     if derived {
         e.next_scope()?;
@@ -878,7 +903,7 @@ fn native_adapters_match_manual_pointer_tags_scopes_and_counted_strings() {
     };
     let mut e = Encoder::new();
     e.object(|e| {
-        e.u32(5);
+        e.u32(5).unwrap();
         e.string("inline")?;
         e.object_array(&[0, 1, 2], |e, kind| {
             if *kind == 0 {
@@ -889,11 +914,11 @@ fn native_adapters_match_manual_pointer_tags_scopes_and_counted_strings() {
                 })
             }
         })?;
-        e.u32(3);
+        e.u32(3).unwrap();
         e.string("a")?;
         e.string("")?;
         e.string("b")?;
-        e.boolean(true);
+        e.boolean(true).unwrap();
         Ok(())
     })
     .unwrap();
@@ -926,8 +951,8 @@ fn typed_dispatch_rejects_unknown_tags_mismatched_kinds_and_missing_derived_scop
     for (tag, kind, derived) in [(1i32, 2i64, false), (3, 3, false), (2, 2, false)] {
         let mut e = Encoder::new();
         e.pointer(Some(&tag.to_le_bytes()), |e| {
-            e.i64(kind);
-            e.u32(7);
+            e.i64(kind).unwrap();
+            e.u32(7).unwrap();
             e.string("base")?;
             if derived {
                 e.next_scope()?;
@@ -944,7 +969,7 @@ fn typed_dispatch_rejects_unknown_tags_mismatched_kinds_and_missing_derived_scop
     assert!(from_slice::<Pointer<Typed<Dynamic>>>(&e.finish()).is_err());
     let mut e = Encoder::new();
     e.pointer(Some(&[1, 0, 0, 0]), |e| {
-        e.u32(1);
+        e.u32(1).unwrap();
         e.string("plain")
     })
     .unwrap();
@@ -990,17 +1015,17 @@ fn trailing_fields_distinguish_absence_null_and_invalid_present_data() {
     }
     let mut e = Encoder::new();
     e.object(|e| {
-        e.u32(1);
-        e.boolean(true);
+        e.u32(1).unwrap();
+        e.boolean(true).unwrap();
         Ok(())
     })
     .unwrap();
     assert!(from_slice::<Versioned>(&e.finish()).is_err());
     let mut e = Encoder::new();
     e.object(|e| {
-        e.u32(1);
+        e.u32(1).unwrap();
         e.string("present")?;
-        e.boolean(true);
+        e.boolean(true).unwrap();
         Ok(())
     })
     .unwrap();
@@ -1015,25 +1040,24 @@ fn trailing_fields_distinguish_absence_null_and_invalid_present_data() {
 
 #[test]
 fn counted_strings_enforce_scalar_kind_counts_and_extent() {
-    for count in [0, MAX_COLLECTION_COUNT] {
+    for count in [0, MAX_COLLECTION_COUNT, MAX_COLLECTION_COUNT + 1] {
         let value = CountedStrings(vec!["".to_string(); count]);
         assert_eq!(
             from_slice::<CountedStrings<Vec<String>>>(&to_vec(&value).unwrap()).unwrap(),
             value
         );
     }
-    assert!(to_vec(&CountedStrings(vec![""; MAX_COLLECTION_COUNT + 1])).is_err());
     assert!(to_vec(&CountedStrings(vec![1u32])).is_err());
     let mut e = Encoder::new();
-    e.u32((MAX_COLLECTION_COUNT + 1) as u32);
+    e.u32((MAX_COLLECTION_COUNT + 1) as u32).unwrap();
     assert!(from_slice::<CountedStrings<Vec<String>>>(&e.finish()).is_err());
     let mut e = Encoder::new();
-    e.u32(2);
+    e.u32(2).unwrap();
     e.string("").unwrap();
     assert!(from_slice::<CountedStrings<Vec<String>>>(&e.finish()).is_err());
     let mut e = Encoder::new();
-    e.u32(1);
-    e.boolean(true);
+    e.u32(1).unwrap();
+    e.boolean(true).unwrap();
     assert!(from_slice::<CountedStrings<Vec<String>>>(&e.finish()).is_err());
     let bytes = to_vec(&CountedStrings(vec![""])).unwrap();
     assert!(from_slice::<CountedStrings<Vec<u32>>>(&bytes).is_err());
@@ -1078,12 +1102,16 @@ fn adapter_failures_roll_back_and_preserve_depth_limits() {
             next: Pointer(Some(Box::new(value))),
         };
     }
-    let bytes = to_vec(&value).unwrap();
+    let limits = Limits {
+        max_depth: MAX_DEPTH,
+        ..Limits::default()
+    };
+    let bytes = to_vec_with_limits(&value, limits).unwrap();
     assert_eq!(from_slice::<NestedPointer>(&bytes).unwrap(), value);
     value = NestedPointer {
         next: Pointer(Some(Box::new(value))),
     };
-    assert!(to_vec(&value).is_err());
+    assert!(to_vec_with_limits(&value, limits).is_err());
 }
 
 #[derive(Debug, PartialEq)]
@@ -1126,7 +1154,7 @@ fn raw_tagged_derived_fields_match_native_bytes_and_retain_bounded_tags() {
         let mut native = Encoder::new();
         native
             .typed_object(&value.type_info, |e| {
-                e.u32(7);
+                e.u32(7).unwrap();
                 e.string("raw tag")
             })
             .unwrap();
@@ -1168,17 +1196,17 @@ fn raw_tagged_pointers_arrays_and_fields_preserve_object_boundaries() {
         let mut native = Encoder::new();
         native
             .object(|e| {
-                e.u32(7);
+                e.u32(7).unwrap();
                 e.pointer(present.then_some(&[1, 2, 3][..]), |e| {
-                    e.u32(8);
+                    e.u32(8).unwrap();
                     e.string("nested")
                 })?;
                 e.object_array_header(1)?;
                 e.typed_object(&[1, 2, 3], |e| {
-                    e.u32(8);
+                    e.u32(8).unwrap();
                     e.string("nested")
                 })?;
-                e.boolean(true);
+                e.boolean(true).unwrap();
                 Ok(())
             })
             .unwrap();
@@ -1190,14 +1218,18 @@ fn raw_tagged_pointers_arrays_and_fields_preserve_object_boundaries() {
         type_info: vec![0; MAX_COLLECTION_COUNT + 1],
         value: Pair(8, "invalid".into()),
     };
-    assert!(to_vec(&invalid).is_err());
+    let limits = Limits {
+        max_bytes: MAX_COLLECTION_COUNT,
+        ..Limits::default()
+    };
+    assert!(to_vec_with_limits(&invalid, limits).is_err());
     let invalid = Fields {
         first: 7,
         pointer: Pointer(Some(invalid)),
         array: ObjectArray(vec![]),
         tail: true,
     };
-    let mut native = Encoder::new();
+    let mut native = Encoder::with_limits(limits);
     native
         .object(|e| {
             assert!(to_fields(e, &invalid).is_err());
@@ -1239,9 +1271,9 @@ fn empty_object_array_requires_the_exact_empty_array_field() {
     let mut native = Encoder::new();
     native
         .object(|e| {
-            e.u32(7);
+            e.u32(7).unwrap();
             e.object_array::<()>(&[], |_, _| unreachable!())?;
-            e.boolean(true);
+            e.boolean(true).unwrap();
             Ok(())
         })
         .unwrap();
@@ -1275,7 +1307,10 @@ fn typed_adapters_enforce_raw_tag_bounds_and_rollback_nested_pointer_failures() 
         (vec![0; MAX_COLLECTION_COUNT + 1], "ok".into()),
         (vec![1], "x".repeat(MAX_STRING_UNITS + 1)),
     ] {
-        let mut e = Encoder::new();
+        let mut e = Encoder::with_limits(Limits {
+            max_bytes: MAX_COLLECTION_COUNT,
+            ..Limits::default()
+        });
         e.object(|e| {
             assert!(to_fields(
                 e,
@@ -1302,10 +1337,10 @@ fn typed_adapters_enforce_raw_tag_bounds_and_rollback_nested_pointer_failures() 
 fn derived_adapter_skips_supported_unknown_base_fields_before_entering_next_scope() {
     let mut e = Encoder::new();
     e.typed_object(&2i32.to_le_bytes(), |e| {
-        e.i64(2);
-        e.u32(7);
+        e.i64(2).unwrap();
+        e.u32(7).unwrap();
         e.string("base")?;
-        e.boolean(true);
+        e.boolean(true).unwrap();
         e.next_scope()?;
         write_row(e, &row())
     })
@@ -1333,13 +1368,18 @@ impl NativeType for Fill {
 }
 
 #[test]
-fn pointer_and_typed_object_extents_allow_the_exact_native_limit() {
-    let exact = to_vec(&Pointer(Some(Fill(MAX_OBJECT_SIZE - 11)))).unwrap();
+fn pointer_and_typed_object_framing_count_toward_byte_limit() {
+    let limits = Limits {
+        max_bytes: MAX_OBJECT_SIZE + 2,
+        ..Limits::default()
+    };
+    let exact = to_vec_with_limits(&Pointer(Some(Fill(MAX_OBJECT_SIZE - 11))), limits).unwrap();
     assert_eq!(exact.len(), MAX_OBJECT_SIZE + 2);
     from_slice::<Pointer<Empty>>(&exact).unwrap();
-    assert!(to_vec(&Pointer(Some(Fill(MAX_OBJECT_SIZE - 10)))).is_err());
-    let exact = to_vec(&Pointer(Some(Typed(Fill(MAX_OBJECT_SIZE - 16))))).unwrap();
+    assert!(to_vec_with_limits(&Pointer(Some(Fill(MAX_OBJECT_SIZE - 10))), limits).is_err());
+    let exact =
+        to_vec_with_limits(&Pointer(Some(Typed(Fill(MAX_OBJECT_SIZE - 16)))), limits).unwrap();
     assert_eq!(exact.len(), MAX_OBJECT_SIZE + 2);
     from_slice::<Pointer<Typed<Fill>>>(&exact).unwrap();
-    assert!(to_vec(&Pointer(Some(Typed(Fill(MAX_OBJECT_SIZE - 15))))).is_err());
+    assert!(to_vec_with_limits(&Pointer(Some(Typed(Fill(MAX_OBJECT_SIZE - 15)))), limits).is_err());
 }

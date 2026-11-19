@@ -163,9 +163,9 @@ pub(crate) fn headers(activity: [u8; 16]) -> Result<Vec<Header>> {
 
 pub(crate) fn sequence(number: u64, size: u64) -> Result<Header> {
     Header::object(FILE_SEQUENCE, |e| {
-        e.u64(number);
-        e.boolean(false);
-        e.u64(size);
+        e.u64(number)?;
+        e.boolean(false)?;
+        e.u64(size)?;
         Ok(())
     })
 }
@@ -257,7 +257,7 @@ pub(crate) fn delete(path: &str, activity: [u8; 16]) -> Result<(Vec<Header>, Vec
             )
         })?,
         Header::object(0x8034, |e| {
-            e.guid(&uuid::Uuid::from_u128(0x3000).to_bytes_le());
+            e.guid(&uuid::Uuid::from_u128(0x3000).to_bytes_le())?;
             Ok(())
         })?,
     ]);

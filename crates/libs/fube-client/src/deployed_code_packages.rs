@@ -219,17 +219,17 @@ mod tests {
     fn statistics_fields(e: &mut Encoder, wire: Wire) -> fubst::Result<()> {
         for field in 0..wire.statistics_fields {
             match field {
-                0 => e.u32(u32::MAX),
-                1 => e.i64(-101),
-                2 => e.i64(202),
-                3 => e.i64(303),
-                4 => e.i64(404),
-                5 => e.u32(5),
-                6 => e.u32(6),
-                7 => e.u32(7),
-                8 => e.u32(8),
-                9 => e.u32(9),
-                10 => e.u32(10),
+                0 => e.u32(u32::MAX)?,
+                1 => e.i64(-101)?,
+                2 => e.i64(202)?,
+                3 => e.i64(303)?,
+                4 => e.i64(404)?,
+                5 => e.u32(5)?,
+                6 => e.u32(6)?,
+                7 => e.u32(7)?,
+                8 => e.u32(8)?,
+                9 => e.u32(9)?,
+                10 => e.u32(10)?,
                 _ => unreachable!(),
             }
         }
@@ -245,16 +245,16 @@ mod tests {
                 } else {
                     "/node/应用/../main\0opaque"
                 })?,
-                1 => e.i64(if setup { -1 } else { i64::MIN }),
+                1 => e.i64(if setup { -1 } else { i64::MIN })?,
                 2 => e.string(if setup {
                     r"DOMAIN\setup"
                 } else {
                     "应用用户"
                 })?,
-                3 => e.i64(if setup { 0 } else { i64::MAX }),
-                4 => e.i64(wire.entry_status),
+                3 => e.i64(if setup { 0 } else { i64::MAX })?,
+                4 => e.i64(wire.entry_status)?,
                 5 => e.object(|e| statistics_fields(e, wire))?,
-                6 => e.i64(if setup { 0 } else { -123 }),
+                6 => e.i64(if setup { 0 } else { -123 })?,
                 _ => unreachable!(),
             }
         }
@@ -268,14 +268,14 @@ mod tests {
                 0 => e.string("Code_应用")?,
                 1 => e.string("v1:opaque")?,
                 2 => e.string("Manifest")?,
-                3 => e.i64(wire.deployment_status),
-                4 => e.u32(u32::MAX),
+                3 => e.i64(wire.deployment_status)?,
+                4 => e.u32(u32::MAX)?,
                 5 => e.object(|e| entry_fields(e, wire, true))?,
                 6 => e.object(|e| entry_fields(e, wire, false))?,
-                7 => e.boolean(wire.has_setup),
+                7 => e.boolean(wire.has_setup)?,
                 8 => e.string("Activation:Opaque/应用")?,
-                9 => e.i64(wire.host_type),
-                10 => e.i64(wire.host_isolation_mode),
+                9 => e.i64(wire.host_type)?,
+                10 => e.i64(wire.host_isolation_mode)?,
                 11 => e.string(" Node_Ab ")?,
                 12 => e.string("fabric:/App/Service?opaque")?,
                 _ => unreachable!(),
@@ -543,7 +543,7 @@ mod tests {
                         ..Wire::default()
                     },
                 )?;
-                e.boolean(false);
+                e.boolean(false).unwrap();
                 Ok(())
             })
             .unwrap();
@@ -562,7 +562,7 @@ mod tests {
                 },
                 false,
             )?;
-            e.u64(123);
+            e.u64(123).unwrap();
             Ok(())
         })
         .unwrap();
@@ -622,7 +622,7 @@ mod tests {
                     ..Wire::default()
                 },
             )?;
-            e.i64(-1);
+            e.i64(-1).unwrap();
             Ok(())
         })
         .unwrap();
@@ -632,7 +632,7 @@ mod tests {
         ));
         let mut e = Encoder::new();
         e.object(|e| {
-            e.i64(-1);
+            e.i64(-1).unwrap();
             Ok(())
         })
         .unwrap();
@@ -664,7 +664,7 @@ mod tests {
         let mut e = Encoder::new();
         e.object(|e| {
             statistics_fields(e, Wire::default())?;
-            e.boolean(true);
+            e.boolean(true).unwrap();
             Ok(())
         })
         .unwrap();

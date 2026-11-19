@@ -82,9 +82,9 @@ mod tests {
     fn reply(kind: i64, error: i64, payload: bool, paging: bool) -> Message {
         let mut e = Encoder::new();
         e.object(|e| {
-            e.i64(kind);
+            e.i64(kind).unwrap();
             e.pointer(payload.then_some(&[][..]), |_| Ok(()))?;
-            e.i64(error);
+            e.i64(error).unwrap();
             e.pointer(paging.then_some(&[][..]), |_| Ok(()))
         })
         .unwrap();
@@ -133,9 +133,9 @@ mod tests {
         let mut encoder = Encoder::new();
         encoder
             .object(|e| {
-                e.i64(0);
+                e.i64(0).unwrap();
                 e.pointer(None, |_| Ok(()))?;
-                e.i64(0);
+                e.i64(0).unwrap();
                 e.pointer(None, |_| Ok(()))
             })
             .unwrap();

@@ -37,12 +37,12 @@ async fn forwarded_body_only_aggregate_lists_use_their_typed_profile() {
                 Message {
                     headers,
                     body: body(|e| {
-                        e.i64(2);
+                        e.i64(2).unwrap();
                         e.pointer(Some(&tag.to_le_bytes()), |e| {
                             e.object_array::<()>(&[], |_, _| Ok(()))?;
                             e.pointer(None, |_| Ok(()))
                         })?;
-                        e.i64(0);
+                        e.i64(0).unwrap();
                         e.pointer(None, |_| Ok(()))
                     }),
                 }
@@ -180,12 +180,12 @@ async fn empty_list_successes_support_default_and_explicit_timeouts() {
                 let request = read_message(&mut stream).await.unwrap();
                 assert_eq!(request.properties().unwrap().action, "QueryRequest");
                 let bytes = body(|e| {
-                    e.i64(2);
+                    e.i64(2).unwrap();
                     e.pointer(Some(&kind.tag().to_le_bytes()), |e| {
                         e.object_array::<()>(&[], |_, _| Ok(()))?;
                         e.pointer(None, |_| Ok(()))
                     })?;
-                    e.i64(0);
+                    e.i64(0).unwrap();
                     e.pointer(None, |_| Ok(()))
                 });
                 write_message(&mut stream, &query_reply(kind, &request, bytes))
@@ -261,12 +261,12 @@ async fn unpaged_deployment_continuations_are_call_local_even_with_native_error(
             for error in [0, REMOTE_CODE] {
                 let (client, server) = reusable_reply(move |request| {
                     let bytes = body(|e| {
-                        e.i64(2);
+                        e.i64(2).unwrap();
                         e.pointer(Some(&kind.tag().to_le_bytes()), |e| {
                             e.object_array::<()>(&[], |_, _| Ok(()))?;
                             e.pointer(None, |_| Ok(()))
                         })?;
-                        e.i64(error);
+                        e.i64(error).unwrap();
                         e.pointer(Some(&[]), |e| e.string(token))
                     });
                     query_reply(kind, request, bytes)
@@ -358,32 +358,32 @@ async fn partition_field_adapters_reject_bad_tags_and_guid_metadata_before_nativ
         for error in [0, REMOTE_CODE] {
             let (client, server) = reusable_reply(move |request| {
                 let bytes = body(|e| {
-                    e.i64(2);
+                    e.i64(2).unwrap();
                     e.pointer(Some(&5i32.to_le_bytes()), |e| {
                         e.object_array(&[()], |e, _| {
-                            e.i64(1);
+                            e.i64(1).unwrap();
                             e.typed_object(if malformed == 0 { &[1] } else { &[] }, |e| {
-                                e.i64(1);
+                                e.i64(1).unwrap();
                                 match malformed {
                                     1 => e.byte_array(&[0; 16])?,
                                     2 => e.string("00112233-4455-6677-8899-aabbccddeeff")?,
-                                    _ => e.guid(&[0; 16]),
+                                    _ => e.guid(&[0; 16])?,
                                 }
                                 e.string("")?;
-                                e.i64(0);
-                                e.i64(0);
+                                e.i64(0).unwrap();
+                                e.i64(0).unwrap();
                                 Ok(())
                             })?;
-                            e.i32(1);
-                            e.u32(0);
-                            e.u32(0);
-                            e.i64(1);
-                            e.i64(1);
+                            e.i32(1).unwrap();
+                            e.u32(0).unwrap();
+                            e.u32(0).unwrap();
+                            e.i64(1).unwrap();
+                            e.i64(1).unwrap();
                             Ok(())
                         })?;
                         e.pointer(None, |_| Ok(()))
                     })?;
-                    e.i64(error);
+                    e.i64(error).unwrap();
                     e.pointer(None, |_| Ok(()))
                 });
                 reply(request, "QueryReply", bytes)
@@ -565,7 +565,7 @@ impl NativeCompletion {
                 Self::Health => 1,
                 Self::Movement => 0,
                 _ => 2,
-            });
+            })?;
             let tag = match self {
                 Self::Replicas => Some(12i32.to_le_bytes()),
                 Self::Hosting => Some(11i32.to_le_bytes()),
@@ -578,14 +578,14 @@ impl NativeCompletion {
                     e.pointer(Some(&[]), |e| {
                         e.string("N0010")?;
                         e.object_array::<()>(&[], |_, _| Ok(()))?;
-                        e.i64(1);
+                        e.i64(1).unwrap();
                         e.object_array::<()>(&[], |_, _| Ok(()))
                     })
                 } else {
                     e.pointer(None, |_| Ok(()))
                 }
             })?;
-            e.i64(error);
+            e.i64(error).unwrap();
             e.pointer(None, |_| Ok(()))
         });
         let (actor, action) = self.actor_action();

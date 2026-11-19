@@ -11,12 +11,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 fn uri_fields(e: &mut Encoder, case: usize) -> fubst::Result<()> {
-    e.i64(if case == 1 { 0 } else { 1 });
+    e.i64(if case == 1 { 0 } else { 1 }).unwrap();
     e.string(if case == 2 { "http" } else { "fabric" })?;
     e.string(if case == 3 { "authority" } else { "" })?;
-    e.i64(if case == 4 { 1 } else { 0 });
+    e.i64(if case == 4 { 1 } else { 0 }).unwrap();
     e.string(if case == 5 { "host" } else { "" })?;
-    e.i32(if case == 6 { 19000 } else { -1 });
+    e.i32(if case == 6 { 19000 } else { -1 }).unwrap();
     e.string(match case {
         7 => "/",
         8 => "App/Child",
@@ -25,7 +25,7 @@ fn uri_fields(e: &mut Encoder, case: usize) -> fubst::Result<()> {
     })?;
     e.string(if case == 10 { "query" } else { "" })?;
     e.string(if case == 11 { "fragment" } else { "" })?;
-    e.u32(2);
+    e.u32(2).unwrap();
     e.string("App")?;
     e.string(if case == 12 { "Other" } else { "Child" })
 }
@@ -142,7 +142,7 @@ fn node_ids_and_timestamps_map_directly_without_guid_or_datetime_conversion() {
     for ticks in [i64::MIN, -1, 0, 1, i64::MAX] {
         let timestamp = NodeTimestamp(ticks);
         let mut e = Encoder::new();
-        e.i64(ticks);
+        e.i64(ticks).unwrap();
         assert_eq!(to_vec(&timestamp).unwrap(), e.finish());
         assert_eq!(
             from_slice::<NodeTimestamp>(&to_vec(&timestamp).unwrap()).unwrap(),
@@ -162,17 +162,17 @@ fn service_fields(
     health: i64,
     suffix: usize,
 ) -> fubst::Result<()> {
-    e.i64(kind);
+    e.i64(kind).unwrap();
     e.object(|e| uri_fields(e, 0))?;
     e.string("ServiceType")?;
     e.string("1.2")?;
-    e.boolean(persisted);
-    e.i64(health);
+    e.boolean(persisted).unwrap();
+    e.i64(health).unwrap();
     if suffix >= 1 {
-        e.i64(2);
+        e.i64(2).unwrap();
     }
     if suffix >= 2 {
-        e.boolean(true);
+        e.boolean(true).unwrap();
     }
     Ok(())
 }
@@ -238,7 +238,7 @@ fn services_reject_unknown_native_kind_status_and_malformed_present_suffixes() {
         let mut e = Encoder::new();
         e.object(|e| {
             service_fields(e, 1, false, 1, 0)?;
-            e.i64(status);
+            e.i64(status).unwrap();
             Ok(())
         })
         .unwrap();
@@ -363,8 +363,8 @@ fn application_fields(
     e.object(|e| uri_fields(e, 0))?;
     e.string("Type")?;
     e.string("1")?;
-    e.i64(2);
-    e.i64(-99);
+    e.i64(2).unwrap();
+    e.i64(-99).unwrap();
     e.object_array(parameters, |e, (key, value)| {
         e.string(key)?;
         e.string(value)
@@ -379,7 +379,7 @@ fn application_fields(
         })?;
     }
     if suffix >= 3 {
-        e.i64(1);
+        e.i64(1).unwrap();
     }
     Ok(())
 }
@@ -492,17 +492,17 @@ fn event() -> HealthEvent {
 fn event_fields(e: &mut Encoder) -> fubst::Result<()> {
     e.string("source")?;
     e.string("property")?;
-    e.i64(i64::MAX);
-    e.i64(2);
+    e.i64(i64::MAX).unwrap();
+    e.i64(2).unwrap();
     e.string("event")?;
-    e.i64(i64::MIN);
-    e.i64(133000000000000001);
-    e.i64(133000000000000002);
-    e.boolean(false);
-    e.boolean(true);
-    e.i64(0);
-    e.i64(-1);
-    e.i64(i64::MAX);
+    e.i64(i64::MIN).unwrap();
+    e.i64(133000000000000001).unwrap();
+    e.i64(133000000000000002).unwrap();
+    e.boolean(false).unwrap();
+    e.boolean(true).unwrap();
+    e.i64(0).unwrap();
+    e.i64(-1).unwrap();
+    e.i64(i64::MAX).unwrap();
     Ok(())
 }
 
@@ -524,14 +524,14 @@ fn health_models_encode_and_decode_directly_with_exact_native_framing() {
     e.object(|e| {
         e.string("Node")?;
         e.object_array(&[()], |e, _| event_fields(e))?;
-        e.i64(-99);
+        e.i64(-99).unwrap();
         e.object_array(&[()], |e, _| {
             e.pointer(Some(&1i32.to_le_bytes()), |e| {
-                e.i64(1);
+                e.i64(1).unwrap();
                 e.string("evaluation")?;
                 e.object(event_fields)?;
-                e.boolean(true);
-                e.i64(3);
+                e.boolean(true).unwrap();
+                e.i64(3).unwrap();
                 Ok(())
             })
         })
@@ -558,7 +558,7 @@ fn direct_health_collection_mappings_retain_bounds_and_required_pointers() {
         .object(|e| {
             e.string("Node")?;
             e.object_array::<()>(&[], |_, _| Ok(()))?;
-            e.i64(1);
+            e.i64(1).unwrap();
             e.object_array(&[()], |e, _| e.pointer(None, |_| Ok(())))
         })
         .unwrap();
@@ -596,7 +596,7 @@ fn task_and_identity_models_deserialize_directly_with_native_nesting() {
     };
     let id_fields = |e: &mut Encoder| {
         e.string("task")?;
-        e.i64(3);
+        e.i64(3).unwrap();
         Ok(())
     };
     let mut e = Encoder::new();
@@ -612,7 +612,7 @@ fn task_and_identity_models_deserialize_directly_with_native_nesting() {
     let mut e = Encoder::new();
     e.object(|e| {
         e.object(id_fields)?;
-        e.i64(2);
+        e.i64(2).unwrap();
         Ok(())
     })
     .unwrap();
@@ -642,20 +642,20 @@ fn task_and_identity_models_deserialize_directly_with_native_nesting() {
 fn deactivation_models_decode_nested_task_ids_without_a_parallel_record_layer() {
     let mut e = Encoder::new();
     e.object(|e| {
-        e.i64(2);
-        e.i64(1);
+        e.i64(2).unwrap();
+        e.i64(1).unwrap();
         e.object_array(&[()], |e, _| {
             e.object(|e| {
                 e.string("task")?;
-                e.i64(3);
+                e.i64(3).unwrap();
                 Ok(())
             })?;
-            e.i64(2);
+            e.i64(2).unwrap();
             Ok(())
         })?;
         e.object_array(&[()], |e, _| {
             e.pointer(Some(&1i32.to_le_bytes()), |e| {
-                e.i64(1);
+                e.i64(1).unwrap();
                 Ok(())
             })
         })

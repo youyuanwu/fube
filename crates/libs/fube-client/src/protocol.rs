@@ -152,17 +152,17 @@ mod tests {
             let mut encoder = Encoder::new();
             encoder
                 .object(|e| {
-                    e.i64(1);
+                    e.i64(1).unwrap();
                     e.string("fabric")?;
                     e.string("")?;
-                    e.i64(0);
+                    e.i64(0).unwrap();
                     e.string("")?;
-                    e.i32(-1);
+                    e.i32(-1).unwrap();
                     e.string(&name["fabric:".len()..])?;
                     e.string("")?;
                     e.string("")?;
                     let segments: Vec<_> = name["fabric:/".len()..].split('/').collect();
-                    e.u32(segments.len() as u32);
+                    e.u32(segments.len() as u32).unwrap();
                     for segment in segments {
                         e.string(segment)?;
                     }

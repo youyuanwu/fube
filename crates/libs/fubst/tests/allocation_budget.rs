@@ -2,10 +2,11 @@ use std::{cell::Cell, mem::size_of};
 
 use fubst::{
     serde::{
-        from_slice, from_slice_with_budget, to_vec, ByteArray, CountedStrings, CountedValues,
+        from_slice, from_slice_with_budget, from_slice_with_limits,
+        from_slice_with_limits_and_budget, to_vec, ByteArray, CountedStrings, CountedValues,
         Derived, Guid, Inline, NativeEnum, NumericEnum, ObjectArray, Pointer, RawTagged, Trailing,
     },
-    Encoder, Error, Result, MAX_COLLECTION_COUNT,
+    Encoder, Error, Limits, Result, MAX_COLLECTION_COUNT,
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +40,43 @@ fn strings_reserve_exact_utf8_capacity_including_non_ascii_expansion() {
             ));
         }
     }
+}
+
+#[test]
+fn wire_limit_precedes_decoding_and_composes_with_allocation_budget() {
+    let value = ByteArray(vec![1; 16]);
+    let bytes = to_vec(&value).unwrap();
+    let mut limits = Limits {
+        max_bytes: bytes.len() - 1,
+        ..Limits::default()
+    };
+    assert!(matches!(
+        from_slice_with_limits_and_budget::<ByteArray>(&bytes, limits, &mut |_| {
+            panic!("oversized input reached allocation admission");
+        }),
+        Err(Error::ResourceLimit(_))
+    ));
+    limits.max_bytes = bytes.len();
+    assert_eq!(
+        from_slice_with_limits::<ByteArray>(&bytes, limits).unwrap(),
+        value
+    );
+    let mut reserved = 0;
+    assert_eq!(
+        from_slice_with_limits_and_budget::<ByteArray>(&bytes, limits, &mut |count| {
+            reserved += count;
+            Ok(())
+        })
+        .unwrap(),
+        value
+    );
+    assert_eq!(reserved, value.0.len());
+    assert!(matches!(
+        from_slice_with_limits_and_budget::<ByteArray>(&bytes, limits, &mut |_| {
+            Err(Error::ResourceLimit("caller reservation"))
+        }),
+        Err(Error::ResourceLimit("caller reservation"))
+    ));
 }
 
 #[test]
@@ -152,7 +190,7 @@ fn rejected_sequence_storage_never_decodes_the_element() {
     assert_eq!(ELEMENTS_DECODED.with(Cell::get), 1);
 
     let mut encoder = Encoder::new();
-    encoder.u32((MAX_COLLECTION_COUNT + 1) as u32);
+    encoder.u32((MAX_COLLECTION_COUNT + 1) as u32).unwrap();
     assert!(matches!(
         decode::<CountedValues<Vec<Probe>>>(&encoder.finish(), 0),
         Err(Error::Protocol(_))
@@ -203,7 +241,7 @@ fn shared_budget_reaches_inline_derived_trailing_and_enum_fields() {
 }
 
 #[test]
-fn skipped_tails_allocate_nothing_and_malformed_utf16_remains_an_error() {
+fn skipped_tails_need_no_decoded_value_charge_and_malformed_utf16_remains_an_error() {
     #[derive(Debug, PartialEq, Deserialize)]
     struct Known {
         value: u32,
@@ -211,7 +249,7 @@ fn skipped_tails_allocate_nothing_and_malformed_utf16_remains_an_error() {
     let mut encoder = Encoder::new();
     encoder
         .object(|encoder| {
-            encoder.u32(7);
+            encoder.u32(7).unwrap();
             encoder.string(&"中".repeat(1000))?;
             encoder.byte_array(&[1; 16])
         })

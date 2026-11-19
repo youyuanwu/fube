@@ -26,7 +26,7 @@ fn scalar_node_enums_use_signed_numeric_serde_and_retain_unknown_values() {
             assert_eq!(as_raw(value), raw);
             assert_eq!(serde_json::to_string(&value).unwrap(), json);
             let mut e = Encoder::new();
-            e.i64(raw);
+            e.i64(raw).unwrap();
             let bytes = e.finish();
             assert_eq!(to_vec(&value).unwrap(), bytes);
             assert_eq!(from_slice::<T>(&bytes).unwrap(), value);
@@ -67,7 +67,7 @@ fn strict_scalar_enums_preserve_numeric_json_and_native_contracts() {
             assert_eq!(serde_json::to_string(value).unwrap(), json);
             assert_eq!(serde_json::from_str::<T>(&json).unwrap(), *value);
             let mut encoder = Encoder::new();
-            encoder.i64(*raw);
+            encoder.i64(*raw).unwrap();
             let bytes = encoder.finish();
             assert_eq!(to_vec(value).unwrap(), bytes);
             assert_eq!(from_slice::<T>(&bytes).unwrap(), *value);
@@ -78,7 +78,7 @@ fn strict_scalar_enums_preserve_numeric_json_and_native_contracts() {
         {
             assert!(serde_json::from_str::<T>(&raw.to_string()).is_err());
             let mut encoder = Encoder::new();
-            encoder.i64(raw);
+            encoder.i64(raw).unwrap();
             assert!(matches!(
                 from_slice::<T>(&encoder.finish()),
                 Err(fubst::Error::Protocol(_))

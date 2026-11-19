@@ -576,8 +576,8 @@ async fn upload_ack_authority_cannot_fall_through_to_ordinary_correlation() {
                     .push(Header::boolean(message::UNCORRELATED_REPLY, true).unwrap()),
                 3 => ack.headers.push(
                     Header::object(message::FAULT, |e| {
-                        e.i64(0);
-                        e.boolean(false);
+                        e.i64(0).unwrap();
+                        e.boolean(false).unwrap();
                         Ok(())
                     })
                     .unwrap(),
@@ -962,7 +962,7 @@ async fn raw_preserves_all_domain_headers_and_success_requires_full_local_write(
         Header::timeout(123).unwrap(),
         Header::activity([3; 16]).unwrap(),
         Header::object(0x8999, |e| {
-            e.u32(42);
+            e.u32(42).unwrap();
             Ok(())
         })
         .unwrap(),
@@ -1144,8 +1144,8 @@ async fn faults_preserve_native_code_zero_is_opaque_and_malformed_is_protocol() 
         if let Some(code) = code {
             response.headers.push(
                 Header::object(message::FAULT, |e| {
-                    e.i64(code);
-                    e.boolean(true);
+                    e.i64(code).unwrap();
+                    e.boolean(true).unwrap();
                     Ok(())
                 })
                 .unwrap(),
@@ -1169,7 +1169,7 @@ async fn faults_preserve_native_code_zero_is_opaque_and_malformed_is_protocol() 
     let mut response = reply(sent.properties().unwrap().id, vec![]);
     response.headers.push(
         Header::object(message::FAULT, |e| {
-            e.u32(8);
+            e.u32(8).unwrap();
             Ok(())
         })
         .unwrap(),
@@ -2069,8 +2069,8 @@ async fn on_time_settlement_survives_late_observation_for_rpc_fault_raw_and_repl
             if kind == 2 {
                 response.headers.push(
                     Header::object(message::FAULT, |e| {
-                        e.i64(-7);
-                        e.boolean(true);
+                        e.i64(-7).unwrap();
+                        e.boolean(true).unwrap();
                         Ok(())
                     })
                     .unwrap(),
@@ -2217,7 +2217,7 @@ async fn forwarded_correlation_completes_only_final_neighbor_and_preserves_wire_
             response.headers.push(Header::activity([3; 16]).unwrap());
             response.headers.push(
                 Header::object(0x8999, |e| {
-                    e.u32(42);
+                    e.u32(42).unwrap();
                     Ok(())
                 })
                 .unwrap(),
@@ -2504,8 +2504,8 @@ async fn forwarded_correlation_keeps_native_fault_handling_independent_of_domain
             forwarded_reply(&[inner, outer], Some(77), Some("OpaqueReply"), vec![99]);
         response.headers.push(
             Header::object(message::FAULT, |e| {
-                e.i64(code);
-                e.boolean(false);
+                e.i64(code).unwrap();
+                e.boolean(false).unwrap();
                 Ok(())
             })
             .unwrap(),

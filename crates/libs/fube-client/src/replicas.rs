@@ -143,14 +143,14 @@ mod tests {
         status: i64,
         health: i64,
     ) -> fubst::Result<()> {
-        e.i64(kind);
-        e.i64(replica_id);
-        e.i64(role);
-        e.i64(instance_id);
-        e.i64(status);
+        e.i64(kind).unwrap();
+        e.i64(replica_id).unwrap();
+        e.i64(role).unwrap();
+        e.i64(instance_id).unwrap();
+        e.i64(status).unwrap();
         e.string(r#"{"Endpoints":{"rpc":"opaque🦀"}}"#)?;
         e.string("_Node_0")?;
-        e.i64(health);
+        e.i64(health).unwrap();
         Ok(())
     }
 
@@ -165,7 +165,7 @@ mod tests {
             1,
         )?;
         if suffix {
-            e.i64(i64::MAX);
+            e.i64(i64::MAX).unwrap();
         }
         Ok(())
     }
@@ -284,11 +284,11 @@ mod tests {
         ));
         assert!(matches!(
             decode_fields(|e| {
-                e.i64(2);
-                e.i64(123);
-                e.i64(2);
-                e.i64(0);
-                e.i64(3);
+                e.i64(2).unwrap();
+                e.i64(123).unwrap();
+                e.i64(2).unwrap();
+                e.i64(0).unwrap();
+                e.i64(3).unwrap();
                 e.string("address")?;
                 e.string("node")
             }),

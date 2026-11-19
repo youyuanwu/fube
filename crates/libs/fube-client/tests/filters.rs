@@ -9,7 +9,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 fn assert_native_mask<T: Debug + PartialEq + Serialize + DeserializeOwned>(value: T, bits: u32) {
     let mut native = Encoder::new();
-    native.u32(bits);
+    native.u32(bits).unwrap();
     let bytes = to_vec(&value).unwrap();
     assert_eq!(bytes, native.finish());
     assert_eq!(from_slice::<T>(&bytes).unwrap(), value);
@@ -26,8 +26,8 @@ fn assert_native_mask<T: Debug + PartialEq + Serialize + DeserializeOwned>(value
     let mut native = Encoder::new();
     native
         .object(|e| {
-            e.u32(bits);
-            e.boolean(true);
+            e.u32(bits).unwrap();
+            e.boolean(true).unwrap();
             Ok(())
         })
         .unwrap();

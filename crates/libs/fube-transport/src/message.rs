@@ -38,9 +38,9 @@ pub struct MessageId {
 }
 
 impl MessageId {
-    pub fn encode(&self, encoder: &mut Encoder) {
-        encoder.guid(&self.guid);
-        encoder.u32(self.index);
+    pub fn encode(&self, encoder: &mut Encoder) -> fubst::Result<()> {
+        encoder.guid(&self.guid)?;
+        encoder.u32(self.index)
     }
 
     pub fn decode(decoder: &mut Decoder<'_>) -> fubst::Result<Self> {
@@ -287,20 +287,20 @@ mod tests {
             for index in [0, u32::MAX] {
                 let id = MessageId { guid, index };
                 compare(Header::message_id(id).unwrap(), |e| {
-                    e.guid(&guid);
-                    e.u32(index);
+                    e.guid(&guid).unwrap();
+                    e.u32(index).unwrap();
                     Ok(())
                 });
                 compare(Header::relates_to(id).unwrap(), |e| {
-                    e.guid(&guid);
-                    e.u32(index);
+                    e.guid(&guid).unwrap();
+                    e.u32(index).unwrap();
                     Ok(())
                 });
             }
             compare(Header::activity(guid).unwrap(), |e| {
                 e.object(|e| {
-                    e.guid(&guid);
-                    e.u64(0);
+                    e.guid(&guid).unwrap();
+                    e.u64(0).unwrap();
                     Ok(())
                 })
             });
@@ -314,8 +314,8 @@ mod tests {
                     let mut old = Encoder::new();
                     old.object(|e| {
                         e.string(address)?;
-                        e.u64(instance);
-                        e.guid(&guid);
+                        e.u64(instance).unwrap();
+                        e.guid(&guid).unwrap();
                         Ok(())
                     })
                     .unwrap();
@@ -327,16 +327,16 @@ mod tests {
         }
         for value in [0, -1, i64::MIN, i64::MAX] {
             compare(Header::actor(value).unwrap(), |e| {
-                e.i64(value);
+                e.i64(value).unwrap();
                 Ok(())
             });
             compare(Header::timeout(value).unwrap(), |e| {
-                e.i64(value);
+                e.i64(value).unwrap();
                 Ok(())
             });
             compare(Header::version(value, 1).unwrap(), |e| {
-                e.i64(value);
-                e.i64(1);
+                e.i64(value).unwrap();
+                e.i64(1).unwrap();
                 Ok(())
             });
         }
@@ -347,7 +347,7 @@ mod tests {
         for kind in [EXPECTS_REPLY, HIGH_PRIORITY, UNCORRELATED_REPLY, 0x8033] {
             for value in [false, true] {
                 compare(Header::boolean(kind, value).unwrap(), |e| {
-                    e.boolean(value);
+                    e.boolean(value).unwrap();
                     Ok(())
                 });
             }
@@ -370,7 +370,7 @@ mod tests {
                 let mut native = Encoder::new();
                 native
                     .object(|e| {
-                        id.encode(e);
+                        id.encode(e)?;
                         Ok(())
                     })
                     .unwrap();
@@ -380,7 +380,7 @@ mod tests {
                 assert_eq!(Header::relates_to(id).unwrap().value, bytes);
 
                 let mut inline = Encoder::new();
-                id.encode(&mut inline);
+                id.encode(&mut inline).unwrap();
                 let inline = inline.finish();
                 let mut decoder = Decoder::new(&inline);
                 assert_eq!(MessageId::decode(&mut decoder).unwrap(), id);

@@ -1085,12 +1085,12 @@ mod tests {
         let mut encoder = Encoder::new();
         encoder
             .object(|e| {
-                e.i64(2);
+                e.i64(2).unwrap();
                 e.pointer(Some(&1i32.to_le_bytes()), |e| {
                     e.object_array(&[(); 4096], |_, _| Ok(()))?;
                     e.pointer(None, |_| Ok(()))
                 })?;
-                e.i64(0);
+                e.i64(0).unwrap();
                 e.pointer(None, |_| Ok(()))
             })
             .unwrap();

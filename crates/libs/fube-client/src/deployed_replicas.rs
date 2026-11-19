@@ -213,16 +213,16 @@ mod tests {
     fn fields(e: &mut Encoder, f: &Fixture<'_>, count: usize) -> fubst::Result<()> {
         for field in 0..count {
             match field {
-                0 => e.i64(f.kind),
+                0 => e.i64(f.kind)?,
                 1 => e.string("fabric:/应用/Service")?,
                 2 => e.string("ServiceType")?,
                 3 => e.string("")?,
                 4 => e.string("Code🦀")?,
-                5 => e.guid(&GUID_BYTES),
-                6 => e.i64(f.replica_id),
-                7 => e.i64(f.instance_id),
-                8 => e.i64(f.role),
-                9 => e.i64(f.status),
+                5 => e.guid(&GUID_BYTES)?,
+                6 => e.i64(f.replica_id)?,
+                7 => e.i64(f.instance_id)?,
+                8 => e.i64(f.role)?,
+                9 => e.i64(f.status)?,
                 10 => e.string(r#"{"Endpoints":{"rpc":"opaque🦀\u0000"}}"#)?,
                 11 => e.string("Manifest")?,
                 12 => {
@@ -232,7 +232,7 @@ mod tests {
                         e.string(f.activation.unwrap())
                     })?;
                 }
-                13 => e.i64(f.process_id),
+                13 => e.i64(f.process_id)?,
                 14 => e.object(|e| reconfiguration_fields(e, f, 4))?,
                 _ => unreachable!(),
             }
@@ -248,7 +248,7 @@ mod tests {
                 2 => f.reconfiguration_type,
                 3 => f.start,
                 _ => unreachable!(),
-            });
+            })?;
         }
         Ok(())
     }
@@ -483,11 +483,11 @@ mod tests {
         let mut e = Encoder::new();
         e.object(|e| {
             fields(e, &f, 5)?;
-            e.guid(&[0; 16]);
-            e.i64(0);
-            e.i64(0);
-            e.i64(1);
-            e.i64(0);
+            e.guid(&[0; 16]).unwrap();
+            e.i64(0).unwrap();
+            e.i64(0).unwrap();
+            e.i64(1).unwrap();
+            e.i64(0).unwrap();
             e.string("")
         })
         .unwrap();
@@ -529,7 +529,7 @@ mod tests {
                     0 => e.string("not-a-pointer"),
                     1 => e.pointer(Some(&[]), |_| Ok(())),
                     2 => e.pointer(Some(&[]), |e| {
-                        e.i64(1);
+                        e.i64(1).unwrap();
                         Ok(())
                     }),
                     _ => unreachable!(),
@@ -571,7 +571,7 @@ mod tests {
             let mut e = Encoder::new();
             e.object(|e| {
                 fields(e, &f, count)?;
-                e.boolean(false);
+                e.boolean(false).unwrap();
                 Ok(())
             })
             .unwrap();

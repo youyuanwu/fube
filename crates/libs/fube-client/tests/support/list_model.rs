@@ -71,16 +71,16 @@ impl Shape {
 
 fn uri(e: &mut Encoder, s: &Shape) -> fubst::Result<()> {
     e.object(|e| {
-        e.i64(s.uri_type);
+        e.i64(s.uri_type).unwrap();
         e.string("fabric")?;
         e.string("")?;
-        e.i64(0);
+        e.i64(0).unwrap();
         e.string("")?;
-        e.i32(-1);
+        e.i32(-1).unwrap();
         e.string(s.path)?;
         e.string("")?;
         e.string("")?;
-        e.u32(s.segments);
+        e.u32(s.segments).unwrap();
         e.string("Model")?;
         e.string("App")
     })
@@ -88,34 +88,34 @@ fn uri(e: &mut Encoder, s: &Shape) -> fubst::Result<()> {
 
 fn record(e: &mut Encoder, s: &Shape) -> fubst::Result<()> {
     if s.service {
-        e.i64(s.kind);
+        e.i64(s.kind).unwrap();
     }
     uri(e, s)?;
     e.string("ModelType")?;
     e.string("1.2")?;
     if s.service {
-        e.boolean(s.persisted);
+        e.boolean(s.persisted).unwrap();
     } else {
-        e.i64(s.status);
+        e.i64(s.status).unwrap();
     }
     if s.wrong_metadata {
         e.string("not an enum")?;
     } else {
-        e.i64(s.health);
+        e.i64(s.health).unwrap();
     }
     if s.service {
         if s.suffix >= 1 {
             if s.wrong_suffix == Some(0) {
                 e.string("not a status")?;
             } else {
-                e.i64(s.status);
+                e.i64(s.status).unwrap();
             }
         }
         if s.suffix >= 2 {
             if s.wrong_suffix == Some(1) {
                 e.string("not a group flag")?;
             } else {
-                e.boolean(true);
+                e.boolean(true).unwrap();
             }
         }
     } else {
@@ -143,7 +143,7 @@ fn record(e: &mut Encoder, s: &Shape) -> fubst::Result<()> {
             })?;
         }
         if s.suffix >= 3 {
-            e.i64(s.definition);
+            e.i64(s.definition).unwrap();
         }
     }
     Ok(())
@@ -151,7 +151,7 @@ fn record(e: &mut Encoder, s: &Shape) -> fubst::Result<()> {
 
 fn list_body(s: &Shape, token: Option<&str>) -> Vec<u8> {
     body(|e| {
-        e.i64(s.result_kind);
+        e.i64(s.result_kind).unwrap();
         e.pointer(
             (!s.null).then_some(s.wrapper.to_le_bytes().as_slice()),
             |e| {
@@ -159,7 +159,7 @@ fn list_body(s: &Shape, token: Option<&str>) -> Vec<u8> {
                 e.pointer(s.item.then_some(&[][..]), |_| Ok(()))
             },
         )?;
-        e.i64(s.error);
+        e.i64(s.error).unwrap();
         e.pointer(
             token.map(|_| if s.paging_tag { &b"bad"[..] } else { &[][..] }),
             |e| e.string(token.unwrap()),
@@ -671,7 +671,7 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
         ApplicationListFilter::DefinitionKind(Definitions::ALL & !Definitions::COMPOSE),
         ApplicationListFilter::DefinitionKind({
             let mut encoder = Encoder::new();
-            encoder.u32(8);
+            encoder.u32(8).unwrap();
             fubst::serde::from_slice(&encoder.finish()).unwrap()
         }),
     ] {
@@ -887,7 +887,7 @@ async fn native_list_errors_are_local_and_allow_mixed_reuse() {
                     &request,
                     "ClientOperationFailure",
                     body(|e| {
-                        e.i64(REMOTE_CODE);
+                        e.i64(REMOTE_CODE).unwrap();
                         e.string("missing application")
                     }),
                 ),
@@ -1127,12 +1127,12 @@ async fn explicit_service_paging_stops_at_empty_terminal_page_without_hidden_req
             );
             let bytes = if next {
                 body(|e| {
-                    e.i64(2);
+                    e.i64(2).unwrap();
                     e.pointer(Some(&2i32.to_le_bytes()), |e| {
                         e.object_array::<()>(&[], |_, _| Ok(()))?;
                         e.pointer(None, |_| Ok(()))
                     })?;
-                    e.i64(0);
+                    e.i64(0).unwrap();
                     e.pointer(None, |_| Ok(()))
                 })
             } else {

@@ -536,7 +536,7 @@ fn ack_initial_in_progress_and_completed_copy_sentinels_are_distinct() {
         assert!(value.encode(false).is_err());
         let body = object(|e| {
             for n in [received, applied, copy_received, copy_applied] {
-                e.i64(n);
+                e.i64(n).unwrap();
             }
             Ok(())
         })
@@ -548,7 +548,7 @@ fn ack_initial_in_progress_and_completed_copy_sentinels_are_distinct() {
             .encode(false)
             .is_err());
         let body = object(|e| {
-            e.i64(sequence);
+            e.i64(sequence).unwrap();
             Ok(())
         })
         .unwrap();
@@ -657,7 +657,7 @@ fn rejects_truncated_header_prefix_bad_in_body_sizes_and_extra_payload() {
         for size in [0, 1, u32::MAX] {
             let mut message = value.encode(true).unwrap();
             header_mut(&mut message, OPERATION_BODY).value = object(|e| {
-                e.u32(size);
+                e.u32(size).unwrap();
                 Ok(())
             })
             .unwrap();
@@ -713,7 +713,7 @@ fn abi_sizes_reserved_pointers_types_sequences_and_native_padding() {
     let mut message = packet(Body::RequestAck).encode(false).unwrap();
     header_mut(&mut message, RE_FROM).value = Header::object(RE_FROM, |e| {
         e.string("host:65536")?;
-        actor(1).write(e);
+        actor(1).write(e)?;
         Ok(())
     })
     .unwrap()
@@ -793,11 +793,11 @@ fn batch_header(
         write_epoch(e, primary_epoch())?;
         write_epoch(e, operation_epoch())?;
         e.u32_array(sizes)?;
-        e.i64(first);
-        e.i64(last);
-        e.i64(batch_end);
+        e.i64(first).unwrap();
+        e.i64(last).unwrap();
+        e.i64(batch_end).unwrap();
         e.u32_array(counts)?;
-        e.i64(completed);
+        e.i64(completed).unwrap();
         Ok(())
     })
     .unwrap()

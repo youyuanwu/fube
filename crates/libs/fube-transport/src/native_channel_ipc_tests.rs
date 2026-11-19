@@ -11,7 +11,7 @@ fn outbound(_: &Message, _: &Properties, _: OutboundKind) -> Result<()> {
 fn identity() -> Header {
     Header::object(message::IPC, |e| {
         e.string("host")?;
-        e.u32(42);
+        e.u32(42).unwrap();
         Ok(())
     })
     .unwrap()
@@ -314,8 +314,8 @@ async fn normal_request_policy_never_grants_special_or_duplicate_authority() {
             1 => message.headers.retain(|h| h.id != message::MESSAGE_ID),
             2 => message.headers.push(
                 Header::object(message::FAULT, |e| {
-                    e.i64(0);
-                    e.boolean(false);
+                    e.i64(0).unwrap();
+                    e.boolean(false).unwrap();
                     Ok(())
                 })
                 .unwrap(),
@@ -597,7 +597,7 @@ async fn ipc_connect_uses_listen_exchange_then_actual_host_pid_without_extra_hel
         assert_eq!(request.properties().unwrap().action, "Register");
         let expected = Header::object(message::IPC, |e| {
             e.string("host-guid")?;
-            e.u32(std::process::id());
+            e.u32(std::process::id()).unwrap();
             Ok(())
         })
         .unwrap();

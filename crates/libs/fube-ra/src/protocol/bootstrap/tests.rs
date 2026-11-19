@@ -144,23 +144,23 @@ fn source_version(e: &mut Encoder) -> fubst::Result<()> {
     e.object(|e| {
         e.object(|e| {
             e.object(|e| {
-                e.u32(3);
-                e.u32(4);
-                e.u32(5);
-                e.u32(6);
+                e.u32(3)?;
+                e.u32(4)?;
+                e.u32(5)?;
+                e.u32(6)?;
                 Ok(())
             })?;
             e.object(|e| e.string("cfg"))
         })?;
-        e.u64(u64::MAX - 1);
+        e.u64(u64::MAX - 1)?;
         Ok(())
     })
 }
 
 fn source_rollout(e: &mut Encoder, major: u32, minor: u32) -> fubst::Result<()> {
     e.object(|e| {
-        e.u32(major);
-        e.u32(minor);
+        e.u32(major)?;
+        e.u32(minor)?;
         Ok(())
     })
 }
@@ -174,7 +174,7 @@ fn source_package(
     e.object(|e| {
         e.object(|e| {
             e.string(application)?;
-            e.u32(number);
+            e.u32(number)?;
             Ok(())
         })?;
         e.string(name)
@@ -187,16 +187,16 @@ fn source_node_up() -> Vec<u8> {
         e.object(|e| {
             e.string("UD")?;
             e.object_array(&[()], |e, _| {
-                e.i64(2);
+                e.i64(2)?;
                 e.string("fd")?;
                 e.string("authority")?;
-                e.i64(3);
+                e.i64(3)?;
                 e.string("host")?;
-                e.i32(123);
+                e.i32(123)?;
                 e.string("/rack/node")?;
                 e.string("q")?;
                 e.string("f")?;
-                e.u32(2);
+                e.u32(2)?;
                 e.string("rack")?;
                 e.string("node")
             })?;
@@ -206,20 +206,20 @@ fn source_node_up() -> Vec<u8> {
             })?;
             e.object_array(&[()], |e, _| {
                 e.string("ratio")?;
-                e.u32(17);
+                e.u32(17)?;
                 Ok(())
             })?;
             e.object_array(&[()], |e, _| {
                 e.string("capacity")?;
-                e.u32(29);
+                e.u32(29)?;
                 Ok(())
             })?;
             source_version(e)?;
             e.string("node-2")?;
             e.string("stateless")?;
             e.string("127.0.0.2")?;
-            e.u32(45000);
-            e.u16(19080);
+            e.u32(45000)?;
+            e.u16(19080)?;
             Ok(())
         })?;
         e.object_array(&[()], |e, _| {
@@ -229,11 +229,11 @@ fn source_node_up() -> Vec<u8> {
                     e.object(|e| source_rollout(e, 2, 3))?;
                     source_rollout(e, 4, 5)
                 })?;
-                e.u64(77);
+                e.u64(77)?;
                 Ok(())
             })
         })?;
-        e.boolean(true);
+        e.boolean(true)?;
         Ok(())
     })
     .unwrap();
@@ -247,18 +247,18 @@ fn source_ack() -> Vec<u8> {
             e.object(|e| {
                 e.object(|e| {
                     e.string("UpgradeAppType")?;
-                    e.u32(11);
+                    e.u32(11)?;
                     Ok(())
                 })?;
                 e.object(|e| source_rollout(e, 2, 3))?;
-                e.u64(u64::MAX);
-                e.i64(-91);
-                e.boolean(true);
+                e.u64(u64::MAX)?;
+                e.i64(-91)?;
+                e.boolean(true)?;
                 e.object_array(&[()], |e, _| {
                     e.string("UpgradePkg")?;
                     source_rollout(e, 4, 5)?;
-                    e.boolean(true);
-                    e.u32(2);
+                    e.boolean(true)?;
+                    e.u32(2)?;
                     e.string("CodeA")?;
                     e.string("CodeB")
                 })?;
@@ -266,37 +266,37 @@ fn source_ack() -> Vec<u8> {
                 e.object_array(&[()], |e, _| {
                     e.string("RemovedPkg")?;
                     source_rollout(e, 6, 7)?;
-                    e.u32(2);
+                    e.u32(2)?;
                     e.string("TypeA")?;
                     e.string("TypeB")
                 })?;
-                e.boolean(true);
+                e.boolean(true)?;
                 e.object_array(&[()], |e, _| {
                     source_package(e, "GovernedType", 13, "GovernedPkg")?;
                     e.object(|e| {
-                        e.boolean(true);
-                        e.u32(3);
-                        e.u32(1024);
-                        e.f64(2.5);
+                        e.boolean(true)?;
+                        e.u32(3)?;
+                        e.u32(1024)?;
+                        e.f64(2.5)?;
                         Ok(())
                     })
                 })?;
                 e.object_array(&[()], |e, _| {
                     source_package(e, "ImagesType", 14, "ImagesPkg")?;
                     e.object(|e| {
-                        e.u32(2);
+                        e.u32(2)?;
                         e.string("image-a")?;
                         e.string("image-b")
                     })
                 })?;
-                e.u32(2);
+                e.u32(2)?;
                 e.string("network-a")?;
                 e.string("network-b")
             })
         })?;
         source_version(e)?;
-        e.boolean(false);
-        e.i64(-9);
+        e.boolean(false)?;
+        e.i64(-9)?;
         Ok(())
     })
     .unwrap();

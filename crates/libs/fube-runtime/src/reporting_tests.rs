@@ -233,9 +233,9 @@ pub(super) async fn health_reply(
                 }
             } else {
                 kind
-            });
+            })?;
             e.string(if wrong == Some(1) { "Other" } else { "User" })?;
-            e.i64(sequence + i64::from(wrong == Some(2)));
+            e.i64(sequence + i64::from(wrong == Some(2))).unwrap();
             e.string(if wrong == Some(3) {
                 "wrong+100+Ready"
             } else if wrong == Some(4) {
@@ -245,7 +245,7 @@ pub(super) async fn health_reply(
             } else {
                 &expected_key
             })?;
-            e.i64(if wrong == Some(6) { -123 } else { 0 });
+            e.i64(if wrong == Some(6) { -123 } else { 0 }).unwrap();
             Ok(())
         })?;
         e.object_array::<()>(&[], |_, _| Ok(()))

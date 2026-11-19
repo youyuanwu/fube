@@ -24,14 +24,14 @@ fn counted_pointer_vectors_match_native_count_then_pointer_elements_without_slot
     };
     let mut e = Encoder::new();
     e.object(|e| {
-        e.u32(3);
+        e.u32(3).unwrap();
         e.pointer(Some(&[]), |e| {
-            e.i64(42);
+            e.i64(42).unwrap();
             Ok(())
         })?;
         e.pointer(None, |_| unreachable!())?;
         e.pointer(Some(&[]), |e| {
-            e.i64(-1);
+            e.i64(-1).unwrap();
             Ok(())
         })?;
         Ok(())
@@ -46,10 +46,10 @@ fn counted_pointer_vectors_match_native_count_then_pointer_elements_without_slot
 }
 
 #[test]
-fn counted_values_reject_oversize_counts_and_old_object_array_shape() {
+fn counted_values_validate_count_extents_and_reject_old_object_array_shape() {
     let mut e = Encoder::new();
     e.object(|e| {
-        e.u32((MAX_COLLECTION_COUNT + 1) as u32);
+        e.u32((MAX_COLLECTION_COUNT + 1) as u32).unwrap();
         Ok(())
     })
     .unwrap();
@@ -61,5 +61,6 @@ fn counted_values_reject_oversize_counts_and_old_object_array_shape() {
     let values = Values {
         values: CountedValues((0..=MAX_COLLECTION_COUNT).map(|_| Pointer(None)).collect()),
     };
-    assert!(to_vec(&values).is_err());
+    let bytes = to_vec(&values).unwrap();
+    assert_eq!(from_slice::<Values>(&bytes).unwrap(), values);
 }
