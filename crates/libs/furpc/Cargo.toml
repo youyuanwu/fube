@@ -10,6 +10,11 @@ fubst.workspace = true
 serde.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+bytes = "1"
+http = "1"
+tower-service = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

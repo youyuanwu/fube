@@ -36,8 +36,50 @@ submission, flushes accepted output, and shuts down under one fixed deadline.
 
 Deterministic I/O cases, backpressured in-memory exchange, and a loopback clear-TCP
 exchange exercise this foundation. They are not native interoperability
-qualification. Public Endpoint/Channel/Server APIs, scope-owned ingress runners,
-managed correlation/duplex, application body codecs, and TLS remain unimplemented.
+qualification.
+
+The initial public facade now supports explicitly selected
+`ConnectionOptions::raw_only()` and one-way messages. Endpoint owns inert URI,
+limit and service configuration; connect returns an owning Channel. Channel
+clones share one retained URI-input Tower connector and demand-driven reconnect
+attempt, without replay. Peer, Source, native Operation and Attempt values never
+own that logical lifetime or retarget another physical generation.
+Default managed mode fails Unsupported before I/O rather than falling back.
+
+TCP/custom connectors, Accept, TCP/stream acceptors and
+`Server::serve_with_shutdown` use the same physical engine. Canonical raw
+IngressService bindings admit bounded work at the header gate, before body
+storage, and run readiness/handlers outside the driver. Header authorization
+and HandlerLimits are shared by all connections in a server or generations in
+one Channel. Handler deadlines begin at that admission, including partial-body
+waiting. Dynamic Channel service installation survives reconnect. Received
+Request parts preserve their original read-only source/deadline/context through
+header edits and body mapping. Only an independently configured SendPolicy
+supplies a source-bound Peer; policy is rechecked at the commitment gate.
+
+The optional accepted-peer hook runs once after establishment, with its own
+timeout and no handler-slot dependency. Shutdown drops acceptance, rejects
+new sends/dispatch and waits for admitted one-way handlers, hook work and
+output under one drain deadline. Finite accept-source exhaustion is not a
+shutdown signal. Dropping initial connect or the last Channel owner cancels
+owned work; retaining Endpoint configuration or a Peer does not keep it alive.
+Runtime errors are cloneable and retain original sources, so Error is no longer
+Copy. Automatic diagnostics are rate-limited static categories/phases, not
+arbitrary handler/connector error text or custom URI paths/queries.
+
+Current TransportLimits defaults use native u32 frame capacity, a disabled
+queue-byte limit, and no retained-allocation accounting. Execution defaults are
+explicit Rust policy: 1,024 pending sends, 128 server connections, 16 simultaneous
+handshakes, 128 peer waiters, 64 KiB/32-step cooperative turns, 30-second frame
+and committed-write watchdogs, and a 5-second discard watchdog. Connect, server
+handshake, peer-ready and server drain default to 30 seconds; HandlerLimits
+retain their documented 8 in-flight/4 readiness-waiter/30-second defaults.
+These are not native constants or performance qualification.
+
+Managed correlation/byte RPC, specialized duplex, application body codecs,
+Actor routing and TLS remain unimplemented. Raw one-way admission rejects
+request/reply flags; returning IngressResponse::Reply without a grant is a
+diagnosed handler contract error and emits nothing.
 
 ## Gap ownership and implementation order
 

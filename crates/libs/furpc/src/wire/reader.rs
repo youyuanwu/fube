@@ -180,7 +180,7 @@ enum Disposition {
     Discard(DiscardReason),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum State {
     Fixed {
         bytes: [u8; FIXED_HEADER_LEN],
@@ -227,11 +227,11 @@ impl FrameReader {
     }
 
     fn fail(&mut self, error: FrameError) -> FrameError {
-        let error = match self.state {
+        let error = match self.state.clone() {
             State::Failed(first) => first,
             _ => error,
         };
-        self.state = State::Failed(error);
+        self.state = State::Failed(error.clone());
         self.headers = None;
         self.body = None;
         error
@@ -242,7 +242,7 @@ impl FrameReader {
         frame: FrameKey,
         permit: HeaderPermit,
     ) -> FrameResult<()> {
-        match self.state {
+        match self.state.clone() {
             State::HeaderGate(expected) if expected.key == frame && expected == permit.frame => {
                 self.headers = Some(permit);
                 self.state = State::Headers(expected);
@@ -257,7 +257,7 @@ impl FrameReader {
         frame: FrameKey,
         decision: BodyDecision,
     ) -> FrameResult<()> {
-        let State::BodyGate(expected) = self.state else {
+        let State::BodyGate(expected) = self.state.clone() else {
             return Err(self.fail(FrameError::InvalidState("body decision outside gate")));
         };
         if frame != expected.key {
@@ -302,7 +302,7 @@ impl FrameReader {
                 return Ok(FrameReadStep::Yield);
             }
             work.transitions -= 1;
-            match self.state {
+            match self.state.clone() {
                 State::Fixed {
                     mut bytes,
                     mut used,
@@ -441,7 +441,7 @@ impl FrameReader {
     /// Call only after buffered bytes/events and admission gates have been
     /// processed. Checking input explicitly prevents a framing-clean false EOF.
     pub(crate) fn finish_eof(&mut self, input: &ReceiveInput) -> FrameResult<()> {
-        let result = match self.state {
+        let result = match self.state.clone() {
             State::Failed(error) => Err(error),
             _ if !input.remaining().is_empty() => Err(FrameError::InvalidState(
                 "EOF before processing buffered input",

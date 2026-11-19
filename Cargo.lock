@@ -534,9 +534,14 @@ dependencies = [
 name = "furpc"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "fubst",
+ "futures-util",
+ "http",
  "serde",
  "tokio",
+ "tower-service",
+ "tracing",
  "uuid",
 ]
 

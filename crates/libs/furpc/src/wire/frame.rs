@@ -18,7 +18,7 @@ pub(crate) const FIXED_HEADER_LEN: usize = 12;
 
 pub(crate) type FrameResult<T> = Result<T, FrameError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FrameError {
     InvalidFrameLength { frame_len: u32, headers_len: u16 },
     HeaderLengthOverflow { len: usize },

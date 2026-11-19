@@ -138,7 +138,7 @@ fn builder_stops_at_the_first_native_error() {
     let builder = Message::builder()
         .append_header(huge)
         .append_header(header::actor(ActorId::new(1).unwrap()).unwrap());
-    let first = builder.error.unwrap();
+    let first = builder.error.clone().unwrap();
     let builder = builder
         .append_header(header::action("ignored").unwrap())
         .body(Body::from_bytes(vec![1, 2, 3]).unwrap());
