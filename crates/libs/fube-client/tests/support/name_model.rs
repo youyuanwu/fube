@@ -142,7 +142,7 @@ async fn native_duplicate_and_missing_are_explicit_and_operation_local() {
                     &request,
                     "ClientOperationFailure",
                     body(|encoder| {
-                        encoder.i64(code);
+                        encoder.i64(code).unwrap();
                         encoder.string("native name diagnostic")
                     }),
                 ),

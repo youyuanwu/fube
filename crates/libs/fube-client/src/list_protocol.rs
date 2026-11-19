@@ -101,33 +101,33 @@ mod tests {
         uri(e)?;
         e.string("Type")?;
         e.string("1")?;
-        e.i64(1);
-        e.i64(1);
+        e.i64(1).unwrap();
+        e.i64(1).unwrap();
         empty_map(e)
     }
 
     fn service_base(e: &mut Encoder) -> fubst::Result<()> {
-        e.i64(1);
+        e.i64(1).unwrap();
         uri(e)?;
         e.string("Type")?;
         e.string("1")?;
-        e.boolean(false);
-        e.i64(1);
+        e.boolean(false).unwrap();
+        e.i64(1).unwrap();
         Ok(())
     }
 
     fn uri(e: &mut Encoder) -> fubst::Result<()> {
         e.object(|e| {
-            e.i64(1);
+            e.i64(1).unwrap();
             e.string("fabric")?;
             e.string("")?;
-            e.i64(0);
+            e.i64(0).unwrap();
             e.string("")?;
-            e.i32(-1);
+            e.i32(-1).unwrap();
             e.string("/App")?;
             e.string("")?;
             e.string("")?;
-            e.u32(1);
+            e.u32(1).unwrap();
             e.string("App")
         })
     }
@@ -149,7 +149,7 @@ mod tests {
                     empty_map(e)?;
                 }
                 // Wrong metadata at upgrade version/map/definition respectively.
-                e.boolean(false);
+                e.boolean(false).unwrap();
                 Ok(())
             })
             .unwrap();
@@ -161,7 +161,7 @@ mod tests {
             e.object(|e| {
                 service_base(e)?;
                 if position == 1 {
-                    e.i64(1);
+                    e.i64(1).unwrap();
                 }
                 e.string("wrong status/group metadata")
             })

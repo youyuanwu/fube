@@ -236,8 +236,8 @@ fn body(fields: impl FnOnce(&mut Encoder) -> fubst::Result<()>) -> Vec<u8> {
 
 fn naming_body(exists: bool, state: i64) -> Vec<u8> {
     body(|encoder| {
-        encoder.boolean(exists);
-        encoder.i64(state);
+        encoder.boolean(exists).unwrap();
+        encoder.i64(state).unwrap();
         Ok(())
     })
 }
@@ -250,7 +250,7 @@ fn ping_body() -> Vec<u8> {
                 let mut id = Vec::from(((NODE_ID >> 64) as u64).to_le_bytes());
                 id.extend_from_slice(&(NODE_ID as u64).to_le_bytes());
                 encoder.byte_array(&id)?;
-                encoder.u64(0xfedcba9876543210);
+                encoder.u64(0xfedcba9876543210).unwrap();
                 Ok(())
             })?;
             encoder.string("N0010")
@@ -529,8 +529,8 @@ async fn all_operations_select_optional_timeout_and_reject_invalid_overrides_wit
                 let mut response = reply(&request, "ClientOperationFailure", vec![]);
                 response.headers.push(
                     Header::object(FAULT, |encoder| {
-                        encoder.i64(REMOTE_CODE);
-                        encoder.boolean(false);
+                        encoder.i64(REMOTE_CODE).unwrap();
+                        encoder.boolean(false).unwrap();
                         Ok(())
                     })
                     .unwrap(),
@@ -718,12 +718,12 @@ async fn malformed_naming_success_never_returns_absent_and_allows_reuse() {
         Vec::new(),
         body(|_| Ok(())),
         body(|encoder| {
-            encoder.boolean(false);
+            encoder.boolean(false).unwrap();
             Ok(())
         }),
         body(|encoder| {
-            encoder.i64(0);
-            encoder.i64(4);
+            encoder.i64(0).unwrap();
+            encoder.i64(4).unwrap();
             Ok(())
         }),
     ];
@@ -753,7 +753,7 @@ async fn malformed_ping_success_requires_every_identity_field() {
                 encoder.string("address")?;
                 encoder.object(|encoder| {
                     encoder.byte_array(&[1; 15])?;
-                    encoder.u64(1);
+                    encoder.u64(1).unwrap();
                     Ok(())
                 })?;
                 encoder.string("node")
@@ -771,7 +771,7 @@ async fn malformed_ping_success_requires_every_identity_field() {
                 encoder.string("address")?;
                 encoder.object(|encoder| {
                     encoder.byte_array(&[1; 16])?;
-                    encoder.u64(1);
+                    encoder.u64(1).unwrap();
                     Ok(())
                 })
             })
@@ -804,7 +804,7 @@ async fn empty_gateway_identity_is_not_a_success() {
                     encoder.string(address)?;
                     encoder.object(|encoder| {
                         encoder.byte_array(&[1; 16])?;
-                        encoder.u64(1);
+                        encoder.u64(1).unwrap();
                         Ok(())
                     })?;
                     encoder.string(node_name)
@@ -902,7 +902,7 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
             true,
             body(|encoder| {
                 encoder.object(|encoder| {
-                    encoder.i64(REMOTE_CODE - 1);
+                    encoder.i64(REMOTE_CODE - 1).unwrap();
                     encoder.string("diagnostic")
                 })
             }),
@@ -911,7 +911,7 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
             true,
             body(|encoder| {
                 encoder.object(|encoder| {
-                    encoder.i64(0);
+                    encoder.i64(0).unwrap();
                     encoder.string("diagnostic")
                 })
             }),
@@ -920,7 +920,7 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
             true,
             body(|encoder| {
                 encoder.object(|encoder| {
-                    encoder.i64(REMOTE_CODE - 1);
+                    encoder.i64(REMOTE_CODE - 1).unwrap();
                     encoder.string("")
                 })
             }),
@@ -928,7 +928,7 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
         (
             true,
             body(|encoder| {
-                encoder.i64(REMOTE_CODE);
+                encoder.i64(REMOTE_CODE).unwrap();
                 encoder.string("wrong un-nested schema")
             }),
         ),
@@ -938,8 +938,8 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
             let mut response = reply(request, "", bytes);
             response.headers.push(
                 Header::object(FAULT, |encoder| {
-                    encoder.i64(REMOTE_CODE);
-                    encoder.boolean(has_body);
+                    encoder.i64(REMOTE_CODE).unwrap();
+                    encoder.boolean(has_body).unwrap();
                     Ok(())
                 })
                 .unwrap(),
@@ -968,7 +968,7 @@ async fn operation_failure_requires_nonzero_code_and_valid_present_diagnostic() 
             request,
             "ClientOperationFailure",
             body(|encoder| {
-                encoder.i64(REMOTE_CODE);
+                encoder.i64(REMOTE_CODE).unwrap();
                 encoder.string("operation failed")
             }),
         )
@@ -989,7 +989,7 @@ async fn operation_failure_requires_nonzero_code_and_valid_present_diagnostic() 
             request,
             "ClientOperationFailure",
             body(|encoder| {
-                encoder.i64(REMOTE_CODE);
+                encoder.i64(REMOTE_CODE).unwrap();
                 Ok(())
             }),
         )
@@ -1004,12 +1004,12 @@ async fn operation_failure_requires_nonzero_code_and_valid_present_diagnostic() 
         Vec::new(),
         body(|_| Ok(())),
         body(|encoder| {
-            encoder.i64(REMOTE_CODE);
-            encoder.boolean(true);
+            encoder.i64(REMOTE_CODE).unwrap();
+            encoder.boolean(true).unwrap();
             Ok(())
         }),
         body(|encoder| {
-            encoder.i64(0);
+            encoder.i64(0).unwrap();
             encoder.string("not a native failure")
         }),
     ] {
@@ -1041,7 +1041,7 @@ async fn input_error_does_not_send_and_native_error_does_not_poison_complete_str
                     &request,
                     "ClientOperationFailure",
                     body(|encoder| {
-                        encoder.i64(REMOTE_CODE);
+                        encoder.i64(REMOTE_CODE).unwrap();
                         encoder.string("native input error")
                     }),
                 )
@@ -1164,7 +1164,7 @@ mod node_queries {
             }
         }
         encoder.pointer(Some(&tag), |encoder| {
-            encoder.i64(serialized_kind);
+            encoder.i64(serialized_kind).unwrap();
             if (2..=7).contains(&kind) {
                 if kind != 2 || !matches!(shape, NodeShape::MissingDerivedScope) {
                     encoder.next_scope()?;
@@ -1172,7 +1172,7 @@ mod node_queries {
                 if kind == 2 && matches!(shape, NodeShape::WrongPartitionIdType) {
                     encoder.byte_array(&partition_id(kind).to_bytes_le())?;
                 } else if kind != 2 || !matches!(shape, NodeShape::MissingPartitionId) {
-                    encoder.guid(&partition_id(kind).to_bytes_le());
+                    encoder.guid(&partition_id(kind).to_bytes_le()).unwrap();
                 }
             }
             Ok(())
@@ -1194,13 +1194,13 @@ mod node_queries {
         encoder.string("11.8.121.4")?;
         encoder.string("cfg:7")?;
         if matches!(shape, NodeShape::WrongStatusType) {
-            encoder.i32(4);
+            encoder.i32(4).unwrap();
         } else {
-            encoder.i64(if unknown { i64::MIN } else { 4 });
+            encoder.i64(if unknown { i64::MIN } else { 4 }).unwrap();
         }
-        encoder.i64(123_456_789);
-        encoder.i64(if unknown { i64::MAX } else { 2 });
-        encoder.boolean(true);
+        encoder.i64(123_456_789).unwrap();
+        encoder.i64(if unknown { i64::MAX } else { 2 }).unwrap();
+        encoder.boolean(true).unwrap();
         encoder.string("UD-02")?;
         encoder.string("fd:/rack/02")?;
         if matches!(shape, NodeShape::DisagreeingIdCopies) {
@@ -1211,17 +1211,19 @@ mod node_queries {
         } else {
             &id
         })?;
-        encoder.u64(0xfedcba9876543210);
-        encoder.u32(19002);
+        encoder.u64(0xfedcba9876543210).unwrap();
+        encoder.u32(19002).unwrap();
         encoder.object(|encoder| {
-            encoder.i64(if unknown { -7001 } else { 4 });
-            encoder.i64(if unknown { 7_654_321 } else { 1 });
+            encoder.i64(if unknown { -7001 } else { 4 }).unwrap();
+            encoder.i64(if unknown { 7_654_321 } else { 1 }).unwrap();
             encoder.object_array(
                 &[("infra:01", 1, 1), ("repair:02", 2, 2), ("client:03", 3, 3)],
                 |encoder, (id, task_type, intent)| {
                     let write_id = |encoder: &mut Encoder| {
                         encoder.string(id)?;
-                        encoder.i64(if unknown { -5003 } else { *task_type });
+                        encoder
+                            .i64(if unknown { -5003 } else { *task_type })
+                            .unwrap();
                         Ok(())
                     };
                     if matches!(shape, NodeShape::InlineTaskId) {
@@ -1230,7 +1232,9 @@ mod node_queries {
                         encoder.object(write_id)?;
                     }
                     if !matches!(shape, NodeShape::MissingTaskIntent) {
-                        encoder.i64(if unknown { i64::MAX - 1 } else { *intent });
+                        encoder
+                            .i64(if unknown { i64::MAX - 1 } else { *intent })
+                            .unwrap();
                     }
                     Ok(())
                 },
@@ -1239,14 +1243,14 @@ mod node_queries {
                 encode_safety(encoder, *kind, *shape)
             })
         })?;
-        encoder.boolean(true);
-        encoder.i64(17);
-        encoder.i64(133_700_000_000_000_001);
-        encoder.i64(133_699_999_830_000_001);
+        encoder.boolean(true).unwrap();
+        encoder.i64(17).unwrap();
+        encoder.i64(133_700_000_000_000_001).unwrap();
+        encoder.i64(133_699_999_830_000_001).unwrap();
         match shape {
             NodeShape::MissingPort => {}
-            NodeShape::WrongPortType => encoder.u32(65535),
-            _ => encoder.u16(65535),
+            NodeShape::WrongPortType => encoder.u32(65535)?,
+            _ => encoder.u16(65535)?,
         }
         Ok(())
     }
@@ -1264,9 +1268,9 @@ mod node_queries {
         wrapper: impl FnOnce(&mut Encoder) -> fubst::Result<()>,
     ) -> Vec<u8> {
         body(|encoder| {
-            encoder.i64(kind);
+            encoder.i64(kind).unwrap();
             encoder.pointer(wrapper_tag, wrapper)?;
-            encoder.i64(error);
+            encoder.i64(error).unwrap();
             if let Some(token) = token {
                 encoder.pointer(Some(&[]), |encoder| encoder.string(token))?;
             } else {
@@ -1851,26 +1855,26 @@ mod node_queries {
             (
                 "scalar count is not an object array",
                 query_result(2, Some(&tag), 0, None, |encoder| {
-                    encoder.u32(0);
+                    encoder.u32(0).unwrap();
                     encoder.pointer(None, |_| Ok(()))
                 }),
             ),
             (
                 "wrong result-kind metadata",
                 body(|encoder| {
-                    encoder.i32(2);
+                    encoder.i32(2).unwrap();
                     encoder.pointer(Some(&tag), |encoder| encode_wrapper(encoder, &[]))?;
-                    encoder.i64(0);
+                    encoder.i64(0).unwrap();
                     encoder.pointer(None, |_| Ok(()))
                 }),
             ),
             (
                 "nested error object instead of inline enum",
                 body(|encoder| {
-                    encoder.i64(2);
+                    encoder.i64(2).unwrap();
                     encoder.pointer(Some(&tag), |encoder| encode_wrapper(encoder, &[]))?;
                     encoder.object(|encoder| {
-                        encoder.i64(0);
+                        encoder.i64(0).unwrap();
                         Ok(())
                     })?;
                     encoder.pointer(None, |_| Ok(()))
@@ -1879,11 +1883,11 @@ mod node_queries {
             (
                 "paging pointer with wrong payload type",
                 body(|encoder| {
-                    encoder.i64(2);
+                    encoder.i64(2).unwrap();
                     encoder.pointer(Some(&tag), |encoder| encode_wrapper(encoder, &[]))?;
-                    encoder.i64(0);
+                    encoder.i64(0).unwrap();
                     encoder.pointer(Some(&[]), |encoder| {
-                        encoder.boolean(false);
+                        encoder.boolean(false).unwrap();
                         Ok(())
                     })
                 }),
@@ -1891,9 +1895,9 @@ mod node_queries {
             (
                 "inline token instead of paging pointer",
                 body(|encoder| {
-                    encoder.i64(2);
+                    encoder.i64(2).unwrap();
                     encoder.pointer(Some(&tag), |encoder| encode_wrapper(encoder, &[]))?;
-                    encoder.i64(0);
+                    encoder.i64(0).unwrap();
                     encoder.string("token")
                 }),
             ),
@@ -2034,8 +2038,8 @@ mod node_queries {
                         let mut response = node_reply(&request, vec![]);
                         response.headers.push(
                             Header::object(FAULT, |encoder| {
-                                encoder.i64(REMOTE_CODE - 2);
-                                encoder.boolean(true);
+                                encoder.i64(REMOTE_CODE - 2).unwrap();
+                                encoder.boolean(true).unwrap();
                                 Ok(())
                             })
                             .unwrap(),
@@ -2046,7 +2050,7 @@ mod node_queries {
                         &request,
                         "ClientOperationFailure",
                         body(|encoder| {
-                            encoder.i64(REMOTE_CODE - 3);
+                            encoder.i64(REMOTE_CODE - 3).unwrap();
                             encoder.string("invalid continuation")
                         }),
                     ),

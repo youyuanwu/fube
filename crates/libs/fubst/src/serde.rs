@@ -25,6 +25,10 @@
 //! custom serializers are outside the positional wire-preserving contract;
 //! attributes invisible to a format backend cannot universally be detected.
 //! Renames do not affect bytes. Supported unknown tails are skipped, not retained.
+//! Default operations impose no extra codec byte/depth ceilings. Transports can
+//! use the `_with_limits` entry points for their own operation budgets. Typed
+//! recursive schemas still use the Rust stack; select an explicit depth guard
+//! or provide a suitable execution strategy. Unknown-tail traversal is iterative.
 //!
 //! ```
 //! use fubst::serde::{to_vec, from_slice, Guid};
@@ -53,7 +57,7 @@
 //! assert_eq!(from_slice::<Pointer<NativeEnum<Evaluation>>>(&bytes).unwrap(), value);
 //! ```
 
-use super::{Decoder, Encoder, MAX_COLLECTION_COUNT, MAX_OBJECT_SIZE, MAX_STRING_UNITS};
+use super::{unsigned_payload_len, Decoder, Encoder, Limits};
 use crate::{Error, Result};
 use ::serde::{
     de::{DeserializeSeed, EnumAccess, SeqAccess, VariantAccess, Visitor},
@@ -199,7 +203,12 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for ObjectArray<Vec<T>> {
 
 /// Encode one native value. Struct roots include object framing; scalar roots do not.
 pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
-    let mut encoder = Encoder::new();
+    to_vec_with_limits(value, Limits::default())
+}
+
+/// Encode one value under explicit byte and nesting limits.
+pub fn to_vec_with_limits<T: Serialize + ?Sized>(value: &T, limits: Limits) -> Result<Vec<u8>> {
+    let mut encoder = Encoder::with_limits(limits);
     value.serialize(Serializer {
         encoder: &mut encoder,
         mode: Mode::Value,
@@ -218,11 +227,32 @@ pub fn from_slice<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T> {
 /// standard `Vec` storage, including growth. The callback owns the reservations;
 /// charges are not refunded on errors. Additional allocations in custom
 /// deserializers/visitors or subsequent conversions require separate accounting.
+/// These are decoded-value charges, not temporary traversal-stack storage;
+/// explicit [`Limits`] can bound traversal bytes and nesting separately.
 pub fn from_slice_with_budget<'de, T: Deserialize<'de>>(
     bytes: &'de [u8],
     reserve: &mut impl FnMut(usize) -> Result<()>,
 ) -> Result<T> {
-    let mut decoder = Decoder::new(bytes);
+    from_slice_with_limits_and_budget(bytes, Limits::default(), reserve)
+}
+
+/// Decode exactly one value under explicit byte and nesting limits.
+pub fn from_slice_with_limits<'de, T: Deserialize<'de>>(
+    bytes: &'de [u8],
+    limits: Limits,
+) -> Result<T> {
+    from_slice_with_limits_and_budget(bytes, limits, &mut |_| Ok(()))
+}
+
+/// Combine explicit wire limits with the allocation accounting of
+/// [`from_slice_with_budget`]. The complete input-size check precedes decoding
+/// and all allocation-budget callbacks.
+pub fn from_slice_with_limits_and_budget<'de, T: Deserialize<'de>>(
+    bytes: &'de [u8],
+    limits: Limits,
+    reserve: &mut impl FnMut(usize) -> Result<()>,
+) -> Result<T> {
+    let mut decoder = Decoder::with_limits(bytes, limits)?;
     let value = T::deserialize(Deserializer {
         decoder: &mut decoder,
         reserve,
@@ -237,18 +267,17 @@ pub fn from_slice_with_budget<'de, T: Deserialize<'de>>(
 ///
 /// No new object/scope is introduced. On error prior bytes and depth are retained.
 pub fn to_fields<T: Serialize + ?Sized>(encoder: &mut Encoder, value: &T) -> Result<()> {
-    if encoder.depth == 0 {
+    if encoder.objects.is_empty() {
         return Err(encode_error());
     }
     let start = encoder.bytes.len();
-    let depth = encoder.depth;
+    let depth = encoder.objects.len();
     let result = value.serialize(Serializer {
         encoder,
         mode: Mode::Fields,
     });
     if result.is_err() {
-        encoder.bytes.truncate(start);
-        encoder.depth = depth;
+        encoder.rollback(start, depth);
     }
     result
 }
@@ -337,27 +366,80 @@ struct Serializer<'a> {
     mode: Mode,
 }
 
-#[derive(Default)]
 struct BoundedText {
     text: String,
     units: usize,
-    failed: bool,
+    max_units: usize,
+    max_encoded_bytes: usize,
+    error: Option<Error>,
+}
+
+impl BoundedText {
+    fn new(max_encoded_bytes: usize) -> Self {
+        Self {
+            text: String::new(),
+            units: 0,
+            max_units: (max_encoded_bytes / 2).min(u32::MAX as usize),
+            max_encoded_bytes,
+            error: None,
+        }
+    }
+
+    fn append(&mut self, value: &str) -> Result<()> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        if value.len()
+            > self
+                .max_units
+                .saturating_mul(3)
+                .saturating_sub(self.text.len())
+        {
+            return Err(Error::ResourceLimit("string code units"));
+        }
+        let units = value.encode_utf16().count();
+        if units > self.max_units - self.units {
+            return Err(Error::ResourceLimit("string code units"));
+        }
+        let total_units = self.units + units;
+        let encoded_size = if total_units == 0 {
+            1
+        } else {
+            total_units
+                .checked_mul(2)
+                .and_then(|size| size.checked_add(1 + unsigned_payload_len(total_units as u64)))
+                .ok_or(Error::ResourceLimit("encoded size"))?
+        };
+        if encoded_size > self.max_encoded_bytes {
+            return Err(Error::ResourceLimit("encoded size"));
+        }
+        let length = self
+            .text
+            .len()
+            .checked_add(value.len())
+            .ok_or(Error::ResourceLimit("formatted string length"))?;
+        if length > self.text.capacity() {
+            let capacity = length
+                .max(self.text.capacity().saturating_mul(2))
+                .min(self.max_units.saturating_mul(3));
+            self.text
+                .try_reserve_exact(capacity - self.text.len())
+                .map_err(|_| Error::ResourceLimit("formatted string allocation"))?;
+        }
+        self.units = total_units;
+        self.text.push_str(value);
+        Ok(())
+    }
 }
 
 impl fmt::Write for BoundedText {
     fn write_str(&mut self, value: &str) -> fmt::Result {
-        if self.failed || value.len() > MAX_STRING_UNITS * 3 - self.text.len() {
-            self.failed = true;
-            return Err(fmt::Error);
+        if let Err(error) = self.append(value) {
+            self.error = Some(error);
+            Err(fmt::Error)
+        } else {
+            Ok(())
         }
-        let units = value.encode_utf16().count();
-        if units > MAX_STRING_UNITS - self.units {
-            self.failed = true;
-            return Err(fmt::Error);
-        }
-        self.units += units;
-        self.text.push_str(value);
-        Ok(())
     }
 }
 
@@ -367,8 +449,7 @@ macro_rules! serialize_scalar {
             if self.mode != Mode::Value {
                 return Err(encode_error());
             }
-            self.encoder.$method(value);
-            Ok(())
+            self.encoder.$method(value)
         }
     };
 }
@@ -395,9 +476,8 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
         match self.mode {
             Mode::Value => self.encoder.u32(value),
             Mode::UInt32Element => self.encoder.write_unsigned_payload(u64::from(value)),
-            _ => return Err(encode_error()),
+            _ => Err(encode_error()),
         }
-        Ok(())
     }
     serialize_scalar!(serialize_i64, i64, i64);
     serialize_scalar!(serialize_u64, u64, u64);
@@ -410,9 +490,9 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
     }
     fn serialize_unit_variant(self, _: &'static str, _: u32, variant: &'static str) -> Result<()> {
         if self.mode == Mode::NumericEnum {
-            self.encoder
+            return self
+                .encoder
                 .i64(variant_code(variant).ok_or_else(encode_error)?);
-            return Ok(());
         }
         self.enum_compound(variant, 0)?.finish()
     }
@@ -426,11 +506,17 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
         if self.mode != Mode::Value {
             return Err(encode_error());
         }
-        let mut text = BoundedText::default();
-        if fmt::write(&mut text, format_args!("{value}")).is_err() || text.failed {
-            return Err(Error::InvalidInput(
-                "native string formatting failed or exceeded limit",
-            ));
+        let mut text = BoundedText::new(
+            self.encoder
+                .write_limit()
+                .saturating_sub(self.encoder.bytes.len()),
+        );
+        let result = fmt::write(&mut text, format_args!("{value}"));
+        if let Some(error) = text.error {
+            return Err(error);
+        }
+        if result.is_err() {
+            return Err(Error::InvalidInput("native string formatting failed"));
         }
         self.encoder.string(&text.text)
     }
@@ -439,8 +525,7 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
             Mode::Value => self.encoder.byte_array(value),
             Mode::Guid => {
                 let bytes = value.try_into().map_err(|_| encode_error())?;
-                self.encoder.guid(bytes);
-                Ok(())
+                self.encoder.guid(bytes)
             }
             Mode::TypeInfo => self.encoder.begin_object(value).map(|_| ()),
             _ => Err(encode_error()),
@@ -478,8 +563,8 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
             (Mode::Value | Mode::Object, ENUM_ADAPTER) => Mode::Enum,
             (Mode::Pointer, ENUM_ADAPTER) => Mode::EnumPointer,
             (Mode::Value, NUMERIC_ENUM_ADAPTER) => Mode::NumericEnum,
-            (Mode::Value, TRAILING_ADAPTER) if self.encoder.depth > 0 => Mode::Trailing,
-            (Mode::Value, INLINE_ADAPTER | DERIVED_ADAPTER) if self.encoder.depth > 0 => {
+            (Mode::Value, TRAILING_ADAPTER) if !self.encoder.objects.is_empty() => Mode::Trailing,
+            (Mode::Value, INLINE_ADAPTER | DERIVED_ADAPTER) if !self.encoder.objects.is_empty() => {
                 if name == DERIVED_ADAPTER {
                     self.encoder.next_scope()?;
                 }
@@ -524,7 +609,7 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
         }
         let len = len.ok_or_else(encode_error)?;
         let start = self.encoder.bytes.len();
-        let depth = self.encoder.depth;
+        let depth = self.encoder.objects.len();
         let framing = if self.mode == Mode::Array {
             self.encoder.object_array_header(len)?;
             Framing::Array
@@ -532,10 +617,8 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
             self.encoder.u32_array_header(len)?;
             Framing::UInt32Array
         } else {
-            if len > MAX_COLLECTION_COUNT {
-                return Err(Error::InvalidInput("counted-string limit exceeded"));
-            }
-            self.encoder.u32(len as u32);
+            self.encoder.check_count(len)?;
+            self.encoder.u32(len as u32)?;
             if self.mode == Mode::Strings {
                 Framing::Strings
             } else {
@@ -600,15 +683,18 @@ impl<'a> Serializer<'a> {
             .map_err(|_| encode_error())?;
         let pointer = self.mode == Mode::EnumPointer;
         let start = self.encoder.bytes.len();
-        let depth = self.encoder.depth;
+        let depth = self.encoder.objects.len();
         if pointer {
-            self.encoder.bytes.push(super::POINTER);
+            self.encoder.write(&[super::POINTER])?;
         }
         if let Err(error) = self.encoder.begin_object(&code.to_le_bytes()) {
             self.encoder.bytes.truncate(start);
             return Err(error);
         }
-        self.encoder.i64(i64::from(code));
+        if let Err(error) = self.encoder.i64(i64::from(code)) {
+            self.encoder.rollback(start, depth);
+            return Err(error);
+        }
         Ok(Compound {
             encoder: self.encoder,
             start,
@@ -631,7 +717,7 @@ impl<'a> Serializer<'a> {
         ) {
             return Err(encode_error());
         }
-        let depth = self.encoder.depth;
+        let depth = self.encoder.objects.len();
         let start = self.encoder.bytes.len();
         let framing = match self.mode {
             Mode::Fields => Framing::Fields,
@@ -641,12 +727,12 @@ impl<'a> Serializer<'a> {
                 }
                 let pointer = self.mode == Mode::TypedPointer;
                 if pointer {
-                    self.encoder.bytes.push(super::POINTER);
+                    self.encoder.write(&[super::POINTER])?;
                 }
                 Framing::Typed { pointer }
             }
             Mode::Pointer => {
-                self.encoder.bytes.push(super::POINTER);
+                self.encoder.write(&[super::POINTER])?;
                 if let Err(error) = self.encoder.begin_object(&[]) {
                     self.encoder.bytes.truncate(start);
                     return Err(error);
@@ -704,14 +790,6 @@ impl Compound<'_> {
             encoder: self.encoder,
             mode,
         })?;
-        if (!matches!(
-            self.framing,
-            Framing::Array | Framing::Strings | Framing::Values | Framing::UInt32Array
-        ) || self.depth > 0)
-            && self.encoder.bytes.len() - self.start > MAX_OBJECT_SIZE
-        {
-            return Err(Error::InvalidInput("object size limit exceeded"));
-        }
         Ok(())
     }
     fn finish(mut self) -> Result<()> {
@@ -728,8 +806,7 @@ impl Compound<'_> {
 impl Drop for Compound<'_> {
     fn drop(&mut self) {
         if !self.complete {
-            self.encoder.bytes.truncate(self.start);
-            self.encoder.depth = self.depth;
+            self.encoder.rollback(self.start, self.depth);
         }
     }
 }
@@ -983,8 +1060,8 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
             self.decoder.u32_array_count()?
         } else {
             let count = self.decoder.u32()? as usize;
-            if count > MAX_COLLECTION_COUNT || count > self.decoder.limit - self.decoder.position {
-                return Err(Error::Protocol("counted-string limit or extent exceeded"));
+            if count > self.decoder.limit - self.decoder.position {
+                return Err(Error::Protocol("counted sequence exceeds enclosing extent"));
             }
             count
         };

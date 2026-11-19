@@ -179,7 +179,7 @@ async fn accepted_native_rejects_wrong_role_empty_identity_ipc_and_nonhello_with
     ipc.headers.push(
         Header::object(message::IPC, |e| {
             e.string("host")?;
-            e.u32(42);
+            e.u32(42).unwrap();
             Ok(())
         })
         .unwrap(),
@@ -367,7 +367,7 @@ async fn accepted_native_uses_actual_peer_identity_and_retains_native_envelope_a
     incoming.headers.push(
         Header::object(message::IPC, |e| {
             e.string("host")?;
-            e.u32(42);
+            e.u32(42).unwrap();
             Ok(())
         })
         .unwrap(),

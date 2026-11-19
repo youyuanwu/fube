@@ -224,7 +224,7 @@ fn activity(message: &Message) -> [u8; 16] {
 fn failure(code: i64) -> Vec<u8> {
     let mut e = Encoder::new();
     e.object(|e| {
-        e.i64(code);
+        e.i64(code).unwrap();
         e.string("native diagnostic")?;
         Ok(())
     })
@@ -240,7 +240,7 @@ fn ack(
 ) -> Message {
     let mut headers = vec![
         Header::object(0x8001, |e| {
-            e.i64(actor);
+            e.i64(actor).unwrap();
             Ok(())
         })
         .unwrap(),
@@ -254,15 +254,15 @@ fn ack(
         .unwrap(),
         Header::object(0x8020, |e| {
             e.object(|e| {
-                e.guid(&guid);
-                e.u64(0);
+                e.guid(&guid).unwrap();
+                e.u64(0).unwrap();
                 Ok(())
             })
         })
         .unwrap(),
         Header::object(0x8025, |e| {
-            e.i64(1);
-            e.i64(2);
+            e.i64(1).unwrap();
+            e.i64(2).unwrap();
             Ok(())
         })
         .unwrap(),
@@ -270,9 +270,9 @@ fn ack(
     if let Some(sequence) = sequence {
         headers.push(
             Header::object(0x803c, |e| {
-                e.u64(sequence);
-                e.boolean(false);
-                e.u64(threshold);
+                e.u64(sequence).unwrap();
+                e.boolean(false).unwrap();
+                e.u64(threshold).unwrap();
                 Ok(())
             })
             .unwrap(),
@@ -326,8 +326,8 @@ fn semantic_ack_decoder_preserves_full_legacy_invalid_matrix_and_remote_codes() 
             18 => {
                 invalid.headers[2] = Header::object(ACTIVITY, |e| {
                     e.object(|e| {
-                        e.guid(&[3; 16]);
-                        e.u64(1);
+                        e.guid(&[3; 16]).unwrap();
+                        e.u64(1).unwrap();
                         Ok(())
                     })
                 })
@@ -335,9 +335,9 @@ fn semantic_ack_decoder_preserves_full_legacy_invalid_matrix_and_remote_codes() 
             }
             19 => {
                 invalid.headers[4] = Header::object(wire::FILE_SEQUENCE, |e| {
-                    e.u64(0);
-                    e.boolean(true);
-                    e.u64(4);
+                    e.u64(0).unwrap();
+                    e.boolean(true).unwrap();
+                    e.u64(4).unwrap();
                     Ok(())
                 })
                 .unwrap()
@@ -609,19 +609,19 @@ async fn delete_request(peer: &mut TcpStream, path: &str) -> Message {
     assert_ne!(p.id, MessageId::default());
     assert_eq!(request.protocol_version().unwrap(), Some((1, 2)));
     let forward = Header::object(0x8028, |e| {
-        e.i64(17);
+        e.i64(17).unwrap();
         e.string("ServiceRouteRequest")
     })
     .unwrap();
     let route = Header::object(0x802c, |e| {
-        e.i64(22);
+        e.i64(22).unwrap();
         e.string("DeleteAction")?;
         e.next_scope()?;
         e.object(|e| {
             e.object(|e| {
                 e.object(|e| {
                     e.string("__FabricSystem")?;
-                    e.u32(u32::MAX);
+                    e.u32(u32::MAX).unwrap();
                     Ok(())
                 })?;
                 e.string("FileStoreService")
@@ -631,7 +631,8 @@ async fn delete_request(peer: &mut TcpStream, path: &str) -> Message {
     })
     .unwrap();
     let partition = Header::object(0x8034, |e| {
-        e.guid(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x30, 0]);
+        e.guid(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x30, 0])
+            .unwrap();
         Ok(())
     })
     .unwrap();
@@ -908,41 +909,41 @@ async fn invalid_source_or_destination_never_deletes_and_keeps_connection() {
     let marker_fits = |destination: &str| {
         let headers = vec![
             Header::object(0x8001, |e| {
-                e.i64(26);
+                e.i64(26).unwrap();
                 Ok(())
             })
             .unwrap(),
             Header::object(0x8002, |e| e.string("FileCreate")).unwrap(),
             Header::object(0x8003, |e| {
-                e.guid(&[255; 16]);
-                e.u32(u32::MAX);
+                e.guid(&[255; 16]).unwrap();
+                e.u32(u32::MAX).unwrap();
                 Ok(())
             })
             .unwrap(),
             Header::object(0x8020, |e| {
                 e.object(|e| {
-                    e.guid(&[255; 16]);
-                    e.u64(0);
+                    e.guid(&[255; 16]).unwrap();
+                    e.u64(0).unwrap();
                     Ok(())
                 })
             })
             .unwrap(),
             Header::object(0x8025, |e| {
-                e.i64(1);
-                e.i64(2);
+                e.i64(1).unwrap();
+                e.i64(2).unwrap();
                 Ok(())
             })
             .unwrap(),
             Header::object(0x804f, |e| {
                 e.string("fabric:/System/ImageStoreService")?;
                 e.string(&format!("{destination}/_.dir"))?;
-                e.boolean(true);
-                e.u64(0);
+                e.boolean(true).unwrap();
+                e.u64(0).unwrap();
                 Ok(())
             })
             .unwrap(),
             Header::object(0x8023, |e| {
-                e.i64(i64::MAX);
+                e.i64(i64::MAX).unwrap();
                 Ok(())
             })
             .unwrap(),

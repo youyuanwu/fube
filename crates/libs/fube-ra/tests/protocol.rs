@@ -740,10 +740,11 @@ fn selected_bodies_reject_all_proper_prefixes_and_trailing_garbage() {
 }
 
 #[test]
-fn oversized_collections_are_explicit_errors() {
+fn initialization_above_legacy_collection_ceiling_roundtrips() {
     let mut body = AddInstance::default();
     body.service.initialization.0 = vec![0; 4097];
-    assert!(to_vec(&body).is_err());
+    let bytes = to_vec(&body).unwrap();
+    assert_eq!(from_slice::<AddInstance>(&bytes).unwrap(), body);
 }
 
 #[test]
@@ -1065,7 +1066,7 @@ fn notification_headers_reject_wrong_actions_destinations_and_missing_or_duplica
 }
 
 #[test]
-fn notification_collections_reject_truncation_trailing_data_and_codec_bound_overflow() {
+fn notification_collections_preserve_large_vectors_and_reject_malformed_data() {
     for body in [
         support::rich_notification(),
         support::partial_notification_reply(),
@@ -1083,7 +1084,8 @@ fn notification_collections_reject_truncation_trailing_data_and_codec_bound_over
     }
     let mut body = ServiceTypeNotification::default();
     body.infos.0 = vec![ServiceTypeInfo::default(); 4097];
-    assert!(service_type_notification_message(&body).is_err());
+    let message = service_type_notification_message(&body).unwrap();
+    assert_eq!(decode_service_type_notification(&message).unwrap(), body);
 }
 
 #[test]
@@ -1427,7 +1429,8 @@ fn complete_load_legacy_and_modern_map_scopes_roundtrip_and_reject_bad_node_ids(
         .unwrap();
         assert!(from_slice::<NodeLoads>(&bytes).is_err());
     }
-    let mut overflow = ReportLoad::default();
-    overflow.legacy.0 = vec![LegacyLoadReport::default(); 4097];
-    assert!(report_load_message(&overflow).is_err());
+    let mut large = ReportLoad::default();
+    large.legacy.0 = vec![LegacyLoadReport::default(); 4097];
+    let message = report_load_message(&large).unwrap();
+    assert_eq!(decode_report_load(&message).unwrap(), large);
 }

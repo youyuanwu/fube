@@ -27,34 +27,34 @@ fn result_for_service(
     service: &str,
 ) -> Vec<u8> {
     body(|e| {
-        e.boolean(group);
+        e.boolean(group).unwrap();
         e.object(|e| {
             e.object(|e| {
-                e.guid(&ID);
+                e.guid(&ID).unwrap();
                 Ok(())
             })?;
             e.string(service)?;
             e.object(|e| {
-                e.boolean(true);
-                e.boolean(true);
+                e.boolean(true).unwrap();
+                e.boolean(true).unwrap();
                 e.string("{opaque primary}")?;
-                e.u32(1);
+                e.u32(1).unwrap();
                 e.string("secondary")?;
-                e.i64(version);
+                e.i64(version).unwrap();
                 Ok(())
             })?;
-            e.boolean(true);
+            e.boolean(true).unwrap();
             Ok(())
         })?;
         e.object(|e| {
-            e.i64(kind);
-            e.i64(low);
-            e.i64(high);
+            e.i64(kind).unwrap();
+            e.i64(low).unwrap();
+            e.i64(high).unwrap();
             e.string(name)
         })?;
-        e.i64(11);
+        e.i64(11).unwrap();
         e.object(|e| {
-            e.i64(7);
+            e.i64(7).unwrap();
             e.byte_array(&[0; 16])
         })?;
         e.pointer(None, |_| unreachable!())?;
@@ -253,8 +253,8 @@ async fn groups_malformed_and_mismatched_replies_are_call_local() {
                     &neighbor,
                     "NameOperationReply",
                     body(|e| {
-                        e.boolean(true);
-                        e.i64(0);
+                        e.boolean(true).unwrap();
+                        e.i64(0).unwrap();
                         Ok(())
                     }),
                 ),

@@ -128,11 +128,11 @@ mod tests {
             match field {
                 0 => e.string("fabric:/应用")?,
                 1 => e.string("Type")?,
-                2 => e.i64(status),
+                2 => e.i64(status)?,
                 3 => e.string("/node/应用/work")?,
                 4 => e.string("/node/应用/log")?,
                 5 => e.string("/node/应用/temp")?,
-                6 => e.i64(health),
+                6 => e.i64(health)?,
                 _ => unreachable!(),
             }
         }
@@ -294,7 +294,7 @@ mod tests {
             let mut e = Encoder::new();
             e.object(|e| {
                 fields(e, count, 3, 1)?;
-                e.boolean(false);
+                e.boolean(false).unwrap();
                 Ok(())
             })
             .unwrap();
@@ -306,11 +306,11 @@ mod tests {
         let mut e = Encoder::new();
         e.object(|e| {
             e.object(|e| {
-                e.i64(1);
+                e.i64(1).unwrap();
                 e.string("fabric")
             })?;
             e.string("Type")?;
-            e.i64(3);
+            e.i64(3).unwrap();
             Ok(())
         })
         .unwrap();

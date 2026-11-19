@@ -142,36 +142,36 @@ pub(crate) mod tests {
     // ServiceModel/ServicePartitionInformation.h FABRIC_FIELDS_05.
     fn information(e: &mut Encoder, key: i64, low: i64, high: i64) -> fubst::Result<()> {
         e.object(|e| {
-            e.i64(key);
-            e.guid(&GUID_BYTES);
+            e.i64(key)?;
+            e.guid(&GUID_BYTES)?;
             e.string(if key == 3 { "named🦀" } else { "" })?;
-            e.i64(low);
-            e.i64(high);
+            e.i64(low)?;
+            e.i64(high)?;
             Ok(())
         })
     }
 
     // ServiceModel/ServicePartitionQueryResult.h FABRIC_FIELDS_09.
     fn base(e: &mut Encoder, kind: i64, key: i64, low: i64, high: i64) -> fubst::Result<()> {
-        e.i64(kind);
+        e.i64(kind)?;
         information(e, key, low, high)?;
-        e.i32(if kind == 1 { -1 } else { 0 });
-        e.u32(if kind == 2 { u32::MAX } else { 0 });
-        e.u32(if kind == 2 { 3 } else { 0 });
-        e.i64(65535);
-        e.i64(4);
+        e.i32(if kind == 1 { -1 } else { 0 })?;
+        e.u32(if kind == 2 { u32::MAX } else { 0 })?;
+        e.u32(if kind == 2 { 3 } else { 0 })?;
+        e.i64(65535)?;
+        e.i64(4)?;
         Ok(())
     }
 
     fn partition_fields(e: &mut Encoder, kind: i64, key: i64, suffix: usize) -> fubst::Result<()> {
         base(e, kind, key, i64::MIN, i64::MAX)?;
         if suffix >= 1 {
-            e.i64(i64::MAX);
+            e.i64(i64::MAX)?;
         }
         if suffix >= 2 {
             e.object(|e| {
-                e.i64(i64::MIN);
-                e.i64(i64::MAX);
+                e.i64(i64::MIN)?;
+                e.i64(i64::MAX)?;
                 Ok(())
             })?;
         }
@@ -303,7 +303,7 @@ pub(crate) mod tests {
             assert!(matches!(
                 decode_fields(|e| {
                     partition_fields(e, 2, 2, suffix)?;
-                    e.boolean(false);
+                    e.boolean(false)?;
                     Ok(())
                 }),
                 Err(Error::Protocol(_))
@@ -313,7 +313,7 @@ pub(crate) mod tests {
             decode_fields(|e| {
                 partition_fields(e, 2, 2, 1)?;
                 e.object(|e| {
-                    e.i64(1);
+                    e.i64(1)?;
                     Ok(())
                 })
             }),
@@ -321,7 +321,7 @@ pub(crate) mod tests {
         ));
         assert!(matches!(
             decode_fields(|e| {
-                e.i64(2);
+                e.i64(2)?;
                 information(e, 1, 0, 0)
             }),
             Err(Error::Protocol(_))
@@ -338,13 +338,13 @@ pub(crate) mod tests {
         }
         assert!(decode_fields(|e| base(e, 2, 2, 5, -5)).is_err());
         assert!(decode_fields(|e| {
-            e.i64(2);
+            e.i64(2)?;
             e.typed_object(&[1], |e| {
-                e.i64(1);
-                e.guid(&GUID_BYTES);
+                e.i64(1)?;
+                e.guid(&GUID_BYTES)?;
                 e.string("")?;
-                e.i64(0);
-                e.i64(0);
+                e.i64(0)?;
+                e.i64(0)?;
                 Ok(())
             })
         })
@@ -369,26 +369,26 @@ pub(crate) mod tests {
         for malformed in 0..3 {
             assert!(matches!(
                 decode_fields(|e| {
-                    e.i64(1);
+                    e.i64(1)?;
                     e.typed_object(if malformed == 0 { &[1] } else { &[] }, |e| {
-                        e.i64(1);
+                        e.i64(1)?;
                         if malformed == 1 {
                             e.byte_array(&GUID_BYTES)?;
                         } else if malformed == 2 {
                             e.string(ID)?;
                         } else {
-                            e.guid(&GUID_BYTES);
+                            e.guid(&GUID_BYTES)?;
                         }
                         e.string("")?;
-                        e.i64(0);
-                        e.i64(0);
+                        e.i64(0)?;
+                        e.i64(0)?;
                         Ok(())
                     })?;
-                    e.i32(1);
-                    e.u32(0);
-                    e.u32(0);
-                    e.i64(1);
-                    e.i64(1);
+                    e.i32(1)?;
+                    e.u32(0)?;
+                    e.u32(0)?;
+                    e.i64(1)?;
+                    e.i64(1)?;
                     Ok(())
                 }),
                 Err(Error::Protocol(_))
@@ -396,11 +396,11 @@ pub(crate) mod tests {
         }
         let mut e = Encoder::new();
         e.object(|e| {
-            e.i64(1);
-            e.guid(&[0; 16]);
+            e.i64(1)?;
+            e.guid(&[0; 16])?;
             e.string("")?;
-            e.i64(0);
-            e.i64(0);
+            e.i64(0)?;
+            e.i64(0)?;
             Ok(())
         })
         .unwrap();

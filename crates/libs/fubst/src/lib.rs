@@ -2,16 +2,70 @@
 //!
 //! [`Encoder`] and [`Decoder`] implement the supported positional wire format.
 //! The [`mod@serde`] module provides Serde mappings and explicit native adapters.
+//! Native field widths and enclosing extents are always checked. [`Limits`]
+//! optionally adds caller-selected byte and nesting policies; there are no
+//! additional default codec ceilings. Transport consumers own message-size
+//! policy and can bound encoding before buffer growth. Local policy exhaustion
+//! is [`Error::ResourceLimit`], not malformed wire input.
 
 mod error;
 pub mod serde;
 
 pub use error::{Error, Result};
 
+/// Legacy string bound retained for existing consumers' domain policies.
+/// The codec itself uses [`Limits`], not this ceiling.
 pub const MAX_STRING_UNITS: usize = 32_768;
+/// Legacy collection bound retained for existing consumers' domain policies.
+/// The codec itself uses [`Limits`], not this ceiling.
 pub const MAX_COLLECTION_COUNT: usize = 4_096;
+/// Legacy nesting bound; not a native wire limit or a default in [`Limits`].
 pub const MAX_DEPTH: usize = 32;
+/// Legacy object bound; the codec now uses native extents and [`Limits::max_bytes`].
 pub const MAX_OBJECT_SIZE: usize = 4 * 1024 * 1024;
+
+/// Local resource policy for one encoder or decoder, not native wire limits.
+///
+/// Defaults impose no additional byte or nesting ceiling beyond native field
+/// widths, enclosing extents, and platform representability. Transports should
+/// supply their own operation bounds. Allocation accounting is separate;
+/// Serde's allocation-budget callback can be combined with these limits.
+///
+/// Unknown-field traversal is iterative, but application callbacks and typed
+/// Serde implementations may recurse. Callers handling recursive schemas must
+/// select a suitable `max_depth` or otherwise manage their stack. This optional
+/// guard is Rust execution policy, not a native validity rule, and cannot bound
+/// recursion performed entirely inside custom application code.
+///
+/// ```
+/// use fubst::{serde::{from_slice_with_limits, to_vec_with_limits}, Limits};
+///
+/// let limits = Limits { max_bytes: 1024, max_depth: 8 };
+/// let bytes = to_vec_with_limits("hello", limits)?;
+/// assert_eq!(from_slice_with_limits::<String>(&bytes, limits)?, "hello");
+/// # Ok::<(), fubst::Error>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Aggregate encoded bytes, including framing, across all root values.
+    /// Defaults to `usize::MAX` (no additional policy ceiling).
+    /// Zero permits no encoded values.
+    pub max_bytes: usize,
+    /// Optional execution-policy bound on simultaneously open native objects.
+    /// Defaults to `usize::MAX` (no additional policy ceiling).
+    /// Zero permits scalar values but no objects.
+    /// Also bounds traversal-stack growth when skipping unknown objects.
+    pub max_depth: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_bytes: usize::MAX,
+            max_depth: usize::MAX,
+        }
+    }
+}
 
 const OBJECT: u8 = 0x00;
 const SCOPE_BEGIN: u8 = 0x1f;
@@ -33,16 +87,30 @@ const UINT32_ARRAY: u8 = 0x88;
 const TRUE: u8 = 0x42;
 const FALSE: u8 = 0x72;
 
-/// The explicit native serializer subset used by the clear-TCP POC.
+/// The supported native serializer with per-operation resource limits.
 #[derive(Default)]
 pub struct Encoder {
     bytes: Vec<u8>,
-    depth: usize,
+    objects: Vec<ObjectState>,
+    limits: Limits,
+}
+
+struct ObjectState {
+    start: usize,
+    // Reserve closing delimiters for this object and every open ancestor.
+    limit: usize,
 }
 
 impl Encoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_limits(limits: Limits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
     }
 
     pub fn finish(self) -> Vec<u8> {
@@ -59,55 +127,125 @@ impl Encoder {
         type_info: &[u8],
         f: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
+        let depth = self.objects.len();
         let start = self.begin_object(type_info)?;
         let result = f(self);
         if let Err(error) = result {
-            self.bytes.truncate(start);
-            self.depth -= 1;
+            self.rollback(start, depth);
             return Err(error);
         }
         self.end_object(start)
     }
 
     fn begin_object(&mut self, type_info: &[u8]) -> Result<usize> {
-        if self.depth >= MAX_DEPTH {
-            return Err(Error::InvalidInput("object nesting limit exceeded"));
+        if self.objects.len() >= self.limits.max_depth {
+            return Err(Error::ResourceLimit("object nesting"));
         }
-        if type_info.len() > MAX_COLLECTION_COUNT {
-            return Err(Error::InvalidInput("type-information limit exceeded"));
+        self.check_count(type_info.len())?;
+        let tag_len = if type_info.is_empty() {
+            0
+        } else {
+            type_info
+                .len()
+                .checked_add(unsigned_payload_len(type_info.len() as u64))
+                .ok_or(Error::ResourceLimit("object size"))?
+        };
+        let prefix_len = 10usize
+            .checked_add(tag_len)
+            .ok_or(Error::ResourceLimit("object size"))?;
+        let max_size = u32::MAX as usize;
+        if prefix_len > max_size - 1 {
+            return Err(Error::InvalidInput("native object extent exceeds UInt32"));
         }
         let start = self.bytes.len();
+        self.reserve(
+            prefix_len
+                .checked_add(2)
+                .ok_or(Error::ResourceLimit("encoded size"))?,
+        )?;
+        let limit = start
+            .saturating_add(max_size)
+            .saturating_add(1)
+            .min(self.write_limit())
+            - 2;
+        self.objects
+            .try_reserve(1)
+            .map_err(|_| Error::ResourceLimit("object stack allocation"))?;
         // Marker, little-endian size, flags, and three deterministic pad bytes.
         self.bytes.extend_from_slice(&[0; 9]);
         if !type_info.is_empty() {
             self.bytes[start + 5] = 1;
-            self.write_unsigned_payload(type_info.len() as u64);
+            self.write_unsigned_payload(type_info.len() as u64)?;
             self.bytes.extend_from_slice(type_info);
         }
         self.bytes.push(SCOPE_BEGIN);
-        self.depth += 1;
+        self.objects.push(ObjectState { start, limit });
         Ok(start)
     }
 
     fn end_object(&mut self, start: usize) -> Result<()> {
-        self.depth -= 1;
-        self.bytes.extend_from_slice(&[SCOPE_END, OBJECT_END]);
-        let size = self.bytes.len() - start - 1;
-        if size > MAX_OBJECT_SIZE {
+        let object = self.objects.pop().expect("an object is open");
+        debug_assert_eq!(object.start, start);
+        if self.bytes.len() > object.limit {
             self.bytes.truncate(start);
-            return Err(Error::InvalidInput("object size limit exceeded"));
+            return Err(Error::ResourceLimit("object size"));
         }
+        if let Err(error) = self.write(&[SCOPE_END, OBJECT_END]) {
+            self.bytes.truncate(start);
+            return Err(error);
+        }
+        let size = self.bytes.len() - start - 1;
         self.bytes[start + 1..start + 5].copy_from_slice(&(size as u32).to_le_bytes());
+        Ok(())
+    }
+
+    fn rollback(&mut self, start: usize, depth: usize) {
+        self.bytes.truncate(start);
+        self.objects.truncate(depth);
+    }
+
+    fn write_limit(&self) -> usize {
+        self.objects
+            .last()
+            .map_or(self.limits.max_bytes, |object| object.limit)
+    }
+
+    fn reserve(&mut self, additional: usize) -> Result<()> {
+        let limit = self.write_limit();
+        let end = self
+            .bytes
+            .len()
+            .checked_add(additional)
+            .filter(|&end| end <= limit)
+            .ok_or(Error::ResourceLimit("encoded size"))?;
+        if end > self.bytes.capacity() {
+            let capacity = end.max(self.bytes.capacity().saturating_mul(2)).min(limit);
+            self.bytes
+                .try_reserve_exact(capacity - self.bytes.len())
+                .map_err(|_| Error::ResourceLimit("encoded buffer allocation"))?;
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.reserve(bytes.len())?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn check_count(&self, count: usize) -> Result<()> {
+        if count > u32::MAX as usize {
+            return Err(Error::InvalidInput("native count exceeds UInt32"));
+        }
         Ok(())
     }
 
     /// End the current base scope and begin a derived scope.
     pub fn next_scope(&mut self) -> Result<()> {
-        if self.depth == 0 {
+        if self.objects.is_empty() {
             return Err(Error::InvalidInput("scope requires an object"));
         }
-        self.bytes.extend_from_slice(&[SCOPE_END, SCOPE_BEGIN]);
-        Ok(())
+        self.write(&[SCOPE_END, SCOPE_BEGIN])
     }
 
     /// A nullable object pointer; `None` emits the native empty-pointer marker.
@@ -118,13 +256,13 @@ impl Encoder {
     ) -> Result<()> {
         let start = self.bytes.len();
         if let Some(type_info) = type_info {
-            self.bytes.push(POINTER);
+            self.write(&[POINTER])?;
             if let Err(error) = self.typed_object(type_info, f) {
                 self.bytes.truncate(start);
                 return Err(error);
             }
         } else {
-            self.bytes.push(POINTER | EMPTY);
+            self.write(&[POINTER | EMPTY])?;
         }
         Ok(())
     }
@@ -147,101 +285,124 @@ impl Encoder {
     }
 
     fn object_array_header(&mut self, count: usize) -> Result<()> {
-        if count > MAX_COLLECTION_COUNT {
-            return Err(Error::InvalidInput("object-array count limit exceeded"));
-        }
+        self.check_count(count)?;
         if count == 0 {
-            self.bytes.push(OBJECT_ARRAY | EMPTY);
+            self.write(&[OBJECT_ARRAY | EMPTY])
         } else {
-            self.bytes.push(OBJECT_ARRAY);
-            self.write_unsigned_payload(count as u64);
+            self.unsigned_with_metadata(Some(OBJECT_ARRAY), count as u64)
         }
-        Ok(())
     }
 
     /// Encode a native compressed UInt16, including its scalar metadata.
-    pub fn u16(&mut self, value: u16) {
-        self.unsigned(UINT16, u64::from(value));
+    pub fn u16(&mut self, value: u16) -> Result<()> {
+        self.unsigned(UINT16, u64::from(value))
     }
 
-    pub fn i32(&mut self, value: i32) {
-        self.signed(INT32, i64::from(value));
+    pub fn i32(&mut self, value: i32) -> Result<()> {
+        self.signed(INT32, i64::from(value))
     }
 
-    pub fn u32(&mut self, value: u32) {
-        self.unsigned(UINT32, u64::from(value));
+    pub fn u32(&mut self, value: u32) -> Result<()> {
+        self.unsigned(UINT32, u64::from(value))
     }
 
     /// Native ULONG vector: array metadata, compressed count, then compressed
     /// payloads without scalar metadata (including a byte for zero elements).
     pub fn u32_array(&mut self, values: &[u32]) -> Result<()> {
+        self.check_count(values.len())?;
+        if !values.is_empty()
+            && values.len()
+                > self
+                    .write_limit()
+                    .saturating_sub(self.bytes.len())
+                    .saturating_sub(1 + unsigned_payload_len(values.len() as u64))
+        {
+            return Err(Error::ResourceLimit("encoded size"));
+        }
+        let size = if values.is_empty() {
+            1
+        } else {
+            values.iter().try_fold(
+                1 + unsigned_payload_len(values.len() as u64),
+                |size, &value| {
+                    size.checked_add(unsigned_payload_len(u64::from(value)))
+                        .ok_or(Error::ResourceLimit("encoded size"))
+                },
+            )?
+        };
+        self.reserve(size)?;
         self.u32_array_header(values.len())?;
         for &value in values {
-            self.write_unsigned_payload(u64::from(value));
+            self.write_unsigned_payload(u64::from(value))?;
         }
         Ok(())
     }
 
     fn u32_array_header(&mut self, count: usize) -> Result<()> {
-        if count > MAX_COLLECTION_COUNT {
-            return Err(Error::InvalidInput("UInt32-array count limit exceeded"));
-        }
+        self.check_count(count)?;
         if count == 0 {
-            self.bytes.push(UINT32_ARRAY | EMPTY);
+            self.write(&[UINT32_ARRAY | EMPTY])
         } else {
-            self.bytes.push(UINT32_ARRAY);
-            self.write_unsigned_payload(count as u64);
+            self.unsigned_with_metadata(Some(UINT32_ARRAY), count as u64)
         }
-        Ok(())
     }
 
-    pub fn i64(&mut self, value: i64) {
-        self.signed(INT64, value);
+    pub fn i64(&mut self, value: i64) -> Result<()> {
+        self.signed(INT64, value)
     }
 
-    pub fn u64(&mut self, value: u64) {
-        self.unsigned(UINT64, value);
+    pub fn u64(&mut self, value: u64) -> Result<()> {
+        self.unsigned(UINT64, value)
     }
 
     /// Native x86-64 IEEE Double; both signed zeros use the empty marker.
-    pub fn f64(&mut self, value: f64) {
+    pub fn f64(&mut self, value: f64) -> Result<()> {
         if value == 0.0 {
-            self.bytes.push(DOUBLE | EMPTY);
+            self.write(&[DOUBLE | EMPTY])
         } else {
-            self.bytes.push(DOUBLE);
-            self.bytes.extend_from_slice(&value.to_le_bytes());
+            let mut bytes = [DOUBLE; 9];
+            bytes[1..].copy_from_slice(&value.to_le_bytes());
+            self.write(&bytes)
         }
     }
 
-    pub fn boolean(&mut self, value: bool) {
-        self.bytes.push(if value { TRUE } else { FALSE });
+    pub fn boolean(&mut self, value: bool) -> Result<()> {
+        self.write(&[if value { TRUE } else { FALSE }])
     }
 
     /// Accepts the native Windows-order GUID bytes without reordering them.
-    pub fn guid(&mut self, value: &[u8; 16]) {
+    pub fn guid(&mut self, value: &[u8; 16]) -> Result<()> {
         if *value == [0; 16] {
-            self.bytes.push(GUID | EMPTY);
+            self.write(&[GUID | EMPTY])
         } else {
-            self.bytes.push(GUID);
-            self.bytes.extend_from_slice(value);
+            let mut bytes = [GUID; 17];
+            bytes[1..].copy_from_slice(value);
+            self.write(&bytes)
         }
     }
 
     pub fn string(&mut self, value: &str) -> Result<()> {
         // At most three UTF-8 bytes per UTF-16 code unit. Reject oversized
         // caller buffers before scanning them; encoding work stays bounded too.
-        if value.len() > MAX_STRING_UNITS * 3 {
-            return Err(Error::InvalidInput("string code-unit limit exceeded"));
+        let maximum =
+            (self.write_limit().saturating_sub(self.bytes.len()) / 2).min(u32::MAX as usize);
+        if value.len() > maximum.saturating_mul(3) {
+            return Err(Error::ResourceLimit("string code units"));
         }
         let count = value.encode_utf16().count();
-        if count > MAX_STRING_UNITS {
-            return Err(Error::InvalidInput("string code-unit limit exceeded"));
+        if count > maximum {
+            return Err(Error::ResourceLimit("string code units"));
         }
         if count == 0 {
-            self.bytes.push(STRING | EMPTY);
+            self.write(&[STRING | EMPTY])?;
         } else {
+            let size = count
+                .checked_mul(2)
+                .and_then(|size| size.checked_add(1 + unsigned_payload_len(count as u64)))
+                .ok_or(Error::ResourceLimit("encoded size"))?;
+            self.reserve(size)?;
             self.bytes.push(STRING);
-            self.write_unsigned_payload(count as u64);
+            self.write_unsigned_payload(count as u64)?;
             for unit in value.encode_utf16() {
                 self.bytes.extend_from_slice(&unit.to_le_bytes());
             }
@@ -250,26 +411,27 @@ impl Encoder {
     }
 
     pub fn byte_array(&mut self, value: &[u8]) -> Result<()> {
-        if value.len() > MAX_COLLECTION_COUNT {
-            return Err(Error::InvalidInput("byte-array count limit exceeded"));
-        }
+        self.check_count(value.len())?;
         if value.is_empty() {
-            self.bytes.push(BYTE_ARRAY | EMPTY);
+            self.write(&[BYTE_ARRAY | EMPTY])?;
         } else {
+            let size = value
+                .len()
+                .checked_add(1 + unsigned_payload_len(value.len() as u64))
+                .ok_or(Error::ResourceLimit("encoded size"))?;
+            self.reserve(size)?;
             self.bytes.push(BYTE_ARRAY);
-            self.write_unsigned_payload(value.len() as u64);
+            self.write_unsigned_payload(value.len() as u64)?;
             self.bytes.extend_from_slice(value);
         }
         Ok(())
     }
 
-    fn signed(&mut self, metadata: u8, mut value: i64) {
+    fn signed(&mut self, metadata: u8, mut value: i64) -> Result<()> {
         if value == 0 {
-            self.bytes.push(metadata | EMPTY);
-            return;
+            return self.write(&[metadata | EMPTY]);
         }
-        self.bytes.push(metadata);
-        let mut payload = [0; 10];
+        let mut payload = [0; 11];
         let mut start = payload.len();
         loop {
             let byte = (value & 0x7f) as u8;
@@ -280,20 +442,28 @@ impl Encoder {
                 break;
             }
         }
-        self.write_groups(&payload[start..]);
+        for byte in &mut payload[start..10] {
+            *byte |= 0x80;
+        }
+        start -= 1;
+        payload[start] = metadata;
+        self.write(&payload[start..])
     }
 
-    fn unsigned(&mut self, metadata: u8, value: u64) {
+    fn unsigned(&mut self, metadata: u8, value: u64) -> Result<()> {
         if value == 0 {
-            self.bytes.push(metadata | EMPTY);
+            self.write(&[metadata | EMPTY])
         } else {
-            self.bytes.push(metadata);
-            self.write_unsigned_payload(value);
+            self.unsigned_with_metadata(Some(metadata), value)
         }
     }
 
-    fn write_unsigned_payload(&mut self, mut value: u64) {
-        let mut payload = [0; 10];
+    fn write_unsigned_payload(&mut self, value: u64) -> Result<()> {
+        self.unsigned_with_metadata(None, value)
+    }
+
+    fn unsigned_with_metadata(&mut self, metadata: Option<u8>, mut value: u64) -> Result<()> {
+        let mut payload = [0; 11];
         let mut start = payload.len();
         loop {
             start -= 1;
@@ -303,15 +473,19 @@ impl Encoder {
                 break;
             }
         }
-        self.write_groups(&payload[start..]);
-    }
-
-    fn write_groups(&mut self, payload: &[u8]) {
-        for (index, &byte) in payload.iter().enumerate() {
-            self.bytes
-                .push(byte | if index + 1 < payload.len() { 0x80 } else { 0 });
+        for byte in &mut payload[start..10] {
+            *byte |= 0x80;
         }
+        if let Some(metadata) = metadata {
+            start -= 1;
+            payload[start] = metadata;
+        }
+        self.write(&payload[start..])
     }
+}
+
+fn unsigned_payload_len(value: u64) -> usize {
+    (u64::BITS - value.leading_zeros()).max(1).div_ceil(7) as usize
 }
 
 /// A bounded reader for supported positional native values, not a general
@@ -321,6 +495,14 @@ pub struct Decoder<'a> {
     position: usize,
     limit: usize,
     depth: usize,
+    limits: Limits,
+}
+
+#[derive(Clone, Copy)]
+enum SkipFrame {
+    Scope,
+    Object { end: usize, outer_limit: usize },
+    Array { remaining: usize },
 }
 
 impl<'a> Decoder<'a> {
@@ -330,7 +512,19 @@ impl<'a> Decoder<'a> {
             position: 0,
             limit: bytes.len(),
             depth: 0,
+            limits: Limits::default(),
         }
+    }
+
+    /// Reject oversized input before any value is decoded or allocated.
+    pub fn with_limits(bytes: &'a [u8], limits: Limits) -> Result<Self> {
+        if bytes.len() > limits.max_bytes {
+            return Err(Error::ResourceLimit("encoded input size"));
+        }
+        Ok(Self {
+            limits,
+            ..Self::new(bytes)
+        })
     }
 
     pub fn finish(self) -> Result<()> {
@@ -404,7 +598,7 @@ impl<'a> Decoder<'a> {
         match self.byte()? {
             metadata if metadata == OBJECT_ARRAY | EMPTY => Ok(0),
             OBJECT_ARRAY => {
-                let count = self.count(MAX_COLLECTION_COUNT)?;
+                let count = self.count()?;
                 // Even a fieldless object occupies marker + header + delimiters.
                 if count > (self.limit - self.position) / 12 {
                     return Err(Error::Protocol("object-array exceeds enclosing extent"));
@@ -440,7 +634,7 @@ impl<'a> Decoder<'a> {
         match self.byte()? {
             metadata if metadata == UINT32_ARRAY | EMPTY => Ok(0),
             UINT32_ARRAY => {
-                let count = self.count(MAX_COLLECTION_COUNT)?;
+                let count = self.count()?;
                 if count > self.limit - self.position {
                     return Err(Error::Protocol("UInt32-array exceeds enclosing extent"));
                 }
@@ -495,10 +689,11 @@ impl<'a> Decoder<'a> {
         reserve: &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<String> {
         let bytes = self.string_bytes()?;
-        let length = Self::characters(bytes).try_fold(0, |length, character| {
-            character
-                .map(|character| length + character.len_utf8())
-                .map_err(|_| Error::Protocol("invalid UTF-16 string"))
+        let length = Self::characters(bytes).try_fold(0usize, |length, character| {
+            let character = character.map_err(|_| Error::Protocol("invalid UTF-16 string"))?;
+            length
+                .checked_add(character.len_utf8())
+                .ok_or(Error::ResourceLimit("decoded string length"))
         })?;
         reserve(length)?;
         let mut value = String::with_capacity(length);
@@ -512,15 +707,15 @@ impl<'a> Decoder<'a> {
         Ok(self.byte_array_bytes()?.to_vec())
     }
 
-    fn read_object<T>(&mut self, f: impl FnOnce(&mut Self, &'a [u8]) -> Result<T>) -> Result<T> {
-        if self.depth >= MAX_DEPTH {
-            return Err(Error::Protocol("object nesting limit exceeded"));
+    fn begin_object(&mut self) -> Result<&'a [u8]> {
+        if self.depth >= self.limits.max_depth {
+            return Err(Error::ResourceLimit("object nesting"));
         }
         self.expect(OBJECT)?;
         let extent_start = self.position;
         let header = self.take(8)?;
         let size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        if !(11..=MAX_OBJECT_SIZE).contains(&size) {
+        if size < 11 {
             return Err(Error::Protocol("invalid object size"));
         }
         let end = extent_start
@@ -536,7 +731,7 @@ impl<'a> Decoder<'a> {
         self.limit = end;
         self.depth += 1;
         let type_info = if flags == 1 {
-            let count = self.count(MAX_COLLECTION_COUNT)?;
+            let count = self.count()?;
             if count == 0 {
                 return Err(Error::Protocol("empty object type information"));
             }
@@ -545,47 +740,116 @@ impl<'a> Decoder<'a> {
             &[]
         };
         self.expect(SCOPE_BEGIN)?;
+        Ok(type_info)
+    }
+
+    fn read_object<T>(&mut self, f: impl FnOnce(&mut Self, &'a [u8]) -> Result<T>) -> Result<T> {
+        let type_info = self.begin_object()?;
+        let end = self.limit;
         let value = f(self, type_info)?;
         self.finish_scope()?;
         while self.peek()? == SCOPE_BEGIN {
             self.byte()?;
             self.finish_scope()?;
         }
+        self.end_object(end)?;
+        Ok(value)
+    }
+
+    fn end_object(&mut self, end: usize) -> Result<()> {
         self.expect(OBJECT_END)?;
         if self.position != end {
             return Err(Error::Protocol(
                 "object size does not match consumed extent",
             ));
         }
-        Ok(value)
+        Ok(())
     }
 
     fn finish_scope(&mut self) -> Result<()> {
+        let outer_limit = self.limit;
+        let outer_depth = self.depth;
+        let result = self.skip_scope();
+        self.limit = outer_limit;
+        self.depth = outer_depth;
+        result
+    }
+
+    fn skip_scope(&mut self) -> Result<()> {
+        let mut stack = Vec::new();
         loop {
-            match self.peek()? {
-                SCOPE_END => {
-                    self.byte()?;
-                    return Ok(());
+            match stack.last().copied().unwrap_or(SkipFrame::Scope) {
+                SkipFrame::Scope => match self.peek()? {
+                    SCOPE_END => {
+                        self.byte()?;
+                        if stack.pop().is_none() {
+                            return Ok(());
+                        }
+                    }
+                    SCOPE_BEGIN | OBJECT_END => {
+                        return Err(Error::Protocol("unexpected scope or object delimiter"));
+                    }
+                    OBJECT => self.begin_skipped_object(&mut stack)?,
+                    POINTER | 0x41 => {
+                        if self.byte()? == POINTER {
+                            self.begin_skipped_object(&mut stack)?;
+                        }
+                    }
+                    OBJECT_ARRAY | 0xc0 => {
+                        let remaining = self.object_array_count()?;
+                        if remaining != 0 {
+                            stack
+                                .try_reserve(1)
+                                .map_err(|_| Error::ResourceLimit("skip stack allocation"))?;
+                            stack.push(SkipFrame::Array { remaining });
+                        }
+                    }
+                    _ => self.skip_scalar_value()?,
+                },
+                SkipFrame::Object { end, outer_limit } => {
+                    if self.peek()? == SCOPE_BEGIN {
+                        self.byte()?;
+                        stack
+                            .try_reserve(1)
+                            .map_err(|_| Error::ResourceLimit("skip stack allocation"))?;
+                        stack.push(SkipFrame::Scope);
+                    } else {
+                        self.end_object(end)?;
+                        self.limit = outer_limit;
+                        self.depth -= 1;
+                        stack.pop();
+                    }
                 }
-                SCOPE_BEGIN | OBJECT_END => {
-                    return Err(Error::Protocol("unexpected scope or object delimiter"));
+                SkipFrame::Array { remaining } => {
+                    if remaining == 0 {
+                        stack.pop();
+                    } else {
+                        *stack.last_mut().expect("an array is open") = SkipFrame::Array {
+                            remaining: remaining - 1,
+                        };
+                        self.begin_skipped_object(&mut stack)?;
+                    }
                 }
-                _ => self.skip_value()?,
             }
         }
     }
 
-    fn skip_value(&mut self) -> Result<()> {
+    fn begin_skipped_object(&mut self, stack: &mut Vec<SkipFrame>) -> Result<()> {
+        let outer_limit = self.limit;
+        self.begin_object()?;
+        stack
+            .try_reserve(2)
+            .map_err(|_| Error::ResourceLimit("skip stack allocation"))?;
+        stack.push(SkipFrame::Object {
+            end: self.limit,
+            outer_limit,
+        });
+        stack.push(SkipFrame::Scope);
+        Ok(())
+    }
+
+    fn skip_scalar_value(&mut self) -> Result<()> {
         match self.peek()? {
-            OBJECT => self.object(|_| Ok(())),
-            POINTER | 0x41 => self.pointer(|_, _| Ok(())).map(|_| ()),
-            OBJECT_ARRAY | 0xc0 => {
-                let count = self.object_array_count()?;
-                for _ in 0..count {
-                    self.object(|_| Ok(()))?;
-                }
-                Ok(())
-            }
             UINT16 | 0x46 => self.u16().map(|_| ()),
             INT32 | 0x47 => self.i32().map(|_| ()),
             UINT32 | 0x48 => self.u32().map(|_| ()),
@@ -664,19 +928,15 @@ impl<'a> Decoder<'a> {
         Err(Error::Protocol("too many unsigned integer groups"))
     }
 
-    fn count(&mut self, maximum: usize) -> Result<usize> {
-        let count = self.read_unsigned_payload(32)? as usize;
-        if count > maximum {
-            return Err(Error::Protocol("collection count limit exceeded"));
-        }
-        Ok(count)
+    fn count(&mut self) -> Result<usize> {
+        Ok(self.read_unsigned_payload(32)? as usize)
     }
 
     fn string_bytes(&mut self) -> Result<&'a [u8]> {
         match self.byte()? {
             metadata if metadata == STRING | EMPTY => Ok(&[]),
             STRING => {
-                let count = self.count(MAX_STRING_UNITS)?;
+                let count = self.count()?;
                 let length = count
                     .checked_mul(2)
                     .ok_or(Error::Protocol("string length overflow"))?;
@@ -702,7 +962,7 @@ impl<'a> Decoder<'a> {
         match self.byte()? {
             metadata if metadata == BYTE_ARRAY | EMPTY => Ok(&[]),
             BYTE_ARRAY => {
-                let count = self.count(MAX_COLLECTION_COUNT)?;
+                let count = self.count()?;
                 self.take(count)
             }
             _ => Err(Error::Protocol("expected byte-array metadata")),
@@ -717,6 +977,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn peek(&self) -> Result<u8> {
+        if self.bytes.len() > self.limits.max_bytes {
+            return Err(Error::ResourceLimit("encoded input size"));
+        }
         if self.position >= self.limit {
             return Err(Error::Protocol("truncated serialized value"));
         }
@@ -730,6 +993,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn take(&mut self, length: usize) -> Result<&'a [u8]> {
+        if self.bytes.len() > self.limits.max_bytes {
+            return Err(Error::ResourceLimit("encoded input size"));
+        }
         let end = self
             .position
             .checked_add(length)
@@ -785,10 +1051,10 @@ mod tests {
             .object(|encoder| {
                 encoder.pointer(None, |_| panic!("null pointer callback"))?;
                 encoder.pointer(Some(&[0x1f, 0x2f, 0x3f]), |encoder| {
-                    encoder.u16(u16::MAX);
+                    encoder.u16(u16::MAX).unwrap();
                     encoder.next_scope()?;
                     encoder.object_array(&[0u16, 127, 128, 32768], |encoder, value| {
-                        encoder.u16(*value);
+                        encoder.u16(*value).unwrap();
                         Ok(())
                     })
                 })
@@ -839,12 +1105,15 @@ mod tests {
         assert!(Decoder::new(&[]).next_scope().is_err());
         assert!(Encoder::new().next_scope().is_err());
         let mut encoder = Encoder::new();
-        encoder.u16(42);
+        encoder.u16(42).unwrap();
         assert!(encoder
             .pointer(Some(&[]), |_| Err(Error::InvalidInput("model failure")))
             .is_err());
         assert_eq!(Decoder::new(&encoder.finish()).u16().unwrap(), 42);
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::with_limits(Limits {
+            max_bytes: MAX_COLLECTION_COUNT,
+            ..Limits::default()
+        });
         assert!(encoder
             .object_array(&vec![0; MAX_COLLECTION_COUNT + 1], |_, _| Ok(()))
             .is_err());
@@ -873,7 +1142,7 @@ mod tests {
     fn counted(metadata: u8, count: u64, payload: &[u8]) -> Vec<u8> {
         encode(|encoder| {
             encoder.bytes.push(metadata);
-            encoder.write_unsigned_payload(count);
+            encoder.write_unsigned_payload(count).unwrap();
             encoder.bytes.extend_from_slice(payload);
         })
     }
@@ -886,12 +1155,12 @@ mod tests {
             signed.extend([boundary - 1, boundary, -boundary, -boundary - 1]);
         }
         for value in signed {
-            let bytes = encode(|encoder| encoder.i64(value));
+            let bytes = encode(|encoder| encoder.i64(value).unwrap());
             let mut decoder = Decoder::new(&bytes);
             assert_eq!(decoder.i64().unwrap(), value);
             decoder.finish().unwrap();
             if let Ok(value) = i32::try_from(value) {
-                let bytes = encode(|encoder| encoder.i32(value));
+                let bytes = encode(|encoder| encoder.i32(value).unwrap());
                 let mut decoder = Decoder::new(&bytes);
                 assert_eq!(decoder.i32().unwrap(), value);
                 decoder.finish().unwrap();
@@ -903,12 +1172,12 @@ mod tests {
             unsigned.extend([boundary - 1, boundary]);
         }
         for value in unsigned {
-            let bytes = encode(|encoder| encoder.u64(value));
+            let bytes = encode(|encoder| encoder.u64(value).unwrap());
             let mut decoder = Decoder::new(&bytes);
             assert_eq!(decoder.u64().unwrap(), value);
             decoder.finish().unwrap();
             if let Ok(value) = u32::try_from(value) {
-                let bytes = encode(|encoder| encoder.u32(value));
+                let bytes = encode(|encoder| encoder.u32(value).unwrap());
                 let mut decoder = Decoder::new(&bytes);
                 assert_eq!(decoder.u32().unwrap(), value);
                 decoder.finish().unwrap();
@@ -920,14 +1189,14 @@ mod tests {
     fn empty_scalars_booleans_and_guids_round_trip() {
         let guid = std::array::from_fn(|index| index as u8);
         let bytes = encode(|encoder| {
-            encoder.i32(0);
-            encoder.u32(0);
-            encoder.i64(0);
-            encoder.u64(0);
-            encoder.boolean(true);
-            encoder.boolean(false);
-            encoder.guid(&[0; 16]);
-            encoder.guid(&guid);
+            encoder.i32(0).unwrap();
+            encoder.u32(0).unwrap();
+            encoder.i64(0).unwrap();
+            encoder.u64(0).unwrap();
+            encoder.boolean(true).unwrap();
+            encoder.boolean(false).unwrap();
+            encoder.guid(&[0; 16]).unwrap();
+            encoder.guid(&guid).unwrap();
             encoder.string("").unwrap();
             encoder.byte_array(&[]).unwrap();
         });
@@ -981,10 +1250,10 @@ mod tests {
             encoder
                 .object(|encoder| {
                     encoder.object(|encoder| {
-                        encoder.u32(128);
+                        encoder.u32(128).unwrap();
                         Ok(())
                     })?;
-                    encoder.i32(-65);
+                    encoder.i32(-65).unwrap();
                     Ok(())
                 })
                 .unwrap();
@@ -1008,6 +1277,10 @@ mod tests {
 
     #[test]
     fn nested_depth_limit_is_checked_for_readers_and_writers() {
+        let limits = Limits {
+            max_depth: MAX_DEPTH,
+            ..Limits::default()
+        };
         fn write_nested(encoder: &mut Encoder, count: usize) -> Result<()> {
             encoder.object(|encoder| {
                 if count > 1 {
@@ -1024,25 +1297,32 @@ mod tests {
                 Ok(())
             })
         }
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::with_limits(limits);
         write_nested(&mut encoder, MAX_DEPTH).unwrap();
         let bytes = encoder.finish();
-        let mut decoder = Decoder::new(&bytes);
+        let mut decoder = Decoder::with_limits(&bytes, limits).unwrap();
         read_nested(&mut decoder, MAX_DEPTH).unwrap();
         decoder.finish().unwrap();
-        let mut decoder = Decoder::new(&bytes);
+        let mut decoder = Decoder::with_limits(&bytes, limits).unwrap();
         decoder.object(|_| Ok(())).unwrap();
         decoder.finish().unwrap();
 
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::with_limits(limits);
         assert!(matches!(
             write_nested(&mut encoder, MAX_DEPTH + 1),
-            Err(Error::InvalidInput(_))
+            Err(Error::ResourceLimit(_))
         ));
         assert!(encoder.finish().is_empty());
         let too_deep = object_bytes(&bytes);
-        assert!(read_nested(&mut Decoder::new(&too_deep), MAX_DEPTH + 1).is_err());
-        assert!(Decoder::new(&too_deep).object(|_| Ok(())).is_err());
+        assert!(read_nested(
+            &mut Decoder::with_limits(&too_deep, limits).unwrap(),
+            MAX_DEPTH + 1
+        )
+        .is_err());
+        assert!(Decoder::with_limits(&too_deep, limits)
+            .unwrap()
+            .object(|_| Ok(()))
+            .is_err());
     }
 
     #[test]
@@ -1050,16 +1330,16 @@ mod tests {
         let bytes = encode(|encoder| {
             encoder
                 .object(|encoder| {
-                    encoder.i32(i32::MIN);
-                    encoder.u32(u32::MAX);
-                    encoder.i64(i64::MIN);
-                    encoder.u64(u64::MAX);
-                    encoder.boolean(true);
-                    encoder.guid(&[0x3f; 16]);
+                    encoder.i32(i32::MIN).unwrap();
+                    encoder.u32(u32::MAX).unwrap();
+                    encoder.i64(i64::MIN).unwrap();
+                    encoder.u64(u64::MAX).unwrap();
+                    encoder.boolean(true).unwrap();
+                    encoder.guid(&[0x3f; 16]).unwrap();
                     encoder.string("x🦀").unwrap();
                     encoder.byte_array(&[0x1f, 0x2f, 0x3f]).unwrap();
                     encoder.object(|encoder| {
-                        encoder.i64(-65);
+                        encoder.i64(-65).unwrap();
                         Ok(())
                     })
                 })
@@ -1087,11 +1367,11 @@ mod tests {
             .unwrap();
         assert!(visited);
         let values = [
-            encode(|encoder| encoder.i32(i32::MIN)),
-            encode(|encoder| encoder.u32(u32::MAX)),
-            encode(|encoder| encoder.i64(i64::MIN)),
-            encode(|encoder| encoder.u64(u64::MAX)),
-            encode(|encoder| encoder.guid(&[1; 16])),
+            encode(|encoder| encoder.i32(i32::MIN).unwrap()),
+            encode(|encoder| encoder.u32(u32::MAX).unwrap()),
+            encode(|encoder| encoder.i64(i64::MIN).unwrap()),
+            encode(|encoder| encoder.u64(u64::MAX).unwrap()),
+            encode(|encoder| encoder.guid(&[1; 16]).unwrap()),
             encode(|encoder| encoder.string("🦀").unwrap()),
             encode(|encoder| encoder.byte_array(&[1, 2, 3]).unwrap()),
         ];
@@ -1162,19 +1442,25 @@ mod tests {
         let bytes = encode(|encoder| encoder.string(&string).unwrap());
         assert_eq!(Decoder::new(&bytes).string().unwrap(), string);
         let too_long = format!("{string}x");
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::with_limits(Limits {
+            max_bytes: bytes.len(),
+            ..Limits::default()
+        });
         assert!(matches!(
             encoder.string(&too_long),
-            Err(Error::InvalidInput(_))
+            Err(Error::ResourceLimit(_))
         ));
         assert!(encoder.finish().is_empty());
         let array = vec![0x3f; MAX_COLLECTION_COUNT];
         let bytes = encode(|encoder| encoder.byte_array(&array).unwrap());
         assert_eq!(Decoder::new(&bytes).byte_array().unwrap(), array);
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::with_limits(Limits {
+            max_bytes: bytes.len(),
+            ..Limits::default()
+        });
         assert!(matches!(
             encoder.byte_array(&vec![0; MAX_COLLECTION_COUNT + 1]),
-            Err(Error::InvalidInput(_))
+            Err(Error::ResourceLimit(_))
         ));
         assert!(encoder.finish().is_empty());
 
@@ -1209,6 +1495,115 @@ mod tests {
     }
 
     #[test]
+    fn byte_limit_rejects_writes_before_growth_without_changing_prior_bytes() {
+        let limits = Limits {
+            max_bytes: 4,
+            max_depth: 0,
+        };
+        let writes: [fn(&mut Encoder) -> Result<()>; 7] = [
+            |e| e.u32(u32::MAX),
+            |e| e.i64(i64::MIN),
+            |e| e.f64(1.0),
+            |e| e.guid(&[1; 16]),
+            |e| e.string("abc"),
+            |e| e.byte_array(&[0; 4]),
+            |e| e.u32_array(&[u32::MAX]),
+        ];
+        let mut encoder = Encoder::with_limits(limits);
+        for write in writes {
+            assert!(matches!(write(&mut encoder), Err(Error::ResourceLimit(_))));
+            assert!(encoder.bytes.is_empty());
+            assert_eq!(encoder.bytes.capacity(), 0);
+        }
+        encoder.u16(128).unwrap();
+        let previous = encoder.bytes.clone();
+        let capacity = encoder.bytes.capacity();
+        assert!(encoder.u32(128).is_err());
+        assert_eq!(encoder.bytes, previous);
+        assert_eq!(encoder.bytes.capacity(), capacity);
+        encoder.boolean(true).unwrap();
+        assert!(encoder.boolean(false).is_err());
+        let bytes = encoder.finish();
+        let mut decoder = Decoder::with_limits(&bytes, limits).unwrap();
+        assert_eq!(decoder.u16().unwrap(), 128);
+        assert!(decoder.boolean().unwrap());
+        decoder.finish().unwrap();
+
+        let mut encoder = Encoder::with_limits(Limits {
+            max_bytes: 0,
+            max_depth: 0,
+        });
+        assert!(encoder.boolean(false).is_err());
+        assert!(encoder.string("").is_err());
+        assert!(encoder.byte_array(&[]).is_err());
+        assert!(encoder.u32_array(&[]).is_err());
+        assert!(encoder.pointer(None, |_| unreachable!()).is_err());
+        assert_eq!(encoder.bytes.capacity(), 0);
+        assert!(Decoder::with_limits(
+            &[],
+            Limits {
+                max_bytes: 0,
+                max_depth: 0
+            }
+        )
+        .unwrap()
+        .finish()
+        .is_ok());
+    }
+
+    #[test]
+    fn nested_and_root_objects_share_the_byte_budget_and_restore_state_on_error() {
+        let limits = Limits {
+            max_bytes: 25,
+            max_depth: 2,
+        };
+        let write = |e: &mut Encoder| e.object(|e| e.pointer(Some(&[]), |_| Ok(())));
+        let mut encoder = Encoder::with_limits(limits);
+        write(&mut encoder).unwrap();
+        let bytes = encoder.finish();
+        assert_eq!(bytes.len(), limits.max_bytes);
+        Decoder::with_limits(&bytes, limits)
+            .unwrap()
+            .object(|_| Ok(()))
+            .unwrap();
+
+        let mut encoder = Encoder::with_limits(Limits {
+            max_bytes: 24,
+            ..limits
+        });
+        assert!(write(&mut encoder).is_err());
+        assert!(encoder.bytes.is_empty());
+        assert!(encoder.objects.is_empty());
+        assert!(encoder.bytes.capacity() <= 24);
+        encoder.object(|_| Ok(())).unwrap();
+
+        let mut decoder = Decoder::with_limits(
+            &bytes,
+            Limits {
+                max_depth: 1,
+                ..limits
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            decoder.object(|_| Ok(())),
+            Err(Error::ResourceLimit(_))
+        ));
+        assert_eq!(decoder.depth, 0);
+        assert_eq!(decoder.limit, bytes.len());
+
+        let mut encoder = Encoder::with_limits(limits);
+        assert!(encoder.object_array(&[(), ()], |_, _| Ok(())).is_err());
+        assert!(encoder.bytes.is_empty());
+        assert!(encoder.objects.is_empty());
+        encoder.object(|_| Ok(())).unwrap();
+        encoder.object(|_| Ok(())).unwrap();
+        encoder.boolean(false).unwrap();
+        assert!(encoder.boolean(false).is_err());
+        assert_eq!(encoder.finish().len(), limits.max_bytes);
+    }
+
+    #[test]
     fn object_size_boundaries() {
         let fields = vec![0x48; MAX_OBJECT_SIZE - 11];
         let bytes = object_bytes(&fields);
@@ -1223,19 +1618,22 @@ mod tests {
         let mut encoder = Encoder::new();
         encoder
             .object(|encoder| {
-                encoder.bytes.extend_from_slice(&fields);
+                encoder.write(&fields)?;
                 Ok(())
             })
             .unwrap();
         assert_eq!(encoder.finish().len(), MAX_OBJECT_SIZE + 1);
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::with_limits(Limits {
+            max_bytes: MAX_OBJECT_SIZE + 1,
+            ..Limits::default()
+        });
         assert!(matches!(
             encoder.object(|encoder| {
-                encoder.bytes.extend_from_slice(&fields);
-                encoder.u32(0);
+                encoder.write(&fields)?;
+                encoder.u32(0)?;
                 Ok(())
             }),
-            Err(Error::InvalidInput(_))
+            Err(Error::ResourceLimit(_))
         ));
         assert!(encoder.finish().is_empty());
     }
@@ -1288,7 +1686,7 @@ mod tests {
             let mut bytes = object_bytes(&[]);
             bytes[5] = 1;
             let mut count_bytes = Encoder::new();
-            count_bytes.write_unsigned_payload(count);
+            count_bytes.write_unsigned_payload(count).unwrap();
             bytes.splice(9..9, count_bytes.finish());
             let size = bytes.len() - 1;
             set_size(&mut bytes, size);
@@ -1305,15 +1703,15 @@ mod tests {
     #[test]
     fn supported_unknown_tail_values_and_extra_scopes_are_typed_skipped() {
         let fields = encode(|encoder| {
-            encoder.i32(-1);
-            encoder.i32(47);
-            encoder.u32(63);
-            encoder.i64(i64::MIN);
-            encoder.u64(u64::MAX);
-            encoder.boolean(true);
-            encoder.boolean(false);
-            encoder.guid(&[0x2f; 16]);
-            encoder.guid(&[0; 16]);
+            encoder.i32(-1).unwrap();
+            encoder.i32(47).unwrap();
+            encoder.u32(63).unwrap();
+            encoder.i64(i64::MIN).unwrap();
+            encoder.u64(u64::MAX).unwrap();
+            encoder.boolean(true).unwrap();
+            encoder.boolean(false).unwrap();
+            encoder.guid(&[0x2f; 16]).unwrap();
+            encoder.guid(&[0; 16]).unwrap();
             encoder.string("/?\u{1f}\0🦀").unwrap();
             encoder.string("").unwrap();
             encoder.byte_array(&[0x1f, 0x2f, 0x3f, 0]).unwrap();
@@ -1343,6 +1741,90 @@ mod tests {
     }
 
     #[test]
+    fn deep_unknown_objects_pointers_and_arrays_use_a_growable_traversal_stack() {
+        let depth = 4_096;
+        let mut bytes = Vec::new();
+        let mut objects = Vec::new();
+        for level in 0..depth {
+            let array_item = level != 0 && level % 3 == 0;
+            if array_item {
+                bytes.extend_from_slice(&[OBJECT_ARRAY, 2]);
+            } else if level % 3 == 1 {
+                bytes.push(POINTER);
+            }
+            let start = bytes.len();
+            bytes.extend_from_slice(&[0; 9]);
+            if level % 5 == 0 {
+                bytes[start + 5] = 1;
+                bytes.extend_from_slice(&[1, 7]);
+            }
+            bytes.push(SCOPE_BEGIN);
+            objects.push((start, array_item));
+        }
+        let leaf_end = bytes.len() + 4;
+        for (start, array_item) in objects.into_iter().rev() {
+            bytes.extend_from_slice(&[SCOPE_END, SCOPE_BEGIN, TRUE, SCOPE_END, OBJECT_END]);
+            let size = (bytes.len() - start - 1) as u32;
+            bytes[start + 1..start + 5].copy_from_slice(&size.to_le_bytes());
+            if array_item {
+                bytes.extend_from_slice(&object_bytes(&[]));
+            }
+        }
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                #[derive(::serde::Deserialize)]
+                struct Empty {}
+
+                let mut decoder = Decoder::new(&bytes);
+                decoder.object(|_| Ok(())).unwrap();
+                decoder.finish().unwrap();
+                crate::serde::from_slice::<Empty>(&bytes).unwrap();
+                let limits = Limits {
+                    max_depth: 101,
+                    ..Limits::default()
+                };
+                assert!(matches!(
+                    Decoder::with_limits(&bytes, limits)
+                        .unwrap()
+                        .object(|_| Ok(())),
+                    Err(Error::ResourceLimit(_))
+                ));
+                let mut malformed = bytes;
+                malformed[leaf_end] = SCOPE_END;
+                let mut decoder = Decoder::new(&malformed);
+                assert!(matches!(
+                    decoder.object(|d| d.next_scope()),
+                    Err(Error::Protocol(_))
+                ));
+                assert_eq!(decoder.depth, 0);
+                assert_eq!(decoder.limit, malformed.len());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_iterative_scope_skip_restores_the_original_object_context() {
+        let child = object_bytes(&[]);
+        let mut bytes = object_bytes(&child);
+        bytes[10 + child.len() - 1] = SCOPE_BEGIN;
+        let mut decoder = Decoder::new(&bytes);
+        assert!(decoder
+            .object(|d| {
+                let limit = d.limit;
+                assert!(matches!(d.next_scope(), Err(Error::Protocol(_))));
+                assert_eq!(d.limit, limit);
+                assert_eq!(d.depth, 1);
+                Err::<(), _>(Error::Protocol("invalid fixture"))
+            })
+            .is_err());
+        assert_eq!(decoder.depth, 0);
+        assert_eq!(decoder.limit, bytes.len());
+    }
+
+    #[test]
     fn missing_required_fields_and_wrong_metadata_are_errors() {
         let empty = object_bytes(&[]);
         assert!(Decoder::new(&empty).object(Decoder::boolean).is_err());
@@ -1362,7 +1844,7 @@ mod tests {
         let bytes = encode(|encoder| {
             encoder.object(|_| Ok(())).unwrap();
             encoder.object(|_| Ok(())).unwrap();
-            encoder.i32(7);
+            encoder.i32(7).unwrap();
         });
         let mut decoder = Decoder::new(&bytes);
         decoder.object(|_| Ok(())).unwrap();
@@ -1378,10 +1860,10 @@ mod tests {
     #[test]
     fn failed_encoder_objects_roll_back_without_losing_prior_values() {
         let mut encoder = Encoder::new();
-        encoder.i32(7);
+        encoder.i32(7).unwrap();
         assert!(encoder
             .object(|encoder| {
-                encoder.i64(4);
+                encoder.i64(4).unwrap();
                 Err(Error::InvalidInput("test failure"))
             })
             .is_err());

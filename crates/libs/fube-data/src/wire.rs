@@ -22,9 +22,9 @@
 //! against an independently built native peer; these codecs alone do not prove it.
 //!
 //! Bounds are 1 MiB and 1024 buffers per operation, 1024 operations per batch,
-//! and the shared transport's complete 4 MiB frame limit. The shared serializer
-//! additionally caps each vector at 4096 elements, including the batch's
-//! flattened segment-size vector.
+//! and the shared transport's complete 4 MiB frame limit. This adapter also
+//! retains a 4096-element bound on encoded flattened segment-size vectors.
+//! That legacy profile bound is not a shared serializer ceiling.
 
 use std::{fmt, net::Ipv6Addr, str::FromStr};
 
@@ -63,11 +63,11 @@ pub struct Actor {
 }
 
 impl Actor {
-    fn write(self, encoder: &mut Encoder) {
+    fn write(self, encoder: &mut Encoder) -> fubst::Result<()> {
         // ReplicationEndpointId uses FABRIC_PRIMITIVE_FIELDS_03, not an object.
-        encoder.guid(&self.partition.to_bytes_le());
-        encoder.i64(self.replica);
-        encoder.guid(&self.incarnation.to_bytes_le());
+        encoder.guid(&self.partition.to_bytes_le())?;
+        encoder.i64(self.replica)?;
+        encoder.guid(&self.incarnation.to_bytes_le())
     }
 
     fn read(decoder: &mut Decoder<'_>) -> fubst::Result<Self> {
@@ -301,11 +301,11 @@ impl Packet {
             headers: vec![
                 Header::object(RE_FROM, |e| {
                     e.string(&self.from.address)?;
-                    self.from.actor.write(e);
+                    self.from.actor.write(e)?;
                     Ok(())
                 })?,
                 Header::object(RE_ACTOR, |e| {
-                    self.to.write(e);
+                    self.to.write(e)?;
                     Ok(())
                 })?,
                 Header::action(self.body.action())?,
@@ -325,8 +325,8 @@ impl Packet {
                 positive_sequence(*start)?;
                 message.body = object(|e| {
                     write_epoch(e, *epoch)?;
-                    e.i64(*target);
-                    e.i64(*start);
+                    e.i64(*target)?;
+                    e.i64(*start)?;
                     Ok(())
                 })?;
             }
@@ -383,11 +383,11 @@ impl Packet {
                     write_epoch(e, *primary_epoch)?;
                     write_epoch(e, *operation_epoch)?;
                     e.u32_array(&sizes)?;
-                    e.i64(first.sequence);
-                    e.i64(last.sequence);
-                    e.i64(*batch_end);
+                    e.i64(first.sequence)?;
+                    e.i64(last.sequence)?;
+                    e.i64(*batch_end)?;
                     e.u32_array(&counts)?;
-                    e.i64(*completed);
+                    e.i64(*completed)?;
                     Ok(())
                 })?;
                 add_operation_header(&mut message, RE_OPERATION, header, header_in_body)?;
@@ -405,11 +405,11 @@ impl Packet {
                 positive_sequence(*sequence)?;
                 let sizes = segment_sizes(data)?;
                 let header = object(|e| {
-                    e.i64(*target);
+                    e.i64(*target)?;
                     write_epoch(e, *epoch)?;
                     write_metadata(e, copy_kind(*last), *sequence, INVALID_ATOMIC_GROUP)?;
                     e.u32_array(&sizes)?;
-                    e.boolean(*last);
+                    e.boolean(*last)?;
                     Ok(())
                 })?;
                 add_operation_header(&mut message, COPY_OPERATION, header, header_in_body)?;
@@ -424,10 +424,10 @@ impl Packet {
             } => {
                 validate_ack(*received, *applied, *copy_received, *copy_applied)?;
                 message.body = object(|e| {
-                    e.i64(*received);
-                    e.i64(*applied);
-                    e.i64(*copy_received);
-                    e.i64(*copy_applied);
+                    e.i64(*received)?;
+                    e.i64(*applied)?;
+                    e.i64(*copy_received)?;
+                    e.i64(*copy_applied)?;
                     Ok(())
                 })?;
                 add_error(&mut message, *error)?;
@@ -443,7 +443,7 @@ impl Packet {
                 message.headers.push(Header::object(COPY_CONTEXT, |e| {
                     write_metadata(e, copy_kind(*last), *sequence, INVALID_ATOMIC_GROUP)?;
                     e.u32_array(&sizes)?;
-                    e.boolean(*last);
+                    e.boolean(*last)?;
                     Ok(())
                 })?);
                 append_segments(&mut message.body, data)?;
@@ -453,7 +453,7 @@ impl Packet {
                     return Err(Error::Protocol("invalid copy-context ACK sequence"));
                 }
                 message.body = object(|e| {
-                    e.i64(*sequence);
+                    e.i64(*sequence)?;
                     Ok(())
                 })?;
                 add_error(&mut message, *error)?;
@@ -464,8 +464,8 @@ impl Packet {
                 reason,
             } => {
                 message.body = object(|e| {
-                    e.i64(*target);
-                    e.guid(&incarnation.to_bytes_le());
+                    e.i64(*target)?;
+                    e.guid(&incarnation.to_bytes_le())?;
                     e.string(reason)
                 })?;
             }
@@ -665,7 +665,7 @@ fn required_header(message: &Message, id: u16) -> Result<&Header> {
 fn add_error(message: &mut Message, error: i32) -> Result<()> {
     if error != 0 {
         message.headers.push(Header::object(OPERATION_ERROR, |e| {
-            e.i32(error);
+            e.i32(error)?;
             Ok(())
         })?);
     }
@@ -687,7 +687,7 @@ fn add_operation_header(
 ) -> Result<()> {
     if in_body {
         message.headers.push(Header::object(OPERATION_BODY, |e| {
-            e.u32(header.len() as u32);
+            e.u32(header.len() as u32)?;
             Ok(())
         })?);
         message.body = header;

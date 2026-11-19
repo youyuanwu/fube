@@ -128,8 +128,8 @@ async fn definitive_registration_error_is_not_unknown_and_all_filter_flags_are_p
         let mut error = peer::reply(&req, "ClientOperationFailure", vec![]);
         error.headers.push(
             Header::object(fube_transport::message::FAULT, |e| {
-                e.i64(-2147024809);
-                e.boolean(false);
+                e.i64(-2147024809).unwrap();
+                e.boolean(false).unwrap();
                 Ok(())
             })
             .unwrap(),

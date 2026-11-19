@@ -227,7 +227,7 @@ impl Peer {
             Header::timeout(50_000_000).unwrap(),
             Header::object(IPC, |e| {
                 e.string(&self.admission.host.id)?;
-                e.u32(self.admission.host.pid);
+                e.u32(self.admission.host.pid).unwrap();
                 Ok(())
             })
             .unwrap(),
@@ -928,7 +928,7 @@ async fn semantic_reply_wrong_host_or_pid_never_enters_owned_inbox() {
                     a.host.pid
                 } else {
                     a.host.pid + 1
-                });
+                })?;
                 Ok(())
             })
             .unwrap(),
@@ -1444,8 +1444,8 @@ async fn malformed_handshake_and_uncorrelated_duplicates_never_succeed() {
             0 => control.headers.insert(0, Header::actor(7).unwrap()),
             1 => control.headers.push(
                 Header::object(fube_transport::message::FAULT, |e| {
-                    e.i64(-1);
-                    e.boolean(false);
+                    e.i64(-1).unwrap();
+                    e.boolean(false).unwrap();
                     Ok(())
                 })
                 .unwrap(),

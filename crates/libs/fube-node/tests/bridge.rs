@@ -253,7 +253,7 @@ impl Peer {
             Header::timeout(50_000_000).unwrap(),
             Header::object(IPC, |e| {
                 e.string(&self.admission.host.id)?;
-                e.u32(self.admission.host.pid);
+                e.u32(self.admission.host.pid).unwrap();
                 Ok(())
             })
             .unwrap(),
@@ -901,7 +901,7 @@ async fn terminal_ra_loss_fences_existing_factory_and_new_admission_without_anot
         Header::action("RegisterServiceTypeRequest").unwrap(),
         Header::object(IPC, |e| {
             e.string(&peer.admission.host.id)?;
-            e.u32(peer.admission.host.pid);
+            e.u32(peer.admission.host.pid).unwrap();
             Ok(())
         })
         .unwrap(),

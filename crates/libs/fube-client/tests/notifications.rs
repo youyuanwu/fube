@@ -59,15 +59,15 @@ async fn connect_peer(listener: TcpListener) -> (TcpStream, String) {
 fn connected_body() -> Vec<u8> {
     body(|e| {
         e.object(|e| {
-            e.i64(1);
+            e.i64(1).unwrap();
             e.byte_array(&[0; 16])
         })?;
-        e.i64(0);
+        e.i64(0).unwrap();
         e.object(|e| {
             e.string("private.example:19000")?;
             e.object(|e| {
                 e.byte_array(&[0; 16])?;
-                e.u64(42);
+                e.u64(42).unwrap();
                 Ok(())
             })?;
             e.string("native-peer")
@@ -134,51 +134,52 @@ fn page_with_endpoints(index: u32, version: i64, count: usize, endpoints: &[Stri
             e.pointer(Some(&[]), |e| {
                 e.object(|e| {
                     e.object(|e| {
-                        e.guid(&[1; 16]);
-                        e.u64(1);
+                        e.guid(&[1; 16]).unwrap();
+                        e.u64(1).unwrap();
                         Ok(())
                     })?;
-                    e.u64(0);
+                    e.u64(0).unwrap();
                     Ok(())
                 })?;
                 e.object(|e| {
-                    e.i64(1);
+                    e.i64(1).unwrap();
                     e.byte_array(&[0; 16])
                 })?;
                 e.pointer(Some(&[]), |e| {
                     e.object_array(
                         &[(version, version + count.max(1) as i64)],
                         |e, (start, end)| {
-                            e.i64(*start);
-                            e.i64(*end);
+                            e.i64(*start).unwrap();
+                            e.i64(*end).unwrap();
                             Ok(())
                         },
                     )
                 })?;
-                e.u32(count as u32);
+                e.u32(count as u32).unwrap();
                 for id in 0..count {
                     e.pointer(Some(&[]), |e| {
                         e.pointer(Some(&[]), |e| {
                             e.object(|e| {
-                                e.guid(&uuid::Uuid::from_u128(id as u128 + 1).to_bytes_le());
+                                e.guid(&uuid::Uuid::from_u128(id as u128 + 1).to_bytes_le())
+                                    .unwrap();
                                 Ok(())
                             })?;
                             e.string("fabric:/App/Service")?;
                             e.object(|e| {
-                                e.boolean(false);
-                                e.boolean(false);
+                                e.boolean(false).unwrap();
+                                e.boolean(false).unwrap();
                                 e.string("")?;
-                                e.u32(endpoints.len() as u32);
+                                e.u32(endpoints.len() as u32).unwrap();
                                 for endpoint in endpoints {
                                     e.string(endpoint)?;
                                 }
-                                e.i64(version + id as i64);
+                                e.i64(version + id as i64).unwrap();
                                 Ok(())
                             })?;
-                            e.boolean(true);
+                            e.boolean(true).unwrap();
                             Ok(())
                         })?;
-                        e.boolean(false);
+                        e.boolean(false).unwrap();
                         Ok(())
                     })?;
                 }
@@ -597,8 +598,8 @@ async fn independent_public_clients_survive_other_client_close_and_connection_fa
             }
             while let Ok(req) = read_message(&mut s).await {
                 let data = body(|e| {
-                    e.boolean(true);
-                    e.i64(0);
+                    e.boolean(true).unwrap();
+                    e.i64(0).unwrap();
                     Ok(())
                 });
                 write_message(&mut s, &peer::reply(&req, "NameOperationReply", data))

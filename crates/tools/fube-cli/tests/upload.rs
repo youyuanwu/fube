@@ -123,9 +123,9 @@ fn acknowledgement(message: &Message, actor: i64, sequence: Option<u64>) -> Mess
     if let Some(sequence) = sequence {
         headers.push(
             Header::object(0x803c, |encoder| {
-                encoder.u64(sequence);
-                encoder.boolean(false);
-                encoder.u64(4);
+                encoder.u64(sequence).unwrap();
+                encoder.boolean(false).unwrap();
+                encoder.u64(4).unwrap();
                 Ok(())
             })
             .unwrap(),
@@ -213,7 +213,7 @@ async fn receive_upload(
                 let mut encoder = Encoder::new();
                 encoder
                     .object(|encoder| {
-                        encoder.i64(-2147017728);
+                        encoder.i64(-2147017728).unwrap();
                         encoder.string("commit rejected")
                     })
                     .unwrap();

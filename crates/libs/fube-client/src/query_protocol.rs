@@ -492,13 +492,13 @@ pub(crate) mod tests {
         let mut encoder = Encoder::new();
         encoder
             .object(|e| {
-                e.i64(kind);
+                e.i64(kind)?;
                 let tag = tag.map(i32::to_le_bytes);
                 e.pointer(tag.as_ref().map(|tag| tag.as_slice()), |e| {
                     e.object_array(values, |e, value| e.string(value))?;
                     e.pointer(item.map(|_| &[][..]), |e| e.string(item.unwrap()))
                 })?;
-                e.i64(error);
+                e.i64(error)?;
                 e.pointer(paging.map(|(tag, _)| tag), |e| e.string(paging.unwrap().1))
             })
             .unwrap();
@@ -1130,12 +1130,12 @@ pub(crate) mod tests {
             let mut encoder = Encoder::new();
             encoder
                 .object(|e| {
-                    e.i64(2);
+                    e.i64(2)?;
                     e.pointer(Some(&wrapper.to_le_bytes()), |e| {
                         e.object_array::<String>(&[], |e, value| e.string(value))?;
                         e.pointer(None, |_| Ok(()))
                     })?;
-                    e.i64(0);
+                    e.i64(0)?;
                     e.pointer(Some(tag), |e| e.string(token))
                 })
                 .unwrap();

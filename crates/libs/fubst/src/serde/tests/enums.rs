@@ -53,19 +53,19 @@ fn code(value: &Poly) -> i32 {
     }
 }
 fn write_poly(e: &mut Encoder, value: &Poly) -> Result<()> {
-    e.i64(i64::from(code(value)));
+    e.i64(i64::from(code(value))).unwrap();
     match value {
         Poly::Event { text, value } => {
             e.string(text)?;
-            e.u32(*value);
+            e.u32(*value).unwrap();
         }
         Poly::None | Poly::Min | Poly::Max | Poly::Zero => {}
         Poly::Partition(value) => {
             e.next_scope()?;
-            e.guid(&value.fields.0.id.0);
+            e.guid(&value.fields.0.id.0).unwrap();
         }
         Poly::Tuple(value, text) => {
-            e.u32(*value);
+            e.u32(*value).unwrap();
             e.string(text)?;
         }
     }
@@ -118,7 +118,7 @@ fn fixed_and_empty_tags_automatically_deserialize_fields_in_every_object_context
     let value = FixedTag::<_, 17>(Pair(9, "fixed".into()));
     let mut e = Encoder::new();
     e.typed_object(&17i32.to_le_bytes(), |e| {
-        e.u32(9);
+        e.u32(9).unwrap();
         e.string("fixed")
     })
     .unwrap();
@@ -169,7 +169,7 @@ fn native_enum_rejects_unknown_mismatching_missing_and_malformed_discriminants()
         let mut e = Encoder::new();
         e.typed_object(&tag, |e| {
             if let Some(kind) = kind {
-                e.i64(kind);
+                e.i64(kind).unwrap();
             }
             Ok(())
         })
@@ -181,25 +181,25 @@ fn native_enum_rejects_unknown_mismatching_missing_and_malformed_discriminants()
     }
     let mut e = Encoder::new();
     e.typed_object(&17i32.to_le_bytes(), |e| {
-        e.u32(17);
+        e.u32(17).unwrap();
         Ok(())
     })
     .unwrap();
     assert!(from_slice::<NativeEnum<Poly>>(&e.finish()).is_err());
     let mut e = Encoder::new();
     e.typed_object(&7i32.to_le_bytes(), |e| {
-        e.i64(7);
-        e.guid(&[1; 16]);
+        e.i64(7).unwrap();
+        e.guid(&[1; 16]).unwrap();
         Ok(())
     })
     .unwrap();
     assert!(from_slice::<NativeEnum<Poly>>(&e.finish()).is_err());
     let mut e = Encoder::new();
     e.typed_object(&7i32.to_le_bytes(), |e| {
-        e.i64(7);
-        e.boolean(true);
+        e.i64(7).unwrap();
+        e.boolean(true).unwrap();
         e.next_scope()?;
-        e.guid(&[1; 16]);
+        e.guid(&[1; 16]).unwrap();
         Ok(())
     })
     .unwrap();
@@ -231,7 +231,7 @@ fn numeric_enum_uses_explicit_i64_codes_not_variant_ordinals() {
         (Scalar::Zero, 0),
     ] {
         let mut e = Encoder::new();
-        e.i64(code);
+        e.i64(code).unwrap();
         let bytes = e.finish();
         let value = NumericEnum(value);
         assert_eq!(to_vec(&value).unwrap(), bytes);
@@ -240,11 +240,11 @@ fn numeric_enum_uses_explicit_i64_codes_not_variant_ordinals() {
         assert!(from_slice::<Scalar>(&bytes).is_err());
     }
     let mut e = Encoder::new();
-    e.i64(1);
+    e.i64(1).unwrap();
     assert!(from_slice::<NumericEnum<Scalar>>(&e.finish()).is_err());
     assert!(to_vec(&NativeEnum(Scalar::Max)).is_err());
     let mut e = Encoder::new();
-    e.u32(65535);
+    e.u32(65535).unwrap();
     assert!(from_slice::<NumericEnum<Scalar>>(&e.finish()).is_err());
 }
 
@@ -273,17 +273,17 @@ fn enum_adapters_reject_implicit_codes_and_do_not_accept_unknown_fallbacks() {
     assert!(to_vec(&NumericEnum(Noncanonical::One)).is_err());
     let mut e = Encoder::new();
     e.typed_object(&88i32.to_le_bytes(), |e| {
-        e.i64(88);
+        e.i64(88).unwrap();
         Ok(())
     })
     .unwrap();
     assert!(from_slice::<NativeEnum<Fallback>>(&e.finish()).is_err());
     let mut e = Encoder::new();
-    e.i64(88);
+    e.i64(88).unwrap();
     assert!(from_slice::<NumericEnum<Fallback>>(&e.finish()).is_err());
     assert!(variant_name(1, &["1", "1"], false).is_err());
     let mut e = Encoder::new();
-    e.i64(1);
+    e.i64(1).unwrap();
     assert!(from_slice::<NumericEnum<Noncanonical>>(&e.finish()).is_err());
     assert!(to_vec(&NumericEnum(Poly::Tuple(1, "payload".into()))).is_err());
 }
@@ -294,7 +294,10 @@ fn native_enum_encoding_rolls_back_nested_failures() {
     struct Fields {
         value: Pointer<NativeEnum<Poly>>,
     }
-    let mut e = Encoder::new();
+    let mut e = Encoder::with_limits(Limits {
+        max_bytes: MAX_STRING_UNITS,
+        ..Limits::default()
+    });
     e.object(|e| {
         let invalid = Poly::Event {
             text: "x".repeat(MAX_STRING_UNITS + 1),
@@ -328,15 +331,21 @@ fn native_enum_preserves_exact_object_and_nesting_bounds() {
         #[serde(rename = "1")]
         Fill(Empty),
     }
-    let bytes = to_vec(&Pointer(Some(NativeEnum(Large::Fill(Fill(
-        MAX_OBJECT_SIZE - 18,
-    ))))))
+    let limits = Limits {
+        max_bytes: MAX_OBJECT_SIZE + 2,
+        ..Limits::default()
+    };
+    let bytes = to_vec_with_limits(
+        &Pointer(Some(NativeEnum(Large::Fill(Fill(MAX_OBJECT_SIZE - 18))))),
+        limits,
+    )
     .unwrap();
     assert_eq!(bytes.len(), MAX_OBJECT_SIZE + 2);
     from_slice::<Pointer<NativeEnum<ReadLarge>>>(&bytes).unwrap();
-    assert!(to_vec(&Pointer(Some(NativeEnum(Large::Fill(Fill(
-        MAX_OBJECT_SIZE - 17
-    ))))))
+    assert!(to_vec_with_limits(
+        &Pointer(Some(NativeEnum(Large::Fill(Fill(MAX_OBJECT_SIZE - 17))))),
+        limits
+    )
     .is_err());
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     enum Recursive {
@@ -353,10 +362,17 @@ fn native_enum_preserves_exact_object_and_nesting_bounds() {
             next: Pointer(Some(Box::new(value))),
         });
     }
-    let bytes = to_vec(&value).unwrap();
+    let limits = Limits {
+        max_depth: MAX_DEPTH,
+        ..Limits::default()
+    };
+    let bytes = to_vec_with_limits(&value, limits).unwrap();
     assert_eq!(from_slice::<NativeEnum<Recursive>>(&bytes).unwrap(), value);
-    assert!(to_vec(&NativeEnum(Recursive::Next {
-        next: Pointer(Some(Box::new(value)))
-    }))
+    assert!(to_vec_with_limits(
+        &NativeEnum(Recursive::Next {
+            next: Pointer(Some(Box::new(value)))
+        }),
+        limits
+    )
     .is_err());
 }

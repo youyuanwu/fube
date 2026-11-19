@@ -143,7 +143,7 @@ impl IpcSession {
         Ok(Self {
             identity: Header::object(message::IPC, |e| {
                 e.string(host_id)?;
-                e.u32(process_id);
+                e.u32(process_id)?;
                 Ok(())
             })?,
         })

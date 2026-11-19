@@ -83,7 +83,7 @@ mod tests {
             match field {
                 0 => e.string("ServiceManifest")?,
                 1 => e.string("1.2")?,
-                2 => e.i64(status),
+                2 => e.i64(status)?,
                 3 => e.string("activation-id")?,
                 _ => unreachable!(),
             }
@@ -173,7 +173,7 @@ mod tests {
         let mut e = Encoder::new();
         e.object(|e| {
             fields(e, 3, 3)?;
-            e.boolean(false);
+            e.boolean(false).unwrap();
             Ok(())
         })
         .unwrap();
