@@ -4,7 +4,6 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
-    time::Duration,
 };
 
 #[path = "support/list_fixture.rs"]
@@ -335,29 +334,10 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
         .remove("applications")
         .unwrap();
     let native_services = reads.as_object_mut().unwrap().remove("services").unwrap();
-    let channel = FabricClient::endpoint_clear("127.0.0.1:19000".parse()?)?
-        .connect_timeout(Duration::from_secs(30))
-        .connect()
-        .await?;
-    let client = FabricClient::new(
-        channel,
-        ClientOptions {
-            default_timeout: Duration::from_secs(30),
-            ..Default::default()
-        },
-    )?;
     let topology = topology::observe(&mut reads_client, generation, &http, &journal).await?;
     let deployment = deployment::observe(&mut reads_client, generation, &http, &journal).await?;
-    let movement = topology::move_primary(
-        &client,
-        &mut reads_client,
-        generation,
-        &http,
-        &journal,
-        &topology,
-    )
-    .await?;
-    client.close().await?;
+    let movement =
+        topology::move_primary(&mut reads_client, generation, &http, &journal, &topology).await?;
     Ok(json!({
         "runtime_version": runtime, "archive_sha256": journal.archive_sha256,
         "native_source_commit": "3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d",

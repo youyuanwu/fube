@@ -4,7 +4,7 @@
 //! Existing [`FabricClient`] connections support bounded concurrency without
 //! automatic reconnect. The separate [`FurpcClient`] is a typed stub over a
 //! byte-facing Tower service, defaulting to furpc's Channel, and provides Ping,
-//! naming operations, single-page cluster/topology/deployment lists and node health.
+//! naming operations, cluster/topology/deployment lists, node health and MovePrimary.
 //! These operations are no longer available on FabricClient or its ClientRequest
 //! adapters. FabricClient retains the remaining, unmigrated operations.
 //! Native connections require an explicitly selected unsecured development gateway.
@@ -49,6 +49,7 @@ pub use deployed_service_packages::*;
 pub use furpc_client::{FurpcClient, FurpcClientError};
 pub use health::*;
 pub use image_store::{ImageStoreClient, ImageStoreClientOptions};
+pub use movement::{MovePrimaryQueryDescription, MovePrimaryQueryParameters};
 pub use naming_uri::NamingUri;
 pub use nodes::*;
 pub use notifications::*;
@@ -66,7 +67,6 @@ use fube_transport::{
     channel::MessageChannel, connection::deadline_after, native_channel::GatewayTarget,
 };
 use tokio::time::Instant;
-use uuid::Uuid;
 
 pub use fube_transport::{Channel, ChannelLimits, Endpoint, Error, Result};
 
@@ -110,8 +110,8 @@ pub struct GatewayDescription {
 
 /// Cloneable client for the native clear-TCP development profile.
 ///
-/// Legacy implementation for MovePrimary and service resolution.
-/// Migrated reads and naming writes use [`FurpcClient`] only.
+/// Legacy implementation for service resolution.
+/// Migrated reads and mutations use [`FurpcClient`] only.
 ///
 /// Clones explicitly share one Channel lifecycle owner, typed budget and terminal state.
 /// A [`GatewayClient`] instead borrows a supplied foundation without adopting it.
@@ -203,32 +203,6 @@ impl FabricClient {
     /// The first terminal connection cause, including failures detected idle.
     pub fn terminal_error(&self) -> Option<Error> {
         self.channel.terminal_error()
-    }
-
-    /// Ask native FM to move a partition's Primary to an explicit node while
-    /// enforcing placement constraints. There is deliberately no force/ignore
-    /// option. Observe placement/discovery separately; this is not an atomic
-    /// cluster snapshot or an application-side membership authority.
-    pub async fn move_primary(
-        &self,
-        partition: Uuid,
-        target_node: &str,
-        timeout: Option<Duration>,
-    ) -> ClientResult<()> {
-        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
-        query_arguments::validate_node_name(
-            target_node,
-            "primary target must be an explicit native node",
-        )
-        .map_err(|error| ClientError::Local(error.into()))?;
-        self.call(
-            QueryDescription::new(movement::MovePrimary {
-                partition,
-                target: target_node.to_owned(),
-            }),
-            CallContext { deadline },
-        )
-        .await
     }
 
     fn deadline(&self, timeout: Option<Duration>) -> Result<Instant> {

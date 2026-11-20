@@ -2,18 +2,13 @@
 
 use std::marker::PhantomData;
 
-use fube_transport::message::{Message, ACTION, ACTOR};
-use fubst::{
-    serde::{
-        from_slice, to_vec_with_limits, EmptyObjectArray, FixedTag, ObjectArray, Pointer, RawTagged,
-    },
-    MAX_COLLECTION_COUNT,
+use fubst::serde::{
+    to_vec_with_limits, EmptyObjectArray, FixedTag, ObjectArray, Pointer, RawTagged,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
-    query_arguments::QueryArguments, DomainFailure, Error, PagedQuery, Paging, QueryDescription,
-    QueryPage, Result,
+    query_arguments::QueryArguments, DomainFailure, PagedQuery, Paging, QueryDescription, QueryPage,
 };
 
 /// Native payload type IDs from ServiceModel/QueryResultHelpersEnum.h.
@@ -78,11 +73,6 @@ impl<Q: Query + Send> QueryRequest for QueryDescription<Q> {
     }
 }
 
-pub(crate) fn encode_query<Q: Query>(query: &Q, paging: Option<&Paging>) -> Result<Vec<u8>> {
-    let arguments = arguments(query, paging, QueryArguments::default())?;
-    encode(Q::NAME, &arguments.values)
-}
-
 pub(crate) fn encode_query_body<Q: Query>(
     query: &Q,
     paging: Option<&Paging>,
@@ -108,33 +98,6 @@ fn arguments<Q: Query>(
     Ok(arguments)
 }
 
-pub(crate) fn decode_reply<Q: Query>(message: &Message) -> Result<Q::Output> {
-    decode_message::<Q::Reply>(message, Q::validate_record)
-}
-
-fn decode_message<R: Reply>(
-    message: &Message,
-    validate: fn(R::Record) -> std::result::Result<R::Record, &'static str>,
-) -> Result<R::Output> {
-    crate::protocol::check_failure(message)?;
-    let properties = message.properties()?;
-    R::ENVELOPE
-        .check(
-            message
-                .headers
-                .iter()
-                .any(|h| h.id == ACTOR)
-                .then_some(properties.actor),
-            message
-                .headers
-                .iter()
-                .any(|h| h.id == ACTION)
-                .then(|| properties.action.encode_utf16()),
-        )
-        .map_err(Error::Protocol)?;
-    R::decode_body(from_slice(&message.body)?, validate).map_err(Into::into)
-}
-
 fn append_paging<Q: Query>(
     arguments: &mut QueryArguments,
     paging: Option<&Paging>,
@@ -156,13 +119,6 @@ fn append_paging<Q: Query>(
         ));
     }
     arguments.append(paging)
-}
-
-fn encode(name: &str, args: &[(String, String)]) -> Result<Vec<u8>> {
-    if args.len() > MAX_COLLECTION_COUNT {
-        return Err(Error::InvalidInput("object-array count limit exceeded"));
-    }
-    Ok(encode_body(name, args, fubst::Limits::default())?)
 }
 
 fn encode_body(
@@ -207,18 +163,6 @@ pub(crate) type ReplyResult<T> = std::result::Result<T, ReplyError>;
 impl From<&'static str> for ReplyError {
     fn from(reason: &'static str) -> Self {
         Self::Protocol(reason)
-    }
-}
-
-impl From<ReplyError> for Error {
-    fn from(error: ReplyError) -> Self {
-        match error {
-            ReplyError::Protocol(reason) => Self::Protocol(reason),
-            ReplyError::Domain(failure) => Self::Remote {
-                code: failure.code,
-                message: failure.message,
-            },
-        }
     }
 }
 

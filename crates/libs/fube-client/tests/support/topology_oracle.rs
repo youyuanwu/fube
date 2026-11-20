@@ -177,7 +177,6 @@ fn movement_matches(native: &[Replica], observed: &[Value]) -> bool {
 }
 
 pub async fn move_primary(
-    client: &FabricClient,
     reads: &mut FurpcClient,
     generation: u64,
     http: &Http,
@@ -185,7 +184,7 @@ pub async fn move_primary(
     topology: &Value,
 ) -> Result<Value> {
     let budget = Duration::from_secs(120);
-    let deadline = tokio::time::Instant::now() + budget;
+    let overall_deadline = tokio::time::Instant::now() + budget;
     let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     let movement = async {
         let application = &journal.applications[0];
@@ -257,17 +256,19 @@ pub async fn move_primary(
             .find(|node| node["Name"] == target.node_name && node["NodeStatus"] == "Up")
             .ok_or("target secondary node is not independently Up")?;
         // Only observation is repeated. An ambiguous mutation is a fixture failure.
-        client
+        let response = reads
             .move_primary(
-                partition,
-                &target.node_name,
-                Some(
-                    deadline
-                        .saturating_duration_since(tokio::time::Instant::now())
-                        .min(Duration::from_secs(60)),
-                ),
+                Request::new(MovePrimaryQueryDescription::new(
+                    MovePrimaryQueryParameters::new(partition, &target.node_name),
+                )),
+                overall_deadline.min(tokio::time::Instant::now() + Duration::from_secs(60)),
             )
             .await?;
+        let request_generation = response
+            .source()
+            .ok_or("missing native movement source")?
+            .generation();
+        body(response, generation);
         let mut polls = 0;
         loop {
             polls += 1;
@@ -309,12 +310,34 @@ pub async fn move_primary(
                             .ok_or("missing independent post-movement replica")?,
                     );
                 }
+                let mut partitions = reads.clone();
+                let mut ping = reads.clone();
+                let reuse_deadline = deadline().min(overall_deadline);
+                let replica_query =
+                    ReplicaQueryDescription::new(ReplicaQueryParameters::new(partition));
+                let partition_query =
+                    PartitionQueryDescription::new(PartitionQueryParameters::new(service.parse()?));
+                let (replicas, partitions, ping) = tokio::try_join!(
+                    reads.get_replica_list(Request::new(replica_query), reuse_deadline),
+                    partitions.get_partition_list(Request::new(partition_query), reuse_deadline,),
+                    ping.ping(Request::new(()), reuse_deadline),
+                )?;
+                let replicas = body(replicas, generation);
+                assert!(replicas.continuation_token.is_none());
+                assert!(movement_matches(&replicas.items, &after_http));
+                assert!(body(partitions, generation)
+                    .items
+                    .iter()
+                    .any(|value| value.partition_information.id == partition));
+                assert!(!body(ping, generation).node_name.is_empty());
                 return Ok(json!({
                     "owner": journal.owner, "application": application, "service": service,
                     "partition": partition, "old_primary": old.node_name, "target": target.node_name,
                     "target_node_observation": target_node,
                     "request": {"operation": "MovePrimary", "constraints": "enforced",
                         "count": 1, "native_succeeded": true},
+                    "furpc": {"generation": generation, "request_generation": request_generation,
+                        "same_generation_after_move": true, "mixed_concurrent_operations": 3},
                     "overall_budget_ms": budget.as_millis(), "poll_count": polls,
                     "native_start_unix_ms": started,
                     "native_end_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
@@ -327,7 +350,7 @@ pub async fn move_primary(
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     };
-    tokio::time::timeout_at(deadline, movement)
+    tokio::time::timeout_at(overall_deadline, movement)
         .await
         .map_err(|_| "owned MovePrimary observation exceeded its overall budget")?
 }

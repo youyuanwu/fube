@@ -1317,6 +1317,18 @@ def validate_native_movement(lists, owner):
             and move.get("request") == {"operation": "MovePrimary", "constraints": "enforced",
                                        "count": 1, "native_succeeded": True},
             "native movement requires one successful constraint-enforced request")
+    furpc = move.get("furpc")
+    reads = lists.get("furpc")
+    require(type(reads) is dict and integer(reads.get("generation"), 1)
+            and type(furpc) is dict and integer(furpc.get("generation"), 1)
+            and furpc["generation"] == reads["generation"]
+            and type(furpc.get("request_generation")) is int
+            and furpc["request_generation"] == furpc["generation"],
+            "MovePrimary must use the original furpc generation")
+    true_fields(furpc, ("same_generation_after_move",))
+    require(type(furpc.get("mixed_concurrent_operations")) is int
+            and furpc["mixed_concurrent_operations"] == 3,
+            "furpc movement mixed-operation reuse")
     node = move.get("target_node_observation")
     require(type(node) is dict and node.get("Name") == target and node.get("NodeStatus") == "Up",
             "native movement existing target node must be Up")

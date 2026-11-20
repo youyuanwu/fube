@@ -23,7 +23,6 @@ use crate::{
     contracts::{
         CallContext, Client, ClientBinding, ClientError, ClientFuture, ClientRequest, ReplyError,
     },
-    query_protocol,
     resolution::Refresh,
     *,
 };
@@ -329,47 +328,6 @@ fn domain_failure(reply: &Message) -> Result<()> {
         code,
         message: diagnostic,
     })
-}
-
-fn decode_domain<T>(
-    reply: &Message,
-    decode: impl FnOnce(&Message) -> Result<T>,
-) -> std::result::Result<T, ReplyError<DomainFailure>> {
-    decoded(domain_failure(reply).and_then(|()| decode(reply)))
-}
-
-impl sealed::Request for QueryDescription<movement::MovePrimary> {
-    fn input_bytes(&self) -> usize {
-        size_of::<Self>() + self.parameters.target.capacity()
-    }
-}
-impl ClientRequest for QueryDescription<movement::MovePrimary> {
-    type Response = ();
-    type ReplyState = ();
-    type DomainError = DomainFailure;
-
-    fn encode(self, context: &CallContext) -> Result<(Message, ())> {
-        Ok((
-            wire(
-                "QueryRequest",
-                vec![],
-                query_protocol::encode_query(&self.parameters, None)?,
-                context,
-            )?,
-            (),
-        ))
-    }
-
-    fn decode(
-        _: (),
-        reply: Message,
-        _: &CallContext,
-    ) -> std::result::Result<(), ReplyError<DomainFailure>> {
-        decode_domain(
-            &reply,
-            query_protocol::decode_reply::<movement::MovePrimary>,
-        )
-    }
 }
 
 /// Exact selection and minimal previous native refresh state, not a client cache.

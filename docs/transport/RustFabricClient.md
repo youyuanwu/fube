@@ -11,11 +11,11 @@ Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
 
 **Client migration:** Ping, NameExists, CreateName/DeleteName, cluster/topology/deployment
-lists and node health are implemented only by `FurpcClient` over furpc. Their old `FabricClient`
+lists, node health and MovePrimary are implemented only by `FurpcClient` over furpc. Their old `FabricClient`
 methods, `PingRequest`, `NameRequest`/`NameOperation`/`NameResponse` and legacy query `ClientRequest`
 implementations have been removed. There is no compatibility wrapper or fallback.
 `FabricClient` and borrowed `GatewayClient` retain the legacy typed-call layer
-for resolution and MovePrimary.
+for resolution only.
 ServiceNotificationClient owns its **own**
 notification-enabled GatewayChannel/native session; it does not adopt an
 ordinary client's channel or lifecycle. ImageStoreClient owns an independent
@@ -43,7 +43,7 @@ The fubst and furpc crates retain their own codec/transport tests.
 ### Separate furpc-backed client
 
 `FurpcClient` is the canonical implementation of twelve read-only native operations
-and the two naming writes.
+and three mutations: CreateName, DeleteName and MovePrimary.
 The remaining `FabricClient` API does not expose these operations:
 
 | Method | Typed request body | Typed response body |
@@ -52,6 +52,7 @@ The remaining `FabricClient` API does not expose these operations:
 | `name_exists` | `NamingUri` | `bool` |
 | `create_name` | `NamingUri` | `()` (zero native bytes) |
 | `delete_name` | `NamingUri` | `()` (zero native bytes) |
+| `move_primary` | `MovePrimaryQueryDescription` | `()` (empty native QueryResult) |
 | `get_node_list` | `NodeQueryDescription` | `NodeListPage` |
 | `get_application_list` | `ApplicationQueryDescription` | `ApplicationListPage` |
 | `get_service_list` | `ServiceQueryDescription` | `ServiceListPage` |
@@ -117,14 +118,25 @@ node schema; aggregate Actor/Action headers are optional but checked when presen
 Query error codes remain domain failures, and malformed typed payloads or
 disagreeing repeated node IDs cannot be hidden behind a nonzero query error.
 
-All ten queries delegate to the private generic `query` helper and `QueryCodec<Q>`.
+All ten read queries and MovePrimary delegate to the private generic `query`
+helper and `QueryCodec<Q>`.
 Query declarations supply the native name, Serde arguments, parameter checks,
-typed reply profile and record validation. The remaining legacy query families
-reuse the same transport-independent framing and validation; only their adapter consumes a
-legacy Message. Profiles retain their own payload tags, list/item/empty shapes,
+typed reply profile and record validation. No query uses a legacy Message or
+typed-request adapter. Profiles retain their own payload tags, list/item/empty shapes,
 required or optional Actor/Action headers, and strict or absent paging rules.
 The generic path supports paged and unpaged request descriptions without adding
 public methods for unmigrated queries.
+
+MovePrimary takes the unpaged `MovePrimaryQueryDescription::new(
+MovePrimaryQueryParameters::new(partition_id, target_node))`. Parameters use
+native JSON names `PartitionId` and `NodeName`; a nil partition, empty/NUL node,
+or target longer than 4096 UTF-16 units is rejected before submission. Target
+case and whitespace are preserved. No force/ignore option or paging is exposed.
+Success requires the existing RS13/QueryReply empty-QueryResult profile, not
+the zero-byte naming-write body. Completion does not establish a placement
+transition: observe replicas/discovery separately. Timeout, cancellation and
+disconnection after submission can leave the mutation outcome unknown; the
+client never retries or replays it.
 
 Application and ordinary application-scoped service lists use strict paging
 metadata and optional checked NamingGateway/QueryReply headers. Node health is
@@ -208,8 +220,19 @@ domain errors. All successful writes, reads and three concurrent cloned
 Ping/NameExists operations retained furpc generation **1**. The actual receipt
 passed `validate_furpc_names` after owned cleanup removed the name journal.
 
-Together with the earlier native runs, this qualifies twelve reads and two naming
-writes over initiating clear TCP on the observed runtime, not furpc native notifications,
+The updated archived list scenario also passed on the retained five-node
+**11.8.121.4** onebox with MovePrimary entirely on furpc. One constraint-enforced
+request moved the captured owned partition from **N0020** to its existing ready
+secondary on **N0040**. Independent native/HTTP observations retained the same
+replica identities and confirmed the role swap; the mutation response and
+subsequent cloned replica/partition/Ping calls all retained generation **1**.
+The actual list, topology, deployment and movement receipts passed their
+independent validators after all owned fixture resources were cleaned.
+This does not qualify force/ignore options, native movement rejections, replay
+or remote completion after a real transport failure.
+
+Together with the earlier native runs, this qualifies twelve reads, two naming
+writes and MovePrimary over initiating clear TCP on the observed runtime, not furpc native notifications,
 accepted-side serving, TLS, other gateway operations, or the rest of the migration.
 
 ### Remaining legacy client and operation inventory
@@ -217,7 +240,7 @@ accepted-side serving, TLS, other gateway operations, or the rest of the migrati
 `fube-transport` implements bounded Fabric serialization, clear frames and CRCs,
 ordered native headers, client-only ListenInstance establishment, and
 continuously driven, bounded concurrent Tokio request/reply I/O. `fube-client`
-retains only MovePrimary and uncached service resolution as ordinary operations.
+retains only uncached service resolution as an ordinary operation.
 All paged and unpaged list queries use furpc; their legacy methods,
 typed-request implementations and input-accounting adapters are retired.
 Uncached resolution and independent notification sessions add endpoint discovery
@@ -247,8 +270,8 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 | ResolveServicePartition | Uncached native gateway request with singleton, named or signed-int64 selection and optional previous-result metadata. Owned partition details, endpoints/roles and identity-scoped generation/lookup versions. All three key kinds, refreshes, missing-service errors and independent endpoint/role comparisons qualified on 11.8.121.4. |
 | Service notifications | Standalone noncloneable `ServiceNotificationClient`, independent connection/session/receiver, many owning RAII filter guards. Exact/prefix/primary-only registration, native updates, endpoint-count changes, primary replacement, empty invalidations, unregister and independent close qualified on 11.8.121.4. A lost successful ACK caused a real native retry without duplicate delivery. Distinct-address primary-only delivery remains separately unqualified. |
 | Native ImageStore package copy | Dedicated `ImageStoreClient`, v1.2 session/chunk/commit protocol and native AtomicCopy root replacement. Rust's complete inventory matched one native SDK predecessor minus a deliberate obsolete file, and independently matched local files/zero-byte postorder `_.dir` markers. Nested Unicode/space paths, empty files/directories, 7 MiB data, a 132 MiB binary, stale removal, provisioning/creation, independent live application contact and deployed Data SHA256 comparison passed on 11.8.121.4. Repeated native SDK copy reliability is not claimed. |
-| MovePrimary | Constraint-enforced native FM query with RS13/QueryReply and empty QueryResult. No force/ignore option. Current owned-fixture qualification records independent native/HTTP primary transition and cleanup. |
-| Native faults/errors | Remaining legacy methods use typed Local/Transport/Protocol/Domain origins. Furpc reads preserve Native/Decode/Protocol/Domain categories, including native Fault bodies and original sources. |
+| MovePrimary | Furpc constraint-enforced native FM query with RS13/QueryReply and empty QueryResult. No force/ignore option, paging or replay. The owned fixture observes the actual native/HTTP primary transition, source generation, mixed cloned reuse and cleanup. |
+| Native faults/errors | Remaining legacy methods use typed Local/Transport/Protocol/Domain origins. Furpc operations preserve Native/Decode/Protocol/Domain categories, including native Fault bodies and original sources. |
 | Concurrent operations | Mixed read queries on clones sharing one connection; real onebox coverage. Deterministic cancellation/late-reply behavior belongs to furpc's transport suite. |
 | Idle disconnect | Historical legacy proxy qualification is retired with its read façade; managed furpc lifecycle has its own transport coverage. |
 | Controls and stream lifecycle | Underlying furpc/fube-transport suites cover managed transport behavior. Synthetic fube-client wire/model-peer tests are retired. |
@@ -454,8 +477,7 @@ conversions or old-Connection compatibility wrappers.
 The shared `Client::call` future is lazy and owns a sealed `ClientRequest`.
 Preparation, admission and I/O begin on first poll. `GatewayClient::new` borrows
 an explicitly supplied channel/target; it does not clone/adopt/close an external
-owner. MovePrimary's query description and ResolutionRequest use existing
-codecs. Resolution retains owned selection and
+owner. ResolutionRequest uses the existing resolution codec and retains owned selection and
 minimal previous refresh metadata, never a cloned endpoint cache.
 
 Every remaining legacy operation takes a final `timeout: Option<Duration>` argument.
@@ -2174,7 +2196,14 @@ parser tests. Offline evidence covers strict suffixes, hostile bounds, enums,
 malformed successes, native errors, out-of-order mixed queries, deadlines,
 ownership collisions, ambiguous mutation retention and cleanup dependency order.
 The current maintained native group has five tests; owned MovePrimary is included
-inside the list fixture. Current migration results are new executable receipts,
+inside the list fixture. The movement now uses the same furpc client as the
+list/topology/deployment reads. Its required `movement.furpc` evidence retains
+the actual mutation response generation, requires the original list generation,
+and records successful concurrent replica/partition/Ping reuse. The existing
+`validate_native_movement` still independently requires a single constraint-enforced
+request and the actual HTTP/native role swap on the same owned replica identities;
+an empty success alone cannot satisfy it.
+Current migration results are new executable receipts,
 not a relabeling of that earlier four-scenario archive.
 Live coverage does not establish Compose/Mesh applications, service groups,
 persisted stateful data, upgrade/deletion transitions, partial aggregation,

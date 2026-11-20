@@ -3,8 +3,9 @@ use clap::Parser;
 use fube_client::{
     ClientOptions, DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
     DeployedReplicaQueryDescription, DeployedReplicaQueryParameters, FabricClient, FurpcClient,
-    NamingUri, PartitionKey, PartitionQueryDescription, PartitionQueryParameters,
-    ReplicaQueryDescription, ReplicaQueryParameters, ServiceEndpointRole, ServiceKind,
+    MovePrimaryQueryDescription, MovePrimaryQueryParameters, NamingUri, PartitionKey,
+    PartitionQueryDescription, PartitionQueryParameters, ReplicaQueryDescription,
+    ReplicaQueryParameters, ServiceEndpointRole, ServiceKind,
 };
 use std::{net::SocketAddr, time::Duration};
 use tokio::{
@@ -375,8 +376,13 @@ async fn run(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         {
             return Err("target is not an independently observed active secondary".into());
         }
-        client
-            .move_primary(partition, &target, Some(Duration::from_secs(60)))
+        reads
+            .move_primary(
+                furpc::Request::new(MovePrimaryQueryDescription::new(
+                    MovePrimaryQueryParameters::new(partition, &target),
+                )),
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            )
             .await?;
         println!(
             "{}",

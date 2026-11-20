@@ -21,10 +21,10 @@ use crate::{
     ApplicationListPage, ApplicationQueryDescription, DeployedApplicationListPage,
     DeployedApplicationQueryDescription, DeployedCodePackage, DeployedCodePackageQueryDescription,
     DeployedReplica, DeployedReplicaQueryDescription, DeployedServicePackage,
-    DeployedServicePackageQueryDescription, DomainFailure, GatewayDescription, NamingUri,
-    NodeHealth, NodeHealthQueryDescription, NodeListPage, NodeQueryDescription, PartitionListPage,
-    PartitionQueryDescription, ReplicaListPage, ReplicaQueryDescription, ServiceListPage,
-    ServiceQueryDescription,
+    DeployedServicePackageQueryDescription, DomainFailure, GatewayDescription,
+    MovePrimaryQueryDescription, NamingUri, NodeHealth, NodeHealthQueryDescription, NodeListPage,
+    NodeQueryDescription, PartitionListPage, PartitionQueryDescription, ReplicaListPage,
+    ReplicaQueryDescription, ServiceListPage, ServiceQueryDescription,
 };
 
 const ACTIVITY: u16 = 0x8020;
@@ -246,6 +246,20 @@ where
             deadline,
         )
         .await
+    }
+
+    /// Ask native FM to move a Primary to an explicit node with placement constraints.
+    ///
+    /// There is no force/ignore option, retry or replay. Timeout, cancellation or
+    /// disconnection after submission can leave the mutation outcome unknown.
+    /// Successful completion is not an observed placement transition; query
+    /// placement/discovery separately, without treating it as an atomic snapshot.
+    pub async fn move_primary(
+        &mut self,
+        request: Request<MovePrimaryQueryDescription>,
+        deadline: Instant,
+    ) -> Result<Response<()>> {
+        self.query(request, deadline).await
     }
 
     /// Get one best-effort native node page, without automatic paging or retries.

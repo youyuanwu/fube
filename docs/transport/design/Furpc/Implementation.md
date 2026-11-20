@@ -62,7 +62,8 @@ Partition and replica list methods now reuse that codec with strict List tags
 legacy methods, typed-request adapters and input accounting are retired.
 The existing owned list scenario now compares canonical furpc topology against
 HTTP, retains actual fields and generation/error evidence, and observes
-MovePrimary through furpc replicas while leaving the mutation on legacy.
+MovePrimary through furpc replicas. The mutation was still legacy in that
+topology qualification and is now migrated below.
 The rewritten archived scenario passed against a fresh SF11.8.121.4 onebox:
 six partitions and 22 replicas/instances matched independent HTTP observations.
 The four node-local deployment queries also use the same codec: deployed
@@ -88,7 +89,7 @@ NamingGateway/NameOperationReply validation, and deletion alone adds native
 explicit-delete header `0x8033`. Both preserve native failures, absolute deadlines,
 source/settlement metadata and no-replay/unknown-write-outcome semantics.
 Their legacy methods, NameRequest/NameOperation/NameResponse and input accounting
-are retired; only MovePrimary and resolution retain the ordinary legacy client.
+are retired.
 The existing owned name lifecycle now uses one furpc generation for writes and
 reads, independently observes HTTP presence/absence and checks duplicate/missing
 errors plus concurrent cloned Ping/NameExists reuse. Its required receipt is
@@ -97,8 +98,27 @@ The targeted archived lifecycle passed on a fresh five-node SF11.8.121.4 onebox:
 both writes and all reads retained generation 1, duplicate/missing failures were
 native domain errors, independent HTTP agreed and owned cleanup completed.
 The actual receipt passed `validate_furpc_names`.
+MovePrimary now uses the generic query codec with public unpaged
+MovePrimaryQueryDescription/MovePrimaryQueryParameters and its existing
+RS13/QueryReply empty-QueryResult profile. Nil partitions and invalid explicit
+node names fail before submission. There is no force/ignore option, paging,
+retry or replay; an acknowledged request is not an observed placement transition,
+and an abandoned submitted mutation can still execute.
+Its legacy method, request adapter, input accounting and the last legacy query
+encode/decode entry points are retired. Only resolution retains the ordinary
+legacy client. The existing owned list scenario now submits one movement on the
+original furpc generation, independently observes the native/HTTP role swap
+and checks concurrent replica/partition/Ping reuse on clones. The existing
+movement validator requires the actual mutation response generation to match
+the read-client generation.
+The updated targeted archive passed against the retained SF11.8.121.4 onebox:
+one request moved the owned primary from N0020 to its existing ready secondary
+on N0040, with unchanged replica identities independently observed through
+native reads and HTTP. The mutation and subsequent cloned mixed reads retained
+generation 1. Actual list/topology/deployment/movement receipts passed the
+independent validators and owned cleanup completed; the onebox was left running.
 Together with the earlier runs, this is initiating clear-TCP evidence for the
-twelve migrated reads and two naming writes only; it does
+twelve migrated reads, two naming writes and MovePrimary only; it does
 not qualify accepted-side serving, notifications, TLS, or the rest of the gateway API. See the
 [client slice](../../RustFabricClient.md#separate-furpc-backed-client).
 

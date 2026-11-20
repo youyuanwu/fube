@@ -428,4 +428,28 @@ fn unpaged_descriptions_reject_unsupported_outer_paging_instead_of_ignoring_it()
     check(DeployedReplicaQueryDescription::new(
         DeployedReplicaQueryParameters::new("Node_1", "fabric:/App".parse().unwrap()),
     ));
+    check(MovePrimaryQueryDescription::new(
+        MovePrimaryQueryParameters::new(uuid::Uuid::new_v4(), "Node_1"),
+    ));
+}
+
+#[test]
+fn movement_json_preserves_explicit_target_without_force_or_ignore_options() {
+    let partition = uuid::Uuid::new_v4();
+    let query =
+        MovePrimaryQueryDescription::new(MovePrimaryQueryParameters::new(partition, " Node_1 "));
+    json_round_trip(&query);
+    let expected = serde_json::json!({
+        "parameters": { "NodeName": " Node_1 ", "PartitionId": partition.to_string() },
+    });
+    assert_eq!(serde_json::to_value(&query).unwrap(), expected);
+    for (field, value) in [
+        ("ForceMove", serde_json::json!(true)),
+        ("IgnoreConstraints", serde_json::json!(true)),
+        ("PartitionId", serde_json::json!("not-a-guid")),
+    ] {
+        let mut invalid = expected.clone();
+        invalid["parameters"][field] = value;
+        assert!(serde_json::from_value::<MovePrimaryQueryDescription>(invalid).is_err());
+    }
 }
