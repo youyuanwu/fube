@@ -34,6 +34,14 @@ fn request(address: &str, from: i64, to: i64) -> Packet {
     }
 }
 
+fn append(message: Message, header: furpc::HeaderRecord) -> Message {
+    let mut builder = Message::builder().body(message.body().clone());
+    for record in message.headers().records() {
+        builder = builder.append_header(record.to_owned());
+    }
+    builder.append_header(header).build().unwrap()
+}
+
 #[test]
 fn dual_stack_peer_resolution_prefers_listener_family_without_dropping_single_family_destinations()
 {
@@ -169,7 +177,8 @@ pub(crate) async fn native_socket(address: &str, published: &str) -> TcpStream {
     let mut socket = TcpStream::connect(address).await.unwrap();
     let hello = read_message(&mut socket).await.unwrap();
     assert_eq!(hello.properties().unwrap().actor, 1);
-    let local = ListenInstance::decode(&hello.body).unwrap();
+    assert!(hello.properties().unwrap().action.is_empty());
+    let local = ListenInstance::decode(hello.body()).unwrap();
     assert_eq!(local.address, address);
     assert!(local.instance > 0);
     assert_ne!(local.nonce, [0; 16]);
@@ -366,7 +375,7 @@ async fn observed_invalid_frame_completion_keeps_exact_bytes_tuple_and_bounded_c
         .unwrap()
         .unwrap();
     assert_eq!(receipt.frame, actual);
-    let message = Message::from_frame(Frame::decode(&actual).unwrap()).unwrap();
+    let message = decode_message(&actual).await.unwrap();
     assert_eq!(Packet::decode(&message).unwrap(), invalid);
     assert_eq!(receipt.message_id, message.properties().unwrap().id);
     assert_ne!(receipt.message_id, MessageId::default());
@@ -1009,7 +1018,7 @@ async fn accepted_and_initiated_sockets_share_one_connection_limit() {
 }
 
 #[tokio::test]
-async fn malformed_security_and_identity_only_retire_the_offending_session() {
+async fn domain_errors_retire_only_the_offending_session_while_policy_rejections_discard() {
     let (transport, mut incoming) = PeerTransport::bind(
         "127.0.0.1:0",
         Settings {
@@ -1025,23 +1034,43 @@ async fn malformed_security_and_identity_only_retire_the_offending_session() {
         if attack == 1 {
             message = request("127.0.0.1:32106", 2, 1).encode(true).unwrap();
         } else if attack == 2 {
-            message
-                .headers
-                .push(fube_transport::message::Header::actor(7).unwrap());
+            message = append(
+                message,
+                furpc::header::actor(furpc::ActorId::new(7).unwrap()).unwrap(),
+            );
         } else if attack == 3 {
-            message.headers.push(message.headers[0].clone());
+            let duplicate = message.headers().records().next().unwrap().to_owned();
+            message = append(message, duplicate);
         } else if attack == 4 {
-            message
-                .headers
-                .push(fube_transport::message::Header::boolean(0x8029, true).unwrap());
+            #[derive(serde::Serialize)]
+            struct Boolean {
+                value: bool,
+            }
+            message = append(
+                message,
+                furpc::HeaderRecord::native(
+                    furpc::HeaderId::new(0x8029).unwrap(),
+                    &Boolean { value: true },
+                )
+                .unwrap(),
+            );
         }
         let mut bytes = message.to_frame().unwrap().encode().unwrap();
         if attack == 0 {
             bytes[4] = 1;
         }
         bad.write_all(&bytes).await.unwrap();
-        expect_closed(&mut bad).await;
-        assert!(incoming.control.is_empty());
+        if matches!(attack, 2 | 4) {
+            let marker = request(published, 3, 1);
+            write_message(&mut bad, &marker.encode(true).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(receive(incoming.recv_control()).await, marker);
+            drop(bad);
+        } else {
+            expect_closed(&mut bad).await;
+            assert!(incoming.control.is_empty());
+        }
     }
     let published = "127.0.0.1:32107";
     let mut good = native_socket(transport.address(), published).await;
@@ -1104,7 +1133,7 @@ async fn native_zero_instance_acceptor_and_directional_nonce_are_wire_compatible
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let hello = read_message(&mut socket).await.unwrap();
-        let hello = ListenInstance::decode(&hello.body).unwrap();
+        let hello = ListenInstance::decode(hello.body()).unwrap();
         assert_eq!(hello.address, source);
         assert_eq!(
             hello.nonce, [0; 16],
@@ -1173,7 +1202,7 @@ async fn partial_frame_and_handshake_deadlines_release_connection_slots() {
 }
 
 #[tokio::test]
-async fn shutdown_is_terminal_synchronous_and_drains_a_backpressured_writer() {
+async fn shutdown_is_terminal_synchronous_and_releases_a_backpressured_writer() {
     let settings = Settings {
         queue_operations: 32,
         ..Settings::default()
@@ -1189,37 +1218,15 @@ async fn shutdown_is_terminal_synchronous_and_drains_a_backpressured_writer() {
         let _ = transport.send(operation(transport.address(), 1, 2, 1024 * 1024 - 1));
     }
     sleep(std::time::Duration::from_millis(30)).await;
-    // At least the first frame has actually become visible, and the large
-    // queued train has backpressured the socket. Closing must not drop a
-    // selected writer's partial suffix.
+    // A committed frame may be truncated by retirement; shutdown must still
+    // release the actual socket and every owned outgoing capture.
     let mut fixed = [0; FIXED_HEADER_SIZE];
     socket.read_exact(&mut fixed).await.unwrap();
     let closing = transport.clone();
     let joined = tokio::task::spawn_blocking(move || closing.shutdown());
     let draining = async {
-        let mut frames = 0;
-        loop {
-            let size = validate_fixed(&fixed).unwrap().0;
-            let mut bytes = fixed.to_vec();
-            bytes.resize(size, 0);
-            socket
-                .read_exact(&mut bytes[FIXED_HEADER_SIZE..])
-                .await
-                .expect("shutdown retains every started frame suffix");
-            let packet =
-                Packet::decode(&Message::from_frame(Frame::decode(&bytes).unwrap()).unwrap())
-                    .unwrap();
-            assert!(matches!(packet.body, Body::Replication { .. }));
-            frames += 1;
-            if socket.read(&mut fixed[..1]).await.unwrap() == 0 {
-                break;
-            }
-            socket
-                .read_exact(&mut fixed[1..])
-                .await
-                .expect("no truncated next frame");
-        }
-        assert!(frames > 0);
+        let mut bytes = [0; 8192];
+        while socket.read(&mut bytes).await.unwrap() != 0 {}
     };
     timeout(std::time::Duration::from_secs(3), draining)
         .await

@@ -18,7 +18,7 @@
 //!
 //! These are payload/header codecs, not a connection, security handshake, or
 //! replication engine. Framing and security-provider rejection belong to
-//! `fube_transport::frame::Frame`. Native interoperability requires execution
+//! `furpc`. Native interoperability requires execution
 //! against an independently built native peer; these codecs alone do not prove it.
 //!
 //! Bounds are 1 MiB and 1024 buffers per operation, 1024 operations per batch,
@@ -29,13 +29,93 @@
 use std::{fmt, net::Ipv6Addr, str::FromStr};
 
 use fube_core::Epoch;
-use fube_transport::{
-    frame::MAX_FRAME_SIZE,
-    message::{Header, Message, MessageId, ACTION, MESSAGE_ID},
-    Error, Result,
-};
 use fubst::{Decoder, Encoder, MAX_COLLECTION_COUNT, MAX_STRING_UNITS};
+use furpc::{header, HeaderId, HeaderRecord, MessageId};
 use uuid::Uuid;
+
+use crate::{Error, Result};
+
+pub(crate) const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
+const ACTION: u16 = header::ACTION.get();
+const MESSAGE_ID: u16 = header::MESSAGE_ID.get();
+
+// Domain codec scratch, not a framing codec or connection implementation.
+#[derive(Clone)]
+struct Header {
+    id: u16,
+    value: Vec<u8>,
+}
+
+impl Header {
+    fn record(record: HeaderRecord) -> Self {
+        Self {
+            id: record.id().get(),
+            value: record.value().to_vec(),
+        }
+    }
+
+    fn object(id: u16, fields: impl FnOnce(&mut Encoder) -> fubst::Result<()>) -> Result<Self> {
+        Ok(Self {
+            id,
+            value: object(fields)?,
+        })
+    }
+
+    fn action(action: &str) -> Result<Self> {
+        header::action(action)
+            .map(Self::record)
+            .map_err(transport_error)
+    }
+
+    fn message_id(id: MessageId) -> Result<Self> {
+        HeaderRecord::native(header::MESSAGE_ID, &id)
+            .map(Self::record)
+            .map_err(transport_error)
+    }
+
+    fn read<T>(&self, fields: impl FnOnce(&mut Decoder<'_>) -> fubst::Result<T>) -> Result<T> {
+        read_object(&self.value, fields)
+    }
+}
+
+#[derive(Clone)]
+struct Message {
+    headers: Vec<Header>,
+    body: Vec<u8>,
+}
+
+impl Message {
+    fn into_native(self) -> Result<furpc::Message> {
+        let mut builder = furpc::Message::builder();
+        for header in self.headers {
+            builder = builder.append_header(
+                HeaderRecord::from_encoded(
+                    HeaderId::new(header.id).map_err(transport_error)?,
+                    header.value,
+                )
+                .map_err(transport_error)?,
+            );
+        }
+        builder
+            .body(furpc::Body::from_bytes(self.body).map_err(transport_error)?)
+            .build()
+            .map_err(transport_error)
+    }
+}
+
+pub(crate) fn transport_error(error: furpc::Error) -> Error {
+    match error {
+        furpc::Error::Closed => Error::Closed,
+        error @ furpc::Error::Cancelled => {
+            Error::with_cause(fube_core::ErrorKind::Canceled, error.to_string(), error)
+        }
+        furpc::Error::Timeout(_) => Error::Timeout,
+        furpc::Error::InvalidInput(message) => Error::InvalidInput(message),
+        furpc::Error::Protocol(message) => Error::Protocol(message),
+        furpc::Error::ResourceLimit(resource) => Error::ResourceLimit(resource),
+        error => Error::with_cause(fube_core::ErrorKind::Transport, error.to_string(), error),
+    }
+}
 
 const RE_FROM: u16 = 0x800a;
 const RE_ACTOR: u16 = 0x8019;
@@ -294,7 +374,11 @@ impl Packet {
     /// `header_in_body` applies to replication and copy, just as in the native
     /// transport. A batch has one shared kind/atomic-group metadata value and
     /// consecutive sequence numbers; heterogeneous batches must be split.
-    pub fn encode(&self, header_in_body: bool) -> Result<Message> {
+    pub fn encode(&self, header_in_body: bool) -> Result<furpc::Message> {
+        self.encode_parts(header_in_body)?.into_native()
+    }
+
+    fn encode_parts(&self, header_in_body: bool) -> Result<Message> {
         self.from.validate()?;
         self.to.validate()?;
         let mut message = Message {
@@ -476,7 +560,35 @@ impl Packet {
 
     /// Decode both native operation-header locations, rejecting ambiguous
     /// identities, impossible batches, malformed native ABI values and bounds.
-    pub fn decode(message: &Message) -> Result<Self> {
+    pub fn decode(message: &furpc::Message) -> Result<Self> {
+        if 12
+            + message
+                .headers()
+                .records()
+                .map(|header| 4 + header.value().len())
+                .sum::<usize>()
+            + message.body().len()
+            > MAX_FRAME_SIZE
+        {
+            return Err(Error::Protocol("replication frame exceeds aggregate limit"));
+        }
+        let mut body = Vec::new();
+        body.try_reserve_exact(message.body().len())
+            .map_err(|_| Error::ResourceLimit("replication decode body"))?;
+        for segment in message.body().segments() {
+            body.extend_from_slice(segment);
+        }
+        Self::decode_parts(&Message {
+            headers: message
+                .headers()
+                .records()
+                .map(|header| Header::record(header.to_owned()))
+                .collect(),
+            body,
+        })
+    }
+
+    fn decode_parts(message: &Message) -> Result<Self> {
         validate_message(message)?;
         for id in [
             RE_FROM,
@@ -500,7 +612,12 @@ impl Packet {
                 "replication security headers outside clear-TCP profile",
             ));
         }
-        required_header(message, MESSAGE_ID)?.read(MessageId::decode)?;
+        required_header(message, MESSAGE_ID)?.read(|decoder| {
+            Ok(MessageId {
+                guid: decoder.guid()?,
+                index: decoder.u32()?,
+            })
+        })?;
         let action = required_header(message, ACTION)?.read(|d| d.string())?;
         let from = required_header(message, RE_FROM)?.read(|d| {
             Ok(Endpoint {
@@ -643,9 +760,15 @@ fn validate_message(message: &Message) -> Result<()> {
     if message.body.len() > MAX_FRAME_SIZE {
         return Err(Error::Protocol("replication body exceeds aggregate limit"));
     }
-    // Keep frame/header limits owned by the shared transport, including the
-    // complete 4 MiB extent rather than just the provider payload length.
-    message.to_frame()?.encode()?;
+    let headers = message.headers.iter().try_fold(0usize, |size, header| {
+        if header.value.is_empty() || header.value.len() > u16::MAX as usize - 4 {
+            return Err(Error::Protocol("invalid replication header extent"));
+        }
+        Ok(size + 4 + header.value.len())
+    })?;
+    if headers > u16::MAX as usize || 12 + headers + message.body.len() > MAX_FRAME_SIZE {
+        return Err(Error::Protocol("replication frame exceeds aggregate limit"));
+    }
     Ok(())
 }
 

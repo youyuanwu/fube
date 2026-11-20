@@ -1,9 +1,7 @@
 use super::*;
+use crate::transport::ipc_wire::{read_message, write_message};
 use crate::transport::tests::native_socket;
-use fube_transport::{
-    connection::{read_message, write_message},
-    message::Message,
-};
+use furpc::Message;
 use tokio::net::TcpStream;
 
 async fn send(socket: &mut TcpStream, primary: &Endpoint, engine: &Engine, body: Body) {

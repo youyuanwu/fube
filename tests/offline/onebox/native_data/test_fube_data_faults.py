@@ -89,7 +89,7 @@ def receipt(value, source, kind):
     frame = struct.pack("<I", len(body) + 12) + b"\0" * 8 + body
     own_socket, selected_socket = own.split("/", 1)[0], selected.split("/", 1)[0]
     result["delivery"] = {
-        "classification": "socket_write_all_and_flush", "session": 1,
+        "classification": "complete_local_socket_acceptance", "session": 1,
         "local": "127.0.0.1:40001" if source["role"] == "Primary" else own_socket,
         "remote": selected_socket if source["role"] == "Primary" else "127.0.0.1:40002",
         "remote_listener": selected_socket, "message_id": {"guid": message_id, "index": 1},

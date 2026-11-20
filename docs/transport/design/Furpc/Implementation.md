@@ -27,7 +27,7 @@ Offline public API cases cover both correlation modes, full native u64 instances
 strings beyond the legacy codec limits, fresh accepted/zero initiating nonces,
 actual wildcard-listener TCP metadata, Endpoint clone/reconnect snapshots and
 original-generation retirement. This is listener API evidence, not native
-replication qualification; the fube-data migration remains proposed below.
+replication qualification; the fube-data migration is described below.
 
 The driver owns cooperative preparation, scalar/vectored partial output,
 queued serialized-frame bytes, precommit cancellation/deadlines, local-write
@@ -212,7 +212,7 @@ This intentionally does not emulate its first-write predicates, ordered ingress
 barrier or physical-driver join. Domain authority checks and the independent
 watchdog remain; already-admitted output can outlive a local check. The consumer
 I/O wrapper observes stream release, not a new furpc lifecycle contract.
-Data replication remains a separate migration track.
+Data replication uses the separately owned adapter described below.
 Retained runtime lifecycle/stateful/subprocess and shared RAP model peers also
 use furpc's public accepted Server, original Peer and ingress reply data.
 Test-only I/O gates preserve queued-write and partial-read coverage without
@@ -241,7 +241,7 @@ owns cancellation and joins its connection/send tasks on its dedicated executor,
 releasing the accepted socket before publishing disconnected state. Registration
 retirement still permits bounded original-path unregister exchanges.
 The Hosting and owned-app sample direct legacy dependency edges are retired;
-RA/node control and data replication remain legacy consumers. Offline managed
+RA/node control remains a legacy consumer. Offline managed
 furpc-client and independent adversarial socket fixtures cover the accepted path;
 real runtime-child, owned activation and local RA/RAP suites remain qualification
 owners.
@@ -433,9 +433,9 @@ notification receiving/ACKs on SF11.8.121.4, including actual ACK loss/retry.
 Native notification origination and accepted-side native interoperability remain
 unqualified. TLS remains unimplemented.
 
-## Proposed data replication migration
+## Data replication migration
 
-**Consumer design only; migration and native qualification not run.** The next separate
+**Implemented; native replication qualification not run.** This separate
 consumer slice replaces `fube-data`'s normal/dev legacy transport use, including
 its native payload/header codecs and directly coupled fixtures. Runtime/RAP
 and transactional callers keep their SF-style public replication boundary;
@@ -468,10 +468,10 @@ to retire just that connection. Both roles install the same raw one-way ingress
 service before application traffic. Raw-only mode preserves caller-owned
 one-way MessageIds; no synthetic Actor header or Actor-0 binding is introduced.
 
-Header checks validate the clear replication envelope and native ReplicationFrom/
-ReplicationActor schemas using public Headers and the original Source.
-Furpc retains control classification, integrity and body verification. The
-byte-facing service then decodes the native replication packet, validates
+The pre-body header policy validates the clear replication envelope.
+Furpc retains control classification, integrity and body verification.
+The byte-facing service then validates ReplicationFrom/ReplicationActor schemas
+using public Headers and the original Source, decodes the native packet, checks
 the remote listener/source identity and operation bounds, and tries the
 appropriate bounded domain handoff. It returns NoReply promptly, without
 waiting for provider application, copy completion or quorum. Malformed domain
@@ -496,7 +496,7 @@ a semantic ACK or advances replication completion.
 
 ### Approved contract changes
 
-| Area | Proposed migration contract |
+| Area | Implemented migration contract |
 | --- | --- |
 | Body admission | Furpc's private frame/header/binding/HandlerLimits gates still precede body retention. Fube-data's control/data byte and queue accounting occurs after verified delivery, before domain handoff, not inside that private gate. |
 | Resource isolation | Existing global control/data queue/byte allowances remain independent domain policies, including retained ingress and outgoing captures. They do not account for furpc's body backing or in-flight handlers and do not imply a total heap bound. ACK/RequestAck is ordinary native traffic, not privileged transport control. |
@@ -504,7 +504,7 @@ a semantic ACK or advances replication completion.
 | Rejection | Furpc may diagnose and discard unbound, wrong-kind or header-policy/capacity-rejected ingress without closing. Input actually reaching the domain still follows its strict sender/schema/control-capacity retirement policy. No rejected data receives a new ACK. |
 | Send authority/cancellation | Keep one admission-started absolute deadline through route selection, connect, Peer acquisition and send. Use original Peer and Operation/Attempt cancellation; do not recreate custom first-positive-write predicates. Admitted or committed output can race domain retirement and have an unknown remote outcome. |
 | Shutdown | Stop new domain work, cancel owned operations and retire Channels/serving futures. A started suffix may be cut short by cancellation/connection retirement; the legacy guarantee of flushing every started frame before joined shutdown is removed. |
-| Physical retirement | The domain still owns and joins its network thread/tasks and observes release of its actual I/O adapters before publishing completed shutdown. Channel drop alone, a furpc error, or an Attempt disposition is not join evidence. No new public furpc join/closure observer is proposed. |
+| Physical retirement | The domain still owns and joins its network thread/tasks and observes release of its actual I/O adapters before publishing completed shutdown. Channel drop alone, a furpc error, or an Attempt disposition is not join evidence. No new public furpc join/closure observer is introduced. |
 | Write evidence | Furpc WriteReceipt proves complete local socket acceptance, not an explicit flush, remote parse or ACK. Qualification receipts must use that classification. Exact frame-byte evidence, when required, must come from an independent observer of actual bytes, not a reconstructed frame labeled as written. |
 
 Domain sends retain their existing finite queue captures/permits until local
@@ -516,27 +516,38 @@ remove a newer route or admit a late send task.
 
 ### Delivery and qualification
 
-The advertised-listener API is implemented using the same internal hello
-engine on both roles, with the offline coverage recorded above. Its delivery
-does not claim native execution or change fube-data's existing transport.
+The adapter in `fube-data/src/transport/connection.rs` uses the common hello
+engine on both roles and bounded send futures sized by the existing combined
+domain operation/byte allowances. Those futures retain original queue permits.
+Qualification-only observed sends drain prior native work and use an exclusive
+actual-I/O capture; no reconstructed frame is claimed as written.
+Packet encoding/decoding uses public furpc Messages with unchanged native
+schemas, segmentation and domain limits. Private mutable header/body scratch
+belongs only to that domain codec; it implements no framing or connection.
+The legacy normal/dev dependency edges and raw-session implementation are removed.
 
-Then replace replication framing/session composition and migrate Packet codecs
-to public furpc headers/messages while retaining the exact native schemas,
-segmentation and domain limits. Remove direct legacy normal/dev dependency
-edges only after their production and fixture uses are gone. Keep independent
-native-source schema/adversarial socket fixtures; do not expose private furpc
-internals or use a managed Rust peer as native interoperability evidence.
-
-Focused consumer cases must retain duplex accepted reuse, exact source/actor
+Retained independent native-source schema/adversarial socket fixtures and
+consumer cases cover duplex accepted reuse, exact source/actor
 validation, duplicate listener affinity and delayed application ACKs,
 independent control/data saturation, operation metadata accounting, shared
 address route removal, combined connection limits, fragmented/expired
 handshakes/frames, and terminal joined socket/task disposal under backpressure.
-Tests asserting retired pre-body admission, universal rejection closure,
-explicit flush evidence or guaranteed started-suffix completion must change
-with the documented contract, not weaken semantic ACK/queue/affinity checks.
-Exercise real replication copy/apply/quorum and coupled runtime/txn consumers
-through their existing supported boundaries.
+Retired universal rejection closure and guaranteed started-suffix completion
+assertions are replaced with the documented discard/retirement contracts;
+semantic ACK/queue/affinity checks remain. No private furpc codec or txn
+engine/qualification hook is exposed.
+
+Offline validation passed 153 data cases and 12 data doctests, 223 txn cases
+plus its two public-runtime integration cases, 31 coupled runtime replication
+cases and the furpc package suite. The updated Python evidence-contract suite
+passed 170 cases with one skip. The retained multi-megabyte public-construction
+txn full-copy case initially hit its unchanged five-second bound with the
+single-send/bitwise-CRC composition under repeated large-frame traffic.
+Bounded native send pipelining and accelerated incremental `crc32fast` preserve
+native checksum bytes and cooperative work quanta, without disabling integrity,
+loosening limits/deadlines or changing copy/ACK/retry policy. The same case
+passes with that original bound. Evidence logs, including the failed diagnostic
+runs, are ignored under `build/furpc-data-proof/`.
 
 Fresh native replication qualification is required before claiming migrated
 native support. Historical V1 receipts and the Hosting bootstrap/registration

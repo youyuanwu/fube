@@ -41,6 +41,9 @@ mssf-util = "0.10"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["full"] }
 tower-service = "0.3"
+tracing = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+crc32fast = "1"
 serde_json = "1"
 serde = {version = "1", features = ["derive"]}
 bitflags = { version = "2", features = ["serde"] }

@@ -65,14 +65,14 @@ For core work, read Architecture, Resources, Operations, Framing, and Lifecycle.
 Cross-topic references point to the owning contract rather than duplicating
 signatures or inventing a second control path.
 
-The next proposed consumer slice is
-[data replication](Implementation.md#proposed-data-replication-migration).
+The delivered consumer slices now include
+[data replication](Implementation.md#data-replication-migration).
 Its furpc API prerequisite,
 [native-style listener configuration](Connections.md#native-style-listener-configuration),
 is now implemented for clear transport;
-the remaining migration uses the existing raw service/Peer contracts and
+the adapter uses the existing raw service/Peer contracts and
 explicitly changes the legacy adapter's admission and cancellation guarantees.
-The consumer migration and its native qualification remain pending.
+The consumer migration is implemented; native replication qualification remains pending.
 
 ## Non-goals and evidence
 

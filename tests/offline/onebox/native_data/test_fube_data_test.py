@@ -2349,7 +2349,7 @@ class WireDeliveryTests(unittest.TestCase):
                  "target": peer, "native_selected_peer": peer, "sequence": 11,
                  "native_epoch": {"data_loss_number": 1, "configuration_number": 2**33},
                  "sent_epoch": {"data_loss_number": 1, "configuration_number": 2**33},
-                 "delivery": {"classification": "socket_write_all_and_flush", "session": 7,
+                 "delivery": {"classification": "complete_local_socket_acceptance", "session": 7,
                               "local": "127.0.0.1:40001", "remote": self.peer_address,
                               "remote_listener": self.peer_address, "message_id": self.message_id,
                               "frame_hex": self.frame.hex(), "frame_bytes": len(self.frame)}}

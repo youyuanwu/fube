@@ -31,7 +31,8 @@ of outside clones. Crate-root transport re-exports are removed; Error/Result now
 mean fubst input/model validation. Remote errors use FurpcClientError,
 NotificationResult and ImageStoreError/ImageStoreResult.
 Runtime's initiating IPC and Hosting's accepted IPC both use furpc.
-Replication's raw-session API remains a separate migration track.
+Data replication now also uses furpc's public raw one-way service/Peer path;
+RA/node control remains a separate migration track.
 
 Runtime requests now use typed furpc Request/Response and FubstCodec over the
 original Peer. Host/PID identity is added only to initiating requests and semantic
@@ -50,7 +51,7 @@ Backpressure and partial-read checks use test-only I/O adapters. Hosting/node
 integration tests retain independent, byte-preserving frame observation using
 public furpc headers; they exercise the production Hosting server.
 Neither fube-runtime nor fube-rap-test-support directly depends on fube-transport,
-including dev-dependencies. Legacy core/data/RA/node transitive consumers remain.
+including dev-dependencies. Legacy core/RA/node transitive consumers remain.
 Role-changing reconfiguration retries during catch-up no longer receive a
 membership-only success before the service and replicator roles are applied.
 
@@ -81,6 +82,27 @@ registration, same-core lookup and owned local closure decisions. All five
 retained native fixture profiles passed separately. This qualifies those clear
 accepted-side bootstrap/registration paths, not native deployed lifecycle,
 stateful/reporting, failed-write/revocation races, or TLS/claims.
+
+`fube-data`'s low-level `Packet::encode` now returns a public furpc Message;
+`Packet::decode` accepts one. Both use core Error/Result for domain validation.
+The classic native
+schemas, operation segmentation, supported address profile and public SF-style
+replicator construction remain unchanged. Its accepted/initiating peers use
+furpc raw-only mode and a shared listener address/instance; immediate and delayed
+ACKs retain original-generation Peer affinity rather than resolving a replacement.
+The direct legacy normal/dev dependency is removed, including retained socket/
+schema fixtures. Framing/checksums/handshake belong solely to furpc.
+
+The data adapter's control/data queue/byte allowances remain independent domain
+policies after verified body delivery, not pre-body allocation admission or
+an aggregate heap guarantee. Domain-invalid input/control overflow retires its
+exact session; generic furpc rejections may discard without closing. Shutdown
+joins owned session/I/O lifetimes on the dedicated thread but can truncate a
+committed frame; the old first-write predicate/started-suffix flush contracts
+are retired. Local qualification write evidence is
+`complete_local_socket_acceptance` with actual observed frame bytes, not an
+explicit flush or remote ACK. Native furpc replication qualification is not run;
+historical data/Hosting receipts are not relabeled as this migration's evidence.
 
 Public `ReplicationEndpointOptions` literals must set `advertised_ip`: use
 `None` for an existing concrete listener, or `Some(ip)` for the concrete IP to

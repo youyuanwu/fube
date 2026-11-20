@@ -204,6 +204,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -364,11 +373,15 @@ name = "fube-data"
 version = "0.1.0"
 dependencies = [
  "fube-core",
- "fube-transport",
+ "fube-rap-test-support",
  "fubst",
+ "furpc",
+ "futures-util",
  "serde",
  "serde_json",
  "tokio",
+ "tower-service",
+ "tracing",
  "uuid",
 ]
 
@@ -544,6 +557,7 @@ name = "furpc"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "crc32fast",
  "fubst",
  "futures-util",
  "http",

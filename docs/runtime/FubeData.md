@@ -1,7 +1,7 @@
 # Fube Data: volatile classic V1 replication
 
 `fube-data` is an owned Rust replication engine, separate from the SF-facing
-runtime/RAP implementation in `fube-runtime`. It implements a **qualified subset** of
+runtime/RAP implementation in `fube-runtime`. It implements a source-guided subset of
 classic V1: ordered nonzero sequences, explicit application acknowledgments,
 current/previous configuration quorums, epoch reconciliation, bounded copy and
 replication streams, retries and native Fabric TCP peers. Native SF nodes remain
@@ -17,7 +17,7 @@ The [current SF/mssf four-axis alignment record](SfApiAlignment.md) separates
 canonical signature from values, completion and capability. The deployed
 results in [executed qualification](#executed-qualification) are **historical at
 their exact old source/profile**, not qualification of this breaking migration.
-Current API-alignment deployed/native validation is **NOT RUN**.
+Current API-alignment and furpc replication deployed/native validation is **NOT RUN**.
 The [source audit and R0 corrections](#known-semantic-differences-from-native-v1)
 below record corrected lower contracts with offline regression evidence.
 They do not qualify R0 against a deployed native cluster.
@@ -35,15 +35,18 @@ native node -- Hosting/RAP control --> fube-runtime
               copy/apply + explicit ACK     Rust or native classic V1
 ```
 
-Production dependencies are **runtime → data → core/transport**.
+Production dependencies are **runtime → data → core/furpc**.
 `fube-core` owns shared SDK types/errors and neutral host execution, with no
 runtime or data implementation dependency. Runtime retains native proof
 interpretation, callback-slot/lease accounting and the independent watchdog.
 The data adapter owns peer listener/session policy and independent global
-control/data budgets, not the gateway client's connection assumptions. It and
-gateway/runtime channels use the same operational
-[`raw_session`](../../crates/libs/fube-transport/src/raw_session.rs) establishment,
-staged receive, fenced complete-frame write and joined I/O lifetime.
+control/data budgets, not the gateway client's connection assumptions.
+Its [furpc adapter](../../crates/libs/fube-data/src/transport/connection.rs)
+composes an owning initiating Channel, per-socket accepted Server, raw one-way
+IngressService and original-generation Peer. The public native headers/messages
+carry the unchanged classic payload schemas; no legacy framing/session backend,
+second reader or private furpc codec is used. The direct normal/dev legacy
+dependency is retired; core/RA/node legacy consumers remain separate.
 Production engine/runtime/app
 have no FabricRuntime, FabricCommon, COM or native replicator dependency.
 See [crate exports](../../crates/libs/fube-data/src/lib.rs),
@@ -61,16 +64,34 @@ override, and does not establish container or remote-native qualification.
 The existing peer supervisor bounds accepted and initiating sessions together,
 including pending handshakes. Initiators send a zero nonce; acceptors send a
 fresh listen-side nonce. Connect and hello exchange share one absolute budget.
-Outgoing work's callback budget starts at admission and fences its first
-positive write. Control is selected before queued data without preempting a
-started frame. Shutdown/retirement stops new work and joins any started suffix
-through completion or the independent callback-timeout frame watchdog, rather
-than abort-dropping it. A blocked peer can therefore delay joined shutdown up
-to that finite watchdog; idle reads still have no inactivity timeout.
+The adapter configures one published listener address/instance on both roles,
+without replacing actual I/O metadata. Its equal ListenInstance/REFrom-address
+check remains a trusted domain-profile restriction, not universal native parity.
+Outgoing work retains one admission-started absolute deadline through connect,
+Peer acquisition and send. Control is selected before queued data, but cannot
+preempt a started frame or data already admitted to furpc. Bounded native send
+pipelining uses the existing combined control/data operation and byte
+allowances; the original domain permits remain held until local completion or
+disposal. ACK/retry/copy/provider/quorum policies are unchanged.
 
-Incoming class admission still occurs before body allocation; rejected data
-is drained without ACK. Each private queued item owns its packet, byte lease
-and original weak source-session grant together. Receive or queued-item disposal
+Shutdown/retirement cancels owned operations and Channel/serving lifetimes;
+a committed frame can be truncated or have an unknown remote outcome.
+The former custom first-write predicates and guaranteed started-suffix flush
+are not emulated. The dedicated network thread joins its session futures and
+observes actual I/O/acquisition release before completed shutdown; this is
+consumer ownership, not a new furpc join API. Idle reads have no inactivity
+timeout, and started frames/discards/writes retain finite watchdogs.
+
+Furpc's frame/header/binding/handler gates precede body retention. Domain
+ReplicationFrom/ReplicationActor and body validation runs in the verified
+one-way service so invalid domain input can retire that exact session.
+Control/data byte and queue admission occurs after verification, before the
+domain handoff; it does not account for furpc's retained body backing or imply
+a total heap ceiling. Data-capacity drops are diagnosed without ACK, while
+domain control-capacity failure retires the session. Generic furpc envelope/
+binding/capacity rejections may instead be discarded without closing.
+Each private queued item owns its packet, byte lease and original weak session
+state/restricted Peer together. Receive or queued-item disposal
 releases the transport lease immediately; engine retention has its own independent
 charge. Public low-level consumers use `Incoming::recv`, `recv_control` or
 `recv_data`, never raw receivers or reply grants (see the
@@ -85,6 +106,15 @@ EOF does not retract a fully received packet already delivered to the engine;
 its historical source identity survives, but its closed reply target cannot write.
 Native membership projection and ordinary outbound membership routes remain
 separate adapter authority. Local write receipts are not semantic ACKs.
+Qualification receipts now classify `complete_local_socket_acceptance`, not an
+explicit flush. Their bounded frame bytes are observed from actual positive I/O
+writes under an exclusive observation barrier, not reconstructed and labeled
+as written; the native harness still requires independent destination ingress.
+
+Furpc uses accelerated incremental native CRC-32 without changing wire bytes,
+checksum policy or deadlines. This and bounded send pipelining preserve the
+retained multi-megabyte full-copy regression through ordinary public runtime/txn
+construction. Historical native receipts do not qualify this new transport.
 
 The existing mixed `rust-runtime-app` keeps `RustRuntimeType` stateless and
 `RustStatefulRuntimeType` volatile stateful in the same executable/code package.
