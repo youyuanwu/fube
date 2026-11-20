@@ -157,10 +157,33 @@ ACK caused an actual gateway retry with a fresh request ID and a correlated
 furpc ACK without duplicate application delivery. Actual notification,
 resolution and retry receipts passed independent validators after owned cleanup.
 The default-Docker onebox was left running.
+ImageStoreClient now also owns an independent furpc Channel and captured Peer.
+Async construction installs authorized Actor 25/27 ordinary one-way ingress;
+semantic ACKs are not native notifications or ordinary RPC responses.
+FileCreate/content/commit/commit-ACK use Peer::send, while the initial routed
+root Delete uses Peer::request. Shared native Serde schemas preserve protocol
+1.2, Activity/sequence checks, negotiated chunks, postorder markers and bounded
+stale-reply handling. There is no reconnect or replay, legacy Channel
+composition, retained-allocation ledger or standalone 4 MiB frame ceiling.
+Cancellation/failure releases upload ownership and fences reuse; legacy
+close/is_closed/terminal_error APIs are removed rather than emulated.
+The last production fube-transport dependency and transport re-exports are
+retired from fube-client. Shared model validation uses fubst Error/Result;
+ImageStore errors retain FurpcClientError or the original filesystem source.
+The existing native upload journey passed on the retained SF11.8.121.4 onebox:
+one real SDK predecessor copy and furpc CLI replacement agreed on inventory,
+removed stale content, and matched all 14 file/marker entries, including seven
+zero-byte directory markers. Provision/create and independent native application
+contact succeeded; all three deployed Data file SHA256 hashes matched source.
+Owned application/type/upload/temp cleanup completed and the onebox remained
+ready/running. The actual optional report retains inventories, hashes, executable
+identities and confirmed cleanup. This does not qualify upload cancellation
+over a real failed connection or repeated native SDK copy reliability.
 Together with the earlier runs, this is initiating clear-TCP evidence for the
-thirteen migrated reads, two naming writes, MovePrimary and notification receiving/ACKs.
+thirteen migrated reads, two naming writes, MovePrimary, notification receiving/ACKs
+and native ImageStore v1.2 upload.
 It does not qualify accepted-side serving, native notification origination, TLS,
-ImageStore over furpc, or the rest of the gateway API. See the
+or the rest of the gateway API. See the
 [client slice](../../RustFabricClient.md#separate-furpc-backed-client).
 
 The public facade supports managed byte RPC by default and explicitly selected

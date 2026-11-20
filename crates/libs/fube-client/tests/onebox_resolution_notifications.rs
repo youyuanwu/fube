@@ -133,7 +133,7 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
         ),
     )
     .await
-    .map_err(|_| Error::Timeout)?
+    .map_err(|_| furpc::Error::Timeout("notification startup"))?
     .map_err(|e| format!("second notification startup: {e}"))?;
     if !observed
         .iter()
@@ -166,7 +166,7 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
         ),
     )
     .await
-    .map_err(|_| Error::Timeout)??;
+    .map_err(|_| furpc::Error::Timeout("notification startup"))??;
     let prefix = notifications
         .register_filter(
             &ServiceNotificationFilter {

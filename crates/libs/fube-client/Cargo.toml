@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 bitflags.workspace = true
-fube-transport.workspace = true
 furpc.workspace = true
 fubst.workspace = true
 serde.workspace = true
@@ -16,6 +15,7 @@ uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 clap.workspace = true
+fube-transport.workspace = true
 time.workspace = true
 reqwest.workspace = true
 openapi-service-fabric.workspace = true

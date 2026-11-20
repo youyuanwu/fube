@@ -22,8 +22,11 @@ ingress and `server::Rpc::unary` decode notifications and return typed ACK data;
 the runner owns native correlation and original-generation ACK writes.
 Session/filter RPCs reuse the gateway adapter on the original furpc Peer.
 The legacy notification adapters, receiver/reply-context plumbing and allocation
-ledger are removed. Only ImageStoreClient retains an independent legacy
-GatewayChannel with registered raw ACK actors.
+ledger are removed. ImageStoreClient now also owns an independent furpc Channel:
+Peer sends carry v1.2 transfer messages and authorized Actor 25/27 one-way
+services receive semantic ACKs. No production fube-client path depends on
+fube-transport; its remaining dependency is test-only for the native loss relay
+and historical transport-model JSON checks.
 Rust error/admission/lifecycle changes below
 are deliberate API breaks, not compatibility wrappers. Historical source/wire
 evidence in later sections is not a substitute for current migration receipts.
@@ -257,14 +260,13 @@ owned cleanup completed; the onebox was left running.
 Together with the earlier native runs, this qualifies thirteen reads, two naming
 writes, MovePrimary and notification receiving/ACKs over initiating clear TCP on
 the observed runtime, not native notification origination, accepted-side serving,
-TLS, other gateway operations, or ImageStore over furpc.
+TLS or other gateway operations. The independent ImageStore journey is described below.
 
 ### Operation inventory and independent clients
 
-`fube-transport` implements bounded Fabric serialization, clear frames and CRCs,
-ordered native headers, client-only ListenInstance establishment, and
-continuously driven, bounded concurrent Tokio request/reply I/O. `fube-client`
-has migrated every implemented ordinary operation and notification sessions to furpc.
+`fube-client` has migrated every implemented ordinary operation, notification
+session and ImageStore upload to furpc. The legacy transport crate remains for
+other workspace consumers, not production fube-client calls.
 All paged and unpaged list queries use furpc; their legacy methods,
 typed-request implementations and input-accounting adapters are retired.
 Uncached resolution and independent notification sessions add endpoint discovery
@@ -336,8 +338,10 @@ drop(other); // last ordinary owner retires the logical channel
 # }
 ```
 
-Ordinary calls use `furpc::Channel`, not the legacy GatewayChannel re-exported
-from `fube-client` for independent notification/ImageStore clients. Endpoint
+All clients use `furpc::Channel`; legacy Channel/Endpoint/ChannelLimits re-exports
+are removed. Crate-root Error/Result now refer to transport-independent
+`fubst` input/model validation; remote calls use FurpcClientError,
+NotificationResult or ImageStoreResult. Endpoint
 configuration is inert; connect owns establishment and `FurpcClient::new` binds
 locally without another handshake. Every ordinary call takes an absolute deadline;
 the earlier request-local deadline wins. Connection timeout is independent.
@@ -533,13 +537,14 @@ body validation. Malformed application data fails the call without inventing a
 successful result; transport integrity failures independently retire the
 physical generation. See the [furpc implementation](design/Furpc/Implementation.md)
 for current lifecycle/settlement behavior and [NativeChannel](NativeChannel.md)
-for the separately retained notification/ImageStore transport.
+for the legacy transport still used by other workspace consumers.
 
 ### Native ImageStore application-package copy
 
-`ImageStoreClient` is a noncloneable owner of a dedicated native upload
-`GatewayChannel` with client-installed authorization and actor25/27 registration.
-Registration alone grants neither sender nor consuming reply permission.
+`ImageStoreClient` is a noncloneable owner of a dedicated furpc Channel and one
+captured Peer, with authorized Actor 25/27 ordinary one-way ingress services.
+Transfer messages use `Peer::send`; the routed root Delete uses `Peer::request`.
+Semantic ACKs are not ordinary RPC completions or furpc native notifications.
 It does not borrow a `FabricClient` or
 notification session.
 Production upload uses no native SDK, COM library, HTTP gateway or subprocess.
@@ -565,49 +570,43 @@ fube --endpoint 127.0.0.1:19000 --unsecured application upload --path ./MyApp --
 final name (`MyApp` here); the CLI has no destination, provisioning, application
 creation, compression or checksum options. Timeout is positive integer seconds,
 defaults to **300**, and covers the **whole CLI operation**, including local path
-resolution, connection establishment, copy and close. Failures exit nonzero;
+resolution, connection establishment, Peer binding and copy. Failures exit nonzero;
 the success message is printed only after package completion.
 
 ```rust,no_run
 use std::{path::Path, time::Duration};
 use fube_client::{ImageStoreClient, ImageStoreClientOptions};
 
-# async fn upload() -> fube_client::Result<()> {
+# async fn upload() -> fube_client::ImageStoreResult<()> {
 let address = "127.0.0.1:19000".parse().expect("native IP socket endpoint");
 let endpoint = ImageStoreClient::endpoint_clear(address)?
     .connect_timeout(Duration::from_secs(10));
 let channel = endpoint.connect().await?;
 let mut client = ImageStoreClient::new(channel, ImageStoreClientOptions {
     default_timeout: Duration::from_secs(300),
-})?;
+}).await?;
 client.copy_application_package(Path::new("./MyApp"), "MyApp", None).await?;
-client.close().await?;
+drop(client); // Release the uploader's Channel owner; not a physical teardown barrier.
 # Ok(())
 # }
 ```
 
-`new` consumes the actual established `Channel` synchronously. It only validates
-operation defaults and acquires the original connection target and private ACK
-receiver: no dial, native session request, hidden startup or permission change.
-Options default to **30 seconds**, independently of endpoint establishment.
-Only `new(Channel, ImageStoreClientOptions)` constructs an uploader; Endpoint
-owns connection establishment, separately from the later copy default.
-
-Use a dedicated upload connection with at most one uploader/protocol consumer.
-Raw channel clones and repeatable/cloned raw receivers remain available, but
-competing consumers can steal semantic ACKs; they are unsupported for this session.
-Binding does not reserve exclusive inbox ownership or upgrade an ordinary
-channel's permissions. Invalid options or unavailable inbox only drop the supplied
-handle, without explicitly aborting retained raw clones. Normal uploader drop
-likewise releases its owner handle; existing last-owner cleanup still applies.
-Explicit upload cancellation or uncertain failure retires the shared connection
-even when raw clones survive. No new uploader drop policy is introduced.
+Async `new` consumes a dedicated `furpc::Channel`, validates operation defaults,
+captures its Peer and installs authorized ordinary one-way ingress. It sends no
+native ImageStore session exchange; each file still creates its own native session.
+Options default to **30 seconds**, independently of Endpoint establishment;
+that default bounds Peer acquisition and each copy without an override.
+After binding, no upload operation reacquires a Peer, reconnects or replays.
+Use a Channel with no existing ingress service and retain no outside clones if
+uploader failure/drop must release its last owner. Ingress configuration captures
+only weak domain ownership; it cannot keep the upload connection alive by itself.
 
 `copy_application_package(&mut self, source: &Path, destination: &str,
-timeout: Option<Duration>) -> Result<()>` serializes copies through its mutable
-receiver and uses the existing `fube_transport::Error`/`Result`.
-`None` uses `ImageStoreClientOptions::default_timeout` (or the legacy connection
-duration); `Some(duration)` overrides the
+timeout: Option<Duration>) -> ImageStoreResult<()>` serializes copies through its
+mutable receiver. `ImageStoreError::Common(FurpcClientError)` preserves native
+transport/Fault, gateway protocol, codec and domain failures;
+`ImageStoreError::Io` retains the original filesystem error.
+`None` uses `ImageStoreClientOptions::default_timeout`; `Some(duration)` overrides the
 copy budget, never meaning infinity. Unlike the CLI's enclosing deadline,
 library connection establishment and a later copy each have their own deadline.
 The copy deadline spans local preparation, root Delete, content, file commits
@@ -641,12 +640,12 @@ source can fail or produce mixed-time content.
 | Upload resource | Limit and behavior |
 |---|---|
 | Outstanding content | **One** negotiated chunk; nonfinal chunks retain the full negotiated size so native sequence-derived offsets remain correct. |
-| Content frame | **4 MiB total**, including the **12-byte** fixed header and every native header. An oversized negotiated threshold fails before content is read/sent; it is never silently shrunk. A zero advertised threshold uses **3 MiB**. |
+| Content frame | Native **u32** full-frame capacity and configured furpc Endpoint limits, including the 12-byte prefix and every native header. Native-capacity overflow fails before reading content; configured limits are additionally enforced at send admission. Thresholds are never silently shrunk. Zero uses **3 MiB**. |
 | Directory traversal | **128** simultaneously open directory levels, including the source root; **1,000,000** visited entries. No package-sized file or GUID snapshot is retained. |
-| Native path encoding | Each native string is at most **32,768 UTF-16 units**; the complete native header area must fit **65,535 bytes**. Before Delete, the generated `/_.dir` FileCreate is encoded as a complete frame, including Actor/Action/MessageId, Activity/version, upload fields, Timeout and record overhead, with maximum relevant MessageId index/timeout widths. These are encoded-size limits, not a promise that every 32,768-unit path fits. |
-| Reply handoff | **32** raw backend ACK envelopes, no second queue/worker; overflow is terminal. Transport authority is validated on ingress; domain headers/body are decoded at client pull before stale filtering. Unread domain-invalid ACKs remain bounded raw ingress until pull. |
+| Native path encoding | Native string widths and the **65,535-byte** header area; no standalone 32,768-unit ceiling. Before Delete, the generated `/_.dir` FileCreate is constructed with complete maximum-width managed MessageId/timeout and native headers. |
+| Reply handoff | **32** decoded application-owned semantic ACKs; no extra socket reader or worker. Furpc authorizes ingress before retention, then the service validates headers/body before enqueueing. Queue overflow or malformed ACKs preserve the original error and release upload ownership. |
 | Stale/duplicate replies | At most **64 consecutive** well-formed obsolete replies per awaited stage; the 65th fails. Wrong future sequences/actions and malformed bodies fail, not count as harmless stale traffic. |
-| Transport capacity | **8** ordinary admitted sends/requests, including started writes and completed-undelivered results; upload content/controls never use consuming reply slots. **1 GiB** conservative aggregate reservation ceiling, not eager allocation. |
+| Transport capacity | Existing furpc TransportLimits/HandlerLimits and native codec widths; no retained-allocation ledger, lifetime-ID history or upload-specific transport quota. |
 
 Every file uses FileCreate, acknowledged raw content chunks, then actor-27
 commit success followed by a flushed FileUploadCommitAck. Even an empty file
@@ -654,8 +653,8 @@ sends **one empty chunk** before commit. Content/chunk ACKs alone cannot report
 file success. Native semantic ACKs can omit MessageId/RelatesTo: strict actor
 25/27, action, version, Activity GUID and sequence/body checks are required.
 Late prior-file cleanup results and duplicate commits cannot complete a later
-file. Upload actor26 frames omit ordinary MessageIds; this avoids consuming
-transport lifetime-ID history per chunk without relaxing history/collision rules.
+file. Managed furpc sends supply MessageIds; semantic ACK matching still uses
+native Activity/sequence, not transport RelatesTo. No lifetime-ID history is added.
 Root Delete is still ordinary actor5 RPC on this upload socket.
 OperationsPending can resend the **same GUID's commit** within the original
 deadline; there is no reconnect or whole-package replay.
@@ -667,25 +666,22 @@ original deadline and socket permit it, without replacing the primary error.
 It never deletes the remote directory as failure recovery. File success does
 not wait for the later native session-cleanup result.
 
-Once remote work is guarded, dropping the upload future synchronously aborts
-the dedicated connection. **No asynchronous remote cleanup is spawned after
-future drop**, and no rollback or remote-session removal is promised; native
-expiry may eventually reclaim staged data. Uncertain errors/deadlines also
-retire the client. `is_closed()`/`terminal_error()` expose terminal state and
-reuse fails rather than reconnecting. Validation failures before guarded remote
-work can leave the client usable; successful copies retain a reusable socket.
-`close(&self) -> Result<()>` awaits the retained socket-driver join with a
-separate **31-second teardown budget** (30-second full-frame watchdog plus
-one second), without extending the upload deadline. A started frame may finish
-its suffix after observer cancellation; completion means local full-frame
-write, never remote ACK, commit or rollback. Close/disposal success is separate
-from the retained terminal cause.
+Once remote work is guarded, dropping the upload future records cancellation
+and releases the uploader's Channel owner. **No asynchronous remote cleanup is
+spawned after future drop**, and no rollback or remote-session removal is promised;
+native expiry may eventually reclaim staged data. Uncertain errors/deadlines
+prevent reuse rather than reconnecting. Validation failures before guarded remote
+work can leave the client usable; successful copies retain a reusable connection.
+Legacy `close`, `is_closed` and `terminal_error` APIs are removed.
+Drop follows furpc last-owner semantics, does not revoke outside clones, and is
+not a physical-driver join barrier. An idle physical disconnect has no separate
+closure observer; waiting for a semantic ACK remains bounded by the copy deadline.
 
-Implementation: [public API and copy lifecycle](../../crates/libs/fube-client/src/image_store.rs#L59),
-[native codecs](../../crates/libs/fube-client/src/image_store_protocol.rs#L144),
-[complete root-marker preflight](../../crates/libs/fube-client/src/image_store_protocol.rs#L310),
-[strict client semantic ACK decoding](../../crates/libs/fube-client/src/image_store_protocol.rs#L48)
-and [client-owned upload envelope authority](../../crates/libs/fube-client/src/channel_adapter.rs#L72).
+Implementation: [public API and copy lifecycle](../../crates/libs/fube-client/src/image_store.rs),
+[native codecs](../../crates/libs/fube-client/src/image_store_protocol.rs),
+[complete root-marker preflight](../../crates/libs/fube-client/src/image_store_protocol.rs),
+[strict client semantic ACK decoding](../../crates/libs/fube-client/src/image_store_protocol.rs)
+and [furpc one-way ingress](../../crates/libs/fube-client/src/image_store.rs).
 Native copy semantics follow the pinned
 [NativeImageStore directory path](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Management/ImageStore/NativeImageStore.cpp#L1139-L1369).
 Native gateway ACKs use raw actor25/27
@@ -1497,29 +1493,24 @@ query-field JSON migration is described above.
 All three naming methods require a checked `NamingUri` in `furpc::Request`,
 with an absolute deadline. There are no legacy string-convenience write methods.
 
-The legacy limits below belong only to ImageStore, not the
-migrated furpc operations, which use their native frame/codec limits.
+All production clients now use furpc/native frame and codec limits rather than
+the retired legacy Channel profile:
 
 | Resource | Limit |
 |---|---:|
-| Entire frame | 4 MiB |
+| Entire frame | Native u32 capacity, optionally narrowed by Endpoint TransportLimits |
 | Native header area | 65,535 bytes |
-| Header records, including deleted records | 4,096 |
-| Object extent, excluding its leading marker | 4 MiB, additionally constrained by the containing frame |
-| Object nesting | 32 |
-| String | 32,768 UTF-16 code units |
-| Byte-array/object-array/type-information count | 4,096 |
-| Application/service rows, parameter pairs, URI segments | 4,096 each (the row bound is independent of requested count) |
-| Legacy RPC/lifetime IDs, including handshake | 4096; terminal exhaustion |
-| Legacy upload channel aggregate retained-byte reservation | 1 GiB, not eager allocation |
-| Started write / partial incoming frame | 30 seconds; request expiry ends local waiting, not started frame completion |
+| Object/string/collection extents | Native field widths/enclosing extents; optional per-codec Limits |
+| Object nesting | No additional default ceiling; codec callers may select one |
+| Pending operations and ingress handlers | Furpc TransportLimits/HandlerLimits; explicit execution policy, not heap quotas |
+| Started write / partial incoming frame | Furpc watchdog policy; 30-second defaults |
 
 Native ImageStore's separate chunk, traversal, path and stale-reply limits are
 listed in [its API section](#native-imagestore-application-package-copy).
 
-ImageStore retains its independent upload-channel and protocol limits.
-Ordinary furpc calls and notifications do not use sealed typed budgets or
-retained-allocation leases.
+ImageStore retains its independently bounded traversal, semantic-ACK queue and
+protocol checks. No production client uses sealed typed budgets,
+retained-allocation leases or lifetime transport-ID histories.
 
 The decoder skips unknown/deleted header records by their bounded record
 lengths. Effective common headers use the last visible occurrence; first
@@ -1549,19 +1540,19 @@ The transport-independent `fubst` crate owns the bounded native
 `to_vec` / `from_slice`, not a JSON, bincode or postcard encoding.
 Ordered native-shaped models use ordinary Serde derives and explicit field
 adapters without parallel wire records. Codec calls return `fubst::Error`;
-transport-facing APIs convert these into the corresponding
-`fube_transport::Error` category. TCP framing and transport message/header
-schemas remain in `fube-transport`:
+client APIs preserve these causes without legacy transport conversion.
+TCP framing and transport message/header schemas belong to furpc; shared model
+validation exposes `fubst::Error`/`Result` at the fube-client crate root:
 
 ```rust
-use fube_transport::message::ListenInstance;
 use fubst::serde::{from_slice, to_vec};
+use serde::{Deserialize, Serialize};
 
-let value = ListenInstance {
-    address: "node".into(), instance: 7, nonce: [0; 16],
-};
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct Record { address: String, instance: u64 }
+let value = Record { address: "node".into(), instance: 7 };
 let bytes = to_vec(&value).unwrap();
-assert_eq!(from_slice::<ListenInstance>(&bytes).unwrap(), value);
+assert_eq!(from_slice::<Record>(&bytes).unwrap(), value);
 ```
 
 | Mapping | Native behavior |
@@ -1590,9 +1581,8 @@ assert_eq!(from_slice::<ListenInstance>(&bytes).unwrap(), value);
 
 Scalar roots are native scalar fragments; struct roots include object framing.
 `from_slice` requires complete root consumption. Decoding uses owned strings
-and bytes, not borrowed UTF-8 views of native UTF-16. Existing limits above
-apply; 4 MiB is a **per-object** extent limit, not an aggregate limit on a
-standalone root object array. Transport frames retain their separate limit.
+and bytes, not borrowed UTF-8 views of native UTF-16. Native widths and optional
+codec-local Limits apply. Transport frames retain their separate limit.
 `collect_str` formats through a bounded sink that checks UTF-16 units before
 buffering each chunk, then uses the same native string encoder.
 
@@ -2270,7 +2260,7 @@ and full-size/multichunk content, exact routed Delete schemas, postorder markers
 native errors, wrong envelopes, bounded handoff/stale replies, prior-file cleanup
 and duplicate commits, and retained-client cancellation/deadline retirement.
 
-**End-to-end qualification passed on an owned SF 11.8.121.4 onebox.** One real
+**The legacy end-to-end qualification passed on an owned SF 11.8.121.4 onebox.** One real
 native mssf SDK copy established the predecessor inventory, including a deliberate
 obsolete file. Rust CLI replacement matched that inventory minus the obsolete
 file and independently matched every local file size and generated zero-byte
@@ -2281,6 +2271,16 @@ resolved/contacted the live application, and deployed Data **SHA256 hashes
 matched the local source**. Exact owned-workload cleanup passed.
 The SDK adapter invokes the real native CopyApplicationPackage API; sfctl
 remains provisioning/observation tooling, not production upload or fallback.
+
+The furpc migration reran that same native journey on the retained default-Docker
+**11.8.121.4** onebox. The SDK predecessor/Rust replacement and independent
+inventory checks agreed on **14 entries**, including **seven** zero-byte
+directory markers, empty/Unicode/space paths, 7 MiB Data content and the
+**150,911,176-byte** sample executable. Provision/create and native application
+contact succeeded; all **three** deployed Data file SHA256 hashes matched the
+source. Exact workload/temp cleanup completed and the onebox remained ready.
+The optional report records actual inventories, source/deployed hashes, CLI/oracle
+hashes and confirmed cleanup; it contains no private allocation-owner capability.
 
 The final scenario uses **one SDK predecessor copy**, not a redundant second SDK
 copy/reference root. That earlier redundant native-only call intermittently

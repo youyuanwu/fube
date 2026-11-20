@@ -632,7 +632,7 @@ struct DeleteNameHeader {
     explicit: bool,
 }
 
-fn decode_body<T: DeserializeOwned>(body: &Body) -> Result<T> {
+pub(crate) fn decode_body<T: DeserializeOwned>(body: &Body) -> Result<T> {
     let mut segments = body.segments();
     let first = segments.next().unwrap_or(&[]);
     if segments.next().is_none() {

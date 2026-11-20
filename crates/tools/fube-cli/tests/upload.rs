@@ -158,7 +158,10 @@ async fn receive_upload(
                 guid: [9; 16],
                 index: 1,
             },
-            &ListenInstance::default(),
+            &ListenInstance {
+                nonce: [9; 16],
+                ..ListenInstance::default()
+            },
         )
         .unwrap(),
     )

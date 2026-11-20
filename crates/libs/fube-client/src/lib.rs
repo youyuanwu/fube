@@ -5,11 +5,10 @@
 //! defaulting to furpc's Channel. It provides Ping, naming operations,
 //! cluster/topology/deployment lists, node health, MovePrimary and resolution.
 //! The old FabricClient façade, sealed request adapters and typed budgets are retired.
-//! Notifications use independently owned furpc sessions; ImageStore retains legacy transport.
+//! Notifications and ImageStore use independently owned furpc sessions.
 //! Native connections require an explicitly selected unsecured development gateway.
 
 mod applications;
-mod channel_adapter;
 mod deployed_applications;
 mod deployed_code_packages;
 mod deployed_replicas;
@@ -44,7 +43,9 @@ pub use deployed_replicas::*;
 pub use deployed_service_packages::*;
 pub use furpc_client::{DomainFailure, FurpcClient, FurpcClientError};
 pub use health::*;
-pub use image_store::{ImageStoreClient, ImageStoreClientOptions};
+pub use image_store::{
+    ImageStoreClient, ImageStoreClientOptions, ImageStoreError, ImageStoreResult,
+};
 pub use movement::{MovePrimaryQueryDescription, MovePrimaryQueryParameters};
 pub use naming_uri::NamingUri;
 pub use nodes::*;
@@ -56,8 +57,8 @@ pub use resolution::*;
 pub use services::*;
 use std::time::Duration;
 
-/// Legacy transport types retained for ImageStore and shared model validation.
-pub use fube_transport::{Channel, ChannelLimits, Endpoint, Error, Result};
+/// Transport-independent input/model validation errors.
+pub use fubst::{Error, Result};
 
 /// Default connection and per-operation timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);

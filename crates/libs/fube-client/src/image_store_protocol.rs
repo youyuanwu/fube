@@ -1,38 +1,38 @@
-use fube_transport::{
-    frame::{FIXED_HEADER_SIZE, MAX_FRAME_SIZE},
-    message::{Header, Message, MessageId, ACTION, ACTIVITY, ACTOR, CLIENT_VERSION, IPC},
-};
-use fubst::{
-    serde::{to_fields, to_vec, Derived, Guid, Inline},
-    Decoder,
-};
-use serde::Serialize;
+use fubst::serde::{from_slice, to_vec, Derived, Guid, Inline};
+use furpc::{header, ActorId, Body, HeaderId, HeaderRecord, Headers, Message, MessageId, Response};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::time::Instant;
 
-use crate::{Error, Result};
+use crate::{
+    furpc_client::decode_body, DomainFailure, FurpcClientError, ImageStoreResult as Result,
+};
 
 pub(crate) const SERVICE: &str = "fabric:/System/ImageStoreService";
 pub(crate) const CREATE: u16 = 0x804f;
 pub(crate) const FILE_NOT_FOUND: i64 = -2147017728;
 pub(crate) const OPERATIONS_PENDING: i64 = -2147017570;
 pub(crate) const DEFAULT_CHUNK_SIZE: u64 = 3 * 1024 * 1024;
-pub(crate) const FILE_SEQUENCE: u16 = 0x803c;
+const FILE_SEQUENCE: u16 = 0x803c;
+const ACTIVITY: u16 = 0x8020;
+const CLIENT_VERSION: u16 = 0x8025;
+const IPC: u16 = 0x800b;
 
 pub(crate) fn remaining_ticks(deadline: Instant) -> Result<i64> {
-    let ticks = deadline
+    let remaining = deadline
         .checked_duration_since(Instant::now())
-        .ok_or(Error::Timeout)?
-        .as_nanos()
-        / 100;
+        .ok_or(furpc::Error::Timeout("ImageStore"))?;
+    let ticks = i64::try_from(remaining.as_nanos() / 100)
+        .map_err(|_| furpc::Error::InvalidInput("timeout exceeds native TimeSpan"))?;
     if ticks == 0 {
-        return Err(Error::Timeout);
+        return Err(furpc::Error::Timeout("ImageStore").into());
     }
-    i64::try_from(ticks).map_err(|_| Error::InvalidInput("timeout exceeds native TimeSpan"))
+    Ok(ticks)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) struct FileSequence {
     pub number: u64,
+    last: bool,
     pub buffer_size: u64,
 }
 
@@ -41,95 +41,118 @@ pub(crate) struct FileTransferReply {
     pub activity: [u8; 16],
     pub actor: i64,
     pub sequence: Option<FileSequence>,
-    pub result: Result<()>,
+    pub result: std::result::Result<(), DomainFailure>,
 }
 
-/// Decode every pulled semantic ACK before applying obsolete-Activity policy.
-pub(crate) fn decode_reply(message: &Message) -> Result<FileTransferReply> {
-    let properties = message.properties()?;
-    if !matches!(properties.actor, 25 | 27)
-        || !matches!(
-            properties.action.as_str(),
-            "ClientOperationSuccess" | "ClientOperationFailure"
-        )
-        || properties.relates_to != MessageId::default()
-        || properties.expects_reply
-        || properties.uncorrelated_reply
-        || properties.fault.is_some()
-    {
-        return Err(Error::Protocol("invalid native file-transfer envelope"));
+#[derive(Serialize, Deserialize)]
+struct ActivityId(Guid, u64);
+
+#[derive(Serialize, Deserialize)]
+struct Activity {
+    activity: ActivityId,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct Version(i64, i64);
+
+#[derive(Serialize)]
+struct Timeout {
+    ticks: i64,
+}
+
+#[derive(Deserialize)]
+struct Failure {
+    code: i64,
+    diagnostic: String,
+}
+
+fn read_header<T: DeserializeOwned>(headers: &Headers, id: u16) -> Result<T> {
+    let record = headers
+        .records()
+        .find(|record| record.id().get() == id)
+        .ok_or(FurpcClientError::Protocol(
+            "missing native file-transfer header",
+        ))?;
+    Ok(from_slice(record.value())?)
+}
+
+fn failure(body: &Body) -> Result<DomainFailure> {
+    let failure: Failure = decode_body(body)?;
+    if failure.code == 0 || i32::try_from(failure.code).is_err() {
+        return Err(FurpcClientError::Protocol("invalid native upload failure code").into());
     }
-    // A semantic reply may have neither MessageId nor RelatesTo.
+    Ok(DomainFailure {
+        code: failure.code,
+        message: failure.diagnostic,
+    })
+}
+
+/// Interpret every semantic ACK before applying obsolete-Activity policy.
+pub(crate) fn decode_reply(headers: &Headers, body: &Body) -> Result<FileTransferReply> {
+    let common = headers.effective();
+    let success = common
+        .action()
+        .iter()
+        .copied()
+        .eq("ClientOperationSuccess".encode_utf16());
+    let failed = common
+        .action()
+        .iter()
+        .copied()
+        .eq("ClientOperationFailure".encode_utf16());
+    if !matches!(common.actor.get(), 25 | 27)
+        || !(success || failed)
+        || common.relates_to != MessageId::default()
+        || common.expects_reply
+        || common.uncorrelated_reply
+        || headers.first_raw(header::FAULT).is_some()
+    {
+        return Err(FurpcClientError::Protocol("invalid native file-transfer envelope").into());
+    }
     let mut seen = std::collections::HashSet::new();
-    for header in &message.headers {
-        if header.id == IPC || !seen.insert(header.id) {
-            return Err(Error::Protocol(
-                "duplicate or IPC native file-transfer header",
-            ));
+    for record in headers.records() {
+        if record.id().get() == IPC || !seen.insert(record.id()) {
+            return Err(
+                FurpcClientError::Protocol("duplicate or IPC native file-transfer header").into(),
+            );
         }
     }
-    let required = |id| {
-        message
-            .headers
-            .iter()
-            .find(|header| header.id == id)
-            .ok_or(Error::Protocol("missing native file-transfer header"))
-    };
-    required(ACTOR)?;
-    required(ACTION)?;
-    if required(CLIENT_VERSION)?.read(|d| Ok((d.i64()?, d.i64()?)))? != (1, 2) {
-        return Err(Error::Protocol(
-            "native upload requires protocol version 1.2",
-        ));
+    if read_header::<Version>(headers, CLIENT_VERSION)? != Version(1, 2) {
+        return Err(
+            FurpcClientError::Protocol("native upload requires protocol version 1.2").into(),
+        );
     }
-    let activity = required(ACTIVITY)?.read(|d| {
-        d.object(|d| {
-            let guid = d.guid()?;
-            if guid == [0; 16] || d.u64()? != 0 {
-                return Err(fubst::Error::Protocol("invalid native upload Activity"));
-            }
-            Ok(guid)
-        })
-    })?;
-    let sequence = if properties.actor == 25 {
-        Some(required(FILE_SEQUENCE)?.read(|d| {
-            let number = d.u64()?;
-            if d.boolean()? {
-                return Err(fubst::Error::Protocol(
-                    "v1.2 acknowledgement has last-chunk flag",
-                ));
-            }
-            Ok(FileSequence {
-                number,
-                buffer_size: d.u64()?,
-            })
-        })?)
+    let Activity {
+        activity: ActivityId(Guid(activity), index),
+    } = read_header(headers, ACTIVITY)?;
+    if activity == [0; 16] || index != 0 {
+        return Err(FurpcClientError::Protocol("invalid native upload Activity").into());
+    }
+    let sequence = if common.actor.get() == 25 {
+        let sequence: FileSequence = read_header(headers, FILE_SEQUENCE)?;
+        if sequence.last {
+            return Err(
+                FurpcClientError::Protocol("v1.2 acknowledgement has last-chunk flag").into(),
+            );
+        }
+        Some(sequence)
     } else {
-        if seen.contains(&FILE_SEQUENCE) {
-            return Err(Error::Protocol("commit reply has a sequence header"));
+        if seen.contains(&HeaderId::new(FILE_SEQUENCE)?) {
+            return Err(FurpcClientError::Protocol("commit reply has a sequence header").into());
         }
         None
     };
-    let result = if properties.action == "ClientOperationSuccess" {
-        if !message.body.is_empty() {
-            return Err(Error::Protocol("native upload success has a body"));
+    let result = if success {
+        if !body.is_empty() {
+            return Err(FurpcClientError::Protocol("native upload success has a body").into());
         }
         Ok(())
     } else {
-        let mut decoder = Decoder::new(&message.body);
-        let (code, diagnostic) = decoder.object(|d| Ok((d.i64()?, d.string()?)))?;
-        decoder.finish()?;
-        if code == 0 || i32::try_from(code).is_err() {
-            return Err(Error::Protocol("invalid native upload failure code"));
-        }
-        Err(Error::Remote {
-            code,
-            message: diagnostic,
-        })
+        Err(failure(body)?)
     };
     Ok(FileTransferReply {
         activity,
-        actor: properties.actor,
+        actor: common.actor.get(),
         sequence,
         result,
     })
@@ -143,48 +166,76 @@ struct Upload<'a> {
     size: u64,
 }
 
-pub(crate) fn create(path: &str, size: u64) -> Result<Header> {
-    Header::object(CREATE, |e| {
-        to_fields(
-            e,
-            &Upload {
-                service: SERVICE,
-                path,
-                overwrite: true,
-                size,
+pub(crate) fn create(path: &str, size: u64) -> Result<HeaderRecord> {
+    Ok(HeaderRecord::native(
+        HeaderId::new(CREATE)?,
+        &Upload {
+            service: SERVICE,
+            path,
+            overwrite: true,
+            size,
+        },
+    )?)
+}
+
+pub(crate) fn headers(activity: [u8; 16]) -> Result<Vec<HeaderRecord>> {
+    Ok(vec![
+        HeaderRecord::native(
+            HeaderId::new(ACTIVITY)?,
+            &Activity {
+                activity: ActivityId(Guid(activity), 0),
             },
-        )
-    })
+        )?,
+        HeaderRecord::native(HeaderId::new(CLIENT_VERSION)?, &Version(1, 2))?,
+    ])
 }
 
-pub(crate) fn headers(activity: [u8; 16]) -> Result<Vec<Header>> {
-    Ok(vec![Header::activity(activity)?, Header::version(1, 2)?])
+pub(crate) fn timeout(deadline: Instant) -> Result<HeaderRecord> {
+    Ok(HeaderRecord::native(
+        HeaderId::new(0x8023)?,
+        &Timeout {
+            ticks: remaining_ticks(deadline)?,
+        },
+    )?)
 }
 
-pub(crate) fn sequence(number: u64, size: u64) -> Result<Header> {
-    Header::object(FILE_SEQUENCE, |e| {
-        e.u64(number)?;
-        e.boolean(false)?;
-        e.u64(size)?;
-        Ok(())
-    })
+pub(crate) fn sequence(number: u64, size: u64) -> Result<HeaderRecord> {
+    Ok(HeaderRecord::native(
+        HeaderId::new(FILE_SEQUENCE)?,
+        &FileSequence {
+            number,
+            last: false,
+            buffer_size: size,
+        },
+    )?)
 }
 
-/// Reserve the largest encoding of every content header, not just raw payload.
+fn widest_message_id() -> furpc::Result<HeaderRecord> {
+    HeaderRecord::native(
+        header::MESSAGE_ID,
+        &MessageId {
+            guid: [255; 16],
+            index: u32::MAX,
+        },
+    )
+}
+
+/// Native full-frame capacity, including the managed ID. Endpoint policy still applies.
 pub(crate) fn chunk_capacity() -> Result<u64> {
     let mut headers = headers([255; 16])?;
     headers.extend([
-        Header::actor(26)?,
-        Header::action("FileContent")?,
-        Header::message_id(MessageId {
-            guid: [255; 16],
-            index: u32::MAX,
-        })?,
-        Header::timeout(i64::MAX)?,
+        header::actor(ActorId::new(26)?)?,
+        header::action("FileContent")?,
+        widest_message_id()?,
+        HeaderRecord::native(HeaderId::new(0x8023)?, &Timeout { ticks: i64::MAX })?,
         sequence(u64::MAX, u64::MAX)?,
     ]);
-    let overhead = FIXED_HEADER_SIZE + headers.iter().map(|h| 4 + h.value.len()).sum::<usize>();
-    Ok((MAX_FRAME_SIZE - overhead) as u64)
+    let overhead = 12
+        + headers
+            .iter()
+            .map(|header| 4 + header.value().len())
+            .sum::<usize>();
+    Ok((u32::MAX as usize - overhead) as u64)
 }
 
 #[derive(Serialize)]
@@ -221,118 +272,117 @@ struct Delete<'a> {
     path: &'a str,
 }
 
-pub(crate) fn delete(path: &str, activity: [u8; 16]) -> Result<(Vec<Header>, Vec<u8>)> {
+pub(crate) fn delete(path: &str, activity: [u8; 16]) -> Result<(Vec<HeaderRecord>, Body)> {
+    #[derive(Serialize)]
+    struct Partition {
+        id: Guid,
+    }
+
     let mut headers = headers(activity)?;
     headers.extend([
-        Header::object(0x8028, |e| {
-            to_fields(
-                e,
-                &Forward {
-                    actor: 17,
-                    action: "ServiceRouteRequest",
-                },
-            )
-        })?,
-        Header::object(0x802c, |e| {
-            to_fields(
-                e,
-                &Route {
-                    base: Inline(Forward {
-                        actor: 22,
-                        action: "DeleteAction",
-                    }),
-                    derived: Derived(TypeScope {
-                        service_type: ServiceType {
-                            package: Package {
-                                application: Application {
-                                    name: "__FabricSystem",
-                                    number: u32::MAX,
-                                },
-                                name: "FileStoreService",
+        HeaderRecord::native(
+            HeaderId::new(0x8028)?,
+            &Forward {
+                actor: 17,
+                action: "ServiceRouteRequest",
+            },
+        )?,
+        HeaderRecord::native(
+            HeaderId::new(0x802c)?,
+            &Route {
+                base: Inline(Forward {
+                    actor: 22,
+                    action: "DeleteAction",
+                }),
+                derived: Derived(TypeScope {
+                    service_type: ServiceType {
+                        package: Package {
+                            application: Application {
+                                name: "__FabricSystem",
+                                number: u32::MAX,
                             },
-                            name: "FileStoreServiceType",
+                            name: "FileStoreService",
                         },
-                    }),
-                },
-            )
-        })?,
-        Header::object(0x8034, |e| {
-            e.guid(&uuid::Uuid::from_u128(0x3000).to_bytes_le())?;
-            Ok(())
-        })?,
+                        name: "FileStoreServiceType",
+                    },
+                }),
+            },
+        )?,
+        HeaderRecord::native(
+            HeaderId::new(0x8034)?,
+            &Partition {
+                id: Guid(uuid::Uuid::from_u128(0x3000).to_bytes_le()),
+            },
+        )?,
     ]);
-    Ok((headers, to_vec(&Delete { path })?))
+    Ok((headers, Body::from_bytes(to_vec(&Delete { path })?)?))
 }
 
-pub(crate) fn decode_delete(message: Message) -> Result<Option<[u8; 16]>> {
-    let p = message.properties()?;
-    if p.fault.is_some() || p.expects_reply || p.uncorrelated_reply {
-        return Err(Error::Protocol("invalid routed ImageStore Delete reply"));
+pub(crate) fn decode_delete(response: Response<Body>) -> Result<Option<[u8; 16]>> {
+    let headers = response.headers();
+    let common = headers.effective();
+    if headers.first_raw(header::FAULT).is_some()
+        || common.expects_reply
+        || common.uncorrelated_reply
+    {
+        return Err(FurpcClientError::Protocol("invalid routed ImageStore Delete reply").into());
     }
-    if p.actor == 5 && p.action == "ClientOperationFailure" {
-        let mut d = Decoder::new(&message.body);
-        let (code, diagnostic) = d.object(|d| Ok((d.i64()?, d.string()?)))?;
-        d.finish()?;
-        if code == 0 || i32::try_from(code).is_err() {
-            return Err(Error::Protocol("invalid routed Delete failure code"));
-        }
-        return if code == FILE_NOT_FOUND {
+    if common.actor.get() == 5
+        && common
+            .action()
+            .iter()
+            .copied()
+            .eq("ClientOperationFailure".encode_utf16())
+    {
+        let failure = failure(response.body())?;
+        return if failure.code == FILE_NOT_FOUND {
             Ok(None)
         } else {
-            Err(Error::Remote {
-                code,
-                message: diagnostic,
-            })
+            Err(FurpcClientError::Domain(failure).into())
         };
     }
-    if p.actor != 22 || p.action != "OperationSuccessAction" || !message.body.is_empty() {
-        return Err(Error::Protocol(
-            "unexpected routed ImageStore Delete result",
-        ));
+    if common.actor.get() != 22
+        || !common
+            .action()
+            .iter()
+            .copied()
+            .eq("OperationSuccessAction".encode_utf16())
+        || !response.body().is_empty()
+    {
+        return Err(
+            FurpcClientError::Protocol("unexpected routed ImageStore Delete result").into(),
+        );
     }
-    let mut activities = message.headers.iter().filter(|h| h.id == ACTIVITY);
-    let activity = activities
-        .next()
-        .ok_or(Error::Protocol("Delete success lacks Activity"))?;
-    if activities.next().is_some() {
-        return Err(Error::Protocol("duplicate Delete success Activity"));
+    if headers
+        .records()
+        .filter(|record| record.id().get() == ACTIVITY)
+        .count()
+        != 1
+    {
+        return Err(FurpcClientError::Protocol("Delete success requires one Activity").into());
     }
-    let guid = activity.read(|d| {
-        d.object(|d| {
-            let guid = d.guid()?;
-            if d.u64()? != 0 {
-                return Err(fubst::Error::Protocol("invalid Delete Activity index"));
-            }
-            Ok(Guid(guid))
-        })
-    })?;
-    Ok(Some(guid.0))
+    let Activity {
+        activity: ActivityId(Guid(activity), index),
+    } = read_header(headers, ACTIVITY)?;
+    if index != 0 {
+        return Err(FurpcClientError::Protocol("invalid Delete Activity index").into());
+    }
+    Ok(Some(activity))
 }
 
 pub(crate) fn preflight_root_marker(destination: &str) -> Result<()> {
-    let preflight = || {
-        // Match the transport-added FileCreate envelope at maximum native
-        // MessageId/TimeSpan widths, then reuse the actual upload headers.
-        let mut complete = vec![
-            Header::actor(26)?,
-            Header::action("FileCreate")?,
-            Header::message_id(MessageId {
-                guid: [255; 16],
-                index: u32::MAX,
-            })?,
-        ];
-        complete.extend(headers([255; 16])?);
-        complete.push(create(&format!("{destination}/_.dir"), 0)?);
-        complete.push(Header::timeout(i64::MAX)?);
-        Message {
-            headers: complete,
-            body: vec![],
-        }
-        .to_frame()?
-        .encode()?;
-        Ok::<_, Error>(())
-    };
-    preflight().map_err(|_| {
-        Error::InvalidInput("ImageStore destination exceeds complete root marker frame limits")
-    })
+    let mut headers = headers([255; 16])?;
+    headers.extend([
+        header::actor(ActorId::new(26)?)?,
+        header::action("FileCreate")?,
+        widest_message_id()?,
+        create(&format!("{destination}/_.dir"), 0)?,
+        HeaderRecord::native(HeaderId::new(0x8023)?, &Timeout { ticks: i64::MAX })?,
+    ]);
+    let mut message = Message::builder();
+    for header in headers {
+        message = message.append_header(header);
+    }
+    message.build()?;
+    Ok(())
 }

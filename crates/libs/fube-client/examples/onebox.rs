@@ -159,7 +159,9 @@ fn timeout(value: &str) -> Result<Duration, String> {
         .filter(|value| value.is_finite() && *value > 0.0)
         .ok_or("timeout must be positive finite seconds")?;
     let timeout = Duration::try_from_secs_f64(seconds).map_err(|_| "timeout is out of range")?;
-    fube_transport::connection::deadline_after(timeout).map_err(|error| error.to_string())?;
+    if tokio::time::Instant::now().checked_add(timeout).is_none() {
+        return Err("timeout is out of range".into());
+    }
     Ok(timeout)
 }
 

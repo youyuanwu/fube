@@ -14,8 +14,13 @@ request contracts and typed allocation budgets are retired. Proposed
 builder examples below are not compatibility wrappers; see the linked subset
 guide for current typed requests and absolute deadlines.
 The standalone notification client now also uses furpc ingress, typed ACK data
-and original-generation Peer RPCs. Its legacy transport/accounting implementation
-is removed; only ImageStore retains the legacy transport. Notification close
+and original-generation Peer RPCs. ImageStore also uses furpc Peer sends and
+authorized Actor 25/27 one-way ACK ingress, with no legacy transport fallback.
+No production fube-client dependency on fube-transport remains; the native loss
+relay and transport-model JSON tests retain it only as a development dependency.
+Shared input/version-model Error/Result aliases now refer to fubst; ImageStore
+exposes ImageStoreError/ImageStoreResult with original filesystem causes.
+Notification close
 releases Channel ownership, not a physical-driver join barrier; idle disconnects
 have no separate closure observer.
 

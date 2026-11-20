@@ -306,6 +306,7 @@ dependencies = [
  "fube-client",
  "fube-transport",
  "fubst",
+ "furpc",
  "libc",
  "tokio",
  "uuid",
