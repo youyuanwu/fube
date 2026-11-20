@@ -306,6 +306,7 @@ dependencies = [
  "fube-client",
  "fube-transport",
  "fubst",
+ "furpc",
  "libc",
  "tokio",
  "uuid",
@@ -317,7 +318,6 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "clap",
- "fube-transport",
  "fubst",
  "furpc",
  "openapi-service-fabric",
@@ -509,6 +509,7 @@ version = "0.1.0"
 dependencies = [
  "fubst",
  "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]

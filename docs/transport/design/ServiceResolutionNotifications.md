@@ -1,7 +1,8 @@
 # Uncached service resolution and notifications
 
 **Status:** implemented as an experimental clear-TCP subset in `fube-client`
-and `fube-transport`, with native qualification on SF 11.8.121.4. See
+over furpc for both ordinary resolution and independently owned notifications,
+with native qualification on SF 11.8.121.4. See
 [usage, measured coverage and limitations](../RustFabricClient.md#owned-resolution-and-notification-qualification).
 This design extends the current [Rust FabricClient](../RustFabricClient.md);
 it does not claim TLS, automatic recovery, or native-client feature parity.
@@ -15,11 +16,11 @@ an endpoint-resolution cache.
 |---|---|
 | Resolution | Every call sends a native gateway request, optionally carrying metadata from a caller-owned previous result. |
 | Notifications | Standalone `ServiceNotificationClient` with its own connection/session, owning filter-registration guards, and one bounded async receiver. |
-| Ownership | `FabricClient` and `ServiceNotificationClient` have independent construction, shutdown, and failure lifecycles within the same crate. |
+| Ownership | `FurpcClient` and `ServiceNotificationClient` have independent construction, shutdown, and failure lifecycles within the same crate. The ordinary legacy façade/adapters/budgets are retired. |
 | Cache | No stored endpoint results used to answer resolve calls, and no notification-driven endpoint cache. |
 | Protocol state | Retain bounded session, filter, generation, and version bookkeeping needed for notification processing. |
 | Delivery | Versioned endpoint updates, not a snapshot or an exactly-once application event log. |
-| Recovery | Initially terminate with an explicit error on disconnect or loss of delivery continuity. No automatic reconnect or filter replay. |
+| Recovery | Notification operations stay on the original furpc Peer, without reconnect/filter replay. Observed failures terminate the domain session; idle disconnect observation follows furpc, not the retired legacy closure API. Later ordinary calls may reconnect; submitted calls are never replayed. |
 | Security | Start with the existing explicitly selected clear-TCP development profile. A later TLS profile must authenticate the notification connection independently. |
 | Excluded | Legacy resolution-change long polling, prefix resolution, service-group expansion, application endpoint connections, and background endpoint refresh. |
 
@@ -32,11 +33,13 @@ commit [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native-revision].
 
 Signatures below describe the implemented Rust API shapes; the snippets omit
 imports and private fields rather than being standalone declarations.
-Each client consumes an established Channel. Configure its protocol-specific
-Endpoint, dial with `connect()` or `connect_until(deadline)`, then call
-`FabricClient::new` or `ServiceNotificationClient::start` with explicit options.
+Each client consumes its own established `furpc::Channel`. Configure a furpc
+Endpoint and dial, then call `FurpcClient::new` or `ServiceNotificationClient::start`.
+Notification startup installs its authorized ingress service on the dedicated Channel.
+Ordinary calls take `furpc::Request` and an absolute Tokio deadline and return
+`furpc::Response` through `FurpcClientError`, preserving source and settlement metadata.
 Connection, notification startup and later operation budgets are independent.
-Subsequent remote operations follow the current timeout convention: `None` uses
+Notification operations retain the optional-duration convention: `None` uses
 that client's configured default, not infinity; `Some(duration)` supplies one
 whole-operation override. There are no `_with_timeout` variants.
 
@@ -49,14 +52,20 @@ pub enum PartitionKey {
     Named(String),
 }
 
-impl FabricClient {
-    pub async fn resolve_service_partition(
-        &self,
+impl ResolutionRequest {
+    pub fn new(
         name: &NamingUri,
         key: &PartitionKey,
         previous: Option<&ResolvedServicePartition>,
-        timeout: Option<Duration>,
-    ) -> Result<ResolvedServicePartition>;
+    ) -> fubst::Result<Self>;
+}
+
+impl<T> FurpcClient<T> {
+    pub async fn resolve_service_partition(
+        &mut self,
+        request: furpc::Request<ResolutionRequest>,
+        deadline: tokio::time::Instant,
+    ) -> Result<furpc::Response<ResolvedServicePartition>, FurpcClientError>;
 }
 
 pub struct ResolvedServicePartition {
@@ -92,7 +101,8 @@ Reuse the existing `NamingUri`, `PartitionInformation`, `ServiceKind`, `Uuid`,
 `Error`, and `Result` types. Preserve the current checked URI profile rather
 than silently broadening it to service-group fragments or root/prefix lookup.
 Partition-key strings are not URI path components and need their own native
-validation and serialization.
+validation and serialization. Named keys reject empty/NUL strings. Native
+frame/body/string widths bound encoding, not the retired standalone 32768-unit ceiling.
 
 Returned values own their data. The caller may retain a result and pass it as
 `previous`; the client does not retain that result after the operation finishes.
@@ -112,7 +122,7 @@ results and notification updates use the same endpoint-version type.
 
 ```rust
 pub enum NotificationError {
-    Common(Error),
+    Common(FurpcClientError),
     Lagged,
     ResourceLimit(&'static str),
 }
@@ -125,10 +135,10 @@ pub struct ServiceNotificationClient {
 }
 
 impl ServiceNotificationClient {
-    pub fn endpoint_clear(endpoint: SocketAddr) -> Result<Endpoint>;
+    pub fn endpoint_clear(endpoint: SocketAddr) -> furpc::Result<furpc::Endpoint>;
 
     pub async fn start(
-        channel: Channel,
+        channel: furpc::Channel,
         options: NotificationClientOptions,
     ) -> NotificationResult<Self>;
 
@@ -167,10 +177,11 @@ pub struct ServiceNotification {
 }
 ```
 
-Notification-only failures belong to this API family, not the shared transport
-`Error` used by ordinary queries/resolution. Every fallible notification method
-uses `NotificationResult`; `Common` wraps the original shared error and preserves
-its source. Shared codec/control resource limits stay common, while notification
+Notification-only failures belong to this API family, not ordinary
+queries/resolution. Every fallible notification protocol method
+uses `NotificationResult`; `Common(FurpcClientError)` preserves the original
+furpc, codec, domain, or gateway protocol cause. Endpoint configuration remains
+`furpc::Result`. Shared codec/control resource limits stay common, while notification
 delivery, filter, and bookkeeping limits use the scoped variants. Low-level
 callback adapters must preserve the original notification cause before retiring
 the connection; do not classify failures by matching diagnostic strings.
@@ -179,13 +190,13 @@ the connection; do not classify failures by matching diagnostic strings.
 session, and one receiver. Multiple filters share that session and receiver;
 they do not create separate TCP connections. Applications can construct multiple
 independent notification clients when they need separate lifecycles, each with
-its own bounded resources and native client ID. There is no per-`FabricClient`
+its own bounded resources and native client ID. There is no per-`FurpcClient`
 session reservation or factory method.
 
-Both public clients live in `fube-client` and reuse transport, serialization,
-endpoint/version models, and security configuration machinery. They do not own
-or retain one another and do not share sockets or mutable session state.
-Notification-only applications need not construct a `FabricClient`. Native
+Both public clients live in `fube-client` and reuse native payload schemas and
+endpoint/version models. Both use furpc, with independent Channel/session owners.
+They do not own or retain one another and do not share sockets or mutable session state.
+Notification-only applications need not construct a `FurpcClient`. Native
 notification entries do not carry matching filter IDs, so do not invent
 per-filter delivery, duplicate an event for every overlapping filter, or attach
 an arbitrary matching ID.
@@ -215,8 +226,8 @@ asynchronous cleanup and failure contract is defined in section 6.3.
 
 ```rust
 let endpoint: SocketAddr = "127.0.0.1:19000".parse()?;
-let channel = FabricClient::endpoint_clear(endpoint)?.connect().await?;
-let client = FabricClient::new(channel, ClientOptions::default())?;
+let channel = FurpcClient::endpoint_clear(endpoint)?.connect().await?;
+let mut client = FurpcClient::new(channel);
 let channel = ServiceNotificationClient::endpoint_clear(endpoint)?.connect().await?;
 let mut notifications =
     ServiceNotificationClient::start(channel, NotificationClientOptions::default()).await?;
@@ -233,8 +244,11 @@ let registration = notifications
     .await?;
 
 let initial = client
-    .resolve_service_partition(&name, &PartitionKey::Singleton, None, None)
-    .await?;
+    .resolve_service_partition(
+        furpc::Request::new(ResolutionRequest::new(&name, &PartitionKey::Singleton, None)?),
+        tokio::time::Instant::now() + Duration::from_secs(30),
+    )
+    .await?.into_body();
 
 if let Some(update) = notifications.recv().await {
     let update = update?;
@@ -243,11 +257,11 @@ if let Some(update) = notifications.recv().await {
 
 registration.unregister(None).await?;
 notifications.close(None).await?;
-client.close().await?;
+drop(client);
 ```
 
 The two clients are constructed and closed independently. Notification-only
-applications omit the `FabricClient` and initial resolution; applications
+applications omit the `FurpcClient` and initial resolution; applications
 combining resolution with updates choose endpoints for the same cluster.
 
 Replace the explicit `unregister` call with `drop(registration)` or normal scope
@@ -360,17 +374,18 @@ is based on protocol identities/versions, not stored endpoint-list equality.
 
 ```text
 Application
-  FabricClient
-    owned ordinary GatewayChannel -> resolve and existing request/reply APIs
+  FurpcClient<T = furpc::Channel>
+    byte-facing Tower service -> typed native resolution and other ordinary APIs
   ServiceNotificationClient
-    own notification-enabled GatewayChannel/native session
-      constructor pull + finite pending handoff -> publish owner
-      scoped ingress staging + semantic worker -> bounded queue -> recv()
-      filters/RAII cleanup + original consuming reply contexts
+    own furpc Channel + original-generation Peer/native session
+      authorized notification ingress -> server::Rpc::unary -> page transaction
+      bounded application queue -> recv()
+      session/filter RPCs -> shared gateway adapter -> Peer::request
+      RAII filter cleanup worker owns the Channel; furpc runner owns ACK completion
 ```
 
-Constructing a `FabricClient` never opens notification transport.
-Its Endpoint factory configures an explicit numeric-loopback/nonzero-port
+Constructing a `FurpcClient` never opens notification transport.
+The notification Endpoint factory configures an explicit numeric-unicast/nonzero-port
 unsecured connection. The caller establishes that Channel, then
 `ServiceNotificationClient::start` connects the native notification session.
 It needs no existing ordinary client. This follows the native separation of normal/high-priority
@@ -386,30 +401,23 @@ Native notification gateway descriptions intentionally omit a public address;
 retain their node identity/name without requiring or inventing an address.
 [Source: [gateway description][notification-gateway-description].]
 
-This narrows the previous notification clear-TCP endpoint policy deliberately;
-non-loopback input now fails explicitly, without compatibility wrapping or
-widening the channel's trust/security profile.
+Startup installs an Actor 5 `IngressService` using
+`IngressOptions::notifications` and an exact `NotificationPolicy` for
+ServiceNotificationRequest/ServiceNotificationReply. The same furpc runner
+classifies special notifications before ordinary RelatesTo correlation,
+authorizes envelopes before body retention, and owns handler/reply capacity.
+There is no second socket reader, pull receiver, public reply grant, or
+notification transport inside `fube-client`.
 
-Use GatewayChannel's configured native MessageReceiver/ReplyContext.
-The notification client installs its exact incoming/reply envelope authorization
-through `ChannelComposition::duplex`, independently of the actor-only native
-demux. Actor registration alone never grants reply or outbound permission.
-The proposed actor/action Router/Registry is not this operational demux and is
-not required for the session.
-Normal request-only channels continue to reject unsupported reverse traffic.
-After controls, route the uncorrelated-notification marker before ordinary
-`RelatesTo` lookup. Only the supported authorized envelope enters pull ingress;
-the client alone decodes domain bodies. Ordinary replies must never satisfy
-notification processing. All ordinary RelatesTo records remain validated in
-wire order and only the final effective ID matches pending state.
-
-The writer needs a bounded reply/control path that does not require an
-outstanding locally initiated request. Notification replies retain the original
-request ID, connection/session identity, and send target. Never send an old
-session's acknowledgment through whichever connection is currently available.
-Reserve reply/control capacity; a full application queue must not block the
-receiver or deadlock registration replies. Priority cannot preempt a TCP frame
-whose write has already started.
+The service uses `server::Rpc::unary` with `FubstCodec<Status, PageBody>`.
+Its typed handler waits for native session initialization, atomically commits
+the whole page, and returns typed ACK data only on success. Furpc supplies
+native flags, correlation and original-generation ACK submission. Decode,
+processing, cancellation and handler failures send no automatic success ACK.
+Session/filter RPCs reuse the ordinary gateway adapter and FubstCodec through a
+small byte service forwarding to the original `Peer::request`, never the
+Channel's reconnecting request path. Native high-priority headers remain set.
+Priority cannot preempt a TCP frame whose write has already started.
 [Sources: [native priority connection][notification-connect], [duplex routing][duplex],
 [reply correlation][receiver-reply].]
 
@@ -463,8 +471,8 @@ belong to the client, not a transport body-fingerprint history.
 
 Process a page as a bounded transaction:
 
-1. Validate and decode the complete envelope/body under frame and collection
-   limits, retaining the original reply context.
+1. Furpc authorizes and decodes the complete envelope/body under native and
+   configured limits, retaining reply authority privately in its runner.
 2. Compute accepted updates and prospective version changes without publishing
    them. Suppress already-covered retries and stale generations using native
    semantics, not TCP arrival order. Track per-partition versions so an older
@@ -482,11 +490,11 @@ cluster-wide snapshot. If a reply is lost after admission, retry processing must
 not enqueue the same admitted update again. Do not promise suppression of all
 semantically identical endpoint payloads arriving under different versions.
 
-If decoding, admission, version tracking, or acknowledgment fails, do not send
-success while dropping the update. Send a native processing error if the
-connection safely permits it, surface the failure locally, and retire the
-notification session when continuity cannot be maintained. A malformed
-notification cannot be treated as an empty success.
+If decoding, admission or version tracking fails, do not return a successful
+ACK. Surface the observed failure locally and release the notification owner's
+Channel. A malformed notification cannot become an empty success. The runner
+owns subsequent ACK writes and their diagnostics; returning ACK data does not
+provide a separate write-completion observer to the domain handler.
 [Sources: [native processing and reply][notification-process],
 [native delivery/version filtering][notification-accept],
 [gateway retry behavior][notification-retry].]
@@ -499,34 +507,28 @@ Use named internal limits, not new public configuration in the first API:
 
 | Resource | Initial implemented bound |
 |---|---|
-| Queued user updates | 256 entries and 8 MiB of accounted decoded memory, whichever is reached first. |
+| Queued user updates | 256 entries; whole-page overflow reports Lagged without advancing progress. |
 | Registered, pending, or cleaning-up filters | 32 per session; dropping a guard does not release its slot until cleanup completes or the session closes. |
 | Tracked partition identities | 4,096 per session. |
 | Native version-range intervals | 4,096 per session. |
-| Page processing | One worker with scoped staging/semantic halves; 32 staged pages and one transfer, sharing the 8 MiB delivery budget. |
-| Native channel ingress / aggregate reservation | 33 slots / 2 GiB charged ceiling; 4 MiB frames. No eager allocation or ordinary-default change. |
-| Native ordinary RPC / consuming reply operations | 8 / 4, independently counted under aggregate reservations. |
-| Native lifetime transport IDs | 4,096; terminal exhaustion, no history eviction or same-ID retry exception. |
+| Page processing | Furpc ingress invocations under Endpoint HandlerLimits; version/delivery commit is serialized. |
+| Native frames, pending RPCs, handler/reply capacity | Existing furpc TransportLimits/HandlerLimits and native Fubst widths. |
 | Automatic cleanup commands | 32, with reserved admission independent of user-update delivery. |
 
-Apply existing frame, object, string, collection, pending-request, and started-I/O
-limits as well. Account for decoded allocations and processing copies, not just
-wire bytes. A page that cannot fit as a complete admission transaction exceeds
-this supported profile even if a native client would accept it.
+No retained-heap ledger, allocation leases, extra construction ceiling or
+lifetime transport-ID history is carried forward from the legacy client.
+Endpoint transport/handler limits are configured before dialing. The
+notification default operation timeout does not override the ingress timeout.
 
 Never evict version/partition state silently to stay within a limit. Queue
 overflow yields a distinct notification-lag/resource error; bookkeeping
 exhaustion yields an explicit resource-limit error. Both terminate this initial
 session instead of claiming an uninterrupted subscription.
 
-Before publication, the constructor drives pull alongside Connect and charges
-each staged body/context. A finite pending-ingress snapshot closes the ordering
-gap if Connect completion overtakes pulling; semantic draining starts only after
-that handoff succeeds. Count exhaustion preserves notification ResourceLimit;
-8 MiB memory exhaustion preserves Lagged. Larger backend-admission bursts can
-terminate first with the original Common(ResourceLimit) transport cause.
-Construction cancellation owns the candidate channel; no constructor-spawned
-reception task can survive it.
+Ingress is installed before Connect is sent. Early typed pages wait for its
+generation under the runner's original handler deadline and capacity; no
+constructor-side pull/staging handoff is needed. Construction cancellation
+closes local domain admission and releases the supplied Channel owner.
 
 ### 6.2 Receive and shutdown
 
@@ -542,24 +544,27 @@ Normal explicit shutdown ends with `None`, not a fabricated update.
 
 `close(self, timeout)` stops new filter operations, takes responsibility for all
 remaining registrations and queued cleanups, attempts deregistration under one
-overall deadline, then stops the notification connection and waits for owned
-tasks to exit. It returns an error if cleanup failed or timed out; socket
-shutdown still proceeds, with started-frame completion separately bounded by
-the 30-second watchdog. Close retains its worker handle while waiting; cancellation
-does not revoke disposal. Dropping `ServiceNotificationClient` initiates local
-connection shutdown but cannot await or guarantee remote deregistration.
-Closing that dedicated connection releases the remote registration through the
-gateway's disconnect path once it detects the disconnect, not an instantaneous
-remote-cleanup guarantee.
+overall deadline, then stops/awaits its cleanup worker and releases its furpc
+Channel. It returns an error if cleanup failed or timed out. It is not a
+physical socket/driver join barrier and cannot revoke outside Channel clones.
+Dropping the client closes local admission and signals worker cancellation;
+last-owner release follows normal furpc shutdown. Supply a dedicated Channel
+and retain no outside clones when owner drop must release its last owner.
+Remote disconnect cleanup remains eventual, not an instantaneous guarantee.
 
 Closing or dropping either public client does not close the other. A failure of
 one client's connection does not retire the other's still-healthy connection.
 Registration guards and background tasks must not keep a notification client
 running after its owner is dropped, or create an ownership cycle.
 
-Failed or cancelled notification-client construction closes the candidate
-connection and stops any started tasks without publishing a partially
-initialized client. After a terminal failure, recovery requires constructing
+Failed or cancelled construction releases its candidate owner without
+publishing a partially initialized session. Furpc has no independent Channel
+closure observer: an idle physical disconnect need not wake local `recv`.
+Use an application-owned receive timeout when required. Observed fatal transport
+or processing failures terminate the domain session; it does not reconnect.
+Definitive native registration rejections and unsubmitted local failures do not
+invalidate otherwise healthy registrations.
+After a terminal failure, recovery requires constructing
 a new `ServiceNotificationClient`; it gets a fresh session with no inherited
 filters or continuity guarantee. Old guards and outstanding reply contexts
 remain bound to the retired client and cannot attach to its replacement.
@@ -621,7 +626,7 @@ connection.
 The initial API has no automatic reconnect, durable cursor, filter restoration,
 or synthesized catch-up snapshot. On failure, callers construct a new
 notification client, register filters again, and fetch any required initial
-state again through a separate `FabricClient`.
+state again through a separate `FurpcClient`.
 
 Native transparent recovery is a separate extension: retain desired filters,
 connect with committed generation/version ranges, compare the deleted-entry
@@ -638,7 +643,11 @@ connection and reply admission; standalone notification client/filters/receiver;
 qualification and public coverage documentation. Notification support does not
 depend on adding a resolution cache or implementing the legacy long-poll API.
 
-Offline coverage must exercise:
+`fube-client` synthetic wire/model-peer tests are retired. Keep non-wire model,
+input/version/state tests and independent report-validator negatives; use native
+owned scenarios for the protocol cases below rather than recreating fake peers.
+The furpc/fubst/fube-transport suites retain their own transport/codec coverage.
+The qualification checklist is:
 
 - Singleton, named, and signed-int64 keys; previous-result metadata; unchanged
   refreshes; native errors; partition identity changes; and version comparison.
@@ -659,7 +668,7 @@ Offline coverage must exercise:
 - Session close while guards survive, filter-slot accounting during cleanup,
   and stale cleanup commands that must not affect a replacement client/session.
 - Independent public-client close/drop and connection faults in both directions;
-  failed/cancelled notification construction must not affect a `FabricClient`.
+  failed/cancelled notification construction must not affect a `FurpcClient`.
 
 Live tests use only disposable owned services and subscriptions. Compare
 resolved endpoints with independently established deployment state; then

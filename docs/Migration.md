@@ -7,23 +7,29 @@ constructors are removed, without deprecated wrappers or compatibility aliases.
 
 | Removed API | Current composition |
 |---|---|
-| `FabricClient::connect_clear(address, timeout)` | `FabricClient::endpoint_clear(address)` -> Endpoint connect -> `FabricClient::new(channel, ClientOptions)` |
-| `ImageStoreClient::connect_clear(address, timeout)` | `ImageStoreClient::endpoint_clear(address)` -> Endpoint connect -> `ImageStoreClient::new(channel, ImageStoreClientOptions)` |
+| `FabricClient::connect_clear(address, timeout)` | `FurpcClient::endpoint_clear(address)` -> furpc Endpoint connect -> local `FurpcClient::new(channel)`; the ordinary legacy façade is removed. |
+| `ImageStoreClient::connect_clear(address, timeout)` | `ImageStoreClient::endpoint_clear(address)` -> furpc Endpoint connect -> async `ImageStoreClient::new(channel, ImageStoreClientOptions).await` |
 | `ServiceNotificationClient::connect_clear(address, timeout)` | `ServiceNotificationClient::endpoint_clear(address)` -> Endpoint connect -> async `ServiceNotificationClient::start(channel, NotificationClientOptions)` |
 | `Channel::connect_unsecured_loopback(address, composition, limits, deadline)` | `Endpoint::unsecured_tcp(address, composition)?.channel_limits(limits).connect_until(deadline)` |
 | `Endpoint::unsecured_loopback(address, composition)` | `Endpoint::unsecured_tcp(address, composition)`; general TCP now accepts non-loopback unicast addresses. |
 | `fube_transport::accept_unsecured_loopback(stream, composition, limits, deadline)` | `fube_transport::accept_unsecured_tcp(stream, composition, limits, deadline)`; local runtime IPC keeps its separate loopback-only constructors. |
 
+The first three rows use furpc; the remaining rows describe legacy transport APIs
+still used by other workspace consumers.
 `Endpoint::connect_timeout` governs dialing; client options govern subsequent
 operations, and notification options separately govern real native startup.
-To retain the old shared establishment/startup budget, pass an absolute deadline
-to `Endpoint::connect_until` and enclose startup in `tokio::time::timeout_at` with
-that same deadline; use the remaining duration for notification startup.
+Enclose furpc connection/startup in `tokio::time::timeout_at` to share one
+absolute deadline; use its remaining duration for notification startup.
 See the [construction and deadline examples](transport/RustFabricClient.md#uncached-resolution-and-independent-notifications).
 
-Protocol-specific endpoint factories still install immutable authorization.
-Client construction cannot upgrade permissions. Dedicated notification/upload
-inboxes, clone ownership and cancellation/retirement semantics are unchanged.
+Native client constructors install explicit authorized furpc ingress services
+on dedicated Channels with no existing ingress service. Notification and
+ImageStore operations capture an original-generation Peer without reconnect or replay.
+ImageStore's legacy `close`/`is_closed`/`terminal_error` methods are removed.
+Drop releases Channel ownership, not a physical-driver join barrier or revocation
+of outside clones. Crate-root transport re-exports are removed; Error/Result now
+mean fubst input/model validation. Remote errors use FurpcClientError,
+NotificationResult and ImageStoreError/ImageStoreResult.
 IPC's separate session setup and replication's raw-session API are unaffected.
 
 Public `ReplicationEndpointOptions` literals must set `advertised_ip`: use

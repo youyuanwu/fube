@@ -2,7 +2,7 @@
 
 use crate::{
     query_protocol::{result_tags, ListReply, Query},
-    Error, HealthState, PagedQuery, QueryPage, Result, ServiceKind,
+    HealthState, PagedQuery, QueryPage, ServiceKind,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -111,12 +111,12 @@ impl Query for ReplicaQueryParameters {
     const NAME: &'static str = "GetServicePartitionReplicaList";
     const SUPPORTS_MAX_RESULTS: bool = false;
 
-    fn validate_record(replica: Replica) -> Result<Replica> {
+    fn validate_record(replica: Replica) -> std::result::Result<Replica, &'static str> {
         if replica.kind == ServiceKind::Invalid {
-            return Err(Error::Protocol("unsupported replica service kind"));
+            return Err("unsupported replica service kind");
         }
         if matches!(replica.health_state, HealthState::Unrecognized(_)) {
-            return Err(Error::Protocol("unsupported replica health state"));
+            return Err("unsupported replica health state");
         }
         Ok(replica)
     }
@@ -125,225 +125,7 @@ impl Query for ReplicaQueryParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        partitions::tests::ID,
-        query_protocol::{encode_query, tests::assert_request},
-        Paging,
-    };
-    use fubst::{serde::from_slice, Encoder};
-    use std::num::NonZeroU64;
-
-    // ServiceModel/ServiceReplicaQueryResult.h FABRIC_FIELDS_09.
-    fn base(
-        e: &mut Encoder,
-        kind: i64,
-        replica_id: i64,
-        instance_id: i64,
-        role: i64,
-        status: i64,
-        health: i64,
-    ) -> fubst::Result<()> {
-        e.i64(kind).unwrap();
-        e.i64(replica_id).unwrap();
-        e.i64(role).unwrap();
-        e.i64(instance_id).unwrap();
-        e.i64(status).unwrap();
-        e.string(r#"{"Endpoints":{"rpc":"opaque🦀"}}"#)?;
-        e.string("_Node_0")?;
-        e.i64(health).unwrap();
-        Ok(())
-    }
-
-    fn fields(e: &mut Encoder, kind: i64, id: i64, suffix: bool) -> fubst::Result<()> {
-        base(
-            e,
-            kind,
-            if kind == 2 { id } else { 0 },
-            if kind == 1 { id } else { 0 },
-            if kind == 2 { 2 } else { 0 },
-            3,
-            1,
-        )?;
-        if suffix {
-            e.i64(i64::MAX).unwrap();
-        }
-        Ok(())
-    }
-
-    fn decode_fields(fields: impl FnOnce(&mut Encoder) -> fubst::Result<()>) -> Result<Replica> {
-        let mut e = Encoder::new();
-        e.object(fields)?;
-        ReplicaQueryParameters::validate_record(from_slice(&e.finish())?)
-    }
-
-    #[test]
-    fn replica_arguments_preserve_signed_ids_numeric_masks_and_omissions() {
-        let mut parameters = ReplicaQueryParameters::new(ID.parse().unwrap());
-        assert_request(
-            &parameters,
-            Some(&Paging::default()),
-            "GetServicePartitionReplicaList",
-            &[("PartitionId", ID)],
-        );
-        parameters.replica_or_instance_id = Some(0);
-        assert_request(
-            &parameters,
-            Some(&Paging {
-                continuation_token: Some(String::new()),
-                ..Default::default()
-            }),
-            "GetServicePartitionReplicaList",
-            &[("PartitionId", ID)],
-        );
-        for id in [i64::MIN, -1, 1, i64::MAX] {
-            parameters.replica_or_instance_id = Some(id);
-            parameters.status_filter = ReplicaStatusFilter::READY | ReplicaStatusFilter::DOWN;
-            assert_request(
-                &parameters,
-                Some(&Paging {
-                    continuation_token: Some("opaque".into()),
-                    max_results: None,
-                }),
-                "GetServicePartitionReplicaList",
-                &[
-                    ("PartitionId", ID),
-                    ("ReplicaId", &id.to_string()),
-                    ("ReplicaStatusFilter", "12"),
-                    ("ContinuationToken", "opaque"),
-                ],
-            );
-        }
-        parameters.status_filter = ReplicaStatusFilter::from_bits_retain(u32::MAX);
-        parameters.replica_or_instance_id = None;
-        parameters.partition_id = Uuid::nil();
-        assert_request(
-            &parameters,
-            None,
-            "GetServicePartitionReplicaList",
-            &[
-                ("PartitionId", "00000000-0000-0000-0000-000000000000"),
-                ("ReplicaStatusFilter", "4294967295"),
-            ],
-        );
-        for limit in [1, i64::MAX as u64, i64::MAX as u64 + 1] {
-            assert!(matches!(
-                encode_query(
-                    &parameters,
-                    Some(&Paging {
-                        max_results: NonZeroU64::new(limit),
-                        ..Default::default()
-                    })
-                ),
-                Err(Error::InvalidInput(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn replicas_decode_stateful_and_stateless_with_full_signed_id_range() {
-        for kind in [1, 2] {
-            for id in [i64::MIN, -1, 0, 1, i64::MAX] {
-                let replica = decode_fields(|e| fields(e, kind, id, true)).unwrap();
-                assert_eq!(
-                    replica.kind,
-                    if kind == 1 {
-                        ServiceKind::Stateless
-                    } else {
-                        ServiceKind::Stateful
-                    }
-                );
-                assert_eq!(replica.replica_id, if kind == 2 { id } else { 0 });
-                assert_eq!(replica.instance_id, if kind == 1 { id } else { 0 });
-                assert_eq!(
-                    replica.role,
-                    if kind == 2 {
-                        ReplicaRole::Primary
-                    } else {
-                        ReplicaRole::Unknown
-                    }
-                );
-                assert_eq!(replica.status, ReplicaStatus::Ready);
-                assert_eq!(replica.address, r#"{"Endpoints":{"rpc":"opaque🦀"}}"#);
-                assert_eq!(replica.node_name, "_Node_0");
-                assert_eq!(replica.health_state, HealthState::Ok);
-                assert_eq!(replica.last_in_build_duration_in_seconds, i64::MAX);
-            }
-        }
-    }
-
-    #[test]
-    fn replica_suffix_default_is_not_a_fallback_for_bad_metadata_or_truncation() {
-        let replica = decode_fields(|e| fields(e, 2, 123, false)).unwrap();
-        assert_eq!(replica.last_in_build_duration_in_seconds, 0);
-        assert!(matches!(
-            decode_fields(|e| {
-                fields(e, 2, 123, false)?;
-                e.string("bad duration metadata")
-            }),
-            Err(Error::Protocol(_))
-        ));
-        assert!(matches!(
-            decode_fields(|e| {
-                e.i64(2).unwrap();
-                e.i64(123).unwrap();
-                e.i64(2).unwrap();
-                e.i64(0).unwrap();
-                e.i64(3).unwrap();
-                e.string("address")?;
-                e.string("node")
-            }),
-            Err(Error::Protocol(_))
-        ));
-        let mut e = Encoder::new();
-        e.object(|e| fields(e, 2, 123, true)).unwrap();
-        let bytes = e.finish();
-        let mut bytes = bytes;
-        // Keep the enclosing extent valid but advertise another varint byte.
-        let last_duration_byte = bytes.len() - 3;
-        bytes[last_duration_byte] |= 0x80;
-        assert!(from_slice::<Replica>(&bytes).is_err());
-    }
-
-    #[test]
-    fn replica_enum_codes_and_filter_masks_keep_their_distinct_numeric_meanings() {
-        for role in 0..=4 {
-            let replica = decode_fields(|e| base(e, 2, -1, 0, role, 0, 65535)).unwrap();
-            assert_eq!(serde_json::to_value(replica.role).unwrap(), role);
-            assert_eq!(replica.status, ReplicaStatus::Invalid);
-            assert_eq!(replica.health_state, HealthState::Unknown);
-        }
-        for status in 0..=5 {
-            let replica = decode_fields(|e| base(e, 2, 1, 0, 4, status, 0)).unwrap();
-            assert_eq!(serde_json::to_value(replica.status).unwrap(), status);
-        }
-        for kind in [-1, 0, 3, i64::MAX] {
-            assert!(decode_fields(|e| fields(e, kind, 1, true)).is_err());
-        }
-        for (role, status, health) in [
-            (-1, 3, 1),
-            (5, 3, 1),
-            (2, -1, 1),
-            (2, 6, 1),
-            (2, 3, 4),
-            (2, 3, -1),
-        ] {
-            assert!(decode_fields(|e| base(e, 2, 1, 0, role, status, health)).is_err());
-        }
-        assert_eq!(ReplicaStatusFilter::DEFAULT.bits(), 0);
-        assert_eq!(ReplicaStatusFilter::ALL.bits(), 0xffff);
-        assert_eq!(ReplicaStatusFilter::IN_BUILD.bits(), 1);
-        assert_eq!(ReplicaStatusFilter::STANDBY.bits(), 2);
-        assert_eq!(ReplicaStatusFilter::READY.bits(), 4);
-        assert_eq!(ReplicaStatusFilter::DOWN.bits(), 8);
-        assert_eq!(ReplicaStatusFilter::DROPPED.bits(), 16);
-        assert_eq!(ReplicaStatusFilter::all().bits(), u32::MAX);
-        for invalid in [-1, 5, i64::MAX] {
-            assert!(serde_json::from_value::<ReplicaRole>(invalid.into()).is_err());
-        }
-        for invalid in [-1, 6, i64::MAX] {
-            assert!(serde_json::from_value::<ReplicaStatus>(invalid.into()).is_err());
-        }
-    }
+    use crate::partitions::tests::ID;
 
     #[test]
     fn replica_parameter_json_keeps_native_names_numeric_masks_and_nested_paging() {

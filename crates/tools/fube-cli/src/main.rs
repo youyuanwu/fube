@@ -1,7 +1,8 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand};
-use fube_client::{Error, ImageStoreClient, ImageStoreClientOptions, Result};
+use fube_client::{ImageStoreClient, ImageStoreClientOptions, ImageStoreResult as Result};
+use furpc::Error;
 
 #[derive(Parser)]
 #[command(version, about = "Native Service Fabric development CLI")]
@@ -43,7 +44,8 @@ async fn run(arguments: Arguments) -> Result<()> {
     if !arguments.unsecured {
         return Err(Error::InvalidInput(
             "native upload requires explicit --unsecured development mode",
-        ));
+        )
+        .into());
     }
     let Command::Application {
         command: ApplicationCommand::Upload { path, timeout },
@@ -64,7 +66,7 @@ async fn run(arguments: Arguments) -> Result<()> {
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())
             .filter(|remaining| !remaining.is_zero())
-            .ok_or(Error::Timeout)?;
+            .ok_or(Error::Timeout("upload"))?;
         let channel = ImageStoreClient::endpoint_clear(arguments.endpoint)?
             .connect_timeout(remaining)
             .connect()
@@ -74,19 +76,19 @@ async fn run(arguments: Arguments) -> Result<()> {
             ImageStoreClientOptions {
                 default_timeout: budget,
             },
-        )?;
+        )
+        .await?;
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())
             .filter(|remaining| !remaining.is_zero())
-            .ok_or(Error::Timeout)?;
+            .ok_or(Error::Timeout("upload"))?;
         client
             .copy_application_package(&path, &destination, Some(remaining))
             .await?;
-        client.close().await?;
-        Ok::<_, Error>(destination)
+        Ok::<_, fube_client::ImageStoreError>(destination)
     })
     .await
-    .map_err(|_| Error::Timeout)??;
+    .map_err(|_| Error::Timeout("upload"))??;
     println!("Uploaded application package to {destination}.");
     Ok(())
 }

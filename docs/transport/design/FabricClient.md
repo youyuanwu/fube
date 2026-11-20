@@ -6,6 +6,24 @@ partition resolution and independently owned notification sessions, with
 recorded SF 11.8.121.4 coverage and explicit limitations. This does not complete
 the TLS/authentication/recovery requirements below.
 
+**Current API split:** this broader design is not the current façade contract.
+Migrated Ping, all three naming methods, cluster/topology/deployment lists, node health, MovePrimary and resolution exist
+only on `FurpcClient` over furpc; their legacy methods and typed-request adapters
+have been removed. The ordinary `FabricClient`/`GatewayClient` façades, sealed
+request contracts and typed allocation budgets are retired. Proposed
+builder examples below are not compatibility wrappers; see the linked subset
+guide for current typed requests and absolute deadlines.
+The standalone notification client now also uses furpc ingress, typed ACK data
+and original-generation Peer RPCs. ImageStore also uses furpc Peer sends and
+authorized Actor 25/27 one-way ACK ingress, with no legacy transport fallback.
+No production fube-client dependency on fube-transport remains; the native loss
+relay and transport-model JSON tests retain it only as a development dependency.
+Shared input/version-model Error/Result aliases now refer to fubst; ImageStore
+exposes ImageStoreError/ImageStoreResult with original filesystem causes.
+Notification close
+releases Channel ownership, not a physical-driver join barrier; idle disconnects
+have no separate closure observer.
+
 ## 1. Goal and protocol baseline
 
 Build an asynchronous, pure Rust client for the Service Fabric **native
@@ -382,7 +400,7 @@ not structural deserialization, rejects Invalid kind and stateless persistence.
 adapter on their existing raw-byte fields; no parallel transport records remain.
 `NamingUri` is a checked semantic type with a private native component schema,
 not an arbitrary String. Naming query fields and application/service result
-names use it; string naming-call convenience remains supported. Names remain
+names use it; naming methods take checked values in furpc Requests. Names remain
 JSON strings, with invalid names rejected on construction/deserialization.
 Request structs directly declare native query names, flattened selectors,
 omissions, numeric masks and embedded JSON through stock Serde attributes and
@@ -451,9 +469,9 @@ evidence for the exercised subset, not every native schema. No C++ fixture
 build, committed capture files, generic derive macro or general-purpose format
 is required. See the [public mapping contract](../RustFabricClient.md#41-native-serde-payloads)
 and its source links for supported adapters, integration and limitations.
-The later shared-adapter and direct-model expansions add offline differential/malformed tests
-and rerun independent model-peer scenarios; they do not constitute a fresh
-live onebox qualification.
+The historical shared-adapter and direct-model expansions used offline
+differential/malformed tests and model peers; those synthetic fube-client wire
+tests are now retired, and are not current native qualification.
 The node-local deployment inspection expansion was separately qualified live on
 SF11.8.121.4 against two owned applications: ten service packages, ten ExeHost
 code packages and 22 deployed replicas/instances matched independent REST

@@ -168,6 +168,7 @@ impl<T> RpcClient<T> {
     pub fn new(transport: T) -> Self;
     pub fn codec_limits(self, limits: ClientCodecLimits) -> Result<Self>;
     pub fn into_inner(self) -> T;
+    pub fn get_mut(&mut self) -> &mut T;
 }
 
 impl<T> RpcClient<T>

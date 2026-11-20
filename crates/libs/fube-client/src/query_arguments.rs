@@ -3,15 +3,13 @@
 //! Values use their ordinary JSON representations. Field adapters explicitly
 //! select numeric flag masks and embedded JSON without per-request serializers.
 
-use fubst::{MAX_COLLECTION_COUNT, MAX_STRING_UNITS};
+use fubst::{Error, Result, MAX_COLLECTION_COUNT, MAX_STRING_UNITS};
 use serde::{
     de::{value::MapAccessDeserializer, DeserializeSeed, IntoDeserializer, MapAccess, Visitor},
     ser::{Impossible, SerializeMap, SerializeStruct},
     Deserialize, Serialize, Serializer,
 };
 use std::{fmt, marker::PhantomData};
-
-use crate::{Error, Result};
 
 const JSON_ARGUMENT: &str = "$fabric::QueryJson";
 
@@ -173,32 +171,54 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for FirstKey<A> {
 #[derive(Default)]
 pub(crate) struct QueryArguments {
     pub values: Vec<(String, String)>,
+    profile: ArgumentProfile,
+}
+
+#[derive(Clone, Copy, Default)]
+enum ArgumentProfile {
+    #[default]
+    Legacy,
+    Native,
 }
 
 impl QueryArguments {
+    pub(crate) fn native() -> Self {
+        Self {
+            values: Vec::new(),
+            profile: ArgumentProfile::Native,
+        }
+    }
+
     pub fn append(&mut self, value: &impl Serialize) -> Result<()> {
         value.serialize(self)
     }
 
     fn field<T: Serialize + ?Sized>(&mut self, key: &str, value: &T) -> Result<()> {
-        if let Some(value) = value.serialize(ArgumentValue)? {
-            if self.values.len() >= MAX_COLLECTION_COUNT {
+        if let Some(value) = value.serialize(ArgumentValue(self.profile))? {
+            if matches!(self.profile, ArgumentProfile::Legacy)
+                && self.values.len() >= MAX_COLLECTION_COUNT
+            {
                 return Err(Error::InvalidInput("object-array count limit exceeded"));
             }
             if self.values.iter().any(|(name, _)| name == key) {
                 return Err(Error::InvalidInput("duplicate query argument"));
             }
-            self.values.push((bounded_string(key)?, value));
+            self.values.push((self.profile.string(key)?, value));
         }
         Ok(())
     }
 }
 
-fn bounded_string(value: &str) -> Result<String> {
-    if value.len() > MAX_STRING_UNITS * 3 || value.encode_utf16().count() > MAX_STRING_UNITS {
-        return Err(Error::InvalidInput("UTF-16 string limit exceeded"));
+impl ArgumentProfile {
+    fn string(self, value: &str) -> Result<String> {
+        if matches!(self, Self::Legacy)
+            && (value.len() > MAX_STRING_UNITS * 3
+                || value.encode_utf16().count() > MAX_STRING_UNITS)
+        {
+            return Err(Error::InvalidInput("UTF-16 string limit exceeded"));
+        }
+        Ok(value.to_owned())
     }
-    Ok(value.to_owned())
 }
 
 macro_rules! reject_scalar {
@@ -350,7 +370,7 @@ impl SerializeMap for QueryMap<'_> {
         if self.key.is_some() {
             return Err(Error::InvalidInput("query map has key without value"));
         }
-        self.key = Some(key.serialize(StringKey)?);
+        self.key = Some(key.serialize(StringKey(self.arguments.profile))?);
         Ok(())
     }
 
@@ -379,7 +399,7 @@ impl SerializeMap for QueryMap<'_> {
     }
 }
 
-struct StringKey;
+struct StringKey(ArgumentProfile);
 
 impl Serializer for StringKey {
     type Ok = String;
@@ -403,7 +423,7 @@ impl Serializer for StringKey {
     reject_compound!();
 
     fn serialize_str(self, value: &str) -> Result<String> {
-        bounded_string(value)
+        self.0.string(value)
     }
     fn serialize_none(self) -> Result<String> {
         Err(Error::InvalidInput("query argument keys must be strings"))
@@ -426,7 +446,8 @@ impl Serializer for StringKey {
     }
 }
 
-struct ArgumentValue;
+#[derive(Default)]
+struct ArgumentValue(ArgumentProfile);
 
 macro_rules! integer_value {
     ($($method:ident($ty:ty)),* $(,)?) => {
@@ -459,7 +480,7 @@ impl Serializer for ArgumentValue {
         Ok(Some(value.to_string()))
     }
     fn serialize_str(self, value: &str) -> Result<Self::Ok> {
-        bounded_string(value).map(Some)
+        self.0.string(value).map(Some)
     }
     fn serialize_none(self) -> Result<Self::Ok> {
         Ok(None)
@@ -475,7 +496,7 @@ impl Serializer for ArgumentValue {
         if name == JSON_ARGUMENT {
             let json = serde_json::to_string(value)
                 .map_err(|_| Error::InvalidInput("failed to serialize query JSON argument"))?;
-            return bounded_string(&json).map(Some);
+            return self.0.string(&json).map(Some);
         }
         value.serialize(self)
     }
@@ -608,6 +629,7 @@ mod tests {
             values: (0..MAX_COLLECTION_COUNT - 1)
                 .map(|index| (index.to_string(), String::new()))
                 .collect(),
+            ..Default::default()
         };
         let mut map = (&mut arguments).serialize_map(None).unwrap();
         map.serialize_entry("Last", &false).unwrap();
@@ -625,7 +647,9 @@ mod tests {
             consider_warning_as_error: false,
         };
         assert_eq!(
-            json::serialize(&policy, ArgumentValue).unwrap().as_deref(),
+            json::serialize(&policy, ArgumentValue::default())
+                .unwrap()
+                .as_deref(),
             Some(r#"{"ConsiderWarningAsError":false}"#),
         );
         assert_eq!(
@@ -642,9 +666,12 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                json::serialize(&HealthEventsQueryFilter::from(filter), ArgumentValue)
-                    .unwrap()
-                    .as_deref(),
+                json::serialize(
+                    &HealthEventsQueryFilter::from(filter),
+                    ArgumentValue::default()
+                )
+                .unwrap()
+                .as_deref(),
                 Some(expected),
             );
             assert!(serde_json::to_value(filter).unwrap().is_string());
@@ -654,7 +681,7 @@ mod tests {
     #[test]
     fn explicit_json_preserves_escaping_and_bounds_encoded_utf16() {
         assert_eq!(
-            json::serialize(&vec!["quote\"\\\n", "\u{1f980}"], ArgumentValue)
+            json::serialize(&vec!["quote\"\\\n", "\u{1f980}"], ArgumentValue::default())
                 .unwrap()
                 .as_deref(),
             Some("[\"quote\\\"\\\\\\n\",\"\u{1f980}\"]"),
@@ -665,10 +692,12 @@ mod tests {
             ("\0", (MAX_STRING_UNITS - 2) / 6),
         ] {
             let text = unit.repeat(count);
-            let encoded = json::serialize(&text, ArgumentValue).unwrap().unwrap();
+            let encoded = json::serialize(&text, ArgumentValue::default())
+                .unwrap()
+                .unwrap();
             assert_eq!(encoded.encode_utf16().count(), MAX_STRING_UNITS);
             assert!(matches!(
-                json::serialize(&(text + unit), ArgumentValue),
+                json::serialize(&(text + unit), ArgumentValue::default()),
                 Err(Error::InvalidInput("UTF-16 string limit exceeded"))
             ));
         }
@@ -683,7 +712,7 @@ mod tests {
             }
         }
         assert!(matches!(
-            json::serialize(&InvalidJson, ArgumentValue),
+            json::serialize(&InvalidJson, ArgumentValue::default()),
             Err(Error::InvalidInput(
                 "failed to serialize query JSON argument"
             ))
@@ -776,6 +805,7 @@ mod tests {
             values: (0..MAX_COLLECTION_COUNT - 1)
                 .map(|n| (n.to_string(), String::new()))
                 .collect(),
+            ..Default::default()
         };
         arguments.append(&Field { key: 1 }).unwrap();
         #[derive(Serialize)]
@@ -787,6 +817,26 @@ mod tests {
             Err(Error::InvalidInput("object-array count limit exceeded"))
         ));
         assert_eq!(arguments.values.len(), MAX_COLLECTION_COUNT);
+    }
+
+    #[test]
+    fn native_arguments_leave_string_and_count_bounds_to_the_body_encoder() {
+        let values = std::collections::BTreeMap::from([("Key", "x".repeat(MAX_STRING_UNITS + 1))]);
+        let mut arguments = QueryArguments::native();
+        arguments.append(&values).unwrap();
+        assert_eq!(arguments.values[0].1.len(), MAX_STRING_UNITS + 1);
+        assert!(QueryArguments::default().append(&values).is_err());
+        let values: std::collections::BTreeMap<_, _> = (0..=MAX_COLLECTION_COUNT)
+            .map(|n| (n.to_string(), n))
+            .collect();
+        let mut arguments = QueryArguments::native();
+        arguments.append(&values).unwrap();
+        assert_eq!(arguments.values.len(), MAX_COLLECTION_COUNT + 1);
+        assert!(QueryArguments::default().append(&values).is_err());
+        assert!(matches!(
+            arguments.append(&values),
+            Err(Error::InvalidInput("duplicate query argument"))
+        ));
     }
 
     #[test]

@@ -38,13 +38,155 @@ Deterministic I/O cases, backpressured in-memory exchange, and a loopback clear-
 exchange exercise this foundation. They are not native interoperability
 qualification.
 
-The separate `fube-client::FurpcClient` now qualifies native Ping through this
-driver against a fresh Service Fabric 11.8.121.4 onebox. The existing baseline
-test runs three overlapping pings on one Channel and compares complete gateway
-identities with fresh independent HTTP observations and the legacy native client.
-Its required `furpc_ping` report records all three results' successful comparison.
-This is initiating clear-TCP Ping evidence only; it does not qualify accepted-side
-serving, notifications, TLS, or the rest of the gateway API. See the
+The generic `fube-client::FurpcClient` now qualifies Ping, NameExists,
+GetNodeList, application/service lists and node health through RpcClient and
+byte-facing Tower services against a fresh Service Fabric 11.8.121.4 onebox.
+The existing baseline compares three cloned
+Pings and full native node identities with independent HTTP observations.
+It also checks naming true/false, node filters,
+real server paging, native invalid-token failure and original-generation
+healthy reuse, and mixed-method concurrency. Required `furpc_ping` and
+`furpc_management` report fields retain those observations.
+The gateway adapter captures each method's selected reply validator before
+success-body decoding; shared native schemas do not route through legacy
+Messages, channels or retained-allocation budgets.
+All migrated queries use a generic typed query codec with shared declarations and
+transport-independent list/item/empty reply profiles. Profile-specific actor,
+action, payload-tag and paging checks remain distinct. The existing owned
+list/health scenarios also compare nonempty application/service fields, real
+continuations, parameter exclusion and all 17 health policy/filter cases against
+independent HTTP. Their evidence checks native errors,
+original-generation reuse and concurrent clones without new codecs or fixtures.
+Partition and replica list methods now reuse that codec with strict List tags
+5/6 and continuation-only paging, without MaxResults or automatic paging. Their
+legacy methods, typed-request adapters and input accounting are retired.
+The existing owned list scenario now compares canonical furpc topology against
+HTTP, retains actual fields and generation/error evidence, and observes
+MovePrimary through furpc replicas. The mutation was still legacy in that
+topology qualification and is now migrated below.
+The rewritten archived scenario passed against a fresh SF11.8.121.4 onebox:
+six partitions and 22 replicas/instances matched independent HTTP observations.
+The four node-local deployment queries also use the same codec: deployed
+applications are paged, while service packages, code packages and deployed
+replicas are unpaged. Deployed replicas retain the RS Actor 13 reply profile.
+Their legacy methods, request adapters and allocation accounting are retired.
+Current native scenarios keep one furpc read client across list, topology and
+deployment observations, with explicit clones for concurrent calls and source
+generation checks on every successful response.
+The same native run qualified actual deployment paging, ten service packages,
+ten ExeHost code packages and 22 deployed replicas, including full supported
+REST projections, selectors, native missing-node errors and original-generation
+healthy reuse. The actual report passed the independent CI evidence validators.
+Synthetic wire/model-peer tests in fube-client are retired; non-wire tests,
+native scenarios and report validators remain.
+All twelve legacy read methods and their typed-request adapters are retired;
+remaining legacy operations keep their own transport. Current proof gates use
+canonical furpc results and independent HTTP/source-derived expectations, not
+retained legacy implementations as comparison oracles.
+CreateName/DeleteName now use the same stub with `Request<NamingUri>` and
+`Response<()>`. The standard FubstCodec requires an empty success body after
+NamingGateway/NameOperationReply validation, and deletion alone adds native
+explicit-delete header `0x8033`. Both preserve native failures, absolute deadlines,
+source/settlement metadata and no-replay/unknown-write-outcome semantics.
+Their legacy methods, NameRequest/NameOperation/NameResponse and input accounting
+are retired.
+The existing owned name lifecycle now uses one furpc generation for writes and
+reads, independently observes HTTP presence/absence and checks duplicate/missing
+errors plus concurrent cloned Ping/NameExists reuse. Its required receipt is
+validated independently and contributes a `furpc_naming_writes` time window.
+The targeted archived lifecycle passed on a fresh five-node SF11.8.121.4 onebox:
+both writes and all reads retained generation 1, duplicate/missing failures were
+native domain errors, independent HTTP agreed and owned cleanup completed.
+The actual receipt passed `validate_furpc_names`.
+MovePrimary now uses the generic query codec with public unpaged
+MovePrimaryQueryDescription/MovePrimaryQueryParameters and its existing
+RS13/QueryReply empty-QueryResult profile. Nil partitions and invalid explicit
+node names fail before submission. There is no force/ignore option, paging,
+retry or replay; an acknowledged request is not an observed placement transition,
+and an abandoned submitted mutation can still execute.
+Its legacy method, request adapter, input accounting and the last legacy query
+encode/decode entry points are retired. The existing owned list scenario now submits one movement on the
+original furpc generation, independently observes the native/HTTP role swap
+and checks concurrent replica/partition/Ping reuse on clones. The existing
+movement validator requires the actual mutation response generation to match
+the read-client generation.
+The updated targeted archive passed against the retained SF11.8.121.4 onebox:
+one request moved the owned primary from N0020 to its existing ready secondary
+on N0040, with unchanged replica identities independently observed through
+native reads and HTTP. The mutation and subsequent cloned mixed reads retained
+generation 1. Actual list/topology/deployment/movement receipts passed the
+independent validators and owned cleanup completed; the onebox was left running.
+Resolution now uses its own native FubstCodec rather than the query envelope,
+with checked `ResolutionRequest` selection and private previous-result metadata.
+Service/partition/version binding, signed/named keys and endpoint roles remain
+validated without a local endpoint cache, hidden description query or replay.
+The native reply model converts without a legacy Message or transport-error
+conversion and preserves furpc response headers/source/settlement.
+The final ordinary FabricClient/GatewayClient façades, sealed Client/ClientRequest
+contracts, options and typed allocation accounting are retired. Notification and
+ImageStore clients kept their separate existing owners/transports and shared models
+in that resolution slice.
+The existing resolution/notification scenario now qualifies eight resolution and
+refresh cases, independent HTTP partition/endpoint-role multisets, missing-service
+failure and concurrent resolution/Ping/node reuse on the original furpc generation.
+Its required receipt is independently validated as `furpc_resolution`.
+The updated targeted archive passed on the retained SF11.8.121.4 onebox: all
+eight resolution/refresh cases matched independent HTTP partition and complete
+endpoint-role inventories. Missing-service failure and concurrent mixed calls
+retained generation 1. Existing endpoint-count changes, primary replacement,
+version advancement, real notification ACK retry and independent teardown also
+passed. Actual resolution/retry receipts and owned cleanup were independently
+validated; the default-Docker onebox was left running.
+ServiceNotificationClient now owns an independent furpc Channel and captures its
+original Peer. Startup installs an authorized notification IngressService before
+the native session exchange. Typed server::Rpc/FubstCodec handlers commit page
+updates/version state atomically and return ACK data; furpc alone supplies native
+ACK correlation, flags, capacity and original-generation submission. Session and
+filter RPCs reuse the gateway adapter over a Peer-backed byte service, with no
+reconnect/replay. Filter guards retain bounded asynchronous cleanup.
+The legacy notification ChannelComposition, pull/staging receiver, ReplyContext
+plumbing, Message decoders and retained-allocation ledger are removed.
+There is no new furpc lifecycle API: notification close joins its own worker and
+releases Channel ownership, not a physical-driver barrier; outside clones are
+not revoked, and idle disconnection need not wake local recv.
+The same targeted native archive passed on the retained SF11.8.121.4 onebox.
+Ordinary calls used generation 1 and three independent notification sessions
+used generations 2/3/4. Four explicit unregisters, endpoint/primary changes,
+empty invalidations and independent closes passed. A dropped successful native
+ACK caused an actual gateway retry with a fresh request ID and a correlated
+furpc ACK without duplicate application delivery. Actual notification,
+resolution and retry receipts passed independent validators after owned cleanup.
+The default-Docker onebox was left running.
+ImageStoreClient now also owns an independent furpc Channel and captured Peer.
+Async construction installs authorized Actor 25/27 ordinary one-way ingress;
+semantic ACKs are not native notifications or ordinary RPC responses.
+FileCreate/content/commit/commit-ACK use Peer::send, while the initial routed
+root Delete uses Peer::request. Shared native Serde schemas preserve protocol
+1.2, Activity/sequence checks, negotiated chunks, postorder markers and bounded
+stale-reply handling. There is no reconnect or replay, legacy Channel
+composition, retained-allocation ledger or standalone 4 MiB frame ceiling.
+Cancellation/failure releases upload ownership and fences reuse; legacy
+close/is_closed/terminal_error APIs are removed rather than emulated.
+The last production fube-transport dependency and transport re-exports are
+retired from fube-client. Shared model validation uses fubst Error/Result;
+ImageStore errors retain FurpcClientError or the original filesystem source.
+The remaining test-only dependency is also retired: the native notification
+loss relay preserves original frame bytes and uses public furpc headers for
+inspection, while legacy transport-model JSON checks live in fube-transport.
+The existing native upload journey passed on the retained SF11.8.121.4 onebox:
+one real SDK predecessor copy and furpc CLI replacement agreed on inventory,
+removed stale content, and matched all 14 file/marker entries, including seven
+zero-byte directory markers. Provision/create and independent native application
+contact succeeded; all three deployed Data file SHA256 hashes matched source.
+Owned application/type/upload/temp cleanup completed and the onebox remained
+ready/running. The actual optional report retains inventories, hashes, executable
+identities and confirmed cleanup. This does not qualify upload cancellation
+over a real failed connection or repeated native SDK copy reliability.
+Together with the earlier runs, this is initiating clear-TCP evidence for the
+thirteen migrated reads, two naming writes, MovePrimary, notification receiving/ACKs
+and native ImageStore v1.2 upload.
+It does not qualify accepted-side serving, native notification origination, TLS,
+or the rest of the gateway API. See the
 [client slice](../../RustFabricClient.md#separate-furpc-backed-client).
 
 The public facade supports managed byte RPC by default and explicitly selected
@@ -208,8 +350,10 @@ Source qualification at the pinned native baseline covers BeginNotification,
 DuplexRequestReply's special-first dispatch, and ReceiverContext::Reply.
 In-memory exchanges cover both directions, typed ACK data, class-local routing,
 policy rejection/commit checks, shared capacity, cancellation, Faults and drain;
-independent native notification interoperability remains unqualified. TLS remains
-unimplemented.
+the fube-client migration above additionally qualifies native gateway-to-client
+notification receiving/ACKs on SF11.8.121.4, including actual ACK loss/retry.
+Native notification origination and accepted-side native interoperability remain
+unqualified. TLS remains unimplemented.
 
 ## Gap ownership and implementation order
 

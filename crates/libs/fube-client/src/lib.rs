@@ -1,14 +1,14 @@
 //! Experimental pure Rust, clear-TCP FabricClient subset.
 //!
 //! This package does not use the native Service Fabric client library.
-//! Existing [`FabricClient`] connections support bounded concurrency without
-//! automatic reconnect. The separate [`FurpcClient`] uses furpc's Channel lifecycle
-//! and currently provides only Ping. Both require an explicitly selected unsecured
-//! development gateway.
+//! [`FurpcClient`] is the ordinary typed stub over a byte-facing Tower service,
+//! defaulting to furpc's Channel. It provides Ping, naming operations,
+//! cluster/topology/deployment lists, node health, MovePrimary and resolution.
+//! The old FabricClient façade, sealed request adapters and typed budgets are retired.
+//! Notifications and ImageStore use independently owned furpc sessions.
+//! Native connections require an explicitly selected unsecured development gateway.
 
 mod applications;
-mod channel_adapter;
-pub mod contracts;
 mod deployed_applications;
 mod deployed_code_packages;
 mod deployed_replicas;
@@ -36,16 +36,17 @@ mod replicas;
 mod resolution;
 mod resolution_protocol;
 mod services;
-mod typed;
 pub use applications::*;
-pub use contracts::{CallContext, Client, ClientBinding, ClientError, ClientRequest};
 pub use deployed_applications::*;
 pub use deployed_code_packages::*;
 pub use deployed_replicas::*;
 pub use deployed_service_packages::*;
-pub use furpc_client::{FurpcClient, FurpcClientError};
+pub use furpc_client::{DomainFailure, FurpcClient, FurpcClientError};
 pub use health::*;
-pub use image_store::{ImageStoreClient, ImageStoreClientOptions};
+pub use image_store::{
+    ImageStoreClient, ImageStoreClientOptions, ImageStoreError, ImageStoreResult,
+};
+pub use movement::{MovePrimaryQueryDescription, MovePrimaryQueryParameters};
 pub use naming_uri::NamingUri;
 pub use nodes::*;
 pub use notifications::*;
@@ -54,47 +55,13 @@ pub use query::*;
 pub use replicas::*;
 pub use resolution::*;
 pub use services::*;
-pub use typed::*;
+use std::time::Duration;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
-
-use contracts::ClientFuture;
-use fube_transport::{
-    channel::MessageChannel, connection::deadline_after, native_channel::GatewayTarget,
-};
-use tokio::time::Instant;
-use uuid::Uuid;
-
-pub use fube_transport::{Channel, ChannelLimits, Endpoint, Error, Result};
+/// Transport-independent input/model validation errors.
+pub use fubst::{Error, Result};
 
 /// Default connection and per-operation timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Local typed-stub defaults, independent of connection settings.
-///
-/// Limits are conservative counters, not allocated memory. Stub clones share
-/// these limits; explicitly constructing another stub creates a fresh budget.
-#[derive(Debug, Clone, Copy)]
-pub struct ClientOptions {
-    pub default_timeout: Duration,
-    pub limits: ClientLimits,
-}
-
-impl Default for ClientOptions {
-    fn default() -> Self {
-        Self {
-            default_timeout: DEFAULT_TIMEOUT,
-            limits: ClientLimits::default(),
-        }
-    }
-}
-
-impl ClientOptions {
-    fn budget(&self) -> Result<typed::ClientBudget> {
-        deadline_after(self.default_timeout)?;
-        typed::ClientBudget::new(self.limits)
-    }
-}
 
 /// Identity returned by the native gateway, not by a management endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,374 +70,4 @@ pub struct GatewayDescription {
     pub node_id: u128,
     pub node_instance: u64,
     pub node_name: String,
-}
-
-/// Cloneable client for the native clear-TCP development profile.
-///
-/// Clones explicitly share one Channel lifecycle owner, typed budget and terminal state.
-/// A [`GatewayClient`] instead borrows a supplied foundation without adopting it.
-/// Eight admitted typed calls are retained through result transfer/drop; excess
-/// calls fail immediately. Protocol/domain failures do not abort the owner.
-/// Every remote operation accepts an optional whole-operation timeout:
-/// `None` uses [`ClientOptions::default_timeout`], while
-/// `Some(duration)` overrides it for that call. `None` is not an infinite timeout.
-///
-/// ```no_run
-/// use std::time::Duration;
-/// use fube_client::{ClientOptions, FabricClient, DEFAULT_TIMEOUT};
-/// use fube_transport::{channel::MessageChannel, connection::deadline_after};
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let endpoint = FabricClient::endpoint_clear("127.0.0.1:19000".parse().unwrap())?
-///     .connect_timeout(Duration::from_secs(10));
-/// let channel = endpoint.connect().await?;
-/// let client = FabricClient::new(channel.clone(), ClientOptions::default())?;
-/// let cloned = client.clone(); // same typed admission budget, no new handshake
-/// let (gateway, exists) = tokio::try_join!(
-///     client.ping(None),
-///     cloned.name_exists("fabric:/MyApplication", Some(Duration::from_secs(5))),
-/// )?;
-/// channel.close(deadline_after(DEFAULT_TIMEOUT)?).await?; // shared shutdown
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Clone)]
-pub struct FabricClient {
-    channel: Channel,
-    target: Arc<GatewayTarget>,
-    budget: typed::ClientBudget,
-    timeout: Duration,
-}
-
-impl FabricClient {
-    /// Configure an ordinary plain-TCP connection without opening it.
-    ///
-    /// Authorization is installed by connection setup, not by stub binding.
-    pub fn endpoint_clear(address: SocketAddr) -> Result<Endpoint> {
-        Endpoint::unsecured_tcp(address, channel_adapter::ordinary()?)
-    }
-
-    /// Bind locally to an established channel and its original target.
-    ///
-    /// No handshake, application message or permission change occurs. Invalid
-    /// options drop only the consumed handle, never explicitly close retained
-    /// clones. A target sample is not a lasting liveness guarantee.
-    pub fn new(channel: Channel, options: ClientOptions) -> Result<Self> {
-        let budget = options.budget()?;
-        let target = channel.target()?;
-        Ok(Self {
-            channel,
-            target,
-            budget,
-            timeout: options.default_timeout,
-        })
-    }
-
-    /// Resolve on the gateway without retaining endpoint results in this client.
-    pub async fn resolve_service_partition(
-        &self,
-        name: &NamingUri,
-        key: &PartitionKey,
-        previous: Option<&ResolvedServicePartition>,
-        timeout: Option<Duration>,
-    ) -> ClientResult<ResolvedServicePartition> {
-        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
-        self.call(
-            ResolutionRequest::new(name, key, previous).map_err(ClientError::Local)?,
-            CallContext { deadline },
-        )
-        .await
-    }
-
-    /// Discover the native gateway's full node identity.
-    pub async fn ping(&self, timeout: Option<Duration>) -> ClientResult<GatewayDescription> {
-        self.operation(PingRequest, timeout).await
-    }
-
-    /// Test naming-store existence, independently of user-service state.
-    ///
-    /// Supported inputs are literal `fabric:/` followed by nonempty ASCII
-    /// `[A-Za-z0-9_-]+` segments separated by single slashes, at most 4096 bytes.
-    /// Root, authority, escapes, query, fragment, whitespace, Unicode, and
-    /// trailing or repeated slashes are rejected rather than normalized.
-    /// Accepts a [`NamingUri`] or a string checked before sending.
-    pub async fn name_exists(
-        &self,
-        name: impl AsRef<str>,
-        timeout: Option<Duration>,
-    ) -> ClientResult<bool> {
-        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
-        let request = self.name_request(name.as_ref(), NameOperation::Exists, deadline)?;
-        drop(name);
-        match self.call(request, CallContext { deadline }).await? {
-            NameResponse::Exists(exists) => Ok(exists),
-            _ => Err(ClientError::Protocol("unexpected naming result")),
-        }
-    }
-
-    /// Explicitly create a naming entry with one deadline from preparation through decode.
-    ///
-    /// Uses the same supported URI profile as [`Self::name_exists`]. Native
-    /// creation may create implicit ancestors or promote an implicit entry;
-    /// an already explicitly created entry returns a native error.
-    ///
-    /// No retry or replay occurs. After sending, timeout, cancellation or
-    /// disconnection can leave the write outcome unknown: stopping local
-    /// waiting does not prove that the name was not created.
-    pub async fn create_name(
-        &self,
-        name: impl AsRef<str>,
-        timeout: Option<Duration>,
-    ) -> ClientResult<()> {
-        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
-        let request = self.name_request(name.as_ref(), NameOperation::Create, deadline)?;
-        drop(name);
-        self.call(request, CallContext { deadline })
-            .await
-            .map(|_| ())
-    }
-
-    /// Explicitly delete one naming entry with one deadline from preparation through decode.
-    ///
-    /// Uses the same URI profile as [`Self::name_exists`]. This is not recursive:
-    /// native missing-name and nonempty-name failures remain errors. The service
-    /// may also remove empty implicit ancestors.
-    ///
-    /// No retry or replay occurs. After sending, timeout, cancellation or
-    /// disconnection can leave the write outcome unknown; none proves that
-    /// deletion did not execute. Native errors are not converted to success.
-    pub async fn delete_name(
-        &self,
-        name: impl AsRef<str>,
-        timeout: Option<Duration>,
-    ) -> ClientResult<()> {
-        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
-        let request = self.name_request(name.as_ref(), NameOperation::Delete, deadline)?;
-        drop(name);
-        self.call(request, CallContext { deadline })
-            .await
-            .map(|_| ())
-    }
-
-    /// Get one native node page. Inspect `continuation_token` even without an
-    /// explicit page limit: the server can also page by message size.
-    ///
-    /// This is best-effort native aggregation, not a membership snapshot.
-    /// No automatic paging, retry, reconnect or replay occurs.
-    pub async fn get_node_list(
-        &self,
-        query: &NodeQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<NodeListPage> {
-        self.query(query, timeout).await
-    }
-
-    /// Query actual single-node health, events and unhealthy explanations.
-    /// This is not GetNodeList's summary. No paging or automatic retries occur.
-    ///
-    /// Native and malformed domain replies are operation-local; transport
-    /// envelope failures can terminate the channel. See [`NodeHealthQueryDescription`].
-    pub async fn get_node_health(
-        &self,
-        query: &NodeHealthQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<NodeHealth> {
-        self.query(query, timeout).await
-    }
-
-    /// Get one native application page with one whole-operation deadline.
-    /// Filters are mutually exclusive; parameters are included by default.
-    ///
-    /// No retries or automatic traversal. Domain validation errors are local to
-    /// this call; the channel independently owns transport failure policy.
-    pub async fn get_application_list(
-        &self,
-        query: &ApplicationQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<ApplicationListPage> {
-        self.query(query, timeout).await
-    }
-
-    /// Get one ordinary application-scoped service page with one whole-operation deadline.
-    /// Ad-hoc/root and System profiles are explicitly unsupported.
-    ///
-    /// Count is a native per-subquery limit, not a strict CM/FM union cap.
-    pub async fn get_service_list(
-        &self,
-        query: &ServiceQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<ServiceListPage> {
-        self.query(query, timeout).await
-    }
-
-    /// Get one partition page for a service with one whole-operation deadline.
-    /// Results describe observed partition state, not service endpoint resolution.
-    ///
-    /// Native partition paging supports continuation tokens, not MaxResults.
-    /// No automatic paging, retries, reconnect or replay occurs.
-    pub async fn get_partition_list(
-        &self,
-        query: &PartitionQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<PartitionListPage> {
-        self.query(query, timeout).await
-    }
-
-    /// Get one replica or stateless instance page for a partition.
-    /// Callers inspect and follow continuation tokens within their own overall budget.
-    ///
-    /// Native replica paging supports continuation tokens, not MaxResults.
-    /// No automatic paging, retries, reconnect or replay occurs.
-    pub async fn get_replica_list(
-        &self,
-        query: &ReplicaQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<ReplicaListPage> {
-        self.query(query, timeout).await
-    }
-
-    /// Get one deployed application page on a selected node.
-    /// This is node-local deployment state, not the cluster-wide application list.
-    ///
-    /// No automatic paging, retries, reconnect or replay occurs.
-    pub async fn get_deployed_application_list(
-        &self,
-        query: &DeployedApplicationQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<DeployedApplicationListPage> {
-        self.query(query, timeout).await
-    }
-
-    /// List service packages deployed for one application on a selected node.
-    /// This native query is unpaged and does not provide a cluster snapshot.
-    ///
-    /// No automatic retries, reconnect or replay occurs.
-    pub async fn get_deployed_service_package_list(
-        &self,
-        query: &DeployedServicePackageQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<Vec<DeployedServicePackage>> {
-        self.query(query, timeout).await
-    }
-
-    /// List code packages deployed for one application on a selected node.
-    /// Includes setup/main entry points, statistics and host details; no paging.
-    ///
-    /// Native errors and malformed domain successes remain operation-local.
-    pub async fn get_deployed_code_package_list(
-        &self,
-        query: &DeployedCodePackageQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<Vec<DeployedCodePackage>> {
-        self.query(query, timeout).await
-    }
-
-    /// List replicas or stateless instances deployed on one node for an application.
-    /// Includes activation, host and reconfiguration details; not endpoint resolution.
-    ///
-    /// No paging, automatic retries, reconnect or replay occurs.
-    pub async fn get_deployed_replica_list(
-        &self,
-        query: &DeployedReplicaQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<Vec<DeployedReplica>> {
-        self.query(query, timeout).await
-    }
-
-    /// Close the shared connection and wait for the background driver to exit.
-    /// Dropping one clone does not close the other handles.
-    pub async fn close(&self) -> Result<()> {
-        self.channel.close(self.deadline(None)?).await
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.channel.terminal_error().is_some()
-    }
-
-    /// The first terminal connection cause, including failures detected idle.
-    pub fn terminal_error(&self) -> Option<Error> {
-        self.channel.terminal_error()
-    }
-
-    /// Ask native FM to move a partition's Primary to an explicit node while
-    /// enforcing placement constraints. There is deliberately no force/ignore
-    /// option. Observe placement/discovery separately; this is not an atomic
-    /// cluster snapshot or an application-side membership authority.
-    pub async fn move_primary(
-        &self,
-        partition: Uuid,
-        target_node: &str,
-        timeout: Option<Duration>,
-    ) -> ClientResult<()> {
-        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
-        query_arguments::validate_node_name(
-            target_node,
-            "primary target must be an explicit native node",
-        )
-        .map_err(ClientError::Local)?;
-        self.call(
-            QueryDescription::new(movement::MovePrimary {
-                partition,
-                target: target_node.to_owned(),
-            }),
-            CallContext { deadline },
-        )
-        .await
-    }
-
-    fn deadline(&self, timeout: Option<Duration>) -> Result<Instant> {
-        deadline_after(timeout.unwrap_or(self.timeout))
-    }
-
-    async fn query<Q: ClientRequest<DomainError = DomainFailure> + Clone>(
-        &self,
-        query: &Q,
-        timeout: Option<Duration>,
-    ) -> ClientResult<Q::Response> {
-        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
-        typed::check_input(query).map_err(ClientError::Local)?;
-        self.call(query.clone(), CallContext { deadline }).await
-    }
-
-    async fn operation<R: ClientRequest<DomainError = DomainFailure>>(
-        &self,
-        request: R,
-        timeout: Option<Duration>,
-    ) -> ClientResult<R::Response> {
-        self.call(
-            request,
-            CallContext {
-                deadline: self.deadline(timeout).map_err(ClientError::Local)?,
-            },
-        )
-        .await
-    }
-
-    fn name_request(
-        &self,
-        name: &str,
-        operation: NameOperation,
-        deadline: Instant,
-    ) -> ClientResult<NameRequest> {
-        typed::check_deadline(deadline).map_err(ClientError::Local)?;
-        let name = NamingUri::parse(name).map_err(ClientError::Local)?;
-        Ok(NameRequest { name, operation })
-    }
-}
-
-impl Client for FabricClient {
-    type Channel = Channel;
-    fn binding(&self) -> ClientBinding<'_, Channel> {
-        ClientBinding {
-            channel: &self.channel,
-            target: &self.target,
-        }
-    }
-    fn call<'a, R: ClientRequest>(
-        &'a self,
-        request: R,
-        context: CallContext,
-    ) -> ClientFuture<'a, R::Response, R::DomainError> {
-        typed::call(self.binding(), &self.budget, request, context)
-    }
 }

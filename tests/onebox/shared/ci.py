@@ -7,6 +7,8 @@ the caller's original capability, including when input validation has failed.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+from decimal import Decimal
 import hashlib
 import json
 import math
@@ -33,11 +35,6 @@ ONEBOX_SUITES = {name: suite for name, suite in suites.MANIFEST.suites.items()
 FIXTURE_PHASES = ("validate", "create", "ready", "suites", "diagnostics", "destroy")
 NATIVE_FILES = tuple(Path(report).name for suite in ONEBOX_SUITES.values()
                      if suite["kind"] == "nextest" for report in suite["reports"])
-CLEAR_CASES = (
-    "native_ping", "native_name_exists_existing", "native_name_exists_absent",
-    "native_concurrent_mixed", "clone_drop_preserves_original_connection",
-    "explicit_close", "test_owned_proxy_idle_disconnect",
-)
 HEALTH_CASES = (
     "healthy", "inherited", "false-omitted", "true-omitted", "default", "all", "none",
     "ok", "warning", "error-false", "combined", "error-true", "warning-true",
@@ -1320,6 +1317,18 @@ def validate_native_movement(lists, owner):
             and move.get("request") == {"operation": "MovePrimary", "constraints": "enforced",
                                        "count": 1, "native_succeeded": True},
             "native movement requires one successful constraint-enforced request")
+    furpc = move.get("furpc")
+    reads = lists.get("furpc")
+    require(type(reads) is dict and integer(reads.get("generation"), 1)
+            and type(furpc) is dict and integer(furpc.get("generation"), 1)
+            and furpc["generation"] == reads["generation"]
+            and type(furpc.get("request_generation")) is int
+            and furpc["request_generation"] == furpc["generation"],
+            "MovePrimary must use the original furpc generation")
+    true_fields(furpc, ("same_generation_after_move",))
+    require(type(furpc.get("mixed_concurrent_operations")) is int
+            and furpc["mixed_concurrent_operations"] == 3,
+            "furpc movement mixed-operation reuse")
     node = move.get("target_node_observation")
     require(type(node) is dict and node.get("Name") == target and node.get("NodeStatus") == "Up",
             "native movement existing target node must be Up")
@@ -1421,6 +1430,703 @@ def validate_notification_retry(retry):
             "fresh native retry ID for dropped target and exactly correlated success ACK")
 
 
+def validate_furpc_management(clear):
+    value = clear.get("furpc_management")
+    require(type(value) is dict and value.get("existing_name") is True
+            and value.get("absent_name") is False, "furpc independently observed naming results")
+    true_fields(value, ("stable_fields_match_http", "exact_name_and_status_filters",
+                        "same_generation_after_error", "mixed_results_match"))
+    require(type(value.get("mixed_concurrent_operations")) is int
+            and value["mixed_concurrent_operations"] == 3 and integer(value.get("generation"), 1),
+            "three mixed furpc operations on the original native generation")
+    require(type(value.get("native_error_code")) is int
+            and value["native_error_code"] in (-2147024809, -2147017462)
+            and value.get("native_error_origin") in ("domain", "native_fault"),
+            "furpc malformed continuation must retain its native error")
+    lengths = value.get("page_lengths")
+    require(type(lengths) is list and all(type(n) is int and 1 <= n <= 2 for n in lengths)
+            and sum(lengths) == 5 and type(value.get("server_token_count")) is int
+            and value["server_token_count"] == len(lengths) - 1 >= 1,
+            "furpc must follow real server paging across five nodes")
+
+    def identity(node):
+        require(type(node) is dict and text(node.get("name"))
+                and type(node.get("node_id")) is str
+                and re.fullmatch(r"[a-fA-F0-9]{1,32}", node["node_id"])
+                and integer(node.get("node_instance")) and node["node_instance"] <= 0xffffffffffffffff,
+                "furpc complete native node identity")
+        return node["name"], int(node["node_id"], 16), node["node_instance"]
+
+    native = value.get("native_nodes")
+    require(type(native) is list and len(native) == 5, "furpc five-node observations required")
+    actual = [identity(node) for node in native]
+    require(len({node[0] for node in actual}) == 5
+            and len({node[1] for node in actual}) == 5,
+            "furpc node identities must not contain duplicates")
+    observed = clear["node_list"].get("independent_nodes")
+    require(type(observed) is list and len(observed) == 5, "independent HTTP five-node identities")
+    independent = []
+    for node in observed:
+        require(type(node) is dict and type(node.get("Id")) is dict
+                and type(node.get("InstanceId")) is str
+                and re.fullmatch(r"[0-9]{1,20}", node["InstanceId"]),
+                "independent HTTP node identity fields")
+        independent.append(identity({
+            "name": node.get("Name"), "node_id": node["Id"].get("Id"),
+            "node_instance": int(node["InstanceId"]),
+        }))
+    require(set(actual) == set(independent), "furpc nodes must match independent HTTP identities")
+    require(identity({
+        "name": clear["gateway"].get("node_name"),
+        "node_id": clear["gateway"].get("node_id"),
+        "node_instance": clear["gateway"].get("node_instance"),
+    }) in actual, "furpc gateway must belong to the independently observed node set")
+    require(all(integer(value.get(key), 1) for key in
+                ("native_observation_start_unix_ms", "native_observation_end_unix_ms")),
+            "furpc native observation timestamps must be integer milliseconds")
+    return [stamp / 1000 for stamp in interval(
+        value, "native_observation_start_unix_ms", "native_observation_end_unix_ms")]
+
+
+def validate_furpc_lists(lists):
+    value = lists.get("furpc")
+    require(type(value) is dict and integer(value.get("generation"), 1),
+            "furpc native list generation required")
+    true_fields(value, ("filters_and_parameter_exclusion", "typed_fields_match_http",
+                        "same_generation_after_error"))
+    require(type(value.get("mixed_concurrent_operations")) is int
+            and value["mixed_concurrent_operations"] == 3,
+            "three mixed furpc list operations")
+    require(type(value.get("native_missing_application_code")) is int
+            and value["native_missing_application_code"] == -2147017763
+            and value["native_missing_application_code"] == lists.get("native_missing_application_code")
+            and value.get("native_error_origin") in ("domain", "native_fault"),
+            "furpc missing application must retain the independent native error")
+    pages = [value.get("application_page_lengths")]
+    services = value.get("service_page_lengths")
+    require(type(services) is list and len(services) == 2, "furpc service paging per owned application")
+    pages.extend(services)
+    require(all(type(page) is list and page == [1, 1]
+                and all(type(count) is int for count in page) for page in pages),
+            "furpc must follow real application and service continuations")
+    for key, count in (("applications", 2), ("services", 4)):
+        actual = lists.get("native_" + key)
+        independent = lists.get("independent_" + key)
+        require(type(actual) is list and type(independent) is list
+                and len(actual) == len(independent) == count,
+                "nonempty furpc and independent HTTP list observations")
+        for records, name in ((actual, "name"), (independent, "Name")):
+            require(all(type(record) is dict and text(record.get(name)) for record in records)
+                    and len({record[name] for record in records}) == count,
+                    "distinct observed native list identities")
+        require({record["name"] for record in actual} == {record["Name"] for record in independent},
+                "furpc list identities must match independent HTTP")
+        fields = ({"type_name": "TypeName", "type_version": "TypeVersion", "status": "Status",
+                   "health_state": "HealthState"} if key == "applications" else
+                  {"type_name": "TypeName", "manifest_version": "ManifestVersion",
+                   "kind": "ServiceKind", "status": "ServiceStatus", "health_state": "HealthState",
+                   "is_service_group": "IsServiceGroup"})
+        for record in actual:
+            observed = next(item for item in independent if item["Name"] == record["name"])
+            require(all(local in record and remote in observed and same(record[local], observed[remote])
+                        for local, remote in fields.items()), "typed list fields must match HTTP")
+            if key == "applications":
+                parameters = observed.get("Parameters")
+                require(type(parameters) is list
+                        and all(type(pair) is dict and type(pair.get("Key")) is str
+                                and type(pair.get("Value")) is str for pair in parameters)
+                        and len({pair["Key"] for pair in parameters}) == len(parameters)
+                        and same(record.get("parameters"), {pair["Key"]: pair["Value"] for pair in parameters})
+                        and record.get("definition_kind") == "ServiceFabricApplicationDescription",
+                        "native application parameter map and source-derived definition kind")
+            else:
+                require(type(record.get("has_persisted_state")) is bool
+                        and (record["has_persisted_state"] is False if record["kind"] == "Stateless"
+                             else same(record["has_persisted_state"], observed.get("HasPersistedState"))),
+                        "native service persistence must match its kind and HTTP")
+    require(all(integer(value.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+            "furpc native list observation timestamps")
+    return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
+
+
+def validate_furpc_topology(lists):
+    topology = lists.get("topology")
+    require(type(topology) is dict, "furpc topology observations required")
+    value = topology.get("furpc")
+    require(type(value) is dict and integer(value.get("generation"), 1)
+            and value["generation"] == lists["furpc"]["generation"],
+            "furpc topology must reuse the list client's generation")
+    true_fields(value, ("same_generation_after_error",))
+    require(type(value.get("mixed_concurrent_operations")) is int
+            and value["mixed_concurrent_operations"] == 3,
+            "three concurrent furpc partition/replica/Ping operations")
+    require(type(topology.get("native_missing_partition_code")) is int
+            and topology["native_missing_partition_code"] == -2147017753
+            and value.get("native_error_origin") in ("domain", "native_fault"),
+            "furpc missing partition must retain its native error")
+    true_fields(topology, ("exact_partition_replica_application_selectors", "ready_replica_status_filter",
+                          "raw_native_epoch_not_compared_to_rest_projection"))
+
+    def signed(value):
+        require(type(value) is int or (type(value) is str and re.fullmatch(r"-?[0-9]{1,20}", value)),
+                "independent topology integer")
+        result = int(value)
+        require(-(2**63) <= result < 2**63, "independent topology signed native width")
+        return result
+
+    def numeric(actual, expected):
+        require(type(actual) is int and actual == signed(expected),
+                "native topology numeric field must match HTTP")
+
+    def matches(actual, observed, fields):
+        require(type(actual) is dict and type(observed) is dict, "native/HTTP topology records")
+        require(all(type(actual.get(local)) is str and type(observed.get(remote)) is str
+                    and actual[local] == observed[remote] for local, remote in fields.items()),
+                "native topology fields must match HTTP")
+
+    observations = topology.get("independent_partition_replicas")
+    require(type(observations) is list and len(observations) == 6,
+            "six owned native/HTTP partitions required")
+    identities, service_partitions, replica_count = set(), {}, 0
+    for observation in observations:
+        require(type(observation) is dict and observation.get("service") in
+                {service["name"] for service in lists["native_services"]},
+                "topology must belong to an independently corroborated owned service")
+        native, observed = observation.get("native_partition"), observation.get("partition")
+        matches(native, observed, {"kind": "ServiceKind", "status": "PartitionStatus",
+                                   "health_state": "HealthState"})
+        information, independent = native.get("information"), observed.get("PartitionInformation")
+        matches(information, independent, {"id": "Id", "kind": "ServicePartitionKind"})
+        identity = information["id"]
+        require(re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", identity)
+                and identity not in identities, "unique native partition identities")
+        identities.add(identity)
+        kind = information["kind"]
+        require(kind in ("Singleton", "Int64Range", "Named"), "supported native partition key kind")
+        if kind == "Named":
+            matches(information, independent, {"name": "Name"})
+        elif kind == "Int64Range":
+            numeric(information.get("low_key"), independent.get("LowKey"))
+            numeric(information.get("high_key"), independent.get("HighKey"))
+            require(information["low_key"] <= information["high_key"], "ordered partition key range")
+        require(native["kind"] in ("Stateful", "Stateless"), "supported native partition service kind")
+        service = next(item for item in lists["native_services"] if item["name"] == observation["service"])
+        require(native["kind"] == service["kind"], "partition and owned service kinds must agree")
+        service_partitions[observation["service"]] = service_partitions.get(observation["service"], 0) + 1
+        fields = ({"instance_count": "InstanceCount"} if native["kind"] == "Stateless" else
+                  {"target_replica_set_size": "TargetReplicaSetSize", "min_replica_set_size": "MinReplicaSetSize",
+                   "last_quorum_loss_duration_in_seconds": "LastQuorumLossDurationInSeconds"})
+        for local, remote in fields.items():
+            numeric(native.get(local), observed.get(remote))
+        replicas, independent_replicas = observation.get("native_replicas"), observation.get("replicas")
+        require(type(replicas) is list and type(independent_replicas) is list
+                and len(replicas) == len(independent_replicas) > 0, "nonempty native/HTTP replica sets")
+        by_id = {}
+        for replica in independent_replicas:
+            require(type(replica) is dict and replica.get("ServiceKind") == native["kind"],
+                    "independent replica kind must match its partition")
+            identity = signed(replica.get("ReplicaId" if native["kind"] == "Stateful" else "InstanceId"))
+            require(identity not in by_id, "distinct independent replica identities")
+            by_id[identity] = replica
+        seen = set()
+        for replica in replicas:
+            require(type(replica) is dict and type(replica.get("id")) is int
+                    and replica["id"] in by_id and replica["id"] not in seen,
+                    "distinct native replica identities must match HTTP")
+            seen.add(replica["id"])
+            independent = by_id[replica["id"]]
+            fields = {"kind": "ServiceKind", "status": "ReplicaStatus", "health_state": "HealthState",
+                      "node_name": "NodeName", "address": "Address"}
+            if native["kind"] == "Stateful":
+                fields["role"] = "ReplicaRole"
+            matches(replica, independent, fields)
+            numeric(replica.get("last_in_build_duration_in_seconds"), independent.get("LastInBuildDurationInSeconds"))
+        replica_count += len(replicas)
+    require(service_partitions == {service["name"]: 2 if service["kind"] == "Stateful" else 1
+                                   for service in lists["native_services"]}
+            and type(topology.get("partition_count")) is int and topology["partition_count"] == 6
+            and type(topology.get("replica_instance_count")) is int
+            and topology["replica_instance_count"] == replica_count == 22,
+            "complete owned topology inventory")
+    require(all(integer(value.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+            "furpc native topology observation timestamps")
+    return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
+
+
+def validate_furpc_deployments(lists):
+    deployment, topology = lists.get("deployment_inspection"), lists.get("topology")
+    require(type(deployment) is dict and type(topology) is dict, "native deployment observations")
+    value = deployment.get("furpc")
+    require(type(value) is dict and integer(value.get("generation"), 1)
+            and value["generation"] == lists["furpc"]["generation"], "original furpc deployment generation")
+    true_fields(value, ("same_generation_after_error",))
+    require(type(value.get("mixed_concurrent_operations")) is int and value["mixed_concurrent_operations"] == 3,
+            "three mixed furpc deployment calls")
+    true_fields(deployment, ("service_manifest_selectors", "code_package_and_partition_selectors",
+                             "stateful_and_stateless", "mixed_shared_native_connection", "reuse_after_native_errors",
+                             "statistics_rest_activation_exit_labels_swapped"))
+    true_fields(topology, ("deployment_native_continuation_followed", "deployed_health_requested_and_omitted"))
+    codes = deployment.get("native_missing_node_codes")
+    origins = deployment.get("native_error_origins")
+    require(type(codes) is list and len(codes) == 3
+            and all(type(code) is int and code == -2147017795 for code in codes)
+            and type(origins) is list and len(origins) == 3
+            and all(origin in ("domain", "native_fault") for origin in origins)
+            and type(topology.get("native_missing_deployment_node_code")) is int
+            and topology["native_missing_deployment_node_code"] == -2147017795
+            and topology.get("deployed_application_native_error_origin") in ("domain", "native_fault"),
+            "all four deployment queries must retain native missing-node errors")
+
+    def equal(native, observed, fields):
+        require(type(native) is dict and type(observed) is dict
+                and all(local in native and remote in observed and same(native[local], observed[remote])
+                        for local, remote in fields.items()), "native deployment fields must match HTTP")
+
+    def numeric(actual, expected):
+        require(type(actual) is int and -(2**63) <= actual < 2**63
+                and (type(expected) is int or (type(expected) is str and re.fullmatch(r"-?[0-9]{1,20}", expected)))
+                and actual == int(expected), "native deployment integer must match HTTP")
+
+    def scalar(actual, expected, names):
+        require(type(actual) is int and actual in names and type(expected) is str
+                and expected == names[actual], "native deployment enum must match HTTP")
+
+    def timestamp(actual, expected):
+        require(type(actual) is int and -(2**63) <= actual < 2**63
+                and type(expected) is str and len(expected) <= 64, "native deployment timestamp")
+        if expected == "0001-01-01T00:00:00.000Z":
+            require(actual == 0, "native default timestamp")
+            return
+        try:
+            stamp = datetime.fromisoformat(expected.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ProofError("invalid independent deployment timestamp") from error
+        require(stamp.tzinfo is not None, "independent deployment timestamp timezone")
+        delta = stamp - datetime(1601, 1, 1, tzinfo=timezone.utc)
+        ticks = (delta.days * 86400 + delta.seconds) * 10_000_000 + delta.microseconds * 10
+        require(abs(actual - ticks) < 10_000, "native deployment timestamp must match HTTP within 1 ms")
+
+    statuses = {0: "Invalid", 1: "Downloading", 2: "Activating", 3: "Active", 4: "Upgrading", 5: "Deactivating"}
+    roles = {0: "Unknown", 1: "None", 2: "Primary", 3: "IdleSecondary", 4: "ActiveSecondary"}
+
+    def records(native, observed, local_keys, remote_keys):
+        require(type(native) is list and type(observed) is list and len(native) == len(observed) > 0
+                and all(type(record) is dict and all(key in record for key in local_keys) for record in native)
+                and all(type(record) is dict and all(key in record for key in remote_keys) for record in observed),
+                "nonempty typed deployment records and independent HTTP")
+        actual = {tuple(record[key] for key in local_keys): record for record in native}
+        independent = {tuple(record[key] for key in remote_keys): record for record in observed}
+        require(len(actual) == len(independent) == len(native) and actual.keys() == independent.keys(),
+                "unique native deployment identities must match HTTP")
+        return [(record, independent[key]) for key, record in actual.items()]
+
+    applications = topology.get("independent_deployments")
+    require(type(applications) is list and len(applications) == 5
+            and {entry.get("node") for entry in applications} == {f"N00{i}0" for i in range(1, 6)},
+            "five independently observed deployment nodes")
+    for entry in applications:
+        pairs = records(entry.get("native_applications"), entry.get("applications"), ("name",), ("Name",))
+        require(set(lists["owned_applications"]) <= {native["name"] for native, _ in pairs},
+                "both owned applications must be deployed on every node")
+        for native, observed in pairs:
+            equal(native, observed, {"name": "Name", "type_name": "TypeName", "work_directory": "WorkDirectory",
+                                      "log_directory": "LogDirectory", "temp_directory": "TempDirectory"})
+            scalar(native.get("status"), observed.get("Status"), statuses)
+            scalar(native.get("health_state"), observed.get("HealthState"),
+                   {0: "Invalid", 1: "Ok", 2: "Warning", 3: "Error", 65535: "Unknown"})
+
+    def entry_point(native, observed):
+        equal(native, observed, {"entry_point_location": "EntryPointLocation", "run_as_user_name": "RunAsUserName"})
+        for local, remote in (("process_id", "ProcessId"), ("instance_id", "InstanceId")):
+            numeric(native.get(local), observed.get(remote))
+        scalar(native.get("status"), observed.get("Status"),
+               {0: "Invalid", 1: "Pending", 2: "Starting", 3: "Started", 4: "Stopping", 5: "Stopped"})
+        timestamp(native.get("next_activation_time"), observed.get("NextActivationTime"))
+        stats, independent = native.get("statistics"), observed.get("CodePackageEntryPointStatistics")
+        require(type(stats) is dict and type(independent) is dict, "complete entry-point statistics")
+        for local, remote in (("last_exit_code", "LastExitCode"), ("activation_failure_count", "ActivationFailureCount"),
+                              ("continuous_activation_failure_count", "ContinuousActivationFailureCount"),
+                              ("exit_failure_count", "ExitFailureCount"), ("continuous_exit_failure_count", "ContinuousExitFailureCount"),
+                              ("activation_count", "ActivationCount"), ("exit_count", "ExitCount")):
+            numeric(stats.get(local), independent.get(remote))
+        for local, remote in (("last_activation_time", "LastExitTime"), ("last_exit_time", "LastActivationTime"),
+                              ("last_successful_activation_time", "LastSuccessfulActivationTime"),
+                              ("last_successful_exit_time", "LastSuccessfulExitTime")):
+            timestamp(stats.get(local), independent.get(remote))
+
+    observations = deployment.get("observations")
+    require(type(observations) is list and len(observations) == 10
+            and {(entry.get("node"), entry.get("application")) for entry in observations} ==
+                {(entry["node"], app) for entry in applications for app in lists["owned_applications"]},
+            "all ten owned node/application deployment observations")
+    counts = [0, 0, 0]
+    for entry in observations:
+        for native, observed in records(entry.get("native_service_packages"), entry.get("service_packages"),
+                ("service_manifest_name", "service_package_activation_id"), ("Name", "ServicePackageActivationId")):
+            equal(native, observed, {"service_manifest_version": "Version"})
+            scalar(native.get("status"), observed.get("Status"), statuses)
+            counts[0] += 1
+        for native, observed in records(entry.get("native_code_packages"), entry.get("code_packages"),
+                ("name", "service_manifest_name", "service_package_activation_id"),
+                ("Name", "ServiceManifestName", "ServicePackageActivationId")):
+            equal(native, observed, {"version": "Version", "has_setup_entry_point": "HasSetupEntryPoint"})
+            require(type(native["has_setup_entry_point"]) is bool, "native setup flag")
+            scalar(native.get("status"), observed.get("Status"), statuses)
+            numeric(native.get("run_frequency_interval"), observed.get("RunFrequencyInterval"))
+            scalar(native.get("host_type"), observed.get("HostType"), {0: "Invalid", 1: "ExeHost", 2: "ContainerHost"})
+            scalar(native.get("host_isolation_mode"), observed.get("HostIsolationMode"), {0: "None", 1: "Process", 2: "HyperV"})
+            for local, remote in (("setup_entry_point", "SetupEntryPoint"), ("main_entry_point", "MainEntryPoint")):
+                entry_point(native.get(local), observed.get(remote))
+            counts[1] += 1
+        native_replicas, independent = entry.get("native_replicas"), entry.get("replicas")
+        require(type(native_replicas) is list and type(independent) is list, "deployed replica observations")
+        for replica in independent:
+            require(type(replica) is dict and replica.get("ServiceKind") in ("Stateful", "Stateless"),
+                    "independent deployed replica kind")
+        normalized = [{**replica, "identity": str(replica.get("ReplicaId" if replica["ServiceKind"] == "Stateful" else "InstanceId"))}
+                      for replica in independent]
+        actual = [{**replica, "identity": str(replica.get("replica_id" if replica.get("kind") == 2 else "instance_id"))}
+                  for replica in native_replicas]
+        for native, observed in records(actual, normalized, ("partition_id", "identity"), ("PartitionId", "identity")):
+            equal(native, observed, {"service_name": "ServiceName", "service_type_name": "ServiceTypeName",
+                "service_manifest_version": "ServiceManifestVersion", "code_package_name": "CodePackageName",
+                "address": "Address", "service_manifest_name": "ServiceManifestName",
+                "service_package_activation_id": "ServicePackageActivationId"})
+            require(native["service_name"].startswith(entry["application"] + "/"), "owned deployed replica")
+            scalar(native.get("kind"), observed.get("ServiceKind"), {1: "Stateless", 2: "Stateful"})
+            numeric(native.get("replica_id" if native["kind"] == 2 else "instance_id"),
+                    observed.get("ReplicaId" if native["kind"] == 2 else "InstanceId"))
+            scalar(native.get("replica_status"), observed.get("ReplicaStatus"),
+                   {0: "Invalid", 1: "InBuild", 2: "Standby", 3: "Ready", 4: "Down", 5: "Dropped"})
+            numeric(native.get("host_process_id"), observed.get("HostProcessId"))
+            if native["kind"] == 2:
+                scalar(native.get("replica_role"), observed.get("ReplicaRole"), roles)
+                info, remote = native.get("reconfiguration_information"), observed.get("ReconfigurationInformation")
+                require(type(info) is dict and type(remote) is dict, "stateful reconfiguration information")
+                scalar(info.get("previous_configuration_role"), remote.get("PreviousConfigurationRole"), roles)
+                scalar(info.get("reconfiguration_phase"), remote.get("ReconfigurationPhase"),
+                       {0: "Invalid", 1: "None", 2: "Zero", 3: "One", 4: "Two", 5: "Three", 6: "Four", 7: "AbortPhaseZero"})
+                scalar(info.get("reconfiguration_type"), remote.get("ReconfigurationType"),
+                       {0: "Invalid", 1: "SwapPrimary", 2: "Failover", 3: "Other", 4: "None"})
+                timestamp(info.get("reconfiguration_start_time_utc"), remote.get("ReconfigurationStartTimeUtc"))
+            counts[2] += 1
+    require(counts == [10, 10, 22] and all(type(deployment.get(key)) is int and deployment[key] == count
+            for key, count in zip(("service_package_count", "code_package_count", "replica_count"), counts)),
+            "complete native deployment inventory")
+    require(all(integer(value.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+            "furpc deployment observation timestamps")
+    return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
+
+
+def health_against_http(native, observed, end_ms):
+    states = {"Invalid": 0, "Ok": 1, "Warning": 2, "Error": 3, "Unknown": 65535}
+
+    def state(actual, expected):
+        require(type(actual) is int and type(expected) is str
+                and expected in states and actual == states[expected],
+                "native health scalar must match independent HTTP")
+
+    def event(actual, expected):
+        require(type(actual) is dict and type(expected) is dict, "native and HTTP health events")
+        for local, remote in (("source_id", "SourceId"), ("property", "Property"),
+                              ("description", "Description"), ("sequence_number", "SequenceNumber"),
+                              ("is_expired", "IsExpired"), ("remove_when_expired", "RemoveWhenExpired")):
+            require(local in actual and remote in expected and same(actual[local], expected[remote]),
+                    "native health event fields must match HTTP")
+        state(actual.get("health_state"), expected.get("HealthState"))
+        ttl = expected.get("TimeToLiveInMilliSeconds")
+        require(type(ttl) is str and 0 < len(ttl) <= 128, "HTTP event TTL required")
+        duration = re.fullmatch(r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?", ttl)
+        require((duration is not None and any(duration.groups()))
+                or re.fullmatch(r"[0-9]+", ttl) is not None, "HTTP event TTL format")
+        if duration:
+            days, hours, minutes, seconds = (Decimal(part or "0") for part in duration.groups())
+            ticks = int((days * 86400 + hours * 3600 + minutes * 60 + seconds) * 10_000_000)
+        else:
+            ticks = int(ttl) * 10_000
+        require(0 <= ticks <= 2**63 - 1 and actual.get("time_to_live_ticks") == str(ticks),
+                "native event TTL ticks")
+        epoch = datetime(1601, 1, 1, tzinfo=timezone.utc)
+        for local, remote in (("source_utc_timestamp", "SourceUtcTimestamp"),
+                              ("last_modified_utc_timestamp", "LastModifiedUtcTimestamp"),
+                              ("last_ok_transition_at", "LastOkTransitionAt"),
+                              ("last_warning_transition_at", "LastWarningTransitionAt"),
+                              ("last_error_transition_at", "LastErrorTransitionAt")):
+            stamp = expected.get(remote)
+            raw = actual.get(local)
+            require(type(stamp) is str and len(stamp) <= 64
+                    and type(raw) is str and len(raw) <= 20 and re.fullmatch(r"-?[0-9]+", raw)
+                    and -(2**63) <= int(raw) < 2**63,
+                    "native and independent health timestamps required")
+            if stamp.startswith("0001-01-01T00:00:00"):
+                require(int(raw) == 0, "native default timestamp")
+                continue
+            try:
+                date = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ProofError("invalid independent health timestamp") from error
+            require(date.tzinfo is not None, "independent health timestamp timezone")
+            delta = date - epoch
+            ticks = (delta.days * 86400 + delta.seconds) * 10_000_000 + delta.microseconds * 10
+            require(abs(int(raw) - ticks) < 10_000
+                    or (local == "last_modified_utc_timestamp" and ticks > 0
+                        and ticks <= int(raw) <= (end_ms + 11644473600000) * 10_000 + 10_000),
+                    "native health timestamps must match their independent observation window")
+
+    require(type(native) is dict and type(observed) is dict
+            and native.get("node_name") == observed.get("Name") and text(native.get("node_name")),
+            "native health node identity must match HTTP")
+    state(native.get("aggregated_health_state"), observed.get("AggregatedHealthState"))
+    events, expected_events = native.get("health_events"), observed.get("HealthEvents")
+    require(type(events) is list and type(expected_events) is list and len(events) == len(expected_events),
+            "native health event inventory must match HTTP")
+    require(all(type(item) is dict and type(item.get("SourceId")) is str
+                and type(item.get("Property")) is str for item in expected_events),
+            "independent HTTP health event identities")
+    expected_by_id = {(item["SourceId"], item["Property"]): item for item in expected_events}
+    require(len(expected_by_id) == len(expected_events), "distinct HTTP health event identities")
+    seen = set()
+    for actual in events:
+        require(type(actual) is dict and type(actual.get("source_id")) is str
+                and type(actual.get("property")) is str, "typed native health event")
+        identity = actual.get("source_id"), actual.get("property")
+        require(identity in expected_by_id and identity not in seen, "distinct native health events")
+        seen.add(identity)
+        event(actual, expected_by_id[identity])
+    evaluations, expected_evaluations = native.get("unhealthy_evaluations"), observed.get("UnhealthyEvaluations")
+    require(type(evaluations) is list and type(expected_evaluations) is list
+            and len(evaluations) == len(expected_evaluations), "native health evaluation inventory")
+    for actual, expected in zip(evaluations, expected_evaluations):
+        require(type(actual) is dict and type(expected) is dict
+                and type(expected.get("HealthEvaluation")) is dict, "HTTP event evaluation wrapper")
+        expected = expected["HealthEvaluation"]
+        require(actual.get("kind") == expected.get("Kind") == "Event"
+                and actual.get("description") == expected.get("Description")
+                and type(actual.get("consider_warning_as_error")) is bool
+                and same(actual["consider_warning_as_error"], expected.get("ConsiderWarningAsError")),
+                "native event evaluation must match HTTP")
+        state(actual.get("aggregated_health_state"), expected.get("AggregatedHealthState"))
+        event(actual.get("unhealthy_event"), expected.get("UnhealthyEvent"))
+
+
+def validate_furpc_health(health):
+    value = health
+    require(type(value) is dict and integer(value.get("generation"), 1),
+            "furpc native health generation required")
+    true_fields(value, ("same_generation_after_error",))
+    require(type(value.get("concurrent_operations")) is int
+            and value["concurrent_operations"] == 3
+            and type(value.get("unknown_node_code")) is int
+            and value["unknown_node_code"] == -2147017705
+            and value.get("native_error_origin") in ("domain", "native_fault"),
+            "furpc native health error and mixed-operation evidence")
+    cases = value.get("cases")
+    require(type(cases) is list and all(type(case) is dict for case in cases)
+            and [case.get("case") for case in cases] == list(HEALTH_CASES),
+            "furpc native health policy/filter case inventory")
+    windows = {}
+    for actual in cases:
+        require(all(integer(actual.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+                "furpc health observation timestamps")
+        expected = actual.get("expected")
+        require(type(expected) is dict and expected.get("label") == actual["case"]
+                and type(expected.get("health")) is dict
+                and integer(expected.get("start_ms"), 1) and integer(expected.get("end_ms"), 1)
+                and expected["start_ms"] <= expected["end_ms"] <= actual["native_start_ms"]
+                and actual["native_end_ms"] - expected["start_ms"] <= 120_000,
+                "fresh independent HTTP health snapshot")
+        health_against_http(actual.get("native"), expected["health"], actual["native_end_ms"])
+        windows["furpc_health/" + actual["case"]] = [
+            stamp / 1000 for stamp in interval(actual, "native_start_ms", "native_end_ms")]
+    require(integer(health.get("completed_at_unix_ms"), 1), "health completion endpoint")
+    for field in ("healthy_reuse_after_error", "final_healthy_reuse"):
+        health_against_http(value.get(field), cases[0]["expected"]["health"], health["completed_at_unix_ms"])
+        require(value[field]["aggregated_health_state"] == 1, "independently healthy native reuse")
+    return windows
+
+
+def validate_furpc_names(name):
+    true_fields(name, ("initial_http_absent", "native_create_succeeded", "http_present_after_create",
+                      "reuse_after_duplicate", "native_delete_succeeded", "http_absent_after_delete",
+                      "reuse_after_missing", "writes_share_native_client", "owned_cleanup_confirmed"))
+    require(type(name.get("duplicate_create_code")) is int and name["duplicate_create_code"] == -2147017792
+            and type(name.get("missing_delete_code")) is int and name["missing_delete_code"] == -2147017791,
+            "native name negative error codes")
+    value = name.get("furpc")
+    require(type(value) is dict and integer(value.get("generation"), 1),
+            "furpc native naming generation required")
+    true_fields(value, ("same_generation_after_error", "http_present_after_create"))
+    require(type(value.get("mixed_concurrent_operations")) is int
+            and value["mixed_concurrent_operations"] == 3
+            and value.get("duplicate_error_origin") in ("domain", "native_fault")
+            and value.get("missing_error_origin") in ("domain", "native_fault"),
+            "furpc naming native errors and mixed-operation reuse")
+    require(value.get("http_present_after_delete") is False
+            and value.get("final_http_present") is False,
+            "independent HTTP absence after native deletion and reuse")
+    require(all(integer(value.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+            "furpc naming observation timestamps")
+    return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
+
+
+def validate_furpc_resolution(report):
+    value = report.get("furpc_resolution")
+    require(type(value) is dict and integer(value.get("generation"), 1),
+            "furpc resolution generation required")
+    true_fields(value, ("same_generation_after_error", "missing_http_absent"))
+    true_fields(report, ("owned_cleanup_confirmed",))
+    require(type(value.get("mixed_concurrent_operations")) is int
+            and value["mixed_concurrent_operations"] == 3
+            and type(value.get("native_missing_service_code")) is int
+            and value["native_missing_service_code"] == -2147017779
+            and value.get("native_error_origin") in ("domain", "native_fault"),
+            "furpc resolution native error and mixed-operation reuse")
+    owner, apps = report.get("owner"), report.get("owned_applications")
+    require(text(owner) and type(apps) is list and len(apps) == 2 and text(apps[0])
+            and re.fullmatch(r"fabric:/native-lists-" + re.escape(owner) + r"-[a-f0-9]{32}-a", apps[0]),
+            "resolution must use the exact owned application fixture")
+    stem = apps[0].removeprefix("fabric:/")[:-2]
+    require(apps == [f"fabric:/{stem}-a", f"fabric:/{stem}-b"]
+            and report.get("owned_type") == "ListType-" + stem
+            and value.get("missing_service") == apps[0] + "/DoesNotExist",
+            "resolution owned identities and absent service")
+    require(all(integer(value.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+            "resolution observation timestamps")
+    window = interval(value, "native_start_ms", "native_end_ms")
+    cases, named = report.get("resolved"), report.get("named")
+    require(type(cases) is list and len(cases) == 6 and type(named) is dict
+            and named.get("name") == apps[0] + "/Named"
+            and type(named.get("partitions")) is list and len(named["partitions"]) == 2,
+            "six singleton/int64 and two named resolution/refresh cases")
+    expected_cases = [(app + "/" + suffix, kind, key) for app in apps
+                      for suffix, kind, keys in (("Stateless", "Singleton", [None]),
+                                                ("Stateful", "Int64", [-10, 9]))
+                      for key in keys]
+    expected_cases += [(apps[0] + "/Named", "Named", key) for key in ("blue", "green")]
+
+    def signed(item):
+        require(type(item) is int or (text(item) and re.fullmatch(r"-?[0-9]{1,19}", item)),
+                "independent signed partition bound")
+        result = int(item)
+        require(-(2 ** 63) <= result < 2 ** 63, "signed partition bound overflow")
+        return result
+
+    for case, (name, kind, key) in zip(cases + named["partitions"], expected_cases):
+        expected_key = {"kind": kind, **({"value": key} if key is not None else {})}
+        require(type(case) is dict and same(case.get("key"), expected_key)
+                and case.get("refresh_order") in ("Equal", "Less"),
+                "exact resolution selector and identity-scoped refresh ordering")
+        require(all(integer(case.get(field), 1) for field in ("native_start_ms", "native_end_ms")),
+                "resolution case timestamps")
+        start, end = interval(case, "native_start_ms", "native_end_ms")
+        require(window[0] <= start <= end <= window[1], "resolution case outside native window")
+        observed, replicas = case.get("expected_partition"), case.get("expected_replicas")
+        service_kind = "Stateful" if kind == "Int64" else "Stateless"
+        partition_kind = "Int64Range" if kind == "Int64" else kind
+        require(type(observed) is dict and observed.get("ServiceKind") == service_kind
+                and type(observed.get("PartitionInformation")) is dict
+                and type(replicas) is list, "independent resolution partition and replicas")
+        info = observed["PartitionInformation"]
+        identity = info.get("Id")
+        require(type(identity) is str
+                and re.fullmatch(r"[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}", identity)
+                and identity != "00000000-0000-0000-0000-000000000000"
+                and info.get("ServicePartitionKind") == partition_kind,
+                "independent resolution partition identity/kind")
+        expected_endpoints = []
+        for replica in replicas:
+            require(type(replica) is dict, "independent resolution replica record")
+            if replica.get("ReplicaStatus") != "Ready":
+                continue
+            role = ("Stateless" if service_kind == "Stateless" else
+                    {"Primary": "StatefulPrimary", "ActiveSecondary": "StatefulSecondary"}
+                    .get(replica.get("ReplicaRole")))
+            require(replica.get("ServiceKind") == service_kind and role is not None
+                    and type(replica.get("Address")) is str, "independent ready endpoint/role")
+            expected_endpoints.append((role, replica["Address"]))
+        expected_count = 3 if kind == "Int64" else (5 if kind == "Singleton" else 1)
+        require(len(expected_endpoints) == expected_count,
+                "complete independently observed fixture endpoint inventory")
+        for field in ("native", "refreshed"):
+            result = case.get(field)
+            require(type(result) is dict and result.get("name") == name
+                    and result.get("kind") == service_kind
+                    and type(result.get("partition")) is dict, "typed native resolution identity/kind")
+            partition = result["partition"]
+            require(partition.get("id") == identity.lower() and partition.get("kind") == partition_kind
+                    and type(partition.get("name")) is str
+                    and all(type(partition.get(bound)) is int
+                            and -(2 ** 63) <= partition[bound] < 2 ** 63
+                            for bound in ("low_key", "high_key")),
+                    "native resolution partition must match independent identity")
+            if kind == "Int64":
+                require(partition["low_key"] == signed(info.get("LowKey"))
+                        and partition["high_key"] == signed(info.get("HighKey"))
+                        and partition["low_key"] <= key <= partition["high_key"],
+                        "resolved range must select the signed key")
+            elif kind == "Named":
+                require(partition["name"] == info.get("Name") == key, "resolved named selector")
+            endpoints = result.get("endpoints")
+            require(type(endpoints) is list and all(type(endpoint) is dict
+                    and type(endpoint.get("role")) is str and type(endpoint.get("address")) is str
+                    for endpoint in endpoints), "typed native endpoint multiset")
+            require(sorted((endpoint["role"], endpoint["address"]) for endpoint in endpoints)
+                    == sorted(expected_endpoints), "native/HTTP endpoint and role multisets")
+    return [stamp / 1000 for stamp in window]
+
+
+def validate_furpc_notifications(report):
+    validate_furpc_resolution(report)
+    value = report.get("furpc_notifications")
+    require(type(value) is dict, "furpc notification session evidence required")
+    generations = value.get("session_generations")
+    require(type(generations) is list and len(generations) == 3
+            and all(integer(generation, 1) for generation in generations)
+            and len(set(generations)) == 3,
+            "three independent actual furpc notification generations")
+    resolution = report.get("furpc_resolution")
+    require(type(resolution) is dict
+            and integer(resolution.get("generation"), 1)
+            and resolution["generation"] not in generations,
+            "notification sessions must not share the ordinary furpc generation")
+    require(type(value.get("explicit_filters_unregistered")) is int
+            and value["explicit_filters_unregistered"] == 4
+            and type(value.get("sessions_closed")) is int and value["sessions_closed"] == 3,
+            "native filter confirmations and independent notification owner close")
+    true_fields(report, ("owned_cleanup_confirmed",))
+    cases, apps = report.get("resolved"), report.get("owned_applications")
+    require(type(cases) is list and len(cases) == 6 and type(cases[0]) is dict
+            and type(apps) is list and len(apps) == 2 and text(apps[0]),
+            "notification observations require the owned resolution fixture")
+    baseline = cases[0].get("native")
+    require(type(baseline) is dict and baseline.get("name") == apps[0] + "/Stateless"
+            and type(baseline.get("partition")) is dict
+            and type(baseline.get("endpoints")) is list,
+            "independently corroborated initial notification partition")
+    initial, invalidations = value.get("initial_updates"), value.get("empty_invalidations")
+    require(type(initial) is list and len(initial) == 2
+            and type(invalidations) is list and len(invalidations) == 2,
+            "prefix and exact subscription updates and empty invalidations")
+    for event, empty in [(event, False) for event in initial] + [
+            (event, True) for event in invalidations]:
+        require(type(event) is dict and event.get("name") == baseline["name"]
+                and event.get("partition_id") == baseline["partition"].get("id")
+                and event.get("kind") == "Stateless" and type(event.get("endpoints")) is list,
+                "native notification identity must match the independent owned partition")
+        endpoints = event["endpoints"]
+        require((not endpoints) if empty else bool(endpoints),
+                "actual initial update versus empty endpoint invalidation")
+        remaining = list(baseline["endpoints"])
+        for endpoint in endpoints:
+            require(type(endpoint) is dict and endpoint in remaining,
+                    "initial notification must contain observed endpoint/role occurrences")
+            remaining.remove(endpoint)
+    validate_notification_retry(report.get("ack_retry"))
+    require(all(integer(value.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+            "furpc notification observation timestamps")
+    return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
+
+
 def validate_native(reports, archive, allocation):
     clear, health, name, lists, notification = [reports[file] for file in NATIVE_FILES]
     for value in (clear, health, name, notification):
@@ -1430,17 +2136,6 @@ def validate_native(reports, archive, allocation):
     require(len({value["runtime_version"] for value in reports.values()}) == 1, "native runtime mismatch")
     for value in (health, name, lists, notification):
         require(value.get("archive_sha256") == archive, "actual native archive hash mismatch")
-    cases = clear["executed_cases"]
-    require(type(cases) is list and [case.get("case") for case in cases] == list(CLEAR_CASES),
-            "clear seven internal cases are not five archived tests")
-    for case in cases:
-        true_fields(case, ("passed",))
-    require(cases[1].get("result") is True and cases[2].get("result") is False
-            and type(cases[3].get("operation_count")) is int and cases[3]["operation_count"] == 8
-            and type(cases[3].get("initially_pending_count")) is int
-            and cases[3]["initially_pending_count"] == 8, "clear native concurrency/name results")
-    true_fields(cases[3], ("ninth_call_rejected_locally", "reuse_after_slot_release"))
-    true_fields(cases[-1], ("native_ping_passed", "closed_without_operation", "terminal_error_observed"))
     furpc_ping = clear.get("furpc_ping")
     require(type(furpc_ping) is dict, "furpc native ping observations required")
     require(type(furpc_ping.get("operation_count")) is int and furpc_ping["operation_count"] == 3
@@ -1449,36 +2144,27 @@ def validate_native(reports, archive, allocation):
     nodes = clear["node_list"]
     require(type(nodes.get("native_node_count")) is int and nodes["native_node_count"] == 5,
             "native five-node observation")
-    true_fields(nodes, ("typed_stable_fields_match", "binary_ports_match_onebox_manifest",
+    true_fields(nodes, ("typed_fields_match_http", "binary_ports_match_onebox_manifest",
                        "exact_name_hit_miss_case_prefix", "status_default_all_up_down",
                        "empty_name_token_omitted", "valid_continuation_after_final_id_is_empty",
                        "connection_survives_native_error"))
-    require([case.get("case") for case in health["cases"]] == list(HEALTH_CASES)
-            and integer(health.get("concurrent_operations")) and health["concurrent_operations"] == 8
-            and type(health.get("initially_pending_count")) is int and health["initially_pending_count"] == 8
-            and type(health.get("unknown_node_code")) is int and health["unknown_node_code"] == -2147017705
-            and health.get("unknown_node_management_code") == "FABRIC_E_HEALTH_ENTITY_NOT_FOUND",
-            "heterogeneous native health case/error inventory")
-    true_fields(health, ("cancelled_after_first_poll",))
-    for field in ("healthy_reuse_after_error", "final_healthy_reuse"):
-        require(type(health[field].get("aggregated_health_state")) is int
-                and health[field]["aggregated_health_state"] == 1, "native healthy reuse")
-    require(integer(health.get("completed_at_unix_ms"), 1), "health completion endpoint")
-    true_fields(name, ("initial_http_absent", "native_create_succeeded", "http_present_after_create",
-                      "reuse_after_duplicate", "native_delete_succeeded", "http_absent_after_delete",
-                      "reuse_after_missing", "shared_native_client", "owned_cleanup_confirmed"))
-    require(type(name.get("duplicate_create_code")) is int and name["duplicate_create_code"] == -2147017792
-            and type(name.get("missing_delete_code")) is int and name["missing_delete_code"] == -2147017791,
-            "native name negative error codes")
+    furpc_window = validate_furpc_management(clear)
+    furpc_health_windows = validate_furpc_health(health)
+    require(health.get("unknown_node_management_code") == "FABRIC_E_HEALTH_ENTITY_NOT_FOUND",
+            "independent missing health entity error")
+    furpc_names_window = validate_furpc_names(name)
     true_fields(lists, ("initial_absence_confirmed", "application_native_continuation_followed",
                        "service_native_continuation_followed", "filters_and_parameter_exclusion",
-                       "mixed_shared_native_connection", "reuse_after_native_error", "owned_cleanup_confirmed"))
+                       "mixed_furpc_connection", "reuse_after_native_error", "owned_cleanup_confirmed"))
     require(type(lists.get("application_count")) is int and lists["application_count"] == 2
             and type(lists.get("service_count")) is int and lists["service_count"] == 4
             and all(nonempty(lists.get(key)) for key in ("topology", "deployment_inspection",
                     "independent_applications", "independent_services", "native_applications", "native_services")),
             "native application/service/topology/deployment observations")
     movement_window = validate_native_movement(lists, health.get("owner"))
+    furpc_lists_window = validate_furpc_lists(lists)
+    furpc_topology_window = validate_furpc_topology(lists)
+    furpc_deployment_window = validate_furpc_deployments(lists)
     true_fields(notification, ("owned_cleanup_confirmed",))
     require(notification.get("allocation") == allocation["name"]
             and notification.get("passed") == list(NOTIFICATION_CASES)
@@ -1486,10 +2172,20 @@ def validate_native(reports, archive, allocation):
                     ("resolved", "named", "ack_retry", "endpoint_change", "role_change")),
             "native notification allocation/cases/actual observations")
     validate_notification_retry(notification["ack_retry"])
+    furpc_resolution_window = validate_furpc_resolution(notification)
+    furpc_notification_window = validate_furpc_notifications(notification)
     windows = {
         "clear_node_queries": [stamp / 1000 for stamp in interval(
             nodes, "native_observation_start_unix_ms", "native_observation_end_unix_ms")],
         "native_move_primary": movement_window,
+        "furpc_gateway_methods": furpc_window,
+        "furpc_naming_writes": furpc_names_window,
+        "furpc_application_service_lists": furpc_lists_window,
+        "furpc_partition_replica_lists": furpc_topology_window,
+        "furpc_deployment_lists": furpc_deployment_window,
+        "furpc_resolution": furpc_resolution_window,
+        "furpc_notifications": furpc_notification_window,
+        **furpc_health_windows,
     }
     require(all(integer(nodes.get(key), 1) for key in
                 ("native_observation_start_unix_ms", "native_observation_end_unix_ms")),

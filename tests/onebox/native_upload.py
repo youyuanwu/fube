@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import shutil
 import sys
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import quote
@@ -56,7 +57,8 @@ def inventory(allocation: runtime.Allocation, root: str, directories: list[str])
     return files
 
 
-def deployed_data(allocation: runtime.Allocation, directory: str, expected: dict[str, str]) -> None:
+def deployed_data(allocation: runtime.Allocation, directory: str,
+                  expected: dict[str, str]) -> dict[str, str]:
     script = r"""
 import hashlib,json,sys
 from pathlib import Path
@@ -70,12 +72,21 @@ for p in root.rglob("*"):
             actual[p.relative_to(root).as_posix()]=digest.hexdigest()
 if actual!=expected:
     raise RuntimeError("deployed Data package contents differ from upload source")
-print("Deployed Data file hashes match upload source.")
+print(json.dumps(actual))
 """
-    allocation.execute("python3", "-c", script, directory, json.dumps(expected), timeout=60)
+    actual = json.loads(allocation.execute(
+        "python3", "-c", script, directory, json.dumps(expected), timeout=60))
+    require(actual == expected, "independent deployed Data hashes differ from the source")
+    return actual
 
 
 def qualify(args: argparse.Namespace) -> None:
+    if args.report is not None:
+        require(args.report.is_absolute() and args.report.parent.is_dir()
+                and not args.report.exists() and not args.report.is_symlink(),
+                "upload report requires a fresh absolute output path")
+    started = time.time()
+    proof = {}
     lines = args.owner_file.read_text(encoding="utf-8").splitlines()
     require(len(lines) == 1 and lines[0].startswith("owner="), "original owner file is invalid")
     allocation = runtime.Allocation(args.name, lines[0].removeprefix("owner="))
@@ -147,7 +158,18 @@ def qualify(args: argparse.Namespace) -> None:
         observation = runtime.wait_observe(application + "/Singleton", observer=args.observer.resolve())
         require(observation["rpc"]["packages"]["configuration"]["value"] == "before-upgrade",
                 "uploaded configuration was not activated")
-        deployed_data(allocation, observation["rpc"]["packages"]["data"]["path"], expected_data)
+        actual_data = deployed_data(
+            allocation, observation["rpc"]["packages"]["data"]["path"], expected_data)
+        proof = {
+            "allocation": args.name, "runtime_version": "11.8.121.4", "profile": "clear",
+            "upload": run_id, "application": application, "application_type": type_name,
+            "application_version": version, "cli_sha256": runtime.digest(args.cli),
+            "native_oracle_sha256": runtime.digest(args.native_oracle),
+            "native_predecessor_inventory": before, "rust_inventory": uploaded,
+            "expected_inventory": expected_files, "expected_data_sha256": expected_data,
+            "deployed_data_sha256": actual_data, "live_service": observation["rpc"]["service"],
+            "started_at": started,
+        }
     finally:
         primary = sys.exception()
         errors = []
@@ -199,6 +221,11 @@ def qualify(args: argparse.Namespace) -> None:
             if primary is not None:
                 raise BaseExceptionGroup("native upload and cleanup failed", [primary, *errors])
             raise ExceptionGroup("native upload cleanup failed", errors)
+    if args.report is not None:
+        proof.update(owned_cleanup_confirmed=True, completed_at=time.time())
+        with args.report.open("x", encoding="utf-8") as file:
+            json.dump(proof, file, indent=2)
+            file.write("\n")
     print("PASS: native SDK layout/replacement, empty/multi-chunk content, markers, "
           "CLI upload, provisioning, live application and verified cleanup.")
 
@@ -211,6 +238,7 @@ def main() -> None:
     parser.add_argument("--app", type=Path, required=True)
     parser.add_argument("--observer", type=Path, required=True)
     parser.add_argument("--native-oracle", type=Path, required=True)
+    parser.add_argument("--report", type=Path)
     qualify(parser.parse_args())
 
 

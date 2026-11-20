@@ -584,16 +584,17 @@ the expanded deterministic Rust channel tests.
 
 Ongoing consumer end-to-end qualification belongs in the
 [existing test infrastructure](../Development.md) and
-[owner-guarded onebox lifecycle](../UbuntuOnebox.md). Ordinary FabricClient now
-uses GatewayChannel and the maintained native group exercises naming, all
+[owner-guarded onebox lifecycle](../UbuntuOnebox.md). The migrated ordinary client
+uses furpc, and the maintained native group exercises naming, all
 query/health/deployment/resolution families and one owned MovePrimary. Current
 receipts come from rebuilt migrated consumers, not the historical foundation
-smoke. The same maintained group now exercises independently owned notification
-GatewayReceiver/session consumers and the existing loss relay: one successful
+smoke. The same maintained group exercises independently owned furpc notification
+sessions and the existing loss relay: one successful
 ACK is dropped, the same target logical page is retried under an observed fresh
 full MessageId, and a successful ACK is fully forwarded for that retry's exact
 ID without duplicate delivered versions. The receipt validator checks these
-bounded witnesses. ImageStoreClient now installs its own upload composition;
+bounded witnesses. ImageStoreClient also uses an independent furpc Channel/Peer
+and ordinary one-way Actor 25/27 ACK services, not legacy upload composition;
 the maintained `tests.onebox.native_upload` journey separately compares native
 COM and Rust package copies, replacement, provisioning and deployed data.
 

@@ -394,13 +394,8 @@ class ProofFiles(fixtures.ProjectFiles):
     def native_reports(self, allocation, start):
         digest = self.built["inputs"]["native_archive"]["sha256"]
         common = {"runtime_version": "11.8.121.4", "profile": "clear", "archive_sha256": digest}
-        cases = [{"case": name, "passed": True} for name in ci.CLEAR_CASES]
-        cases[1]["result"], cases[2]["result"] = True, False
-        cases[3].update(operation_count=8, initially_pending_count=8,
-                        ninth_call_rejected_locally=True, reuse_after_slot_release=True)
-        cases[-1].update(native_ping_passed=True, closed_without_operation=True, terminal_error_observed=True)
         nodes = dict.fromkeys((
-            "typed_stable_fields_match", "binary_ports_match_onebox_manifest", "exact_name_hit_miss_case_prefix",
+            "typed_fields_match_http", "binary_ports_match_onebox_manifest", "exact_name_hit_miss_case_prefix",
             "status_default_all_up_down", "empty_name_token_omitted",
             "valid_continuation_after_final_id_is_empty", "connection_survives_native_error"), True)
         nodes["native_node_count"] = 5
@@ -408,29 +403,66 @@ class ProofFiles(fixtures.ProjectFiles):
         nodes["native_observation_end_unix_ms"] = int(start * 1000) + 10
         gateway = {"address": "172.30.91.11:19000", "node_name": "N0010",
                    "node_id": "123", "node_instance": 456}
-        clear = {**common, "executed_cases": cases, "node_list": nodes, "gateway": gateway,
-                 "furpc_ping": {"operation_count": 3, "gateway": copy.deepcopy(gateway)}}
+        furpc_nodes = [{"name": f"N00{index + 1}0", "node_id": f"{0x123 + index:x}",
+                        "node_instance": 456 + index} for index in range(5)]
+        nodes["independent_nodes"] = [
+            {"Name": node["name"], "Id": {"Id": node["node_id"]},
+             "InstanceId": str(node["node_instance"])} for node in furpc_nodes]
+        clear = {**common, "node_list": nodes, "gateway": gateway,
+                 "furpc_ping": {"operation_count": 3, "gateway": copy.deepcopy(gateway)},
+                 "furpc_management": {
+                     "existing_name": True, "absent_name": False,
+                     "native_nodes": furpc_nodes,
+                     "stable_fields_match_http": True, "exact_name_and_status_filters": True,
+                     "page_lengths": [2, 2, 1], "server_token_count": 2,
+                     "native_error_code": -2147024809, "native_error_origin": "domain",
+                     "same_generation_after_error": True, "mixed_concurrent_operations": 3,
+                     "mixed_results_match": True, "generation": 1,
+                     "native_observation_start_unix_ms": int(start * 1000) + 1,
+                     "native_observation_end_unix_ms": int(start * 1000) + 10,
+                 }}
         # Clear really has no archive field; the successful command binds it.
         del clear["archive_sha256"]
         health = {
             **common, "owner": "ci-" + self.current["run_id"] + "-" + self.current["attempt"], "cases": [{
                 "case": name, "native_start_ms": int(start * 1000) + 11,
                 "native_end_ms": int(start * 1000) + 12} for name in ci.HEALTH_CASES],
-            "concurrent_operations": 8, "initially_pending_count": 8, "unknown_node_code": -2147017705,
+            "concurrent_operations": 3, "generation": 1, "unknown_node_code": -2147017705,
             "unknown_node_management_code": "FABRIC_E_HEALTH_ENTITY_NOT_FOUND",
-            "cancelled_after_first_poll": True, "completed_at_unix_ms": int(start * 1000) + 20,
+            "same_generation_after_error": True, "native_error_origin": "domain",
+            "completed_at_unix_ms": int(start * 1000) + 20,
             "healthy_reuse_after_error": {"aggregated_health_state": 1},
             "final_healthy_reuse": {"aggregated_health_state": 1},
         }
+        healthy = {"node_name": "N0010", "aggregated_health_state": 1,
+                   "health_events": [], "unhealthy_evaluations": []}
+        for case in health["cases"]:
+            case["native"] = copy.deepcopy(healthy)
+            case["expected"] = {
+                "label": case["case"], "start_ms": int(start * 1000) + 1,
+                "end_ms": int(start * 1000) + 2,
+                "health": {"Name": "N0010", "AggregatedHealthState": "Ok",
+                           "HealthEvents": [], "UnhealthyEvaluations": []},
+            }
+        health["healthy_reuse_after_error"] = copy.deepcopy(healthy)
+        health["final_healthy_reuse"] = copy.deepcopy(healthy)
         names = {**common, **dict.fromkeys((
             "initial_http_absent", "native_create_succeeded", "http_present_after_create",
             "reuse_after_duplicate", "native_delete_succeeded", "http_absent_after_delete",
-            "reuse_after_missing", "shared_native_client", "owned_cleanup_confirmed"), True),
-            "duplicate_create_code": -2147017792, "missing_delete_code": -2147017791}
+            "reuse_after_missing", "writes_share_native_client", "owned_cleanup_confirmed"), True),
+            "duplicate_create_code": -2147017792, "missing_delete_code": -2147017791,
+            "furpc": {
+                "generation": 1, "same_generation_after_error": True,
+                "mixed_concurrent_operations": 3,
+                "duplicate_error_origin": "domain", "missing_error_origin": "native_fault",
+                "http_present_after_create": True, "http_present_after_delete": False,
+                "final_http_present": False, "native_start_ms": int(start * 1000) + 1,
+                "native_end_ms": int(start * 1000) + 10,
+            }}
         lists = {**common, **dict.fromkeys((
             "initial_absence_confirmed", "application_native_continuation_followed",
             "service_native_continuation_followed", "filters_and_parameter_exclusion",
-            "mixed_shared_native_connection", "reuse_after_native_error", "owned_cleanup_confirmed"), True),
+            "mixed_furpc_connection", "reuse_after_native_error", "owned_cleanup_confirmed"), True),
             "application_count": 2, "service_count": 4,
             **dict.fromkeys(("topology", "deployment_inspection", "independent_applications",
                              "independent_services", "native_applications", "native_services"), [{"model": 1}])}
@@ -456,8 +488,10 @@ class ProofFiles(fixtures.ProjectFiles):
             owned_applications=applications, owned_type=type_name,
             native_applications=[{"name": app, "type_name": type_name} for app in applications],
             independent_applications=[{"Name": app, "TypeName": type_name} for app in applications],
-            native_services=[{"name": service, "kind": "Stateful"}],
-            independent_services=[{"Name": service, "ServiceKind": "Stateful"}],
+            native_services=[{"name": app + "/" + kind, "kind": kind}
+                             for app in applications for kind in ("Stateful", "Stateless")],
+            independent_services=[{"Name": app + "/" + kind, "ServiceKind": kind}
+                                  for app in applications for kind in ("Stateful", "Stateless")],
             topology={"independent_partition_replicas": [{
                 "service": service, "partition": {"ServiceKind": "Stateful",
                     "PartitionInformation": {"Id": partition}}, "replicas": http_replicas(before)}]},
@@ -471,6 +505,8 @@ class ProofFiles(fixtures.ProjectFiles):
                 "target_node_observation": {"Name": "N0020", "NodeStatus": "Up"},
                 "request": {"operation": "MovePrimary", "constraints": "enforced",
                             "count": 1, "native_succeeded": True},
+                "furpc": {"generation": 1, "request_generation": 1,
+                          "same_generation_after_move": True, "mixed_concurrent_operations": 3},
                 "overall_budget_ms": 120000, "poll_count": 1,
                 "native_start_unix_ms": int(start * 1000) + 21,
                 "native_end_unix_ms": int(start * 1000) + 22,
@@ -479,6 +515,147 @@ class ProofFiles(fixtures.ProjectFiles):
                     "after": {"native_replicas": after, "http_replicas": http_replicas(after)},
                 },
             })
+        for native, observed in zip(lists["native_applications"], lists["independent_applications"]):
+            native.update(type_version="1.0", status="Ready", health_state="Ok",
+                          parameters={"Evidence": "owned-list-value"},
+                          definition_kind="ServiceFabricApplicationDescription")
+            observed.update(TypeVersion="1.0", Status="Ready", HealthState="Ok",
+                            Parameters=[{"Key": "Evidence", "Value": "owned-list-value"}])
+        for native, observed in zip(lists["native_services"], lists["independent_services"]):
+            native.update(type_name="ServiceType", manifest_version="1.0", status="Active",
+                          health_state="Ok", has_persisted_state=False, is_service_group=False)
+            observed.update(TypeName="ServiceType", ManifestVersion="1.0", ServiceStatus="Active",
+                            HealthState="Ok", HasPersistedState=False, IsServiceGroup=False)
+        lists["native_missing_application_code"] = -2147017763
+        lists["furpc"] = {
+            "generation": 1,
+            "application_page_lengths": [1, 1], "service_page_lengths": [[1, 1], [1, 1]],
+            "filters_and_parameter_exclusion": True, "typed_fields_match_http": True,
+            "native_missing_application_code": -2147017763, "native_error_origin": "domain",
+            "same_generation_after_error": True, "mixed_concurrent_operations": 3,
+            "native_start_ms": int(start * 1000) + 1, "native_end_ms": int(start * 1000) + 10,
+        }
+        topology = lists["topology"]
+        topology.update(
+            partition_count=6, replica_instance_count=22, native_missing_partition_code=-2147017753,
+            exact_partition_replica_application_selectors=True, ready_replica_status_filter=True,
+            raw_native_epoch_not_compared_to_rest_projection=True,
+            furpc={"generation": 1, "same_generation_after_error": True,
+                   "native_error_origin": "domain", "mixed_concurrent_operations": 3,
+                   "native_start_ms": int(start * 1000) + 11, "native_end_ms": int(start * 1000) + 20})
+        topology["independent_partition_replicas"] = []
+        for app in applications:
+            for kind in ("Stateful", "Stateless"):
+                for index in range(2 if kind == "Stateful" else 1):
+                    count = len(topology["independent_partition_replicas"])
+                    identity = partition if count == 0 else f"{count:08x}-1111-4111-8111-111111111111"
+                    information = {"Id": identity, "ServicePartitionKind": "Int64Range" if kind == "Stateful"
+                                   else "Singleton", "LowKey": str(-(2**63)), "HighKey": str(2**63 - 1)}
+                    observed = {
+                        "ServiceKind": kind, "PartitionStatus": "Ready", "HealthState": "Ok",
+                        "PartitionInformation": information, "InstanceCount": 5,
+                        "TargetReplicaSetSize": 3, "MinReplicaSetSize": 2, "LastQuorumLossDurationInSeconds": "0"}
+                    native = {
+                        "kind": kind, "status": "Ready", "health_state": "Ok",
+                        "information": {"id": identity, "kind": information["ServicePartitionKind"], "name": "",
+                                        "low_key": -(2**63), "high_key": 2**63 - 1},
+                        "instance_count": 5, "target_replica_set_size": 3, "min_replica_set_size": 2,
+                        "last_quorum_loss_duration_in_seconds": 0}
+                    native_replicas, independent_replicas = [], []
+                    for number in range(3 if kind == "Stateful" else 5):
+                        replica = {
+                            "id": 10 + number, "node_name": f"N00{number + 1}0",
+                            "kind": kind, "status": "Ready", "health_state": "Ok",
+                            "role": ("Primary" if number == 0 else "ActiveSecondary") if kind == "Stateful" else "Unknown",
+                            "address": f"opaque/{identity}/{number}", "last_in_build_duration_in_seconds": 0}
+                        independent_replicas.append({
+                            "ReplicaId" if kind == "Stateful" else "InstanceId": str(replica["id"]),
+                            "NodeName": replica["node_name"], "ServiceKind": kind, "ReplicaStatus": "Ready",
+                            "ReplicaRole": replica["role"], "HealthState": "Ok", "Address": replica["address"],
+                            "LastInBuildDurationInSeconds": "0"})
+                        native_replicas.append(replica)
+                    topology["independent_partition_replicas"].append({
+                        "service": app + "/" + kind, "partition": observed, "native_partition": native,
+                        "replicas": independent_replicas, "native_replicas": native_replicas})
+        topology.update(
+            deployment_native_continuation_followed=True, deployed_health_requested_and_omitted=True,
+            native_missing_deployment_node_code=-2147017795, deployed_application_native_error_origin="domain")
+        topology["independent_deployments"] = []
+        deployment = lists["deployment_inspection"] = {
+            **dict.fromkeys(("service_manifest_selectors", "code_package_and_partition_selectors",
+                            "stateful_and_stateless", "mixed_shared_native_connection",
+                            "reuse_after_native_errors", "statistics_rest_activation_exit_labels_swapped"), True),
+            "service_package_count": 10, "code_package_count": 10, "replica_count": 22,
+            "native_missing_node_codes": [-2147017795] * 3, "native_error_origins": ["domain"] * 3,
+            "furpc": {"generation": 1, "same_generation_after_error": True, "mixed_concurrent_operations": 3,
+                      "native_start_ms": int(start * 1000) + 21, "native_end_ms": int(start * 1000) + 22},
+            "observations": [],
+        }
+        empty_time = "0001-01-01T00:00:00.000Z"
+        for node in (f"N00{i}0" for i in range(1, 6)):
+            topology["independent_deployments"].append({
+                "node": node,
+                "native_applications": [{"name": app, "type_name": type_name, "status": 3, "health_state": 1,
+                    "work_directory": "/work", "log_directory": "/log", "temp_directory": "/temp"} for app in applications],
+                "applications": [{"Name": app, "TypeName": type_name, "Status": "Active", "HealthState": "Ok",
+                    "WorkDirectory": "/work", "LogDirectory": "/log", "TempDirectory": "/temp"} for app in applications]})
+            for app in applications:
+                stats = dict.fromkeys(("last_exit_code", "last_activation_time", "last_exit_time",
+                    "last_successful_activation_time", "last_successful_exit_time", "activation_failure_count",
+                    "continuous_activation_failure_count", "exit_failure_count", "continuous_exit_failure_count",
+                    "activation_count", "exit_count"), 0)
+                remote_stats = dict.fromkeys(("LastExitCode", "ActivationFailureCount", "ContinuousActivationFailureCount",
+                    "ExitFailureCount", "ContinuousExitFailureCount", "ActivationCount", "ExitCount"), 0)
+                remote_stats.update(dict.fromkeys(("LastActivationTime", "LastExitTime",
+                    "LastSuccessfulActivationTime", "LastSuccessfulExitTime"), empty_time))
+                stats["last_activation_time"] = 116_444_736_000_000_000
+                remote_stats["LastExitTime"] = "1970-01-01T00:00:00.000Z"
+                entry = {"entry_point_location": "/sleep", "run_as_user_name": "", "process_id": 123,
+                         "instance_id": 1, "next_activation_time": 0, "status": 3, "statistics": stats}
+                remote_entry = {"EntryPointLocation": "/sleep", "RunAsUserName": "", "ProcessId": "123",
+                                "InstanceId": "1", "NextActivationTime": empty_time, "Status": "Started",
+                                "CodePackageEntryPointStatistics": remote_stats}
+                native_replicas, independent = [], []
+                for captured in topology["independent_partition_replicas"]:
+                    if not captured["service"].startswith(app + "/"):
+                        continue
+                    for replica in captured["native_replicas"]:
+                        if replica["node_name"] != node:
+                            continue
+                        stateful = replica["kind"] == "Stateful"
+                        native_replicas.append({
+                            "kind": 2 if stateful else 1, "service_name": captured["service"],
+                            "service_type_name": "ServiceType", "service_manifest_version": "1",
+                            "code_package_name": "Code", "partition_id": captured["native_partition"]["information"]["id"],
+                            "replica_id": replica["id"] if stateful else 0, "instance_id": 0 if stateful else replica["id"],
+                            "replica_role": {"Primary": 2, "ActiveSecondary": 4, "Unknown": 1}[replica["role"]],
+                            "replica_status": 3, "address": replica["address"], "service_manifest_name": "Manifest",
+                            "service_package_activation_id": "", "host_process_id": 123,
+                            "reconfiguration_information": {"previous_configuration_role": 1, "reconfiguration_phase": 1,
+                                "reconfiguration_type": 4, "reconfiguration_start_time_utc": 0}})
+                        independent.append({
+                            "ServiceKind": replica["kind"], "ServiceName": captured["service"], "ServiceTypeName": "ServiceType",
+                            "ServiceManifestVersion": "1", "CodePackageName": "Code",
+                            "PartitionId": captured["native_partition"]["information"]["id"],
+                            "ReplicaId" if stateful else "InstanceId": str(replica["id"]),
+                            "ReplicaRole": replica["role"] if stateful else "None", "ReplicaStatus": "Ready",
+                            "Address": replica["address"], "ServiceManifestName": "Manifest", "ServicePackageActivationId": "",
+                            "HostProcessId": "123", "ReconfigurationInformation": {"PreviousConfigurationRole": "None",
+                                "ReconfigurationPhase": "None", "ReconfigurationType": "None", "ReconfigurationStartTimeUtc": empty_time}})
+                deployment["observations"].append({
+                    "node": node, "application": app,
+                    "native_service_packages": [{"service_manifest_name": "Manifest", "service_manifest_version": "1",
+                                                "service_package_activation_id": "", "status": 3}],
+                    "service_packages": [{"Name": "Manifest", "Version": "1", "ServicePackageActivationId": "", "Status": "Active"}],
+                    "native_code_packages": [{"name": "Code", "version": "1", "service_manifest_name": "Manifest",
+                        "service_package_activation_id": "", "status": 3, "has_setup_entry_point": False,
+                        "host_type": 1, "host_isolation_mode": 0, "run_frequency_interval": 0,
+                        "setup_entry_point": copy.deepcopy(entry), "main_entry_point": copy.deepcopy(entry)}],
+                    "code_packages": [{"Name": "Code", "Version": "1", "ServiceManifestName": "Manifest",
+                        "ServicePackageActivationId": "", "Status": "Active", "HasSetupEntryPoint": False,
+                        "HostType": "ExeHost", "HostIsolationMode": "None", "RunFrequencyInterval": 0,
+                        "SetupEntryPoint": copy.deepcopy(remote_entry), "MainEntryPoint": copy.deepcopy(remote_entry)}],
+                    "native_replicas": native_replicas, "replicas": independent})
         notification = {
             **common, "allocation": allocation, "passed": list(ci.NOTIFICATION_CASES),
             "owned_cleanup_confirmed": True, "resolved": [{"model": 1}], "named": {"model": 1},
@@ -492,6 +669,68 @@ class ProofFiles(fixtures.ProjectFiles):
                           "forwarded_success_ack": {"request_id": {"guid": [1] * 16, "index": 2},
                                                     "page_id": [[2] * 16, 1, 0]}},
             "endpoint_change": {"from": 2, "to": 1}, "role_change": {"model": 1},
+        }
+        notification.update(
+            owner=owner, owned_applications=applications, owned_type="ListType-" + stem,
+            furpc_resolution={
+                "generation": 1, "same_generation_after_error": True,
+                "mixed_concurrent_operations": 3, "missing_service": applications[0] + "/DoesNotExist",
+                "native_missing_service_code": -2147017779, "native_error_origin": "domain",
+                "missing_http_absent": True, "native_start_ms": int(start * 1000) + 1,
+                "native_end_ms": int(start * 1000) + 10,
+            },
+        )
+
+        def resolution_case(name, kind, key, index):
+            stateful = kind == "Int64"
+            partition_kind = "Int64Range" if stateful else kind
+            identity = f"{index:08x}-1111-4111-8111-111111111111"
+            low, high = ((-10, -1) if key == -10 else (0, 9)) if stateful else (0, 0)
+            info = {"Id": identity, "ServicePartitionKind": partition_kind}
+            if stateful:
+                info.update(LowKey=str(low), HighKey=str(high))
+            elif kind == "Named":
+                info["Name"] = key
+            count = 3 if stateful else (5 if kind == "Singleton" else 1)
+            replicas = [{"ServiceKind": "Stateful" if stateful else "Stateless",
+                         "ReplicaStatus": "Ready", "Address": f"opaque-{node}",
+                         "ReplicaRole": "Primary" if node == 0 else "ActiveSecondary"}
+                        for node in range(count)]
+            native = {
+                "name": name, "kind": "Stateful" if stateful else "Stateless",
+                "partition": {"id": identity, "kind": partition_kind, "name": key if kind == "Named" else "",
+                              "low_key": low, "high_key": high},
+                "endpoints": [{"address": replica["Address"], "role": (
+                    "StatefulPrimary" if node == 0 else "StatefulSecondary") if stateful else "Stateless"}
+                    for node, replica in enumerate(replicas)],
+            }
+            return {"key": {"kind": kind, **({"value": key} if key is not None else {})},
+                    "native": native, "refreshed": copy.deepcopy(native),
+                    "expected_partition": {"ServiceKind": native["kind"], "PartitionInformation": info},
+                    "expected_replicas": replicas, "refresh_order": "Equal",
+                    "native_start_ms": int(start * 1000) + 2, "native_end_ms": int(start * 1000) + 3}
+
+        notification["resolved"] = [
+            resolution_case(app + "/" + suffix, kind, key, index)
+            for index, (app, suffix, kind, key) in enumerate(
+                ((app, suffix, kind, key) for app in applications
+                 for suffix, kind, keys in (("Stateless", "Singleton", [None]), ("Stateful", "Int64", [-10, 9]))
+                 for key in keys), 1)]
+        notification["named"] = {
+            "name": applications[0] + "/Named",
+            "partitions": [resolution_case(applications[0] + "/Named", "Named", key, index)
+                           for index, key in enumerate(("blue", "green"), 7)],
+        }
+        initial = notification["resolved"][0]["native"]
+        update = {
+            "name": initial["name"], "partition_id": initial["partition"]["id"],
+            "kind": initial["kind"], "endpoints": initial["endpoints"],
+        }
+        notification["furpc_notifications"] = {
+            "session_generations": [2, 3, 4], "explicit_filters_unregistered": 4,
+            "sessions_closed": 3, "initial_updates": [copy.deepcopy(update), copy.deepcopy(update)],
+            "empty_invalidations": [{**copy.deepcopy(update), "endpoints": []} for _ in range(2)],
+            "native_start_ms": int(start * 1000) + 1, "native_end_ms": int(start * 1000) + 10,
         }
         return dict(zip(ci.NATIVE_FILES, (clear, health, names, lists, notification)))
 
@@ -1275,23 +1514,21 @@ class WorkerTests(ProofFiles):
             self.emit(path, original)
         self.assertEqual(self.checking("client-runtime", directory), 0)
 
-    def test_native_concurrency_requires_eight_overlapping_calls_and_bounded_reuse(self):
+    def test_native_concurrency_requires_three_mixed_calls_and_generation_reuse(self):
         archive = self.built["inputs"]["native_archive"]["sha256"]
         reports = self.native_reports("owned", 1)
         allocation = ci.binding("owned", "a" * 32, "original-cid")
         ci.validate_native(reports, archive, allocation)
         for file, field, values in [
-            (ci.NATIVE_FILES[0], "operation_count", (7, 32, True)),
-            (ci.NATIVE_FILES[0], "initially_pending_count", (0, 7, 32, True)),
-            (ci.NATIVE_FILES[0], "ninth_call_rejected_locally", (False, 1)),
-            (ci.NATIVE_FILES[0], "reuse_after_slot_release", (False, 1)),
+            (ci.NATIVE_FILES[0], "mixed_concurrent_operations", (0, 7, 32, True)),
+            (ci.NATIVE_FILES[0], "same_generation_after_error", (False, 1)),
             (ci.NATIVE_FILES[1], "concurrent_operations", (7, 32, True)),
-            (ci.NATIVE_FILES[1], "initially_pending_count", (None, 0, 7, 32, True)),
+            (ci.NATIVE_FILES[1], "same_generation_after_error", (False, 1)),
         ]:
             for value in values:
                 with self.subTest(file=file, field=field, value=value):
                     broken = copy.deepcopy(reports)
-                    target = (broken[file]["executed_cases"][3]
+                    target = (broken[file]["furpc_management"]
                               if file == ci.NATIVE_FILES[0] else broken[file])
                     target[field] = value
                     with self.assertRaises(ci.ProofError):
@@ -1324,6 +1561,63 @@ class WorkerTests(ProofFiles):
                 with self.assertRaises(ci.ProofError):
                     ci.validate_notification_retry(broken)
 
+    def test_furpc_notifications_require_independent_sessions_native_updates_and_acks(self):
+        original = self.native_reports("owned", 1)[ci.NATIVE_FILES[4]]
+        self.assertEqual(ci.validate_furpc_notifications(original), [1.001, 1.010])
+        mutations = [
+            lambda value: value.pop("furpc_notifications"),
+            lambda value: value["furpc_notifications"].update(session_generations=[2, 2, 3]),
+            lambda value: value["furpc_notifications"].update(session_generations=[1, 2, 3]),
+            lambda value: value["furpc_notifications"].update(session_generations=[True, 2, 3]),
+            lambda value: value["furpc_notifications"].update(sessions_closed=True),
+            lambda value: value["furpc_notifications"].update(explicit_filters_unregistered=3),
+            lambda value: value["furpc_notifications"].update(initial_updates=[]),
+            lambda value: value["furpc_notifications"]["initial_updates"][0].update(endpoints=[]),
+            lambda value: value["furpc_notifications"]["initial_updates"][0].update(name="fabric:/foreign"),
+            lambda value: value["resolved"][0]["native"]["partition"].update(id=None),
+            lambda value: value["furpc_notifications"]["initial_updates"][0]["endpoints"][0].update(
+                role="StatefulPrimary"),
+            lambda value: value["furpc_notifications"]["empty_invalidations"][0].update(
+                endpoints=[{"role": "Stateless", "address": ""}]),
+            lambda value: value["furpc_notifications"].update(native_end_ms=1),
+            lambda value: value["ack_retry"].update(duplicate_versions=1),
+            lambda value: value.update(owned_cleanup_confirmed=False),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                broken = copy.deepcopy(original)
+                mutate(broken)
+                with self.assertRaises(ci.ProofError):
+                    ci.validate_furpc_notifications(broken)
+
+    def test_furpc_names_require_native_errors_generation_and_independent_http(self):
+        original = self.native_reports("owned", 1)[ci.NATIVE_FILES[2]]
+        self.assertEqual(ci.validate_furpc_names(original), [1.001, 1.010])
+        mutations = [
+            lambda value: value.pop("furpc"),
+            lambda value: value.update(duplicate_create_code=True),
+            lambda value: value.update(missing_delete_code=0),
+            lambda value: value.update(owned_cleanup_confirmed=False),
+            lambda value: value["furpc"].update(generation=True),
+            lambda value: value["furpc"].update(generation=0),
+            lambda value: value["furpc"].update(same_generation_after_error=False),
+            lambda value: value["furpc"].update(mixed_concurrent_operations=True),
+            lambda value: value["furpc"].update(mixed_concurrent_operations=2),
+            lambda value: value["furpc"].update(duplicate_error_origin="local"),
+            lambda value: value["furpc"].update(missing_error_origin="protocol"),
+            lambda value: value["furpc"].update(http_present_after_create=False),
+            lambda value: value["furpc"].update(http_present_after_delete=0),
+            lambda value: value["furpc"].update(final_http_present=True),
+            lambda value: value["furpc"].update(native_start_ms=True),
+            lambda value: value["furpc"].update(native_end_ms=1),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                broken = copy.deepcopy(original)
+                mutate(broken)
+                with self.assertRaises(ci.ProofError):
+                    ci.validate_furpc_names(broken)
+
     def test_native_movement_requires_owned_single_request_and_independent_role_change(self):
         archive = self.built["inputs"]["native_archive"]["sha256"]
         reports = self.native_reports("owned", 1)
@@ -1342,6 +1636,16 @@ class WorkerTests(ProofFiles):
             lambda lists: lists["movement"]["request"].update(native_succeeded=False),
             lambda lists: lists["movement"]["request"].update(constraints="ignored"),
             lambda lists: lists["movement"]["request"].update(force=True),
+            lambda lists: lists.update(furpc=None),
+            lambda lists: lists["furpc"].update(generation=True),
+            lambda lists: lists["movement"].pop("furpc"),
+            lambda lists: lists["movement"]["furpc"].update(generation=True),
+            lambda lists: lists["movement"]["furpc"].update(generation=2),
+            lambda lists: lists["movement"]["furpc"].update(request_generation=True),
+            lambda lists: lists["movement"]["furpc"].update(request_generation=2),
+            lambda lists: lists["movement"]["furpc"].update(same_generation_after_move=False),
+            lambda lists: lists["movement"]["furpc"].update(mixed_concurrent_operations=True),
+            lambda lists: lists["movement"]["furpc"].update(mixed_concurrent_operations=2),
             lambda lists: lists["movement"]["target_node_observation"].update(NodeStatus="Down"),
             lambda lists: lists["movement"]["verified_observations"]["after"].update(
                 http_replicas=lists["movement"]["verified_observations"]["before"]["http_replicas"]),
@@ -1366,6 +1670,116 @@ class WorkerTests(ProofFiles):
                 change(broken[ci.NATIVE_FILES[3]])
                 with self.assertRaises(ci.ProofError):
                     ci.validate_native(broken, archive, allocation)
+
+    def test_furpc_resolution_requires_all_selectors_refresh_and_independent_endpoints(self):
+        original = self.native_reports("owned", 1)[ci.NATIVE_FILES[4]]
+        self.assertEqual(ci.validate_furpc_resolution(original), [1.001, 1.010])
+        changes = [
+            lambda value: value.pop("furpc_resolution"),
+            lambda value: value["furpc_resolution"].update(generation=True),
+            lambda value: value["furpc_resolution"].update(same_generation_after_error=False),
+            lambda value: value["furpc_resolution"].update(mixed_concurrent_operations=True),
+            lambda value: value["furpc_resolution"].update(native_missing_service_code=0),
+            lambda value: value["furpc_resolution"].update(native_missing_service_code=-1),
+            lambda value: value["furpc_resolution"].update(native_error_origin="local"),
+            lambda value: value["furpc_resolution"].update(missing_http_absent=False),
+            lambda value: value.update(owned_cleanup_confirmed=False),
+            lambda value: value.update(owner="foreign"),
+            lambda value: value["resolved"].pop(),
+            lambda value: value["resolved"][1]["key"].update(value=9),
+            lambda value: value["resolved"][0]["refreshed"].update(name="fabric:/foreign"),
+            lambda value: value["resolved"][1]["native"]["partition"].update(low_key=-9),
+            lambda value: value["resolved"][0]["native"]["endpoints"].pop(),
+            lambda value: value["resolved"][1]["refreshed"]["endpoints"][0].update(role="Stateless"),
+            lambda value: value["resolved"][0]["expected_replicas"][0].update(Address="different"),
+            lambda value: value["resolved"][0].update(refresh_order="Greater"),
+            lambda value: value["named"]["partitions"][0]["refreshed"]["partition"].update(name="green"),
+            lambda value: value["named"]["partitions"].pop(),
+            lambda value: value["furpc_resolution"].update(native_end_ms=1001),
+        ]
+        for index, change in enumerate(changes):
+            with self.subTest(change=index):
+                broken = copy.deepcopy(original)
+                change(broken)
+                with self.assertRaises(ci.ProofError):
+                    ci.validate_furpc_resolution(broken)
+
+    def test_furpc_topology_requires_typed_native_results_and_independent_http(self):
+        original = self.native_reports("owned", 1)[ci.NATIVE_FILES[3]]
+        self.assertEqual(ci.validate_furpc_topology(original), [1.011, 1.020])
+        changes = [
+            lambda topology: topology.pop("furpc"),
+            lambda topology: topology["furpc"].update(generation=2),
+            lambda topology: topology["furpc"].update(generation=True),
+            lambda topology: topology["furpc"].update(same_generation_after_error=1),
+            lambda topology: topology["furpc"].update(mixed_concurrent_operations=True),
+            lambda topology: topology["furpc"].update(native_error_origin="local"),
+            lambda topology: topology["furpc"].update(native_end_ms=1010),
+            lambda topology: topology.update(native_missing_partition_code=0),
+            lambda topology: topology.update(partition_count=True),
+            lambda topology: topology.update(replica_instance_count=21),
+            lambda topology: topology["independent_partition_replicas"].pop(),
+            lambda topology: topology["independent_partition_replicas"][0].pop("native_partition"),
+            lambda topology: topology["independent_partition_replicas"][0].update(service="fabric:/foreign"),
+            lambda topology: topology["independent_partition_replicas"][0]["native_partition"].update(kind="Stateless"),
+            lambda topology: topology["independent_partition_replicas"][0]["native_partition"].update(
+                min_replica_set_size=True),
+            lambda topology: topology["independent_partition_replicas"][0]["native_partition"]["information"].update(
+                low_key=0),
+            lambda topology: topology["independent_partition_replicas"][0]["partition"]["PartitionInformation"].update(
+                LowKey=str(-(2**63) - 1)),
+            lambda topology: topology["independent_partition_replicas"][1]["native_partition"]["information"].update(
+                id=topology["independent_partition_replicas"][0]["native_partition"]["information"]["id"]),
+            lambda topology: topology["independent_partition_replicas"][0].update(native_replicas=[]),
+            lambda topology: topology["independent_partition_replicas"][0]["native_replicas"][0].update(id=True),
+            lambda topology: topology["independent_partition_replicas"][0]["native_replicas"][0].update(id="10"),
+            lambda topology: topology["independent_partition_replicas"][0]["native_replicas"][0].update(address="wrong"),
+            lambda topology: topology["independent_partition_replicas"][0]["native_replicas"][0].update(role="Unknown"),
+            lambda topology: topology["independent_partition_replicas"][0]["native_replicas"][0].update(
+                last_in_build_duration_in_seconds=True),
+        ]
+        for index, change in enumerate(changes):
+            with self.subTest(change=index):
+                broken = copy.deepcopy(original)
+                change(broken["topology"])
+                with self.assertRaises(ci.ProofError):
+                    ci.validate_furpc_topology(broken)
+
+    def test_furpc_deployments_require_independent_fields_and_original_generation(self):
+        original = self.native_reports("owned", 1)[ci.NATIVE_FILES[3]]
+        self.assertEqual(ci.validate_furpc_deployments(original), [1.021, 1.022])
+        changes = [
+            lambda value: value["deployment_inspection"].pop("furpc"),
+            lambda value: value["deployment_inspection"]["furpc"].update(generation=2),
+            lambda value: value["deployment_inspection"]["furpc"].update(same_generation_after_error=1),
+            lambda value: value["deployment_inspection"]["furpc"].update(mixed_concurrent_operations=True),
+            lambda value: value["deployment_inspection"]["furpc"].update(native_end_ms=1020),
+            lambda value: value["deployment_inspection"].update(native_missing_node_codes=[-2147017795] * 2),
+            lambda value: value["deployment_inspection"].update(native_error_origins=["local"] * 3),
+            lambda value: value["topology"].update(deployment_native_continuation_followed=False),
+            lambda value: value["topology"]["independent_deployments"][0].pop("native_applications"),
+            lambda value: value["topology"]["independent_deployments"][0]["native_applications"][0].update(health_state=True),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_service_packages"][0].update(status=True),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_code_packages"][0].update(host_type=2),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_code_packages"][0]["main_entry_point"].update(
+                process_id="123"),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_code_packages"][0]["main_entry_point"][
+                "statistics"].update(last_activation_time=0),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_code_packages"][0]["main_entry_point"][
+                "statistics"].update(last_activation_time=116_444_736_000_010_000),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_replicas"][0].update(host_process_id=True),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_replicas"][0].update(service_name="fabric:/foreign"),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_replicas"][0][
+                "reconfiguration_information"].update(reconfiguration_phase=2),
+            lambda value: value["deployment_inspection"]["observations"][0].update(native_replicas=[]),
+            lambda value: value["deployment_inspection"].update(replica_count=21),
+        ]
+        for index, change in enumerate(changes):
+            with self.subTest(change=index):
+                broken = copy.deepcopy(original)
+                change(broken)
+                with self.assertRaises(ci.ProofError):
+                    ci.validate_furpc_deployments(broken)
 
     def test_native_movement_observation_must_belong_to_current_execution(self):
         directory = self.worker("client-runtime")
@@ -1430,7 +1844,7 @@ class WorkerTests(ProofFiles):
         original = ci.read(path)
         for index, value in enumerate((False, 1, "true")):
             broken = copy.deepcopy(original)
-            broken["executed_cases"][0]["passed"] = value
+            broken["furpc_management"]["same_generation_after_error"] = value
             self.emit(path, broken)
             self.assertEqual(self.checking("client-runtime", directory), 1)
         for change in (
@@ -1443,6 +1857,142 @@ class WorkerTests(ProofFiles):
             self.emit(path, broken)
             self.assertEqual(self.checking("client-runtime", directory), 1)
         self.emit(path, original)
+
+    def test_furpc_methods_require_independent_nodes_paging_and_native_error_reuse(self):
+        directory = self.worker("client-runtime")
+        path = directory / "client" / ci.NATIVE_FILES[0]
+        original = ci.read(path)
+        for change in (
+            lambda value: value.update(existing_name=1),
+            lambda value: value.update(absent_name=0),
+            lambda value: value.update(mixed_concurrent_operations=True),
+            lambda value: value.update(page_lengths=[True, 2, 2]),
+            lambda value: value.update(server_token_count=True),
+            lambda value: value.update(native_error_code=0),
+            lambda value: value.update(native_error_code=True),
+            lambda value: value.update(same_generation_after_error=False),
+            lambda value: value.update(native_observation_start_unix_ms=True),
+            lambda value: value["native_nodes"][0].update(node_instance=True),
+            lambda value: value["native_nodes"][0].update(node_id="ffff"),
+            lambda value: value["native_nodes"][0].update(name="different"),
+        ):
+            broken = copy.deepcopy(original)
+            change(broken["furpc_management"])
+            self.emit(path, broken)
+            self.assertEqual(self.checking("client-runtime", directory), 1)
+        broken = copy.deepcopy(original)
+        broken.pop("furpc_management")
+        self.emit(path, broken)
+        self.assertEqual(self.checking("client-runtime", directory), 1)
+        self.emit(path, original)
+        self.assertEqual(self.checking("client-runtime", directory), 0)
+
+    def test_furpc_lists_require_native_fields_real_paging_and_generation_reuse(self):
+        directory = self.worker("client-runtime")
+        path = directory / "client" / ci.NATIVE_FILES[3]
+        original = ci.read(path)
+        for change in (
+            lambda value: value["furpc"].update(generation=True),
+            lambda value: value["furpc"].update(application_page_lengths=[True, 1]),
+            lambda value: value["furpc"].update(service_page_lengths=[[1, 1]]),
+            lambda value: value.update(native_services=[]),
+            lambda value: value["native_applications"][0].update(type_name="different"),
+            lambda value: value["furpc"].update(native_missing_application_code=0),
+            lambda value: value["furpc"].update(native_missing_application_code=True),
+            lambda value: value["furpc"].update(native_error_origin="local"),
+            lambda value: value["furpc"].update(same_generation_after_error=False),
+            lambda value: value["furpc"].update(native_start_ms=True),
+        ):
+            broken = copy.deepcopy(original)
+            change(broken)
+            self.emit(path, broken)
+            self.assertEqual(self.checking("client-runtime", directory), 1)
+        broken = copy.deepcopy(original)
+        broken.pop("furpc")
+        self.emit(path, broken)
+        self.assertEqual(self.checking("client-runtime", directory), 1)
+        self.emit(path, original)
+        self.assertEqual(self.checking("client-runtime", directory), 0)
+
+    def test_furpc_health_requires_all_policy_cases_and_native_health_fields(self):
+        directory = self.worker("client-runtime")
+        path = directory / "client" / ci.NATIVE_FILES[1]
+        original = ci.read(path)
+        for change in (
+            lambda value: value.update(generation=True),
+            lambda value: value["cases"].pop(),
+            lambda value: value["cases"][0]["native"].update(node_name="different"),
+            lambda value: value["cases"][0]["native"].update(aggregated_health_state=True),
+            lambda value: value.update(unknown_node_code=True),
+            lambda value: value.update(native_error_origin="local"),
+            lambda value: value.update(same_generation_after_error=False),
+            lambda value: value["healthy_reuse_after_error"].update(aggregated_health_state=3),
+            lambda value: value["cases"][0].update(native_start_ms=True),
+        ):
+            broken = copy.deepcopy(original)
+            change(broken)
+            self.emit(path, broken)
+            self.assertEqual(self.checking("client-runtime", directory), 1)
+        broken = copy.deepcopy(original)
+        broken.pop("generation")
+        self.emit(path, broken)
+        self.assertEqual(self.checking("client-runtime", directory), 1)
+        self.emit(path, original)
+        self.assertEqual(self.checking("client-runtime", directory), 0)
+
+    def test_native_health_events_match_full_independent_http_fields(self):
+        stamp = "1970-01-01T00:00:00.000Z"
+        absent = "0001-01-01T00:00:00.000Z"
+        ticks = "116444736000000000"
+        observed_event = {
+            "SourceId": "owned", "Property": "property", "Description": "warning",
+            "SequenceNumber": "7", "HealthState": "Warning",
+            "TimeToLiveInMilliSeconds": "PT1.0000001S",
+            "SourceUtcTimestamp": stamp, "LastModifiedUtcTimestamp": stamp,
+            "IsExpired": False, "RemoveWhenExpired": True,
+            "LastOkTransitionAt": absent, "LastWarningTransitionAt": stamp,
+            "LastErrorTransitionAt": absent,
+        }
+        native_event = {
+            "source_id": "owned", "property": "property", "description": "warning",
+            "sequence_number": "7", "health_state": 2, "time_to_live_ticks": "10000001",
+            "source_utc_timestamp": ticks, "last_modified_utc_timestamp": ticks,
+            "is_expired": False, "remove_when_expired": True,
+            "last_ok_transition_at": "0", "last_warning_transition_at": ticks,
+            "last_error_transition_at": "0",
+        }
+        observed = {
+            "Name": "N0020", "AggregatedHealthState": "Error", "HealthEvents": [observed_event],
+            "UnhealthyEvaluations": [{"HealthEvaluation": {
+                "Kind": "Event", "Description": "evaluation", "ConsiderWarningAsError": True,
+                "AggregatedHealthState": "Error", "UnhealthyEvent": copy.deepcopy(observed_event),
+            }}],
+        }
+        native = {
+            "node_name": "N0020", "aggregated_health_state": 3, "health_events": [native_event],
+            "unhealthy_evaluations": [{
+                "kind": "Event", "description": "evaluation", "consider_warning_as_error": True,
+                "aggregated_health_state": 3, "unhealthy_event": copy.deepcopy(native_event),
+            }],
+        }
+        ci.health_against_http(native, observed, 10)
+        for field, value in (
+            ("health_state", True), ("time_to_live_ticks", "10000000"), ("sequence_number", "8"),
+            ("is_expired", 0), ("last_error_transition_at", "1"),
+            ("source_utc_timestamp", str(int(ticks) + 10_000)),
+            ("last_modified_utc_timestamp", str(int(ticks) + 110_001)),
+        ):
+            broken = copy.deepcopy(native)
+            broken["health_events"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(ci.ProofError):
+                ci.health_against_http(broken, observed, 10)
+        native["health_events"][0]["last_modified_utc_timestamp"] = str(int(ticks) + 100_000)
+        ci.health_against_http(native, observed, 10)
+        for event in (observed_event, observed["UnhealthyEvaluations"][0]["HealthEvaluation"]["UnhealthyEvent"]):
+            event["TimeToLiveInMilliSeconds"] = "P10675199DT2H48M5.4775807S"
+        for event in (native_event, native["unhealthy_evaluations"][0]["unhealthy_event"]):
+            event["time_to_live_ticks"] = str(2**63 - 1)
+        ci.health_against_http(native, observed, 10)
 
 class BoundedParserTests(fixtures.ProjectFiles):
     def test_selected_content_digest_is_canonical_local_strict_and_bounded(self):

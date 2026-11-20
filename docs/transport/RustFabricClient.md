@@ -10,17 +10,24 @@ have been demonstrated against the repository's Ubuntu onebox running
 Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
 
-**Ordinary-channel migration:** all 16 existing ordinary operations now use
-GatewayChannel through a shared, sealed typed-call layer. Naming, all nine
-list/deployed-list queries, node health, resolution and MovePrimary retain their
-native schemas. `FabricClient` explicitly owns the channel; `GatewayClient`
-borrows a supplied binding. ServiceNotificationClient owns its **own**
-notification-enabled GatewayChannel/native session; it does not adopt an
-ordinary client's channel or lifecycle. ImageStoreClient owns an independent
-GatewayChannel with registered raw ACK actors. Each client installs its own
-actor/action/envelope authorization; the native channel's minimal actor demux
-and duplex/RPC split contain no gateway/upload/notification profile switch.
-The broader actor/action router remains declarations only.
+**Client migration:** Ping, NameExists, CreateName/DeleteName, cluster/topology/deployment
+lists, node health, MovePrimary and resolution are implemented only by `FurpcClient` over furpc. Their old `FabricClient`
+methods, `PingRequest`, `NameRequest`/`NameOperation`/`NameResponse` and legacy query `ClientRequest`
+implementations have been removed. There is no compatibility wrapper or fallback.
+`FabricClient`, borrowed `GatewayClient`, `Client`/`ClientRequest` contracts,
+`ClientOptions`/`ClientLimits` and typed retained-allocation accounting are retired.
+ServiceNotificationClient owns its **own furpc Channel/native session**; it
+does not adopt an ordinary client's channel or lifecycle. Authorized furpc
+ingress and `server::Rpc::unary` decode notifications and return typed ACK data;
+the runner owns native correlation and original-generation ACK writes.
+Session/filter RPCs reuse the gateway adapter on the original furpc Peer.
+The legacy notification adapters, receiver/reply-context plumbing and allocation
+ledger are removed. ImageStoreClient now also owns an independent furpc Channel:
+Peer sends carry v1.2 transfer messages and authorized Actor 25/27 one-way
+services receive semantic ACKs. Neither production nor test fube-client paths
+depend on fube-transport. The native loss relay forwards original clear-frame
+bytes unchanged and inspects headers through public furpc types; legacy
+transport-model JSON checks live in fube-transport.
 Rust error/admission/lifecycle changes below
 are deliberate API breaks, not compatibility wrappers. Historical source/wire
 evidence in later sections is not a substitute for current migration receipts.
@@ -30,57 +37,239 @@ native SDK predecessor/Rust replacement comparison, completion markers,
 provisioning/creation, independent live application contact and deployed Data
 SHA256 comparison passed. Repeated native SDK copy reliability is not claimed.
 
+**Testing:** `fube-client` no longer contains synthetic native-wire fixtures or
+model-peer tests. Non-wire JSON, validation and state tests, native onebox
+scenarios and independent report validators remain. Historical offline-wire
+coverage descriptions below refer to retired tests, not current qualification.
+The fubst and furpc crates retain their own codec/transport tests.
+
 ## 1. What is implemented
 
 ### Separate furpc-backed client
 
-`FurpcClient` is a new, minimal client alongside `FabricClient`, not a backend
-switch on the existing client. Its only remote API is `ping(timeout)`, returning
-the same GatewayDescription. It owns a furpc Channel and uses its native byte
-request/reply path directly; only the Ping/failure body schemas and public result
-models are shared with the existing client. No legacy Message, channel, typed
-budget or lifecycle is adopted.
+`FurpcClient` is the canonical implementation of thirteen read-only native operations
+and three mutations: CreateName, DeleteName and MovePrimary.
+There is no remaining ordinary legacy façade:
+
+| Method | Typed request body | Typed response body |
+|---|---|---|
+| `ping` | `()` (zero native bytes) | `GatewayDescription` |
+| `name_exists` | `NamingUri` | `bool` |
+| `create_name` | `NamingUri` | `()` (zero native bytes) |
+| `delete_name` | `NamingUri` | `()` (zero native bytes) |
+| `move_primary` | `MovePrimaryQueryDescription` | `()` (empty native QueryResult) |
+| `resolve_service_partition` | `ResolutionRequest` | `ResolvedServicePartition` |
+| `get_node_list` | `NodeQueryDescription` | `NodeListPage` |
+| `get_application_list` | `ApplicationQueryDescription` | `ApplicationListPage` |
+| `get_service_list` | `ServiceQueryDescription` | `ServiceListPage` |
+| `get_partition_list` | `PartitionQueryDescription` | `PartitionListPage` |
+| `get_replica_list` | `ReplicaQueryDescription` | `ReplicaListPage` |
+| `get_deployed_application_list` | `DeployedApplicationQueryDescription` | `DeployedApplicationListPage` |
+| `get_deployed_service_package_list` | `DeployedServicePackageQueryDescription` | `Vec<DeployedServicePackage>` |
+| `get_deployed_code_package_list` | `DeployedCodePackageQueryDescription` | `Vec<DeployedCodePackage>` |
+| `get_deployed_replica_list` | `DeployedReplicaQueryDescription` | `Vec<DeployedReplica>` |
+| `get_node_health` | `NodeHealthQueryDescription` | `NodeHealth` |
+
+Each method accepts `furpc::Request<T>` and an absolute deadline, and returns
+`furpc::Response<U>`.
+It follows tonic's generated-client style: `FurpcClient<T = furpc::Channel>`
+wraps a byte-facing Tower service, methods borrow `&mut self`, and callers
+explicitly clone cloneable clients for concurrency. `new(transport)` is local
+and inert; Endpoint still owns connection setup. Custom transports need not be
+Clone, Sync or static. Native body schemas, validation and public models are
+reused without legacy typed-request implementations. No legacy Message, channel,
+typed budget or lifecycle is adopted.
 
 ```rust,no_run
-use fube_client::FurpcClient;
+use fube_client::{FurpcClient, NamingUri, NodeQueryDescription};
+use furpc::Request;
+use std::time::Duration;
+use tokio::time::Instant;
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let channel = FurpcClient::endpoint_clear("127.0.0.1:19000".parse()?)?
     .connect().await?;
-let client = FurpcClient::new(channel);
-let gateway = client.ping(None).await?;
-# let _ = gateway;
+let mut client = FurpcClient::new(channel);
+let deadline = Instant::now() + Duration::from_secs(30);
+let gateway = client.ping(Request::new(()), deadline).await?.into_body();
+let name: NamingUri = "fabric:/Example".parse()?;
+let exists = client.name_exists(Request::new(name), deadline).await?.into_body();
+let page = client.get_node_list(
+    Request::new(NodeQueryDescription::default()), deadline,
+).await?.into_body();
+# let _ = (gateway, exists, page);
 # Ok(())
 # }
 ```
 
-The client sends an empty native PingRequest body with gateway Actor, activity,
-protocol 1.1 and remaining-time headers. It validates the effective reply
-Actor/Action and protocol version, and preserves native Fault, domain failure,
-malformed-body and protocol errors separately. One deadline covers Peer acquisition
-and RPC; a failed invocation is never replayed. Clones share Channel ownership
-and pending capacity, and the final owner drop closes it.
+The stub owns `RpcClient<GatewayService<T>>`. The gateway byte-service adapter
+forwards readiness to that exact transport instance, adds the remaining Timeout
+header after readiness, and captures reply validation in each call's future.
+The method selects its validator through `RpcClient::get_mut` before invoking
+the RPC; validators are neither inferred from an edited reply nor shared between
+clones. The adapter validates the reply envelope or decodes
+ClientOperationFailure before the success body codec. Ping uses the standard
+`FubstCodec<(), PingReplyBody>`: fubst's root unit maps to zero body bytes, while
+the reply uses its native object schema. Nested unit values remain unsupported
+and empty structs retain native object framing.
+Gateway Actor, activity and protocol 1.1 remain method-owned native headers.
+NameExists sends the structured native NamingUri and requires NamingGateway's
+NameOperationReply. CreateName/DeleteName reuse the same checked URI and reply
+envelope, but `FubstCodec<NamingUri, ()>` requires zero success-body bytes.
+DeleteName adds native explicit-delete header `0x8033` with `true`; creation
+does not add that header. These writes use the same deadline, source/settlement
+metadata and error path as the reads, without retry or replay.
+GetNodeList uses the shared native query envelope and typed
+node schema; aggregate Actor/Action headers are optional but checked when present.
+Query error codes remain domain failures, and malformed typed payloads or
+disagreeing repeated node IDs cannot be hidden behind a nonzero query error.
+
+All ten read queries and MovePrimary delegate to the private generic `query`
+helper and `QueryCodec<Q>`.
+Query declarations supply the native name, Serde arguments, parameter checks,
+typed reply profile and record validation. No query uses a legacy Message or
+typed-request adapter. Profiles retain their own payload tags, list/item/empty shapes,
+required or optional Actor/Action headers, and strict or absent paging rules.
+The generic path supports paged and unpaged request descriptions without adding
+public methods for unmigrated queries.
+
+MovePrimary takes the unpaged `MovePrimaryQueryDescription::new(
+MovePrimaryQueryParameters::new(partition_id, target_node))`. Parameters use
+native JSON names `PartitionId` and `NodeName`; a nil partition, empty/NUL node,
+or target longer than 4096 UTF-16 units is rejected before submission. Target
+case and whitespace are preserved. No force/ignore option or paging is exposed.
+Success requires the existing RS13/QueryReply empty-QueryResult profile, not
+the zero-byte naming-write body. Completion does not establish a placement
+transition: observe replicas/discovery separately. Timeout, cancellation and
+disconnection after submission can leave the mutation outcome unknown; the
+client never retries or replays it.
+
+Application and ordinary application-scoped service lists use strict paging
+metadata and optional checked NamingGateway/QueryReply headers. Node health is
+an unpaged item requiring Actor 16 and OperationSuccessAction. It preserves the
+distinction between omitted and explicit policy overrides, and sends event
+filters as numeric-mask JSON. An unhealthy aggregate is successful data.
+Partition and replica lists use the same strict list profile with tags 5 and 6.
+Their native names are GetServicePartitionList and GetServicePartitionReplicaList;
+both accept continuations but reject MaxResults before transport submission.
+
+Node filters and paging retain their native values and empty-string omission
+semantics. The new query codec does not adopt legacy standalone string/count
+ceilings. Signed native MaxResults, codec byte limits and actual transport
+admission still apply. Each call returns one page; only the caller follows
+continuation tokens. No typed-retention ledger or second RPC engine is introduced.
+
+The client preserves native Fault, domain failure, malformed-body and protocol
+errors separately, including original error sources. Response mapping preserves
+headers, native source and settlement metadata. The earlier explicit/request-local
+deadline covers encoding, readiness/reconnect, submission and receipt under
+furpc's on-time settlement rules; a failed invocation is never replayed.
+With the default transport, clones share Channel ownership and pending capacity,
+and the final owner drop closes it. This replaces the original immutable
+`ping(timeout) -> GatewayDescription` API. The duplicate legacy read APIs have
+also been retired; callers must use this typed request/deadline interface.
 
 The existing `onebox_ping_name_exists_and_node_list` test now also sends three
 overlapping pings on the new client and compares every full gateway identity with
-fresh HTTP management observations and the independent legacy native result.
-Its `furpc_ping` evidence is required by the existing onebox report validator;
-no separate fixture, test partition, or HTTP execution fallback was added.
-The baseline passed against a fresh five-node Service Fabric **11.8.121.4**
-onebox, including all three furpc pings and the existing seven baseline cases.
-This qualifies only the initiating clear-TCP Ping profile, not native
-notifications, accepted-side serving, TLS, or other furpc management operations.
+fresh HTTP management observations.
+Its `furpc_ping` and `furpc_management` evidence is required by the existing onebox
+report validator; no separate fixture, test partition, or HTTP execution fallback
+was added. The generic typed Ping was first requalified against a fresh five-node
+Service Fabric **11.8.121.4** onebox. The extended baseline then passed NameExists
+true/false, native node identities and stable fields compared with HTTP and the
+source-derived binary-port checks, exact-name/status selection, real 2/2/1 server paging, native
+invalid-token error and healthy reuse on the original furpc generation, and
+concurrent Ping/NameExists/GetNodeList on clones. Reports retain actual node identities, page lengths,
+native error provenance and native observation times; offline negative models
+reject missing, boolean-substituted or mismatched evidence.
 
-### Existing client
+The existing application/service-list and node-health scenarios also qualify
+the new client using owned fixtures and independent HTTP observations.
+The initial six-method archived run passed nonempty two-application/four-service
+comparisons, real 1/1 server paging for applications and each application's
+services, selectors and parameter exclusion, and all 17 node-health policy/filter
+cases including unhealthy success results. Missing application and node-health
+queries retained native errors **-2147017763** and **-2147017705**. Each scenario
+checked mixed concurrent clones and healthy reuse on its original furpc generation.
+Reports now retain one canonical furpc result plus the independent HTTP
+observations, not a second legacy implementation. CI compares complete list
+fields, health events/evaluations, TTLs and timestamps directly with those
+observations. Only native health-event LastModified timestamps may advance
+within the actual observation window. Legacy typed-slot/explicit-close cases
+are not imposed on furpc; its own transport suite covers managed lifecycle.
+The initial three archived scenarios passed together on Service Fabric
+**11.8.121.4**, also requalifying Ping, NameExists and GetNodeList after the
+generic-codec refactor.
 
-`fube-transport` implements bounded Fabric serialization, clear frames and CRCs,
-ordered native headers, client-only ListenInstance establishment, and
-continuously driven, bounded concurrent Tokio request/reply I/O. `fube-client`
-adds native gateway ping, NameExists, typed node/application/service pages, node health and
-single-name creation/deletion, with owned results and explicit errors. Additional
-typed pages cover service partitions, partition replicas/stateless instances and
-node-local deployed applications. Unpaged node/application-scoped lists inspect
-service packages, code packages and deployed replicas.
+The partition/replica migration reuses those declarations and retires both
+legacy methods and typed-request adapters. Its updated owned list scenario
+records canonical furpc partition/replica fields alongside independent HTTP,
+checks six partitions and 22 replicas/instances, and verifies native
+missing-partition error **-2147017753**, original-generation reuse and concurrent
+partition/replica/Ping calls. Movement still uses the legacy writer but observes
+replicas through furpc.
+
+The updated archived scenario passed against a fresh five-node Service Fabric
+**11.8.121.4** onebox after the deployment migration and synthetic-test removal.
+It checked six partitions, 22 replicas/instances, real deployed-application
+paging, ten service packages, ten code packages and 22 deployed replicas against
+independent HTTP. All topology/deployment responses retained the original furpc
+generation. The four deployment methods preserved missing-node error
+**-2147017795**, and the existing owned MovePrimary transition and cleanup passed.
+CI independently validated the actual list, topology, deployment and movement
+receipts, including entry-point statistics and native/REST timestamp-label mapping.
+
+The migrated native name-lifecycle archive also passed on a fresh five-node
+**11.8.121.4** onebox. Native create/delete and NameExists matched independent
+HTTP observations; duplicate **-2147017792** and missing **-2147017791** remained
+domain errors. All successful writes, reads and three concurrent cloned
+Ping/NameExists operations retained furpc generation **1**. The actual receipt
+passed `validate_furpc_names` after owned cleanup removed the name journal.
+
+The updated archived list scenario also passed on the retained five-node
+**11.8.121.4** onebox with MovePrimary entirely on furpc. One constraint-enforced
+request moved the captured owned partition from **N0020** to its existing ready
+secondary on **N0040**. Independent native/HTTP observations retained the same
+replica identities and confirmed the role swap; the mutation response and
+subsequent cloned replica/partition/Ping calls all retained generation **1**.
+The actual list, topology, deployment and movement receipts passed their
+independent validators after all owned fixture resources were cleaned.
+This does not qualify force/ignore options, native movement rejections, replay
+or remote completion after a real transport failure.
+
+The updated archived resolution/notification scenario passed on the retained
+**11.8.121.4** onebox. Eight resolution/previous-result refresh cases covered
+singleton, negative/positive signed-int64 and both named keys. Native partition
+details and endpoint/role multisets matched independent HTTP, with endpoint
+counts **5/3/3/5/3/3/1/1**. Missing service **-2147017779** remained a domain
+failure; subsequent concurrent resolution/Ping/node calls retained generation **1**.
+The existing endpoint-count change, primary replacement, version progression,
+real notification ACK loss/retry and independent notification-owner teardown
+also passed. Actual resolution and retry receipts passed their validators after
+owned cleanup. That earlier run used the independent legacy notification transport.
+
+The notification migration then reran the same targeted archive on the retained
+default-Docker **11.8.121.4** onebox. Ordinary calls retained furpc generation
+**1**, with three independent notification sessions on generations **2/3/4**.
+Native session establishment, four explicit filter unregister confirmations,
+endpoint-count/primary changes and empty invalidations passed. A real successful
+ACK was dropped, the native gateway retried under a fresh request ID, and the
+furpc runner sent its correlated ACK without duplicate application delivery.
+Actual notification/resolution/retry receipts passed independent validators and
+owned cleanup completed; the onebox was left running.
+
+Together with the earlier native runs, this qualifies thirteen reads, two naming
+writes, MovePrimary and notification receiving/ACKs over initiating clear TCP on
+the observed runtime, not native notification origination, accepted-side serving,
+TLS or other gateway operations. The independent ImageStore journey is described below.
+
+### Operation inventory and independent clients
+
+`fube-client` has migrated every implemented ordinary operation, notification
+session and ImageStore upload to furpc. The legacy transport crate remains for
+other workspace consumers, not production fube-client calls.
+All paged and unpaged list queries use furpc; their legacy methods,
+typed-request implementations and input-accounting adapters are retired.
 Uncached resolution and independent notification sessions add endpoint discovery
 without an endpoint-result cache.
 An independently owned `ImageStoreClient` adds native application-package copy
@@ -99,20 +288,20 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 | GetNodeHealth | Sends external `GetNodeHealth` via NamingGateway; validates the HM single-item envelope, aggregate, full events and Event evaluations. Independently injected Warning, false/true/inherited policy, event masks, unknown-node error and healthy same-connection reuse qualified live. |
 | GetApplicationList | Native external query with owned application identity/type/version/status/health/parameters/definition; two unique nonempty applications, exact/type/definition filters, parameter exclusion and explicit native continuation qualified live. |
 | GetServiceList | Public Rust method sends external **GetApplicationServiceList** for an ordinary application. Owned kind/type/manifest/status/health/persistence/group results; stateless and volatile stateful guest services, filters and real native continuation qualified live. |
-| GetPartitionList | Sends **GetServicePartitionList**, wrapper tag 5. Singleton/stateless and int64-range/stateful records, GUID selectors and overlapping fields independently compared live for six owned partitions. Named keys and message-size continuations have offline coverage only. |
-| GetReplicaList | Sends **GetServicePartitionReplicaList**, wrapper tag 6. Stateful replicas and stateless instances, signed ID selectors, Ready status filtering, addresses, placement and health compared live for 22 records; missing-partition error followed by healthy reuse. Message-size continuations have offline coverage only. |
+| GetPartitionList | Furpc sends **GetServicePartitionList**, wrapper tag 5. Six owned singleton/stateless and int64-range/stateful partitions, field projections and GUID selectors independently compared live. Named keys and message-size continuations remain unqualified. |
+| GetReplicaList | Furpc sends **GetServicePartitionReplicaList**, wrapper tag 6. Twenty-two stateful replicas/stateless instances, ID selectors, Ready filtering, placement and native error reuse independently compared live on the original furpc generation. Message-size continuations remain unqualified. |
 | GetDeployedApplicationList | Sends **GetApplicationPagedListDeployedOnNode**, wrapper tag 10. Node/application selectors, directory fields, requested/default health and real count-limited continuation independently compared live; missing-node error followed by healthy reuse. |
 | GetDeployedServicePackageList | Sends **GetServiceManifestListDeployedOnNode**, wrapper tag 11. Ten service-package observations independently compared live, including manifest/version/status/activation and exact manifest selectors. No paging. |
-| GetDeployedCodePackageList | Sends **GetCodePackageListDeployedOnNode**, wrapper tag 14. Ten ExeHost code-package observations independently compared live, including entry points/statistics, host/activation fields and exact code-package selectors. Setup execution and container hosts are offline-only. No paging. |
+| GetDeployedCodePackageList | Furpc sends **GetCodePackageListDeployedOnNode**, wrapper tag 14. Ten ExeHost code-package observations independently compared live, including entry points/statistics, host/activation fields and exact code-package selectors. Setup execution and container hosts remain unqualified. No paging. |
 | GetDeployedReplicaList | Sends **GetServiceReplicaListDeployedOnNode**, wrapper tag 12. Twenty-two stateful/stateless observations independently compared live, including partition selectors, host process IDs, activation and stateful reconfiguration details. Reply actor is RS (13), not RA (12) or NamingGateway (5). No paging. |
 | ResolveServicePartition | Uncached native gateway request with singleton, named or signed-int64 selection and optional previous-result metadata. Owned partition details, endpoints/roles and identity-scoped generation/lookup versions. All three key kinds, refreshes, missing-service errors and independent endpoint/role comparisons qualified on 11.8.121.4. |
 | Service notifications | Standalone noncloneable `ServiceNotificationClient`, independent connection/session/receiver, many owning RAII filter guards. Exact/prefix/primary-only registration, native updates, endpoint-count changes, primary replacement, empty invalidations, unregister and independent close qualified on 11.8.121.4. A lost successful ACK caused a real native retry without duplicate delivery. Distinct-address primary-only delivery remains separately unqualified. |
 | Native ImageStore package copy | Dedicated `ImageStoreClient`, v1.2 session/chunk/commit protocol and native AtomicCopy root replacement. Rust's complete inventory matched one native SDK predecessor minus a deliberate obsolete file, and independently matched local files/zero-byte postorder `_.dir` markers. Nested Unicode/space paths, empty files/directories, 7 MiB data, a 132 MiB binary, stale removal, provisioning/creation, independent live application contact and deployed Data SHA256 comparison passed on 11.8.121.4. Repeated native SDK copy reliability is not claimed. |
-| MovePrimary | Constraint-enforced native FM query with RS13/QueryReply and empty QueryResult. No force/ignore option. Current owned-fixture qualification records independent native/HTTP primary transition and cleanup. |
-| Native faults/errors | Typed Local/Transport/Protocol/Domain origins. Transport Fault retains its exact header code with a generic diagnostic, not optional native-body enrichment. Domain failures retain required native codes and valid diagnostic data. |
-| Concurrent operations | Mixed ping, NameExists, node-list and node-health queries on clones sharing one connection; real onebox coverage. Deterministic cancellation/late-reply safety remains model-covered. |
-| Idle disconnect | Real native ping through a test-owned proxy, followed by proxy cutoff; closure detected without another operation. |
-| Controls and stream lifecycle | Idle ListenInstance, deadlines, fragmentation, backpressure, correlation, cancellation, and close/drop; offline model-peer coverage. |
+| MovePrimary | Furpc constraint-enforced native FM query with RS13/QueryReply and empty QueryResult. No force/ignore option, paging or replay. The owned fixture observes the actual native/HTTP primary transition, source generation, mixed cloned reuse and cleanup. |
+| Native faults/errors | Furpc operations preserve Native/Decode/Protocol/Domain categories, including native Fault bodies and original sources. Independent notification/ImageStore clients retain their own error contracts. |
+| Concurrent operations | Mixed read queries on clones sharing one connection; real onebox coverage. Deterministic cancellation/late-reply behavior belongs to furpc's transport suite. |
+| Idle disconnect | Historical legacy proxy qualification is retired with its read façade; managed furpc lifecycle has its own transport coverage. |
+| Controls and stream lifecycle | Underlying furpc/fube-transport suites cover managed transport behavior. Synthetic fube-client wire/model-peer tests are retired. |
 
 Ordinary management requests advertise protocol **1.1**; native ImageStore
 uploads use canonical **1.2**, without legacy fallback. The demonstrated gateway replies with
@@ -129,59 +318,41 @@ GetNodeHealth instead returns actor **HM (16)** and action
 
 ```rust,no_run
 use std::time::Duration;
-use fube_client::{ClientOptions, FabricClient};
-use fube_transport::{channel::MessageChannel, connection::deadline_after};
+use fube_client::FurpcClient;
+use furpc::Request;
+use tokio::time::Instant;
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let endpoint = FabricClient::endpoint_clear("127.0.0.1:19000".parse()?)?
+let endpoint = FurpcClient::endpoint_clear("127.0.0.1:19000".parse()?)?
     .connect_timeout(Duration::from_secs(10));
 let channel = endpoint.connect().await?;
-let client = FabricClient::new(channel.clone(), ClientOptions {
-    default_timeout: Duration::from_secs(30),
-    ..ClientOptions::default()
-})?;
-let other = client.clone();
-let (gateway, exists) = tokio::try_join!(
-    client.ping(None),
-    other.name_exists("fabric:/Example", Some(Duration::from_secs(5))),
+let mut client = FurpcClient::new(channel);
+let mut other = client.clone();
+let deadline = Instant::now() + Duration::from_secs(30);
+let (first, second) = tokio::try_join!(
+    client.ping(Request::new(()), deadline),
+    other.ping(Request::new(()), deadline),
 )?;
-channel.close(deadline_after(Duration::from_secs(30))?).await?;
+drop(client);
+drop(other); // last ordinary owner retires the logical channel
 # Ok(())
 # }
 ```
 
-`Channel` is the actual `fube_transport::native_channel::GatewayChannel`, also
-re-exported with `Endpoint`/`ChannelLimits` from `fube-client`, not an
-ordinary-only facade. Its `target()` captures the original actual connection,
-not the gateway's advertised address. Stub binding is synchronous/local: no dial,
-hello, ping or capability grant. Unsupported operations still fail via installed
-policy before visibility. `GatewayClient` remains an explicitly borrowed view.
+All clients use `furpc::Channel`; legacy Channel/Endpoint/ChannelLimits re-exports
+are removed. Crate-root Error/Result now refer to transport-independent
+`fubst` input/model validation; remote calls use FurpcClientError,
+NotificationResult or ImageStoreResult. Endpoint
+configuration is inert; connect owns establishment and `FurpcClient::new` binds
+locally without another handshake. Every ordinary call takes an absolute deadline;
+the earlier request-local deadline wins. Connection timeout is independent.
 
-Endpoint configuration/Clone opens no socket; repeated `connect()` calls create
-independent transport owners. Connection timeout is independent of stub-default
-and per-call durations. Each call starts a fresh whole-operation deadline;
-`None` is finite, and `Some(duration)` overrides only that operation.
-All clients are constructed from an established Channel. The address-taking
-client shortcuts and Channel dialing shortcut are removed; Endpoint owns dialing.
-Use `Endpoint::connect_until(deadline)` when establishment shares a caller-owned
-absolute budget with subsequent startup. Set operation defaults in client options,
-not connection settings; default limits and wire behavior are unchanged.
-
-Invalid Endpoint settings fail pre-dial; invalid `ClientOptions` fail
-pre-application on a possibly already connected channel. Failed `new` normally
-drops only its consumed handle, never explicitly closes retained clones;
-last-owner cleanup still applies. `target()` samples terminal state, not lasting
-health. Drop of one stub does not close surviving owners. Explicit channel close
-uses an absolute deadline and closes all users; `FabricClient::close()` derives
-that wait from its operation default. Timeout/drop after send can leave the
-remote outcome unknown; local write is not receipt, semantic ACK or commit.
-
-Stub clones share typed `ClientLimits`; distinct explicit `new` calls get separate
-local budgets/defaults while sharing transport count/bytes, target, ID history and
-terminal state. Local versus Transport overload remains fail-fast with unchanged
-error provenance and no waiting queue. `CLIENT_SLOT_BYTES` is a conservative
-**4 GiB + 16 MiB counter reservation per typed call**, not an actual allocation
-or RSS estimate. Separate stubs do not promise pooled typed-memory accounting.
+Clones share furpc lifecycle/capacity, not a second typed budget. Dropping one
+owner leaves surviving owners usable; dropping the last retires the logical
+channel. Later independent calls may reconnect, but submitted calls are never
+replayed. Peer/source metadata does not own that lifecycle or retarget the
+gateway to a service-published endpoint. There are no ordinary `close`,
+`is_closed`, `terminal_error`, optional-duration or typed-slot compatibility APIs.
 
 ImageStore's actual connect path uses its own Endpoint factory and common target,
 but keeps a dedicated mutable serial session, one private receiver, actor26 raw
@@ -278,59 +449,66 @@ just onebox destroy poc --confirm poc
 ## 3. Rust API and lifecycle
 
 ```rust,no_run
-use fube_client::{ClientOptions, FabricClient};
+use fube_client::{FurpcClient, PartitionKey, ResolutionRequest};
+use furpc::Request;
+use std::time::Duration;
+use tokio::time::Instant;
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = "127.0.0.1:19000".parse().expect("IP socket endpoint");
-let channel = FabricClient::endpoint_clear(endpoint)?.connect().await?;
-let client = FabricClient::new(channel, ClientOptions::default())?;
-let clone = client.clone();
-let (gateway, exists) = tokio::try_join!(
-    client.ping(None),
-    clone.name_exists("fabric:/app/service", None),
-)?;
-client.close().await?;
+let channel = FurpcClient::endpoint_clear(endpoint)?.connect().await?;
+let mut client = FurpcClient::new(channel);
+let name = "fabric:/Example/Service".parse()?;
+let key = PartitionKey::Singleton;
+let first = client.resolve_service_partition(
+    Request::new(ResolutionRequest::new(&name, &key, None)?),
+    Instant::now() + Duration::from_secs(30),
+).await?.into_body();
+let refreshed = client.resolve_service_partition(
+    Request::new(ResolutionRequest::new(&name, &key, Some(&first))?),
+    Instant::now() + Duration::from_secs(30),
+).await?.into_body();
+let order = first.version.compare(&refreshed.version)?;
+# let _ = order;
 # Ok(())
 # }
 ```
 
-The explicit owner is **cloneable**; operations take `&self` and share one
-GatewayChannel, target and typed budget. Default admission is **eight** retained
-calls, including ready-undelivered replies. The ninth fails immediately with a
-local resource error; there is no admission-waiter queue. Default lifetime
-identity history is **4096**, including the handshake; exhaustion terminates
-the channel without automatic reconnect, retry or replay.
+`ResolutionRequest::new` validates a checked service name, singleton/named/signed
+int64 key and optional previous result, returning `fubst::Result`. It copies only
+the selection and private native refresh metadata, never previous endpoints.
+Public edits to service/partition/version identity cannot rebind that metadata.
+Named keys reject empty/NUL values; native body byte/string widths, rather than
+the retired standalone 32768-unit construction ceiling, bound serialization.
 
-Ordinary methods return `ClientResult<T>` / `ClientError<DomainFailure>`:
-`Local(Error)` for preparation/budget, `Transport(Error)` for RPC including
-Fault, `Protocol(&'static str)` for malformed/mismatched required domain data,
-and `Domain { code, message }` for valid native operation failure. Connect/close
-and excluded clients retain transport Result/Error. There are no flattening
-conversions or old-Connection compatibility wrappers.
+Resolution uses a dedicated native `FubstCodec<ResolutionRequest, ResolveReply>`,
+not the query envelope. NamingGateway actor 5 and `ResolveServiceRequest` reply
+action are checked before body decode. Identity/version, partition details and
+the requested service/key are checked before returning `Response<ResolvedServicePartition>`.
+Addresses remain opaque, endpoint roles retain native semantics, and version
+ordering stays service/partition scoped, including the generation owner.
+No endpoint cache, description lookup, HTTP fallback, retry or replay is added.
 
-The shared `Client::call` future is lazy and owns a sealed `ClientRequest`.
-Preparation, admission and I/O begin on first poll. `GatewayClient::new` borrows
-an explicitly supplied channel/target; it does not clone/adopt/close an external
-owner. Concrete query descriptions, PingRequest, NameRequest and
-ResolutionRequest use existing codecs. Resolution retains owned selection and
-minimal previous refresh metadata, never a cloned endpoint cache.
+All ordinary RPCs use `FurpcClientError`: `Native`, `Decode`, `Protocol` or
+`Domain`, preserving original sources and native Fault bodies. Response source,
+headers and settlement survive model conversion. On-time native settlement stays
+on time when observed/decoded later; there is no legacy final-decode deadline check.
+Independent notifications and ImageStore retain their existing error/lifecycle contracts.
 
-Every remote operation takes a final `timeout: Option<Duration>` argument.
-`None` uses `ClientOptions::default_timeout`; `Some(duration)` overrides
-it for that call, including `ping` and `name_exists`. `None` does **not** mean
-infinite. Explicit durations must satisfy the same finite positive bounds as
-the configured default. There are no separate `_with_timeout` methods.
-
-`create_name(name, timeout)` and `delete_name(name, timeout)` return owned
-`ClientResult<()>` and use one deadline calculated **before URI preparation**, through
-admission and reply decoding. Both reuse the existing bounded URI encoder and
-shared driver; the supported URI grammar is unchanged.
+`FurpcClient::create_name(Request<NamingUri>, deadline)` and `delete_name` return
+`Response<()>` through `FurpcClientError`, using the earlier explicit/request-local
+absolute deadline for encoding, readiness/reconnect, submission and receipt.
+Parse the checked URI before calling. Native on-time settlement remains on time
+when observed or decoded later; the old legacy post-decode deadline check is not
+reintroduced. Both use the shared native URI schema; the supported grammar is unchanged.
 For example, with a unique caller-owned name on a disposable cluster:
 
 ```rust,no_run
-# async fn write(client: &fube_client::FabricClient, owned_name: &str) -> fube_client::ClientResult<()> {
-client.create_name(owned_name, Some(std::time::Duration::from_secs(5))).await?;
-client.delete_name(owned_name, None).await?;
+# async fn write(client: &mut fube_client::FurpcClient, owned_name: fube_client::NamingUri) -> Result<(), fube_client::FurpcClientError> {
+let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+client.create_name(furpc::Request::new(owned_name.clone()), deadline).await?;
+let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+client.delete_name(furpc::Request::new(owned_name), deadline).await?;
 # Ok(())
 # }
 ```
@@ -340,7 +518,7 @@ an already **explicitly created** name returns native `FABRIC_E_NAME_ALREADY_EXI
 (-2147017792), not an idempotent success. Deleting an absent name returns
 `FABRIC_E_NAME_DOES_NOT_EXIST` (-2147017791). Deletion is not recursive and can
 reject a nonempty name; the service may remove empty implicit ancestors.
-Native body codes/diagnostics remain `ClientError::Domain`, operation-local
+Native body codes/diagnostics remain `FurpcClientError::Domain`, operation-local
 when the stream is healthy. Write success has an empty body, unlike NameExists
 despite their shared reply action.
 
@@ -349,73 +527,25 @@ disconnect after sending **does not establish that the write failed to execute**
 replication may commit after local waiting stops. Dropping the future or closing
 the connection does not roll back a sent write.
 
-Implementation: [write facade](../../crates/libs/fube-client/src/lib.rs#L85-L136)
-and [empty-success decoder](../../crates/libs/fube-client/src/protocol.rs#L165-L171).
+Implementation: [typed stub](../../crates/libs/fube-client/src/furpc_client.rs)
+and [empty-root codec](../../crates/libs/furpc/src/codec.rs).
 Native contract: [public request construction](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/client/FabricClientImpl.cpp#L6881-L6976)
 and [gateway create reply](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/EntreeService.CreateNameAsyncOperation.cpp#L24-L49).
 
-Each operation has one local monotonic deadline covering encoding, sending,
-control dispatch, receiving, and result decoding. Replies match both message
-GUID and index. Unknown, duplicate, and late replies cannot complete another
-operation; their bodies are discarded and a saturating diagnostic count is
-retained. More than 1,024 consecutive unmatched replies retires the connection.
-
-One background driver per connection supervises independent persistent receive,
-write, and deadline processing. It continues receiving while idle and while
-output is blocked. Supported ListenInstance controls update a peer snapshot.
-Transport controls are handled before reverse traffic and ordinary correlation;
-unsupported reverse requests fail explicitly and receive no acknowledgment.
-
-Cancellation or a reply-wait timeout removes that caller's pending entry without
-closing an otherwise healthy connection. Cancelled/expired queued frames are
-discarded before writing. A started frame is finished independently of the
-caller, or the entire connection closes: its suffix is never removed from a
-reusable stream. Started writes have an independent 30-second local progress
-limit: a cancelled/expired caller's deadline cannot truncate that frame or
-prematurely fail its neighbors. Partial incoming frames must complete
-within 30 seconds of their first byte; an idle connection has no inactivity
-timeout. A stalled partial read/write, I/O failure, or malformed frame closes
-the connection and resolves pending callers.
-
-Successful domain bodies are decoded on the polling typed observer, not a
-detached task or the transport driver. The absolute deadline is rechecked
-before/after preparation and final validation: an on-time channel settlement
-observed too late cannot become a late typed success. Malformed/mismatched
-domain data fails only that call and leaves neighbors/owner usable; malformed
-transport envelopes independently terminate the channel. Native code-only
-ClientOperationFailure suffixes are valid; a present diagnostic must decode.
-Transport Fault diagnostics are not reconstructed from the consumed body.
-Cancellation/timeout does not imply remote cancellation. Invalid input sends nothing.
-
-Ordinary replies use native's final effective RelatesTo in wire order.
-All repeated records are validated and preserved under the
-[channel's header/frame bounds](NativeChannel.md#supported-composition), without a
-special forwarding-count or repetition-pattern restriction. Typed operations
-validate their normal reply actor/action/body profile independently.
-No earlier pending-ID fallback, header normalization, notification/IPC expansion
-or trust bypass.
-
-`is_closed()` observes terminal state, including idle failures;
-`terminal_error()` returns the first terminal cause. Later operations surface
-closure/resource/deadline errors rather than reconnecting; inspect
-`terminal_error()` for the original cause. `close()` is shared and idempotent, resolves
-pending callers and waits for driver exit. Cancelling its wait does not cancel
-shutdown. Dropping one clone leaves others usable; dropping the final handle
-signals shutdown without an asynchronous join. Use `close()` when release must
-be observed before continuing.
-
-Only valid ListenInstance updates are supported controls. `ScheduleClose`,
-`Reconnect`, authorization/security controls and other control actions are
-unsupported and terminate explicitly; there is no delayed session draining or
-recovery. Supported correlated Faults retain exact header code, not optional
-diagnostic-body enrichment. This is not
-qualification of native secure-session recovery or service notifications.
+Furpc owns managed correlation, send commitment, deadlines and physical
+generation retirement. Operation codecs own their success/failure envelopes and
+body validation. Malformed application data fails the call without inventing a
+successful result; transport integrity failures independently retire the
+physical generation. See the [furpc implementation](design/Furpc/Implementation.md)
+for current lifecycle/settlement behavior and [NativeChannel](NativeChannel.md)
+for the legacy transport still used by other workspace consumers.
 
 ### Native ImageStore application-package copy
 
-`ImageStoreClient` is a noncloneable owner of a dedicated native upload
-`GatewayChannel` with client-installed authorization and actor25/27 registration.
-Registration alone grants neither sender nor consuming reply permission.
+`ImageStoreClient` is a noncloneable owner of a dedicated furpc Channel and one
+captured Peer, with authorized Actor 25/27 ordinary one-way ingress services.
+Transfer messages use `Peer::send`; the routed root Delete uses `Peer::request`.
+Semantic ACKs are not ordinary RPC completions or furpc native notifications.
 It does not borrow a `FabricClient` or
 notification session.
 Production upload uses no native SDK, COM library, HTTP gateway or subprocess.
@@ -441,49 +571,43 @@ fube --endpoint 127.0.0.1:19000 --unsecured application upload --path ./MyApp --
 final name (`MyApp` here); the CLI has no destination, provisioning, application
 creation, compression or checksum options. Timeout is positive integer seconds,
 defaults to **300**, and covers the **whole CLI operation**, including local path
-resolution, connection establishment, copy and close. Failures exit nonzero;
+resolution, connection establishment, Peer binding and copy. Failures exit nonzero;
 the success message is printed only after package completion.
 
 ```rust,no_run
 use std::{path::Path, time::Duration};
 use fube_client::{ImageStoreClient, ImageStoreClientOptions};
 
-# async fn upload() -> fube_client::Result<()> {
+# async fn upload() -> fube_client::ImageStoreResult<()> {
 let address = "127.0.0.1:19000".parse().expect("native IP socket endpoint");
 let endpoint = ImageStoreClient::endpoint_clear(address)?
     .connect_timeout(Duration::from_secs(10));
 let channel = endpoint.connect().await?;
 let mut client = ImageStoreClient::new(channel, ImageStoreClientOptions {
     default_timeout: Duration::from_secs(300),
-})?;
+}).await?;
 client.copy_application_package(Path::new("./MyApp"), "MyApp", None).await?;
-client.close().await?;
+drop(client); // Release the uploader's Channel owner; not a physical teardown barrier.
 # Ok(())
 # }
 ```
 
-`new` consumes the actual established `Channel` synchronously. It only validates
-operation defaults and acquires the original connection target and private ACK
-receiver: no dial, native session request, hidden startup or permission change.
-Options default to **30 seconds**, independently of endpoint establishment.
-Only `new(Channel, ImageStoreClientOptions)` constructs an uploader; Endpoint
-owns connection establishment, separately from the later copy default.
-
-Use a dedicated upload connection with at most one uploader/protocol consumer.
-Raw channel clones and repeatable/cloned raw receivers remain available, but
-competing consumers can steal semantic ACKs; they are unsupported for this session.
-Binding does not reserve exclusive inbox ownership or upgrade an ordinary
-channel's permissions. Invalid options or unavailable inbox only drop the supplied
-handle, without explicitly aborting retained raw clones. Normal uploader drop
-likewise releases its owner handle; existing last-owner cleanup still applies.
-Explicit upload cancellation or uncertain failure retires the shared connection
-even when raw clones survive. No new uploader drop policy is introduced.
+Async `new` consumes a dedicated `furpc::Channel`, validates operation defaults,
+captures its Peer and installs authorized ordinary one-way ingress. It sends no
+native ImageStore session exchange; each file still creates its own native session.
+Options default to **30 seconds**, independently of Endpoint establishment;
+that default bounds Peer acquisition and each copy without an override.
+After binding, no upload operation reacquires a Peer, reconnects or replays.
+Use a Channel with no existing ingress service and retain no outside clones if
+uploader failure/drop must release its last owner. Ingress configuration captures
+only weak domain ownership; it cannot keep the upload connection alive by itself.
 
 `copy_application_package(&mut self, source: &Path, destination: &str,
-timeout: Option<Duration>) -> Result<()>` serializes copies through its mutable
-receiver and uses the existing `fube_transport::Error`/`Result`.
-`None` uses `ImageStoreClientOptions::default_timeout` (or the legacy connection
-duration); `Some(duration)` overrides the
+timeout: Option<Duration>) -> ImageStoreResult<()>` serializes copies through its
+mutable receiver. `ImageStoreError::Common(FurpcClientError)` preserves native
+transport/Fault, gateway protocol, codec and domain failures;
+`ImageStoreError::Io` retains the original filesystem error.
+`None` uses `ImageStoreClientOptions::default_timeout`; `Some(duration)` overrides the
 copy budget, never meaning infinity. Unlike the CLI's enclosing deadline,
 library connection establishment and a later copy each have their own deadline.
 The copy deadline spans local preparation, root Delete, content, file commits
@@ -517,12 +641,12 @@ source can fail or produce mixed-time content.
 | Upload resource | Limit and behavior |
 |---|---|
 | Outstanding content | **One** negotiated chunk; nonfinal chunks retain the full negotiated size so native sequence-derived offsets remain correct. |
-| Content frame | **4 MiB total**, including the **12-byte** fixed header and every native header. An oversized negotiated threshold fails before content is read/sent; it is never silently shrunk. A zero advertised threshold uses **3 MiB**. |
+| Content frame | Native **u32** full-frame capacity and configured furpc Endpoint limits, including the 12-byte prefix and every native header. Native-capacity overflow fails before reading content; configured limits are additionally enforced at send admission. Thresholds are never silently shrunk. Zero uses **3 MiB**. |
 | Directory traversal | **128** simultaneously open directory levels, including the source root; **1,000,000** visited entries. No package-sized file or GUID snapshot is retained. |
-| Native path encoding | Each native string is at most **32,768 UTF-16 units**; the complete native header area must fit **65,535 bytes**. Before Delete, the generated `/_.dir` FileCreate is encoded as a complete frame, including Actor/Action/MessageId, Activity/version, upload fields, Timeout and record overhead, with maximum relevant MessageId index/timeout widths. These are encoded-size limits, not a promise that every 32,768-unit path fits. |
-| Reply handoff | **32** raw backend ACK envelopes, no second queue/worker; overflow is terminal. Transport authority is validated on ingress; domain headers/body are decoded at client pull before stale filtering. Unread domain-invalid ACKs remain bounded raw ingress until pull. |
+| Native path encoding | Native string widths and the **65,535-byte** header area; no standalone 32,768-unit ceiling. Before Delete, the generated `/_.dir` FileCreate is constructed with complete maximum-width managed MessageId/timeout and native headers. |
+| Reply handoff | **32** decoded application-owned semantic ACKs; no extra socket reader or worker. Furpc authorizes ingress before retention, then the service validates headers/body before enqueueing. Queue overflow or malformed ACKs preserve the original error and release upload ownership. |
 | Stale/duplicate replies | At most **64 consecutive** well-formed obsolete replies per awaited stage; the 65th fails. Wrong future sequences/actions and malformed bodies fail, not count as harmless stale traffic. |
-| Transport capacity | **8** ordinary admitted sends/requests, including started writes and completed-undelivered results; upload content/controls never use consuming reply slots. **1 GiB** conservative aggregate reservation ceiling, not eager allocation. |
+| Transport capacity | Existing furpc TransportLimits/HandlerLimits and native codec widths; no retained-allocation ledger, lifetime-ID history or upload-specific transport quota. |
 
 Every file uses FileCreate, acknowledged raw content chunks, then actor-27
 commit success followed by a flushed FileUploadCommitAck. Even an empty file
@@ -530,8 +654,8 @@ sends **one empty chunk** before commit. Content/chunk ACKs alone cannot report
 file success. Native semantic ACKs can omit MessageId/RelatesTo: strict actor
 25/27, action, version, Activity GUID and sequence/body checks are required.
 Late prior-file cleanup results and duplicate commits cannot complete a later
-file. Upload actor26 frames omit ordinary MessageIds; this avoids consuming
-transport lifetime-ID history per chunk without relaxing history/collision rules.
+file. Managed furpc sends supply MessageIds; semantic ACK matching still uses
+native Activity/sequence, not transport RelatesTo. No lifetime-ID history is added.
 Root Delete is still ordinary actor5 RPC on this upload socket.
 OperationsPending can resend the **same GUID's commit** within the original
 deadline; there is no reconnect or whole-package replay.
@@ -543,25 +667,22 @@ original deadline and socket permit it, without replacing the primary error.
 It never deletes the remote directory as failure recovery. File success does
 not wait for the later native session-cleanup result.
 
-Once remote work is guarded, dropping the upload future synchronously aborts
-the dedicated connection. **No asynchronous remote cleanup is spawned after
-future drop**, and no rollback or remote-session removal is promised; native
-expiry may eventually reclaim staged data. Uncertain errors/deadlines also
-retire the client. `is_closed()`/`terminal_error()` expose terminal state and
-reuse fails rather than reconnecting. Validation failures before guarded remote
-work can leave the client usable; successful copies retain a reusable socket.
-`close(&self) -> Result<()>` awaits the retained socket-driver join with a
-separate **31-second teardown budget** (30-second full-frame watchdog plus
-one second), without extending the upload deadline. A started frame may finish
-its suffix after observer cancellation; completion means local full-frame
-write, never remote ACK, commit or rollback. Close/disposal success is separate
-from the retained terminal cause.
+Once remote work is guarded, dropping the upload future records cancellation
+and releases the uploader's Channel owner. **No asynchronous remote cleanup is
+spawned after future drop**, and no rollback or remote-session removal is promised;
+native expiry may eventually reclaim staged data. Uncertain errors/deadlines
+prevent reuse rather than reconnecting. Validation failures before guarded remote
+work can leave the client usable; successful copies retain a reusable connection.
+Legacy `close`, `is_closed` and `terminal_error` APIs are removed.
+Drop follows furpc last-owner semantics, does not revoke outside clones, and is
+not a physical-driver join barrier. An idle physical disconnect has no separate
+closure observer; waiting for a semantic ACK remains bounded by the copy deadline.
 
-Implementation: [public API and copy lifecycle](../../crates/libs/fube-client/src/image_store.rs#L59),
-[native codecs](../../crates/libs/fube-client/src/image_store_protocol.rs#L144),
-[complete root-marker preflight](../../crates/libs/fube-client/src/image_store_protocol.rs#L310),
-[strict client semantic ACK decoding](../../crates/libs/fube-client/src/image_store_protocol.rs#L48)
-and [client-owned upload envelope authority](../../crates/libs/fube-client/src/channel_adapter.rs#L72).
+Implementation: [public API and copy lifecycle](../../crates/libs/fube-client/src/image_store.rs),
+[native codecs](../../crates/libs/fube-client/src/image_store_protocol.rs),
+[complete root-marker preflight](../../crates/libs/fube-client/src/image_store_protocol.rs),
+[strict client semantic ACK decoding](../../crates/libs/fube-client/src/image_store_protocol.rs)
+and [furpc one-way ingress](../../crates/libs/fube-client/src/image_store.rs).
 Native copy semantics follow the pinned
 [NativeImageStore directory path](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Management/ImageStore/NativeImageStore.cpp#L1139-L1369).
 Native gateway ACKs use raw actor25/27
@@ -591,9 +712,9 @@ for the native wire.
 
 Internally, parameter structs implement `Query: Serialize`, binding the native
 query name, optional `validate_parameters` hook, paging placement, output and
-declarative reply profile. Existing request wrappers implement the sealed
-ClientRequest family. The shared call starts its deadline before preparation,
-awaits an opaque channel response and validates/decodes on the polling typed
+declarative reply profile. Furpc request wrappers use the generic query codec,
+not the retired sealed ClientRequest family. One absolute deadline covers
+encoding, readiness and receipt; validation/decoding stays on the polling
 observer, never on the transport driver. The shared encoder validates and
 serializes parameters directly; operations no longer implement parameter encoding.
 A dedicated Serde argument serializer consumes the parameter types and `Paging`.
@@ -673,10 +794,10 @@ the emitted native request bytes, validation and CLI arguments are unchanged.
 ```rust,no_run
 use std::num::NonZeroU64;
 use fube_client::{
-    FabricClient, NodeQueryDescription, NodeQueryParameters, NodeStatusFilter, Paging,
+    FurpcClient, NodeQueryDescription, NodeQueryParameters, NodeStatusFilter, Paging,
 };
 
-# async fn pages(client: &FabricClient) -> Result<(), Box<dyn std::error::Error>> {
+# async fn pages(client: &mut FurpcClient, deadline: tokio::time::Instant) -> Result<(), Box<dyn std::error::Error>> {
 let mut query = NodeQueryDescription {
     parameters: NodeQueryParameters {
         status_filter: NodeStatusFilter::UP | NodeStatusFilter::DOWN,
@@ -688,7 +809,7 @@ let mut query = NodeQueryDescription {
     },
 };
 loop {
-    let page = client.get_node_list(&query, None).await?;
+    let page = client.get_node_list(furpc::Request::new(query.clone()), deadline).await?.into_body();
     for node in page.items {
         println!("{} {} {:?}", node.name, node.id, node.status);
     }
@@ -702,8 +823,8 @@ loop {
 ```
 
 The operation returns an owned `NodeListPage`; callers choose traversal and
-overall budgets. `get_node_list(&query, Some(duration))` supplies a per-request
-timeout, not a whole-traversal deadline. Nodes can change between pages; native
+overall budgets. Reusing the same absolute deadline bounds the whole traversal;
+choosing a new deadline gives each request a separate budget. Nodes can change between pages; native
 aggregation is best-effort when individual subqueries fail. **No continuation
 means paging ended, not proof that every aggregation source answered.**
 
@@ -731,15 +852,15 @@ call, without aborting the owner. Nonempty deactivation/safety variants have sou
 
 ```rust,no_run
 use fube_client::{
-    FabricClient, HealthEventsFilter, NodeHealthPolicy, NodeHealthQueryDescription,
+    FurpcClient, HealthEventsFilter, NodeHealthPolicy, NodeHealthQueryDescription,
     NodeHealthQueryParameters,
 };
 
-# async fn health(client: &FabricClient) -> Result<(), Box<dyn std::error::Error>> {
+# async fn health(client: &mut FurpcClient, deadline: tokio::time::Instant) -> Result<(), Box<dyn std::error::Error>> {
 let mut query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("N0020"));
 query.parameters.events_filter = Some(HealthEventsFilter::ERROR.into());
 query.parameters.health_policy = Some(NodeHealthPolicy { consider_warning_as_error: true });
-let health = client.get_node_health(&query, None).await?;
+let health = client.get_node_health(furpc::Request::new(query), deadline).await?.into_body();
 println!("{:?}", health.aggregated_health_state);
 for evaluation in health.unhealthy_evaluations {
     println!("{evaluation:?}");
@@ -748,8 +869,8 @@ for evaluation in health.unhealthy_evaluations {
 # }
 ```
 
-`get_node_health` uses one deadline from preparation through typed-observer
-decode, like node-list. `NodeHealth` owns its node name, event vector, aggregate
+`get_node_health` uses furpc's absolute deadline and on-time settlement rules,
+like node-list. `NodeHealth` owns its node name, event vector, aggregate
 `HealthState` and unhealthy evaluations. This is **actual detail health**, not
 `Node.health_state` from GetNodeList. Unhealthy aggregate is successful data;
 unknown node returns native `FABRIC_E_HEALTH_ENTITY_NOT_FOUND`
@@ -806,11 +927,12 @@ public C API pointer layout or safety-check-style derived scope.
 ```rust,no_run
 use std::{num::NonZeroU64, time::Duration};
 use fube_client::{
-    ApplicationListFilter, ApplicationQueryDescription, ApplicationQueryParameters, FabricClient,
+    ApplicationListFilter, ApplicationQueryDescription, ApplicationQueryParameters, FurpcClient,
     Paging, ServiceListFilter, ServiceQueryDescription, ServiceQueryParameters,
 };
 
-# async fn workloads(client: &FabricClient) -> Result<(), Box<dyn std::error::Error>> {
+# async fn workloads(client: &mut FurpcClient) -> Result<(), Box<dyn std::error::Error>> {
+let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 let mut applications = ApplicationQueryDescription {
     parameters: ApplicationQueryParameters {
         filter: ApplicationListFilter::TypeName("MyApplicationType".into()),
@@ -821,7 +943,7 @@ let mut applications = ApplicationQueryDescription {
         ..Default::default()
     },
 };
-let page = client.get_application_list(&applications, None).await?;
+let page = client.get_application_list(furpc::Request::new(applications.clone()), deadline).await?.into_body();
 for application in page.items {
     println!("{} {} {:?}", application.name, application.type_version, application.health_state);
 }
@@ -830,7 +952,7 @@ applications.paging.continuation_token = page.continuation_token;
 
 let mut services = ServiceQueryDescription::new(ServiceQueryParameters::new("fabric:/MyApplication".parse()?));
 services.parameters.filter = ServiceListFilter::TypeName("MyServiceType".into());
-let page = client.get_service_list(&services, Some(Duration::from_secs(5))).await?;
+let page = client.get_service_list(furpc::Request::new(services), deadline).await?.into_body();
 for service in page.items {
     println!("{} {:?} {:?}", service.name, service.kind, service.status);
 }
@@ -839,13 +961,11 @@ println!("continuation={:?}", page.continuation_token);
 # }
 ```
 
-`get_application_list` / `get_service_list` use the connection's configured
-default operation timeout when passed `None`, or an override with `Some(duration)`.
-Both use one deadline from preparation through admission, write waiting and
-typed-observer decode. Neither
-automatically pages, retries, reconnects or replays. Native errors stay
-`ClientError::Domain` and permit same-owner reuse; malformed successful domain
-results return `ClientError::Protocol` without failing independent neighbors.
+`get_application_list` / `get_service_list` take typed requests and absolute
+deadlines under furpc settlement rules. Neither automatically pages or replays
+a submitted operation; later independent calls may reconnect. Domain errors stay
+`FurpcClientError::Domain`, transport Faults remain native, and malformed bodies
+or protocol violations remain operation-local without failing independent neighbors.
 
 | Description | Selector and independent controls |
 |---|---|
@@ -938,56 +1058,62 @@ Three additional list APIs extend discovery beyond applications and services:
 | `get_deployed_application_list` | Applications deployed on one selected node, not the cluster-wide application inventory. |
 
 Each accepts a `PagedQuery`-based description and returns one owned `QueryPage`.
-The optional timeout uses one whole-operation deadline,
-including parameter validation and decoding. Continuations are opaque and must
+All three take `furpc::Request<Description>` and an absolute
+deadline, returning the page inside `furpc::Response`. They follow furpc
+settlement/deadline rules.
+Continuations are opaque and must
 be followed explicitly; observations across pages and families are not a
-snapshot. Native errors and malformed domain replies remain operation-local; transport failures retire
-the shared connection. The existing restricted naming URI profile still applies
+snapshot. Native domain errors and malformed success bodies remain operation-local;
+furpc transport/protocol failures may retire a generation, without replaying a
+submitted call. The existing restricted naming URI profile still applies
 to service names and application selectors.
 
 ```rust,no_run
 use std::time::Duration;
 use fube_client::{
     DeployedApplicationQueryDescription, DeployedApplicationQueryParameters,
-    FabricClient, PartitionQueryDescription, PartitionQueryParameters,
+    FurpcClient, PartitionQueryDescription, PartitionQueryParameters,
     ReplicaQueryDescription, ReplicaQueryParameters,
 };
+use furpc::Request;
+use tokio::time::Instant;
 
-# async fn topology(client: &FabricClient, partition_id: uuid::Uuid) -> Result<(), Box<dyn std::error::Error>> {
+# async fn topology(reads: &mut FurpcClient, partition_id: uuid::Uuid) -> Result<(), Box<dyn std::error::Error>> {
+let deadline = Instant::now() + Duration::from_secs(30);
 let mut partitions = PartitionQueryDescription::new(PartitionQueryParameters::new(
     "fabric:/MyApplication/MyService".parse()?,
 ));
-let page = client.get_partition_list(&partitions, None).await?;
+let page = reads.get_partition_list(Request::new(partitions.clone()), deadline).await?.into_body();
 for partition in page.items {
     println!("{} {:?}", partition.partition_information.id, partition.kind);
     let replicas = ReplicaQueryDescription::new(ReplicaQueryParameters::new(
         partition.partition_information.id,
     ));
-    println!("{:?}", client.get_replica_list(&replicas, None).await?.items);
+    println!("{:?}", reads.get_replica_list(Request::new(replicas), deadline).await?.into_body().items);
 }
 partitions.paging.continuation_token = page.continuation_token;
 
 let replicas = ReplicaQueryDescription::new(ReplicaQueryParameters::new(partition_id));
-let page = client
-    .get_replica_list(&replicas, Some(Duration::from_secs(5)))
-    .await?;
+let page = reads
+    .get_replica_list(Request::new(replicas), Instant::now() + Duration::from_secs(5))
+    .await?.into_body();
 println!("{:?}", page.items);
 
 let mut deployments = DeployedApplicationQueryDescription::new(
     DeployedApplicationQueryParameters::new("N0010"),
 );
 deployments.parameters.include_health_state = true;
-let page = client.get_deployed_application_list(&deployments, None).await?;
+let page = reads.get_deployed_application_list(Request::new(deployments), deadline).await?.into_body();
 println!("{:?}", page.items);
 # Ok(())
 # }
 ```
 
 Request JSON retains separate `parameters` and `paging` objects. These APIs use
-the same shared request encoder and list reply profile as the existing queries;
-they introduce no new transport session, automatic retries, or HTTP fallback.
-Service partition resolution, resolution caching, notifications and additional
-health-detail APIs remain out of scope.
+the same shared declarations and list reply profile as the existing queries.
+Furpc owns all ordinary query/resolution paths and independently owned
+notification transport. No query
+adds automatic paging, retry, an endpoint cache or HTTP fallback.
 
 Native partition and replica queries accept continuation tokens but not
 `MaxResults`. Their shared paging field must leave `max_results` as `None`;
@@ -1040,12 +1166,14 @@ Native query specifications reject unknown arguments, including count limits
 on the partition/replica routes; the shared encoder's query capability metadata
 rejects those counts before any request is sent.
 
-The existing owned application/service onebox scenario also qualifies these
+The existing owned application/service onebox scenario covers these
 APIs. Its stateless service runs on all five nodes and its stateful service has
 two int64-range partitions. Independent REST observations must converge to
 Ready/Ok partition and replica state before native field comparisons. The live
-fixture covers all six partitions, 22 replicas/instances, node-local deployment
-pages and native error reuse. It does not exercise Named keys live, manufacture
+fixture now also qualifies all six partitions, 22 replicas/instances,
+node-local deployment pages and native error reuse through furpc, with current
+archived receipts and independent HTTP field comparisons.
+It does not exercise Named keys live, manufacture
 partition/replica continuation evidence, or qualify persisted data replication.
 
 ### Node-local service packages, code packages and deployed replicas
@@ -1059,12 +1187,13 @@ distinct from the cluster-wide service list and partition-scoped replica list.
 | `get_deployed_code_package_list` | `GetCodePackageListDeployedOnNode` | 14 |
 | `get_deployed_replica_list` | `GetServiceReplicaListDeployedOnNode` | 12 |
 
-Each takes a `QueryDescription`-based request and returns `Vec<Record>`, not a
+Each takes `furpc::Request<QueryDescription<Parameters>>` and returns
+`furpc::Response<Vec<Record>>`, not a
 `QueryPage`. The native facade/specifications expose **no paging controls** for
 these queries: there is no `paging`, `MaxResults` or continuation token to set.
-Each takes an optional timeout, with the same whole-operation
-deadline, native-error reuse and call-local domain validation behavior as the
-other queries. There are no retries, reconnects or automatic replay.
+Each takes an absolute deadline under furpc settlement rules, with native-error
+reuse and call-local domain validation. Later calls may reconnect; submitted
+calls are never replayed.
 Unpaged description JSON rejects unknown outer fields, including `paging`,
 rather than ignoring unsupported controls. This also tightens the shared
 `NodeHealthQueryDescription` wrapper; valid existing request JSON is unchanged.
@@ -1072,18 +1201,21 @@ rather than ignoring unsupported controls. This also tightens the shared
 ```rust,no_run
 use std::time::Duration;
 use fube_client::{
-    FabricClient, DeployedServicePackageQueryDescription,
+    FurpcClient, DeployedServicePackageQueryDescription,
     DeployedServicePackageQueryParameters, DeployedCodePackageQueryDescription,
     DeployedCodePackageQueryParameters, DeployedReplicaQueryDescription,
     DeployedReplicaQueryParameters,
 };
+use furpc::Request;
+use tokio::time::Instant;
 
-# async fn inspect(client: &FabricClient) -> Result<(), Box<dyn std::error::Error>> {
+# async fn inspect(client: &mut FurpcClient) -> Result<(), Box<dyn std::error::Error>> {
+let deadline = Instant::now() + Duration::from_secs(30);
 let application = "fabric:/MyApplication".parse()?;
 let packages = DeployedServicePackageQueryDescription::new(
     DeployedServicePackageQueryParameters::new("N0010", application),
 );
-for package in client.get_deployed_service_package_list(&packages, None).await? {
+for package in client.get_deployed_service_package_list(Request::new(packages), deadline).await?.into_body() {
     println!("{} {}", package.service_manifest_name, package.service_manifest_version);
 }
 let mut code = DeployedCodePackageQueryDescription::new(
@@ -1091,7 +1223,7 @@ let mut code = DeployedCodePackageQueryDescription::new(
 );
 code.parameters.service_manifest_name = Some("MyServiceManifest".into());
 code.parameters.code_package_name = Some("Code".into());
-println!("{:?}", client.get_deployed_code_package_list(&code, None).await?);
+println!("{:?}", client.get_deployed_code_package_list(Request::new(code), deadline).await?.into_body());
 
 let mut replicas = DeployedReplicaQueryDescription::new(
     DeployedReplicaQueryParameters::new("N0010", "fabric:/MyApplication".parse()?),
@@ -1100,8 +1232,8 @@ replicas.parameters.partition_id = Some(uuid::Uuid::parse_str(
     "00112233-4455-6677-8899-aabbccddeeff",
 ).expect("partition UUID"));
 let deployed = client
-    .get_deployed_replica_list(&replicas, Some(Duration::from_secs(5)))
-    .await?;
+    .get_deployed_replica_list(Request::new(replicas), Instant::now() + Duration::from_secs(5))
+    .await?.into_body();
 println!("{deployed:?}");
 # Ok(())
 # }
@@ -1155,28 +1287,28 @@ REST comparisons, exact selectors, empty selections, mixed queries and ping,
 and missing-node native errors followed by healthy same-connection reuse.
 The fixture uses shared activation and ExeHost without a setup entry point.
 Exclusive/nonempty activation, setup execution, container/HyperV hosting,
-nondefault reconfiguration phases and fields without REST projections have
-offline model coverage only; reconfiguration transitions were not exercised
-live. No TLS or cross-release compatibility is claimed.
+nondefault reconfiguration phases and fields without REST projections are not
+independently qualified; reconfiguration transitions were not exercised live.
+No TLS or cross-release compatibility is claimed.
 
 ### Uncached resolution and independent notifications
 
 Both clients live in `fube-client`, but neither owns the other or shares its
-socket/session. Notification-only applications need no `FabricClient`; multiple
+socket/session. Notification-only applications need no `FurpcClient`; multiple
 notification clients can coexist. Each is constructed from its own Channel;
-options set remote-operation defaults independently of dialing. `None` uses the
-session default, not infinity.
+notification options set remote-operation defaults independently of dialing.
+Their `None` uses the session default, not infinity; ordinary calls take absolute deadlines.
 
 ```rust
 use fube_client::{
-    ClientOptions, FabricClient, NamingUri, NotificationClientOptions, PartitionKey,
+    FurpcClient, NamingUri, NotificationClientOptions, PartitionKey, ResolutionRequest,
     ServiceNotificationClient, ServiceNotificationFilter,
 };
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = "127.0.0.1:19000".parse().unwrap();
-let channel = FabricClient::endpoint_clear(endpoint)?.connect().await?;
-let ordinary = FabricClient::new(channel, ClientOptions::default())?;
+let channel = FurpcClient::endpoint_clear(endpoint)?.connect().await?;
+let mut ordinary = FurpcClient::new(channel);
 let channel = ServiceNotificationClient::endpoint_clear(endpoint)?.connect().await?;
 let mut changes =
     ServiceNotificationClient::start(channel, NotificationClientOptions::default()).await?;
@@ -1185,8 +1317,9 @@ let registration = changes.register_filter(&ServiceNotificationFilter {
     name: name.clone(), name_prefix: false, primary_only: false,
 }, None).await?;
 let initial = ordinary.resolve_service_partition(
-    &name, &PartitionKey::Singleton, None, None,
-).await?;
+    furpc::Request::new(ResolutionRequest::new(&name, &PartitionKey::Singleton, None)?),
+    tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+).await?.into_body();
 if let Some(update) = changes.recv().await {
     let update = update?;
     if update.partition_id == initial.partition_information.id {
@@ -1195,7 +1328,7 @@ if let Some(update) = changes.recv().await {
 }
 registration.unregister(None).await?;
 changes.close(None).await?;
-ordinary.close().await?;
+drop(ordinary);
 # Ok(())
 # }
 ```
@@ -1209,7 +1342,7 @@ use std::time::Duration;
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = ServiceNotificationClient::endpoint_clear(
     "127.0.0.1:19000".parse()?,
-)?; // Local configuration only; installs notification-specific transport policy.
+)?; // Local furpc configuration only; start installs authorized notification ingress.
 let channel = endpoint.connect_timeout(Duration::from_secs(10)).connect().await?;
 let changes = ServiceNotificationClient::start(channel, NotificationClientOptions {
     startup_timeout: Duration::from_secs(15),
@@ -1222,10 +1355,10 @@ changes.close(None).await?;
 
 These are three distinct operations: Endpoint configuration performs no I/O;
 `Endpoint::connect` establishes transport; notification `start` asynchronously
-creates a fresh native session. Unlike ordinary `FabricClient::new`, `start` is
-not local stub binding. It uses `Channel::target()` (the original established
-target), not the gateway address advertised in the native reply. The factory
-returns the shared transport `Result<Endpoint>`; startup and subsequent protocol
+creates a fresh native session. Unlike ordinary `FurpcClient::new`, `start` is
+not local stub binding. It captures the original established furpc Peer,
+not the gateway address advertised in the native reply. The factory
+returns `furpc::Result<furpc::Endpoint>`; startup and subsequent protocol
 operations return `NotificationResult`.
 
 `NotificationClientOptions` defaults both budgets to 30 seconds. The Endpoint's
@@ -1243,7 +1376,7 @@ use tokio::time::{timeout_at, Instant};
 let deadline = Instant::now() + Duration::from_secs(30);
 let changes = timeout_at(deadline, async {
     let channel = ServiceNotificationClient::endpoint_clear("127.0.0.1:19000".parse()?)?
-        .connect_until(deadline).await?;
+        .connect().await?;
     ServiceNotificationClient::start(channel, NotificationClientOptions {
         startup_timeout: deadline.saturating_duration_since(Instant::now()),
         default_timeout: Duration::from_secs(30),
@@ -1255,24 +1388,15 @@ changes.close(None).await?;
 ```
 
 The outer deadline also bounds startup publication; it never renews the dial
-budget. Startup cancellation retains the existing candidate-retirement behavior.
+budget. Failed/cancelled startup closes local session admission and releases its
+Channel owner; it does not add a furpc physical-retirement receipt.
 
-Use a **dedicated notification-authorized Channel**, with no other protocol
-session or competing receivers. `start` cannot add notification permissions or
-silently adopt an ordinary session; having some receiver-enabled policy is not
-proof of notification authorization. Generic Channel receiver acquisition and
-clone/concurrent-read semantics are unchanged, but competing notification
-consumers are unsupported because they can steal ordered pages/reply contexts.
-
-Both startup options validate locally before protocol responsibility begins.
-Invalid options or dropping an unpolled startup future only drop the supplied
-handle, without explicitly aborting retained clones (normal last-owner shutdown
-still applies). Once validated startup begins, failure or cancellation retires
-the candidate shared Channel. After publication, owner drop, explicit close and
-terminal failure likewise retire the Channel even if raw clones remain. Retaining
-a clone does not keep a retired native notification session usable. Shutdown can
-outlive an expired operation deadline while the existing started-frame watchdog
-and worker/socket teardown finish.
+Use a **dedicated furpc Channel with no existing ingress service**. `start`
+installs the Actor 5 notification binding and exact envelope/ACK policies before
+the native connection request. Do not retain outside Channel clones if owner
+drop must release its last owner. There is no second reader or public native
+notification receiver. Endpoint HandlerLimits govern incoming invocation
+capacity and ACK deadlines independently of the notification operation default.
 
 Keep the returned registration bound to a variable. Dropping it initiates
 bounded asynchronous cleanup; `let _ = register_filter(...).await?` immediately
@@ -1298,45 +1422,46 @@ one terminal error, then `None`, independently of a full update queue. Buffered
 updates may be discarded on terminal failure. Full-page delivery and progress
 commit before successful native ACK; application processing is not part of ACK.
 Unconfirmed filter mutations/cleanup retire only this notification session.
-Explicit close attempts deregistration under one deadline and awaits task/socket
-stop even on cleanup failure. Owner drop initiates shutdown; remote disconnect
-cleanup is eventual, not an immediate deregistration guarantee.
+Explicit close attempts deregistration under one deadline, awaits its cleanup
+worker and releases its Channel. Owner drop signals that same worker and closes
+local admission. Neither promises furpc driver/socket teardown completion or
+revokes outside Channel clones. Remote disconnect cleanup remains eventual.
+An idle physical disconnect need not wake local `recv`, because furpc has no
+independent Channel closure observer; use a caller-owned receive timeout when needed.
 
 **Notification endpoint policy:** `endpoint_clear(SocketAddr)` accepts
 explicit numeric unicast/nonzero-port NamingGateway endpoints, including
 non-loopback addresses. Unspecified, multicast and zero-port destinations fail
 InvalidInput. No hostname/advertised-address
 fallback, compatibility wrapper or TLS/claims/security expansion is supplied.
-The native session/filter API and error types otherwise remain unchanged.
-
-Construction pulls and client-charges ingress alongside Connect, then admits a
-finite pending snapshot before starting semantic draining or publishing the
-owner. Runtime staging and semantic processing are scoped inside one worker.
-Registration cancellation can retract until the first **positive** socket write;
-after visibility an unconfirmed mutation retires the session. Dropping/cancelling
-close fences the owner and stops the same worker/socket; awaitable close retains
-its worker handle and observes teardown after the shared cleanup deadline.
-An irrevocably started frame retains the separate 30-second completion watchdog.
+Session/filter RPCs are typed calls through the shared gateway adapter over a
+small Peer-backed byte service, so they cannot reconnect or replay. Early typed
+notification pages wait for Connect's native generation under furpc handler
+limits/deadlines; no pull/staging handoff or retained-allocation ledger remains.
+Furpc Attempt retraction fences cancellation against the first positive write.
+An unconfirmed committed registration terminates this domain session rather
+than leaking a filter handle or retrying the mutation.
 
 Native retries preserve logical page identity but the proxy assigns a fresh
 client-leg MessageId on every forwarding attempt
 ([pinned source:453–483](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/ServiceNotificationManagerProxy.cpp#L453-L483)).
 The client suppresses accepted versions, merges progress and ACKs each admitted
-attempt. Transport same-ID collisions still terminate without a second reply
-authority. ACK success means whole-page local acceptance, not application
+attempt. Furpc owns transport correlation without a domain transport-ID history.
+ACK success means whole-page local acceptance, not application
 consumption or a per-page fixed-body fingerprint.
 
 Notification construction, registration, receive, unregister, and close return
-`NotificationResult<T>`, whose error is `NotificationError`. Delivery-budget
+`NotificationResult<T>`, whose error is `NotificationError`. Delivery-queue
 exhaustion is `NotificationError::Lagged`; notification filter/bookkeeping/queue
 limits are `NotificationError::ResourceLimit`. Shared transport, protocol,
-timeout, input, and native faults are retained as `NotificationError::Common(Error)`,
-including genuinely shared decoder/control resource limits. The ordinary
-`FabricClient` uses layered `ClientResult<T>` and has no notification-only error cases;
+timeout, input, native faults and domain failures are retained as
+`NotificationError::Common(FurpcClientError)`, including original decoder/control
+resource limits. There is no legacy Error conversion. The ordinary
+`FurpcClient` uses `FurpcClientError` and has no notification-only error cases;
 notification-only failures stay above the shared channel and its opaque RPC boundary.
-This changes notification method error types, not the native payload or wire
-format. Match `NotificationError::Common(Error::Timeout)` for a notification
-timeout instead of matching `Error::Timeout` directly.
+This changes notification error/lifecycle contracts, not native payloads.
+Match `NotificationError::Common(FurpcClientError::Native(furpc::Error::Timeout(_)))`
+for a native notification-operation timeout.
 
 There is no endpoint cache, hidden description query, reconnect, filter replay,
 or snapshot. The gateway can still use its own cache: independent management
@@ -1366,45 +1491,27 @@ structured URI object. Application/service result `name` fields,
 These field/constructor changes require callers to parse their names explicitly;
 Names remain strings in query JSON, with invalid names rejected earlier; the
 query-field JSON migration is described above.
-Naming methods accept `impl AsRef<str>`, so both existing string calls and
-`client.name_exists(&name, None)` with a `NamingUri` are supported.
+All three naming methods require a checked `NamingUri` in `furpc::Request`,
+with an absolute deadline. There are no legacy string-convenience write methods.
+
+All production clients now use furpc/native frame and codec limits rather than
+the retired legacy Channel profile:
 
 | Resource | Limit |
 |---|---:|
-| Entire frame | 4 MiB |
+| Entire frame | Native u32 capacity, optionally narrowed by Endpoint TransportLimits |
 | Native header area | 65,535 bytes |
-| Header records, including deleted records | 4,096 |
-| Object extent, excluding its leading marker | 4 MiB, additionally constrained by the containing frame |
-| Object nesting | 32 |
-| String | 32,768 UTF-16 code units |
-| Byte-array/object-array/type-information count | 4,096 |
-| Application/service rows, parameter pairs, URI segments | 4,096 each (the row bound is independent of requested count) |
-| Ordinary typed/RPC calls, including undelivered results | 8 by default; immediate exhaustion error |
-| Ordinary lifetime IDs, including handshake | 4096; terminal exhaustion |
-| Typed input owned capacities | 1 MiB per accepted call |
-| Typed retained-byte reservation | 4 GiB +16 MiB per call; conservative accounting, not an allocation/RSS estimate |
-| Channel aggregate retained-byte reservation | 512 MiB ordinary default; 2 GiB notification-owned profile, not eager allocation |
-| Started write / partial incoming frame | 30 seconds; request expiry ends local waiting, not started frame completion |
-| Notification delivery | 256 events and 8 MiB of accounted page/delivery allocations, whichever is reached first |
-| Notification filters, including pending registration/cleanup | 32 per independently owned session |
-| Notification partition identities / version intervals | 4,096 each; exhaustion is terminal, never silent eviction |
-| Notification page queue / processing | 32 client-staged pages plus at most one transferred envelope; 33 backend ingress slots and one scoped worker |
-| Notification ordinary RPC / consuming replies | 8 / 4, independently counted under the shared channel byte ceiling |
-| Notification cleanup commands | 32, admitted independently of application delivery |
-| Notification lifetime IDs, including handshake | 4096, transport attempts not logical pages; terminal exhaustion without eviction |
+| Object/string/collection extents | Native field widths/enclosing extents; optional per-codec Limits |
+| Object nesting | No additional default ceiling; codec callers may select one |
+| Pending operations and ingress handlers | Furpc TransportLimits/HandlerLimits; explicit execution policy, not heap quotas |
+| Started write / partial incoming frame | Furpc watchdog policy; 30-second defaults |
 
 Native ImageStore's separate chunk, traversal, path and stale-reply limits are
 listed in [its API section](#native-imagestore-application-package-copy).
 
-Ordinary channel entries cover queued/pending/ready-undelivered work; a started
-writer retains its lease after observer abandonment. Client admission occurs
-before typed encoding and follows result/state until transfer/drop. Sealed
-schemas have compile-time element/minimum-wire bounds; vector growth, map-node
-conversion, UTF conversion and overlapping endpoint/slot copies are included
-in the conservative fixed slot. This is intentionally looser than actual memory
-usage. Unpolled futures and transferred values are caller-held. Notifications
-apply both their own channel profile and client accounting above; upload retains
-its independent upload-channel and protocol limits.
+ImageStore retains its independently bounded traversal, semantic-ACK queue and
+protocol checks. No production client uses sealed typed budgets,
+retained-allocation leases or lifetime transport-ID histories.
 
 The decoder skips unknown/deleted header records by their bounded record
 lengths. Effective common headers use the last visible occurrence; first
@@ -1415,15 +1522,12 @@ base/derived scopes needed by node results.
 Native upload semantic ACKs additionally reject duplicate visible header IDs;
 they do not inherit the common last-occurrence acceptance policy.
 
-Notification memory accounting includes queue backing storage, input pages,
-decoded strings/vectors, conversion copies and prospective progress copies.
-Raw input capacity is reserved before queue admission. The shared native Serde
-decoder charges strings, bytes, and conservative sequence storage before owned
-allocation; the worker separately reserves endpoint-conversion and prospective
-progress copies before constructing them. There is no second notification-schema
-parser. This is an accounted allocation budget, not a bound on total process RSS;
-existing transport I/O limits and separately bounded protocol state still apply.
-A page must fit as one transaction. Delivery lag and protocol-bookkeeping/
+Notifications retain 256 queued application events, 32 filters including pending
+registration/cleanup, 4,096 partition identities and version intervals each,
+and 32 automatic cleanup commands. Furpc owns frame/codec, pending-operation,
+handler and ACK capacity; Endpoint limits are configured before dialing.
+There is no notification heap ledger, extra construction ceiling or lifetime
+transport-ID history. A page must fit as one transaction. Delivery lag and protocol-bookkeeping/
 cleanup resource failures are terminal; status does not need a queue slot.
 Local filter-admission exhaustion is instead rejected before sending without
 retiring the healthy session (`NotificationError::ResourceLimit("notification filters")`).
@@ -1437,19 +1541,19 @@ The transport-independent `fubst` crate owns the bounded native
 `to_vec` / `from_slice`, not a JSON, bincode or postcard encoding.
 Ordered native-shaped models use ordinary Serde derives and explicit field
 adapters without parallel wire records. Codec calls return `fubst::Error`;
-transport-facing APIs convert these into the corresponding
-`fube_transport::Error` category. TCP framing and transport message/header
-schemas remain in `fube-transport`:
+client APIs preserve these causes without legacy transport conversion.
+TCP framing and transport message/header schemas belong to furpc; shared model
+validation exposes `fubst::Error`/`Result` at the fube-client crate root:
 
 ```rust
-use fube_transport::message::ListenInstance;
 use fubst::serde::{from_slice, to_vec};
+use serde::{Deserialize, Serialize};
 
-let value = ListenInstance {
-    address: "node".into(), instance: 7, nonce: [0; 16],
-};
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct Record { address: String, instance: u64 }
+let value = Record { address: "node".into(), instance: 7 };
 let bytes = to_vec(&value).unwrap();
-assert_eq!(from_slice::<ListenInstance>(&bytes).unwrap(), value);
+assert_eq!(from_slice::<Record>(&bytes).unwrap(), value);
 ```
 
 | Mapping | Native behavior |
@@ -1478,9 +1582,8 @@ assert_eq!(from_slice::<ListenInstance>(&bytes).unwrap(), value);
 
 Scalar roots are native scalar fragments; struct roots include object framing.
 `from_slice` requires complete root consumption. Decoding uses owned strings
-and bytes, not borrowed UTF-8 views of native UTF-16. Existing limits above
-apply; 4 MiB is a **per-object** extent limit, not an aggregate limit on a
-standalone root object array. Transport frames retain their separate limit.
+and bytes, not borrowed UTF-8 views of native UTF-16. Native widths and optional
+codec-local Limits apply. Transport frames retain their separate limit.
 `collect_str` formats through a bounded sink that checks UTF-16 units before
 buffering each chunk, then uses the same native string encoder.
 
@@ -1924,7 +2027,7 @@ records that proof **before any native mutation**. An existing candidate is
 never adopted or deleted. Existing journals are never overwritten, including
 same-owner unresolved writes.
 
-On one shared native client it confirms initial absence, creates the name,
+On one shared `FurpcClient` it confirms initial absence, creates the name,
 checks HTTP/native presence, requires duplicate-create error -2147017792 and
 healthy reuse, deletes the name, checks HTTP/native absence, then requires
 missing-delete error -2147017791 and healthy reuse/ping. Management HTTP is only
@@ -1946,11 +2049,20 @@ in-process cleanup; exact-allocation always-run teardown remains essential.
 
 `MSSF_NAME_REPORT` is written only after settled owned cleanup succeeds. It
 records independent lifecycle observations, native results/error codes,
-same-client reuse, runtime and archive identity. Keep journals private/ignored;
+same-client reuse, runtime and archive identity. Its required `furpc` section
+records the original source generation, native duplicate/missing error origins,
+independent HTTP presence/absence, three concurrent Ping/NameExists operations
+after errors, and observation timestamps. Every successful write and read checks
+the original generation. CI validates this receipt and binds its observation
+window as `furpc_naming_writes`. Keep journals private/ignored;
 after exact destruction, remove private profiles and extracted consumers.
 Never use these fixtures on a shared cluster.
 
-The native-name archive qualified on **11.8.121.4**, five logical nodes in one
+The current furpc name archive passed this lifecycle and the independent receipt
+validator on **11.8.121.4**, retaining generation 1 through native errors, write
+reuse and concurrent cloned reads. It did not rerun the other native scenarios.
+
+The earlier legacy native-name archive qualified on **11.8.121.4**, five logical nodes in one
 Ubuntu container, with **119 offline tests and all three live group scenarios**.
 Offline tests cover exact requests, call-local malformed-domain rejection, concurrent
 reordering, peer-observed cancellation/timeouts without replay, partial setup,
@@ -2004,7 +2116,14 @@ parser tests. Offline evidence covers strict suffixes, hostile bounds, enums,
 malformed successes, native errors, out-of-order mixed queries, deadlines,
 ownership collisions, ambiguous mutation retention and cleanup dependency order.
 The current maintained native group has five tests; owned MovePrimary is included
-inside the list fixture. Current migration results are new executable receipts,
+inside the list fixture. The movement now uses the same furpc client as the
+list/topology/deployment reads. Its required `movement.furpc` evidence retains
+the actual mutation response generation, requires the original list generation,
+and records successful concurrent replica/partition/Ping reuse. The existing
+`validate_native_movement` still independently requires a single constraint-enforced
+request and the actual HTTP/native role swap on the same owned replica identities;
+an empty success alone cannot satisfy it.
+Current migration results are new executable receipts,
 not a relabeling of that earlier four-scenario archive.
 Live coverage does not establish Compose/Mesh applications, service groups,
 persisted stateful data, upgrade/deletion transitions, partial aggregation,
@@ -2109,12 +2228,18 @@ A test-only relay drops exactly one successful native processing ACK, observes a
 gateway retry, and verifies no repeated endpoint version is delivered.
 Production operations never use HTTP or this relay.
 
+The required `furpc_notifications` receipt records three actual, independent
+transport generations, confirmed unregister/close counts, initial prefix/exact
+updates and empty invalidations. Validators bind those events to the independently
+observed owned partition and require the native ACK-loss/retry witnesses.
+Initial updates can precede full placement; they are not a five-endpoint snapshot.
+
 On SF **11.8.121.4**, clear TCP, the scenario demonstrated six singleton/int64
 partition lookups plus two named lookups, previous-result refresh, native errors
 with healthy reuse, three independent notification sessions, exact/prefix/
 primary-only registration, updates, endpoint-count/primary changes, invalidation,
 unregister and independent close. The relay observed one dropped successful ACK,
-one native retry and zero duplicate delivered versions. The actual gateway
+one native retry and zero duplicate delivered versions. The original gateway
 identity was returned as node N0010; its notification address was intentionally
 empty, not replaced with an advertised/dialed private endpoint.
 
@@ -2136,7 +2261,7 @@ and full-size/multichunk content, exact routed Delete schemas, postorder markers
 native errors, wrong envelopes, bounded handoff/stale replies, prior-file cleanup
 and duplicate commits, and retained-client cancellation/deadline retirement.
 
-**End-to-end qualification passed on an owned SF 11.8.121.4 onebox.** One real
+**The legacy end-to-end qualification passed on an owned SF 11.8.121.4 onebox.** One real
 native mssf SDK copy established the predecessor inventory, including a deliberate
 obsolete file. Rust CLI replacement matched that inventory minus the obsolete
 file and independently matched every local file size and generated zero-byte
@@ -2147,6 +2272,16 @@ resolved/contacted the live application, and deployed Data **SHA256 hashes
 matched the local source**. Exact owned-workload cleanup passed.
 The SDK adapter invokes the real native CopyApplicationPackage API; sfctl
 remains provisioning/observation tooling, not production upload or fallback.
+
+The furpc migration reran that same native journey on the retained default-Docker
+**11.8.121.4** onebox. The SDK predecessor/Rust replacement and independent
+inventory checks agreed on **14 entries**, including **seven** zero-byte
+directory markers, empty/Unicode/space paths, 7 MiB Data content and the
+**150,911,176-byte** sample executable. Provision/create and native application
+contact succeeded; all **three** deployed Data file SHA256 hashes matched the
+source. Exact workload/temp cleanup completed and the onebox remained ready.
+The optional report records actual inventories, source/deployed hashes, CLI/oracle
+hashes and confirmed cleanup; it contains no private allocation-owner capability.
 
 The final scenario uses **one SDK predecessor copy**, not a redundant second SDK
 copy/reference root. That earlier redundant native-only call intermittently

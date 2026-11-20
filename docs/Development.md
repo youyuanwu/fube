@@ -172,15 +172,17 @@ container-side package copy. The destination is the local directory's final
 name. The timeout is in seconds and bounds the whole CLI operation, including
 connection establishment. Native AtomicCopy replaces the destination directory
 and publishes completion markers after its contents; failure is not rollback.
-Only native `fabric:ImageStore` through an explicitly unsecured numeric-loopback
-gateway with a nonzero port is supported. Upload owns a separate native
-GatewayChannel; ACK decoding and package policy stay in the client. Client adapters
-install envelope authorization and raw ACK actor registrations; the channel's
-native actor demux is independent of gateway/upload protocol values.
+Only native `fabric:ImageStore` through an explicitly unsecured numeric-unicast
+gateway with a nonzero port is supported. Upload owns a separate furpc Channel
+and captures one Peer. Ordinary one-way ingress services authorize Actor 25/27
+semantic ACKs; body interpretation and package policy stay in the client.
+These ACKs are neither ordinary RPC responses nor furpc native notifications.
 The maintained CLI configures `ImageStoreClient::endpoint_clear`, establishes
-its actual `Channel`, and binds synchronously with explicit
-`ImageStoreClientOptions` before the upload operation. Binding sends no native
-request; the CLI's original whole-operation deadline remains enclosing.
+its actual `Channel`, and awaits `ImageStoreClient::new` with explicit options
+before the upload operation. This captures the Peer and installs ingress but
+sends no native ImageStore session request. The CLI's original whole-operation
+deadline remains enclosing. Drop follows furpc ownership; there is no legacy
+client close/abort/closure-observer compatibility layer.
 See [Rust FabricClient](transport/RustFabricClient.md) for the
 library API, transfer limits and cancellation behavior.
 
@@ -198,16 +200,19 @@ python3 -m tests.onebox.native_upload --name native-upload \
   --owner-file /private/native-upload-owner.txt \
   --cli target/debug/fube --app target/debug/rust-runtime-app \
   --observer target/debug/examples/runtime_observer \
-  --native-oracle target/debug/examples/image_store_copy
+  --native-oracle target/debug/examples/image_store_copy \
+  --report /private/fresh-upload-report.json
 ```
 
 The native SDK reference runs inside the owned SF container and uses real mssf
 bindings; sfctl is used only for management/cleanup. The test removes its unique
 workloads and temporary packages, but retains the caller-owned onebox. It
-prints the outcome rather than writing/uploading success reports.
-This live scenario proves native upload/content, not injected cancellation;
-the focused ImageStore framed-peer tests exercise cancellation at upload stages.
-Destroy a task-owned onebox afterward using its original controller capability.
+prints the outcome; optional `--report` requires a fresh absolute path and retains
+native/Rust/expected inventories, deployed Data hashes, executable hashes and
+confirmed owned cleanup, without the private allocation capability.
+This live scenario proves native upload/content, not injected cancellation.
+fube-client synthetic wire/model-peer tests remain retired. The caller decides
+whether to retain or explicitly destroy its allocation afterward.
 
 ## Native-free checks
 

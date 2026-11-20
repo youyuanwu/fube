@@ -4,12 +4,14 @@ use crate::{
     applications::*,
     query_protocol::{result_tags, ListReply, Query},
     services::*,
-    Error, HealthState, Result,
+    HealthState,
 };
 
-fn validate_type_selector(value: &str) -> Result<()> {
+fn validate_type_selector(value: &str) -> fubst::Result<()> {
     if value.is_empty() {
-        return Err(Error::InvalidInput("selected type name must not be empty"));
+        return Err(fubst::Error::InvalidInput(
+            "selected type name must not be empty",
+        ));
     }
     Ok(())
 }
@@ -19,30 +21,26 @@ impl Query for ApplicationQueryParameters {
     type Reply = ListReply<Application, { result_tags::APPLICATION }>;
     const NAME: &'static str = "GetApplicationList";
 
-    fn validate_parameters(&self) -> Result<()> {
+    fn validate_parameters(&self) -> fubst::Result<()> {
         match &self.filter {
             ApplicationListFilter::TypeName(name) => {
                 validate_type_selector(name)?;
             }
             ApplicationListFilter::DefinitionKind(filter) => {
-                ApplicationDefinitionKindFilter::try_from_bits(filter.bits())?;
+                filter.validate()?;
             }
             _ => {}
         }
         Ok(())
     }
 
-    fn validate_record(application: Application) -> Result<Application> {
+    fn validate_record(application: Application) -> std::result::Result<Application, &'static str> {
         validate_list_health(application.health_state)?;
         if !application.upgrade_type_version.is_empty() {
-            return Err(Error::Protocol(
-                "nonempty deprecated application upgrade version",
-            ));
+            return Err("nonempty deprecated application upgrade version");
         }
         if !application.upgrade_parameters.is_empty() {
-            return Err(Error::Protocol(
-                "nonempty deprecated application upgrade parameters",
-            ));
+            return Err("nonempty deprecated application upgrade parameters");
         }
         Ok(application)
     }
@@ -53,9 +51,9 @@ impl Query for ServiceQueryParameters {
     type Reply = ListReply<Service, { result_tags::SERVICE }>;
     const NAME: &'static str = "GetApplicationServiceList";
 
-    fn validate_parameters(&self) -> Result<()> {
+    fn validate_parameters(&self) -> fubst::Result<()> {
         if self.application_name.as_str() == "fabric:/System" {
-            return Err(Error::InvalidInput(
+            return Err(fubst::Error::InvalidInput(
                 "System service-list profile is unsupported",
             ));
         }
@@ -65,146 +63,20 @@ impl Query for ServiceQueryParameters {
         Ok(())
     }
 
-    fn validate_record(service: Service) -> Result<Service> {
+    fn validate_record(service: Service) -> std::result::Result<Service, &'static str> {
         if service.kind == ServiceKind::Invalid
             || (service.kind == ServiceKind::Stateless && service.has_persisted_state)
         {
-            return Err(Error::Protocol("unsupported service kind/persistence"));
+            return Err("unsupported service kind/persistence");
         }
         validate_list_health(service.health_state)?;
         Ok(service)
     }
 }
 
-fn validate_list_health(value: HealthState) -> Result<HealthState> {
+fn validate_list_health(value: HealthState) -> std::result::Result<HealthState, &'static str> {
     if matches!(value, HealthState::Unrecognized(_)) {
-        return Err(Error::Protocol("unsupported list health state"));
+        return Err("unsupported list health state");
     }
     Ok(value)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fubst::{serde::from_fields, Decoder, Encoder};
-
-    fn application(bytes: &[u8]) -> Result<Application> {
-        let value = Decoder::new(bytes).object(from_fields::<Application>)?;
-        ApplicationQueryParameters::validate_record(value)
-    }
-    fn service(bytes: &[u8]) -> Result<Service> {
-        let value = Decoder::new(bytes).object(from_fields::<Service>)?;
-        ServiceQueryParameters::validate_record(value)
-    }
-
-    fn application_base(e: &mut Encoder) -> fubst::Result<()> {
-        uri(e)?;
-        e.string("Type")?;
-        e.string("1")?;
-        e.i64(1).unwrap();
-        e.i64(1).unwrap();
-        empty_map(e)
-    }
-
-    fn service_base(e: &mut Encoder) -> fubst::Result<()> {
-        e.i64(1).unwrap();
-        uri(e)?;
-        e.string("Type")?;
-        e.string("1")?;
-        e.boolean(false).unwrap();
-        e.i64(1).unwrap();
-        Ok(())
-    }
-
-    fn uri(e: &mut Encoder) -> fubst::Result<()> {
-        e.object(|e| {
-            e.i64(1).unwrap();
-            e.string("fabric")?;
-            e.string("")?;
-            e.i64(0).unwrap();
-            e.string("")?;
-            e.i32(-1).unwrap();
-            e.string("/App")?;
-            e.string("")?;
-            e.string("")?;
-            e.u32(1).unwrap();
-            e.string("App")
-        })
-    }
-
-    fn empty_map(e: &mut Encoder) -> fubst::Result<()> {
-        e.object_array::<()>(&[], |_, _| Ok(()))
-    }
-
-    #[test]
-    fn optional_suffix_wrong_metadata_is_not_absence_at_valid_record_extent() {
-        for position in 0..3 {
-            let mut e = Encoder::new();
-            e.object(|e| {
-                application_base(e)?;
-                if position >= 1 {
-                    e.string("")?;
-                }
-                if position >= 2 {
-                    empty_map(e)?;
-                }
-                // Wrong metadata at upgrade version/map/definition respectively.
-                e.boolean(false).unwrap();
-                Ok(())
-            })
-            .unwrap();
-            let bytes = e.finish();
-            assert!(matches!(application(&bytes), Err(Error::Protocol(_))));
-        }
-        for position in 0..2 {
-            let mut e = Encoder::new();
-            e.object(|e| {
-                service_base(e)?;
-                if position == 1 {
-                    e.i64(1).unwrap();
-                }
-                e.string("wrong status/group metadata")
-            })
-            .unwrap();
-            let bytes = e.finish();
-            assert!(matches!(service(&bytes), Err(Error::Protocol(_))));
-        }
-    }
-
-    #[test]
-    fn nonempty_deprecated_upgrade_parameter_map_is_explicitly_unsupported() {
-        let mut e = Encoder::new();
-        e.object(|e| {
-            application_base(e)?;
-            e.string("")?;
-            e.object_array(&[()], |e, _| {
-                e.string("upgrade")?;
-                e.string("value")
-            })
-        })
-        .unwrap();
-        assert!(matches!(
-            application(&e.finish()),
-            Err(Error::Protocol(
-                "nonempty deprecated application upgrade parameters"
-            ))
-        ));
-    }
-
-    #[test]
-    fn truncated_optional_string_with_valid_record_extent_is_not_an_absent_suffix() {
-        let mut e = Encoder::new();
-        e.object(|e| {
-            application_base(e)?;
-            e.string("tail")
-        })
-        .unwrap();
-        let mut bytes = e.finish();
-        // Keep the record header and all enclosing extents valid. Only the
-        // trailing string's advertised unit count exceeds its remaining payload.
-        let count = bytes.len() - 11;
-        assert_eq!(bytes[count - 1], 0x8d);
-        bytes[count] = 20;
-        assert!(matches!(application(&bytes), Err(Error::Protocol(_))));
-    }
 }

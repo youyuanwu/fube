@@ -1,7 +1,10 @@
 //! Real nonempty native queries against an independently prepared owned workload.
 use fube_client::*;
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, num::NonZeroU64, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU64,
+};
 
 #[path = "support/list_fixture.rs"]
 mod oracle;
@@ -10,6 +13,8 @@ use oracle::{output, owner, Http, Journal, Result};
 mod deployment;
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/furpc.rs"]
+mod furpc_support;
 #[path = "support/rest.rs"]
 mod rest;
 #[path = "support/topology_oracle.rs"]
@@ -29,11 +34,24 @@ fn compare_application(app: &Application, observed: &Value) {
         app.parameters.get("Evidence").map(String::as_str),
         Some("owned-list-value")
     );
-    assert!(observed["Parameters"]
+    let parameters: BTreeMap<_, _> = observed["Parameters"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|p| p["Key"] == "Evidence" && p["Value"] == "owned-list-value"));
+        .map(|pair| {
+            (
+                pair["Key"].as_str().unwrap(),
+                pair["Value"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        app.parameters
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<BTreeMap<_, _>>(),
+        parameters
+    );
 }
 
 fn compare_service(service: &Service, observed: &Value) {
@@ -59,6 +77,218 @@ fn compare_service(service: &Service, observed: &Value) {
     }
 }
 
+fn application_evidence(app: &Application) -> Value {
+    json!({
+        "name": app.name, "type_name": app.type_name, "type_version": app.type_version,
+        "status": format!("{:?}", app.status), "health_state": format!("{:?}", app.health_state),
+        "parameters": app.parameters, "definition_kind": format!("{:?}", app.definition_kind),
+    })
+}
+
+fn service_evidence(service: &Service) -> Value {
+    json!({
+        "name": service.name, "type_name": service.type_name,
+        "manifest_version": service.manifest_version, "kind": format!("{:?}", service.kind),
+        "has_persisted_state": service.has_persisted_state,
+        "status": format!("{:?}", service.status), "health_state": format!("{:?}", service.health_state),
+        "is_service_group": service.is_service_group,
+    })
+}
+
+async fn observe_furpc(
+    client: &mut FurpcClient,
+    generation: u64,
+    journal: &Journal,
+    observed_apps: &[Value],
+    observed_services: &[Value],
+) -> Result<Value> {
+    use furpc::Request;
+    use furpc_support::{body, deadline};
+
+    let start_ms = furpc_support::now_ms();
+    let mut query = ApplicationQueryDescription::new(ApplicationQueryParameters {
+        filter: ApplicationListFilter::TypeName(journal.type_name.clone()),
+        ..Default::default()
+    });
+    query.paging.max_results = NonZeroU64::new(1);
+    let first = body(
+        client
+            .get_application_list(Request::new(query.clone()), deadline())
+            .await?,
+        generation,
+    );
+    assert_eq!(first.items.len(), 1);
+    assert!(first
+        .continuation_token
+        .as_ref()
+        .is_some_and(|s| !s.is_empty()));
+    query.paging.continuation_token = first.continuation_token;
+    let second = body(
+        client
+            .get_application_list(Request::new(query.clone()), deadline())
+            .await?,
+        generation,
+    );
+    assert_eq!(second.items.len(), 1);
+    assert!(second.continuation_token.is_none());
+    let app_page_lengths = [first.items.len(), second.items.len()];
+    let applications: Vec<_> = first.items.into_iter().chain(second.items).collect();
+    query.paging = Paging::default();
+    assert_eq!(
+        applications
+            .iter()
+            .map(|app| app.name.as_str())
+            .collect::<BTreeSet<_>>(),
+        journal
+            .applications
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
+    for application in &applications {
+        compare_application(
+            application,
+            observed_apps
+                .iter()
+                .find(|app| app["Name"] == application.name.as_str())
+                .unwrap(),
+        );
+    }
+    query.parameters.filter = ApplicationListFilter::Name(journal.applications[0].parse()?);
+    query.parameters.exclude_application_parameters = true;
+    let excluded = body(
+        client
+            .get_application_list(Request::new(query.clone()), deadline())
+            .await?,
+        generation,
+    );
+    assert_eq!(excluded.items.len(), 1);
+    assert_eq!(excluded.items[0].name.as_str(), journal.applications[0]);
+    assert!(excluded.items[0].parameters.is_empty());
+    query.parameters.filter =
+        ApplicationListFilter::Name(format!("{}-absent", journal.applications[0]).parse()?);
+    assert!(body(
+        client
+            .get_application_list(Request::new(query), deadline())
+            .await?,
+        generation
+    )
+    .items
+    .is_empty());
+
+    let mut services = Vec::new();
+    let mut service_page_lengths = Vec::new();
+    for name in &journal.applications {
+        let mut query = ServiceQueryDescription::new(ServiceQueryParameters::new(name.parse()?));
+        query.paging.max_results = NonZeroU64::new(1);
+        let first = body(
+            client
+                .get_service_list(Request::new(query.clone()), deadline())
+                .await?,
+            generation,
+        );
+        assert_eq!(first.items.len(), 1);
+        assert!(first
+            .continuation_token
+            .as_ref()
+            .is_some_and(|s| !s.is_empty()));
+        query.paging.continuation_token = first.continuation_token;
+        let second = body(
+            client
+                .get_service_list(Request::new(query.clone()), deadline())
+                .await?,
+            generation,
+        );
+        assert_eq!(second.items.len(), 1);
+        assert!(second.continuation_token.is_none());
+        service_page_lengths.push([first.items.len(), second.items.len()]);
+        let actual: Vec<_> = first.items.into_iter().chain(second.items).collect();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|service| service.name.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
+        query.paging = Paging::default();
+        for service in &actual {
+            assert!(service.name.as_str().starts_with(&format!("{name}/")));
+            compare_service(
+                service,
+                observed_services
+                    .iter()
+                    .find(|s| s["Name"] == service.name.as_str())
+                    .unwrap(),
+            );
+        }
+        services.extend(actual);
+        query.parameters.filter = ServiceListFilter::TypeName("ListStateful".into());
+        let selected = body(
+            client
+                .get_service_list(Request::new(query.clone()), deadline())
+                .await?,
+            generation,
+        );
+        assert_eq!(selected.items.len(), 1);
+        assert_eq!(selected.items[0].kind, ServiceKind::Stateful);
+        query.parameters.filter = ServiceListFilter::Name(format!("{name}/Stateless").parse()?);
+        let selected = body(
+            client
+                .get_service_list(Request::new(query.clone()), deadline())
+                .await?,
+            generation,
+        );
+        assert_eq!(selected.items.len(), 1);
+        assert_eq!(selected.items[0].kind, ServiceKind::Stateless);
+        query.parameters.filter = ServiceListFilter::Name(format!("{name}/Absent").parse()?);
+        assert!(body(
+            client
+                .get_service_list(Request::new(query), deadline())
+                .await?,
+            generation
+        )
+        .items
+        .is_empty());
+    }
+    let missing = ServiceQueryDescription::new(ServiceQueryParameters::new(
+        format!("{}-absent", journal.applications[0]).parse()?,
+    ));
+    let (error_code, error_origin) = furpc_support::failure(
+        client
+            .get_service_list(Request::new(missing), deadline())
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(error_code, -2147017763);
+    let app_query = ApplicationQueryDescription::new(ApplicationQueryParameters {
+        filter: ApplicationListFilter::TypeName(journal.type_name.clone()),
+        ..Default::default()
+    });
+    let service_query = ServiceQueryDescription::new(ServiceQueryParameters::new(
+        journal.applications[0].parse()?,
+    ));
+    let mut apps = client.clone();
+    let mut list = client.clone();
+    let (apps, list, ping) = tokio::try_join!(
+        apps.get_application_list(Request::new(app_query), deadline()),
+        list.get_service_list(Request::new(service_query), deadline()),
+        client.ping(Request::new(()), deadline()),
+    )?;
+    assert_eq!(body(apps, generation).items.len(), 2);
+    assert_eq!(body(list, generation).items.len(), 2);
+    assert!(!body(ping, generation).node_name.is_empty());
+    Ok(json!({
+        "generation": generation, "native_start_ms": start_ms, "native_end_ms": furpc_support::now_ms(),
+        "applications": applications.iter().map(application_evidence).collect::<Vec<_>>(),
+        "services": services.iter().map(service_evidence).collect::<Vec<_>>(),
+        "application_page_lengths": app_page_lengths, "service_page_lengths": service_page_lengths,
+        "filters_and_parameter_exclusion": true, "typed_fields_match_http": true,
+        "native_missing_application_code": error_code, "native_error_origin": error_origin,
+        "same_generation_after_error": true, "mixed_concurrent_operations": 3,
+    }))
+}
+
 async fn scenario(mut journal: Journal) -> Result<Value> {
     let path = output("MSSF_LIST_CONFIG")?;
     let report = output("MSSF_LIST_REPORT")?;
@@ -67,231 +297,62 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     }
     match std::fs::remove_file(&report) {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let http = Http::new()?;
     let nodes = http.nodes().await?;
     let nodes = nodes["Items"]
         .as_array()
-        .ok_or("missing independent node list")?;
-    if nodes.len() != 5 || nodes.iter().any(|n| n["NodeStatus"] != "Up") {
+        .ok_or("missing independent nodes")?;
+    if nodes.len() != 5 || nodes.iter().any(|node| node["NodeStatus"] != "Up") {
         return Err("requires independent five-node onebox".into());
     }
     let runtime = nodes[0]["CodeVersion"]
         .as_str()
-        .ok_or("missing runtime version")?
-        .to_string();
+        .ok_or("missing runtime")?
+        .to_owned();
     http.prepare(&mut journal, &path).await?;
     http.wait_ready(&journal).await?;
     let observed_apps = http.applications(&journal).await?;
-    let channel = FabricClient::endpoint_clear("127.0.0.1:19000".parse()?)?
-        .connect_timeout(Duration::from_secs(30))
-        .connect()
-        .await?;
-    let client = FabricClient::new(
-        channel,
-        ClientOptions {
-            default_timeout: Duration::from_secs(30),
-            ..Default::default()
-        },
-    )?;
-    let mut app_query = ApplicationQueryDescription {
-        parameters: ApplicationQueryParameters {
-            filter: ApplicationListFilter::TypeName(journal.type_name.clone()),
-            ..Default::default()
-        },
-        paging: Paging {
-            max_results: NonZeroU64::new(1),
-            ..Default::default()
-        },
-    };
-    let first = client.get_application_list(&app_query, None).await?;
-    assert_eq!(first.items.len(), 1);
-    assert!(
-        first.continuation_token.is_some(),
-        "two owned apps must force a real native token"
-    );
-    app_query.paging.continuation_token = first.continuation_token.clone();
-    let second = client
-        .get_application_list(&app_query, Some(Duration::from_secs(30)))
-        .await?;
-    assert_eq!(second.items.len(), 1);
-    assert!(second.continuation_token.is_none());
-    let combined: Vec<_> = first.items.into_iter().chain(second.items).collect();
-    assert_eq!(
-        combined
-            .iter()
-            .map(|a| a.name.as_str())
-            .collect::<BTreeSet<_>>(),
-        journal.applications.iter().map(String::as_str).collect()
-    );
-    for app in &combined {
-        compare_application(
-            app,
-            observed_apps
-                .iter()
-                .find(|a| a["Name"] == app.name.as_str())
-                .unwrap(),
-        );
+    let mut observed_services = vec![];
+    for application in &journal.applications {
+        observed_services.extend(http.services(application).await?);
     }
-    app_query.paging.continuation_token = None;
-    app_query.paging.max_results = None;
-    app_query.parameters.exclude_application_parameters = true;
-    let excluded = client.get_application_list(&app_query, None).await?;
-    assert_eq!(excluded.items.len(), 2);
-    assert!(excluded.items.iter().all(|a| a.parameters.is_empty()));
-    app_query.parameters.filter = ApplicationListFilter::Name(journal.applications[0].parse()?);
-    assert_eq!(
-        client
-            .get_application_list(&app_query, None)
-            .await?
-            .items
-            .len(),
-        1
-    );
-    app_query.parameters.filter =
-        ApplicationListFilter::Name(format!("{}-absent", journal.applications[0]).parse()?);
-    assert!(client
-        .get_application_list(&app_query, None)
-        .await?
-        .items
-        .is_empty());
-    app_query.parameters.filter = ApplicationListFilter::DefinitionKind(
-        ApplicationDefinitionKindFilter::SERVICE_FABRIC_APPLICATION_DESCRIPTION,
-    );
-    let definitions = client.get_application_list(&app_query, None).await?;
-    assert!(journal
-        .applications
-        .iter()
-        .all(|name| definitions.items.iter().any(|a| a.name.as_str() == name)));
-
-    let mut service_observations = Vec::new();
-    let mut native_services = Vec::new();
-    for name in &journal.applications {
-        let observed = http.services(name).await?;
-        let mut query = ServiceQueryDescription::new(ServiceQueryParameters::new(name.parse()?));
-        query.paging.max_results = NonZeroU64::new(1);
-        let first = client.get_service_list(&query, None).await?;
-        assert_eq!(first.items.len(), 1);
-        assert!(first.continuation_token.is_some());
-        query.paging.continuation_token = first.continuation_token.clone();
-        let second = client
-            .get_service_list(&query, Some(Duration::from_secs(30)))
-            .await?;
-        assert_eq!(second.items.len(), 1);
-        assert!(second.continuation_token.is_none());
-        let services: Vec<_> = first.items.into_iter().chain(second.items).collect();
-        assert_eq!(
-            services
-                .iter()
-                .map(|s| &s.name)
-                .collect::<BTreeSet<_>>()
-                .len(),
-            2
-        );
-        assert!(services.iter().any(|s| s.kind == ServiceKind::Stateless));
-        assert!(services
-            .iter()
-            .any(|s| s.kind == ServiceKind::Stateful && !s.has_persisted_state));
-        for service in &services {
-            compare_service(
-                service,
-                observed
-                    .iter()
-                    .find(|s| s["Name"] == service.name.as_str())
-                    .unwrap(),
-            );
-            native_services.push(json!({
-                "name": service.name, "type_name": service.type_name,
-                "manifest_version": service.manifest_version, "kind": format!("{:?}", service.kind),
-                "has_persisted_state": service.has_persisted_state,
-                "status": format!("{:?}", service.status), "health_state": format!("{:?}", service.health_state),
-                "is_service_group": service.is_service_group,
-            }));
-        }
-        query.paging.continuation_token = None;
-        query.paging.max_results = None;
-        query.parameters.filter = ServiceListFilter::TypeName("ListStateful".into());
-        assert_eq!(client.get_service_list(&query, None).await?.items.len(), 1);
-        query.parameters.filter = ServiceListFilter::Name(format!("{name}/Stateless").parse()?);
-        assert_eq!(client.get_service_list(&query, None).await?.items.len(), 1);
-        query.parameters.filter = ServiceListFilter::Name(format!("{name}/Absent").parse()?);
-        assert!(client
-            .get_service_list(&query, None)
-            .await?
-            .items
-            .is_empty());
-        service_observations.extend(observed);
-    }
-    let app_query = ApplicationQueryDescription::new(ApplicationQueryParameters {
-        filter: ApplicationListFilter::TypeName(journal.type_name.clone()),
-        ..Default::default()
-    });
-    let service_query = ServiceQueryDescription::new(ServiceQueryParameters::new(
-        journal.applications[0].parse()?,
-    ));
-    let node_query = NodeQueryDescription::default();
-    let (a, s, n, p) = tokio::join!(
-        client.get_application_list(&app_query, None),
-        client.get_service_list(&service_query, None),
-        client.get_node_list(&node_query, None),
-        client.ping(None)
-    );
-    assert_eq!(a?.items.len(), 2);
-    assert_eq!(s?.items.len(), 2);
-    assert_eq!(n?.items.len(), 5);
-    p?;
-    let missing = client
-        .get_service_list(
-            &ServiceQueryDescription::new(ServiceQueryParameters::new(
-                format!("{}-absent", journal.applications[0]).parse()?,
-            )),
-            None,
-        )
-        .await;
-    let code = match missing {
-        Err(
-            ClientError::Domain(DomainFailure { code, .. })
-            | ClientError::Transport(Error::Remote { code, .. }),
-        ) => code,
-        other => {
-            return Err(format!("missing application must remain native error: {other:?}").into())
-        }
-    };
-    assert!(!client.is_closed());
-    assert_eq!(
-        client
-            .get_application_list(&app_query, None)
-            .await?
-            .items
-            .len(),
-        2
-    );
-    client.ping(None).await?;
-    let topology = topology::observe(&client, &http, &journal).await?;
-    let deployment = deployment::observe(&client, &http, &journal).await?;
-    let movement = topology::move_primary(&client, &http, &journal, &topology).await?;
-    client.close().await?;
+    let (mut reads_client, generation) = furpc_support::connect("127.0.0.1:19000").await?;
+    let mut reads = observe_furpc(
+        &mut reads_client,
+        generation,
+        &journal,
+        &observed_apps,
+        &observed_services,
+    )
+    .await?;
+    let native_applications = reads
+        .as_object_mut()
+        .unwrap()
+        .remove("applications")
+        .unwrap();
+    let native_services = reads.as_object_mut().unwrap().remove("services").unwrap();
+    let topology = topology::observe(&mut reads_client, generation, &http, &journal).await?;
+    let deployment = deployment::observe(&mut reads_client, generation, &http, &journal).await?;
+    let movement =
+        topology::move_primary(&mut reads_client, generation, &http, &journal, &topology).await?;
     Ok(json!({
         "runtime_version": runtime, "archive_sha256": journal.archive_sha256,
         "native_source_commit": "3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d",
         "owned_applications": journal.applications, "owned_type": journal.type_name,
-        "initial_absence_confirmed": true, "application_count": 2, "service_count": 4,
+        "initial_absence_confirmed": true,
+        "application_count": native_applications.as_array().unwrap().len(),
+        "service_count": native_services.as_array().unwrap().len(),
         "application_native_continuation_followed": true, "service_native_continuation_followed": true,
-        "filters_and_parameter_exclusion": true, "mixed_shared_native_connection": true,
-        "native_missing_application_code": code, "reuse_after_native_error": true,
-        "independent_applications": observed_apps, "independent_services": service_observations,
-        "native_applications": combined.iter().map(|app| json!({
-            "name": app.name, "type_name": app.type_name, "type_version": app.type_version,
-            "status": format!("{:?}", app.status), "health_state": format!("{:?}", app.health_state),
-            "parameters": app.parameters, "definition_kind": format!("{:?}", app.definition_kind),
-        })).collect::<Vec<_>>(),
-        "native_services": native_services,
-        "topology": topology,
-        "deployment_inspection": deployment,
-        "movement": movement,
-        "qualification_limit": "volatile implicit-host stateful kind; not persisted application data replication"
+        "filters_and_parameter_exclusion": true, "mixed_furpc_connection": true,
+        "native_missing_application_code": reads["native_missing_application_code"],
+        "reuse_after_native_error": true, "furpc": reads,
+        "independent_applications": observed_apps, "independent_services": observed_services,
+        "native_applications": native_applications, "native_services": native_services,
+        "topology": topology, "deployment_inspection": deployment, "movement": movement,
+        "qualification_limit": "volatile implicit-host stateful kind; not persisted application data replication",
     }))
 }
 

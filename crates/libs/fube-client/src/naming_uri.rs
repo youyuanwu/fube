@@ -31,10 +31,6 @@ impl NamingUri {
         &self.0
     }
 
-    pub(crate) fn capacity(&self) -> usize {
-        self.0.capacity()
-    }
-
     pub fn into_string(self) -> String {
         self.0
     }

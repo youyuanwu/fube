@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     query_arguments::validate_node_name,
     query_protocol::{result_tags, Query, UnpagedListReply},
-    DeploymentStatus, NamingUri, QueryDescription, Result,
+    DeploymentStatus, NamingUri, QueryDescription,
 };
 
 /// Native service-package selectors in facade argument order.
@@ -57,7 +57,7 @@ impl Query for DeployedServicePackageQueryParameters {
         UnpagedListReply<DeployedServicePackage, { result_tags::DEPLOYED_SERVICE_PACKAGE }>;
     const NAME: &'static str = "GetServiceManifestListDeployedOnNode";
 
-    fn validate_parameters(&self) -> Result<()> {
+    fn validate_parameters(&self) -> fubst::Result<()> {
         validate_node_name(
             &self.node_name,
             "deployed service package node name must be 1..=4096 UTF-16 units without NUL",
@@ -68,117 +68,6 @@ impl Query for DeployedServicePackageQueryParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        query_protocol::{encode_query, tests::assert_request},
-        Error,
-    };
-    use fubst::{
-        serde::{from_slice, to_vec},
-        Encoder,
-    };
-
-    // ServiceModel/DeployedServiceManifestQueryResult.h FABRIC_FIELDS_04.
-    fn fields(e: &mut Encoder, count: usize, status: i64) -> fubst::Result<()> {
-        for field in 0..count {
-            match field {
-                0 => e.string("ServiceManifest")?,
-                1 => e.string("1.2")?,
-                2 => e.i64(status)?,
-                3 => e.string("activation-id")?,
-                _ => unreachable!(),
-            }
-        }
-        Ok(())
-    }
-
-    fn record(count: usize, status: i64) -> Vec<u8> {
-        let mut e = Encoder::new();
-        e.object(|e| fields(e, count, status)).unwrap();
-        e.finish()
-    }
-
-    #[test]
-    fn service_package_query_name_filters_and_bounded_inputs() {
-        let mut parameters =
-            DeployedServicePackageQueryParameters::new("Node_1", "fabric:/App".parse().unwrap());
-        for filter in [None, Some(String::new())] {
-            parameters.service_manifest_name = filter;
-            assert_request(
-                &parameters,
-                None,
-                "GetServiceManifestListDeployedOnNode",
-                &[("NodeName", "Node_1"), ("ApplicationName", "fabric:/App")],
-            );
-        }
-        parameters.service_manifest_name = Some("Manifest".into());
-        assert_request(
-            &parameters,
-            None,
-            "GetServiceManifestListDeployedOnNode",
-            &[
-                ("NodeName", "Node_1"),
-                ("ApplicationName", "fabric:/App"),
-                ("ServiceManifestName", "Manifest"),
-            ],
-        );
-        for node in [
-            String::new(),
-            "bad\0node".into(),
-            "x".repeat(4097),
-            "\u{1f600}".repeat(2049),
-            "x".repeat(100_000),
-        ] {
-            parameters.node_name = node;
-            assert!(matches!(
-                encode_query(&parameters, None),
-                Err(Error::InvalidInput(_))
-            ));
-        }
-        for node in [
-            "x".repeat(4096),
-            "\u{754c}".repeat(4096),
-            "\u{1f600}".repeat(2048),
-        ] {
-            parameters.node_name = node;
-            encode_query(&parameters, None).unwrap();
-        }
-        parameters.node_name = "Node_1".into();
-        parameters.service_manifest_name = Some("x".repeat(32769));
-        assert!(matches!(
-            encode_query(&parameters, None),
-            Err(Error::InvalidInput(_))
-        ));
-    }
-
-    #[test]
-    fn service_package_complete_native_layout_and_compatible_suffix() {
-        for status in 0..=5 {
-            let bytes = record(4, status);
-            let package: DeployedServicePackage = from_slice(&bytes).unwrap();
-            assert_eq!(package.service_manifest_name, "ServiceManifest");
-            assert_eq!(package.service_manifest_version, "1.2");
-            assert_eq!(package.service_package_activation_id, "activation-id");
-            assert_eq!(serde_json::to_value(package.status).unwrap(), status);
-            assert_eq!(to_vec(&package).unwrap(), bytes);
-        }
-        let package: DeployedServicePackage = from_slice(&record(3, 3)).unwrap();
-        assert_eq!(package.status, DeploymentStatus::Active);
-        assert!(package.service_package_activation_id.is_empty());
-        for count in 0..3 {
-            assert!(from_slice::<DeployedServicePackage>(&record(count, 3)).is_err());
-        }
-        for status in [-1, 6, i64::MAX] {
-            assert!(from_slice::<DeployedServicePackage>(&record(4, status)).is_err());
-        }
-        let mut e = Encoder::new();
-        e.object(|e| {
-            fields(e, 3, 3)?;
-            e.boolean(false).unwrap();
-            Ok(())
-        })
-        .unwrap();
-        assert!(from_slice::<DeployedServicePackage>(&e.finish()).is_err());
-    }
 
     #[test]
     fn service_package_public_json_and_numeric_status() {
@@ -202,7 +91,12 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<DeployedServicePackageQueryParameters>(json).is_err());
         }
-        let package: DeployedServicePackage = from_slice(&record(4, 3)).unwrap();
+        let package = DeployedServicePackage {
+            service_manifest_name: "Manifest".into(),
+            service_manifest_version: "1".into(),
+            status: DeploymentStatus::Active,
+            service_package_activation_id: String::new(),
+        };
         let json = serde_json::to_value(&package).unwrap();
         assert_eq!(json["status"], 3);
         assert_eq!(

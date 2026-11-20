@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    mem::size_of,
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -9,14 +8,12 @@ use uuid::Uuid;
 use crate::{
     notification_protocol::{Interval, Page},
     resolution::Generation,
-    Error, NotificationError, NotificationResult, ServiceNotification,
+    FurpcClientError, NotificationError, NotificationResult, ServiceNotification,
 };
 
 pub(crate) const MAX_EVENTS: usize = 256;
-pub(crate) const MAX_MEMORY: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_IDENTITIES: usize = 4096;
 pub(crate) const MAX_INTERVALS: usize = 4096;
-pub(crate) const MAX_PAGES: usize = 32;
 pub(crate) const MAX_FILTERS: usize = 32;
 pub(crate) const MAX_CLEANUPS: usize = 32;
 
@@ -25,56 +22,8 @@ pub(crate) const MAX_CLEANUPS: usize = 32;
 mod tests;
 
 #[derive(Default)]
-pub(crate) struct Budget(Mutex<usize>);
-pub(crate) struct Memory {
-    budget: Arc<Budget>,
-    bytes: usize,
-}
-impl Budget {
-    fn charge(&self, bytes: usize) -> NotificationResult<()> {
-        let mut used = self.0.lock().unwrap();
-        if bytes > MAX_MEMORY.saturating_sub(*used) {
-            return Err(NotificationError::Lagged);
-        }
-        *used += bytes;
-        Ok(())
-    }
-    pub fn reserve(self: &Arc<Self>, bytes: usize) -> NotificationResult<Memory> {
-        self.charge(bytes)?;
-        Ok(Memory {
-            budget: self.clone(),
-            bytes,
-        })
-    }
-}
-impl Memory {
-    pub fn grow(&mut self, bytes: usize) -> NotificationResult<()> {
-        self.budget.charge(bytes)?;
-        self.bytes += bytes;
-        Ok(())
-    }
-    fn split(&mut self, bytes: usize) -> NotificationResult<Self> {
-        if bytes > self.bytes {
-            return Err(NotificationError::ResourceLimit(
-                "decoded notification accounting",
-            ));
-        }
-        self.bytes -= bytes;
-        Ok(Self {
-            budget: self.budget.clone(),
-            bytes,
-        })
-    }
-}
-impl Drop for Memory {
-    fn drop(&mut self) {
-        *self.budget.0.lock().unwrap() -= self.bytes;
-    }
-}
-
-#[derive(Default)]
 struct Delivery {
-    queue: VecDeque<(ServiceNotification, Memory)>,
+    queue: VecDeque<ServiceNotification>,
     terminal: Option<NotificationError>,
     emitted: bool,
     closed: bool,
@@ -82,25 +31,15 @@ struct Delivery {
 pub(crate) struct Receiver {
     inner: Mutex<Delivery>,
     changed: Notify,
-    pub budget: Arc<Budget>,
-    _queue_memory: Memory,
 }
 impl Default for Receiver {
     fn default() -> Self {
-        let budget = Arc::new(Budget::default());
-        let queue = VecDeque::with_capacity(MAX_EVENTS);
-        let storage = queue.capacity() * size_of::<(ServiceNotification, Memory)>();
-        let memory = budget
-            .reserve(storage)
-            .expect("fixed queue fits memory profile");
         Self {
             inner: Mutex::new(Delivery {
-                queue,
+                queue: VecDeque::with_capacity(MAX_EVENTS),
                 ..Default::default()
             }),
             changed: Notify::new(),
-            budget,
-            _queue_memory: memory,
         }
     }
 }
@@ -126,8 +65,9 @@ impl Receiver {
     pub fn error(&self) -> Option<NotificationError> {
         self.inner.lock().unwrap().terminal.clone()
     }
-    pub fn common_error(&self, error: Error) -> NotificationError {
-        self.error().unwrap_or(NotificationError::Common(error))
+    pub fn common_error(&self, error: impl Into<FurpcClientError>) -> NotificationError {
+        self.error()
+            .unwrap_or_else(|| NotificationError::Common(error.into()))
     }
     pub async fn recv(&self) -> Option<NotificationResult<ServiceNotification>> {
         loop {
@@ -141,7 +81,7 @@ impl Receiver {
                 if inner.closed {
                     return None;
                 }
-                if let Some((event, _memory)) = inner.queue.pop_front() {
+                if let Some(event) = inner.queue.pop_front() {
                     return Some(Ok(event));
                 }
             }
@@ -164,26 +104,10 @@ impl Progress {
         }
     }
     /// No delivery or progress becomes visible until the entire page fits.
-    pub fn commit(
-        &mut self,
-        page: Page,
-        mut memory: Memory,
-        receiver: &Receiver,
-    ) -> NotificationResult<()> {
+    pub fn commit(&mut self, page: Page, receiver: &Receiver) -> NotificationResult<()> {
         if page.generation < self.generation {
             return Ok(());
         }
-        // Cloning is not the only peak: a one-entry insertion can rehash the
-        // whole prospective map, and range merge/reallocation overlaps buffers.
-        // Retained protocol state is separately bounded; all transient copies
-        // must fit delivery accounting before constructing prospective state.
-        let copy_bytes = if page.generation == self.generation {
-            4 * (self.partitions.capacity() * (size_of::<(Uuid, i64)>() + 16)
-                + self.ranges.capacity() * size_of::<Interval>())
-        } else {
-            0
-        };
-        let _scratch = receiver.budget.reserve(copy_bytes)?;
         let mut next = if page.generation > self.generation {
             Self {
                 generation: page.generation,
@@ -194,30 +118,16 @@ impl Progress {
         };
         let mut updates = Vec::new();
         for slot in page.entries.0 {
-            let entry = slot.0.ok_or(Error::Protocol("null notification entry"))?;
+            let entry = slot
+                .0
+                .ok_or(FurpcClientError::Protocol("null notification entry"))?;
             let table = entry
                 .entry
                 .0
-                .ok_or(Error::Protocol("null notification partition"))?;
-            // Decoding is already charged. Reserve the additional DTO/name/
-            // endpoint copies and growing update/admission containers before
-            // constructing them; no wire schema is walked a second time.
-            let endpoints =
-                table.replicas.replicas.0.len() + usize::from(table.replicas.primary_valid);
-            let conversion_bytes = 8
-                * (size_of::<ServiceNotification>() + size_of::<(ServiceNotification, Memory)>())
-                + table.name.len() * 4
-                + endpoints * 4 * size_of::<crate::ServiceEndpoint>()
-                + table.replicas.primary.len()
-                + table
-                    .replicas
-                    .replicas
-                    .0
-                    .iter()
-                    .map(String::len)
-                    .sum::<usize>();
-            memory.grow(conversion_bytes)?;
-            let version = table.identity(page.generation)?;
+                .ok_or(FurpcClientError::Protocol("null notification partition"))?;
+            let version = table
+                .identity(page.generation)
+                .map_err(FurpcClientError::Protocol)?;
             let lookup = version.lookup;
             if next
                 .ranges
@@ -251,7 +161,7 @@ impl Progress {
             next.ranges.extend(versions.ranges.0);
         }
         if next.ranges.iter().any(|r| r.start < 0 || r.start >= r.end) {
-            return Err(Error::Protocol("invalid notification version range").into());
+            return Err(FurpcClientError::Protocol("invalid notification version range").into());
         }
         next.ranges.sort_unstable_by_key(|r| r.start);
         let mut merged: Vec<Interval> = Vec::new();
@@ -273,27 +183,13 @@ impl Progress {
             return Err(inner
                 .terminal
                 .clone()
-                .unwrap_or(NotificationError::Common(Error::Closed)));
+                .unwrap_or_else(|| furpc::Error::Closed.into()));
         }
         if updates.len() > MAX_EVENTS.saturating_sub(inner.queue.len()) {
             return Err(NotificationError::Lagged);
         }
-        let mut admitted = Vec::with_capacity(updates.len());
-        for event in updates {
-            // Endpoint vectors and both owned service identities survive page disposal.
-            let bytes = size_of::<ServiceNotification>()
-                + 128
-                + event.service_name.as_str().len() * 4
-                + event.endpoints.capacity() * size_of::<crate::ServiceEndpoint>()
-                + event
-                    .endpoints
-                    .iter()
-                    .map(|e| e.address.capacity())
-                    .sum::<usize>();
-            admitted.push((event, memory.split(bytes)?));
-        }
         // The only publication point: queue entries and progress advance together.
-        inner.queue.extend(admitted);
+        inner.queue.extend(updates);
         *self = next;
         drop(inner);
         receiver.changed.notify_one();

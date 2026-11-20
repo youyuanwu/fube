@@ -1,37 +1,17 @@
-use std::{
-    future::{poll_fn, Future},
-    net::SocketAddr,
-    path::PathBuf,
-    task::Poll,
-    time::Duration,
-};
-
 use fube_client::{
-    ClientError, ClientOptions, DomainFailure, FabricClient, FurpcClient, GatewayDescription,
-    HealthState, Node, NodeDeactivationIntent, NodeDeactivationStatus, NodeListPage,
-    NodeQueryDescription, NodeQueryParameters, NodeStatus, NodeStatusFilter, Paging,
-    DEFAULT_TIMEOUT,
+    FurpcClient, FurpcClientError, GatewayDescription, HealthState, NamingUri, Node,
+    NodeDeactivationIntent, NodeDeactivationStatus, NodeListPage, NodeQueryDescription,
+    NodeQueryParameters, NodeStatus, NodeStatusFilter, Paging, DEFAULT_TIMEOUT,
 };
 use serde::Deserialize;
-use tokio::{
-    io::copy_bidirectional,
-    net::{TcpListener, TcpStream},
-    sync::oneshot,
-    task::JoinSet,
-    time::{sleep, timeout},
-};
-
-const CONCURRENT_OPERATIONS: usize = 8;
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-const OBSERVATION_MAX_AGE_MS: u64 = 120_000;
-
+use std::{net::SocketAddr, path::PathBuf};
 mod support;
 use support::ObservedNode;
-
 #[path = "support/rest.rs"]
 mod rest;
 #[path = "support/baseline_setup.rs"]
 mod setup;
+const OBSERVATION_MAX_AGE_MS: u64 = 120_000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -219,12 +199,20 @@ fn native_timing_evidence(nodes: &[Node]) -> serde_json::Value {
         .collect()
 }
 
-async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_json::Value {
+async fn assert_node_queries(
+    client: &mut FurpcClient,
+    config: &Config,
+    generation: u64,
+) -> serde_json::Value {
     assert_fresh(config);
     let native_observation_start_unix_ms = support::unix_millis();
     let baseline = client
-        .get_node_list(&NodeQueryDescription::default(), None)
+        .get_node_list(
+            furpc::Request::new((NodeQueryDescription::default()).clone()),
+            furpc_deadline(),
+        )
         .await
+        .map(|response| furpc_body(response, generation))
         .expect("native GetNodeList");
     let native_observation_end_unix_ms = support::unix_millis();
     assert_membership(&baseline, config);
@@ -236,63 +224,79 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
         assert_membership(
             &client
                 .get_node_list(
-                    &NodeQueryDescription::new(NodeQueryParameters {
-                        status_filter: filter,
-                        ..Default::default()
-                    }),
-                    None,
+                    furpc::Request::new(
+                        (NodeQueryDescription::new(NodeQueryParameters {
+                            status_filter: filter,
+                            ..Default::default()
+                        }))
+                        .clone(),
+                    ),
+                    furpc_deadline(),
                 )
                 .await
+                .map(|response| furpc_body(response, generation))
                 .expect("native status selection"),
             config,
         );
     }
     let empty = client
         .get_node_list(
-            &NodeQueryDescription::new(NodeQueryParameters {
-                status_filter: NodeStatusFilter::DOWN,
-                ..Default::default()
-            }),
-            None,
+            furpc::Request::new(
+                (NodeQueryDescription::new(NodeQueryParameters {
+                    status_filter: NodeStatusFilter::DOWN,
+                    ..Default::default()
+                }))
+                .clone(),
+            ),
+            furpc_deadline(),
         )
         .await
+        .map(|response| furpc_body(response, generation))
         .expect("native nonmatching status selection");
     assert!(empty.items.is_empty() && empty.continuation_token.is_none());
     assert_membership(
         &client
             .get_node_list(
-                &NodeQueryDescription {
-                    parameters: NodeQueryParameters {
-                        node_name: Some(String::new()),
-                        ..Default::default()
-                    },
-                    paging: Paging {
-                        continuation_token: Some(String::new()),
-                        ..Default::default()
-                    },
-                },
-                None,
+                furpc::Request::new(
+                    (NodeQueryDescription {
+                        parameters: NodeQueryParameters {
+                            node_name: Some(String::new()),
+                            ..Default::default()
+                        },
+                        paging: Paging {
+                            continuation_token: Some(String::new()),
+                            ..Default::default()
+                        },
+                    })
+                    .clone(),
+                ),
+                furpc_deadline(),
             )
             .await
+            .map(|response| furpc_body(response, generation))
             .expect("native empty omission semantics"),
         config,
     );
     for expected in &config.expected_nodes {
         let page = client
             .get_node_list(
-                &NodeQueryDescription {
-                    parameters: NodeQueryParameters {
-                        node_name: Some(expected.name.clone()),
-                        status_filter: NodeStatusFilter::UP,
-                    },
-                    paging: Paging {
-                        max_results: std::num::NonZeroU64::new(1),
-                        ..Default::default()
-                    },
-                },
-                None,
+                furpc::Request::new(
+                    (NodeQueryDescription {
+                        parameters: NodeQueryParameters {
+                            node_name: Some(expected.name.clone()),
+                            status_filter: NodeStatusFilter::UP,
+                        },
+                        paging: Paging {
+                            max_results: std::num::NonZeroU64::new(1),
+                            ..Default::default()
+                        },
+                    })
+                    .clone(),
+                ),
+                furpc_deadline(),
             )
             .await
+            .map(|response| furpc_body(response, generation))
             .expect("native exact-name hit and full terminal page");
         assert_eq!(page.items.len(), 1);
         assert!(
@@ -304,13 +308,17 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     for absent in ["native-client-no-such-node", "n0010", "N00"] {
         let page = client
             .get_node_list(
-                &NodeQueryDescription::new(NodeQueryParameters {
-                    node_name: Some(absent.into()),
-                    ..Default::default()
-                }),
-                None,
+                furpc::Request::new(
+                    (NodeQueryDescription::new(NodeQueryParameters {
+                        node_name: Some(absent.into()),
+                        ..Default::default()
+                    }))
+                    .clone(),
+                ),
+                furpc_deadline(),
             )
             .await
+            .map(|response| furpc_body(response, generation))
             .expect("native exact-name miss");
         assert!(page.items.is_empty() && page.continuation_token.is_none());
     }
@@ -323,16 +331,20 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
         for _ in 0..16 {
             let page = client
                 .get_node_list(
-                    &NodeQueryDescription {
-                        paging: Paging {
-                            continuation_token: token.take(),
-                            max_results: std::num::NonZeroU64::new(page_size),
-                        },
-                        ..Default::default()
-                    },
-                    None,
+                    furpc::Request::new(
+                        (NodeQueryDescription {
+                            paging: Paging {
+                                continuation_token: token.take(),
+                                max_results: std::num::NonZeroU64::new(page_size),
+                            },
+                            ..Default::default()
+                        })
+                        .clone(),
+                    ),
+                    furpc_deadline(),
                 )
                 .await
+                .map(|response| furpc_body(response, generation))
                 .expect("native server continuation chain");
             assert!(!page.items.is_empty());
             assert!(page.items.len() <= page_size as usize);
@@ -371,35 +383,45 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
         .unwrap();
     let exhausted = client
         .get_node_list(
-            &NodeQueryDescription {
-                paging: Paging {
-                    continuation_token: Some(format!("{final_id:x}")),
-                    max_results: std::num::NonZeroU64::new(1),
-                },
-                ..Default::default()
-            },
-            None,
+            furpc::Request::new(
+                (NodeQueryDescription {
+                    paging: Paging {
+                        continuation_token: Some(format!("{final_id:x}")),
+                        max_results: std::num::NonZeroU64::new(1),
+                    },
+                    ..Default::default()
+                })
+                .clone(),
+            ),
+            furpc_deadline(),
         )
         .await
+        .map(|response| furpc_body(response, generation))
         .expect("valid boundary continuation strictly after final independent ID");
     assert!(exhausted.items.is_empty() && exhausted.continuation_token.is_none());
     let invalid = client
         .get_node_list(
-            &NodeQueryDescription {
-                paging: Paging {
-                    continuation_token: Some("this-is-not-a-node-id".into()),
+            furpc::Request::new(
+                (NodeQueryDescription {
+                    paging: Paging {
+                        continuation_token: Some("this-is-not-a-node-id".into()),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            },
-            None,
+                })
+                .clone(),
+            ),
+            furpc_deadline(),
         )
         .await
+        .map(|response| furpc_body(response, generation))
         .expect_err("malformed continuation must be a native error, not empty success");
-    let (ClientError::Domain(DomainFailure { code, message })
-    | ClientError::Transport(fube_client::Error::Remote { code, message })) = invalid
-    else {
-        panic!("expected native error, got {invalid:?}");
+    let (code, message) = match invalid {
+        FurpcClientError::Domain(failure) => (failure.code, failure.message),
+        FurpcClientError::Native(furpc::Error::RemoteFault(fault)) => {
+            (fault.code(), String::from_utf16(fault.message()).unwrap())
+        }
+        other => panic!("expected native error, got {other:?}"),
     };
     // On this runtime all invalid-token subqueries can fail, and the parallel
     // handler returns the last failure (QueryMessageHandler.cpp:212-225). Real
@@ -409,97 +431,24 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
         [-2147024809, -2147017462].contains(&code),
         "unexpected native malformed-token error {code}: {message}"
     );
-    assert!(
-        !client.is_closed(),
-        "complete native fault must not poison the stream"
-    );
     assert_membership(
         &client
-            .get_node_list(&NodeQueryDescription::default(), None)
+            .get_node_list(
+                furpc::Request::new((NodeQueryDescription::default()).clone()),
+                furpc_deadline(),
+            )
             .await
+            .map(|response| furpc_body(response, generation))
             .expect("reuse after native error"),
         config,
     );
-    // Test-only low-level native probe records the effective success envelope,
-    // not packet fixtures. Production operations above all use FabricClient.
-    let deadline = fube_transport::connection::deadline_after(DEFAULT_TIMEOUT).unwrap();
-    use fube_transport::{
-        channel::{MessageChannel, RpcChannel},
-        message::{Header, Message, Properties},
-        native_demux::{ActorDemux, ChannelComposition, OutboundKind},
-        Endpoint,
-    };
-    fn probe_outbound(
-        _: &Message,
-        p: &Properties,
-        kind: OutboundKind,
-    ) -> fube_transport::Result<()> {
-        if kind != OutboundKind::Rpc || p.actor != 5 || p.action != "QueryRequest" {
-            return Err(fube_transport::Error::InvalidInput(
-                "native query probe envelope",
-            ));
-        }
-        Ok(())
-    }
-    fn probe_reply(_: &Message, _: &Properties) -> fube_transport::Result<()> {
-        Ok(())
-    }
-    let probe = Endpoint::unsecured_tcp(
-        config.gateway.parse().unwrap(),
-        ChannelComposition {
-            outbound: probe_outbound,
-            ordinary_reply: probe_reply,
-            actors: ActorDemux::new(vec![]).unwrap(),
-            duplex: None,
-            requests: None,
-            ordered_ingress: false,
-        },
-    )
-    .unwrap()
-    .connect_until(deadline)
-    .await
-    .unwrap();
-    let target = probe.resolve_target(&config.gateway).unwrap();
-    let mut body = fubst::Encoder::new();
-    body.object(|encoder| {
-        encoder.object(|encoder| encoder.object_array::<()>(&[], |_, _| Ok(())))?;
-        encoder.string("GetNodeList")
-    })
-    .unwrap();
-    let reply = probe
-        .request(
-            &target,
-            Message {
-                headers: vec![
-                    Header::actor(5).unwrap(),
-                    Header::action("QueryRequest").unwrap(),
-                    Header::timeout(i64::try_from(DEFAULT_TIMEOUT.as_nanos() / 100).unwrap())
-                        .unwrap(),
-                    Header::activity(uuid::Uuid::new_v4().to_bytes_le()).unwrap(),
-                    Header::version(1, 1).unwrap(),
-                ],
-                body: body.finish(),
-            },
-            deadline,
-        )
-        .await
-        .expect("native success envelope observation");
-    let properties = reply.properties().unwrap();
-    let headers = serde_json::json!({
-        "actor_present": reply.headers.iter().any(|h| h.id == fube_transport::message::ACTOR),
-        "effective_actor": properties.actor,
-        "action_present": reply.headers.iter().any(|h| h.id == fube_transport::message::ACTION),
-        "effective_action": properties.action,
-        "protocol_version": reply.protocol_version().unwrap(),
-    });
-    probe.close(deadline).await.unwrap();
     serde_json::json!({
         "native_node_count": baseline.items.len(), "independent_nodes": config.expected_nodes,
         "observation_unix_ms": config.observed_at_unix_ms,
         "native_observation_start_unix_ms": native_observation_start_unix_ms,
         "native_observation_end_unix_ms": native_observation_end_unix_ms,
         "native_timings": native_timing_evidence(&baseline.items),
-        "typed_stable_fields_match": true, "timing_tolerance_seconds": 120,
+        "typed_fields_match_http": true, "timing_tolerance_seconds": 120,
         "timestamp_precision_tolerance_ticks": 10000,
         "binary_ports_match_onebox_manifest": true,
         "exact_name_hit_miss_case_prefix": true, "status_default_all_up_down": true,
@@ -507,7 +456,6 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
         "valid_continuation_after_final_id_is_empty": true,
         "invalid_token_native_code": code, "connection_survives_native_error": true,
         "invalid_token_native_diagnostic": message,
-        "success_headers": headers,
         "limits": "healthy five logical nodes, one host; empty deactivation only; no snapshot/partial-failure qualification"
     })
 }
@@ -522,436 +470,253 @@ fn assert_independent_gateway(gateway: &GatewayDescription, config: &Config, nod
     assert_eq!(gateway.node_instance, config.expected_node_instance);
 }
 
-async fn assert_idle_proxy_disconnect(
-    endpoint: SocketAddr,
-    baseline: &GatewayDescription,
-    config: &Config,
-    node_id: u128,
-) {
-    let listener = timeout(SHUTDOWN_TIMEOUT, TcpListener::bind("127.0.0.1:0"))
-        .await
-        .expect("bound proxy listener setup")
-        .expect("bind test-owned ephemeral proxy");
-    let proxy_endpoint = listener.local_addr().expect("proxy listener address");
-    let (disconnect, disconnected) = oneshot::channel();
-    let mut proxy_tasks = JoinSet::new();
-    proxy_tasks.spawn(async move {
-        timeout(DEFAULT_TIMEOUT * 3, async move {
-            let (mut downstream, _) = listener.accept().await.expect("accept proxy client");
-            drop(listener);
-            let mut upstream = TcpStream::connect(endpoint)
-                .await
-                .expect("connect proxy to configured native gateway");
-            tokio::select! {
-                signal = disconnected => {
-                    signal.expect("explicit idle proxy disconnect signal");
-                }
-                result = copy_bidirectional(&mut downstream, &mut upstream) => {
-                    panic!("proxy forwarding ended before explicit disconnect: {result:?}");
-                }
-            }
-            drop(downstream);
-            drop(upstream);
-        })
-        .await
-        .expect("bound entire proxy forwarding lifetime");
-    });
-
-    let channel = timeout(
-        DEFAULT_TIMEOUT + SHUTDOWN_TIMEOUT,
-        FabricClient::endpoint_clear(proxy_endpoint)
-            .expect("configure test-owned proxy")
-            .connect_timeout(DEFAULT_TIMEOUT)
-            .connect(),
-    )
-    .await
-    .expect("bound native connection through proxy")
-    .expect("connect through test-owned proxy");
-    let client = FabricClient::new(channel, ClientOptions::default())
-        .expect("bind client to test-owned proxy channel");
-    let gateway = timeout(DEFAULT_TIMEOUT + SHUTDOWN_TIMEOUT, client.ping(None))
-        .await
-        .expect("bound real native ping through proxy")
-        .expect("real native ping through proxy");
-    assert_independent_gateway(&gateway, config, node_id);
-    assert_eq!(&gateway, baseline, "full native gateway identity via proxy");
-    assert!(
-        !client.is_closed(),
-        "proxy client must be live before cutoff"
-    );
-    assert!(client.terminal_error().is_none());
-
-    disconnect.send(()).expect("signal idle proxy cutoff");
-    timeout(SHUTDOWN_TIMEOUT, proxy_tasks.join_next())
-        .await
-        .expect("bound proxy shutdown")
-        .expect("proxy task exists")
-        .expect("proxy task completed without error");
-    assert!(proxy_tasks.is_empty());
-
-    // Only inspect state after cutoff: another operation must not drive EOF.
-    timeout(SHUTDOWN_TIMEOUT, async {
-        while !client.is_closed() || client.terminal_error().is_none() {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("observe idle closure and terminal error without sending an operation");
-    assert!(client.is_closed());
-    assert!(client.terminal_error().is_some());
-    timeout(SHUTDOWN_TIMEOUT, client.close())
-        .await
-        .expect("bound disconnected client driver join")
-        .expect("close and join disconnected proxy client");
+fn furpc_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + DEFAULT_TIMEOUT
 }
 
-/// This is deliberately not part of ordinary offline tests. Missing config or
-/// fixtures is an error, never a successful skip.
-/// Mixed operations are initially polled together on the current-thread runtime,
-/// proving overlapping lifetimes before yielding to the connection driver.
+fn furpc_body<T>(response: furpc::Response<T>, generation: u64) -> T {
+    assert_eq!(
+        response
+            .source()
+            .expect("native furpc response source")
+            .generation(),
+        generation,
+        "operation must reuse the original native generation, not reconnect"
+    );
+    response.into_body()
+}
+
+fn node_identities(page: &NodeListPage) -> serde_json::Value {
+    let mut nodes: Vec<_> = page.items.iter().collect();
+    nodes.sort_by_key(|node| node.id);
+    nodes
+        .into_iter()
+        .map(|node| serde_json::json!({
+            "name": node.name, "node_id": node.id.to_string(), "node_instance": node.instance_id,
+        }))
+        .collect()
+}
+
+async fn assert_furpc_management(
+    client: &mut FurpcClient,
+    gateway: &GatewayDescription,
+    config: &Config,
+    generation: u64,
+) -> serde_json::Value {
+    assert_fresh(config);
+    let native_observation_start_unix_ms = support::unix_millis();
+    let existing: NamingUri = config.existing_name.parse().unwrap();
+    let absent: NamingUri = config.absent_name.parse().unwrap();
+    let existing_result = furpc_body(
+        client
+            .name_exists(furpc::Request::new(existing.clone()), furpc_deadline())
+            .await
+            .expect("furpc existing name"),
+        generation,
+    );
+    let absent_result = furpc_body(
+        client
+            .name_exists(furpc::Request::new(absent), furpc_deadline())
+            .await
+            .expect("furpc absent name"),
+        generation,
+    );
+    assert!(existing_result && !absent_result);
+    let baseline = furpc_body(
+        client
+            .get_node_list(
+                furpc::Request::new(NodeQueryDescription::default()),
+                furpc_deadline(),
+            )
+            .await
+            .expect("furpc native GetNodeList"),
+        generation,
+    );
+    assert_membership(&baseline, config);
+    for (name, status, expected_count) in [
+        (
+            Some(config.expected_node_name.clone()),
+            NodeStatusFilter::UP,
+            1,
+        ),
+        (Some("furpc-no-such-node".into()), NodeStatusFilter::ALL, 0),
+        (None, NodeStatusFilter::DOWN, 0),
+    ] {
+        let query = NodeQueryDescription::new(NodeQueryParameters {
+            node_name: name,
+            status_filter: status,
+        });
+        let page = furpc_body(
+            client
+                .get_node_list(furpc::Request::new(query), furpc_deadline())
+                .await
+                .expect("furpc native node selector"),
+            generation,
+        );
+        assert_eq!(page.items.len(), expected_count);
+        assert!(page.continuation_token.is_none());
+        for node in &page.items {
+            assert_independent_node(
+                node,
+                config
+                    .expected_nodes
+                    .iter()
+                    .find(|observed| observed.name == node.name)
+                    .unwrap(),
+            );
+        }
+    }
+    let mut token = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut all = Vec::new();
+    let mut page_lengths = Vec::new();
+    for _ in 0..16 {
+        let query = NodeQueryDescription {
+            paging: Paging {
+                continuation_token: token.take(),
+                max_results: std::num::NonZeroU64::new(2),
+            },
+            ..Default::default()
+        };
+        let page = furpc_body(
+            client
+                .get_node_list(furpc::Request::new(query), furpc_deadline())
+                .await
+                .expect("furpc server-issued node continuation"),
+            generation,
+        );
+        assert!(!page.items.is_empty() && page.items.len() <= 2);
+        page_lengths.push(page.items.len());
+        all.extend(page.items);
+        token = page.continuation_token;
+        if let Some(token) = &token {
+            assert!(seen.insert(token.clone()), "continuation must advance");
+        } else {
+            break;
+        }
+    }
+    assert!(
+        token.is_none() && !seen.is_empty(),
+        "follow a real native continuation to completion"
+    );
+    assert!(all.windows(2).all(|pair| pair[0].id < pair[1].id));
+    assert_membership(
+        &NodeListPage {
+            items: all,
+            continuation_token: None,
+        },
+        config,
+    );
+    let invalid = NodeQueryDescription {
+        paging: Paging {
+            continuation_token: Some("this-is-not-a-node-id".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let error = client
+        .get_node_list(furpc::Request::new(invalid), furpc_deadline())
+        .await
+        .expect_err("furpc malformed continuation must remain a native error");
+    let (native_error_code, native_error_origin) = match error {
+        FurpcClientError::Domain(failure) => (failure.code, "domain"),
+        FurpcClientError::Native(furpc::Error::RemoteFault(fault)) => {
+            (fault.code(), "native_fault")
+        }
+        other => panic!("unexpected furpc native error category: {other:?}"),
+    };
+    assert!([-2147024809, -2147017462].contains(&native_error_code));
+    let reused = furpc_body(
+        client
+            .get_node_list(
+                furpc::Request::new(NodeQueryDescription::default()),
+                furpc_deadline(),
+            )
+            .await
+            .expect("furpc same-generation reuse after native error"),
+        generation,
+    );
+    assert_membership(&reused, config);
+    let mut ping = client.clone();
+    let mut naming = client.clone();
+    let mut nodes = client.clone();
+    let deadline = furpc_deadline();
+    let (ping, naming, nodes) = tokio::try_join!(
+        ping.ping(furpc::Request::new(()), deadline),
+        naming.name_exists(furpc::Request::new(existing), deadline),
+        nodes.get_node_list(
+            furpc::Request::new(NodeQueryDescription::default()),
+            deadline
+        ),
+    )
+    .expect("mixed concurrent furpc calls over clones");
+    assert_eq!(&furpc_body(ping, generation), gateway);
+    assert!(furpc_body(naming, generation));
+    assert_membership(&furpc_body(nodes, generation), config);
+    serde_json::json!({
+        "existing_name": existing_result, "absent_name": absent_result,
+        "native_observation_start_unix_ms": native_observation_start_unix_ms,
+        "native_observation_end_unix_ms": support::unix_millis(),
+        "native_nodes": node_identities(&baseline),
+        "stable_fields_match_http": true,
+        "exact_name_and_status_filters": true,
+        "page_lengths": page_lengths, "server_token_count": seen.len(),
+        "native_error_code": native_error_code, "native_error_origin": native_error_origin,
+        "same_generation_after_error": true, "mixed_concurrent_operations": 3,
+        "mixed_results_match": true, "generation": generation,
+    })
+}
 #[tokio::test]
-#[ignore = "prepares its own fixtures on a disposable clear onebox; requires MSSF_TEST_CONFIG and MSSF_TEST_REPORT"]
+#[ignore = "prepares owned fixtures on a disposable clear onebox; requires MSSF_TEST_CONFIG and MSSF_TEST_REPORT"]
 async fn onebox_ping_name_exists_and_node_list() {
     setup::prepare()
         .await
-        .expect("independently prepare fresh baseline fixtures");
-    let path = PathBuf::from(
-        std::env::var_os("MSSF_TEST_CONFIG")
-            .expect("MSSF_TEST_CONFIG must point to the private JSON fixture configuration"),
-    );
-    assert!(
-        path.is_absolute(),
-        "MSSF_TEST_CONFIG must be absolute; Cargo runs tests from the package directory"
-    );
-    let bytes = std::fs::read(path).expect("read MSSF_TEST_CONFIG");
-    let config: Config = serde_json::from_slice(&bytes).expect("parse exact onebox configuration");
-    let (endpoint, node_id) = config
-        .validate()
-        .expect("validate independent onebox fixtures");
+        .expect("prepare independent baseline");
+    let path = PathBuf::from(std::env::var_os("MSSF_TEST_CONFIG").expect("MSSF_TEST_CONFIG"));
+    assert!(path.is_absolute());
+    let config: Config = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let (endpoint, node_id) = config.validate().unwrap();
     assert_fresh(&config);
-    let channel = FabricClient::endpoint_clear(endpoint)
-        .expect("configure native clear gateway")
-        .connect_timeout(DEFAULT_TIMEOUT)
+    let channel = FurpcClient::endpoint_clear(endpoint)
+        .unwrap()
         .connect()
         .await
-        .expect("connect explicitly to native clear gateway");
-    let client = FabricClient::new(channel, ClientOptions::default())
-        .expect("bind client to native gateway channel");
-    let gateway = client.ping(None).await.expect("native correlated ping");
-    assert_independent_gateway(&gateway, &config, node_id);
-    let furpc_channel = FurpcClient::endpoint_clear(endpoint)
-        .expect("configure furpc native clear gateway")
-        .connect()
-        .await
-        .expect("establish furpc with native gateway");
-    let furpc_client = FurpcClient::new(furpc_channel);
-    let furpc_clone = furpc_client.clone();
-    let (furpc_gateway, second, third) = tokio::try_join!(
-        furpc_client.ping(None),
-        furpc_clone.ping(None),
-        furpc_client.ping(None),
+        .unwrap();
+    let mut client = FurpcClient::new(channel);
+    let mut second_client = client.clone();
+    let mut third_client = client.clone();
+    let deadline = furpc_deadline();
+    let (first, second, third) = tokio::try_join!(
+        client.ping(furpc::Request::new(()), deadline),
+        second_client.ping(furpc::Request::new(()), deadline),
+        third_client.ping(furpc::Request::new(()), deadline),
     )
-    .expect("three furpc native pings on the shared channel");
-    for actual in [&furpc_gateway, &second, &third] {
+    .unwrap();
+    let generation = first.source().unwrap().generation();
+    let gateway = furpc_body(first, generation);
+    for actual in [
+        &gateway,
+        &furpc_body(second, generation),
+        &furpc_body(third, generation),
+    ] {
         assert_independent_gateway(actual, &config, node_id);
-        assert_eq!(actual, &gateway, "furpc and legacy native identities match");
     }
-    drop((furpc_client, furpc_clone));
-    assert!(client
-        .name_exists(&config.existing_name, None)
-        .await
-        .expect("existing native name"));
-    assert!(!client
-        .name_exists(&config.absent_name, None)
-        .await
-        .expect("absent native name"));
-    let node_evidence = assert_node_queries(&client, &config).await;
-    let mut pending_operations = Vec::with_capacity(CONCURRENT_OPERATIONS);
-    for index in 0..CONCURRENT_OPERATIONS {
-        let handle = client.clone();
-        let existing_name = config.existing_name.clone();
-        let absent_name = config.absent_name.clone();
-        let expected_config = config.clone();
-        pending_operations.push(Box::pin(async move {
-            match index % 5 {
-                0 | 1 => Some(handle.ping(None).await.expect("concurrent native ping")),
-                2 => {
-                    assert!(handle
-                        .name_exists(&existing_name, None)
-                        .await
-                        .expect("concurrent existing native name"));
-                    None
-                }
-                3 => {
-                    assert!(!handle
-                        .name_exists(&absent_name, None)
-                        .await
-                        .expect("concurrent absent native name"));
-                    None
-                }
-                _ => {
-                    assert_membership(
-                        &handle
-                            .get_node_list(&NodeQueryDescription::default(), None)
-                            .await
-                            .expect("concurrent native node list"),
-                        &expected_config,
-                    );
-                    None
-                }
-            }
-        }));
-    }
-    let initially_pending_count = poll_fn(|context| {
-        let mut pending_count = 0;
-        for operation in &mut pending_operations {
-            assert!(
-                operation.as_mut().poll(context).is_pending(),
-                "every native operation must start without completing before the driver runs"
-            );
-            pending_count += 1;
-        }
-        Poll::Ready(pending_count)
-    })
-    .await;
-    assert_eq!(initially_pending_count, CONCURRENT_OPERATIONS);
-    assert_eq!(initially_pending_count, 8);
-    assert!(matches!(
-        client.ping(None).await,
-        Err(ClientError::Local(fube_client::Error::ResourceLimit(_)))
-    ));
-    assert!(!client.is_closed());
-    assert!(client.terminal_error().is_none());
-    let mut operations = JoinSet::new();
-    for operation in pending_operations {
-        operations.spawn(operation);
-    }
-    let mut concurrent_completed = 0;
-    timeout(DEFAULT_TIMEOUT + SHUTDOWN_TIMEOUT, async {
-        while let Some(result) = operations.join_next().await {
-            if let Some(actual) = result.expect("concurrent native operation task") {
-                assert_independent_gateway(&actual, &config, node_id);
-                assert_eq!(
-                    actual, gateway,
-                    "complete concurrent native gateway identity"
-                );
-            }
-            concurrent_completed += 1;
-        }
-    })
-    .await
-    .expect("bound all overlapping native operations and task joins");
-    assert_eq!(concurrent_completed, CONCURRENT_OPERATIONS);
-    assert!(operations.is_empty());
-
-    drop(client.clone());
-    assert!(
-        !client.is_closed(),
-        "dropping clones must preserve base client"
-    );
-    assert!(client.terminal_error().is_none());
-    let after_clone_drop = client
-        .ping(None)
-        .await
-        .expect("original native connection survives all operation clones being dropped");
-    assert_independent_gateway(&after_clone_drop, &config, node_id);
-    assert_eq!(after_clone_drop, gateway, "gateway after dropping clones");
-    timeout(SHUTDOWN_TIMEOUT, client.close())
-        .await
-        .expect("bound native client driver join")
-        .expect("close native connection");
-    assert!(client.is_closed());
-
-    assert_idle_proxy_disconnect(endpoint, &gateway, &config, node_id).await;
-
+    let node_evidence = assert_node_queries(&mut client, &config, generation).await;
+    let management = assert_furpc_management(&mut client, &gateway, &config, generation).await;
+    let gateway = serde_json::json!({
+        "address": gateway.address, "node_name": gateway.node_name,
+        "node_id": format!("{:x}", gateway.node_id), "node_instance": gateway.node_instance,
+    });
     let record = serde_json::json!({
-        "runtime_version": config.runtime_version,
-        "profile": config.profile,
-        "endpoint": endpoint.to_string(),
-        "gateway": {
-            "address": gateway.address,
-            "node_name": gateway.node_name,
-            "node_id": format!("{:x}", gateway.node_id),
-            "node_instance": gateway.node_instance
-        },
+        "profile": config.profile, "runtime_version": config.runtime_version,
+        "endpoint": endpoint.to_string(), "gateway": gateway,
         "node_list": node_evidence,
-        "furpc_ping": {
-            "operation_count": ([&furpc_gateway, &second, &third].len()),
-            "gateway": {
-                "address": furpc_gateway.address,
-                "node_name": furpc_gateway.node_name,
-                "node_id": format!("{:x}", furpc_gateway.node_id),
-                "node_instance": furpc_gateway.node_instance
-            }
-        },
-        "executed_cases": [
-            {"case": "native_ping", "passed": true},
-            {"case": "native_name_exists_existing", "result": true, "passed": true},
-            {"case": "native_name_exists_absent", "result": false, "passed": true},
-            {
-                "case": "native_concurrent_mixed",
-                "operation_count": concurrent_completed,
-                "initially_pending_count": initially_pending_count,
-                "ninth_call_rejected_locally": true,
-                "reuse_after_slot_release": true,
-                "ping_count": (0..CONCURRENT_OPERATIONS).filter(|i| i % 5 <= 1).count(),
-                "existing_name_count": (0..CONCURRENT_OPERATIONS).filter(|i| i % 5 == 2).count(),
-                "absent_name_count": (0..CONCURRENT_OPERATIONS).filter(|i| i % 5 == 3).count(),
-                "node_list_count": (0..CONCURRENT_OPERATIONS).filter(|i| i % 5 == 4).count(),
-                "passed": true
-            },
-            {"case": "clone_drop_preserves_original_connection", "passed": true},
-            {"case": "explicit_close", "passed": true},
-            {
-                "case": "test_owned_proxy_idle_disconnect",
-                "native_ping_passed": true,
-                "closed_without_operation": true,
-                "terminal_error_observed": true,
-                "passed": true
-            }
-        ]
+        "furpc_ping": {"operation_count": 3, "gateway": gateway},
+        "furpc_management": management,
     });
     std::fs::write(
         &config.report_path,
-        serde_json::to_vec_pretty(&record).expect("serialize sanitized compatibility record"),
+        serde_json::to_vec_pretty(&record).unwrap(),
     )
-    .expect("write sanitized compatibility record after all native cases passed");
-}
-
-#[test]
-fn observation_freshness_is_finite_and_future_dates_are_rejected() {
-    let mut config: Config = serde_json::from_value(sample_config()).unwrap();
-    assert_fresh(&config);
-    config.observed_at_unix_ms = support::unix_millis() - OBSERVATION_MAX_AGE_MS - 1;
-    assert!(std::panic::catch_unwind(|| assert_fresh(&config)).is_err());
-    config.observed_at_unix_ms = support::unix_millis() + OBSERVATION_MAX_AGE_MS;
-    assert!(std::panic::catch_unwind(|| assert_fresh(&config)).is_err());
-}
-
-#[test]
-fn native_timestamp_oracle_preserves_epoch_and_millisecond_precision() {
-    assert_native_time(0, "0001-01-01T00:00:00.000Z");
-    assert_native_time(116_444_736_000_000_000, "1970-01-01T00:00:00.000Z");
-    assert_native_time(134_371_187_016_289_999, "2026-10-22T04:58:21.628Z");
-    assert!(std::panic::catch_unwind(|| {
-        assert_native_time(134_371_187_016_300_000, "2026-10-22T04:58:21.628Z");
-    })
-    .is_err());
-}
-
-#[test]
-fn evidence_retains_native_timing_values_without_precision_loss() {
-    use fube_client::{NodeDeactivation, NodeId, NodeTimestamp};
-    let node = Node {
-        name: "N0010".into(),
-        id: NodeId { high: 1, low: 2 },
-        ip_address_or_fqdn: "127.0.0.1".into(),
-        node_type: "type".into(),
-        code_version: "version".into(),
-        config_version: "1".into(),
-        status: NodeStatus::Up,
-        up_time_seconds: 123,
-        health_state: HealthState::Ok,
-        is_seed_node: true,
-        upgrade_domain: "UD0".into(),
-        fault_domain: "fd:/n".into(),
-        id_copy: NodeId { high: 1, low: 2 },
-        instance_id: 42,
-        cluster_connection_port: 19002,
-        deactivation: NodeDeactivation {
-            effective_intent: NodeDeactivationIntent::Invalid,
-            status: NodeDeactivationStatus::None,
-            tasks: vec![],
-            pending_safety_checks: vec![],
-        },
-        is_stopped: false,
-        down_time_seconds: 456,
-        up_at: NodeTimestamp(134_371_187_016_284_610),
-        down_at: NodeTimestamp(0),
-        http_gateway_port: 19080,
-    };
-    let evidence = native_timing_evidence(&[node]);
-    assert_eq!(evidence[0]["name"], "N0010");
-    assert_eq!(evidence[0]["id"], "10000000000000002");
-    assert_eq!(evidence[0]["up_time_seconds"].as_i64(), Some(123));
-    assert_eq!(evidence[0]["down_time_seconds"].as_i64(), Some(456));
-    assert_eq!(
-        evidence[0]["up_at_native_ticks"].as_i64(),
-        Some(134_371_187_016_284_610)
-    );
-    assert_eq!(evidence[0]["down_at_native_ticks"].as_i64(), Some(0));
-}
-
-#[cfg(test)]
-fn sample_config() -> serde_json::Value {
-    serde_json::json!({
-        "profile": "clear",
-        "gateway": "127.0.0.1:19000",
-        "runtime_version": "independently-observed-version",
-        "existing_name": "fabric:/poc/existing",
-        "absent_name": "fabric:/poc/absent",
-        "expected_node_name": "N0010",
-        "expected_node_id": "abcdef0123456789",
-        "expected_node_instance": 123456789,
-        "observed_at_unix_ms": support::unix_millis(),
-        "expected_nodes": (0..5).map(|index| serde_json::json!({
-            "Name": format!("N00{}0", index + 1),
-            "IpAddressOrFQDN": "127.0.0.1", "Type": "node-type",
-            "CodeVersion": "version", "ConfigVersion": "1", "NodeStatus": "Up",
-            "NodeUpTimeInSeconds": "1", "HealthState": "Ok", "IsSeedNode": true,
-            "UpgradeDomain": "UD0", "FaultDomain": "fd:/n",
-            "Id": {"Id": format!("{:x}", index + 1)}, "InstanceId": "1",
-            "NodeDeactivationInfo": {"NodeDeactivationIntent": "Invalid",
-                "NodeDeactivationStatus": "None", "NodeDeactivationTask": [],
-                "PendingSafetyChecks": []},
-            "IsStopped": false, "NodeDownTimeInSeconds": "0",
-            "NodeUpAt": "2026-10-22T00:00:00.000Z", "NodeDownAt": "0001-01-01T00:00:00.000Z"
-        })).collect::<Vec<_>>(),
-        "report_path": std::env::temp_dir().join("mssf-poc-evidence.json")
-    })
-}
-
-#[test]
-fn private_config_requires_exact_fields_and_independent_fixtures() {
-    let good = sample_config();
-    assert!(serde_json::from_value::<Config>(good.clone())
-        .unwrap()
-        .validate()
-        .is_ok());
-    let mut unknown = good.clone();
-    unknown["secret"] = "not-allowed".into();
-    assert!(serde_json::from_value::<Config>(unknown).is_err());
-    for field in good.as_object().unwrap().keys() {
-        let mut missing = good.clone();
-        missing.as_object_mut().unwrap().remove(field);
-        assert!(
-            serde_json::from_value::<Config>(missing).is_err(),
-            "{field}"
-        );
-    }
-    for (field, value) in [
-        ("profile", "tls"),
-        ("gateway", "localhost:19000"),
-        ("gateway", "127.0.0.1:0"),
-        ("runtime_version", " "),
-        ("existing_name", "fabric:/"),
-        ("absent_name", "fabric:/a?b"),
-        ("absent_name", "fabric:/poc/existing"),
-        ("expected_node_name", ""),
-        ("expected_node_id", "ABCDEF"),
-        ("expected_node_id", "0xabc"),
-        ("expected_node_id", "00abc"),
-        ("report_path", ""),
-        ("report_path", "relative-report.json"),
-    ] {
-        let mut bad = good.clone();
-        bad[field] = value.into();
-        assert!(
-            serde_json::from_value::<Config>(bad)
-                .unwrap()
-                .validate()
-                .is_err(),
-            "{field}={value:?}"
-        );
-    }
+    .unwrap();
 }

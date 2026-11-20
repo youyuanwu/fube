@@ -3,9 +3,9 @@ use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use fube_client::{
     ApplicationDefinitionKindFilter, ApplicationListFilter, ApplicationQueryDescription,
-    ClientOptions, FabricClient, HealthEventsFilter, NamingUri, NodeHealthPolicy,
-    NodeHealthQueryDescription, NodeHealthQueryParameters, NodeQueryDescription, Paging,
-    ServiceListFilter, ServiceQueryDescription, ServiceQueryParameters, DEFAULT_TIMEOUT,
+    FurpcClient, HealthEventsFilter, NamingUri, NodeHealthPolicy, NodeHealthQueryDescription,
+    NodeHealthQueryParameters, NodeQueryDescription, Paging, ServiceListFilter,
+    ServiceQueryDescription, ServiceQueryParameters, DEFAULT_TIMEOUT,
 };
 
 #[derive(Parser)]
@@ -159,7 +159,9 @@ fn timeout(value: &str) -> Result<Duration, String> {
         .filter(|value| value.is_finite() && *value > 0.0)
         .ok_or("timeout must be positive finite seconds")?;
     let timeout = Duration::try_from_secs_f64(seconds).map_err(|_| "timeout is out of range")?;
-    fube_transport::connection::deadline_after(timeout).map_err(|error| error.to_string())?;
+    if tokio::time::Instant::now().checked_add(timeout).is_none() {
+        return Err("timeout is out of range".into());
+    }
     Ok(timeout)
 }
 
@@ -250,21 +252,21 @@ impl From<Command> for Operation {
 async fn run(arguments: Arguments) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let timeout = arguments.timeout();
     let operation = Operation::from(arguments.command);
-    let endpoint = FabricClient::endpoint_clear(arguments.clear)?.connect_timeout(timeout);
-    let channel = endpoint.connect().await?;
-    let client = FabricClient::new(
-        channel,
-        ClientOptions {
-            default_timeout: timeout,
-            ..ClientOptions::default()
-        },
-    )?;
+    let channel = FurpcClient::endpoint_clear(arguments.clear)?
+        .connect_timeout(timeout)
+        .connect()
+        .await?;
+    let mut client = FurpcClient::new(channel);
+    let deadline = tokio::time::Instant::now() + timeout;
     match operation {
         Operation::Ping => {
-            // Explicit stub clones share one channel and typed admission budget.
-            let cloned = client.clone();
-            let (first, second) = tokio::try_join!(client.ping(None), cloned.ping(None))?;
+            let mut cloned = client.clone();
+            let (first, second) = tokio::try_join!(
+                client.ping(furpc::Request::new(()), deadline),
+                cloned.ping(furpc::Request::new(()), deadline)
+            )?;
             for gateway in [first, second] {
+                let gateway = gateway.into_body();
                 println!(
                     "gateway={} node_name={} node_id={:x} node_instance={}",
                     gateway.address, gateway.node_name, gateway.node_id, gateway.node_instance
@@ -274,45 +276,66 @@ async fn run(arguments: Arguments) -> std::result::Result<(), Box<dyn std::error
         Operation::NodeList => {
             // Explicit single page: never imply this is the complete membership.
             let page = client
-                .get_node_list(&NodeQueryDescription::default(), None)
-                .await?;
+                .get_node_list(
+                    furpc::Request::new(NodeQueryDescription::default()),
+                    deadline,
+                )
+                .await?
+                .into_body();
             for node in page.items {
                 println!("{node:?}");
             }
             println!("continuation_token={:?}", page.continuation_token);
         }
         Operation::NodeHealth(query) => {
-            println!("{:#?}", client.get_node_health(&query, None).await?);
+            println!(
+                "{:#?}",
+                client
+                    .get_node_health(furpc::Request::new(query), deadline)
+                    .await?
+                    .into_body()
+            );
         }
         Operation::ApplicationList(query) => {
             println!(
                 "{:#?}",
-                client.get_application_list(&query, Some(timeout)).await?
+                client
+                    .get_application_list(furpc::Request::new(query), deadline)
+                    .await?
+                    .into_body()
             );
         }
         Operation::ServiceList(query) => {
             println!(
                 "{:#?}",
-                client.get_service_list(&query, Some(timeout)).await?
+                client
+                    .get_service_list(furpc::Request::new(query), deadline)
+                    .await?
+                    .into_body()
             );
         }
         Operation::NameExists(name) => {
             println!(
                 "name={name} exists={}",
-                client.name_exists(&name, None).await?
+                client
+                    .name_exists(furpc::Request::new(name.clone()), deadline)
+                    .await?
+                    .into_body()
             );
         }
         Operation::CreateName(name) => {
-            // Sent writes can execute despite timeout/cancel/disconnect. Never replay.
-            client.create_name(&name, Some(timeout)).await?;
+            client
+                .create_name(furpc::Request::new(name.clone()), deadline)
+                .await?;
             println!("created name={name}");
         }
         Operation::DeleteName(name) => {
-            client.delete_name(&name, Some(timeout)).await?;
+            client
+                .delete_name(furpc::Request::new(name.clone()), deadline)
+                .await?;
             println!("deleted name={name}");
         }
     }
-    client.close().await?;
     Ok(())
 }
 

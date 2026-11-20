@@ -145,6 +145,118 @@ struct Pair(u32, String);
 struct Newtype(Pair);
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct Empty {}
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct NoBody(());
+
+#[test]
+fn root_unit_is_empty_with_zero_limits_and_transparent_newtypes() {
+    let limits = Limits {
+        max_bytes: 0,
+        max_depth: 0,
+    };
+    assert!(to_vec(&()).unwrap().is_empty());
+    from_slice::<()>(&[]).unwrap();
+    assert!(to_vec_with_limits(&(), limits).unwrap().is_empty());
+    from_slice_with_limits_and_budget::<()>(&[], limits, &mut |_| {
+        panic!("an empty root must not reserve allocations")
+    })
+    .unwrap();
+    assert!(to_vec_with_limits(&NoBody(()), limits).unwrap().is_empty());
+    assert_eq!(
+        from_slice_with_limits::<NoBody>(&[], limits).unwrap(),
+        NoBody(())
+    );
+}
+
+#[test]
+fn root_unit_rejects_nonempty_input_without_changing_empty_object_framing() {
+    let mut native = Encoder::new();
+    native.object(|_| Ok(())).unwrap();
+    let framed = to_vec(&Empty {}).unwrap();
+    assert_eq!(framed, native.finish());
+    assert!(!framed.is_empty());
+    assert_eq!(from_slice::<Empty>(&framed).unwrap(), Empty {});
+    assert!(from_slice::<Empty>(&[]).is_err());
+    for bytes in [framed, to_vec(&false).unwrap(), vec![0xff]] {
+        assert!(matches!(from_slice::<()>(&bytes), Err(Error::Protocol(_))));
+        assert!(matches!(
+            from_slice::<NoBody>(&bytes),
+            Err(Error::Protocol(_))
+        ));
+    }
+}
+
+#[test]
+fn unit_cannot_erase_native_fields_or_container_elements() {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Fields {
+        head: u32,
+        unit: NoBody,
+        tail: u32,
+    }
+    assert!(matches!(
+        to_vec(&Fields {
+            head: 1,
+            unit: NoBody(()),
+            tail: 2,
+        }),
+        Err(Error::InvalidInput(_))
+    ));
+    let mut native = Encoder::new();
+    native
+        .object(|encoder| {
+            encoder.u32(1)?;
+            assert!(matches!(
+                to_fields(encoder, &()),
+                Err(Error::InvalidInput(_))
+            ));
+            encoder.u32(2)
+        })
+        .unwrap();
+    let bytes = native.finish();
+    assert!(matches!(
+        from_slice::<Fields>(&bytes),
+        Err(Error::Protocol(_))
+    ));
+    let mut decoder = Decoder::new(&bytes);
+    decoder
+        .object(|decoder| {
+            assert_eq!(decoder.u32()?, 1);
+            assert!(matches!(
+                from_fields::<()>(decoder),
+                Err(Error::Protocol(_))
+            ));
+            assert_eq!(decoder.u32()?, 2);
+            Ok(())
+        })
+        .unwrap();
+    decoder.finish().unwrap();
+    assert!(matches!(
+        to_vec(&Pointer(Some(()))),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        from_slice::<Pointer<()>>(&to_vec(&Pointer(Some(Empty {}))).unwrap()),
+        Err(Error::Protocol(_))
+    ));
+    assert!(matches!(
+        to_vec(&ObjectArray(vec![()])),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        from_slice::<ObjectArray<Vec<()>>>(&to_vec(&ObjectArray(vec![Empty {}])).unwrap()),
+        Err(Error::Protocol(_))
+    ));
+    assert!(matches!(
+        to_vec(&CountedValues(vec![()])),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        from_slice::<CountedValues<Vec<()>>>(&to_vec(&CountedValues(vec![false])).unwrap()),
+        Err(Error::Protocol(_))
+    ));
+}
+
 #[test]
 fn tuple_struct_newtype_and_explicit_empty_kinds() {
     let value = Newtype(Pair(128, String::new()));
@@ -527,7 +639,6 @@ fn unsupported_standard_serde_shapes_fail_in_both_directions() {
     unsupported(&1i128);
     unsupported(&1.0f32);
     unsupported(&'x');
-    unsupported(&());
     unsupported(&Unit);
     unsupported(&None::<u32>);
     unsupported(&Some(1u32));

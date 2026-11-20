@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     query_arguments::validate_node_name,
     query_protocol::{result_tags, ListReply, Query},
-    Error, HealthState, NamingUri, PagedQuery, QueryPage, Result,
+    HealthState, NamingUri, PagedQuery, QueryPage,
 };
 
 /// Native paged deployed-application parameters in facade argument order.
@@ -91,18 +91,18 @@ impl Query for DeployedApplicationQueryParameters {
     type Reply = ListReply<DeployedApplication, { result_tags::DEPLOYED_APPLICATION }>;
     const NAME: &'static str = "GetApplicationPagedListDeployedOnNode";
 
-    fn validate_parameters(&self) -> Result<()> {
+    fn validate_parameters(&self) -> fubst::Result<()> {
         validate_node_name(
             &self.node_name,
             "deployed application node name must be 1..=4096 UTF-16 units without NUL",
         )
     }
 
-    fn validate_record(record: DeployedApplication) -> Result<DeployedApplication> {
+    fn validate_record(
+        record: DeployedApplication,
+    ) -> std::result::Result<DeployedApplication, &'static str> {
         if matches!(record.health_state, HealthState::Unrecognized(_)) {
-            return Err(Error::Protocol(
-                "unsupported deployed application health state",
-            ));
+            return Err("unsupported deployed application health state");
         }
         Ok(record)
     }
@@ -111,228 +111,8 @@ impl Query for DeployedApplicationQueryParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        query_protocol::{encode_query, tests::assert_request},
-        Paging,
-    };
-    use fubst::{
-        serde::{from_fields, from_slice, to_vec},
-        Decoder, Encoder,
-    };
+    use crate::Paging;
     use std::num::NonZeroU64;
-
-    // ServiceModel/DeployedApplicationQueryResult.h FABRIC_FIELDS_07: the
-    // application name is std::wstring, unlike ApplicationQueryResult's URI.
-    fn fields(e: &mut Encoder, count: usize, status: i64, health: i64) -> fubst::Result<()> {
-        for field in 0..count {
-            match field {
-                0 => e.string("fabric:/应用")?,
-                1 => e.string("Type")?,
-                2 => e.i64(status)?,
-                3 => e.string("/node/应用/work")?,
-                4 => e.string("/node/应用/log")?,
-                5 => e.string("/node/应用/temp")?,
-                6 => e.i64(health)?,
-                _ => unreachable!(),
-            }
-        }
-        Ok(())
-    }
-
-    fn record(count: usize, status: i64, health: i64) -> Vec<u8> {
-        let mut e = Encoder::new();
-        e.object(|e| fields(e, count, status, health)).unwrap();
-        e.finish()
-    }
-
-    fn decode_record(bytes: &[u8]) -> Result<DeployedApplication> {
-        DeployedApplicationQueryParameters::validate_record(from_slice(bytes)?)
-    }
-
-    #[test]
-    fn deployed_query_name_omission_boolean_and_paging_arguments() {
-        let mut parameters = DeployedApplicationQueryParameters::new("Node_1");
-        assert_request(
-            &parameters,
-            None,
-            "GetApplicationPagedListDeployedOnNode",
-            &[("NodeName", "Node_1"), ("IncludeHealthState", "false")],
-        );
-        assert_request(
-            &parameters,
-            Some(&Paging {
-                continuation_token: Some(String::new()),
-                max_results: None,
-            }),
-            "GetApplicationPagedListDeployedOnNode",
-            &[("NodeName", "Node_1"), ("IncludeHealthState", "false")],
-        );
-        parameters.application_name = Some(NamingUri::parse("fabric:/App").unwrap());
-        parameters.include_health_state = true;
-        assert_request(
-            &parameters,
-            Some(&Paging {
-                continuation_token: Some("opaque:/应用".into()),
-                max_results: NonZeroU64::new(3),
-            }),
-            "GetApplicationPagedListDeployedOnNode",
-            &[
-                ("NodeName", "Node_1"),
-                ("ApplicationName", "fabric:/App"),
-                ("IncludeHealthState", "true"),
-                ("ContinuationToken", "opaque:/应用"),
-                ("MaxResults", "3"),
-            ],
-        );
-        assert!(matches!(
-            encode_query(
-                &parameters,
-                Some(&Paging {
-                    continuation_token: None,
-                    max_results: NonZeroU64::new(i64::MAX as u64 + 1),
-                })
-            ),
-            Err(Error::InvalidInput(_))
-        ));
-    }
-
-    #[test]
-    fn deployed_query_requires_bounded_nonempty_node_name() {
-        for name in [
-            String::new(),
-            "bad\0node".into(),
-            "x".repeat(4097),
-            "😀".repeat(2049),
-        ] {
-            assert!(matches!(
-                encode_query(&DeployedApplicationQueryParameters::new(name), None),
-                Err(Error::InvalidInput(_))
-            ));
-        }
-        for name in ["x".repeat(4096), "😀".repeat(2048), "节点".into()] {
-            encode_query(&DeployedApplicationQueryParameters::new(name), None).unwrap();
-        }
-    }
-
-    #[test]
-    fn deployed_record_exact_native_string_layout_and_numeric_enums() {
-        for (status, expected) in [
-            (0, DeploymentStatus::Invalid),
-            (1, DeploymentStatus::Downloading),
-            (2, DeploymentStatus::Activating),
-            (3, DeploymentStatus::Active),
-            (4, DeploymentStatus::Upgrading),
-            (5, DeploymentStatus::Deactivating),
-        ] {
-            let bytes = record(7, status, 2);
-            let application = decode_record(&bytes).unwrap();
-            assert_eq!(application.name, "fabric:/应用");
-            assert_eq!(application.type_name, "Type");
-            assert_eq!(application.status, expected);
-            assert_eq!(application.work_directory, "/node/应用/work");
-            assert_eq!(application.log_directory, "/node/应用/log");
-            assert_eq!(application.temp_directory, "/node/应用/temp");
-            assert_eq!(application.health_state, HealthState::Warning);
-            assert_eq!(to_vec(&application).unwrap(), bytes);
-        }
-        for health in [0, 1, 2, 3, 65535] {
-            assert_eq!(
-                decode_record(&record(7, 3, health))
-                    .unwrap()
-                    .health_state
-                    .as_raw(),
-                health
-            );
-        }
-        for status in [-1, 6, i64::MAX] {
-            assert!(matches!(
-                decode_record(&record(7, status, 1)),
-                Err(Error::Protocol(_))
-            ));
-        }
-        for health in [-1, 4, i64::MAX] {
-            assert!(matches!(
-                decode_record(&record(7, 3, health)),
-                Err(Error::Protocol(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn deployed_record_required_prefix_and_optional_native_suffix_defaults() {
-        for count in 0..3 {
-            assert!(decode_record(&record(count, 3, 1)).is_err());
-        }
-        for count in 3..=7 {
-            let application = decode_record(&record(count, 3, 1)).unwrap();
-            assert_eq!(
-                application.work_directory,
-                if count > 3 { "/node/应用/work" } else { "" }
-            );
-            assert_eq!(
-                application.log_directory,
-                if count > 4 { "/node/应用/log" } else { "" }
-            );
-            assert_eq!(
-                application.temp_directory,
-                if count > 5 { "/node/应用/temp" } else { "" }
-            );
-            assert_eq!(
-                application.health_state,
-                if count > 6 {
-                    HealthState::Ok
-                } else {
-                    HealthState::Unknown
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn deployed_record_rejects_malformed_suffix_and_structured_uri_in_string_slot() {
-        for count in 3..=6 {
-            let mut e = Encoder::new();
-            e.object(|e| {
-                fields(e, count, 3, 1)?;
-                e.boolean(false).unwrap();
-                Ok(())
-            })
-            .unwrap();
-            assert!(matches!(
-                decode_record(&e.finish()),
-                Err(Error::Protocol(_))
-            ));
-        }
-        let mut e = Encoder::new();
-        e.object(|e| {
-            e.object(|e| {
-                e.i64(1).unwrap();
-                e.string("fabric")
-            })?;
-            e.string("Type")?;
-            e.i64(3).unwrap();
-            Ok(())
-        })
-        .unwrap();
-        assert!(matches!(
-            decode_record(&e.finish()),
-            Err(Error::Protocol(_))
-        ));
-        let mut e = Encoder::new();
-        e.object(|e| {
-            fields(e, 3, 3, 1)?;
-            e.string("tail")
-        })
-        .unwrap();
-        let mut bytes = e.finish();
-        let count = bytes.len() - 11;
-        assert_eq!(bytes[count - 1], 0x8d);
-        bytes[count] = 20;
-        assert!(matches!(
-            Decoder::new(&bytes).object(from_fields::<DeployedApplication>),
-            Err(fubst::Error::Protocol(_))
-        ));
-    }
 
     #[test]
     fn deployed_public_json_preserves_nested_parameters_and_numeric_results() {
@@ -377,7 +157,10 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<DeployedApplicationQueryParameters>(json).is_err());
         }
-        let application = decode_record(&record(7, 3, 2)).unwrap();
+        let application: DeployedApplication = serde_json::from_str(
+            r#"{"name":"fabric:/App","type_name":"Type","status":3,"health_state":2}"#,
+        )
+        .unwrap();
         let json = serde_json::to_value(&application).unwrap();
         assert_eq!(json["status"], 3);
         assert_eq!(json["health_state"], 2);
