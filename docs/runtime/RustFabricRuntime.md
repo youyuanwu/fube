@@ -83,8 +83,9 @@ not reasons to assume liveness is already solved.
 
 The table and notification-specific warning below describe the original
 research baseline. The parallel Connection/connect_duplex_clear APIs have since
-been retired. Current activated-host IPC uses a separately authorized composition
-of the [operational shared channel](../transport/NativeChannel.md#runtime-ipc-composition)
+been retired, and fube-transport has been removed. Legacy source links below
+are pinned to its final pre-removal revision. Current activated-host IPC uses
+public [furpc services and original-generation Peers](../transport/design/Furpc/Implementation.md)
 with runtime-owned domain policy; no runtime command is routed through the
 notification exception. Historical qualification remains tied to its source.
 
@@ -530,9 +531,9 @@ Native facts and the detailed source map are in
 [FabricRuntime architecture](FabricRuntime.md). Repository links below refer to
 the inspected implementation; line anchors identify the relevant surfaces.
 
-[rust-frame]: ../../crates/libs/fube-transport/src/frame.rs#L1-L85
+[rust-frame]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/frame.rs#L1-L85
 [rust-serde]: ../../crates/libs/fubst/src/serde.rs#L1-L28
-[rust-connection]: ../../crates/libs/fube-transport/src/native_channel.rs
+[rust-connection]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_channel.rs
 [rust-client]: ../../crates/libs/fube-client/Cargo.toml
 [rust-ext]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/libs/mssf-ext/src/state_replicator.rs#L17-L69
 [rust-replicator]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/libs/mssf-rplctr/src/rplctr.rs#L73-L138

@@ -313,10 +313,11 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fube-client",
- "fube-transport",
+ "fube-rap-test-support",
  "fubst",
  "furpc",
  "libc",
+ "serde",
  "tokio",
  "uuid",
 ]
@@ -362,9 +363,10 @@ dependencies = [
 name = "fube-core"
 version = "0.1.0"
 dependencies = [
- "fube-transport",
  "fubst",
+ "furpc",
  "tokio",
+ "tower-service",
  "uuid",
 ]
 
@@ -514,23 +516,14 @@ dependencies = [
  "fube-node",
  "fube-ra",
  "fube-ra-store",
- "fube-transport",
+ "fube-rap-test-support",
  "fubst",
+ "furpc",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
- "uuid",
-]
-
-[[package]]
-name = "fube-transport"
-version = "0.1.0"
-dependencies = [
- "fubst",
- "serde",
- "serde_json",
- "tokio",
+ "tower-service",
  "uuid",
 ]
 

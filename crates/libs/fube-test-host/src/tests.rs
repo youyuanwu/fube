@@ -1,5 +1,35 @@
 use super::*;
-use fube_transport::message::{Header, MessageId};
+use furpc::{ActorId, HeaderId, HeaderRecord, MessageId};
+
+fn message(headers: &[HeaderRecord], body: Vec<u8>) -> Message {
+    let mut builder = Message::builder().body(Body::from_bytes(body).unwrap());
+    for header in headers {
+        builder = builder.append_header(header.clone());
+    }
+    builder.build().unwrap()
+}
+
+fn dispatch(
+    state: &mut Registration,
+    message: Message,
+    bundle: &deployment::Deployment,
+) -> Result<()> {
+    let (response, _receive) = tokio::sync::oneshot::channel();
+    state.dispatch(
+        ipc::Incoming {
+            message,
+            response: Some(response),
+        },
+        "owned",
+        42,
+        bundle,
+    )
+}
+
+#[derive(serde::Serialize)]
+struct Flag {
+    value: bool,
+}
 
 // These are state/decoder regression tests, not native compatibility proof.
 #[test]
@@ -7,66 +37,65 @@ fn reject_unowned_identity_unsupported_actions_and_bad_state() {
     let bundle =
         deployment::Deployment::create(&std::env::temp_dir(), &std::env::current_exe().unwrap())
             .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (socket, _) = listener.accept().unwrap();
-    let mut session =
-        ipc::Session::new(socket, listener.local_addr().unwrap().to_string()).unwrap();
-    let mut state = Registration {
-        handshake: true,
-        ..Default::default()
-    };
-    let mut message = Message {
-        headers: vec![
-            Header::actor(7).unwrap(),
-            Header::action("FinishRegisterApplicationHostRequest").unwrap(),
-            Header::message_id(MessageId {
+    let mut state = Registration::default();
+    let mut headers = vec![
+        header::actor(ActorId::new(7).unwrap()).unwrap(),
+        header::action("FinishRegisterApplicationHostRequest").unwrap(),
+        HeaderRecord::native(
+            header::MESSAGE_ID,
+            &MessageId {
                 guid: [1; 16],
                 index: 1,
-            })
-            .unwrap(),
-            Header::boolean(fube_transport::message::EXPECTS_REPLY, true).unwrap(),
-        ],
-        body: to_vec(&wire::HostId {
-            host: "owned".into(),
-        })
+            },
+        )
         .unwrap(),
-    };
-    assert!(state
-        .dispatch(message.clone(), &mut session, "owned", 42, &bundle)
-        .unwrap_err()
-        .0
-        .contains("identity"));
-    message.headers.push(Header {
-        id: wire::IPC_HEADER,
-        value: to_vec(&wire::IpcIdentity {
-            host: "owned".into(),
-            pid: 43,
-        })
-        .unwrap(),
-    });
-    assert!(state
-        .dispatch(message.clone(), &mut session, "owned", 42, &bundle)
-        .unwrap_err()
-        .0
-        .contains("unowned"));
-    message.headers.last_mut().unwrap().value = to_vec(&wire::IpcIdentity {
+        HeaderRecord::native(header::EXPECTS_REPLY, &Flag { value: true }).unwrap(),
+    ];
+    let body = to_vec(&wire::HostId {
         host: "owned".into(),
-        pid: 42,
     })
     .unwrap();
-    assert!(state
-        .dispatch(message.clone(), &mut session, "owned", 42, &bundle)
-        .unwrap_err()
-        .0
-        .contains("finish"));
-    message.headers[1] = Header::action("UnsupportedAction").unwrap();
-    assert!(state
-        .dispatch(message, &mut session, "owned", 42, &bundle)
+    assert!(
+        dispatch(&mut state, message(&headers, body.clone()), &bundle)
+            .unwrap_err()
+            .0
+            .contains("identity")
+    );
+    headers.push(
+        HeaderRecord::native(
+            HeaderId::new(wire::IPC_HEADER).unwrap(),
+            &wire::IpcIdentity {
+                host: "owned".into(),
+                pid: 43,
+            },
+        )
+        .unwrap(),
+    );
+    assert!(
+        dispatch(&mut state, message(&headers, body.clone()), &bundle)
+            .unwrap_err()
+            .0
+            .contains("unowned")
+    );
+    *headers.last_mut().unwrap() = HeaderRecord::native(
+        HeaderId::new(wire::IPC_HEADER).unwrap(),
+        &wire::IpcIdentity {
+            host: "owned".into(),
+            pid: 42,
+        },
+    )
+    .unwrap();
+    assert!(
+        dispatch(&mut state, message(&headers, body.clone()), &bundle)
+            .unwrap_err()
+            .0
+            .contains("finish")
+    );
+    headers[1] = header::action("UnsupportedAction").unwrap();
+    assert!(dispatch(&mut state, message(&headers, body), &bundle)
         .unwrap_err()
         .0
         .contains("unsupported"));
-    drop(session);
     std::fs::remove_dir_all(bundle.root).unwrap();
 }
 
@@ -153,7 +182,7 @@ fn cleanup_never_masks_native_or_caller_failure() {
         .0,
         "semantic Open failed"
     );
-    let error = complete(
+    let error = complete::<serde_json::Value>(
         Err(HostError("caller probe failed".into())),
         Err(HostError("owned reap failed".into())),
     )
@@ -192,13 +221,7 @@ fn registration_admits_only_manifest_code_and_type_context() {
             .unwrap();
     bundle.identity = wire::code_context("CustomApp", "fabric:/Custom", "Package", "Executable");
     bundle.service_type = "CustomType".into();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (socket, _) = listener.accept().unwrap();
-    let mut session =
-        ipc::Session::new(socket, listener.local_addr().unwrap().to_string()).unwrap();
     let mut state = Registration {
-        handshake: true,
         started: true,
         finished: true,
         ..Default::default()
@@ -214,59 +237,58 @@ fn registration_admits_only_manifest_code_and_type_context() {
         },
         code: wire::expected_code(),
     };
-    let request = |action: &str, body| Message {
-        headers: vec![
-            Header::actor(9).unwrap(),
-            Header::action(action).unwrap(),
-            Header::message_id(MessageId {
-                guid: [1; 16],
-                index: 1,
-            })
-            .unwrap(),
-            Header::boolean(fube_transport::message::EXPECTS_REPLY, true).unwrap(),
-            Header {
-                id: wire::IPC_HEADER,
-                value: to_vec(&wire::IpcIdentity {
-                    host: "owned".into(),
-                    pid: 42,
-                })
+    let request = |action: &str, body| {
+        message(
+            &[
+                header::actor(ActorId::new(9).unwrap()).unwrap(),
+                header::action(action).unwrap(),
+                HeaderRecord::native(
+                    header::MESSAGE_ID,
+                    &MessageId {
+                        guid: [1; 16],
+                        index: 1,
+                    },
+                )
                 .unwrap(),
-            },
-        ],
-        body,
-    };
-    assert!(state
-        .dispatch(
-            request(
-                "RegisterFabricRuntimeRequest",
-                to_vec(&wire::RuntimeRegistration {
-                    context: context.clone()
-                })
-                .unwrap()
-            ),
-            &mut session,
-            "owned",
-            42,
-            &bundle
+                HeaderRecord::native(header::EXPECTS_REPLY, &Flag { value: true }).unwrap(),
+                HeaderRecord::native(
+                    HeaderId::new(wire::IPC_HEADER).unwrap(),
+                    &wire::IpcIdentity {
+                        host: "owned".into(),
+                        pid: 42,
+                    },
+                )
+                .unwrap(),
+            ],
+            body,
         )
-        .is_err());
+    };
+    assert!(dispatch(
+        &mut state,
+        request(
+            "RegisterFabricRuntimeRequest",
+            to_vec(&wire::RuntimeRegistration {
+                context: context.clone()
+            })
+            .unwrap()
+        ),
+        &bundle
+    )
+    .is_err());
     assert!(state.runtime.is_none());
     context.code = bundle.identity.clone();
-    state
-        .dispatch(
-            request(
-                "RegisterFabricRuntimeRequest",
-                to_vec(&wire::RuntimeRegistration {
-                    context: context.clone(),
-                })
-                .unwrap(),
-            ),
-            &mut session,
-            "owned",
-            42,
-            &bundle,
-        )
-        .unwrap();
+    dispatch(
+        &mut state,
+        request(
+            "RegisterFabricRuntimeRequest",
+            to_vec(&wire::RuntimeRegistration {
+                context: context.clone(),
+            })
+            .unwrap(),
+        ),
+        &bundle,
+    )
+    .unwrap();
     for (name, success) in [("WrongType", false), ("CustomType", true)] {
         let value = wire::TypeRegistration {
             context: context.clone(),
@@ -276,19 +298,15 @@ fn registration_admits_only_manifest_code_and_type_context() {
             },
         };
         assert_eq!(
-            state
-                .dispatch(
-                    request("RegisterServiceTypeRequest", to_vec(&value).unwrap()),
-                    &mut session,
-                    "owned",
-                    42,
-                    &bundle
-                )
-                .is_ok(),
+            dispatch(
+                &mut state,
+                request("RegisterServiceTypeRequest", to_vec(&value).unwrap()),
+                &bundle
+            )
+            .is_ok(),
             success
         );
         assert_eq!(state.registered_type, success);
     }
-    drop(session);
     std::fs::remove_dir_all(bundle.root).unwrap();
 }

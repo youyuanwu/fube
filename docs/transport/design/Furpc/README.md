@@ -34,7 +34,7 @@ substitute HTTP/2 or gRPC or reproduce the entire ecosystem's abstractions.
 | Lifecycle | Tonic-shaped signal-and-await server shutdown returns `Result<()>`; Channels close on last-owner release. Peer handles, native operations, and received requests are nonowning. Admitted replies/notification acknowledgments participate in runner drain. No independent closure observers or public client drain/abort methods. Errors/cancellation do not guarantee joined background cleanup. |
 | Security | Initial delivery is Linux/Tokio clear TCP. TLS/claims implementation is deferred, but native negotiation and protection boundaries are designed. No downgrade. |
 | Domain protocols | Discovery, readiness, replication operation queues/ACK scheduling/retry, session recovery, and application errors stay in consumers. Replication follows native's framework-owned flow control above furpc. Physical reconnect restores no domain session and replays no calls. |
-| Migration | Introduce a new crate alongside `fube-transport`; migrate adapters independently and qualify native support explicitly. |
+| Migration | All workspace consumers now use furpc; `fube-transport` is removed. Native qualification remains exact-source/profile-specific. |
 
 ## Design map
 

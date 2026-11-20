@@ -2,6 +2,11 @@
 
 **Status:** proposed; all implementation phases are pending.
 
+**Historical crate layout:** the `fube-transport` paths and example commands in
+this original plan are obsolete. The replacement is [furpc](Furpc/README.md);
+the legacy crate has been removed, without completing the broader TLS/recovery
+phase gates proposed here.
+
 The focused [uncached resolution/notification scope](ServiceResolutionNotifications.md)
 is now implemented and qualified as an experimental clear-TCP subset on
 SF 11.8.121.4; see the [current coverage guide](../RustFabricClient.md).

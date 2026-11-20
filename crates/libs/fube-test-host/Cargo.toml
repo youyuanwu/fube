@@ -11,7 +11,9 @@ fube-node = { path = "../fube-node" }
 fube-ra = { path = "../fube-ra" }
 fube-ra-store = { path = "../fube-ra-store" }
 tokio.workspace = true
-fube-transport.workspace = true
+furpc.workspace = true
+fube-rap-test-support.workspace = true
+tower-service.workspace = true
 fubst.workspace = true
 serde.workspace = true
 serde_json.workspace = true

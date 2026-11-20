@@ -186,7 +186,7 @@ retired from fube-client. Shared model validation uses fubst Error/Result;
 ImageStore errors retain FurpcClientError or the original filesystem source.
 The remaining test-only dependency is also retired: the native notification
 loss relay preserves original frame bytes and uses public furpc headers for
-inspection, while legacy transport-model JSON checks live in fube-transport.
+inspection. Legacy transport-model JSON checks were retired with fube-transport.
 The existing native upload journey passed on the retained SF11.8.121.4 onebox:
 one real SDK predecessor copy and furpc CLI replacement agreed on inventory,
 removed stale content, and matched all 14 file/marker entries, including seven
@@ -602,8 +602,8 @@ establishment and each admitted request/send.
 
 Coupled cluster/FM and standalone-Node launchers/fixtures migrate in the same
 slice, including the Hosting residency fixture's native body accounting. Their
-normal/dev legacy transport edges are removed; remaining core/CLI/test-host edges
-are outside this slice. RA source-oracle provenance now hashes furpc rather than
+normal/dev legacy transport edges are removed; the final core/CLI/test-host edges
+are retired in the subsequent slice below. RA source-oracle provenance now hashes furpc rather than
 the retired transport, including its transitive Rust sources and manifest.
 
 Affected offline suites passed: 257 RA unit/entity/Hosting-event/protocol cases,
@@ -623,6 +623,37 @@ Federation interoperability. No fresh native-stream producer/consumer bundle or
 native FM/RA run was executed. The earlier exact-source `154b4f1` native-data
 receipt does not qualify this changed RA/node code. TLS and broader routing stay
 unqualified.
+
+## Final legacy retirement
+
+The final core, standalone test-host and CLI fixture dependencies are migrated;
+`fube-transport` and its workspace/lockfile/CI entries are removed. Core retains
+the complete original furpc error, including native Fault codes and bodies,
+while mapping SDK kinds explicitly. Transport/handler/codec errors can capture
+user code and therefore retain supervised destruction. Fubst maps directly to
+SDK error categories. The unused legacy-only `transport_fault` API is removed,
+not replaced with fabricated native Fault objects.
+
+The approved test-host redesign uses public Server/Peer and immutable Message
+APIs, a finite one-socket acceptor and a bounded domain inbox on an owned thread.
+Furpc consumes establishment and owns correlation. The ready hook requires a
+native client-only advertisement; host/PID, registration and semantic lifecycle
+checks remain in the fixture. Reply submission consumes an original response
+slot and means data handoff, not local write completion. One-way sends still
+await local writing. Shutdown cancels inline serving, joins its thread/socket
+and disposes queued messages; no reconnection or public join observer is added.
+The frame cap remains 4 MiB, inbox/handler admission 64, command admission eight,
+handshake/frame/handler budgets 120 seconds and write completion five seconds.
+Generic furpc rejection may discard traffic without closing.
+
+The native qualification proxies reuse the independent bounded frame observer
+and forward original bytes, including checksums, unchanged. Observer failures
+remain owned results rather than being silently lost on task cleanup. CLI upload
+tests reuse the existing independent injector and public native header schemas.
+Legacy-only model tests retire with their implementation; this is not a new
+native qualification receipt. All earlier receipts retain their exact-source
+boundaries. Fresh RA/native-stream and native FM/Federation interoperability
+remain separate; TLS implementation is still deferred.
 
 ## Gap ownership and implementation order
 

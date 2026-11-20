@@ -1,6 +1,6 @@
 use crate::{ipc::Session, lifecycle_wire::*, require, wire, HostError, Result};
-use fube_transport::message::Message;
-use fubst::serde::{from_slice, to_vec, ByteArray, EmptyObjectArray, Guid};
+use fubst::serde::{to_vec, ByteArray, EmptyObjectArray, Guid};
+use furpc::Message;
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
@@ -131,20 +131,24 @@ impl ServiceUnit {
     }
 
     pub fn accept(&mut self, message: &Message) -> Result<()> {
-        let properties = message.properties()?;
+        let properties = message.headers().effective();
         let expected = match self.state {
             UnitState::OpenPending => "ReplicaOpenReply",
             UnitState::ClosePending => "ReplicaCloseReply",
             _ => return Err(HostError("unsolicited/late lifecycle reply".into())),
         };
         require(
-            properties.actor == 12
-                && properties.action == expected
+            properties.actor.get() == 12
+                && properties
+                    .action()
+                    .iter()
+                    .copied()
+                    .eq(expected.encode_utf16())
                 && !properties.expects_reply
                 && properties.relates_to == Default::default(),
             "wrong semantic lifecycle envelope",
         )?;
-        let reply: ProxyReply = from_slice(&message.body)?;
+        let reply: ProxyReply = crate::decode(message)?;
         require(
             reply.unit == self.request.unit
                 && reply.local.node == self.request.local.node
@@ -221,7 +225,7 @@ fn require_connection_refused(connection: std::io::Result<TcpStream>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fube_transport::message::Header;
+    use furpc::{header, ActorId, Body};
 
     fn unit() -> ServiceUnit {
         ServiceUnit::new(
@@ -261,10 +265,12 @@ mod tests {
         }
     }
     fn message(reply: &ProxyReply, action: &str) -> Message {
-        Message {
-            headers: vec![Header::actor(12).unwrap(), Header::action(action).unwrap()],
-            body: to_vec(reply).unwrap(),
-        }
+        Message::builder()
+            .append_header(header::actor(ActorId::new(12).unwrap()).unwrap())
+            .append_header(header::action(action).unwrap())
+            .body(Body::from_bytes(to_vec(reply).unwrap()).unwrap())
+            .build()
+            .unwrap()
     }
 
     #[test]

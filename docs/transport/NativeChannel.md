@@ -1,15 +1,16 @@
 # Operational native channel composition
 
 **Migration status:** this page records legacy fube-transport APIs and historical
-guarantees. Client, initiating runtime IPC and accepted Hosting IPC now use furpc.
-See [current IPC composition](#runtime-ipc-composition); data replication and
-RA/node control remain separate legacy consumers.
+guarantees. All consumers now use furpc and the legacy crate has been removed.
+Source links below are pinned to its final pre-removal revision; legacy commands
+are historical, not runnable current-workspace instructions.
+See the [current composition and retirement record](design/Furpc/Implementation.md).
 
 ## Supported composition
 
 `fube_transport::native_channel` implements the existing
 [`MessageChannel`, `RpcChannel`, `MessageReceiver` and consuming `ReplyContext`
-contracts](../../crates/libs/fube-transport/src/channel.rs) for one dedicated
+contracts](https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/channel.rs) for one dedicated
 **plain-TCP connection to a numeric endpoint**, composed for
 NamingGateway clients or activated-host IPC.
 This is native Fabric TCP messaging, not `IFabricTransport`, UDP, actor36,
@@ -66,7 +67,7 @@ See [ordinary stub composition](RustFabricClient.md#endpoint-channel-and-local-s
 ### Shared raw sessions, distinct adapters
 
 The channel and replication peers now use the same operational
-[`raw_session`](../../crates/libs/fube-transport/src/raw_session.rs) establishment,
+[`raw_session`](https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/raw_session.rs) establishment,
 staged reader, fenced frame writer and joined I/O lifetime. Raw sessions support
 initiating sockets (zero ListenInstance nonce) and accepted sockets (fresh
 listen-side nonce). One absolute establishment budget includes connect and both
@@ -94,7 +95,7 @@ forced through the other's protocol.
 ### Internal established connection engine
 
 Channel's crate-private
-[`raw_session::engine`](../../crates/libs/fube-transport/src/raw_session/engine.rs)
+[`raw_session::engine`](https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/raw_session/engine.rs)
 owns the established socket/task scope, bounded raw frame progress, priority
 write jobs, local-write receipts, common envelope/controls, first terminal cause
 and ordinary-close versus whole-socket-disposal/join core. Dialed and accepted
@@ -259,7 +260,7 @@ lifecycle API. See [accepted Hosting contracts](../cluster/RustHosting.md#implem
 The remainder of this section records the legacy IPC composition and its
 historical guarantees, not the current runtime or Hosting implementation.
 
-[`native_ipc::connect_unsecured_loopback`](../../crates/libs/fube-transport/src/native_ipc.rs)
+[`native_ipc::connect_unsecured_loopback`](https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_ipc.rs)
 creates the IPC session above the shared channel, reuses its bounded
 TCP/ListenInstance exchange and captures a nonempty bounded host identity plus
 the actual OS PID. Numeric
@@ -284,13 +285,13 @@ public plugin or domain executor. Fixed common wire/control/correlation guards
 and consuming reply authority remain outside that policy. Collision-aware ID
 allocation/history, budgets and first-write
 fencing remain shared-driver mechanisms. The internal
-[`native_request_reply`](../../crates/libs/fube-transport/src/native_request_reply.rs)
+[`native_request_reply`](https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_request_reply.rs)
 component owns the consuming source-bound reply context for both normal and
 special ingress. Runtime actor/action rules and control/health processing stay
 in the runtime adapter; only opaque ordering acknowledgments live below it.
 
 Legacy Hosting called
-[`native_ipc::accept_unsecured_loopback`](../../crates/libs/fube-transport/src/native_ipc.rs)
+[`native_ipc::accept_unsecured_loopback`](https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_ipc.rs)
 for the restricted client-only ListenInstance exchange and accepted IPC envelope
 policy. A crate-private established-session adoption seam rechecks actual socket
 endpoints, finite limits, allocator identity and deadline before publishing the
@@ -467,7 +468,7 @@ bounded like other close observers.
 
 ## Finite retention and ordering
 
-[`ChannelLimits`](../../crates/libs/fube-transport/src/native_channel.rs)
+[`ChannelLimits`](https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_channel.rs)
 fixes count, frame/allocation, aggregate reservation and lifetime-ID limits before
 connect. Defaults:
 

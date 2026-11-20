@@ -1,6 +1,8 @@
 //! Release-native factory producer against the actual owned local node.
 //! This is not the five original canned lifecycle fixtures or H4 deployment.
-use crate::hosting_leases::{mapped_libraries, node, Observation, Trace};
+use crate::hosting_leases::{
+    mapped_libraries, node, observe_frames, stop_observer, Observation, Trace,
+};
 use crate::{
     complete, deployment, process, require, HostError, Options, Result, RunReport, Scenario,
 };
@@ -8,7 +10,6 @@ use fube_hosting::{self as hosting, ipc, wire};
 use fube_node::{Config, Input, Node, Response};
 use fube_ra::{entity as ra, protocol};
 use fube_ra_store::{MemoryBackend, Settings as StoreSettings, Store};
-use fube_transport::connection::{read_message, write_message};
 use fubst::serde::{from_slice, to_vec};
 use std::{
     sync::Arc,
@@ -65,21 +66,8 @@ pub fn run_hosting_registration(options: Options) -> Result<RunReport> {
             let (client, _) = listener.accept().await?;
             let server = TcpStream::connect(address).await?;
             let (mut cr, mut cw) = client.into_split(); let (mut sr, mut sw) = server.into_split();
-            let upstream = observed.clone();
-            let requests = async move {
-                while let Ok(m) = read_message(&mut cr).await {
-                    upstream.try_send(Observation::Request(m.clone())).map_err(|_| HostError("registration observer request budget".into()))?;
-                    if write_message(&mut sw, &m).await.is_err() { break; }
-                }
-                Ok::<_, HostError>(())
-            };
-            let replies = async move {
-                while let Ok(m) = read_message(&mut sr).await {
-                    observed.try_send(Observation::Reply(m.clone())).map_err(|_| HostError("registration observer reply budget".into()))?;
-                    if write_message(&mut cw, &m).await.is_err() { break; }
-                }
-                Ok::<_, HostError>(())
-            };
+            let requests = observe_frames(&mut cr, &mut sw, observed.clone(), Observation::Request);
+            let replies = observe_frames(&mut sr, &mut cw, observed, Observation::Reply);
             tokio::select! { result = requests => result, result = replies => result }
         });
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -95,9 +83,9 @@ pub fn run_hosting_registration(options: Options) -> Result<RunReport> {
                     .map_err(|_| HostError("native registration frame timeout".into()))?
                     .ok_or_else(|| HostError("native IPC closed before factory registration".into()))?;
                 if let Observation::Request(m) = &observation {
-                    if m.properties()?.action == "RegisterServiceTypeRequest" {
+                    if m.metadata()?.action == "RegisterServiceTypeRequest" {
                         require(type_request.is_none(), "unexpected duplicate native factory attempt")?;
-                        type_request = Some(from_slice::<wire::TypeRequest>(&m.body)?);
+                        type_request = Some(from_slice::<wire::TypeRequest>(m.body())?);
                     }
                 }
                 trace.observe(observation)?;
@@ -154,7 +142,7 @@ pub fn run_hosting_registration(options: Options) -> Result<RunReport> {
             Ok::<_, HostError>(())
         }.await;
         prepared.lease.revoke();
-        tasks.abort_all(); while tasks.join_next().await.is_some() {}
+        let outcome = complete(outcome, stop_observer(&mut tasks).await);
         node.stop().map_err(|e| HostError(format!("registration node stop: {e:?}")))?;
         let residual = handle.take_shutdown().ok_or_else(|| HostError("node shutdown residual missing".into()))?;
         let operations = residual.owner.take_operations().map_err(|e| HostError(format!("operation transfer: {e:?}")))?;

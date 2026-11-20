@@ -5,9 +5,10 @@ edition = "2021"
 
 [dependencies]
 fubst.workspace = true
-fube-transport.workspace = true
+furpc.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tower-service.workspace = true

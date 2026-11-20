@@ -8,7 +8,7 @@ and standalone test host in Rust.
 | [`fube-client`](crates/libs/fube-client) | Native clear-TCP FabricClient queries, naming, health, resolution, notifications, and ImageStore upload; no native SF library dependency. |
 | [`fube-cli`](crates/tools/fube-cli) | Thin native application-package upload CLI with explicit unsecured-development opt-in. |
 | [`fubst`](crates/libs/fubst) | Transport-independent bounded Fabric serialization, encoding/decoding, and Serde adapters. |
-| [`fube-transport`](crates/libs/fube-transport) | Bounded Fabric framing, message/header codecs, and concurrent TCP messaging. |
+| [`furpc`](crates/libs/furpc) | Shared native Fabric TCP transport, immutable messages, Tower ingress and runner-owned RPC correlation. |
 | [`fube-test-host`](crates/libs/fube-test-host) | Node-side stateless test-host subset, including manifest-based SharedProcess activation. |
 | [`fube-runtime`](crates/libs/fube-runtime) | Owned async stateless/stateful application runtime; real SF placement/reconfiguration without native SF libraries in the application. Linux x86-64 only. |
 | [`fube-data`](crates/libs/fube-data) | Owned volatile classic V1 replication, explicit acknowledgments, copy streams and native Fabric TCP peers. |
@@ -35,7 +35,7 @@ qualification additionally requires Linux x86-64.
 
 ```sh
 cargo build --locked --workspace
-cargo test --locked -p fubst -p fube-transport -p fube-client -p fube-test-host
+cargo test --locked -p fubst -p furpc -p fube-client -p fube-test-host
 python3 -m tests.run --suite offline
 ```
 
@@ -85,8 +85,8 @@ repeated native SDK copy reliability is not claimed.
 
 - [Rust FabricClient API and native qualification](docs/transport/RustFabricClient.md)
 - [Native transport/TCP/TLS specification](docs/transport/Transport.md)
-- [Operational native gateway message/RPC channels, authorized notifications, bounds and evidence](docs/transport/NativeChannel.md) ([shared contracts](crates/libs/fube-transport/src/channel.rs))
-- [Native actor/action router and registry API contracts (Rustdoc source; declarations only, not implemented)](crates/libs/fube-transport/src/routing.rs)
+- [Current furpc transport design, public APIs and migration evidence](docs/transport/design/Furpc/README.md)
+- [Historical legacy channel contracts and evidence](docs/transport/NativeChannel.md)
 - [Operational bounded typed native client contracts and borrowed observer](crates/libs/fube-client/src/contracts.rs)
 - [FabricClient behavior](docs/transport/FabricClient.md) and [message formats](docs/transport/FabricClientMessageFormat.md)
 - [Native FabricRuntime](docs/runtime/FabricRuntime.md) and [node-side host responsibilities](docs/runtime/FabricRuntimeHost.md)

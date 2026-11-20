@@ -14,8 +14,8 @@ constructors are removed, without deprecated wrappers or compatibility aliases.
 | `Endpoint::unsecured_loopback(address, composition)` | `Endpoint::unsecured_tcp(address, composition)`; general TCP now accepts non-loopback unicast addresses. |
 | `fube_transport::accept_unsecured_loopback(stream, composition, limits, deadline)` | `fube_transport::accept_unsecured_tcp(stream, composition, limits, deadline)`; local runtime IPC keeps its separate loopback-only constructors. |
 
-The first three rows use furpc; the remaining rows describe legacy transport APIs
-still used by other workspace consumers.
+The first three rows use furpc; the remaining rows are historical intermediate
+legacy transport APIs, now removed with the legacy crate.
 `Endpoint::connect_timeout` governs dialing; client options govern subsequent
 operations, and notification options separately govern real native startup.
 Enclose furpc connection/startup in `tokio::time::timeout_at` to share one
@@ -50,8 +50,8 @@ use public furpc Server/Peer/ingress contracts, including runner-owned replies.
 Backpressure and partial-read checks use test-only I/O adapters. Hosting/node
 integration tests retain independent, byte-preserving frame observation using
 public furpc headers; they exercise the production Hosting server.
-Neither fube-runtime nor fube-rap-test-support directly depends on fube-transport,
-including dev-dependencies. Legacy core/tool transitive consumers remain.
+Neither fube-runtime nor fube-rap-test-support depends on the legacy transport,
+including dev-dependencies. All remaining workspace edges are now retired.
 Role-changing reconfiguration retries during catch-up no longer receive a
 membership-only success before the service and replicator roles are applied.
 
@@ -96,9 +96,37 @@ hands data to the runner, not proof of writing or remote receipt. `Link::retire`
 completed close joins the owned serving task and actual socket adapter release.
 No reconnect or new public furpc join observer is introduced.
 The RA/node, cluster/FM and standalone-Node normal/dev legacy edges and coupled
-fixtures are retired together; core, CLI and test-host edges remain.
+fixtures are retired together; the subsequent core/CLI/test-host migration
+retires the final workspace edges.
 Native-data evidence at `154b4f1` does not qualify this later RA/node migration
 or native FM/Federation interoperability.
+
+## Legacy transport retirement
+
+`fube-transport` is removed from the workspace, dependency graph and source tree.
+All runtime, data, Hosting, RA/node, client and fixture consumers use furpc.
+Core converts furpc errors without flattening their original typed sources;
+native Fault codes and bodies remain available through the cause chain.
+Source-bearing transport/handler/codec errors retain managed destruction.
+The unused legacy-only `Error::transport_fault` API is removed; native result
+codes still use the SDK's domain mapping. Fubst errors map directly to SDK
+categories instead of passing through a transport crate.
+
+The standalone native test host owns a finite, single-socket furpc Server on a
+joined serving thread. Furpc validates establishment and owns correlation;
+the host retains native client-only listen-instance, host/PID and lifecycle
+checks. Consuming reply submission is response-data handoff, not a local-write
+receipt. Semantic one-way sends still await local write completion, which is not
+native lifecycle success. Close joins the serving thread/socket and disposes its
+inbox; no reconnect, legacy framing engine or public furpc join API is added.
+Qualification proxies use the independent bounded wire observer and forward
+original bytes unchanged. The CLI upload fixture reuses the independent injector
+with public furpc header schemas. Legacy-only transport model tests retire with
+their implementation; public furpc and consumer behavior suites remain.
+
+This retirement is not fresh native interoperability evidence. Earlier native
+receipts retain their exact-source limits; current RA/native-stream and native
+FM/Federation qualification remain separate. TLS implementation stays deferred.
 
 `fube-data`'s low-level `Packet::encode` now returns a public furpc Message;
 `Packet::decode` accepts one. Both use core Error/Result for domain validation.

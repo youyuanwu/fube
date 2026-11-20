@@ -1,5 +1,10 @@
 # Native transport: SF source gaps and Rust profile limits
 
+**Historical comparison:** `fube-transport` is now removed. The gaps below
+motivated [furpc's replacement design](design/Furpc/README.md); they are not a
+current furpc support matrix. Legacy source links are pinned to the last
+pre-removal revision, while each stated evidence baseline remains unchanged.
+
 ## 1. Scope and conclusion
 
 `fube-transport` is a **bounded implementation of selected Service Fabric native
@@ -10,8 +15,8 @@ otherwise valid SF traffic.
 
 This comparison describes **main** at
 [`2b9e8436bc120b63a5dd01bcda6ba0bc3c45b2fb`][rust-revision].
-Rust source links outside section 7 follow the current file locations, including
-the extraction of the unchanged serializer into `fubst`; the comparison remains
+Rust source links outside section 7 follow the final pre-removal file locations,
+including the extraction of the unchanged serializer into `fubst`; the comparison remains
 bound to that baseline. This extraction does not address the gaps below. Line
 references should be rechecked after later changes. The SF source was inspected
 locally in `../reference/service-fabric` at
@@ -481,38 +486,38 @@ or exposing unsecured networking.
 [sf-ipc]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/IpcClient.cpp#L63-L161
 [sf-send-buffer]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/TcpSendBuffer.cpp#L306-L350
 [sf-writev]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/TcpConnection.cpp#L2381-L2422
-[rust-lib]: ../../crates/libs/fube-transport/src/lib.rs#L1-L29
-[rust-endpoint]: ../../crates/libs/fube-transport/src/endpoint.rs#L18-L107
-[rust-accepted]: ../../crates/libs/fube-transport/src/accepted_channel.rs#L18-L95
-[rust-ipc]: ../../crates/libs/fube-transport/src/native_ipc.rs#L24-L116
-[rust-channel]: ../../crates/libs/fube-transport/src/native_channel.rs#L1-L47
-[rust-engine]: ../../crates/libs/fube-transport/src/raw_session/engine.rs#L1-L223
-[rust-controls]: ../../crates/libs/fube-transport/src/raw_session/engine.rs#L307-L332
-[rust-control-instance]: ../../crates/libs/fube-transport/src/raw_session/engine.rs#L376-L392
-[rust-channel-limits]: ../../crates/libs/fube-transport/src/native_channel.rs#L80-L142
+[rust-lib]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/lib.rs#L1-L29
+[rust-endpoint]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/endpoint.rs#L18-L107
+[rust-accepted]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/accepted_channel.rs#L18-L95
+[rust-ipc]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_ipc.rs#L24-L116
+[rust-channel]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_channel.rs#L1-L47
+[rust-engine]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/raw_session/engine.rs#L1-L223
+[rust-controls]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/raw_session/engine.rs#L307-L332
+[rust-control-instance]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/raw_session/engine.rs#L376-L392
+[rust-channel-limits]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_channel.rs#L80-L142
 [rust-serialization]: ../../crates/libs/fubst/src/lib.rs#L11-L101
-[rust-message]: ../../crates/libs/fube-transport/src/message.rs#L148-L206
-[rust-header-read]: ../../crates/libs/fube-transport/src/message.rs#L116-L121
-[rust-listen-instance]: ../../crates/libs/fube-transport/src/message.rs#L259-L275
-[rust-properties]: ../../crates/libs/fube-transport/src/message.rs#L208-L241
+[rust-message]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/message.rs#L148-L206
+[rust-header-read]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/message.rs#L116-L121
+[rust-listen-instance]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/message.rs#L259-L275
+[rust-properties]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/message.rs#L208-L241
 [rust-serde-fields]: ../../crates/libs/fubst/src/serde.rs#L1103-L1127
 [rust-object-reader]: ../../crates/libs/fubst/src/lib.rs#L515-L576
 [rust-skip]: ../../crates/libs/fubst/src/lib.rs#L578-L614
-[rust-history]: ../../crates/libs/fube-transport/src/native_channel.rs#L456-L465
-[rust-submit]: ../../crates/libs/fube-transport/src/native_channel.rs#L1067-L1111
-[rust-envelope]: ../../crates/libs/fube-transport/src/raw_session/engine.rs#L394-L448
-[rust-receive]: ../../crates/libs/fube-transport/src/native_channel.rs#L1341-L1485
-[rust-fault-completion]: ../../crates/libs/fube-transport/src/native_channel.rs#L1457-L1462
-[rust-terminal]: ../../crates/libs/fube-transport/src/raw_session/engine.rs#L142-L160
-[rust-abort]: ../../crates/libs/fube-transport/src/native_channel.rs#L725-L757
-[rust-close]: ../../crates/libs/fube-transport/src/native_channel.rs#L1223-L1229
-[rust-engine-drive]: ../../crates/libs/fube-transport/src/raw_session/engine.rs#L343-L369
-[rust-submission-guards]: ../../crates/libs/fube-transport/src/native_channel.rs#L1021-L1052
-[rust-demux]: ../../crates/libs/fube-transport/src/native_demux.rs#L42-L94
-[rust-duplex]: ../../crates/libs/fube-transport/src/native_demux.rs#L97-L107
-[rust-raw-limits]: ../../crates/libs/fube-transport/src/raw_session.rs#L43-L60
-[rust-raw-reader]: ../../crates/libs/fube-transport/src/raw_session.rs#L74-L125
-[rust-raw-writer]: ../../crates/libs/fube-transport/src/raw_session.rs#L235-L289
-[rust-frame]: ../../crates/libs/fube-transport/src/frame.rs#L13-L37
-[rust-frame-validation]: ../../crates/libs/fube-transport/src/frame.rs#L60-L80
+[rust-history]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_channel.rs#L456-L465
+[rust-submit]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_channel.rs#L1067-L1111
+[rust-envelope]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/raw_session/engine.rs#L394-L448
+[rust-receive]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_channel.rs#L1341-L1485
+[rust-fault-completion]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_channel.rs#L1457-L1462
+[rust-terminal]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/raw_session/engine.rs#L142-L160
+[rust-abort]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_channel.rs#L725-L757
+[rust-close]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_channel.rs#L1223-L1229
+[rust-engine-drive]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/raw_session/engine.rs#L343-L369
+[rust-submission-guards]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_channel.rs#L1021-L1052
+[rust-demux]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_demux.rs#L42-L94
+[rust-duplex]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_demux.rs#L97-L107
+[rust-raw-limits]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/raw_session.rs#L43-L60
+[rust-raw-reader]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/raw_session.rs#L74-L125
+[rust-raw-writer]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/raw_session.rs#L235-L289
+[rust-frame]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/frame.rs#L13-L37
+[rust-frame-validation]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/frame.rs#L60-L80
 [rust-serde]: ../../crates/libs/fubst/src/serde.rs#L1-L25

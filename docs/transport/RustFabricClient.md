@@ -27,7 +27,7 @@ Peer sends carry v1.2 transfer messages and authorized Actor 25/27 one-way
 services receive semantic ACKs. Neither production nor test fube-client paths
 depend on fube-transport. The native loss relay forwards original clear-frame
 bytes unchanged and inspects headers through public furpc types; legacy
-transport-model JSON checks live in fube-transport.
+transport-model JSON checks were retired with fube-transport.
 Rust error/admission/lifecycle changes below
 are deliberate API breaks, not compatibility wrappers. Historical source/wire
 evidence in later sections is not a substitute for current migration receipts.
@@ -301,7 +301,7 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 | Native faults/errors | Furpc operations preserve Native/Decode/Protocol/Domain categories, including native Fault bodies and original sources. Independent notification/ImageStore clients retain their own error contracts. |
 | Concurrent operations | Mixed read queries on clones sharing one connection; real onebox coverage. Deterministic cancellation/late-reply behavior belongs to furpc's transport suite. |
 | Idle disconnect | Historical legacy proxy qualification is retired with its read façade; managed furpc lifecycle has its own transport coverage. |
-| Controls and stream lifecycle | Underlying furpc/fube-transport suites cover managed transport behavior. Synthetic fube-client wire/model-peer tests are retired. |
+| Controls and stream lifecycle | Underlying furpc suites cover managed transport behavior. Synthetic fube-client wire/model-peer tests are retired. |
 
 Ordinary management requests advertise protocol **1.1**; native ImageStore
 uploads use canonical **1.2**, without legacy fallback. The demonstrated gateway replies with
@@ -1778,7 +1778,7 @@ See the [backend contract and compiling example][native-serde],
 [health reply declaration][serde-health] and [list validation][serde-lists].
 
 [native-serde]: ../../crates/libs/fubst/src/serde.rs
-[serde-messages]: ../../crates/libs/fube-transport/src/message.rs#L12-L123
+[serde-messages]: https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/message.rs#L12-L123
 [serde-query]: ../../crates/libs/fube-client/src/query_protocol.rs
 [serde-health]: ../../crates/libs/fube-client/src/health_protocol.rs
 [serde-lists]: ../../crates/libs/fube-client/src/list_protocol.rs
@@ -1790,10 +1790,10 @@ test-group filters. Ordinary checks need neither onebox nor native client
 libraries:
 
 ```sh
-cargo nextest run --locked -p fube-transport -p fube-client \
+cargo nextest run --locked -p furpc -p fube-client \
   -E 'not group(onebox)' --no-tests fail
-cargo clippy --locked -p fube-transport -p fube-client --all-targets -- -D warnings
-cargo doc --locked -p fube-transport -p fube-client --no-deps
+cargo clippy --locked -p furpc -p fube-client --all-targets -- -D warnings
+cargo doc --locked -p furpc -p fube-client --no-deps
 ```
 
 **Live onebox exchanges are the wire-compatibility authority.** Offline tests
@@ -1863,7 +1863,7 @@ export MSSF_NAME_OWNER="poc-unique-task-id"
 export MSSF_LIST_CONFIG="$PWD/build/poc-native/list-config.json"
 export MSSF_LIST_REPORT="$PWD/build/poc-native/list-report.json"
 export MSSF_LIST_OWNER="poc-unique-task-id"
-cargo nextest archive --locked -p fube-transport -p fube-client \
+cargo nextest archive --locked -p furpc -p fube-client \
   --archive-file build/poc-native/native-client-tests.tar.zst
 export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum build/poc-native/native-client-tests.tar.zst | cut -d ' ' -f 1)"
 cargo nextest run --archive-file build/poc-native/native-client-tests.tar.zst \
@@ -2135,7 +2135,7 @@ The Linux Rust job compiles the selected packages' test binaries, including
 ignored onebox cases, into a Zstandard-compressed tar archive:
 
 ```sh
-cargo nextest archive --locked -p fube-transport -p fube-client \
+cargo nextest archive --locked -p furpc -p fube-client \
   --archive-file build/native-client-tests.tar.zst
 cargo nextest run --archive-file build/native-client-tests.tar.zst \
   -E 'not group(onebox)' --no-tests fail
@@ -2204,7 +2204,7 @@ Never select these mutating fixture tests against a shared or pre-existing
 allocation that you do not exclusively own.
 
 ```sh
-cargo nextest archive --locked -p fube-transport -p fube-client \
+cargo nextest archive --locked -p furpc -p fube-client \
   --archive-file build/native-client-tests.tar.zst
 export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum build/native-client-tests.tar.zst | cut -d ' ' -f 1)"
 mkdir -p build/notification-evidence
