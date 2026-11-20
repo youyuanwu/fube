@@ -30,8 +30,8 @@ Drop releases Channel ownership, not a physical-driver join barrier or revocatio
 of outside clones. Crate-root transport re-exports are removed; Error/Result now
 mean fubst input/model validation. Remote errors use FurpcClientError,
 NotificationResult and ImageStoreError/ImageStoreResult.
-Runtime's initiating IPC client also uses furpc; Hosting's accepted IPC and
-replication's raw-session API remain separate migration tracks.
+Runtime's initiating IPC and Hosting's accepted IPC both use furpc.
+Replication's raw-session API remains a separate migration track.
 
 Runtime requests now use typed furpc Request/Response and FubstCodec over the
 original Peer. Host/PID identity is added only to initiating requests and semantic
@@ -48,11 +48,39 @@ Runtime's retained lifecycle/stateful/subprocess and shared RAP model peers now
 use public furpc Server/Peer/ingress contracts, including runner-owned replies.
 Backpressure and partial-read checks use test-only I/O adapters. Hosting/node
 integration tests retain independent, byte-preserving frame observation using
-public furpc headers; they do not replace the unmigrated production Hosting server.
+public furpc headers; they exercise the production Hosting server.
 Neither fube-runtime nor fube-rap-test-support directly depends on fube-transport,
-including dev-dependencies. Legacy core/data/Hosting transitive consumers remain.
+including dev-dependencies. Legacy core/data/RA/node transitive consumers remain.
 Role-changing reconfiguration retries during catch-up no longer receive a
 membership-only success before the service and replicator roles are applied.
+
+Hosting's accepted IPC now composes public furpc Server/ingress services and
+captures the original-generation Peer for semantic lifecycle sends. Host/PID
+admission, serialized registration mutations, finite leases, non-evicting replay
+history, result ownership and explicit successor admission remain in Hosting.
+Replies are data handoff to furpc, not a first-positive-write authority fence or
+an ingress-before-reply-write barrier. Lifecycle observers return furpc Error/Result;
+authority is checked before submission and after local write completion, while
+already-admitted output can race revocation with an unknown remote outcome.
+Unbound/wrong-kind/capacity-rejected ingress is discarded by furpc without
+granting Hosting authority; it need not retire the connection. Invalid domain
+messages that reach Hosting still retire their exact session.
+Hosting owns and joins connection/send tasks on its dedicated executor; dropping
+each inline furpc serving future releases its accepted socket. This is a consumer
+ownership guarantee, not a new furpc driver-join API. Unregister replies retain the
+bounded original cleanup path after serving retirement. Fubst codec errors retain
+their original source. Hosting and the owned-app sample no longer directly depend
+on legacy transport, including dev edges. Independent adversarial socket fixtures
+use public furpc headers and a test-only clear-frame injector; managed-client and
+real runtime-child/RA/RAP coverage exercise production accepted serving.
+Native SF11.8.121.4 `hosting-leases` and `hosting-registration` passed at
+`0191bcc` with freshly rebuilt, source/hash/mode-verified binaries. Both production
+profiles observed two finite correlated polls, actual runtime unregister and
+graceful child exit/reap/group drain; registration also verified native factory
+registration, same-core lookup and owned local closure decisions. All five
+retained native fixture profiles passed separately. This qualifies those clear
+accepted-side bootstrap/registration paths, not native deployed lifecycle,
+stateful/reporting, failed-write/revocation races, or TLS/claims.
 
 Public `ReplicationEndpointOptions` literals must set `advertised_ip`: use
 `None` for an existing concrete listener, or `Some(ip)` for the concrete IP to

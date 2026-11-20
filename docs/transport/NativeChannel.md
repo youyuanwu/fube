@@ -1,5 +1,10 @@
 # Operational native channel composition
 
+**Migration status:** this page records legacy fube-transport APIs and historical
+guarantees. Client, initiating runtime IPC and accepted Hosting IPC now use furpc.
+See [current IPC composition](#runtime-ipc-composition); data replication and
+RA/node control remain separate legacy consumers.
+
 ## Supported composition
 
 `fube_transport::native_channel` implements the existing
@@ -241,10 +246,18 @@ return reply data; furpc alone correlates and writes it. Retirement releases
 Channel ownership rather than joining the physical driver. Legacy ordered
 handoff/held completions and first-write runtime predicates are not emulated.
 See the [current runtime contracts](../runtime/RustStatelessRuntime.md#wire-and-ownership-invariants).
-Hosting's accepted side still uses fube-transport.
+Hosting's accepted side now also uses public furpc Server/Actor ingress services,
+one inline serving future per socket and an original-generation Peer. Hosting
+owns actual loopback/host/PID admission, serialized registration/lease/replay
+policy, result/provenance ownership and task/socket retirement. Reply-data
+handoff is not a first-write fence or an ingress-before-write barrier.
+Already-admitted output can race revocation; unbound/wrong-kind/capacity-rejected
+traffic can be discarded without closing the session. Hosting itself cancels
+and joins its owned connection/send tasks; this does not extend furpc's public
+lifecycle API. See [accepted Hosting contracts](../cluster/RustHosting.md#implemented-h3-bootstrap-only-local-ipc).
 
 The remainder of this section records the legacy IPC composition and its
-historical guarantees, not the current initiating runtime implementation.
+historical guarantees, not the current runtime or Hosting implementation.
 
 [`native_ipc::connect_unsecured_loopback`](../../crates/libs/fube-transport/src/native_ipc.rs)
 creates the IPC session above the shared channel, reuses its bounded
@@ -276,7 +289,7 @@ component owns the consuming source-bound reply context for both normal and
 special ingress. Runtime actor/action rules and control/health processing stay
 in the runtime adapter; only opaque ordering acknowledgments live below it.
 
-Hosting calls
+Legacy Hosting called
 [`native_ipc::accept_unsecured_loopback`](../../crates/libs/fube-transport/src/native_ipc.rs)
 for the restricted client-only ListenInstance exchange and accepted IPC envelope
 policy. A crate-private established-session adoption seam rechecks actual socket

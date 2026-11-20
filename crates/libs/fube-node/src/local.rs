@@ -3033,8 +3033,8 @@ impl Node {
                         self.sending = Some(Sending { dispatch, send });
                         return Ok(());
                     }
-                    Err(fube_transport::Error::ResourceLimit(_)) => return Ok(()),
-                    Err(fube_transport::Error::Protocol(_)) => return Err(Error::Protocol),
+                    Err(furpc::Error::ResourceLimit(_)) => return Ok(()),
+                    Err(furpc::Error::Protocol(_)) => return Err(Error::Protocol),
                     Err(_) => LocalDisposition::WriteFailed,
                 }
             }
@@ -3114,7 +3114,7 @@ impl Node {
                         self.sending = Some(Sending { dispatch, send });
                         return Ok(());
                     }
-                    Err(fube_transport::Error::ResourceLimit(_)) => return Ok(()),
+                    Err(furpc::Error::ResourceLimit(_)) => return Ok(()),
                     // This is a local failed write observation, NOT a semantic
                     // outcome. HostClosed and RA retries remain authoritative.
                     Err(_) => LocalDisposition::WriteFailed,

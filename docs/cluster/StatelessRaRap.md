@@ -42,16 +42,15 @@ Only committed `RuntimeOpen`/`Close` effects send actor12 `ReplicaOpen`/
 replies are semantic **one-way** traffic; only RAPQuery uses correlation.
 Transport write success is not service success
 ([lookup/release/effects](../../crates/libs/fube-node/src/local.rs#L791-L1025)).
-Accepted IPC establishment/envelope policy belongs to `native_ipc`, not a
-Hosting mode in the shared channel. Hosting retains admission and lease
-authority and explicitly invokes whole-socket disposal when retiring a
-connection, so a backpressured uncertain reply cannot delay withdrawal or be
-reused. Ordinary channel abort/close still retains a started suffix; neither
-local write nor physical socket disposal is an RA/RAP semantic acknowledgment.
-The returned `fube_transport::Channel` is the existing backend. Its neutral
-`target()` refers to the accepted socket's actual ephemeral peer, not the
-listener/advertised address. Hosting still owns the single private receiver;
-channel/Session clones add no independent handler or admission authority.
+Accepted IPC uses public furpc Server/ingress services. Hosting retains admission
+and lease authority, plus one serialized domain handoff per accepted socket.
+Its connection task owns the inline serving future and original-generation Peer;
+retirement cancels that future and joins owned send work, releasing the socket
+before publishing disconnected state. No listener/advertised address is used to
+retarget replies, reconnect or adopt a successor. Local write and socket release
+are not RA/RAP semantic acknowledgments. Furpc alone reads and correlates replies.
+Authority is checked before lifecycle submission and after local completion, not
+at the first positive write; already-admitted output can race revocation.
 
 Hosting privately constructs reply provenance from the exact admitted host/PID/
 connection. The adapter checks that source and captured runtime, then RA applies
@@ -85,15 +84,17 @@ and acquisition slots each, and 32 external pending slots; saturation retains
 work upstream rather than dropping a drained batch
 ([progress](../../crates/libs/fube-node/src/local.rs#L662-L789)).
 
-Accepted Hosting channels reuse the shared bounded stream driver. One ordinary
-lifecycle send leaves ingress and reserved response byte headroom within the
-4MiB connection reservation. Fixed session GUID plus bounded non-evicting ID
+Accepted Hosting connections use bounded furpc frame/handler/send policies within
+the existing 4MiB logical connection reservation. One retained lifecycle observer
+leaves bounded ingress/response queue headroom. Fixed session GUID plus non-evicting ID
 history rejects replay while allowing reserved semantic output to overtake an
-older lease RPC. History exhaustion retires the session. Terminal accepted-socket
-retirement discards that entire socket, including any uncertain partial reply;
-ordinary client channels retain their existing started-suffix behavior
-([channel adoption](../../crates/libs/fube-transport/src/native_channel.rs#L429-L490),
-[Hosting composition](../../crates/libs/fube-hosting/src/ipc.rs#L1261-L1508)).
+older lease RPC. History exhaustion retires the session. Invalid domain input
+retires that exact connection, but furpc-discarded unbound/wrong-kind/capacity
+input grants no domain authority and need not close it. Reply-data handoff is
+neither a write-order barrier nor a first-write fence. Terminal retirement drops
+the whole accepted socket, including an uncertain partial reply; that socket is
+never reused ([furpc ingress](../../crates/libs/fube-hosting/src/ipc/transport.rs),
+[Hosting policy](../../crates/libs/fube-hosting/src/ipc.rs)).
 
 Retain this owner on error/Busy/Unknown. The first accepted RA ticket and original
 store operation remain authoritative. A Store timeout **terminally fences that

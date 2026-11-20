@@ -5,17 +5,9 @@
 //! an owned consumer boundary; reports, deployed RA/RAP and distributed Federation
 //! capability are not implied. Node composition owns actual event consumers.
 use crate::{lease::Authority, wire, Hosting};
-use fube_transport::{
-    channel::MessageReceiver,
-    message::{self, Header, Message, MessageId},
-    native_channel::GatewayTarget,
-    native_demux::{
-        ActorDemux, ActorRegistration, ChannelComposition, OutboundKind, RequestPolicy,
-    },
-    Channel, ChannelLimits, Error as TransportError, Result as TransportResult,
-};
-use fubst::serde::{from_slice_with_budget, to_vec};
-use serde::{de::DeserializeOwned, Deserialize};
+use fubst::serde::to_vec;
+use furpc::{header, Error as TransportError, Headers, MessageId, Peer, Result as TransportResult};
+use serde::Deserialize;
 use std::{
     collections::{HashSet, VecDeque},
     net::SocketAddr,
@@ -26,13 +18,14 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
-#[cfg(test)]
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Notify,
     task::JoinSet,
 };
+
+mod transport;
+use transport::{decode, encode, message, IpcMessage};
 
 const IO_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_INPUT: usize = 64 * 1024;
@@ -65,8 +58,8 @@ pub enum RequestDeadlines {
     NativeClientLocal,
 }
 
-/// Logical session scratch reservations include frame/header duplication,
-/// bounded DTO decode, semantic projection, serialization and one full write.
+/// Logical session scratch reservations include bounded furpc frame/handler
+/// policy, DTO decode, semantic projection, serialization and queued writes.
 /// Slots remain charged until the connection task and accepted results terminate.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -110,18 +103,19 @@ struct Entry {
     _reservation: Reservation,
     consumer: OnceLock<RegistrationGate>,
     session: Mutex<Option<Session>>,
-    semantic: Mutex<VecDeque<Message>>,
+    semantic: Mutex<VecDeque<IpcMessage>>,
     sends: Arc<tokio::sync::Semaphore>,
 }
 #[derive(Clone)]
 struct Session {
-    channel: Channel,
-    target: Arc<GatewayTarget>,
+    peer: Peer,
     executor: tokio::runtime::Handle,
+    tasks: Arc<Mutex<Option<JoinSet<()>>>>,
 }
 
 /// A retained local-write observation, never a service lifecycle completion.
-/// Dropping it does not cancel accepted channel work.
+/// Dropping it does not cancel accepted session work. Local failure can coexist
+/// with an unknown remote outcome after submission races authority retirement.
 pub struct LifecycleSend {
     result: Arc<Mutex<Option<TransportResult<()>>>>,
     _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
@@ -148,11 +142,11 @@ impl Drop for SendCompletion {
 /// Private construction prevents callers from manufacturing source provenance.
 pub struct LifecycleReply {
     entry: Arc<Entry>,
-    message: Message,
+    message: IpcMessage,
 }
 impl LifecycleReply {
     pub fn action(&self) -> TransportResult<String> {
-        Ok(self.message.properties()?.action)
+        transport::action(&self.message.headers)
     }
     pub fn body(&self) -> &[u8] {
         &self.message.body
@@ -249,8 +243,8 @@ impl HostLease {
         }
         Ok(LifecycleReply {
             entry: self.entry.clone(),
-            message: Message {
-                headers: vec![Header::actor(12)?, Header::action(action)?],
+            message: IpcMessage {
+                headers: message(12, action, vec![])?.headers().clone(),
                 body,
             },
         })
@@ -305,23 +299,32 @@ impl HostLease {
             _permit: permit.clone(),
         };
         let entry = self.entry.clone();
-        let message = Message {
-            headers: vec![Header::actor(12)?, Header::action(action)?],
-            body,
-        };
-        session.executor.spawn(async move {
-            let value = session
-                .channel
-                .send_one_way_fenced(
-                    session.target.as_ref(),
-                    message,
-                    tokio::time::Instant::now() + IO_DEADLINE,
-                    Arc::new(move || session_live(&entry)),
-                )
+        let message = message(12, action, body)?;
+        let peer = session.peer.clone();
+        let mut guard = session.tasks.lock().unwrap();
+        let tasks = guard.as_mut().ok_or(TransportError::Closed)?;
+        while let Some(result) = tasks.try_join_next() {
+            result.map_err(|_| TransportError::Internal("Hosting lifecycle task panicked"))?;
+        }
+        tasks.spawn_on(
+            async move {
+                let value = async {
+                    if !session_live(&entry) {
+                        return Err(TransportError::Closed);
+                    }
+                    peer.send(message, tokio::time::Instant::now() + IO_DEADLINE)
+                        .await?;
+                    if !session_live(&entry) {
+                        return Err(TransportError::Closed);
+                    }
+                    Ok(())
+                }
                 .await;
-            *completion.result.lock().unwrap() = Some(value);
-            drop(completion);
-        });
+                *completion.result.lock().unwrap() = Some(value);
+                drop(completion);
+            },
+            &session.executor,
+        );
         Ok(LifecycleSend {
             result,
             _permit: permit,
@@ -1146,12 +1149,20 @@ async fn serve(listener: TcpListener, shared: Arc<Shared>) {
     // Cancel sockets first; aborted work is joined, then synchronously cleaned.
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+    let mut sessions = Vec::new();
+    if let Ok(state) = shared.state() {
+        for record in &state.records {
+            record.entry.authority.revoke();
+            if let Some(session) = record.entry.session.lock().unwrap().take() {
+                sessions.push(session);
+            }
+        }
+    }
+    for session in sessions {
+        settle_sends(session).await;
+    }
     if let Ok(mut state) = shared.state() {
         for i in 0..state.records.len() {
-            if let Some(session) = state.records[i].entry.session.lock().unwrap().take() {
-                session.channel.dispose();
-            }
-            state.records[i].entry.authority.revoke();
             state.records[i]
                 .entry
                 .connected
@@ -1161,95 +1172,63 @@ async fn serve(listener: TcpListener, shared: Arc<Shared>) {
     }
 }
 
-#[cfg(test)]
-async fn write_fenced<W: AsyncWrite + Unpin>(
-    socket: &mut W,
-    value: Message,
-    fence: Option<&Authority>,
-) -> TransportResult<()> {
-    let bytes = value.to_frame()?.encode_with_body_crc(true)?;
-    if bytes.len() > MAX_INPUT {
-        return Err(protocol("Hosting reply exceeds bootstrap profile"));
-    }
-    if fence.is_some_and(|authority| !authority.live()) {
-        return Err(TransportError::Closed);
-    }
-    tokio::time::timeout(IO_DEADLINE, socket.write_all(&bytes))
-        .await
-        .map_err(|_| protocol("Hosting write deadline"))??;
-    Ok(())
-}
-fn decode<T: DeserializeOwned>(bytes: &[u8], limit: usize) -> TransportResult<T> {
-    let mut left = limit;
-    Ok(from_slice_with_budget(bytes, &mut |capacity| {
-        left = left
-            .checked_sub(capacity)
-            .ok_or(fubst::Error::Protocol("Hosting decode budget"))?;
-        Ok(())
-    })?)
-}
-fn unique_headers(message: &Message) -> TransportResult<()> {
+fn unique_headers(headers: &Headers) -> TransportResult<()> {
     for kind in [
-        message::ACTOR,
-        message::ACTION,
-        message::MESSAGE_ID,
-        message::RELATES_TO,
-        message::EXPECTS_REPLY,
-        message::IPC,
-        message::TIMEOUT,
-        message::FAULT,
-        message::UNCORRELATED_REPLY,
-        message::HIGH_PRIORITY,
+        header::ACTOR,
+        header::ACTION,
+        header::MESSAGE_ID,
+        header::RELATES_TO,
+        header::EXPECTS_REPLY,
+        furpc::HeaderId::new(IPC)?,
+        furpc::HeaderId::new(TIMEOUT)?,
+        header::FAULT,
+        header::UNCORRELATED_REPLY,
+        header::HIGH_PRIORITY,
     ] {
-        if message.headers.iter().filter(|h| h.id == kind).count() > 1 {
+        if headers.records().filter(|h| h.id() == kind).count() > 1 {
             return Err(protocol("duplicate Hosting routing header"));
         }
     }
     Ok(())
 }
-fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, u32, Option<i64>)> {
-    unique_headers(message)?;
-    let p = message.properties()?;
-    if p.id == MessageId::default()
+const IPC: u16 = 0x800b;
+const TIMEOUT: u16 = 0x8023;
+
+fn envelope(
+    message: &IpcMessage,
+    decode_limit: usize,
+) -> TransportResult<(String, u32, Option<i64>)> {
+    unique_headers(&message.headers)?;
+    let p = message.headers.effective();
+    if p.message_id == MessageId::default()
         || p.relates_to != MessageId::default()
-        || (p.actor == 12) == p.expects_reply
-        || p.fault.is_some()
+        || (p.actor.get() == 12) == p.expects_reply
+        || message.headers.first_raw(header::FAULT).is_some()
         || p.uncorrelated_reply
-        || !message.headers.iter().any(|h| h.id == message::ACTOR)
+        || message.headers.first_raw(header::ACTOR).is_none()
     {
         return Err(protocol("invalid Hosting request envelope"));
     }
+    #[derive(Deserialize)]
+    struct Timeout {
+        ticks: i64,
+    }
     let timeout = message
         .headers
-        .iter()
-        .find(|h| h.id == message::TIMEOUT)
-        .map(|h| h.read(|d| d.i64()))
+        .first_raw(furpc::HeaderId::new(TIMEOUT)?)
+        .map(|h| decode::<Timeout>(h.value(), decode_limit).map(|value| value.ticks))
         .transpose()?;
     if timeout.is_some_and(|value| value <= 0) {
         return Err(protocol("expired Hosting request"));
     }
     let header = message
         .headers
-        .iter()
-        .find(|h| h.id == message::IPC)
+        .first_raw(furpc::HeaderId::new(IPC)?)
         .ok_or(protocol("missing Hosting identity"))?;
     #[derive(Deserialize)]
     struct Identity(String, u32);
-    let Identity(host, pid) = decode(&header.value, decode_limit)?;
+    let Identity(host, pid) = decode(header.value(), decode_limit)?;
     Ok((host, pid, timeout))
-}
-#[cfg(test)]
-fn reply(id: MessageId, body: Vec<u8>) -> TransportResult<Message> {
-    Ok(Message {
-        headers: vec![
-            Header::message_id(MessageId {
-                guid: uuid::Uuid::new_v4().to_bytes_le(),
-                index: 0,
-            })?,
-            Header::relates_to(id)?,
-        ],
-        body,
-    })
 }
 
 async fn connection(socket: TcpStream, shared: Arc<Shared>) -> Option<Arc<Entry>> {
@@ -1258,7 +1237,7 @@ async fn connection(socket: TcpStream, shared: Arc<Shared>) -> Option<Arc<Entry>
     if let Some(entry) = claimed {
         let session = entry.session.lock().unwrap().take();
         let loss = match &outcome {
-            Ok(()) | Err(TransportError::Io(_)) => Loss::ConnectionClosed,
+            Ok(()) | Err(TransportError::Transport { .. }) => Loss::ConnectionClosed,
             Err(TransportError::Closed) => Loss::Authority,
             Err(_) => Loss::Protocol,
         };
@@ -1269,11 +1248,7 @@ async fn connection(socket: TcpStream, shared: Arc<Shared>) -> Option<Arc<Entry>
             }
         }
         if let Some(session) = session {
-            session.channel.dispose();
-            let _ = session
-                .channel
-                .closed(tokio::time::Instant::now() + IO_DEADLINE)
-                .await;
+            settle_sends(session).await;
         }
         Some(entry)
     } else {
@@ -1285,22 +1260,11 @@ async fn run_connection(
     shared: &Arc<Shared>,
     claimed: &mut Option<Arc<Entry>>,
 ) -> TransportResult<()> {
-    let channel = fube_transport::native_ipc::accept_unsecured_loopback(
-        socket,
-        hosting_composition()?,
-        ChannelLimits {
-            max_operations: 1,
-            max_replies: 1,
-            max_ingress: 1,
-            max_frame_bytes: MAX_INPUT,
-            max_retained_bytes: SCRATCH,
-            max_history: 4096,
-        },
-        tokio::time::Instant::now() + IO_DEADLINE,
-    )
-    .await?;
-    let receiver = channel.receiver()?;
-    let target = channel.target()?;
+    let mut connection = transport::accepted(socket)?;
+    let peer = tokio::select! {
+        result = &mut connection.serving => return result,
+        result = &mut connection.ready => result.map_err(|_| TransportError::Closed)?,
+    };
     let mut guid = None;
     let mut seen = HashSet::new();
     loop {
@@ -1310,29 +1274,46 @@ async fn run_connection(
         let incoming = if let Some(entry) = claimed.as_ref() {
             tokio::select! {
                 _ = entry.authority.cancel.notified() => return Err(TransportError::Closed),
-                value = receiver.receive(tokio::time::Instant::now() + Duration::from_secs(30)) => value?,
+                result = &mut connection.serving => return result,
+                result = connection.failure.changed() => {
+                    result.map_err(|_| TransportError::Closed)?;
+                    return Err(connection.failure.borrow().clone().unwrap_or(TransportError::Closed));
+                },
+                value = connection.incoming.recv() => value.ok_or(TransportError::Closed)?,
                 result = watch_deadlines(shared, entry) => return result,
             }
         } else {
-            receiver
-                .receive(tokio::time::Instant::now() + Duration::from_secs(30))
-                .await?
+            tokio::select! {
+                result = &mut connection.serving => return result,
+                result = connection.failure.changed() => {
+                    result.map_err(|_| TransportError::Closed)?;
+                    return Err(connection.failure.borrow().clone().unwrap_or(TransportError::Closed));
+                },
+                value = connection.incoming.recv() => value.ok_or(TransportError::Closed)?,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => return Err(TransportError::Timeout("Hosting first request")),
+            }
         };
-        let arrived = incoming.received_at.into_std();
+        if tokio::time::Instant::now() >= incoming.deadline {
+            return Err(TransportError::Timeout("Hosting ingress"));
+        }
+        let arrived = incoming.received_at;
         let request = incoming.message;
         let (host, pid, timeout) = envelope(&request, shared.config.decode_bytes)?;
         let has_timeout = timeout.is_some();
-        let p = request.properties()?;
-        if p.id.guid == [0; 16]
-            || guid.is_some_and(|guid| p.id.guid != guid)
+        let p = request.headers.effective();
+        let id = p.message_id;
+        let actor = p.actor.get();
+        let action = transport::action(&request.headers)?;
+        if id.guid == [0; 16]
+            || guid.is_some_and(|guid| id.guid != guid)
             || seen.len() == 4096
-            || !seen.insert(p.id.index)
+            || !seen.insert(id.index)
         {
             return Err(protocol("replayed or exhausted Hosting session identity"));
         }
         // Reserved semantic replies may overtake older ordinary lease RPCs.
         // No eviction: a replay can never become fresh by waiting.
-        guid = Some(p.id.guid);
+        guid = Some(id.guid);
         if claimed.is_none() {
             let mut state = shared.state().map_err(|_| protocol("Hosting closed"))?;
             let r = state
@@ -1352,27 +1333,24 @@ async fn run_connection(
             r.claimed = true;
             r.entry.connected.store(true, Ordering::SeqCst);
             *r.entry.session.lock().unwrap() = Some(Session {
-                channel: channel.clone(),
-                target: target.clone(),
+                peer: peer.clone(),
                 executor: tokio::runtime::Handle::current(),
+                tasks: Arc::new(Mutex::new(Some(JoinSet::new()))),
             });
             *claimed = Some(r.entry.clone());
         }
         let entry = claimed.as_ref().expect("claimed session");
-        if !has_timeout
-            && p.actor != 12
-            && entry.admission.deadlines == RequestDeadlines::Propagated
+        if !has_timeout && actor != 12 && entry.admission.deadlines == RequestDeadlines::Propagated
         {
             return Err(protocol("missing propagated Hosting timeout"));
         }
         if entry.admission.host.id != host || entry.admission.host.pid != pid {
             return Err(protocol("Hosting identity changed"));
         }
-        if p.actor == 12 {
+        if actor == 12 {
             if !entry.ready.load(Ordering::SeqCst)
-                || incoming.reply.is_some()
                 || !matches!(
-                    p.action.as_str(),
+                    action.as_str(),
                     "ReplicaOpenReply"
                         | "ReplicaCloseReply"
                         | "ProxyUpdateServiceDescriptionReply"
@@ -1391,11 +1369,15 @@ async fn run_connection(
                 return Err(TransportError::ResourceLimit("Hosting semantic inbox"));
             }
             queue.push_back(request);
+            incoming
+                .response
+                .send(furpc::IngressResponse::NoReply)
+                .map_err(|_| TransportError::Closed)?;
             continue;
         }
-        let lease_reply = p.actor == 15;
+        let lease_reply = actor == 15;
         let body = if lease_reply {
-            if !p.action.is_empty() || !request.body.is_empty() {
+            if !action.is_empty() || !request.body.is_empty() {
                 return Err(protocol("invalid actor-15 request"));
             }
             // No core lock or callback is involved in ongoing lease service.
@@ -1404,109 +1386,39 @@ async fn run_connection(
             }
             let ttl = entry.authority.poll().ok_or(TransportError::Closed)?;
             reply_budget(shared, 32)?;
-            to_vec(&wire::LeaseReply { ttl })?
+            encode(&wire::LeaseReply { ttl })?
         } else {
-            let type_deadline =
-                (p.actor == 9 && p.action == "RegisterServiceTypeRequest").then(|| {
-                    arrived
-                        + Duration::from_nanos(
-                            timeout.unwrap_or(300_000_000).min(300_000_000) as u64 * 100,
-                        )
-                });
-            dispatch(
-                shared,
-                entry,
-                p.actor,
-                &p.action,
-                &request.body,
-                type_deadline,
-            )?
+            let type_deadline = (actor == 9 && action == "RegisterServiceTypeRequest").then(|| {
+                (arrived
+                    + Duration::from_nanos(
+                        timeout.unwrap_or(300_000_000).min(300_000_000) as u64 * 100,
+                    ))
+                .min(incoming.deadline.into_std())
+            });
+            dispatch(shared, entry, actor, &action, &request.body, type_deadline)?
         };
-        // Serving replies use the shared first-write fence. Terminal accepted
-        // session retirement discards its socket, never reuses a partial writer.
+        // This is data handoff, not a first-write fence or write-order barrier.
+        // Cleanup replies remain possible after serving authority retires.
         if lease_reply && !entry.authority.live() {
             return Err(TransportError::Closed);
         }
-        let value = Message {
-            headers: vec![],
-            body,
-        };
-        let context = incoming
-            .reply
-            .ok_or(protocol("missing Hosting request grant"))?;
-        let fenced_entry = entry.clone();
-        let response = if lease_reply {
-            context.reply_fenced(
-                value,
-                tokio::time::Instant::now() + IO_DEADLINE,
-                Arc::new(move || session_live(&fenced_entry)),
-            )
-        } else {
-            // Unregister replies use the original cleanup grant after serving
-            // authority retires. They cannot renew lease or authorize callbacks.
-            context.reply(value, tokio::time::Instant::now() + IO_DEADLINE)
-        };
-        tokio::select! {
-            _ = entry.authority.cancel.notified() => return Err(TransportError::Closed),
-            result = watch_deadlines(shared, entry) => return result,
-            result = response => result?,
-        }
+        incoming
+            .response
+            .send(furpc::IngressResponse::Reply(message(0, "", body)?))
+            .map_err(|_| TransportError::Closed)?;
     }
 }
 
-fn hosting_composition() -> TransportResult<ChannelComposition> {
-    fn ingress(m: &Message, _: &message::Properties) -> TransportResult<()> {
-        envelope(m, 256 * 1024).map(|_| ())
-    }
-    fn response(_: &Message, p: &message::Properties) -> TransportResult<()> {
-        if p.actor != 0 || !p.action.is_empty() || p.expects_reply || p.fault.is_some() {
-            return Err(protocol("invalid Hosting response"));
+async fn settle_sends(session: Session) {
+    let Some(mut tasks) = session.tasks.lock().unwrap().take() else {
+        return;
+    };
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        if result.is_err_and(|error| error.is_panic()) {
+            panic!("Hosting lifecycle task panicked");
         }
-        Ok(())
     }
-    fn outbound(_: &Message, p: &message::Properties, kind: OutboundKind) -> TransportResult<()> {
-        if kind != OutboundKind::Raw
-            || p.actor != 12
-            || !matches!(
-                p.action.as_str(),
-                "ReplicaOpen"
-                    | "ReplicaClose"
-                    | "ProxyUpdateServiceDescription"
-                    | "ReplicatorBuildIdleReplica"
-                    | "ReplicatorRemoveIdleReplica"
-                    | "UpdateConfiguration"
-                    | "ReplicatorUpdateEpochAndGetStatus"
-                    | "ProxyReplicaEndpointUpdatedReply"
-            )
-            || p.expects_reply
-            || p.relates_to != MessageId::default()
-        {
-            return Err(protocol("invalid Hosting lifecycle send"));
-        }
-        Ok(())
-    }
-    fn reject(_: &Message, _: &message::Properties) -> TransportResult<()> {
-        Err(protocol("Hosting has no ordinary outbound RPC"))
-    }
-    Ok(ChannelComposition {
-        outbound,
-        ordinary_reply: reject,
-        actors: ActorDemux::new(
-            [7, 9, 12, 15]
-                .into_iter()
-                .map(|actor| ActorRegistration {
-                    actor,
-                    authorize: ingress,
-                })
-                .collect(),
-        )?,
-        duplex: None,
-        requests: Some(RequestPolicy {
-            incoming: ingress,
-            reply: response,
-        }),
-        ordered_ingress: true,
-    })
 }
 
 fn session_live(entry: &Entry) -> bool {
@@ -1840,10 +1752,10 @@ fn dispatch(
         node.lease_duration = (shared.config.lease_duration.as_nanos() / 100) as i64;
         node.initial_ttl = node.lease_duration;
         node.error = error;
-        to_vec(&node)?
+        encode(&node)?
     } else {
         reply_budget(shared, 32)?;
-        to_vec(&wire::ErrorReply { error })?
+        encode(&wire::ErrorReply { error })?
     };
     Ok(response)
 }
@@ -1883,7 +1795,6 @@ fn cleanup(state: &mut State, i: usize, loss: Loss) {
 #[cfg(test)]
 mod fence_tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
 
     fn fixture(duration: Duration) -> (Server, Admission) {
         let node = NodeContext {
@@ -2189,39 +2100,5 @@ mod fence_tests {
         server.release(prepared.lease).unwrap();
         owner.close().unwrap();
         server.stop().unwrap();
-    }
-
-    #[tokio::test]
-    async fn queued_production_reply_fence_observes_no_frame_after_terminal_loss() {
-        for expire in [false, true] {
-            let authority = Authority::new(Duration::from_millis(10));
-            let (mut sender, mut receiver) = tokio::io::duplex(64);
-            let correlation = MessageId {
-                guid: uuid::Uuid::new_v4().to_bytes_le(),
-                index: 123,
-            };
-            // Queue the exact production writer future, before its pre-frame
-            // boundary. Do not replace that writer with a flag-inspection shim.
-            let pending = write_fenced(
-                &mut sender,
-                reply(
-                    correlation,
-                    to_vec(&wire::LeaseReply { ttl: 100_000 }).unwrap(),
-                )
-                .unwrap(),
-                Some(authority.as_ref()),
-            );
-            if expire {
-                authority.stop_renewal();
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            } else {
-                authority.revoke();
-            }
-            assert!(matches!(pending.await, Err(TransportError::Closed)));
-            drop(sender);
-            let mut observed = Vec::new();
-            receiver.read_to_end(&mut observed).await.unwrap();
-            assert!(observed.is_empty(), "a queued correlated frame started");
-        }
     }
 }

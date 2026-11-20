@@ -198,19 +198,60 @@ This intentionally does not emulate its first-write predicates, ordered ingress
 barrier or physical-driver join. Domain authority checks and the independent
 watchdog remain; already-admitted output can outlive a local check. The consumer
 I/O wrapper observes stream release, not a new furpc lifecycle contract.
-Hosting's accepted side and data replication remain separate migration tracks.
+Data replication remains a separate migration track.
 Retained runtime lifecycle/stateful/subprocess and shared RAP model peers also
 use furpc's public accepted Server, original Peer and ingress reply data.
 Test-only I/O gates preserve queued-write and partial-read coverage without
 exporting the private codec. Production Hosting/node tests independently observe
 and forward original frame bytes using public furpc headers. The direct legacy
 dependency is removed from runtime's normal/dev edges and shared RAP support;
-core/data/Hosting transitive consumers are not retired by this cleanup.
+core/data/RA/node transitive consumers are not retired by this cleanup.
 The existing native upload/provision/contact/hash journey passed with the new
 runtime executable on the retained SF11.8.121.4 onebox. Native registration,
 stateless activation and independent application RPC succeeded; owned workload
 cleanup completed and the onebox was retained. This is not a fresh full runtime
 reporting/upgrade/stateful/recovery qualification.
+
+Hosting's production accepted IPC also uses the existing public furpc Server,
+Actor-specific ingress services and original Peer. Each connection task owns
+one inline serving future and a bounded serialized domain handoff; there is no
+second reader, private codec export or new furpc lifecycle API. Hosting retains
+actual loopback validation, exact host/PID and one-use admission, registration/
+lease/replay policy, semantic reply provenance and retained cleanup/results.
+Original-path reply correlation and writes belong to furpc. The former first-write
+predicate and ingress-before-reply-write ordering barrier are intentionally not
+emulated: already-admitted output can race revocation, and unbound/wrong-kind/
+capacity-rejected traffic can be discarded without closing the connection.
+Lifecycle authority checks surround submission/local completion. Hosting itself
+owns cancellation and joins its connection/send tasks on its dedicated executor,
+releasing the accepted socket before publishing disconnected state. Registration
+retirement still permits bounded original-path unregister exchanges.
+The Hosting and owned-app sample direct legacy dependency edges are retired;
+RA/node control and data replication remain legacy consumers. Offline managed
+furpc-client and independent adversarial socket fixtures cover the accepted path;
+real runtime-child, owned activation and local RA/RAP suites remain qualification
+owners.
+
+On 2026-11-20, both native `hosting-leases` and `hosting-registration` passed at
+`0191bcc` with newly built test-host, native SDK producer and manifest-acceptance
+executables in one exact-source/hash/mode-verified bundle. Pinned SF11.8.121.4
+Runtime/Common mappings were verified from private native/ABI inputs; no node
+service was installed or used by these clusterless profiles. Each production
+Hosting profile observed two positive finite correlated polls, actual runtime
+unregister, graceful exit0 and owned direct-child reap/process-group drain.
+Registration additionally verified the native stateless factory, same-core
+equal-version lookup, reporting-disabled bookkeeping and owned Registered/
+RuntimeClosed/HostClosed local decisions. FM readiness remained closed; no native
+host-unregister frame was observed, and HostClosed came from connection-loss
+cleanup. One gated package obligation remained owned, not treated as release.
+All five retained native fixture profiles passed separately with their existing
+graceful/forced-cleanup distinctions; their lifecycle evidence is not relabeled
+as production Hosting lifecycle. The retained onebox stayed healthy/running.
+Ignored evidence is under `build/furpc-hosting-proof/`: `binaries-0191bcc/`,
+`native-receipts-0191bcc-r2/` and `native-regressions-0191bcc/`.
+This qualifies the selected accepted clear-TCP bootstrap/registration paths, not
+native deployed/stateful/reporting lifecycle, failed-write/revocation races,
+TLS/claims, or full original native node-handler parity.
 
 The public facade supports managed byte RPC by default and explicitly selected
 `ConnectionOptions::raw_only()` for caller-owned one-way IDs. Endpoint owns inert URI,

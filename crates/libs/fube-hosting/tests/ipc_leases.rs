@@ -1,9 +1,12 @@
 use fube_hosting::{ipc::*, wire, ClosedRegisteredEvent, Error};
-use fube_transport::{
-    connection::{read_message, write_message},
-    message::{Header, ListenInstance, Message, MessageId, EXPECTS_REPLY, IPC},
-};
+#[path = "support/ipc_wire.rs"]
+mod ipc_wire;
 use fubst::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer};
+use furpc::MessageId;
+use ipc_wire::{
+    read_message, write_message, Header, ListenInstance, Message, EXPECTS_REPLY, FAULT, IPC,
+    TIMEOUT, UNCORRELATED_REPLY,
+};
 use serde::Serialize;
 use std::time::{Duration, Instant};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
@@ -204,7 +207,7 @@ impl Peer {
         assert_eq!(response.properties().unwrap().actor, 1);
         let listen = ListenInstance::decode(&response.body).unwrap();
         assert_eq!(listen.instance, 1);
-        assert_ne!(listen.nonce, [0; 16]);
+        assert_ne!(listen.nonce.0, [0; 16]);
         Self {
             socket,
             admission,
@@ -225,11 +228,13 @@ impl Peer {
             .unwrap(),
             Header::boolean(EXPECTS_REPLY, true).unwrap(),
             Header::timeout(50_000_000).unwrap(),
-            Header::object(IPC, |e| {
-                e.string(&self.admission.host.id)?;
-                e.u32(self.admission.host.pid).unwrap();
-                Ok(())
-            })
+            Header::native(
+                IPC,
+                &ipc_wire::Identity {
+                    host: &self.admission.host.id,
+                    pid: self.admission.host.pid,
+                },
+            )
             .unwrap(),
         ];
         if !action.is_empty() {
@@ -237,12 +242,12 @@ impl Peer {
         }
         Message { headers, body }
     }
-    async fn raw(&mut self, request: Message) -> fube_transport::Result<Message> {
+    async fn raw(&mut self, request: Message) -> ipc_wire::Result<Message> {
         let id = request.properties()?.id;
         write_message(&mut self.socket, &request).await?;
         let response = tokio::time::timeout(Duration::from_secs(2), read_message(&mut self.socket))
             .await
-            .unwrap()?;
+            .map_err(|_| furpc::Error::Timeout("Hosting fixture reply"))??;
         assert_eq!(response.properties()?.relates_to, id);
         assert!(response.properties()?.action.is_empty());
         Ok(response)
@@ -308,7 +313,7 @@ impl Peer {
         assert_eq!(self.finish().await, 0);
         assert_eq!(self.register().await, 0);
     }
-    async fn poll(&mut self) -> fube_transport::Result<i64> {
+    async fn poll(&mut self) -> ipc_wire::Result<i64> {
         let frame = self.frame(15, "", vec![]);
         self.raw(frame)
             .await
@@ -620,11 +625,7 @@ async fn positive_but_expired_factory_deadline_never_publishes_registration() {
     peer.bootstrap().await;
     let request = type_request(&peer, "Widget");
     let mut frame = peer.frame(9, "RegisterServiceTypeRequest", to_vec(&request).unwrap());
-    *frame
-        .headers
-        .iter_mut()
-        .find(|h| h.id == fube_transport::message::TIMEOUT)
-        .unwrap() = Header::timeout(1).unwrap();
+    *frame.headers.iter_mut().find(|h| h.id == TIMEOUT).unwrap() = Header::timeout(1).unwrap();
     assert!(peer.raw(frame).await.is_err());
     disconnected(&server, &prepared.lease).await;
     assert!(!owner
@@ -922,15 +923,17 @@ async fn semantic_reply_wrong_host_or_pid_never_enters_owned_inbox() {
             .headers
             .retain(|h| h.id != EXPECTS_REPLY && h.id != IPC);
         reply.headers.push(
-            Header::object(IPC, |e| {
-                e.string(if wrong_host { "other-host" } else { &a.host.id })?;
-                e.u32(if wrong_host {
-                    a.host.pid
-                } else {
-                    a.host.pid + 1
-                })?;
-                Ok(())
-            })
+            Header::native(
+                IPC,
+                &ipc_wire::Identity {
+                    host: if wrong_host { "other-host" } else { &a.host.id },
+                    pid: if wrong_host {
+                        a.host.pid
+                    } else {
+                        a.host.pid + 1
+                    },
+                },
+            )
             .unwrap(),
         );
         write_message(&mut peer.socket, &reply).await.unwrap();
@@ -953,7 +956,7 @@ async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_
     let mut semantic = peer.frame(12, "ReplicaOpenReply", vec![7, 8]);
     semantic
         .headers
-        .retain(|h| h.id != EXPECTS_REPLY && h.id != fube_transport::message::TIMEOUT);
+        .retain(|h| h.id != EXPECTS_REPLY && h.id != TIMEOUT);
     write_message(&mut peer.socket, &semantic).await.unwrap();
     let result = peer.raw(ordinary).await.unwrap();
     assert!(from_slice::<wire::LeaseReply>(&result.body).unwrap().ttl > 0);
@@ -992,7 +995,7 @@ async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_
         let mut reply = peer.frame(12, action, vec![10]);
         reply
             .headers
-            .retain(|h| h.id != EXPECTS_REPLY && h.id != fube_transport::message::TIMEOUT);
+            .retain(|h| h.id != EXPECTS_REPLY && h.id != TIMEOUT);
         write_message(&mut peer.socket, &reply).await.unwrap();
         let ping = peer.frame(15, "", vec![]);
         peer.raw(ping).await.unwrap();
@@ -1236,6 +1239,15 @@ async fn malformed_actor15_and_unsupported_profiles_fail_closed() {
         let mut peer = Peer::connect(&server, a).await;
         peer.bootstrap().await;
         assert!(peer.raw(peer.frame(actor, action, body)).await.is_err());
+        if actor == 12 {
+            assert!(lease.take_lifecycle_reply().is_none());
+            assert!(
+                peer.poll().await.unwrap() > 0,
+                "wrong-kind ingress grants no domain authority"
+            );
+            assert!(server.status(&lease).unwrap().registered_host);
+            continue;
+        }
         disconnected(&server, &lease).await;
         assert!(!server.status(&lease).unwrap().registered_host);
         assert!(server.status(&lease).unwrap().runtimes.is_empty());
@@ -1279,7 +1291,7 @@ async fn truncated_start_requests_never_register() {
 
 #[tokio::test]
 async fn malformed_headers_pid_and_frame_allocation_limit() {
-    for variant in 0..5 {
+    for variant in 0..6 {
         let server = server(LOCAL_LEASE_DURATION);
         let a = admission();
         let lease = server.admit(a.clone()).unwrap();
@@ -1290,9 +1302,17 @@ async fn malformed_headers_pid_and_frame_allocation_limit() {
             1 => peer.admission.host.pid += 1,
             2 => request.headers.retain(|h| h.id != IPC),
             3 => request.headers.push(Header::timeout(-1).unwrap()),
-            _ => request
-                .headers
-                .retain(|h| h.id != fube_transport::message::TIMEOUT),
+            4 => request.headers.retain(|h| h.id != TIMEOUT),
+            _ => request.headers.push(
+                Header::native(
+                    FAULT,
+                    &ipc_wire::Fault {
+                        error: -1,
+                        has_body: false,
+                    },
+                )
+                .unwrap(),
+            ),
         }
         if variant == 1 {
             request = peer.frame(15, "", vec![]);
@@ -1305,6 +1325,10 @@ async fn malformed_headers_pid_and_frame_allocation_limit() {
     let mut fixed = [0u8; 12];
     fixed[..4].copy_from_slice(&(1024u32 * 1024).to_le_bytes());
     socket.write_all(&fixed).await.unwrap();
+    // Furpc may enqueue its hello before reading the invalid peer frame.
+    if let Ok(hello) = read_message(&mut socket).await {
+        assert_eq!(hello.properties().unwrap().actor, 1);
+    }
     assert!(
         tokio::time::timeout(Duration::from_secs(2), read_message(&mut socket))
             .await
@@ -1441,20 +1465,22 @@ async fn malformed_handshake_and_uncorrelated_duplicates_never_succeed() {
         let mut socket = TcpStream::connect(server.address()).await.unwrap();
         let mut control = Message::listen_instance(new_id(), &ListenInstance::default()).unwrap();
         match variant {
-            0 => control.headers.insert(0, Header::actor(7).unwrap()),
-            1 => control.headers.push(
-                Header::object(fube_transport::message::FAULT, |e| {
-                    e.i64(-1).unwrap();
-                    e.boolean(false).unwrap();
-                    Ok(())
+            0 => control.headers.push(Header::actor(7).unwrap()),
+            1 => {
+                control.body = to_vec(&ListenInstance {
+                    nonce: Guid([1; 16]),
+                    ..Default::default()
                 })
-                .unwrap(),
-            ),
+                .unwrap()
+            }
             _ => control
                 .headers
-                .push(Header::boolean(EXPECTS_REPLY, true).unwrap()),
+                .push(Header::action("not-a-clear-hello").unwrap()),
         }
         write_message(&mut socket, &control).await.unwrap();
+        if let Ok(hello) = read_message(&mut socket).await {
+            assert_eq!(hello.properties().unwrap().actor, 1);
+        }
         assert!(
             tokio::time::timeout(Duration::from_secs(1), read_message(&mut socket))
                 .await
@@ -1471,7 +1497,7 @@ async fn malformed_handshake_and_uncorrelated_duplicates_never_succeed() {
     for value in [true, false] {
         request
             .headers
-            .push(Header::boolean(fube_transport::message::UNCORRELATED_REPLY, value).unwrap());
+            .push(Header::boolean(UNCORRELATED_REPLY, value).unwrap());
     }
     assert!(peer.raw(request).await.is_err());
     disconnected(&server, &lease).await;
@@ -1718,18 +1744,20 @@ async fn queued_replayed_poll_is_not_a_new_correlated_grant() {
     for message in [&first, &first, &later] {
         write_message(&mut peer.socket, message).await.unwrap();
     }
-    let response = read_message(&mut peer.socket).await.unwrap();
-    assert_eq!(
-        response.properties().unwrap().relates_to,
-        first.properties().unwrap().id
-    );
-    assert!(from_slice::<wire::LeaseReply>(&response.body).unwrap().ttl > 0);
-    assert!(
+    let mut replies = 0;
+    while let Ok(response) =
         tokio::time::timeout(Duration::from_secs(1), read_message(&mut peer.socket))
             .await
             .unwrap()
-            .is_err()
-    );
+    {
+        replies += 1;
+        assert!(replies <= 1, "replay/later work received a new grant");
+        assert_eq!(
+            response.properties().unwrap().relates_to,
+            first.properties().unwrap().id
+        );
+        assert!(from_slice::<wire::LeaseReply>(&response.body).unwrap().ttl > 0);
+    }
     disconnected(&server, &lease).await;
     assert_eq!(server.status(&lease).unwrap().loss, Some(Loss::Protocol));
 }
@@ -1747,18 +1775,20 @@ async fn queued_changed_producer_guid_never_gets_a_correlated_grant() {
     for value in [&first, &changed] {
         write_message(&mut peer.socket, value).await.unwrap();
     }
-    let response = read_message(&mut peer.socket).await.unwrap();
-    assert_eq!(
-        response.properties().unwrap().relates_to,
-        first.properties().unwrap().id
-    );
-    assert!(from_slice::<wire::LeaseReply>(&response.body).unwrap().ttl > 0);
-    assert!(
+    let mut replies = 0;
+    while let Ok(response) =
         tokio::time::timeout(Duration::from_secs(1), read_message(&mut peer.socket))
             .await
             .unwrap()
-            .is_err()
-    );
+    {
+        replies += 1;
+        assert!(replies <= 1, "changed producer received a correlated grant");
+        assert_eq!(
+            response.properties().unwrap().relates_to,
+            first.properties().unwrap().id
+        );
+        assert!(from_slice::<wire::LeaseReply>(&response.body).unwrap().ttl > 0);
+    }
     disconnected(&server, &lease).await;
     assert_eq!(server.status(&lease).unwrap().loss, Some(Loss::Protocol));
 }
@@ -1870,17 +1900,192 @@ async fn native_local_deadlines_are_explicit_and_do_not_accept_expired_headers()
     let mut peer = Peer::connect(&server, a).await;
     peer.bootstrap().await;
     let mut request = peer.frame(15, "", vec![]);
-    request
-        .headers
-        .retain(|h| h.id != fube_transport::message::TIMEOUT);
+    request.headers.retain(|h| h.id != TIMEOUT);
     let reply = peer.raw(request).await.unwrap();
     assert!(from_slice::<wire::LeaseReply>(&reply.body).unwrap().ttl > 0);
     let mut expired = peer.frame(15, "", vec![]);
-    expired
-        .headers
-        .retain(|h| h.id != fube_transport::message::TIMEOUT);
+    expired.headers.retain(|h| h.id != TIMEOUT);
     expired.headers.push(Header::timeout(-1).unwrap());
     assert!(peer.raw(expired).await.is_err());
     disconnected(&server, &lease).await;
     assert_eq!(server.status(&lease).unwrap().loss, Some(Loss::Protocol));
+}
+
+struct OriginalPeer(furpc::Peer);
+impl tower_service::Service<furpc::Request<furpc::Body>> for OriginalPeer {
+    type Response = furpc::Response<furpc::Body>;
+    type Error = furpc::Error;
+    type Future = furpc::Operation<Self::Response>;
+    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<furpc::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: furpc::Request<furpc::Body>) -> Self::Future {
+        let deadline = request.deadline().expect("RpcClient supplies a deadline");
+        self.0.request(request, deadline)
+    }
+}
+
+fn managed_request<B>(body: B, a: &Admission, actor: i64, action: &str) -> furpc::Request<B> {
+    let mut request = furpc::Request::new(body)
+        .append_header(furpc::header::actor(furpc::ActorId::new(actor).unwrap()).unwrap())
+        .unwrap()
+        .append_header(
+            furpc::HeaderRecord::native(
+                furpc::HeaderId::new(IPC).unwrap(),
+                &ipc_wire::Identity {
+                    host: &a.host.id,
+                    pid: a.host.pid,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .append_header(
+            furpc::HeaderRecord::from_encoded(
+                furpc::HeaderId::new(TIMEOUT).unwrap(),
+                Header::timeout(50_000_000).unwrap().value,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    if !action.is_empty() {
+        request
+            .headers_mut()
+            .append(furpc::header::action(action).unwrap())
+            .unwrap();
+    }
+    request
+}
+
+async fn managed_bootstrap(peer: &furpc::Peer, a: &Admission) {
+    let mut client = furpc::RpcClient::new(OriginalPeer(peer.clone()));
+    let start = managed_request(
+        wire::StartRequest {
+            id: a.host.id.clone(),
+            kind: a.host.kind,
+            pid: a.host.pid,
+            timeout: 300_000_000,
+            container: a.host.container,
+            activator: a.host.activator,
+        },
+        a,
+        7,
+        "StartRegisterApplicationHostRequest",
+    );
+    let reply = client
+        .call(
+            start,
+            furpc::FubstCodec::<_, wire::StartReply>::default(),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.body().error, 0);
+    assert_eq!(reply.source().unwrap().generation(), peer.info().generation);
+    let finish = managed_request(
+        wire::IdRequest {
+            id: a.host.id.clone(),
+        },
+        a,
+        7,
+        "FinishRegisterApplicationHostRequest",
+    );
+    assert_eq!(
+        client
+            .call(
+                finish,
+                furpc::FubstCodec::<_, wire::ErrorReply>::default(),
+                tokio::time::Instant::now() + Duration::from_secs(5)
+            )
+            .await
+            .unwrap()
+            .body()
+            .error,
+        0
+    );
+    let register = managed_request(
+        wire::RuntimeRequest {
+            context: wire::RuntimeContext {
+                id: uuid::Uuid::new_v4().to_string(),
+                host: a.host.clone(),
+                code: a.code.clone(),
+            },
+        },
+        a,
+        9,
+        "RegisterFabricRuntimeRequest",
+    );
+    assert_eq!(
+        client
+            .call(
+                register,
+                furpc::FubstCodec::<_, wire::ErrorReply>::default(),
+                tokio::time::Instant::now() + Duration::from_secs(5)
+            )
+            .await
+            .unwrap()
+            .body()
+            .error,
+        0
+    );
+}
+
+#[tokio::test]
+async fn managed_original_peer_never_adopts_same_identity_successor() {
+    let mut server = server(LOCAL_LEASE_DURATION);
+    let a = admission();
+    let lease = server.admit(a.clone()).unwrap();
+    let channel = furpc::Endpoint::try_from(server.address())
+        .unwrap()
+        .connect_timeout(Duration::from_secs(5))
+        .connect()
+        .await
+        .unwrap();
+    let peer = channel
+        .peer(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    managed_bootstrap(&peer, &a).await;
+    let poll = || managed_request(furpc::Body::empty(), &a, 15, "");
+    let response = peer
+        .request(poll(), tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_ne!(
+        response.headers().effective().relates_to,
+        MessageId::default()
+    );
+    let bytes: Vec<u8> = response.body().segments().flatten().copied().collect();
+    assert!(from_slice::<wire::LeaseReply>(&bytes).unwrap().ttl > 0);
+    lease.revoke();
+    disconnected(&server, &lease).await;
+    server.take_outputs().unwrap();
+    server.release(lease).unwrap();
+    let next = server.admit(a.clone()).unwrap();
+    let successor = furpc::Endpoint::try_from(server.address())
+        .unwrap()
+        .connect_timeout(Duration::from_secs(5))
+        .connect()
+        .await
+        .unwrap();
+    let current = successor
+        .peer(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    managed_bootstrap(&current, &a).await;
+    assert!(peer
+        .request(poll(), tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .is_err());
+    assert!(current
+        .request(poll(), tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .is_ok());
+    assert_eq!(server.status(&next).unwrap().runtimes.len(), 1);
+    server.stop().unwrap();
+    assert!(current
+        .request(poll(), tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .is_err());
+    assert!(!server.status(&next).unwrap().connected);
 }
