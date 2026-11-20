@@ -7,7 +7,7 @@ recorded SF 11.8.121.4 coverage and explicit limitations. This does not complete
 the TLS/authentication/recovery requirements below.
 
 **Current API split:** this broader design is not the current façade contract.
-Migrated Ping, NameExists, node/application/service/partition/replica lists and node health exist
+Migrated Ping, NameExists, cluster/topology/deployment lists and node health exist
 only on `FurpcClient` over furpc; their legacy methods and typed-request adapters
 have been removed. `FabricClient` remains for unmigrated operations. Proposed
 builder examples below are not compatibility wrappers; see the linked subset
@@ -458,9 +458,9 @@ evidence for the exercised subset, not every native schema. No C++ fixture
 build, committed capture files, generic derive macro or general-purpose format
 is required. See the [public mapping contract](../RustFabricClient.md#41-native-serde-payloads)
 and its source links for supported adapters, integration and limitations.
-The later shared-adapter and direct-model expansions add offline differential/malformed tests
-and rerun independent model-peer scenarios; they do not constitute a fresh
-live onebox qualification.
+The historical shared-adapter and direct-model expansions used offline
+differential/malformed tests and model peers; those synthetic fube-client wire
+tests are now retired, and are not current native qualification.
 The node-local deployment inspection expansion was separately qualified live on
 SF11.8.121.4 against two owned applications: ten service packages, ten ExeHost
 code packages and 22 deployed replicas/instances matched independent REST

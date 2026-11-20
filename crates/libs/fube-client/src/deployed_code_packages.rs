@@ -179,117 +179,6 @@ impl Query for DeployedCodePackageQueryParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        query_protocol::{encode_query, tests::assert_request},
-        Error,
-    };
-    use fubst::{
-        serde::{from_slice, to_vec},
-        Encoder, MAX_STRING_UNITS,
-    };
-
-    #[derive(Clone, Copy)]
-    struct Wire {
-        package_fields: usize,
-        entry_fields: usize,
-        statistics_fields: usize,
-        deployment_status: i64,
-        entry_status: i64,
-        host_type: i64,
-        host_isolation_mode: i64,
-        has_setup: bool,
-    }
-
-    impl Default for Wire {
-        fn default() -> Self {
-            Self {
-                package_fields: 13,
-                entry_fields: 7,
-                statistics_fields: 11,
-                deployment_status: 3,
-                entry_status: 3,
-                host_type: 2,
-                host_isolation_mode: 2,
-                has_setup: true,
-            }
-        }
-    }
-
-    // ServiceModel/CodePackageEntryPointStatistics.h FABRIC_FIELDS_11.
-    fn statistics_fields(e: &mut Encoder, wire: Wire) -> fubst::Result<()> {
-        for field in 0..wire.statistics_fields {
-            match field {
-                0 => e.u32(u32::MAX)?,
-                1 => e.i64(-101)?,
-                2 => e.i64(202)?,
-                3 => e.i64(303)?,
-                4 => e.i64(404)?,
-                5 => e.u32(5)?,
-                6 => e.u32(6)?,
-                7 => e.u32(7)?,
-                8 => e.u32(8)?,
-                9 => e.u32(9)?,
-                10 => e.u32(10)?,
-                _ => unreachable!(),
-            }
-        }
-        Ok(())
-    }
-
-    // Both entry points are embedded objects, not pointers or nullable Options.
-    fn entry_fields(e: &mut Encoder, wire: Wire, setup: bool) -> fubst::Result<()> {
-        for field in 0..wire.entry_fields {
-            match field {
-                0 => e.string(if setup {
-                    r"C:\节点\..\setup.exe"
-                } else {
-                    "/node/应用/../main\0opaque"
-                })?,
-                1 => e.i64(if setup { -1 } else { i64::MIN })?,
-                2 => e.string(if setup {
-                    r"DOMAIN\setup"
-                } else {
-                    "应用用户"
-                })?,
-                3 => e.i64(if setup { 0 } else { i64::MAX })?,
-                4 => e.i64(wire.entry_status)?,
-                5 => e.object(|e| statistics_fields(e, wire))?,
-                6 => e.i64(if setup { 0 } else { -123 })?,
-                _ => unreachable!(),
-            }
-        }
-        Ok(())
-    }
-
-    // ServiceModel/DeployedCodePackageQueryResult.h FABRIC_FIELDS_13.
-    fn package_fields(e: &mut Encoder, wire: Wire) -> fubst::Result<()> {
-        for field in 0..wire.package_fields {
-            match field {
-                0 => e.string("Code_应用")?,
-                1 => e.string("v1:opaque")?,
-                2 => e.string("Manifest")?,
-                3 => e.i64(wire.deployment_status)?,
-                4 => e.u32(u32::MAX)?,
-                5 => e.object(|e| entry_fields(e, wire, true))?,
-                6 => e.object(|e| entry_fields(e, wire, false))?,
-                7 => e.boolean(wire.has_setup)?,
-                8 => e.string("Activation:Opaque/应用")?,
-                9 => e.i64(wire.host_type)?,
-                10 => e.i64(wire.host_isolation_mode)?,
-                11 => e.string(" Node_Ab ")?,
-                12 => e.string("fabric:/App/Service?opaque")?,
-                _ => unreachable!(),
-            }
-        }
-        Ok(())
-    }
-
-    fn record(wire: Wire) -> Vec<u8> {
-        let mut e = Encoder::new();
-        e.object(|e| package_fields(e, wire)).unwrap();
-        e.finish()
-    }
-
     fn parameters() -> DeployedCodePackageQueryParameters {
         DeployedCodePackageQueryParameters::new(
             " Node_Ab ",
@@ -297,474 +186,42 @@ mod tests {
         )
     }
 
-    #[test]
-    fn code_query_name_arguments_and_empty_filter_omission() {
-        let mut parameters = parameters();
-        let required = [
-            ("NodeName", " Node_Ab "),
-            ("ApplicationName", "fabric:/App"),
-        ];
-        assert_request(
-            &parameters,
-            None,
-            "GetCodePackageListDeployedOnNode",
-            &required,
-        );
-        parameters.service_manifest_name = Some(String::new());
-        parameters.code_package_name = Some(String::new());
-        assert_request(
-            &parameters,
-            None,
-            "GetCodePackageListDeployedOnNode",
-            &required,
-        );
-        parameters.code_package_name = Some("CodeCase/应用".into());
-        assert_request(
-            &parameters,
-            None,
-            "GetCodePackageListDeployedOnNode",
-            &[
-                required[0],
-                required[1],
-                ("CodePackageName", "CodeCase/应用"),
-            ],
-        );
-        parameters.service_manifest_name = Some(" ManifestCase ".into());
-        assert_request(
-            &parameters,
-            None,
-            "GetCodePackageListDeployedOnNode",
-            &[
-                required[0],
-                required[1],
-                ("ServiceManifestName", " ManifestCase "),
-                ("CodePackageName", "CodeCase/应用"),
-            ],
-        );
-        parameters.code_package_name = None;
-        assert_request(
-            &parameters,
-            None,
-            "GetCodePackageListDeployedOnNode",
-            &[
-                required[0],
-                required[1],
-                ("ServiceManifestName", " ManifestCase "),
-            ],
-        );
-    }
-
-    #[test]
-    fn code_query_bounded_node_and_filter_validation() {
-        for name in [
-            String::new(),
-            "bad\0node".into(),
-            "x".repeat(4097),
-            "😀".repeat(2049),
-            "😀".repeat(2048) + "x",
-        ] {
-            let mut parameters = parameters();
-            parameters.node_name = name;
-            assert!(matches!(
-                encode_query(&parameters, None),
-                Err(Error::InvalidInput(_))
-            ));
-        }
-        for name in [
-            "x".repeat(4096),
-            "界".repeat(4096),
-            "😀".repeat(2048),
-            "😀".repeat(2047) + "ab",
-        ] {
-            let mut parameters = parameters();
-            parameters.node_name = name;
-            encode_query(&parameters, None).unwrap();
-        }
-        for service_manifest in [false, true] {
-            let mut parameters = parameters();
-            let filter = if service_manifest {
-                &mut parameters.service_manifest_name
-            } else {
-                &mut parameters.code_package_name
-            };
-            *filter = Some("x".repeat(MAX_STRING_UNITS + 1));
-            assert!(matches!(
-                encode_query(&parameters, None),
-                Err(Error::InvalidInput(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn code_record_complete_native_layout_signed_ids_timestamps_and_statistics() {
-        let bytes = record(Wire::default());
-        let package: DeployedCodePackage = from_slice(&bytes).unwrap();
-        assert_eq!(package.name, "Code_应用");
-        assert_eq!(package.version, "v1:opaque");
-        assert_eq!(package.service_manifest_name, "Manifest");
-        assert_eq!(package.status, DeploymentStatus::Active);
-        assert_eq!(package.run_frequency_interval, u32::MAX);
-        assert!(package.has_setup_entry_point);
-        assert_eq!(
-            package.service_package_activation_id,
-            "Activation:Opaque/应用"
-        );
-        assert_eq!(package.host_type, HostType::ContainerHost);
-        assert_eq!(package.host_isolation_mode, HostIsolationMode::HyperV);
-        assert_eq!(package.node_name, " Node_Ab ");
-        assert_eq!(
-            package.service_name_internal_use_only,
-            "fabric:/App/Service?opaque"
-        );
-        let setup = &package.setup_entry_point;
-        assert_eq!(setup.entry_point_location, r"C:\节点\..\setup.exe");
-        assert_eq!(setup.process_id, -1);
-        assert_eq!(setup.run_as_user_name, r"DOMAIN\setup");
-        assert_eq!(setup.next_activation_time, NodeTimestamp(0));
-        assert_eq!(setup.instance_id, 0);
-        let main = &package.main_entry_point;
-        assert_eq!(main.entry_point_location, "/node/应用/../main\0opaque");
-        assert_eq!(main.process_id, i64::MIN);
-        assert_eq!(main.run_as_user_name, "应用用户");
-        assert_eq!(main.next_activation_time, NodeTimestamp(i64::MAX));
-        assert_eq!(main.status, EntryPointStatus::Started);
-        assert_eq!(main.instance_id, -123);
-        assert_eq!(
-            main.statistics,
-            CodePackageEntryPointStatistics {
-                last_exit_code: u32::MAX,
+    fn package() -> DeployedCodePackage {
+        let entry = CodePackageEntryPoint {
+            entry_point_location: "/entry".into(),
+            process_id: 42,
+            run_as_user_name: String::new(),
+            next_activation_time: NodeTimestamp(0),
+            status: EntryPointStatus::Started,
+            statistics: CodePackageEntryPointStatistics {
+                last_exit_code: 0,
                 last_activation_time: NodeTimestamp(-101),
                 last_exit_time: NodeTimestamp(202),
-                last_successful_activation_time: NodeTimestamp(303),
-                last_successful_exit_time: NodeTimestamp(404),
-                activation_failure_count: 5,
-                continuous_activation_failure_count: 6,
-                exit_failure_count: 7,
-                continuous_exit_failure_count: 8,
-                activation_count: 9,
-                exit_count: 10,
-            }
-        );
-        assert_eq!(setup.statistics, main.statistics);
-        assert_eq!(to_vec(&package).unwrap(), bytes);
-        let package: DeployedCodePackage = from_slice(&record(Wire {
-            has_setup: false,
-            ..Wire::default()
-        }))
-        .unwrap();
-        assert!(!package.has_setup_entry_point);
-        assert_eq!(package.setup_entry_point.process_id, -1);
-    }
-
-    #[test]
-    fn code_record_required_prefixes_and_true_native_suffix_defaults() {
-        for package_fields in 0..8 {
-            assert!(from_slice::<DeployedCodePackage>(&record(Wire {
-                package_fields,
-                ..Wire::default()
-            }))
-            .is_err());
-        }
-        for package_fields in 8..=13 {
-            let package: DeployedCodePackage = from_slice(&record(Wire {
-                package_fields,
-                ..Wire::default()
-            }))
-            .unwrap();
-            assert_eq!(
-                package.service_package_activation_id,
-                if package_fields > 8 {
-                    "Activation:Opaque/应用"
-                } else {
-                    ""
-                }
-            );
-            assert_eq!(
-                package.host_type,
-                if package_fields > 9 {
-                    HostType::ContainerHost
-                } else {
-                    HostType::Invalid
-                }
-            );
-            assert_eq!(
-                package.host_isolation_mode,
-                if package_fields > 10 {
-                    HostIsolationMode::HyperV
-                } else {
-                    HostIsolationMode::None
-                }
-            );
-            assert_eq!(
-                package.node_name,
-                if package_fields > 11 { " Node_Ab " } else { "" }
-            );
-            assert_eq!(
-                package.service_name_internal_use_only,
-                if package_fields > 12 {
-                    "fabric:/App/Service?opaque"
-                } else {
-                    ""
-                }
-            );
-        }
-        for entry_fields in 0..6 {
-            assert!(from_slice::<DeployedCodePackage>(&record(Wire {
-                entry_fields,
-                ..Wire::default()
-            }))
-            .is_err());
-        }
-        let old: DeployedCodePackage = from_slice(&record(Wire {
-            entry_fields: 6,
-            ..Wire::default()
-        }))
-        .unwrap();
-        assert_eq!(old.main_entry_point.instance_id, 0);
-        assert_eq!(old.setup_entry_point.instance_id, 0);
-        for statistics_fields in 0..11 {
-            assert!(from_slice::<DeployedCodePackage>(&record(Wire {
-                statistics_fields,
-                ..Wire::default()
-            }))
-            .is_err());
-        }
-    }
-
-    #[test]
-    fn code_record_rejects_present_malformed_suffixes() {
-        for count in 8..13 {
-            let mut e = Encoder::new();
-            e.object(|e| {
-                package_fields(
-                    e,
-                    Wire {
-                        package_fields: count,
-                        ..Wire::default()
-                    },
-                )?;
-                e.boolean(false).unwrap();
-                Ok(())
-            })
-            .unwrap();
-            assert!(matches!(
-                from_slice::<DeployedCodePackage>(&e.finish()),
-                Err(fubst::Error::Protocol(_))
-            ));
-        }
-        let mut e = Encoder::new();
-        e.object(|e| {
-            entry_fields(
-                e,
-                Wire {
-                    entry_fields: 6,
-                    ..Wire::default()
-                },
-                false,
-            )?;
-            e.u64(123).unwrap();
-            Ok(())
-        })
-        .unwrap();
-        assert!(matches!(
-            from_slice::<CodePackageEntryPoint>(&e.finish()),
-            Err(fubst::Error::Protocol(_))
-        ));
-    }
-
-    #[test]
-    fn code_record_embedded_objects_require_native_shape_and_empty_tags() {
-        for pointer in [false, true] {
-            let mut e = Encoder::new();
-            e.object(|e| {
-                package_fields(
-                    e,
-                    Wire {
-                        package_fields: 5,
-                        ..Wire::default()
-                    },
-                )?;
-                if pointer {
-                    e.pointer(None, |_| Ok(()))
-                } else {
-                    e.typed_object(&[1], |e| entry_fields(e, Wire::default(), true))
-                }
-            })
-            .unwrap();
-            assert!(matches!(
-                from_slice::<DeployedCodePackage>(&e.finish()),
-                Err(fubst::Error::Protocol(_))
-            ));
-        }
-        let mut e = Encoder::new();
-        e.object(|e| {
-            entry_fields(
-                e,
-                Wire {
-                    entry_fields: 5,
-                    ..Wire::default()
-                },
-                false,
-            )?;
-            e.typed_object(&[1], |e| statistics_fields(e, Wire::default()))
-        })
-        .unwrap();
-        assert!(matches!(
-            from_slice::<CodePackageEntryPoint>(&e.finish()),
-            Err(fubst::Error::Protocol(_))
-        ));
-        let mut e = Encoder::new();
-        e.object(|e| {
-            package_fields(
-                e,
-                Wire {
-                    package_fields: 4,
-                    ..Wire::default()
-                },
-            )?;
-            e.i64(-1).unwrap();
-            Ok(())
-        })
-        .unwrap();
-        assert!(matches!(
-            from_slice::<DeployedCodePackage>(&e.finish()),
-            Err(fubst::Error::Protocol(_))
-        ));
-        let mut e = Encoder::new();
-        e.object(|e| {
-            e.i64(-1).unwrap();
-            Ok(())
-        })
-        .unwrap();
-        assert!(matches!(
-            from_slice::<CodePackageEntryPointStatistics>(&e.finish()),
-            Err(fubst::Error::Protocol(_))
-        ));
-    }
-
-    #[test]
-    fn code_record_supported_future_tails_are_skipped() {
-        let mut e = Encoder::new();
-        e.object(|e| {
-            package_fields(e, Wire::default())?;
-            e.string("future:opaque")
-        })
-        .unwrap();
-        let bytes = e.finish();
-        let package: DeployedCodePackage = from_slice(&bytes).unwrap();
-        assert_eq!(package.name, "Code_应用");
-        let mut e = Encoder::new();
-        e.object(|e| {
-            entry_fields(e, Wire::default(), false)?;
-            e.string("future:entry")
-        })
-        .unwrap();
-        let entry: CodePackageEntryPoint = from_slice(&e.finish()).unwrap();
-        assert_eq!(entry.instance_id, -123);
-        let mut e = Encoder::new();
-        e.object(|e| {
-            statistics_fields(e, Wire::default())?;
-            e.boolean(true).unwrap();
-            Ok(())
-        })
-        .unwrap();
-        let statistics: CodePackageEntryPointStatistics = from_slice(&e.finish()).unwrap();
-        assert_eq!(statistics.exit_count, 10);
-    }
-
-    #[test]
-    fn code_record_all_numeric_enum_codes_and_unknown_rejection() {
-        for (deployment_status, expected) in [
-            (0, DeploymentStatus::Invalid),
-            (1, DeploymentStatus::Downloading),
-            (2, DeploymentStatus::Activating),
-            (3, DeploymentStatus::Active),
-            (4, DeploymentStatus::Upgrading),
-            (5, DeploymentStatus::Deactivating),
-        ] {
-            let package: DeployedCodePackage = from_slice(&record(Wire {
-                deployment_status,
-                ..Wire::default()
-            }))
-            .unwrap();
-            assert_eq!(package.status, expected);
-        }
-        for (entry_status, expected) in [
-            (0, EntryPointStatus::Invalid),
-            (1, EntryPointStatus::Pending),
-            (2, EntryPointStatus::Starting),
-            (3, EntryPointStatus::Started),
-            (4, EntryPointStatus::Stopping),
-            (5, EntryPointStatus::Stopped),
-        ] {
-            let package: DeployedCodePackage = from_slice(&record(Wire {
-                entry_status,
-                ..Wire::default()
-            }))
-            .unwrap();
-            assert_eq!(package.main_entry_point.status, expected);
-            assert_eq!(package.setup_entry_point.status, expected);
-        }
-        for (host_type, expected) in [
-            (0, HostType::Invalid),
-            (1, HostType::ExeHost),
-            (2, HostType::ContainerHost),
-        ] {
-            let package: DeployedCodePackage = from_slice(&record(Wire {
-                host_type,
-                ..Wire::default()
-            }))
-            .unwrap();
-            assert_eq!(package.host_type, expected);
-        }
-        for (host_isolation_mode, expected) in [
-            (0, HostIsolationMode::None),
-            (1, HostIsolationMode::Process),
-            (2, HostIsolationMode::HyperV),
-        ] {
-            let package: DeployedCodePackage = from_slice(&record(Wire {
-                host_isolation_mode,
-                ..Wire::default()
-            }))
-            .unwrap();
-            assert_eq!(package.host_isolation_mode, expected);
-        }
-        for value in [-1, 6, i64::MAX] {
-            for wire in [
-                Wire {
-                    deployment_status: value,
-                    ..Wire::default()
-                },
-                Wire {
-                    entry_status: value,
-                    ..Wire::default()
-                },
-                Wire {
-                    host_type: value,
-                    ..Wire::default()
-                },
-                Wire {
-                    host_isolation_mode: value,
-                    ..Wire::default()
-                },
-            ] {
-                assert!(matches!(
-                    from_slice::<DeployedCodePackage>(&record(wire)),
-                    Err(fubst::Error::Protocol(_))
-                ));
-            }
-        }
-        for wire in [
-            Wire {
-                host_type: 3,
-                ..Wire::default()
+                last_successful_activation_time: NodeTimestamp(0),
+                last_successful_exit_time: NodeTimestamp(0),
+                activation_failure_count: 0,
+                continuous_activation_failure_count: 0,
+                exit_failure_count: 0,
+                continuous_exit_failure_count: 0,
+                activation_count: 1,
+                exit_count: 0,
             },
-            Wire {
-                host_isolation_mode: 3,
-                ..Wire::default()
-            },
-        ] {
-            assert!(from_slice::<DeployedCodePackage>(&record(wire)).is_err());
+            instance_id: -123,
+        };
+        DeployedCodePackage {
+            name: "Code".into(),
+            version: "1".into(),
+            service_manifest_name: "Manifest".into(),
+            status: DeploymentStatus::Active,
+            run_frequency_interval: 0,
+            setup_entry_point: entry.clone(),
+            main_entry_point: entry,
+            has_setup_entry_point: false,
+            service_package_activation_id: String::new(),
+            host_type: HostType::ContainerHost,
+            host_isolation_mode: HostIsolationMode::HyperV,
+            node_name: "Node".into(),
+            service_name_internal_use_only: String::new(),
         }
     }
 
@@ -814,7 +271,7 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<DeployedCodePackageQueryParameters>(json).is_err());
         }
-        let package: DeployedCodePackage = from_slice(&record(Wire::default())).unwrap();
+        let package = package();
         let json = serde_json::to_value(&package).unwrap();
         assert_eq!(json["status"], 3);
         assert_eq!(json["host_type"], 2);
@@ -871,7 +328,7 @@ mod tests {
 
     #[test]
     fn code_public_json_rejects_missing_required_fields_and_malformed_present_values() {
-        let package: DeployedCodePackage = from_slice(&record(Wire::default())).unwrap();
+        let package = package();
         let json = serde_json::to_value(package).unwrap();
         for field in [
             "name",

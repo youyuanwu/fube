@@ -23,7 +23,7 @@ use crate::{
     contracts::{
         CallContext, Client, ClientBinding, ClientError, ClientFuture, ClientRequest, ReplyError,
     },
-    query_protocol::{self, Query},
+    query_protocol,
     resolution::Refresh,
     *,
 };
@@ -51,8 +51,7 @@ pub type ClientResult<T> = std::result::Result<T, ClientError<DomainFailure>>;
 /// The sealed schemas contain no recursive user-defined visitors. The static
 /// table below checks each allocating element against its minimum consumed wire
 /// extent (32 bytes of element per byte). Object-array records consume >=12
-/// bytes; counted strings consume >=1. The code package's two required embedded
-/// objects strengthen its minimum.
+/// bytes; counted strings consume >=1.
 ///
 /// Per decoded tree, geometric Vec growth/overlap is <=8x element storage
 /// (256x wire), including the native pointer-slot conversion. Pairs-to-BTreeMap
@@ -73,18 +72,12 @@ pub const CLIENT_SLOT_BYTES: usize = 4 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 // fubst checks array framing before allocating.
-// Even null native pointer slots occupy their enclosing 12-byte object. The
-// code-package record has required embedded objects as documented above;
-// absent version suffixes do not remove those embedded objects.
+// Even null native pointer slots occupy their enclosing 12-byte object.
 macro_rules! element_bound {
     ($type:ty, $minimum:expr) => {
         const _: () = assert!(size_of::<$type>() <= 32 * $minimum);
     };
 }
-element_bound!(DeployedCodePackage, 12 + 2 * 12);
-element_bound!(DeployedApplication, 12);
-element_bound!(DeployedServicePackage, 12);
-element_bound!(DeployedReplica, 12);
 element_bound!(ServiceEndpoint, 1);
 element_bound!(String, 1);
 element_bound!((String, String), 12);
@@ -224,9 +217,6 @@ pub(crate) fn call<'a, C: RpcChannel + ?Sized, R: ClientRequest>(
 
 pub(crate) mod sealed {
     pub trait Request {
-        fn input_bytes(&self) -> usize;
-    }
-    pub trait Parameters {
         fn input_bytes(&self) -> usize;
     }
 }
@@ -402,115 +392,39 @@ impl ClientRequest for NameRequest {
     }
 }
 
-impl<P: Query + sealed::Parameters + Send + 'static> sealed::Request for PagedQuery<P> {
+impl sealed::Request for QueryDescription<movement::MovePrimary> {
     fn input_bytes(&self) -> usize {
-        size_of::<Self>()
-            + self.parameters.input_bytes()
-            + self
-                .paging
-                .continuation_token
-                .as_ref()
-                .map_or(0, String::capacity)
+        size_of::<Self>() + self.parameters.target.capacity()
     }
 }
-impl<P: Query + sealed::Parameters + Send + 'static> sealed::Request for QueryDescription<P> {
-    fn input_bytes(&self) -> usize {
-        size_of::<Self>() + self.parameters.input_bytes()
-    }
-}
-macro_rules! queries {
-    ($request:ty, $parameters:ty, $response:ty, $s:ident, $paging:expr) => {
-        impl ClientRequest for $request {
-            type Response = $response;
-            type ReplyState = ();
-            type DomainError = DomainFailure;
-            fn encode($s, context: &CallContext) -> Result<(Message, ())> {
-                Ok((wire("QueryRequest", vec![], query_protocol::encode_query(&$s.parameters, $paging)?, context)?, ()))
-            }
-            fn decode(_: (), reply: Message, _: &CallContext) -> std::result::Result<Self::Response, ReplyError<DomainFailure>> {
-                decode_domain(&reply, query_protocol::decode_reply::<$parameters>)
-            }
-        }
-    };
-}
-queries!(
-    DeployedApplicationQueryDescription,
-    DeployedApplicationQueryParameters,
-    DeployedApplicationListPage,
-    self,
-    Some(&self.paging)
-);
-queries!(
-    DeployedServicePackageQueryDescription,
-    DeployedServicePackageQueryParameters,
-    Vec<DeployedServicePackage>,
-    self,
-    None
-);
-queries!(
-    DeployedCodePackageQueryDescription,
-    DeployedCodePackageQueryParameters,
-    Vec<DeployedCodePackage>,
-    self,
-    None
-);
-queries!(
-    DeployedReplicaQueryDescription,
-    DeployedReplicaQueryParameters,
-    Vec<DeployedReplica>,
-    self,
-    None
-);
-queries!(
-    QueryDescription<movement::MovePrimary>,
-    movement::MovePrimary,
-    (),
-    self,
-    None
-);
+impl ClientRequest for QueryDescription<movement::MovePrimary> {
+    type Response = ();
+    type ReplyState = ();
+    type DomainError = DomainFailure;
 
-macro_rules! inputs {
-    ($ty:ty, $s:ident, $bytes:expr) => {
-        impl sealed::Parameters for $ty {
-            fn input_bytes(&$s) -> usize { $bytes }
-        }
-    };
+    fn encode(self, context: &CallContext) -> Result<(Message, ())> {
+        Ok((
+            wire(
+                "QueryRequest",
+                vec![],
+                query_protocol::encode_query(&self.parameters, None)?,
+                context,
+            )?,
+            (),
+        ))
+    }
+
+    fn decode(
+        _: (),
+        reply: Message,
+        _: &CallContext,
+    ) -> std::result::Result<(), ReplyError<DomainFailure>> {
+        decode_domain(
+            &reply,
+            query_protocol::decode_reply::<movement::MovePrimary>,
+        )
+    }
 }
-fn optional(value: &Option<String>) -> usize {
-    value.as_ref().map_or(0, String::capacity)
-}
-inputs!(
-    DeployedApplicationQueryParameters,
-    self,
-    self.node_name.capacity()
-        + self
-            .application_name
-            .as_ref()
-            .map_or(0, NamingUri::capacity)
-);
-inputs!(
-    DeployedServicePackageQueryParameters,
-    self,
-    self.node_name.capacity()
-        + self.application_name.capacity()
-        + optional(&self.service_manifest_name)
-);
-inputs!(
-    DeployedCodePackageQueryParameters,
-    self,
-    self.node_name.capacity()
-        + self.application_name.capacity()
-        + optional(&self.service_manifest_name)
-        + optional(&self.code_package_name)
-);
-inputs!(
-    DeployedReplicaQueryParameters,
-    self,
-    self.node_name.capacity()
-        + self.application_name.capacity()
-        + optional(&self.service_manifest_name)
-);
-inputs!(movement::MovePrimary, self, self.target.capacity());
 
 /// Exact selection and minimal previous native refresh state, not a client cache.
 #[derive(Debug, Clone)]
@@ -585,334 +499,11 @@ impl ClientRequest for ResolutionRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fube_transport::channel::{ChannelFuture, MessageChannel};
-    use std::{
-        future::Future,
-        pin::Pin,
-        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-        task::Poll,
-        time::Duration,
-    };
-
-    struct Stub {
-        calls: AtomicUsize,
-        closes: AtomicUsize,
-        ready: AtomicBool,
-        result: Mutex<Option<Result<Message>>>,
-        changed: tokio::sync::Notify,
-    }
-    impl Stub {
-        fn new(ready: bool) -> Self {
-            Self {
-                calls: AtomicUsize::new(0),
-                closes: AtomicUsize::new(0),
-                ready: AtomicBool::new(ready),
-                result: Mutex::new(None),
-                changed: tokio::sync::Notify::new(),
-            }
-        }
-    }
-    impl MessageChannel for Stub {
-        type Target = ();
-        fn resolve_target(&self, _: &str) -> Result<Arc<()>> {
-            Ok(Arc::new(()))
-        }
-        fn send_one_way<'a>(&'a self, _: &'a (), _: Message, _: Instant) -> ChannelFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-        fn close(&self, _: Instant) -> ChannelFuture<'_, ()> {
-            Box::pin(async {
-                self.closes.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            })
-        }
-    }
-    impl RpcChannel for Stub {
-        fn request<'a>(&'a self, _: &'a (), _: Message, _: Instant) -> ChannelFuture<'a, Message> {
-            Box::pin(async {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                loop {
-                    let notified = self.changed.notified();
-                    if self.ready.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    notified.await;
-                }
-                self.result.lock().unwrap().take().unwrap_or_else(|| {
-                    Ok(Message {
-                        headers: vec![],
-                        body: vec![],
-                    })
-                })
-            })
-        }
-    }
-    struct Probe {
-        encoded: Arc<AtomicUsize>,
-        decode_delay: Duration,
-    }
-    impl sealed::Request for Probe {
-        fn input_bytes(&self) -> usize {
-            size_of::<Self>()
-        }
-    }
-    impl ClientRequest for Probe {
-        type Response = ();
-        type ReplyState = Duration;
-        type DomainError = DomainFailure;
-        fn encode(self, _: &CallContext) -> Result<(Message, Duration)> {
-            self.encoded.fetch_add(1, Ordering::SeqCst);
-            Ok((
-                Message {
-                    headers: vec![],
-                    body: vec![],
-                },
-                self.decode_delay,
-            ))
-        }
-        fn decode(
-            delay: Duration,
-            _: Message,
-            _: &CallContext,
-        ) -> std::result::Result<(), ReplyError<DomainFailure>> {
-            std::thread::sleep(delay);
-            Ok(())
-        }
-    }
-    fn context() -> CallContext {
-        CallContext {
-            deadline: Instant::now() + Duration::from_secs(5),
-        }
-    }
-    fn probe(encoded: &Arc<AtomicUsize>) -> Probe {
-        Probe {
-            encoded: encoded.clone(),
-            decode_delay: Duration::ZERO,
-        }
-    }
-    async fn pending<F: Future + ?Sized>(mut future: Pin<&mut F>) {
-        std::future::poll_fn(|cx| {
-            assert!(future.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn lazy_deadline_and_nonowning_observer() {
-        let channel = Stub::new(true);
-        let client = GatewayClient::new(
-            ClientBinding {
-                channel: &channel,
-                target: &(),
-            },
-            ClientLimits::default(),
-        )
-        .unwrap();
-        let encoded = Arc::new(AtomicUsize::new(0));
-        let unpolled = client.call(probe(&encoded), context());
-        assert_eq!(encoded.load(Ordering::SeqCst), 0);
-        assert_eq!(channel.calls.load(Ordering::SeqCst), 0);
-        drop(unpolled);
-        assert!(matches!(
-            client
-                .call(
-                    probe(&encoded),
-                    CallContext {
-                        deadline: Instant::now()
-                    }
-                )
-                .await,
-            Err(ClientError::Local(Error::Timeout))
-        ));
-        assert_eq!(encoded.load(Ordering::SeqCst), 0);
-        assert_eq!(client.budget.usage.lock().unwrap().calls, 0);
-        client.call(probe(&encoded), context()).await.unwrap();
-        let late = Probe {
-            encoded: encoded.clone(),
-            decode_delay: Duration::from_millis(20),
-        };
-        assert!(matches!(
-            client
-                .call(
-                    late,
-                    CallContext {
-                        deadline: Instant::now() + Duration::from_millis(5)
-                    }
-                )
-                .await,
-            Err(ClientError::Local(Error::Timeout))
-        ));
-        drop(client);
-        assert_eq!(channel.closes.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn retained_ready_calls_exhaust_count_and_bytes_until_drop_or_transfer() {
-        for limits in [
-            ClientLimits::default(),
-            ClientLimits {
-                max_calls: 9,
-                max_retained_bytes: 8 * CLIENT_SLOT_BYTES,
-            },
-        ] {
-            let channel = Stub::new(false);
-            let client = GatewayClient::new(
-                ClientBinding {
-                    channel: &channel,
-                    target: &(),
-                },
-                limits,
-            )
-            .unwrap();
-            let encoded = Arc::new(AtomicUsize::new(0));
-            let mut calls: Vec<_> = (0..8)
-                .map(|_| client.call(probe(&encoded), context()))
-                .collect();
-            for call in &mut calls {
-                pending(call.as_mut()).await;
-            }
-            assert_eq!(channel.calls.load(Ordering::SeqCst), 8);
-            channel.ready.store(true, Ordering::SeqCst);
-            channel.changed.notify_waiters();
-            // Completion availability does not transfer any result until poll.
-            assert!(matches!(
-                client.call(probe(&encoded), context()).await,
-                Err(ClientError::Local(Error::ResourceLimit(_)))
-            ));
-            assert_eq!(encoded.load(Ordering::SeqCst), 8);
-            drop(calls.pop());
-            client.call(probe(&encoded), context()).await.unwrap();
-            calls.pop().unwrap().await.unwrap();
-            drop(calls);
-            assert_eq!(client.budget.usage.lock().unwrap().calls, 0);
-
-            channel.ready.store(false, Ordering::SeqCst);
-            let mut late = client.call(
-                probe(&encoded),
-                CallContext {
-                    deadline: Instant::now() + Duration::from_millis(5),
-                },
-            );
-            pending(late.as_mut()).await;
-            tokio::time::sleep(Duration::from_millis(15)).await;
-            channel.ready.store(true, Ordering::SeqCst);
-            channel.changed.notify_waiters();
-            assert!(matches!(
-                late.await,
-                Err(ClientError::Local(Error::Timeout))
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn layered_errors_capacity_and_native_duplicate_headers() {
-        let channel = Stub::new(true);
-        let client = GatewayClient::new(
-            ClientBinding {
-                channel: &channel,
-                target: &(),
-            },
-            ClientLimits::default(),
-        )
-        .unwrap();
-        let encoded = Arc::new(AtomicUsize::new(0));
-        *channel.result.lock().unwrap() = Some(Err(Error::Remote {
-            code: -123,
-            message: "native transport Fault".into(),
-        }));
-        assert!(matches!(
-            client.call(probe(&encoded), context()).await,
-            Err(ClientError::Transport(Error::Remote { code: -123, .. }))
-        ));
-        #[derive(serde::Serialize)]
-        struct Failure {
-            code: i64,
-            diagnostic: String,
-        }
-        let failure = |body| Message {
-            headers: vec![
-                Header::actor(5).unwrap(),
-                Header::action("ClientOperationFailure").unwrap(),
-            ],
-            body,
-        };
-        *channel.result.lock().unwrap() = Some(Ok(failure(
-            fubst::serde::to_vec(&Failure {
-                code: -456,
-                diagnostic: "domain".into(),
-            })
-            .unwrap(),
-        )));
-        assert!(matches!(
-            client
-                .call(
-                    NameRequest {
-                        name: "fabric:/Probe".parse().unwrap(),
-                        operation: NameOperation::Create
-                    },
-                    context()
-                )
-                .await,
-            Err(ClientError::Domain(DomainFailure { code: -456, .. }))
-        ));
-        *channel.result.lock().unwrap() = Some(Ok(failure(vec![])));
-        assert!(matches!(
-            client
-                .call(
-                    NameRequest {
-                        name: "fabric:/Probe".parse().unwrap(),
-                        operation: NameOperation::Create
-                    },
-                    context()
-                )
-                .await,
-            Err(ClientError::Protocol(_))
-        ));
-        let mut oversized = String::with_capacity(MAX_INPUT_BYTES + 1);
-        oversized.push_str("N0010");
-        assert!(matches!(
-            client
-                .call(
-                    DeployedApplicationQueryDescription::new(
-                        DeployedApplicationQueryParameters::new(oversized)
-                    ),
-                    context()
-                )
-                .await,
-            Err(ClientError::Local(Error::ResourceLimit(_)))
-        ));
-        assert_eq!(client.budget.usage.lock().unwrap().calls, 0);
-        let id = message::MessageId {
-            guid: [1; 16],
-            index: 2,
-        };
-        let header = Header::relates_to(id).unwrap();
-        let mut reply = Message {
-            headers: vec![header.clone(), header.clone()],
-            body: vec![],
-        };
-        validate_reply_headers(&reply).unwrap();
-        reply.headers.push(header);
-        validate_reply_headers(&reply).unwrap();
-        let actor = Header::actor(5).unwrap();
-        reply.headers = vec![actor.clone(), actor];
-        assert!(validate_reply_headers(&reply).is_err());
-    }
 
     #[test]
     fn fixed_schema_allocation_elements_fit_the_documented_bound() {
-        for size in [
-            size_of::<Partition>(),
-            size_of::<Replica>(),
-            size_of::<DeployedApplication>(),
-            size_of::<DeployedServicePackage>(),
-            size_of::<DeployedCodePackage>(),
-            size_of::<DeployedReplica>(),
-            size_of::<ServiceEndpoint>(),
-        ] {
-            assert!(size <= 1024, "fixed heap element is {size} bytes");
-        }
+        let size = size_of::<ServiceEndpoint>();
+        assert!(size <= 1024, "fixed heap element is {size} bytes");
         const {
             assert!(2 * 512 * MAX_FRAME_SIZE + 16 * MAX_INPUT_BYTES <= CLIENT_SLOT_BYTES);
         }
@@ -921,107 +512,5 @@ mod tests {
             max_retained_bytes: CLIENT_SLOT_BYTES
         })
         .is_err());
-    }
-
-    #[tokio::test]
-    async fn typed_allocating_lengths_are_rejected_before_unbounded_decode() {
-        use fubst::{Encoder, MAX_STRING_UNITS};
-        let channel = Stub::new(true);
-        let client = GatewayClient::new(
-            ClientBinding {
-                channel: &channel,
-                target: &(),
-            },
-            ClientLimits::default(),
-        )
-        .unwrap();
-        // A valid maximum string, then same-sized count edits. Outer scopes
-        // remain well framed: rejection must reach the allocating length check.
-        let mut encoder = Encoder::new();
-        encoder
-            .object(|e| {
-                e.i64(2)?;
-                e.pointer(Some(&10i32.to_le_bytes()), |e| {
-                    e.object_array(&[()], |e, _| {
-                        e.string(&"g".repeat(MAX_STRING_UNITS))?;
-                        e.string("Type")?;
-                        e.i64(1)?;
-                        for _ in 0..3 {
-                            e.string("")?;
-                        }
-                        e.i64(1)
-                    })?;
-                    e.pointer(None, |_| Ok(()))
-                })?;
-                e.i64(0)?;
-                e.pointer(None, |_| Ok(()))
-            })
-            .unwrap();
-        let body = encoder.finish();
-        let reply = |body| Message {
-            headers: vec![
-                Header::actor(5).unwrap(),
-                Header::action("QueryReply").unwrap(),
-            ],
-            body,
-        };
-        let request = || {
-            DeployedApplicationQueryDescription::new(DeployedApplicationQueryParameters::new(
-                "N0010",
-            ))
-        };
-        *channel.result.lock().unwrap() = Some(Ok(reply(body.clone())));
-        assert_eq!(
-            client.call(request(), context()).await.unwrap().items[0]
-                .name
-                .len(),
-            MAX_STRING_UNITS
-        );
-        let count = body
-            .windows(4)
-            .position(|w| w == [0x8d, 0x82, 0x80, 0x00])
-            .unwrap();
-        for ending in [1, 0x7f] {
-            let mut invalid = body.clone();
-            invalid[count + 3] = ending;
-            *channel.result.lock().unwrap() = Some(Ok(reply(invalid)));
-            assert!(matches!(
-                client.call(request(), context()).await,
-                Err(ClientError::Protocol(_))
-            ));
-            assert_eq!(client.budget.usage.lock().unwrap().calls, 0);
-        }
-
-        let mut encoder = Encoder::new();
-        encoder
-            .object(|e| {
-                e.i64(2).unwrap();
-                e.pointer(Some(&10i32.to_le_bytes()), |e| {
-                    e.object_array(&[(); 4096], |_, _| Ok(()))?;
-                    e.pointer(None, |_| Ok(()))
-                })?;
-                e.i64(0).unwrap();
-                e.pointer(None, |_| Ok(()))
-            })
-            .unwrap();
-        let mut invalid = encoder.finish();
-        let count = invalid
-            .windows(3)
-            .position(|w| w == [0x80, 0xa0, 0x00])
-            .unwrap();
-        invalid[count + 2] = 1; // 4097, above collection limit; body extent unchanged.
-        *channel.result.lock().unwrap() = Some(Ok(Message {
-            headers: vec![
-                Header::actor(5).unwrap(),
-                Header::action("QueryReply").unwrap(),
-            ],
-            body: invalid,
-        }));
-        assert!(matches!(
-            client.call(request(), context()).await,
-            Err(ClientError::Protocol(_))
-        ));
-        assert_eq!(client.budget.usage.lock().unwrap().calls, 0);
-        assert_eq!(channel.closes.load(Ordering::SeqCst), 0);
     }
 }

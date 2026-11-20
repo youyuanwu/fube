@@ -1641,6 +1641,171 @@ def validate_furpc_topology(lists):
     return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
 
 
+def validate_furpc_deployments(lists):
+    deployment, topology = lists.get("deployment_inspection"), lists.get("topology")
+    require(type(deployment) is dict and type(topology) is dict, "native deployment observations")
+    value = deployment.get("furpc")
+    require(type(value) is dict and integer(value.get("generation"), 1)
+            and value["generation"] == lists["furpc"]["generation"], "original furpc deployment generation")
+    true_fields(value, ("same_generation_after_error",))
+    require(type(value.get("mixed_concurrent_operations")) is int and value["mixed_concurrent_operations"] == 3,
+            "three mixed furpc deployment calls")
+    true_fields(deployment, ("service_manifest_selectors", "code_package_and_partition_selectors",
+                             "stateful_and_stateless", "mixed_shared_native_connection", "reuse_after_native_errors",
+                             "statistics_rest_activation_exit_labels_swapped"))
+    true_fields(topology, ("deployment_native_continuation_followed", "deployed_health_requested_and_omitted"))
+    codes = deployment.get("native_missing_node_codes")
+    origins = deployment.get("native_error_origins")
+    require(type(codes) is list and len(codes) == 3
+            and all(type(code) is int and code == -2147017795 for code in codes)
+            and type(origins) is list and len(origins) == 3
+            and all(origin in ("domain", "native_fault") for origin in origins)
+            and type(topology.get("native_missing_deployment_node_code")) is int
+            and topology["native_missing_deployment_node_code"] == -2147017795
+            and topology.get("deployed_application_native_error_origin") in ("domain", "native_fault"),
+            "all four deployment queries must retain native missing-node errors")
+
+    def equal(native, observed, fields):
+        require(type(native) is dict and type(observed) is dict
+                and all(local in native and remote in observed and same(native[local], observed[remote])
+                        for local, remote in fields.items()), "native deployment fields must match HTTP")
+
+    def numeric(actual, expected):
+        require(type(actual) is int and -(2**63) <= actual < 2**63
+                and (type(expected) is int or (type(expected) is str and re.fullmatch(r"-?[0-9]{1,20}", expected)))
+                and actual == int(expected), "native deployment integer must match HTTP")
+
+    def scalar(actual, expected, names):
+        require(type(actual) is int and actual in names and type(expected) is str
+                and expected == names[actual], "native deployment enum must match HTTP")
+
+    def timestamp(actual, expected):
+        require(type(actual) is int and -(2**63) <= actual < 2**63
+                and type(expected) is str and len(expected) <= 64, "native deployment timestamp")
+        if expected == "0001-01-01T00:00:00.000Z":
+            require(actual == 0, "native default timestamp")
+            return
+        try:
+            stamp = datetime.fromisoformat(expected.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ProofError("invalid independent deployment timestamp") from error
+        require(stamp.tzinfo is not None, "independent deployment timestamp timezone")
+        delta = stamp - datetime(1601, 1, 1, tzinfo=timezone.utc)
+        ticks = (delta.days * 86400 + delta.seconds) * 10_000_000 + delta.microseconds * 10
+        require(abs(actual - ticks) < 10_000, "native deployment timestamp must match HTTP within 1 ms")
+
+    statuses = {0: "Invalid", 1: "Downloading", 2: "Activating", 3: "Active", 4: "Upgrading", 5: "Deactivating"}
+    roles = {0: "Unknown", 1: "None", 2: "Primary", 3: "IdleSecondary", 4: "ActiveSecondary"}
+
+    def records(native, observed, local_keys, remote_keys):
+        require(type(native) is list and type(observed) is list and len(native) == len(observed) > 0
+                and all(type(record) is dict and all(key in record for key in local_keys) for record in native)
+                and all(type(record) is dict and all(key in record for key in remote_keys) for record in observed),
+                "nonempty typed deployment records and independent HTTP")
+        actual = {tuple(record[key] for key in local_keys): record for record in native}
+        independent = {tuple(record[key] for key in remote_keys): record for record in observed}
+        require(len(actual) == len(independent) == len(native) and actual.keys() == independent.keys(),
+                "unique native deployment identities must match HTTP")
+        return [(record, independent[key]) for key, record in actual.items()]
+
+    applications = topology.get("independent_deployments")
+    require(type(applications) is list and len(applications) == 5
+            and {entry.get("node") for entry in applications} == {f"N00{i}0" for i in range(1, 6)},
+            "five independently observed deployment nodes")
+    for entry in applications:
+        pairs = records(entry.get("native_applications"), entry.get("applications"), ("name",), ("Name",))
+        require(set(lists["owned_applications"]) <= {native["name"] for native, _ in pairs},
+                "both owned applications must be deployed on every node")
+        for native, observed in pairs:
+            equal(native, observed, {"name": "Name", "type_name": "TypeName", "work_directory": "WorkDirectory",
+                                      "log_directory": "LogDirectory", "temp_directory": "TempDirectory"})
+            scalar(native.get("status"), observed.get("Status"), statuses)
+            scalar(native.get("health_state"), observed.get("HealthState"),
+                   {0: "Invalid", 1: "Ok", 2: "Warning", 3: "Error", 65535: "Unknown"})
+
+    def entry_point(native, observed):
+        equal(native, observed, {"entry_point_location": "EntryPointLocation", "run_as_user_name": "RunAsUserName"})
+        for local, remote in (("process_id", "ProcessId"), ("instance_id", "InstanceId")):
+            numeric(native.get(local), observed.get(remote))
+        scalar(native.get("status"), observed.get("Status"),
+               {0: "Invalid", 1: "Pending", 2: "Starting", 3: "Started", 4: "Stopping", 5: "Stopped"})
+        timestamp(native.get("next_activation_time"), observed.get("NextActivationTime"))
+        stats, independent = native.get("statistics"), observed.get("CodePackageEntryPointStatistics")
+        require(type(stats) is dict and type(independent) is dict, "complete entry-point statistics")
+        for local, remote in (("last_exit_code", "LastExitCode"), ("activation_failure_count", "ActivationFailureCount"),
+                              ("continuous_activation_failure_count", "ContinuousActivationFailureCount"),
+                              ("exit_failure_count", "ExitFailureCount"), ("continuous_exit_failure_count", "ContinuousExitFailureCount"),
+                              ("activation_count", "ActivationCount"), ("exit_count", "ExitCount")):
+            numeric(stats.get(local), independent.get(remote))
+        for local, remote in (("last_activation_time", "LastExitTime"), ("last_exit_time", "LastActivationTime"),
+                              ("last_successful_activation_time", "LastSuccessfulActivationTime"),
+                              ("last_successful_exit_time", "LastSuccessfulExitTime")):
+            timestamp(stats.get(local), independent.get(remote))
+
+    observations = deployment.get("observations")
+    require(type(observations) is list and len(observations) == 10
+            and {(entry.get("node"), entry.get("application")) for entry in observations} ==
+                {(entry["node"], app) for entry in applications for app in lists["owned_applications"]},
+            "all ten owned node/application deployment observations")
+    counts = [0, 0, 0]
+    for entry in observations:
+        for native, observed in records(entry.get("native_service_packages"), entry.get("service_packages"),
+                ("service_manifest_name", "service_package_activation_id"), ("Name", "ServicePackageActivationId")):
+            equal(native, observed, {"service_manifest_version": "Version"})
+            scalar(native.get("status"), observed.get("Status"), statuses)
+            counts[0] += 1
+        for native, observed in records(entry.get("native_code_packages"), entry.get("code_packages"),
+                ("name", "service_manifest_name", "service_package_activation_id"),
+                ("Name", "ServiceManifestName", "ServicePackageActivationId")):
+            equal(native, observed, {"version": "Version", "has_setup_entry_point": "HasSetupEntryPoint"})
+            require(type(native["has_setup_entry_point"]) is bool, "native setup flag")
+            scalar(native.get("status"), observed.get("Status"), statuses)
+            numeric(native.get("run_frequency_interval"), observed.get("RunFrequencyInterval"))
+            scalar(native.get("host_type"), observed.get("HostType"), {0: "Invalid", 1: "ExeHost", 2: "ContainerHost"})
+            scalar(native.get("host_isolation_mode"), observed.get("HostIsolationMode"), {0: "None", 1: "Process", 2: "HyperV"})
+            for local, remote in (("setup_entry_point", "SetupEntryPoint"), ("main_entry_point", "MainEntryPoint")):
+                entry_point(native.get(local), observed.get(remote))
+            counts[1] += 1
+        native_replicas, independent = entry.get("native_replicas"), entry.get("replicas")
+        require(type(native_replicas) is list and type(independent) is list, "deployed replica observations")
+        for replica in independent:
+            require(type(replica) is dict and replica.get("ServiceKind") in ("Stateful", "Stateless"),
+                    "independent deployed replica kind")
+        normalized = [{**replica, "identity": str(replica.get("ReplicaId" if replica["ServiceKind"] == "Stateful" else "InstanceId"))}
+                      for replica in independent]
+        actual = [{**replica, "identity": str(replica.get("replica_id" if replica.get("kind") == 2 else "instance_id"))}
+                  for replica in native_replicas]
+        for native, observed in records(actual, normalized, ("partition_id", "identity"), ("PartitionId", "identity")):
+            equal(native, observed, {"service_name": "ServiceName", "service_type_name": "ServiceTypeName",
+                "service_manifest_version": "ServiceManifestVersion", "code_package_name": "CodePackageName",
+                "address": "Address", "service_manifest_name": "ServiceManifestName",
+                "service_package_activation_id": "ServicePackageActivationId"})
+            require(native["service_name"].startswith(entry["application"] + "/"), "owned deployed replica")
+            scalar(native.get("kind"), observed.get("ServiceKind"), {1: "Stateless", 2: "Stateful"})
+            numeric(native.get("replica_id" if native["kind"] == 2 else "instance_id"),
+                    observed.get("ReplicaId" if native["kind"] == 2 else "InstanceId"))
+            scalar(native.get("replica_status"), observed.get("ReplicaStatus"),
+                   {0: "Invalid", 1: "InBuild", 2: "Standby", 3: "Ready", 4: "Down", 5: "Dropped"})
+            numeric(native.get("host_process_id"), observed.get("HostProcessId"))
+            if native["kind"] == 2:
+                scalar(native.get("replica_role"), observed.get("ReplicaRole"), roles)
+                info, remote = native.get("reconfiguration_information"), observed.get("ReconfigurationInformation")
+                require(type(info) is dict and type(remote) is dict, "stateful reconfiguration information")
+                scalar(info.get("previous_configuration_role"), remote.get("PreviousConfigurationRole"), roles)
+                scalar(info.get("reconfiguration_phase"), remote.get("ReconfigurationPhase"),
+                       {0: "Invalid", 1: "None", 2: "Zero", 3: "One", 4: "Two", 5: "Three", 6: "Four", 7: "AbortPhaseZero"})
+                scalar(info.get("reconfiguration_type"), remote.get("ReconfigurationType"),
+                       {0: "Invalid", 1: "SwapPrimary", 2: "Failover", 3: "Other", 4: "None"})
+                timestamp(info.get("reconfiguration_start_time_utc"), remote.get("ReconfigurationStartTimeUtc"))
+            counts[2] += 1
+    require(counts == [10, 10, 22] and all(type(deployment.get(key)) is int and deployment[key] == count
+            for key, count in zip(("service_package_count", "code_package_count", "replica_count"), counts)),
+            "complete native deployment inventory")
+    require(all(integer(value.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+            "furpc deployment observation timestamps")
+    return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
+
+
 def health_against_http(native, observed, end_ms):
     states = {"Invalid": 0, "Ok": 1, "Warning": 2, "Error": 3, "Unknown": 65535}
 
@@ -1810,6 +1975,7 @@ def validate_native(reports, archive, allocation):
     movement_window = validate_native_movement(lists, health.get("owner"))
     furpc_lists_window = validate_furpc_lists(lists)
     furpc_topology_window = validate_furpc_topology(lists)
+    furpc_deployment_window = validate_furpc_deployments(lists)
     true_fields(notification, ("owned_cleanup_confirmed",))
     require(notification.get("allocation") == allocation["name"]
             and notification.get("passed") == list(NOTIFICATION_CASES)
@@ -1824,6 +1990,7 @@ def validate_native(reports, archive, allocation):
         "furpc_gateway_methods": furpc_window,
         "furpc_application_service_lists": furpc_lists_window,
         "furpc_partition_replica_lists": furpc_topology_window,
+        "furpc_deployment_lists": furpc_deployment_window,
         **furpc_health_windows,
     }
     require(all(integer(nodes.get(key), 1) for key in

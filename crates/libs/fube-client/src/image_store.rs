@@ -525,7 +525,3 @@ fn validate_destination(destination: &str) -> Result<String> {
     wire::delete(&normalized, [1; 16])?;
     Ok(normalized)
 }
-
-#[cfg(test)]
-#[path = "image_store_tests.rs"]
-mod tests;

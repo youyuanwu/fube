@@ -63,13 +63,27 @@ legacy methods, typed-request adapters and input accounting are retired.
 The existing owned list scenario now compares canonical furpc topology against
 HTTP, retains actual fields and generation/error evidence, and observes
 MovePrimary through furpc replicas while leaving the mutation on legacy.
-These two methods have focused offline coverage; fresh native requalification
-of the rewritten topology scenario is still pending.
-All eight legacy read methods and their typed-request adapters are retired;
+The rewritten archived scenario passed against a fresh SF11.8.121.4 onebox:
+six partitions and 22 replicas/instances matched independent HTTP observations.
+The four node-local deployment queries also use the same codec: deployed
+applications are paged, while service packages, code packages and deployed
+replicas are unpaged. Deployed replicas retain the RS Actor 13 reply profile.
+Their legacy methods, request adapters and allocation accounting are retired.
+Current native scenarios keep one furpc read client across list, topology and
+deployment observations, with explicit clones for concurrent calls and source
+generation checks on every successful response.
+The same native run qualified actual deployment paging, ten service packages,
+ten ExeHost code packages and 22 deployed replicas, including full supported
+REST projections, selectors, native missing-node errors and original-generation
+healthy reuse. The actual report passed the independent CI evidence validators.
+Synthetic wire/model-peer tests in fube-client are retired; non-wire tests,
+native scenarios and report validators remain.
+All twelve legacy read methods and their typed-request adapters are retired;
 remaining legacy operations keep their own transport. Current proof gates use
 canonical furpc results and independent HTTP/source-derived expectations, not
 retained legacy implementations as comparison oracles.
-This is initiating clear-TCP evidence for those six operations only; it does
+Together with the earlier runs, this is initiating clear-TCP evidence for the
+twelve migrated read operations only; it does
 not qualify accepted-side serving, notifications, TLS, or the rest of the gateway API. See the
 [client slice](../../RustFabricClient.md#separate-furpc-backed-client).
 

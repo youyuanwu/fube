@@ -16,7 +16,6 @@ uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 clap.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
 time.workspace = true
 reqwest.workspace = true
 openapi-service-fabric.workspace = true

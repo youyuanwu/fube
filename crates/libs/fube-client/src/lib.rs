@@ -4,7 +4,7 @@
 //! Existing [`FabricClient`] connections support bounded concurrency without
 //! automatic reconnect. The separate [`FurpcClient`] is a typed stub over a
 //! byte-facing Tower service, defaulting to furpc's Channel, and provides Ping,
-//! NameExists, single-page node/application/service/partition/replica lists and node health.
+//! NameExists, single-page cluster/topology/deployment lists and node health.
 //! These reads are no longer available on FabricClient or its ClientRequest
 //! adapters. FabricClient retains the remaining, unmigrated operations.
 //! Native connections require an explicitly selected unsecured development gateway.
@@ -110,8 +110,8 @@ pub struct GatewayDescription {
 
 /// Cloneable client for the native clear-TCP development profile.
 ///
-/// Legacy implementation for naming writes, deployment
-/// queries and service resolution. Migrated reads use [`FurpcClient`] only.
+/// Legacy implementation for naming writes, MovePrimary and service resolution.
+/// Migrated reads use [`FurpcClient`] only.
 ///
 /// Clones explicitly share one Channel lifecycle owner, typed budget and terminal state.
 /// A [`GatewayClient`] instead borrows a supplied foundation without adopting it.
@@ -232,54 +232,6 @@ impl FabricClient {
             .map(|_| ())
     }
 
-    /// Get one deployed application page on a selected node.
-    /// This is node-local deployment state, not the cluster-wide application list.
-    ///
-    /// No automatic paging, retries, reconnect or replay occurs.
-    pub async fn get_deployed_application_list(
-        &self,
-        query: &DeployedApplicationQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<DeployedApplicationListPage> {
-        self.query(query, timeout).await
-    }
-
-    /// List service packages deployed for one application on a selected node.
-    /// This native query is unpaged and does not provide a cluster snapshot.
-    ///
-    /// No automatic retries, reconnect or replay occurs.
-    pub async fn get_deployed_service_package_list(
-        &self,
-        query: &DeployedServicePackageQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<Vec<DeployedServicePackage>> {
-        self.query(query, timeout).await
-    }
-
-    /// List code packages deployed for one application on a selected node.
-    /// Includes setup/main entry points, statistics and host details; no paging.
-    ///
-    /// Native errors and malformed domain successes remain operation-local.
-    pub async fn get_deployed_code_package_list(
-        &self,
-        query: &DeployedCodePackageQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<Vec<DeployedCodePackage>> {
-        self.query(query, timeout).await
-    }
-
-    /// List replicas or stateless instances deployed on one node for an application.
-    /// Includes activation, host and reconfiguration details; not endpoint resolution.
-    ///
-    /// No paging, automatic retries, reconnect or replay occurs.
-    pub async fn get_deployed_replica_list(
-        &self,
-        query: &DeployedReplicaQueryDescription,
-        timeout: Option<Duration>,
-    ) -> ClientResult<Vec<DeployedReplica>> {
-        self.query(query, timeout).await
-    }
-
     /// Close the shared connection and wait for the background driver to exit.
     /// Dropping one clone does not close the other handles.
     pub async fn close(&self) -> Result<()> {
@@ -323,16 +275,6 @@ impl FabricClient {
 
     fn deadline(&self, timeout: Option<Duration>) -> Result<Instant> {
         deadline_after(timeout.unwrap_or(self.timeout))
-    }
-
-    async fn query<Q: ClientRequest<DomainError = DomainFailure> + Clone>(
-        &self,
-        query: &Q,
-        timeout: Option<Duration>,
-    ) -> ClientResult<Q::Response> {
-        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
-        typed::check_input(query).map_err(ClientError::Local)?;
-        self.call(query.clone(), CallContext { deadline }).await
     }
 
     fn name_request(

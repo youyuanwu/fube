@@ -360,7 +360,6 @@ fn replica_evidence(replica: &Replica) -> Value {
 }
 
 pub async fn observe(
-    client: &FabricClient,
     reads: &mut FurpcClient,
     generation: u64,
     http: &Http,
@@ -528,7 +527,12 @@ pub async fn observe(
         let mut seen_tokens = BTreeSet::new();
         let mut deployments = Vec::new();
         loop {
-            let page = client.get_deployed_application_list(&query, None).await?;
+            let page = body(
+                reads
+                    .get_deployed_application_list(Request::new(query.clone()), deadline())
+                    .await?,
+                generation,
+            );
             assert!(page.items.len() <= 1);
             deployments.extend(page.items);
             let Some(token) = page.continuation_token else {
@@ -570,14 +574,19 @@ pub async fn observe(
             query.parameters.application_name = Some(app.name.parse()?);
             query.parameters.include_health_state = false;
             query.paging = Paging::default();
-            let selected = client
-                .get_deployed_application_list(&query, Some(Duration::from_secs(30)))
-                .await?;
+            let selected = body(
+                reads
+                    .get_deployed_application_list(Request::new(query.clone()), deadline())
+                    .await?,
+                generation,
+            );
             assert_eq!(selected.items.len(), 1);
             assert_eq!(selected.items[0].name, app.name);
             assert_eq!(selected.items[0].health_state, HealthState::Unknown);
         }
-        deployment_observations.push(json!({"node": name, "applications": observed}));
+        deployment_observations.push(json!({
+            "node": name, "applications": observed, "native_applications": deployments,
+        }));
     }
     assert!(
         deployment_paging,
@@ -616,27 +625,27 @@ pub async fn observe(
     let missing_node = DeployedApplicationQueryDescription::new(
         DeployedApplicationQueryParameters::new(absent_node),
     );
-    let missing_node_code = match client
-        .get_deployed_application_list(&missing_node, None)
-        .await
-    {
-        Err(
-            ClientError::Domain(DomainFailure { code, .. })
-            | ClientError::Transport(Error::Remote { code, .. }),
-        ) => code,
-        other => return Err(format!("missing node must return a native error: {other:?}").into()),
-    };
-    assert!(!client.is_closed());
-    client
-        .get_deployed_application_list(
-            &DeployedApplicationQueryDescription::new(DeployedApplicationQueryParameters::new(
-                nodes[0]["Name"]
-                    .as_str()
-                    .ok_or("missing independent node")?,
-            )),
-            None,
-        )
-        .await?;
+    let (missing_node_code, missing_node_origin) = furpc_support::failure(
+        reads
+            .get_deployed_application_list(Request::new(missing_node), deadline())
+            .await
+            .unwrap_err(),
+    );
+    body(
+        reads
+            .get_deployed_application_list(
+                Request::new(DeployedApplicationQueryDescription::new(
+                    DeployedApplicationQueryParameters::new(
+                        nodes[0]["Name"]
+                            .as_str()
+                            .ok_or("missing independent node")?,
+                    ),
+                )),
+                deadline(),
+            )
+            .await?,
+        generation,
+    );
     Ok(json!({
         "partition_count": partition_count,
         "replica_instance_count": replica_count,
@@ -649,7 +658,7 @@ pub async fn observe(
         "raw_native_epoch_not_compared_to_rest_projection": true,
         "native_missing_partition_code": missing_replica_code,
         "native_missing_deployment_node_code": missing_node_code,
-        "legacy_deployment_connection_reused_after_error": true,
+        "deployed_application_native_error_origin": missing_node_origin,
         "furpc": {
             "generation": generation, "same_generation_after_error": true,
             "native_error_origin": error_origin, "mixed_concurrent_operations": 3,

@@ -122,14 +122,9 @@ async fn http(address: &str) -> ObserverResult<serde_json::Value> {
 
 async fn stateful_snapshot(
     client: &FabricClient,
-    gateway: SocketAddr,
+    reads: &mut FurpcClient,
     name: &NamingUri,
 ) -> ObserverResult<serde_json::Value> {
-    let channel = FurpcClient::endpoint_clear(gateway)?
-        .connect_timeout(Duration::from_secs(10))
-        .connect()
-        .await?;
-    let mut reads = FurpcClient::new(channel);
     let mut description =
         PartitionQueryDescription::new(PartitionQueryParameters::new(name.clone()));
     let mut partitions = Vec::new();
@@ -195,12 +190,13 @@ async fn stateful_snapshot(
                 DeployedReplicaQueryParameters::new(&replica.node_name, application.clone());
             query.partition_id = Some(id);
             query.service_manifest_name = Some("RustRuntimeService".into());
-            let deployed = client
+            let deployed = reads
                 .get_deployed_replica_list(
-                    &DeployedReplicaQueryDescription::new(query),
-                    Some(Duration::from_secs(10)),
+                    furpc::Request::new(DeployedReplicaQueryDescription::new(query)),
+                    tokio::time::Instant::now() + Duration::from_secs(10),
                 )
-                .await?;
+                .await?
+                .into_body();
             let deployed = deployed
                 .into_iter()
                 .find(|r| r.replica_id == replica.replica_id && r.kind == ServiceKind::Stateful)
@@ -285,15 +281,18 @@ async fn stateful_snapshot(
     if rpc["replica"] != native["replica"] || rpc["node"] != native["node"] {
         return Err("primary HTTP identity mismatch".into());
     }
-    let packages = client
+    let packages = reads
         .get_deployed_code_package_list(
-            &DeployedCodePackageQueryDescription::new(DeployedCodePackageQueryParameters::new(
-                native["node"].as_str().ok_or("node")?,
-                application,
+            furpc::Request::new(DeployedCodePackageQueryDescription::new(
+                DeployedCodePackageQueryParameters::new(
+                    native["node"].as_str().ok_or("node")?,
+                    application,
+                ),
             )),
-            None,
+            tokio::time::Instant::now() + Duration::from_secs(10),
         )
-        .await?;
+        .await?
+        .into_body();
     let package = packages
         .iter()
         .find(|p| {
@@ -318,17 +317,11 @@ async fn stateful_snapshot(
 }
 
 async fn run(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
-    let channel = FabricClient::endpoint_clear(args.gateway)?
+    let channel = FurpcClient::endpoint_clear(args.gateway)?
         .connect_timeout(Duration::from_secs(10))
         .connect()
         .await?;
-    let client = FabricClient::new(
-        channel,
-        ClientOptions {
-            default_timeout: Duration::from_secs(10),
-            ..Default::default()
-        },
-    )?;
+    let mut reads = FurpcClient::new(channel);
     let name = args.service;
     let service = name.as_str();
     if let Some(node) = args.deployed_replicas {
@@ -337,15 +330,15 @@ async fn run(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("service application")?
             .0
             .parse()?;
-        let values = client
+        let values = reads
             .get_deployed_replica_list(
-                &DeployedReplicaQueryDescription::new(DeployedReplicaQueryParameters::new(
-                    &node,
-                    application,
+                furpc::Request::new(DeployedReplicaQueryDescription::new(
+                    DeployedReplicaQueryParameters::new(&node, application),
                 )),
-                Some(Duration::from_secs(10)),
+                tokio::time::Instant::now() + Duration::from_secs(10),
             )
-            .await?;
+            .await?
+            .into_body();
         if values.len() > 64 {
             return Err("deployed inventory bound".into());
         }
@@ -358,11 +351,21 @@ async fn run(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             serde_json::json!({"observer":"fube-client","node":node,"service":service,
             "deployed":values,"fixture_contacted":false})
         );
-        client.close().await?;
         return Ok(());
     }
+    let channel = FabricClient::endpoint_clear(args.gateway)?
+        .connect_timeout(Duration::from_secs(10))
+        .connect()
+        .await?;
+    let client = FabricClient::new(
+        channel,
+        ClientOptions {
+            default_timeout: Duration::from_secs(10),
+            ..Default::default()
+        },
+    )?;
     if let Some(target) = args.move_primary {
-        let before = stateful_snapshot(&client, args.gateway, &name).await?;
+        let before = stateful_snapshot(&client, &mut reads, &name).await?;
         let partition = before["partition"].as_str().ok_or("partition")?.parse()?;
         if !before["replicas"]
             .as_array()
@@ -384,7 +387,7 @@ async fn run(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.stateful {
-        let snapshot = stateful_snapshot(&client, args.gateway, &name).await?;
+        let snapshot = stateful_snapshot(&client, &mut reads, &name).await?;
         println!("{snapshot}");
         client.close().await?;
         return Ok(());
@@ -434,15 +437,18 @@ async fn run(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             .rsplit_once('/')
             .ok_or("service must belong to app")?
             .0;
-        let packages = client
+        let packages = reads
             .get_deployed_code_package_list(
-                &DeployedCodePackageQueryDescription::new(DeployedCodePackageQueryParameters::new(
-                    rpc["node"].as_str().ok_or("missing node")?,
-                    application.parse()?,
+                furpc::Request::new(DeployedCodePackageQueryDescription::new(
+                    DeployedCodePackageQueryParameters::new(
+                        rpc["node"].as_str().ok_or("missing node")?,
+                        application.parse()?,
+                    ),
                 )),
-                None,
+                tokio::time::Instant::now() + Duration::from_secs(10),
             )
-            .await?;
+            .await?
+            .into_body();
         let package = packages
             .iter()
             .find(|p| {

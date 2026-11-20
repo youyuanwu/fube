@@ -567,6 +567,85 @@ class ProofFiles(fixtures.ProjectFiles):
                     topology["independent_partition_replicas"].append({
                         "service": app + "/" + kind, "partition": observed, "native_partition": native,
                         "replicas": independent_replicas, "native_replicas": native_replicas})
+        topology.update(
+            deployment_native_continuation_followed=True, deployed_health_requested_and_omitted=True,
+            native_missing_deployment_node_code=-2147017795, deployed_application_native_error_origin="domain")
+        topology["independent_deployments"] = []
+        deployment = lists["deployment_inspection"] = {
+            **dict.fromkeys(("service_manifest_selectors", "code_package_and_partition_selectors",
+                            "stateful_and_stateless", "mixed_shared_native_connection",
+                            "reuse_after_native_errors", "statistics_rest_activation_exit_labels_swapped"), True),
+            "service_package_count": 10, "code_package_count": 10, "replica_count": 22,
+            "native_missing_node_codes": [-2147017795] * 3, "native_error_origins": ["domain"] * 3,
+            "furpc": {"generation": 1, "same_generation_after_error": True, "mixed_concurrent_operations": 3,
+                      "native_start_ms": int(start * 1000) + 21, "native_end_ms": int(start * 1000) + 22},
+            "observations": [],
+        }
+        empty_time = "0001-01-01T00:00:00.000Z"
+        for node in (f"N00{i}0" for i in range(1, 6)):
+            topology["independent_deployments"].append({
+                "node": node,
+                "native_applications": [{"name": app, "type_name": type_name, "status": 3, "health_state": 1,
+                    "work_directory": "/work", "log_directory": "/log", "temp_directory": "/temp"} for app in applications],
+                "applications": [{"Name": app, "TypeName": type_name, "Status": "Active", "HealthState": "Ok",
+                    "WorkDirectory": "/work", "LogDirectory": "/log", "TempDirectory": "/temp"} for app in applications]})
+            for app in applications:
+                stats = dict.fromkeys(("last_exit_code", "last_activation_time", "last_exit_time",
+                    "last_successful_activation_time", "last_successful_exit_time", "activation_failure_count",
+                    "continuous_activation_failure_count", "exit_failure_count", "continuous_exit_failure_count",
+                    "activation_count", "exit_count"), 0)
+                remote_stats = dict.fromkeys(("LastExitCode", "ActivationFailureCount", "ContinuousActivationFailureCount",
+                    "ExitFailureCount", "ContinuousExitFailureCount", "ActivationCount", "ExitCount"), 0)
+                remote_stats.update(dict.fromkeys(("LastActivationTime", "LastExitTime",
+                    "LastSuccessfulActivationTime", "LastSuccessfulExitTime"), empty_time))
+                stats["last_activation_time"] = 116_444_736_000_000_000
+                remote_stats["LastExitTime"] = "1970-01-01T00:00:00.000Z"
+                entry = {"entry_point_location": "/sleep", "run_as_user_name": "", "process_id": 123,
+                         "instance_id": 1, "next_activation_time": 0, "status": 3, "statistics": stats}
+                remote_entry = {"EntryPointLocation": "/sleep", "RunAsUserName": "", "ProcessId": "123",
+                                "InstanceId": "1", "NextActivationTime": empty_time, "Status": "Started",
+                                "CodePackageEntryPointStatistics": remote_stats}
+                native_replicas, independent = [], []
+                for captured in topology["independent_partition_replicas"]:
+                    if not captured["service"].startswith(app + "/"):
+                        continue
+                    for replica in captured["native_replicas"]:
+                        if replica["node_name"] != node:
+                            continue
+                        stateful = replica["kind"] == "Stateful"
+                        native_replicas.append({
+                            "kind": 2 if stateful else 1, "service_name": captured["service"],
+                            "service_type_name": "ServiceType", "service_manifest_version": "1",
+                            "code_package_name": "Code", "partition_id": captured["native_partition"]["information"]["id"],
+                            "replica_id": replica["id"] if stateful else 0, "instance_id": 0 if stateful else replica["id"],
+                            "replica_role": {"Primary": 2, "ActiveSecondary": 4, "Unknown": 1}[replica["role"]],
+                            "replica_status": 3, "address": replica["address"], "service_manifest_name": "Manifest",
+                            "service_package_activation_id": "", "host_process_id": 123,
+                            "reconfiguration_information": {"previous_configuration_role": 1, "reconfiguration_phase": 1,
+                                "reconfiguration_type": 4, "reconfiguration_start_time_utc": 0}})
+                        independent.append({
+                            "ServiceKind": replica["kind"], "ServiceName": captured["service"], "ServiceTypeName": "ServiceType",
+                            "ServiceManifestVersion": "1", "CodePackageName": "Code",
+                            "PartitionId": captured["native_partition"]["information"]["id"],
+                            "ReplicaId" if stateful else "InstanceId": str(replica["id"]),
+                            "ReplicaRole": replica["role"] if stateful else "None", "ReplicaStatus": "Ready",
+                            "Address": replica["address"], "ServiceManifestName": "Manifest", "ServicePackageActivationId": "",
+                            "HostProcessId": "123", "ReconfigurationInformation": {"PreviousConfigurationRole": "None",
+                                "ReconfigurationPhase": "None", "ReconfigurationType": "None", "ReconfigurationStartTimeUtc": empty_time}})
+                deployment["observations"].append({
+                    "node": node, "application": app,
+                    "native_service_packages": [{"service_manifest_name": "Manifest", "service_manifest_version": "1",
+                                                "service_package_activation_id": "", "status": 3}],
+                    "service_packages": [{"Name": "Manifest", "Version": "1", "ServicePackageActivationId": "", "Status": "Active"}],
+                    "native_code_packages": [{"name": "Code", "version": "1", "service_manifest_name": "Manifest",
+                        "service_package_activation_id": "", "status": 3, "has_setup_entry_point": False,
+                        "host_type": 1, "host_isolation_mode": 0, "run_frequency_interval": 0,
+                        "setup_entry_point": copy.deepcopy(entry), "main_entry_point": copy.deepcopy(entry)}],
+                    "code_packages": [{"Name": "Code", "Version": "1", "ServiceManifestName": "Manifest",
+                        "ServicePackageActivationId": "", "Status": "Active", "HasSetupEntryPoint": False,
+                        "HostType": "ExeHost", "HostIsolationMode": "None", "RunFrequencyInterval": 0,
+                        "SetupEntryPoint": copy.deepcopy(remote_entry), "MainEntryPoint": copy.deepcopy(remote_entry)}],
+                    "native_replicas": native_replicas, "replicas": independent})
         notification = {
             **common, "allocation": allocation, "passed": list(ci.NOTIFICATION_CASES),
             "owned_cleanup_confirmed": True, "resolved": [{"model": 1}], "named": {"model": 1},
@@ -1493,6 +1572,42 @@ class WorkerTests(ProofFiles):
                 change(broken["topology"])
                 with self.assertRaises(ci.ProofError):
                     ci.validate_furpc_topology(broken)
+
+    def test_furpc_deployments_require_independent_fields_and_original_generation(self):
+        original = self.native_reports("owned", 1)[ci.NATIVE_FILES[3]]
+        self.assertEqual(ci.validate_furpc_deployments(original), [1.021, 1.022])
+        changes = [
+            lambda value: value["deployment_inspection"].pop("furpc"),
+            lambda value: value["deployment_inspection"]["furpc"].update(generation=2),
+            lambda value: value["deployment_inspection"]["furpc"].update(same_generation_after_error=1),
+            lambda value: value["deployment_inspection"]["furpc"].update(mixed_concurrent_operations=True),
+            lambda value: value["deployment_inspection"]["furpc"].update(native_end_ms=1020),
+            lambda value: value["deployment_inspection"].update(native_missing_node_codes=[-2147017795] * 2),
+            lambda value: value["deployment_inspection"].update(native_error_origins=["local"] * 3),
+            lambda value: value["topology"].update(deployment_native_continuation_followed=False),
+            lambda value: value["topology"]["independent_deployments"][0].pop("native_applications"),
+            lambda value: value["topology"]["independent_deployments"][0]["native_applications"][0].update(health_state=True),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_service_packages"][0].update(status=True),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_code_packages"][0].update(host_type=2),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_code_packages"][0]["main_entry_point"].update(
+                process_id="123"),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_code_packages"][0]["main_entry_point"][
+                "statistics"].update(last_activation_time=0),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_code_packages"][0]["main_entry_point"][
+                "statistics"].update(last_activation_time=116_444_736_000_010_000),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_replicas"][0].update(host_process_id=True),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_replicas"][0].update(service_name="fabric:/foreign"),
+            lambda value: value["deployment_inspection"]["observations"][0]["native_replicas"][0][
+                "reconfiguration_information"].update(reconfiguration_phase=2),
+            lambda value: value["deployment_inspection"]["observations"][0].update(native_replicas=[]),
+            lambda value: value["deployment_inspection"].update(replica_count=21),
+        ]
+        for index, change in enumerate(changes):
+            with self.subTest(change=index):
+                broken = copy.deepcopy(original)
+                change(broken)
+                with self.assertRaises(ci.ProofError):
+                    ci.validate_furpc_deployments(broken)
 
     def test_native_movement_observation_must_belong_to_current_execution(self):
         directory = self.worker("client-runtime")

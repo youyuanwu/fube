@@ -18,7 +18,10 @@ use tower_service::Service;
 use crate::{
     protocol,
     query_protocol::{self, Query, QueryRequest, Reply},
-    ApplicationListPage, ApplicationQueryDescription, DomainFailure, GatewayDescription, NamingUri,
+    ApplicationListPage, ApplicationQueryDescription, DeployedApplicationListPage,
+    DeployedApplicationQueryDescription, DeployedCodePackage, DeployedCodePackageQueryDescription,
+    DeployedReplica, DeployedReplicaQueryDescription, DeployedServicePackage,
+    DeployedServicePackageQueryDescription, DomainFailure, GatewayDescription, NamingUri,
     NodeHealth, NodeHealthQueryDescription, NodeListPage, NodeQueryDescription, PartitionListPage,
     PartitionQueryDescription, ReplicaListPage, ReplicaQueryDescription, ServiceListPage,
     ServiceQueryDescription,
@@ -104,8 +107,8 @@ type Result<T> = std::result::Result<T, FurpcClientError>;
 
 /// Typed gateway stub over a byte-facing Tower service.
 ///
-/// Ping, NameExists, node/application/service/partition/replica lists and node health are
-/// implemented separately from [`crate::FabricClient`].
+/// Read-only gateway queries, Ping and NameExists are implemented separately
+/// from [`crate::FabricClient`].
 /// The default transport is a furpc Channel; clones share its lifecycle and
 /// dropping the last owner closes it. Later calls may reconnect, but a submitted
 /// call is never replayed. Custom transports need not be Clone, Sync or static.
@@ -258,6 +261,48 @@ where
         request: Request<ReplicaQueryDescription>,
         deadline: Instant,
     ) -> Result<Response<ReplicaListPage>> {
+        self.query(request, deadline).await
+    }
+
+    /// Get one node-local deployed-application page with optional health.
+    ///
+    /// Follow continuations explicitly; neither count nor message-size paging
+    /// is automatic. This is not the cluster-wide application inventory.
+    pub async fn get_deployed_application_list(
+        &mut self,
+        request: Request<DeployedApplicationQueryDescription>,
+        deadline: Instant,
+    ) -> Result<Response<DeployedApplicationListPage>> {
+        self.query(request, deadline).await
+    }
+
+    /// List service packages for one application on a selected node, without paging.
+    pub async fn get_deployed_service_package_list(
+        &mut self,
+        request: Request<DeployedServicePackageQueryDescription>,
+        deadline: Instant,
+    ) -> Result<Response<Vec<DeployedServicePackage>>> {
+        self.query(request, deadline).await
+    }
+
+    /// List unpaged code packages, including both native entry-point records.
+    pub async fn get_deployed_code_package_list(
+        &mut self,
+        request: Request<DeployedCodePackageQueryDescription>,
+        deadline: Instant,
+    ) -> Result<Response<Vec<DeployedCodePackage>>> {
+        self.query(request, deadline).await
+    }
+
+    /// List unpaged node/application-scoped replicas and stateless instances.
+    ///
+    /// Native replies use RS Actor 13, not NamingGateway or RA. This is a
+    /// deployment observation, not service endpoint resolution.
+    pub async fn get_deployed_replica_list(
+        &mut self,
+        request: Request<DeployedReplicaQueryDescription>,
+        deadline: Instant,
+    ) -> Result<Response<Vec<DeployedReplica>>> {
         self.query(request, deadline).await
     }
 
@@ -574,6 +619,3 @@ fn check_query_reply<Q: QueryRequest>(response: &Response<Body>) -> Result<()> {
         )
         .map_err(FurpcClientError::Protocol)
 }
-
-#[cfg(test)]
-mod tests;

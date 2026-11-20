@@ -346,9 +346,8 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
             ..Default::default()
         },
     )?;
-    let topology =
-        topology::observe(&client, &mut reads_client, generation, &http, &journal).await?;
-    let deployment = deployment::observe(&client, &http, &journal).await?;
+    let topology = topology::observe(&mut reads_client, generation, &http, &journal).await?;
+    let deployment = deployment::observe(&mut reads_client, generation, &http, &journal).await?;
     let movement = topology::move_primary(
         &client,
         &mut reads_client,

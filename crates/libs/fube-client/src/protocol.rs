@@ -134,40 +134,6 @@ pub(crate) fn decode_name_write(message: &Message) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fubst::Encoder;
-
-    #[test]
-    fn naming_uri_serde_bytes_match_the_manual_native_schema() {
-        for name in [
-            "fabric:/App",
-            "fabric:/App_1/Service-2",
-            &format!("fabric:/{}", "a".repeat(4088)),
-        ] {
-            let mut encoder = Encoder::new();
-            encoder
-                .object(|e| {
-                    e.i64(1).unwrap();
-                    e.string("fabric")?;
-                    e.string("")?;
-                    e.i64(0).unwrap();
-                    e.string("")?;
-                    e.i32(-1).unwrap();
-                    e.string(&name["fabric:".len()..])?;
-                    e.string("")?;
-                    e.string("")?;
-                    let segments: Vec<_> = name["fabric:/".len()..].split('/').collect();
-                    e.u32(segments.len() as u32).unwrap();
-                    for segment in segments {
-                        e.string(segment)?;
-                    }
-                    Ok(())
-                })
-                .unwrap();
-            let bytes = encode_name(name).unwrap();
-            assert_eq!(bytes, encoder.finish());
-            assert_eq!(from_slice::<NamingUri>(&bytes).unwrap().as_str(), name);
-        }
-    }
 
     #[test]
     fn uri_rejects_every_unsupported_grammar_class() {
@@ -198,38 +164,14 @@ mod tests {
             "fabric:/a\\b",
         ] {
             assert!(
-                matches!(encode_name(input), Err(Error::InvalidInput(_))),
+                matches!(NamingUri::parse(input), Err(Error::InvalidInput(_))),
                 "{input:?}"
             );
         }
-        assert!(encode_name(&format!("fabric:/{}", "a".repeat(4088))).is_ok());
+        assert!(NamingUri::parse(&format!("fabric:/{}", "a".repeat(4088))).is_ok());
         assert!(matches!(
-            encode_name(&format!("fabric:/{}", "a".repeat(4089))),
+            NamingUri::parse(&format!("fabric:/{}", "a".repeat(4089))),
             Err(Error::InvalidInput(_))
         ));
-    }
-
-    #[test]
-    fn uri_preserves_path_case_and_segment_spelling() {
-        let bytes = encode_name("fabric:/App_1/Service-2").unwrap();
-        let mut decoder = Decoder::new(&bytes);
-        decoder
-            .object(|decoder| {
-                assert_eq!(decoder.i64()?, 1);
-                assert_eq!(decoder.string()?, "fabric");
-                assert_eq!(decoder.string()?, "");
-                assert_eq!(decoder.i64()?, 0);
-                assert_eq!(decoder.string()?, "");
-                assert_eq!(decoder.i32()?, -1);
-                assert_eq!(decoder.string()?, "/App_1/Service-2");
-                assert_eq!(decoder.string()?, "");
-                assert_eq!(decoder.string()?, "");
-                assert_eq!(decoder.u32()?, 2);
-                assert_eq!(decoder.string()?, "App_1");
-                assert_eq!(decoder.string()?, "Service-2");
-                Ok(())
-            })
-            .unwrap();
-        decoder.finish().unwrap();
     }
 }
