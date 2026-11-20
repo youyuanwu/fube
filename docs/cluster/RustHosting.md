@@ -157,7 +157,7 @@ and corresponding tests. Finding a similarly named native class is insufficient.
 ## 4. Architecture and interface shape
 
 ```text
-fube-test-host -----------------> fube-hosting ---> fube-transport
+fube-test-host -----------------> fube-hosting ---> furpc
        |                              |
        +------> fube-local-host <------+
 
@@ -376,7 +376,7 @@ replace a fenced RA executor or infer rollback from observer cancellation.
 
 ### H3: long-running local protocol service
 
-Reuse `fube-transport` framing and serialization. Reconcile the test-host,
+Use `furpc` framing/correlation and shared Fubst serialization. Reconcile the test-host,
 runtime and RA schema definitions against native source before sharing them;
 do not generalize a narrow codec by accepting arbitrary missing fields.
 
@@ -565,7 +565,7 @@ under registration locks. Each native table/state operation uses bounded
 projection-before-publication; public Start/Finish/timeout and tentative
 registration steps remain separately drivable. The H1 core introduces no production
 dependency on RA, runtime, test-host or native SF. The crate now additionally uses
-transport/Serde/Tokio for the separate bootstrap-only H3 service; socket2 is
+furpc/Serde/Tokio/Tower for the separate bootstrap-only H3 service; socket2 is
 test-only ([manifest](../../crates/libs/fube-hosting/Cargo.toml)).
 
 | Implemented surface | Rust source | Native closure |
@@ -899,11 +899,11 @@ Both profiles retain finite frame/write, registration and local authority bounds
 The default local duration is **30 seconds**, configurable only to a finite
 1 ms–30 s duration. Initial TTL is informational: completed host, owned valid
 runtime and a fresh correlated poll are required. Polls bind a producer GUID and
-increasing index, permit gaps and reject replay/GUID changes. Atomic terminal
-authority checks precede renewal and frame start. `HostLease::stop_renewal` permits
+fresh indices, permit gaps/reordering and reject replay/GUID changes. Atomic terminal
+authority checks precede renewal and reply-data handoff. `HostLease::stop_renewal` permits
 only the remaining prior grant; `revoke` closes authority/I/O without waiting for
 registration cleanup, callbacks, diagnostics, RA or process teardown. Expiry/EOF/
-registration timeout/replacement cannot revive an old session. Already-started
+registration timeout/replacement cannot revive an old session. Already-admitted
 or buffered frames are not retroactively recalled; the runtime retains its
 request-send-relative TTL and independent terminal fence.
 
@@ -916,6 +916,27 @@ decode/projection/reply budgets and slot counts are checked before excess work.
 Transfer is not live RA delivery ACK, process cleanup or Residency release.
 Full closure capacity can retain membership and a cleanup failure while authority
 is already terminal. The H1/H2 semantics and live-composition rejection remain.
+
+**Accepted-side furpc migration:** each accepted socket now uses public furpc
+Server/Actor ingress services, with a bounded serialized Hosting handoff and
+original-generation Peer for semantic sends. Furpc owns correlation and writes.
+The previous first-positive-write authority predicate and ingress-before-reply-write
+barrier are not emulated. Lifecycle authority checks occur before submission and
+after local completion; a raced local failure does not prove the remote saw no
+output. Furpc-discarded unbound/wrong-kind/capacity input grants no domain
+authority but need not close the session. Invalid domain input reaching Hosting
+still retires that exact connection. Hosting owns cancellation/join of its
+connection/send tasks on the dedicated executor, dropping the inline serving
+future and accepted socket before publishing disconnected state. Unregister
+reply data retains the bounded original cleanup path after serving retirement.
+This introduces no furpc lifecycle API or second reader. Public lifecycle error
+types are furpc Error/Result; Fubst encode/decode errors retain their source.
+The direct legacy dependency is removed from Hosting's normal/dev edges.
+Independent adverse-frame fixtures use public furpc header schemas with disabled
+checksums for injection; a managed furpc peer exercises correlated registration,
+lease and same-identity successor retirement. Existing real runtime-child and
+owned-app/RA/RAP suites exercise production serving. The historical native
+qualification below does not qualify this new accepted implementation.
 
 **New qualification (2026-11-01, `1a1a51fd215d0b237f1f0d63902e5ef3d02a951f`):**
 23 [Hosting socket cases](../../crates/libs/fube-hosting/tests/ipc_leases.rs)

@@ -162,7 +162,7 @@ fn owned_stateful_factory_registers_and_resolves_without_replica_lifecycle() {
     for action in ["ReplicaOpen", "ReplicaClose"] {
         assert!(matches!(
             lease.send_lifecycle(action, vec![]),
-            Err(fube_transport::Error::Protocol(_))
+            Err(furpc::Error::Protocol(_))
         ));
     }
     std::thread::sleep(Duration::from_millis(4500));
