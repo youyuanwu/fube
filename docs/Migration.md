@@ -73,7 +73,14 @@ their original source. Hosting and the owned-app sample no longer directly depen
 on legacy transport, including dev edges. Independent adversarial socket fixtures
 use public furpc headers and a test-only clear-frame injector; managed-client and
 real runtime-child/RA/RAP coverage exercise production accepted serving.
-TLS/claims and fresh native accepted-side qualification remain deferred.
+Native SF11.8.121.4 `hosting-leases` and `hosting-registration` passed at
+`0191bcc` with freshly rebuilt, source/hash/mode-verified binaries. Both production
+profiles observed two finite correlated polls, actual runtime unregister and
+graceful child exit/reap/group drain; registration also verified native factory
+registration, same-core lookup and owned local closure decisions. All five
+retained native fixture profiles passed separately. This qualifies those clear
+accepted-side bootstrap/registration paths, not native deployed lifecycle,
+stateful/reporting, failed-write/revocation races, or TLS/claims.
 
 Public `ReplicationEndpointOptions` literals must set `advertised_ip`: use
 `None` for an existing concrete listener, or `Some(ip)` for the concrete IP to

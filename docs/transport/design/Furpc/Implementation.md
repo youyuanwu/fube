@@ -230,7 +230,28 @@ The Hosting and owned-app sample direct legacy dependency edges are retired;
 RA/node control and data replication remain legacy consumers. Offline managed
 furpc-client and independent adversarial socket fixtures cover the accepted path;
 real runtime-child, owned activation and local RA/RAP suites remain qualification
-owners. This is not fresh native SF accepted-side or TLS/claims evidence.
+owners.
+
+On 2026-11-20, both native `hosting-leases` and `hosting-registration` passed at
+`0191bcc` with newly built test-host, native SDK producer and manifest-acceptance
+executables in one exact-source/hash/mode-verified bundle. Pinned SF11.8.121.4
+Runtime/Common mappings were verified from private native/ABI inputs; no node
+service was installed or used by these clusterless profiles. Each production
+Hosting profile observed two positive finite correlated polls, actual runtime
+unregister, graceful exit0 and owned direct-child reap/process-group drain.
+Registration additionally verified the native stateless factory, same-core
+equal-version lookup, reporting-disabled bookkeeping and owned Registered/
+RuntimeClosed/HostClosed local decisions. FM readiness remained closed; no native
+host-unregister frame was observed, and HostClosed came from connection-loss
+cleanup. One gated package obligation remained owned, not treated as release.
+All five retained native fixture profiles passed separately with their existing
+graceful/forced-cleanup distinctions; their lifecycle evidence is not relabeled
+as production Hosting lifecycle. The retained onebox stayed healthy/running.
+Ignored evidence is under `build/furpc-hosting-proof/`: `binaries-0191bcc/`,
+`native-receipts-0191bcc-r2/` and `native-regressions-0191bcc/`.
+This qualifies the selected accepted clear-TCP bootstrap/registration paths, not
+native deployed/stateful/reporting lifecycle, failed-write/revocation races,
+TLS/claims, or full original native node-handler parity.
 
 The public facade supports managed byte RPC by default and explicitly selected
 `ConnectionOptions::raw_only()` for caller-owned one-way IDs. Endpoint owns inert URI,

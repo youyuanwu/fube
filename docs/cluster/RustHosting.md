@@ -938,6 +938,21 @@ lease and same-identity successor retirement. Existing real runtime-child and
 owned-app/RA/RAP suites exercise production serving. The historical native
 qualification below does not qualify this new accepted implementation.
 
+**Native accepted-side qualification (2026-11-20, `0191bcc`):** fresh exact-source/
+hash/mode-verified binaries passed both `hosting-leases` and `hosting-registration`
+against pinned SF11.8.121.4 Runtime/Common libraries. Both production profiles
+observed two finite correlated polls, native runtime unregister and graceful exit0,
+with direct-child reap and process-group drain independently verified. Factory
+registration also proved same-core equal-version lookup and owned local Registered/
+RuntimeClosed/HostClosed decisions with native FM readiness closed. HostClosed
+remained connection-loss cleanup, not an observed native host-unregister exchange;
+one gated package obligation remained owned. All five legacy native fixture
+profiles passed separately; abort and manifest cleanup retained their expected
+forced/reaped classification. Those fixtures do not qualify production lifecycle.
+The clusterless runs used private copied native/ABI inputs; the retained onebox
+remained healthy/running. This does not qualify native deployed/stateful/reporting
+lifecycle, failed-write/revocation races, TLS/claims or full native node handlers.
+
 **New qualification (2026-11-01, `1a1a51fd215d0b237f1f0d63902e5ef3d02a951f`):**
 23 [Hosting socket cases](../../crates/libs/fube-hosting/tests/ipc_leases.rs)
 exercise malformed/truncated requests, identity/target/freshness rejection,

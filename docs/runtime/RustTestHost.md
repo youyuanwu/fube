@@ -328,6 +328,15 @@ not a silent missing-header fallback. Source inspection and release-library
 version/hashes remain distinct provenance from complete original native node
 handler execution or deployed/distributed parity.
 
+The furpc-backed production accepted side passed this profile anew on 2026-11-20
+at `0191bcc`, using freshly rebuilt source/hash/mode-verified binaries and pinned
+SF11.8.121.4 Runtime/Common mappings. Two correlated finite polls, actual runtime
+unregister and graceful exit0/reap/process-group drain were verified. The native
+registration profile and all five original fixture profiles also passed separately.
+Private copied native/ABI inputs were sufficient; no node service was used and
+the retained onebox stayed healthy/running. This does not qualify native expiry/
+revocation under write pressure or production lifecycle/stateful/reporting/TLS.
+
 ## 2.8. Owned registration-events qualification
 
 The separate `hosting-registration` action runs the actual native stateless
@@ -361,6 +370,16 @@ No endpoint, launch/package/process activation, report consumer, FM/HM ACK,
 native lease-agent or deployed RA/RAP lifecycle is qualified.
 [API/ownership/profile details](../cluster/HostingRegistrationEvents.md)
 describe the production-versus-qualification boundaries.
+
+On 2026-11-20 this profile passed at `0191bcc` against furpc-backed production
+Hosting, using the same exact-source verified bundle as the lease profile.
+Native factory registration, same-core equal-version lookup, reporting-disabled
+bookkeeping and all three owned local registration/runtime/host closure decisions
+were observed. Both finite polls and runtime unregister completed; the child exited
+gracefully and its process group was drained/reaped. Native FM readiness remained
+closed, no native host-unregister frame was observed, and one gated package
+obligation remained owned. The five retained native fixture regressions passed
+without relabeling their lifecycle or forced-cleanup evidence.
 
 ## 3. Why a small RA-only listener is insufficient
 
