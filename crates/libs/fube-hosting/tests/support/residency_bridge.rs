@@ -737,7 +737,11 @@ pub fn lookup(core: &mut hosting::Hosting, issued: &Issued) -> hosting::LookupRe
 fn body_bytes(body: &wire::AddInstance) -> Vec<u8> {
     wire::add_instance_message(body, &wire::GenerationHeader::default())
         .expect("actual supported native Add shape")
-        .body
+        .body()
+        .segments()
+        .flatten()
+        .copied()
+        .collect()
 }
 
 fn text(out: &mut Vec<u8>, value: &str) {
@@ -862,13 +866,13 @@ fn effect_bytes(effect: &ra::Effect) -> usize {
         ra::Effect::Reply(reply) => {
             128 + wire::add_instance_reply_message(reply, wire::Owner::Fm)
                 .unwrap()
-                .body
+                .body()
                 .len()
         }
         ra::Effect::RemoveReply(reply) => {
             128 + wire::remove_instance_reply_message(reply, wire::Owner::Fm)
                 .unwrap()
-                .body
+                .body()
                 .len()
         }
         ra::Effect::ReleaseUsage { .. }

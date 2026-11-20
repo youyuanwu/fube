@@ -591,10 +591,17 @@ The native-derived fixed-profile exchanges are NodeUp/Ack, final empty
 ReplicaUp/Reply, AddInstance/Reply, RemoveInstance/Reply and
 ServiceTypeNotification/Reply. Full native body schemas, recipient actors,
 priority, PToP NodeInstance identity and FM generation are retained. The one-use
-original-child control capability admits one established Channel; it is trusted
+original-child control capability admits one established control session; it is trusted
 local admission, not hostile-network authentication or lifecycle success.
-Endpoint owns dialing; FM/node clients use established Channels, and native
-Hosting IPC remains a distinct setup.
+FM/node control now uses public furpc Endpoint/Server/Peer through the Node-owned
+bounded ingress/response adapter; native Hosting IPC remains a distinct setup.
+Its request runner owns correlation/reply writes, not the domain response slot.
+Generic transport rejection may discard without closing; invalid admitted domain
+input or inbox overflow retires its exact session. Original-session task/socket
+release is joined explicitly on close, without the legacy reader-level handoff,
+first-write fencing or guaranteed started-suffix completion. FM/RA admission,
+store/commit gates and semantic ACKs remain separate. This does not qualify
+native FM/Federation interoperability.
 
 The FM retains desired versus observed state. Actual Running requires the
 eligible RA semantic reply after real RAP Open; Absent requires matched
@@ -776,9 +783,10 @@ tracks that gap separately from frozen-body/request ownership correctness.
 The RA uses its current committed service description, not the historical
 reconfiguration request, without widening the Node profile's service-update
 admission. Concurrent uploads are bounded by RA `max_outstanding`. Capacity
-retains the original generation-update frame without advancing receive; only
-its transport handoff is released so the upload replies that free capacity can
-still arrive. This is not a semantic ACK or successful RA admission.
+retains the original generation-update frame without advancing receive in the
+bounded domain owner. Correlated LFUM replies progress independently through
+furpc, freeing admission capacity. This is not a semantic ACK or successful RA
+admission.
 
 #### Committed phase inventory
 

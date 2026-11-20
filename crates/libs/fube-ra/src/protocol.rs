@@ -3,14 +3,50 @@
 //! Field order follows pinned native FABRIC_FIELDS, not declaration order.
 //! Scalar enums and ErrorCode values are LONG64; unknown values are retained.
 //! ErrorCode diagnostic strings are not serialized. No Federation routing.
-use fube_transport::{
-    message::{Header, Message, ACTION, ACTOR, HIGH_PRIORITY},
-    Error, Result,
+use fubst::serde::{ByteArray, Derived, Guid, Inline, NativeEnum, ObjectArray, Pointer};
+use furpc::{
+    header::{self, ACTION, ACTOR, HIGH_PRIORITY},
+    ActorId, Body, Error, HeaderId, HeaderRecord, HeaderRef, Message, Result,
 };
-use fubst::serde::{
-    from_slice, to_vec, ByteArray, Derived, Guid, Inline, NativeEnum, ObjectArray, Pointer,
-};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+fn codec_error(source: fubst::Error) -> Error {
+    match source {
+        fubst::Error::Protocol(detail) => Error::Protocol(detail),
+        fubst::Error::InvalidInput(detail) => Error::InvalidInput(detail),
+        fubst::Error::ResourceLimit(detail) => Error::ResourceLimit(detail),
+    }
+}
+
+fn from_slice<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    fubst::serde::from_slice(bytes).map_err(codec_error)
+}
+
+fn decode_body<T: DeserializeOwned>(message: &Message) -> Result<T> {
+    let bytes: Vec<_> = message.body().segments().flatten().copied().collect();
+    from_slice(&bytes)
+}
+
+fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    fubst::serde::to_vec(value).map_err(codec_error)
+}
+
+fn envelope(headers: Vec<HeaderRecord>, body: Vec<u8>) -> Result<Message> {
+    let mut builder = Message::builder().body(Body::from_bytes(body)?);
+    for header in headers {
+        builder = builder.append_header(header);
+    }
+    builder.build()
+}
+
+#[derive(Serialize, Deserialize)]
+struct Scalar<T> {
+    value: T,
+}
+
+fn priority(value: bool) -> Result<HeaderRecord> {
+    HeaderRecord::native(HIGH_PRIORITY, &Scalar { value })
+}
 
 pub mod bootstrap;
 pub use bootstrap::*;
@@ -430,38 +466,17 @@ pub enum Owner {
 }
 
 impl GenerationHeader {
-    pub fn header(&self) -> Result<Header> {
-        Ok(Header {
-            id: GENERATION_HEADER,
-            value: to_vec(self)?,
-        })
+    pub fn header(&self) -> Result<HeaderRecord> {
+        HeaderRecord::native(HeaderId::new(GENERATION_HEADER)?, self)
     }
 }
 
 pub fn add_instance_message(body: &AddInstance, generation: &GenerationHeader) -> Result<Message> {
-    Ok(Message {
-        headers: vec![
-            Header::actor(RA_ACTOR)?,
-            Header::action("AddInstance")?,
-            Header::boolean(HIGH_PRIORITY, true)?,
-            generation.header()?,
-        ],
-        body: to_vec(body)?,
-    })
+    reliability_message(body, "AddInstance", RA_ACTOR, true, Some(generation))
 }
 
 pub fn add_instance_reply_message(body: &AddInstanceReply, owner: Owner) -> Result<Message> {
-    Ok(Message {
-        headers: vec![
-            Header::actor(match owner {
-                Owner::Fm => FM_ACTOR,
-                Owner::Fmm => FMM_ACTOR,
-            })?,
-            Header::action("AddInstanceReply")?,
-            Header::boolean(HIGH_PRIORITY, true)?,
-        ],
-        body: to_vec(body)?,
-    })
+    reliability_message(body, "AddInstanceReply", owner_actor(owner), true, None)
 }
 
 fn reliability_message<T: Serialize>(
@@ -472,17 +487,14 @@ fn reliability_message<T: Serialize>(
     generation: Option<&GenerationHeader>,
 ) -> Result<Message> {
     let mut headers = vec![
-        Header::actor(actor)?,
-        Header::action(action)?,
-        Header::boolean(HIGH_PRIORITY, priority)?,
+        header::actor(ActorId::new(actor)?)?,
+        header::action(action)?,
+        self::priority(priority)?,
     ];
     if let Some(generation) = generation {
         headers.push(generation.header()?);
     }
-    Ok(Message {
-        headers,
-        body: to_vec(body)?,
-    })
+    envelope(headers, to_vec(body)?)
 }
 pub fn remove_instance_message(
     body: &RemoveInstance,
@@ -554,8 +566,8 @@ pub fn remove_replica_reply_message(body: &RemoveReplicaReply, owner: Owner) -> 
     reliability_message(body, "RemoveReplicaReply", owner_actor(owner), true, None)
 }
 
-fn unique(message: &Message, id: u16) -> Result<&Header> {
-    let mut headers = message.headers.iter().filter(|h| h.id == id);
+fn unique(message: &Message, id: HeaderId) -> Result<HeaderRef<'_>> {
+    let mut headers = message.headers().records().filter(|h| h.id() == id);
     let header = headers
         .next()
         .ok_or(Error::Protocol("missing reliability header"))?;
@@ -566,20 +578,22 @@ fn unique(message: &Message, id: u16) -> Result<&Header> {
 }
 
 fn check_factory(message: &Message, action: &str, actors: &[i64]) -> Result<i64> {
-    let actor = unique(message, ACTOR)?.read(|d| d.i64())?;
-    if !actors.contains(&actor) || unique(message, ACTION)?.read(|d| d.string())? != action {
+    let actor = from_slice::<Scalar<i64>>(unique(message, ACTOR)?.value())?.value;
+    if !actors.contains(&actor)
+        || from_slice::<Scalar<String>>(unique(message, ACTION)?.value())?.value != action
+    {
         return Err(Error::Protocol("wrong reliability actor/action"));
     }
     // Priority is a native factory default, not semantic admission/acknowledgment.
-    unique(message, HIGH_PRIORITY)?.read(|d| d.boolean())?;
+    from_slice::<Scalar<bool>>(unique(message, HIGH_PRIORITY)?.value())?;
     Ok(actor)
 }
 
 pub fn decode_add_instance(message: &Message) -> Result<(AddInstance, GenerationHeader)> {
     check_factory(message, "AddInstance", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 
@@ -587,7 +601,7 @@ pub fn decode_add_instance_reply(message: &Message) -> Result<(AddInstanceReply,
     let actor = check_factory(message, "AddInstanceReply", &[FM_ACTOR, FMM_ACTOR])?;
     // The actual FMTransport reply helper does not require GenerationHeader.
     Ok((
-        from_slice(&message.body)?,
+        decode_body(message)?,
         if actor == FM_ACTOR {
             Owner::Fm
         } else {
@@ -598,14 +612,14 @@ pub fn decode_add_instance_reply(message: &Message) -> Result<(AddInstanceReply,
 pub fn decode_add_primary(message: &Message) -> Result<(AddPrimary, GenerationHeader)> {
     check_factory(message, "AddPrimary", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 pub fn decode_add_primary_reply(message: &Message) -> Result<(AddPrimaryReply, Owner)> {
     let actor = check_factory(message, "AddPrimaryReply", &[FM_ACTOR, FMM_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
+        decode_body(message)?,
         if actor == FM_ACTOR {
             Owner::Fm
         } else {
@@ -616,14 +630,14 @@ pub fn decode_add_primary_reply(message: &Message) -> Result<(AddPrimaryReply, O
 pub fn decode_add_replica(message: &Message) -> Result<(AddReplica, GenerationHeader)> {
     check_factory(message, "AddReplica", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 pub fn decode_add_replica_reply(message: &Message) -> Result<(AddReplicaReply, Owner)> {
     let actor = check_factory(message, "AddReplicaReply", &[FM_ACTOR, FMM_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
+        decode_body(message)?,
         if actor == FM_ACTOR {
             Owner::Fm
         } else {
@@ -634,14 +648,14 @@ pub fn decode_add_replica_reply(message: &Message) -> Result<(AddReplicaReply, O
 pub fn decode_remove_replica(message: &Message) -> Result<(RemoveReplica, GenerationHeader)> {
     check_factory(message, "RemoveReplica", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 pub fn decode_remove_replica_reply(message: &Message) -> Result<(RemoveReplicaReply, Owner)> {
     let actor = check_factory(message, "RemoveReplicaReply", &[FM_ACTOR, FMM_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
+        decode_body(message)?,
         if actor == FM_ACTOR {
             Owner::Fm
         } else {
@@ -653,14 +667,14 @@ pub fn decode_remove_replica_reply(message: &Message) -> Result<(RemoveReplicaRe
 pub fn decode_remove_instance(message: &Message) -> Result<(RemoveInstance, GenerationHeader)> {
     check_factory(message, "RemoveInstance", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 pub fn decode_remove_instance_reply(message: &Message) -> Result<(RemoveInstanceReply, Owner)> {
     let actor = check_factory(message, "RemoveInstanceReply", &[FM_ACTOR, FMM_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
+        decode_body(message)?,
         if actor == FM_ACTOR {
             Owner::Fm
         } else {
@@ -671,14 +685,14 @@ pub fn decode_remove_instance_reply(message: &Message) -> Result<(RemoveInstance
 pub fn decode_delete_replica(message: &Message) -> Result<(DeleteReplica, GenerationHeader)> {
     check_factory(message, "DeleteReplica", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 pub fn decode_delete_replica_reply(message: &Message) -> Result<(DeleteReplicaReply, Owner)> {
     let actor = check_factory(message, "DeleteReplicaReply", &[FM_ACTOR, FMM_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
+        decode_body(message)?,
         if actor == FM_ACTOR {
             Owner::Fm
         } else {
@@ -689,7 +703,7 @@ pub fn decode_delete_replica_reply(message: &Message) -> Result<(DeleteReplicaRe
 pub fn decode_replica_up(message: &Message) -> Result<(ReplicaUp, Owner)> {
     let actor = check_factory(message, "ReplicaUp", &[FM_ACTOR, FMM_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
+        decode_body(message)?,
         if actor == FM_ACTOR {
             Owner::Fm
         } else {
@@ -700,20 +714,20 @@ pub fn decode_replica_up(message: &Message) -> Result<(ReplicaUp, Owner)> {
 pub fn decode_replica_up_reply(message: &Message) -> Result<(ReplicaUp, GenerationHeader)> {
     check_factory(message, "ReplicaUpReply", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 pub fn decode_service_type_notification(message: &Message) -> Result<ServiceTypeNotification> {
     check_factory(message, "ServiceTypeNotification", &[FM_ACTOR])?;
-    Ok(from_slice(&message.body)?)
+    decode_body(message)
 }
 pub fn decode_service_type_notification_reply(
     message: &Message,
 ) -> Result<(ServiceTypeNotificationReply, GenerationHeader)> {
     check_factory(message, "ServiceTypeNotificationReply", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }

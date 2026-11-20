@@ -32,7 +32,7 @@ mean fubst input/model validation. Remote errors use FurpcClientError,
 NotificationResult and ImageStoreError/ImageStoreResult.
 Runtime's initiating IPC and Hosting's accepted IPC both use furpc.
 Data replication now also uses furpc's public raw one-way service/Peer path;
-RA/node control remains a separate migration track.
+RA/node control now also uses furpc through the Node-owned FM/peer adapter.
 
 Runtime requests now use typed furpc Request/Response and FubstCodec over the
 original Peer. Host/PID identity is added only to initiating requests and semantic
@@ -51,7 +51,7 @@ Backpressure and partial-read checks use test-only I/O adapters. Hosting/node
 integration tests retain independent, byte-preserving frame observation using
 public furpc headers; they exercise the production Hosting server.
 Neither fube-runtime nor fube-rap-test-support directly depends on fube-transport,
-including dev-dependencies. Legacy core/RA/node transitive consumers remain.
+including dev-dependencies. Legacy core/tool transitive consumers remain.
 Role-changing reconfiguration retries during catch-up no longer receive a
 membership-only success before the service and replicator roles are applied.
 
@@ -83,6 +83,23 @@ retained native fixture profiles passed separately. This qualifies those clear
 accepted-side bootstrap/registration paths, not native deployed lifecycle,
 stateful/reporting, failed-write/revocation races, or TLS/claims.
 
+RA reliability factory/decoder APIs now exchange public furpc Messages and
+HeaderRecords with furpc Error/Result; native schemas and action/actor/generation
+asymmetry remain unchanged. Node control uses an owning per-socket Session and
+the original Peer, a bounded domain inbox and consuming response-data slots.
+FM/peer PToP incarnation/generation checks and SF-style RA/store semantic gates
+remain separate from transport admission. Reader-level ordered handoffs and the
+legacy aggregate allocation ledger are removed; generic furpc rejection may
+discard, and committed output may race retirement. Response-slot completion
+hands data to the runner, not proof of writing or remote receipt. `Link::retire`,
+`closed`, `terminal_error` and `is_live` replace direct legacy Channel access;
+completed close joins the owned serving task and actual socket adapter release.
+No reconnect or new public furpc join observer is introduced.
+The RA/node, cluster/FM and standalone-Node normal/dev legacy edges and coupled
+fixtures are retired together; core, CLI and test-host edges remain.
+Native-data evidence at `154b4f1` does not qualify this later RA/node migration
+or native FM/Federation interoperability.
+
 `fube-data`'s low-level `Packet::encode` now returns a public furpc Message;
 `Packet::decode` accepts one. Both use core Error/Result for domain validation.
 The classic native
@@ -101,7 +118,10 @@ joins owned session/I/O lifetimes on the dedicated thread but can truncate a
 committed frame; the old first-write predicate/started-suffix flush contracts
 are retired. Local qualification write evidence is
 `complete_local_socket_acceptance` with actual observed frame bytes, not an
-explicit flush or remote ACK. Native furpc replication qualification is not run;
+explicit flush or remote ACK. Fresh native furpc replication qualification passed
+all 17 `native-data` scenarios at clean source `154b4f1` against SF 11.8.121.4,
+including both replication directions, copy/ACK/quorum and owned workload cleanup.
+See the [exact-source record and limits](runtime/FubeData.md#furpc-native-data-qualification-2026-11-20);
 historical data/Hosting receipts are not relabeled as this migration's evidence.
 
 Public `ReplicationEndpointOptions` literals must set `advertised_ip`: use

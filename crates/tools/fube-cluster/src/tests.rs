@@ -1,8 +1,7 @@
 use super::*;
 use crate::fm::{Desired, IdleDeleteTarget, Observed};
 use fubst::serde::ObjectArray;
-use fube_transport::{channel::IncomingMessage,
-native_channel::GatewayTarget};
+
 use std::{
     io::{Read, Write},
     net::TcpStream,
@@ -3396,15 +3395,14 @@ async fn hold_peer_loss_frame(
     node: usize,
     action: &str,
     budget: Duration,
-) -> Result<fube_transport::message::Message> {
+) -> Result<furpc::Message> {
     let end = Instant::now() + budget;
     loop {
         for index in 0..cluster.children.len() {
-            if let Some(mut incoming) = cluster.children[index].link.as_ref().unwrap()
+            if let Some(incoming) = cluster.children[index].link.as_ref().unwrap()
                 .receive(Instant::now() + Duration::from_millis(2)).await?
             {
-                if index == node && incoming.message.properties().map_err(err)?.action == action {
-                    if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+                if index == node && wire::action(&incoming.message)? == action {
                     return Ok(incoming.message);
                 }
                 cluster.receive_message(index, incoming).await?;
@@ -3563,12 +3561,11 @@ async fn peer_idle_app_host_loss_rejects_stale_ack_and_replays_metadata_without_
         let end = Instant::now() + Duration::from_secs(8);
         while !evidence.try_exists().map_err(err)? {
             for index in 0..2 {
-                if let Some(mut incoming) = cluster.children[index].link.as_ref().unwrap()
+                if let Some(incoming) = cluster.children[index].link.as_ref().unwrap()
                     .receive(Instant::now() + Duration::from_millis(2)).await?
                 {
-                    if index == 0 && incoming.message.properties().map_err(err)?.action == "RemoveReplicaReply" {
+                    if index == 0 && wire::action(&incoming.message)? == "RemoveReplicaReply" {
                         assert_eq!(decode_remove_replica_reply(&incoming.message).map_err(err)?.0, removed);
-                        if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
                     } else {
                         cluster.receive_message(index, incoming).await?;
                     }
@@ -3986,12 +3983,11 @@ async fn fm_add_idle_copies_real_state_and_recovers_lost_reply_without_resurrect
                 for index in 0..2 {
                     let incoming = cluster.children[index].link.as_ref().unwrap()
                         .receive(Instant::now() + Duration::from_millis(2)).await?;
-                    if let Some(mut incoming) = incoming {
-                        if incoming.message.properties().map_err(err)?.action == "AddReplicaReply" {
+                    if let Some(incoming) = incoming {
+                        if wire::action(&incoming.message)? == "AddReplicaReply" {
                             let (body, owner) = decode_add_replica_reply(&incoming.message).map_err(err)?;
                             assert_eq!(owner, Owner::Fm);
                             assert_eq!(index, 0);
-                            if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
                             dropped = Some(body);
                         } else {
                             cluster.receive_message(index, incoming).await?;
@@ -4020,12 +4016,11 @@ async fn fm_add_idle_copies_real_state_and_recovers_lost_reply_without_resurrect
                     for index in 0..2 {
                         let incoming = cluster.children[index].link.as_ref().unwrap()
                             .receive(Instant::now() + Duration::from_millis(2)).await?;
-                        if let Some(mut incoming) = incoming {
-                            if incoming.message.properties().map_err(err)?.action == "RemoveReplicaReply" {
+                        if let Some(incoming) = incoming {
+                            if wire::action(&incoming.message)? == "RemoveReplicaReply" {
                                 let (body, owner) = decode_remove_replica_reply(&incoming.message).map_err(err)?;
                                 assert_eq!(owner, Owner::Fm);
                                 assert_eq!(index, 0);
-                                if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
                                 dropped = Some(body);
                             } else {
                                 cluster.receive_message(index, incoming).await?;
@@ -4146,10 +4141,9 @@ async fn fm_can_remove_ready_idle_without_waiting_for_open_telemetry() {
     assert_eq!(cluster.status()["peer_idle"]["state"], "pending");
     let result = cluster.remove_idle_replica_via_fm().await;
     if result.is_ok() {
-        let mut incoming = node.receive(wire::deadline()).await.unwrap().unwrap();
+        let incoming = node.receive(wire::deadline()).await.unwrap().unwrap();
         let (body, _) = decode_remove_replica(&incoming.message).unwrap();
         assert_eq!(body.replica, replica);
-        if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
         assert_eq!(cluster.ledger.idle_removal_status()["pending_remove"], true);
     }
     node.close().await.unwrap();
@@ -5388,7 +5382,7 @@ async fn secondary_removal_primary_loss(lfum: bool) {
 async fn capture_removal_round(
     cluster: &mut Cluster,
     hold: &[usize],
-    retained: &mut Vec<(usize, IncomingMessage<GatewayTarget>)>,
+    retained: &mut Vec<(usize, wire::Incoming)>,
 ) -> Result<Vec<LfumUpload>> {
     let uploads = begin_removal_lfum_round(cluster, retained).await?;
     let frozen = uploads.iter().map(|u| decode_lfum_upload(&u.message))
@@ -5409,8 +5403,8 @@ async fn capture_removal_round(
 
 async fn begin_removal_lfum_round(
     cluster: &mut Cluster,
-    retained: &mut Vec<(usize, IncomingMessage<GatewayTarget>)>,
-) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
+    retained: &mut Vec<(usize, wire::Incoming)>,
+) -> Result<Vec<wire::Incoming>> {
     cluster.begin_generation_handshake()?;
     let mut pending = send_generation_updates(cluster).await?;
     let generation = cluster.ledger.generation.as_ref().unwrap().number.clone();
@@ -5424,9 +5418,8 @@ async fn begin_removal_lfum_round(
                 cluster.children[index].link.as_ref().unwrap()
                     .receive(Instant::now() + Duration::from_millis(5)).await?
             };
-            if let Some(mut incoming) = incoming {
-                if incoming.message.properties().map_err(err)?.action == "LFUMUpload" {
-                    if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+            if let Some(incoming) = incoming {
+                if wire::action(&incoming.message)? == "LFUMUpload" {
                     if decode_lfum_upload(&incoming.message).map_err(err)?.generation == generation {
                         current.push(incoming);
                         break;
@@ -5438,7 +5431,7 @@ async fn begin_removal_lfum_round(
         }
     }
     for (index, incoming) in pending {
-        if incoming.message.properties().map_err(err)?.action == "LFUMUpload"
+        if wire::action(&incoming.message)? == "LFUMUpload"
             && decode_lfum_upload(&incoming.message).map_err(err)?.generation != generation
         {
             retained.push((index, incoming));
@@ -5451,7 +5444,7 @@ async fn begin_removal_lfum_round(
 
 async fn reply_older_removal_uploads(
     cluster: &Cluster,
-    retained: &mut Vec<(usize, IncomingMessage<GatewayTarget>)>,
+    retained: &mut Vec<(usize, wire::Incoming)>,
 ) -> Result<()> {
     for (index, mut incoming) in retained.drain(..) {
         let body = decode_lfum_upload(&incoming.message).map_err(err)?;
@@ -7407,11 +7400,10 @@ async fn fm_idle_replacement_rebuilds_real_data_retries_lost_reply_and_fences_ol
             for index in 0..2 {
                 let incoming = cluster.children[index].link.as_ref().unwrap()
                     .receive(Instant::now() + Duration::from_millis(2)).await?;
-                if let Some(mut incoming) = incoming {
-                    if incoming.message.properties().map_err(err)?.action == "AddReplicaReply" {
+                if let Some(incoming) = incoming {
+                    if wire::action(&incoming.message)? == "AddReplicaReply" {
                         let (body, _) = decode_add_replica_reply(&incoming.message).map_err(err)?;
                         assert_eq!(body.replica.id, successor.replica.id);
-                        if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
                         dropped = Some(body);
                     } else {
                         cluster.receive_message(index, incoming).await?;
@@ -8045,15 +8037,12 @@ async fn real_generation_upload_uses_correlated_replies_and_resumes_new_generati
             .map_err(err)?,
         )
         .await?;
-        let mut rejected = link
+        let rejected = link
             .receive(wire::deadline())
             .await?
             .ok_or("missing native GenerationUpdateReject")?;
         let proposed = decode_generation_update_reject(&rejected.message).map_err(err)?;
         assert_eq!(proposed, initial.number);
-        if let Some(handoff) = rejected.handoff.as_mut() {
-            handoff.acknowledge();
-        }
         let reply = link
             .request(generation_proposal_message(&high).map_err(err)?)
             .await?;
@@ -8504,14 +8493,14 @@ async fn primary_repair_lfum(cycles: usize, deactivate: bool) {
     result.unwrap().unwrap();
 }
 
-async fn hold_superseding_lfum(cluster: &mut Cluster) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
+async fn hold_superseding_lfum(cluster: &mut Cluster) -> Result<Vec<wire::Incoming>> {
     hold_superseding_lfum_with_deactivation(cluster, None).await
 }
 
 async fn hold_superseding_lfum_with_deactivation(
     cluster: &mut Cluster,
     deactivate: Option<usize>,
-) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
+) -> Result<Vec<wire::Incoming>> {
     let before = cluster.status();
     cluster.begin_generation_handshake()?;
     let pending = send_generation_updates(cluster).await?;
@@ -8556,7 +8545,7 @@ async fn hold_superseding_lfum_with_deactivation(
 
 async fn send_generation_updates(
     cluster: &mut Cluster,
-) -> Result<Vec<(usize, IncomingMessage<GatewayTarget>)>> {
+) -> Result<Vec<(usize, wire::Incoming)>> {
     let updates: Vec<_> = (0..cluster.children.len()).collect();
     send_generation_updates_to(cluster, &updates).await
 }
@@ -8564,7 +8553,7 @@ async fn send_generation_updates(
 async fn send_generation_updates_to(
     cluster: &mut Cluster,
     updates: &[usize],
-) -> Result<Vec<(usize, IncomingMessage<GatewayTarget>)>> {
+) -> Result<Vec<(usize, wire::Incoming)>> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut pending = vec![];
     loop {
@@ -8578,9 +8567,8 @@ async fn send_generation_updates_to(
                         biased;
                         result = &mut retry => { result?; break; }
                         incoming = link.receive(wire::deadline()) => {
-                            if let Some(mut incoming) = incoming? {
+                            if let Some(incoming) = incoming? {
                                 // Release ordered transport, not the held semantic completion.
-                                if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
                                 pending.push((index, incoming));
                             }
                         }
@@ -8791,7 +8779,7 @@ async fn real_lfum_during_planned_handoff_preserves_sf_phases_upload_owners_and_
     }
 }
 
-async fn begin_lfum_round(cluster: &mut Cluster) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
+async fn begin_lfum_round(cluster: &mut Cluster) -> Result<Vec<wire::Incoming>> {
     cluster.begin_generation_handshake()?;
     let pending = send_generation_updates(cluster).await?;
     hold_lfum_uploads_with_pending(cluster, pending).await
@@ -8808,7 +8796,7 @@ async fn observe_without_fm_scan(cluster: &Cluster, predicate: impl Fn(&Cluster)
     Ok(())
 }
 
-async fn finish_lfum_round(cluster: &mut Cluster, uploads: Vec<IncomingMessage<GatewayTarget>>) -> Result<()> {
+async fn finish_lfum_round(cluster: &mut Cluster, uploads: Vec<wire::Incoming>) -> Result<()> {
     for (index, incoming) in uploads.into_iter().enumerate() {
         cluster.receive_message(index, incoming).await?;
     }
@@ -9171,14 +9159,14 @@ async fn real_lfum_during_secondary_admission_preserves_sf_inventory_and_origina
     result.unwrap().unwrap();
 }
 
-async fn hold_lfum_uploads(cluster: &mut Cluster) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
+async fn hold_lfum_uploads(cluster: &mut Cluster) -> Result<Vec<wire::Incoming>> {
     hold_lfum_uploads_with_pending(cluster, vec![]).await
 }
 
 async fn hold_lfum_uploads_with_pending(
     cluster: &mut Cluster,
-    mut pending: Vec<(usize, IncomingMessage<GatewayTarget>)>,
-) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
+    mut pending: Vec<(usize, wire::Incoming)>,
+) -> Result<Vec<wire::Incoming>> {
     let mut held = vec![];
     for index in 0..cluster.children.len() {
         held.push(hold_lfum_upload(cluster, index, &mut pending).await?);
@@ -9192,17 +9180,16 @@ async fn hold_lfum_uploads_with_pending(
 async fn hold_lfum_upload(
     cluster: &mut Cluster,
     index: usize,
-    pending: &mut Vec<(usize, IncomingMessage<GatewayTarget>)>,
-) -> Result<IncomingMessage<GatewayTarget>> {
+    pending: &mut Vec<(usize, wire::Incoming)>,
+) -> Result<wire::Incoming> {
     loop {
-        let mut incoming = if let Some(position) = pending.iter().position(|(node, _)| *node == index) {
+        let incoming = if let Some(position) = pending.iter().position(|(node, _)| *node == index) {
             pending.remove(position).1
         } else {
             cluster.children[index].link.as_ref().unwrap().receive(wire::deadline()).await?
                 .ok_or("missing replicated LFUM upload")?
         };
-        if incoming.message.properties().map_err(err)?.action == "LFUMUpload" {
-            if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+        if wire::action(&incoming.message)? == "LFUMUpload" {
             return Ok(incoming);
         }
         cluster.receive_message(index, incoming).await?;
@@ -9362,15 +9349,14 @@ async fn real_lfum_channel_loss_preserves_original_primary_without_upload_succes
         for index in 0..2 { cluster.retry_generation(index).await?; }
         for index in 0..2 { cluster.retry_generation(index).await?; }
         loop {
-            let mut incoming = cluster.children[0].link.as_ref().unwrap()
+            let incoming = cluster.children[0].link.as_ref().unwrap()
                 .receive(wire::deadline()).await?.ok_or("missing owned LFUM request")?;
-            if incoming.message.properties().map_err(err)?.action == "LFUMUpload" {
-                if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+            if wire::action(&incoming.message)? == "LFUMUpload" {
                 break;
             }
             cluster.receive_message(0, incoming).await?;
         }
-        cluster.children[0].link.as_ref().unwrap().channel.dispose();
+        cluster.children[0].link.as_ref().unwrap().retire();
         until(&mut cluster, |c| {
             let retained = &c.status()["nodes"][0]["retained_work"];
             retained["link_alive"] == false && retained["error"].is_string()
@@ -9403,12 +9389,12 @@ async fn stateful_add_primary_lost_reply_retries_the_original_native_lifetime() 
     let end = Instant::now() + Duration::from_secs(8);
     let original = loop {
         let link = cluster.children[0].link.as_ref().unwrap();
-        if let Some(mut incoming) = link
+        if let Some(incoming) = link
             .receive(Instant::now() + Duration::from_millis(10))
             .await
             .unwrap()
         {
-            let action = incoming.message.properties().unwrap().action;
+            let action = wire::action(&incoming.message).unwrap();
             let reply = match action.as_str() {
                 "AddPrimaryReply" => Some(decode_add_primary_reply(&incoming.message).unwrap().0),
                 "ServiceTypeNotification" => {
@@ -9427,9 +9413,6 @@ async fn stateful_add_primary_lost_reply_retries_the_original_native_lifetime() 
                 }
                 other => panic!("unexpected original Primary ingress {other}"),
             };
-            if let Some(handoff) = incoming.handoff.as_mut() {
-                handoff.acknowledge();
-            }
             if let Some(reply) = reply {
                 break reply;
             } // Intentionally lose semantic processing, not the live link.
@@ -9712,12 +9695,12 @@ async fn stateful_delete_lost_reply_retries_original_lifetime_after_independent_
     let end = Instant::now() + Duration::from_secs(8);
     loop {
         let link = cluster.children[0].link.as_ref().unwrap();
-        if let Some(mut incoming) = link
+        if let Some(incoming) = link
             .receive(Instant::now() + Duration::from_millis(10))
             .await
             .unwrap()
         {
-            let action = incoming.message.properties().unwrap().action;
+            let action = wire::action(&incoming.message).unwrap();
             let lost = match action.as_str() {
                 "DeleteReplicaReply" => {
                     let reply = decode_delete_replica_reply(&incoming.message).unwrap().0;
@@ -9742,9 +9725,6 @@ async fn stateful_delete_lost_reply_retries_original_lifetime_after_independent_
                 }
                 other => panic!("unexpected DeleteReplica ingress {other}"),
             };
-            if let Some(handoff) = incoming.handoff.as_mut() {
-                handoff.acknowledge();
-            }
             if lost {
                 break;
             }
@@ -9824,12 +9804,12 @@ async fn stateful_delete_lost_reply_retries_original_lifetime_after_independent_
     }
     let end = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(mut incoming) = link
+        if let Some(incoming) = link
             .receive(Instant::now() + Duration::from_millis(10))
             .await
             .unwrap()
         {
-            let action = incoming.message.properties().unwrap().action;
+            let action = wire::action(&incoming.message).unwrap();
             let barrier = match action.as_str() {
                 "AddPrimaryReply" => {
                     let reply = decode_add_primary_reply(&incoming.message).unwrap().0;
@@ -9849,9 +9829,6 @@ async fn stateful_delete_lost_reply_retries_original_lifetime_after_independent_
                 }
                 other => panic!("stale frames emitted unexpected successor work {other}"),
             };
-            if let Some(handoff) = incoming.handoff.as_mut() {
-                handoff.acknowledge();
-            }
             if barrier {
                 break;
             }
@@ -10340,7 +10317,7 @@ async fn executable_nodes_preserve_uncertainty_sibling_contact_and_clean_handoff
         .execute(command("c1", "create", Some(2)))
         .await
         .is_err());
-    cluster.children[0].link.as_ref().unwrap().channel.dispose();
+    cluster.children[0].link.as_ref().unwrap().retire();
     until(&mut cluster, |cluster| {
         cluster.ledger.placements[0].observed == Observed::Unknown
     })

@@ -257,8 +257,8 @@ Counts are **overlapping suites, not additive unique scenarios**. Local raw logs
 and ignored workflow files are not durable public prerequisites; reproduce
 commands in [Development](../Development.md#native-free-checks), inspect the
 linked public tests, and record new immutable source/bundle identities for
-future native qualification. No live/deployed qualification was run anywhere
-in this API-alignment workflow.
+future native qualification. No live/deployed qualification was run in the
+original API-alignment workflow; the later furpc native-data run is scoped below.
 
 | Source covered | Actual recorded validation | What it does not prove |
 |---|---|---|
@@ -267,7 +267,8 @@ in this API-alignment workflow.
 | `34bb3194ce574ab046c2f9dff97a8a59377d3442` (historical Phase 4 before load-role correction) | 373 Rust +22 docs and second310 Rust +17 docs; workspace gates/32 doctests; Python414 (413 pass/one skip); fresh archive SHA256 `872a9be0122e1e827303567631fd4bf7c34d49ffe760744b8294b922bbae57a2`, 798 pass/five native exclusions | Its completed-role bucket policy is **superseded**, not user policy or corrected-source acceptance |
 | `6b397e335b98cf65160a3f8bacb2b30b9b386344` (historical corrected Phase 4 implementation) | 374 Rust +22 docs and second311 Rust +17 docs; strict workspace all-target/all-feature check/clippy, build bins/examples, warning-denied docs, fmt/diff and32 workspace doctests PASS; Python414 run,413 pass/one AF_PACKET capability skip under umask022; fresh post-review archive SHA256 **`7924b016eee67120134e6039ab87d50eefb2f8407d0f938f941256071638ff3e`**, **799 pass/five intended native-group exclusions**, unchanged `not group(onebox)` | That archive was built from these implementation bytes, **not later documentation/Rustdoc-edited bytes**; no native/live claim |
 | `29005d09ff63d26831ef993ca08244bbd260f8b6` (historical Phase 5 documentation/Rustdoc changes based on `6b397e3`, 2026-10-30) | Required format, workspace all-target/all-feature check and strict clippy, workspace bins/examples build, warning-denied workspace docs, diff check **PASS**; **33 workspace doctests PASS** (6 client +9 data +14 runtime +4 transport), including the added public reservation/registration example. Local/source/pinned reference links checked separately; [commands](../Development.md#api-alignment-documentation-gates). | No fresh archive/native outcome inferred from documentation checks; all Rust edits are comments, no executable algorithm/fixture changes; historical archive still belongs to6b397e3 |
-| Current API alignment on deployed SF, both runtime three-replica and data profiles | **NOT RUN** | Must use fresh immutable bundles/exact source identities and separately execute both profiles; model/RAP/source/ABI tests do not substitute |
+| `154b4f13902263a5ef61876cf88276c48fc35a07` (furpc replication migration, 2026-11-20) | Fresh exact-source bundle; all17 `native-data` scenarios **PASS** against SF 11.8.121.4, both replication directions, copy/ACK/quorum and independent owned-workload cleanup; [pinned record](FubeData.md#furpc-native-data-qualification-2026-11-20) | Not Rust-only14, the separate full legacy/runtime three-replica suite, every semantic capability, TLS or different listen/publish addresses |
+| Current API alignment on deployed SF, separate full legacy/runtime three-replica profile | **NOT RUN** | Must separately execute this profile with fresh immutable source-bound inputs; the native-data run and model/RAP/source/ABI tests do not substitute |
 
 Earlier native qualifications remain historical at the **exact old source and
 profile** recorded in [stateless evidence](RustStatelessRuntime.md#recorded-package-update-outcome-2026-10-27),

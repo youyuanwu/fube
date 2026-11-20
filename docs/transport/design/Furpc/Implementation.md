@@ -219,7 +219,7 @@ Test-only I/O gates preserve queued-write and partial-read coverage without
 exporting the private codec. Production Hosting/node tests independently observe
 and forward original frame bytes using public furpc headers. The direct legacy
 dependency is removed from runtime's normal/dev edges and shared RAP support;
-core/data/RA/node transitive consumers are not retired by this cleanup.
+core/tool legacy edges remain; data and RA/node use the separate adapters below.
 The existing native upload/provision/contact/hash journey passed with the new
 runtime executable on the retained SF11.8.121.4 onebox. Native registration,
 stateless activation and independent application RPC succeeded; owned workload
@@ -241,7 +241,7 @@ owns cancellation and joins its connection/send tasks on its dedicated executor,
 releasing the accepted socket before publishing disconnected state. Registration
 retirement still permits bounded original-path unregister exchanges.
 The Hosting and owned-app sample direct legacy dependency edges are retired;
-RA/node control remains a legacy consumer. Offline managed
+RA/node control uses the separate migrated adapter below. Offline managed
 furpc-client and independent adversarial socket fixtures cover the accepted path;
 real runtime-child, owned activation and local RA/RAP suites remain qualification
 owners.
@@ -435,7 +435,7 @@ unqualified. TLS remains unimplemented.
 
 ## Data replication migration
 
-**Implemented; native replication qualification not run.** This separate
+**Implemented; native-data qualification passed at `154b4f1`.** This separate
 consumer slice replaces `fube-data`'s normal/dev legacy transport use, including
 its native payload/header codecs and directly coupled fixtures. Runtime/RAP
 and transactional callers keep their SF-style public replication boundary;
@@ -549,12 +549,80 @@ loosening limits/deadlines or changing copy/ACK/retry policy. The same case
 passes with that original bound. Evidence logs, including the failed diagnostic
 runs, are ignored under `build/furpc-data-proof/`.
 
-Fresh native replication qualification is required before claiming migrated
-native support. Historical V1 receipts and the Hosting bootstrap/registration
-qualification do not qualify this slice. New native work must use a fresh
-exact-source bundle and actual independent observations, preserve owned
-workload cleanup and retained infrastructure, and keep native stateful/
-deployed/reporting and TLS/claims gaps explicit.
+Fresh native qualification on 2026-11-20 passed all 17 scenarios in the maintained
+`native-data` profile against SF 11.8.121.4, using clean source
+`154b4f13902263a5ef61876cf88276c48fc35a07` and a newly built strict bundle.
+Both Rust/native replication directions, nonempty copy, held application/final-copy
+ACK negatives, quorum loss/recovery, interrupted copy/epoch changes, identified
+retries, stale-wire probes and owned workload cleanup passed with zero errors.
+Six stale-wire receipts pair complete local socket acceptance with independently
+captured destination ingress; they do not prove native parse/rejection or flush.
+The minted application/type/ImageStore upload and original staging reservation
+were removed with absence checks; the caller-owned onebox remains intact.
+See the [pinned qualification record](../../../runtime/FubeData.md#furpc-native-data-qualification-2026-11-20).
+
+This qualifies that volatile clear mixed-native data profile, not the separate
+Rust-only14, full legacy/runtime three-replica profile, every stateful/reporting
+path, different listen/publish addresses, durability or TLS/claims. Historical
+V1/Hosting receipts remain historical. Future changed-source native work requires
+another fresh exact-source bundle and independently observed owned cleanup.
+
+## RA/node control migration
+
+**Implemented; offline-qualified, native FM/Federation interoperability not run.**
+The selected design is a redesign on public furpc APIs, not a legacy Channel
+backend. RA factories/decoders use public immutable Messages and native header
+records; native FABRIC_FIELDS, PToP source/recipient incarnation and generation
+schemas remain unchanged. The Node composition owns one finite admitted socket
+and original-generation Peer for each FM or RA peer relationship. It never
+reconnects, adopts another session or treats transport success as FM/RA completion.
+
+Endpoint/Server use the same domain ingress service before application traffic.
+A finite Node-owned inbox separates verified delivery from caller-driven
+admission; requests retain a bounded response slot returned to the furpc runner,
+which alone adds correlation and sends the reply. A reply handoff is not a
+first-write authority fence or write receipt. Capacity/invalid domain input
+retires its exact owner; generic furpc policy/binding/handler rejection may
+discard without closing. The former reader-level ordered-handoff gate and
+aggregate legacy retained-allocation ledger are not preserved. PToP validation,
+older peer-generation drops, frozen LFUM retry identity, domain admission order,
+store/RA commit gates and semantic acknowledgment remain domain responsibilities.
+Per session, the complete frame remains capped at 64 KiB, headers at 16 records/
+4 KiB, the domain inbox at eight messages, handlers at eight and pending
+requests/sends at eight each. Native send-queue bytes are finite independently;
+these bounds are not an aggregate heap ledger. Initial TCP source-IP binding,
+actual I/O metadata and one admitted connection per relationship are retained.
+
+The owner cancels its operations and serving lifetime and observes actual
+driver-task and socket-adapter release before completed close. Dropping a
+Channel/Peer or observing a terminal error alone does not prove physical join.
+Already-committed output may race retirement or be truncated; no suffix-flush
+or remote rollback guarantee is introduced. One absolute deadline bounds
+establishment and each admitted request/send.
+
+Coupled cluster/FM and standalone-Node launchers/fixtures migrate in the same
+slice, including the Hosting residency fixture's native body accounting. Their
+normal/dev legacy transport edges are removed; remaining core/CLI/test-host edges
+are outside this slice. RA source-oracle provenance now hashes furpc rather than
+the retired transport, including its transitive Rust sources and manifest.
+
+Affected offline suites passed: 257 RA unit/entity/Hosting-event/protocol cases,
+nine Node unit/control and eight bridge cases, 157 cluster model/real-process
+cases plus four CLI and six foreground cases, 34 standalone-Node cases and
+17 coupled Hosting residency cases. Final focused checks also exercise concurrent
+joined close/retained reply revocation, concurrent receive deadlines, exact inbox
+overflow retirement and five
+standalone generation/LFUM process scenarios. All-target/all-feature workspace
+checking, strict affected-crate Clippy, warning-denied Rustdoc, formatting and
+34 source-bundle/schema validator cases passed. The initial malformed-header
+fixture failure was a stale post-construction assertion: public native header
+construction already rejects that invalid record; no production gate was relaxed.
+
+These are source/schema and real Rust-process results, not native handler or
+Federation interoperability. No fresh native-stream producer/consumer bundle or
+native FM/RA run was executed. The earlier exact-source `154b4f1` native-data
+receipt does not qualify this changed RA/node code. TLS and broader routing stay
+unqualified.
 
 ## Gap ownership and implementation order
 

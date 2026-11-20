@@ -11,11 +11,12 @@ fube-hosting = { path = "../fube-hosting" }
 fube-ra = { path = "../fube-ra" }
 uuid = { workspace = true }
 fube-ra-store = { path = "../fube-ra-store" }
-fube-transport = { workspace = true }
 furpc.workspace = true
+tower-service.workspace = true
 fubst.workspace = true
 serde = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 fube-ra = { path = "../fube-ra", features = ["qualification"] }
+fube-rap-test-support.workspace = true

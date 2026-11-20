@@ -38,14 +38,14 @@
 //! These are pinned schema codecs, not native execution/interoperability proof.
 
 use super::{
-    reliability_message, unique, ApplicationId, ApplicationVersion, GenerationHeader, PackageId,
-    Rollout, VersionInstance, FM_ACTOR, GENERATION_HEADER,
-};
-use fube_transport::{
-    message::{Message, ACTION, ACTOR, HIGH_PRIORITY},
-    Error, Result,
+    codec_error, from_slice, reliability_message, unique, ApplicationId, ApplicationVersion,
+    GenerationHeader, PackageId, Rollout, Scalar, VersionInstance, FM_ACTOR, GENERATION_HEADER,
 };
 use fubst::serde::{from_slice_with_budget, CountedStrings, ObjectArray};
+use furpc::{
+    header::{ACTION, ACTOR, HIGH_PRIORITY},
+    Error, HeaderId, Message, Result,
+};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -340,15 +340,15 @@ pub fn node_up_ack_message(body: &NodeUpAck, generation: &GenerationHeader) -> R
 }
 
 fn check_envelope(message: &Message) -> Result<()> {
-    if message.body.len() > BOOTSTRAP_MAX_BODY_BYTES
-        || message.headers.len() > BOOTSTRAP_MAX_HEADERS
+    if message.body().len() > BOOTSTRAP_MAX_BODY_BYTES
+        || message.headers().records().count() > BOOTSTRAP_MAX_HEADERS
     {
         return Err(Error::ResourceLimit("bootstrap message size"));
     }
     let mut remaining = BOOTSTRAP_MAX_HEADER_BYTES;
-    for header in &message.headers {
+    for header in message.headers().records() {
         remaining = remaining
-            .checked_sub(header.value.len())
+            .checked_sub(header.value().len())
             .ok_or(Error::ResourceLimit("bootstrap headers"))?;
     }
     Ok(())
@@ -363,15 +363,15 @@ fn check_bootstrap_factory(
     check_envelope(message)?;
     // Transport headers are primitive Encoder values, not FabricSerializable
     // body object scopes. Reserve the bounded UTF-16 projection before reading.
-    let actual_actor = unique(message, ACTOR)?.read(|d| d.i64())?;
+    let actual_actor = from_slice::<Scalar<i64>>(unique(message, ACTOR)?.value())?.value;
     let action_header = unique(message, ACTION)?;
-    reserve(action_header.value.len().saturating_mul(2))?;
-    let actual_action = action_header.read(|d| d.string())?;
+    reserve(action_header.value().len().saturating_mul(2)).map_err(codec_error)?;
+    let actual_action = from_slice::<Scalar<String>>(action_header.value())?.value;
     if actual_actor != actor || actual_action != action {
         return Err(Error::Protocol("wrong reliability actor/action"));
     }
     // Priority is decoded, not promoted to lifecycle or sender authority.
-    unique(message, HIGH_PRIORITY)?.read(|d| d.boolean())?;
+    from_slice::<Scalar<bool>>(unique(message, HIGH_PRIORITY)?.value())?;
     Ok(())
 }
 
@@ -399,7 +399,8 @@ pub fn decode_node_up_with_budget(
     reserve: &mut impl FnMut(usize) -> fubst::Result<()>,
 ) -> Result<NodeUp> {
     check_bootstrap_factory(message, "NodeUp", FM_ACTOR, reserve)?;
-    Ok(from_slice_with_budget(&message.body, reserve)?)
+    let bytes: Vec<_> = message.body().segments().flatten().copied().collect();
+    from_slice_with_budget(&bytes, reserve).map_err(codec_error)
 }
 
 pub fn decode_node_up_ack(message: &Message) -> Result<(NodeUpAck, GenerationHeader)> {
@@ -411,8 +412,16 @@ pub fn decode_node_up_ack_with_budget(
     reserve: &mut impl FnMut(usize) -> fubst::Result<()>,
 ) -> Result<(NodeUpAck, GenerationHeader)> {
     check_bootstrap_factory(message, "NodeUpAck", RS_ACTOR, reserve)?;
-    let generation = from_slice_with_budget(&unique(message, GENERATION_HEADER)?.value, reserve)?;
-    Ok((from_slice_with_budget(&message.body, reserve)?, generation))
+    let generation = from_slice_with_budget(
+        unique(message, HeaderId::new(GENERATION_HEADER)?)?.value(),
+        reserve,
+    )
+    .map_err(codec_error)?;
+    let bytes: Vec<_> = message.body().segments().flatten().copied().collect();
+    Ok((
+        from_slice_with_budget(&bytes, reserve).map_err(codec_error)?,
+        generation,
+    ))
 }
 
 #[cfg(test)]

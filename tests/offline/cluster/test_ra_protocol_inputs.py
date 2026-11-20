@@ -48,10 +48,14 @@ class InputTests(unittest.TestCase):
     def save(self):
         (self.bundle / "manifest.json").write_text(json.dumps(self.manifest))
 
-    def test_source_digest_tracks_extracted_serializer_changes(self):
+    def test_source_digest_tracks_serializer_and_furpc_changes(self):
         crate = self.root / "crates/libs/fubst"
         (crate / "src/serde").mkdir(parents=True)
         paths = [crate / "Cargo.toml", crate / "src/lib.rs", crate / "src/serde/adapters.rs"]
+        transport = self.root / "crates/libs/furpc"
+        (transport / "src/transport").mkdir(parents=True)
+        paths.extend([transport / "Cargo.toml", transport / "src/lib.rs",
+                      transport / "src/transport/session.rs"])
         for path in paths:
             path.write_text("original")
         with patch.object(producer, "ROOT", self.root), patch.object(

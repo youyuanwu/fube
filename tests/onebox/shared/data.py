@@ -2077,7 +2077,7 @@ class Qualification:
     def stale_wire_receipts(self, evidence: dict) -> None:
         evidence.update(coverage=[], admission_is_not_rejection_evidence=True,
                         limitation="No native-primary packet spoofing. Rust probes use only existing native-selected sessions. "
-                                   "Exact socket write/flush plus independent destination kernel ingress are required; "
+                                   "Complete local socket acceptance plus independent destination kernel ingress are required; "
                                    "neither proves native parsing or rejection.")
         for primary_kind in (("rust", "native-classic-v1") if self.mixed else ("rust",)):
             group = {"primary_kind": primary_kind, "receipts": [], "positive_copy": {}}

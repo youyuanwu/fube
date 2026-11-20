@@ -3,8 +3,8 @@ use fube_local_host::process::OwnedApp;
 use fube_node::control::wire::{self, Link};
 use fube_node_runner::{Config, Fm, Identity, Placement};
 use fube_ra::protocol::*;
-use fube_transport::{channel::IncomingMessage, message::Message, native_channel::GatewayTarget};
 use fubst::serde::ObjectArray;
+use furpc::Message;
 use serde_json::Value;
 use std::{
     fs,
@@ -299,7 +299,7 @@ struct FmFixture {
     failover_ending: bool,
     transfer: Option<(ConfigurationReply, DoReconfiguration)>,
     removal: Option<RemovalLfum>,
-    older_uploads: Vec<(usize, IncomingMessage<GatewayTarget>)>,
+    older_uploads: Vec<(usize, wire::Incoming)>,
     repair_previous: Option<ConfigurationReply>,
     repair_build: Option<AddReplica>,
     repair_membership: Option<Configuration>,
@@ -312,7 +312,7 @@ struct FmFixture {
     held_deletion: Option<DeleteReplicaReply>,
     retired_replicas: Vec<(usize, i64, i64)>,
     hold_uploads: bool,
-    held_uploads: Vec<(usize, IncomingMessage<GatewayTarget>)>,
+    held_uploads: Vec<(usize, wire::Incoming)>,
     stopping: bool,
     expected_loss: Option<usize>,
 }
@@ -485,14 +485,9 @@ impl FmFixture {
                 .iter()
                 .position(|config| accepted.1.ip() == *config.node.address.ip())
                 .unwrap();
-            let channel = fube_transport::accept_unsecured_tcp(
-                accepted.0,
-                wire::composition(true).unwrap(),
-                wire::limits(),
-                deadline,
-            )
-            .await
-            .unwrap();
+            let channel = wire::accept(accepted.0, wire::Role::Fm, deadline)
+                .await
+                .unwrap();
             let config = &fixture.configs[index];
             links[index] = Some(
                 Link::new(
@@ -572,7 +567,7 @@ impl FmFixture {
             };
             wire::predecode(&incoming.message).unwrap();
             let generation = self.configurations[index].generation().unwrap();
-            match incoming.message.properties().unwrap().action.as_str() {
+            match wire::action(&incoming.message).unwrap().as_str() {
                 "NodeDeactivateReply" => {
                     let (reply, owner) = decode_node_deactivate_reply(&incoming.message).unwrap();
                     assert_eq!(owner, Owner::Fm);
@@ -582,9 +577,6 @@ impl FmFixture {
                 "LFUMUpload" => {
                     let body = decode_lfum_upload(&incoming.message).unwrap();
                     if self.removal.is_some() && body.generation.older_than(&generation.number) {
-                        if let Some(handoff) = incoming.handoff.as_mut() {
-                            handoff.acknowledge();
-                        }
                         self.older_uploads.push((index, incoming));
                         continue;
                     }
@@ -955,9 +947,6 @@ impl FmFixture {
                         assert!(body.units.0.is_empty() && !body.any_replica_found);
                     }
                     if self.hold_uploads {
-                        if let Some(handoff) = incoming.handoff.as_mut() {
-                            handoff.acknowledge();
-                        }
                         self.held_uploads.push((index, incoming));
                         self.uploaded[index] = Some(body);
                         continue;
@@ -1036,8 +1025,7 @@ impl FmFixture {
                         .unwrap();
                 }
                 "ServiceTypeEnabled" | "ServiceTypeDisabled" => {
-                    let enabled =
-                        incoming.message.properties().unwrap().action == "ServiceTypeEnabled";
+                    let enabled = wire::action(&incoming.message).unwrap() == "ServiceTypeEnabled";
                     let body = if enabled {
                         decode_service_type_enabled(&incoming.message)
                     } else {
@@ -1076,9 +1064,6 @@ impl FmFixture {
                                 build.replica.instance
                             )
                         );
-                        if let Some(handoff) = incoming.handoff.as_mut() {
-                            handoff.acknowledge();
-                        }
                         continue;
                     }
                     assert_eq!(body.error, 0);
@@ -1152,9 +1137,6 @@ impl FmFixture {
                     }
                 }
                 action => panic!("unexpected fixture FM action: {action}"),
-            }
-            if let Some(handoff) = incoming.handoff.as_mut() {
-                handoff.acknowledge();
             }
         }
     }
@@ -1696,7 +1678,7 @@ async fn capture_removal_rollover(
     fm: &mut FmFixture,
     fixture: &mut Fixture,
     hold: &[usize],
-    retained: &mut Vec<(usize, IncomingMessage<GatewayTarget>)>,
+    retained: &mut Vec<(usize, wire::Incoming)>,
 ) -> Vec<LfumUpload> {
     hold_rollover(fm, fixture).await;
     let frozen: Vec<_> = fm.uploaded.iter().map(|u| u.clone().unwrap()).collect();
@@ -1744,7 +1726,7 @@ async fn capture_removal_rollover(
 
 async fn reply_older_removal_rollovers(
     fm: &mut FmFixture,
-    retained: &mut Vec<(usize, IncomingMessage<GatewayTarget>)>,
+    retained: &mut Vec<(usize, wire::Incoming)>,
 ) {
     retained.append(&mut fm.older_uploads);
     for (index, mut incoming) in retained.drain(..) {

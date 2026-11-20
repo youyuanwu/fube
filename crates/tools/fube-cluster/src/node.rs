@@ -24,9 +24,7 @@ use tokio::{
 
 struct PeerConnection {
     link: Option<Link>,
-    incoming: Option<
-        fube_transport::channel::IncomingMessage<fube_transport::native_channel::GatewayTarget>,
-    >,
+    incoming: Option<wire::Incoming>,
     dialed: bool,
 }
 
@@ -127,14 +125,9 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         .map_err(err)?
         .map_err(err)?;
     drop(listener); // Exactly one original session; no reconnect listener.
-    let channel = fube_transport::accept_unsecured_tcp(
-        stream,
-        wire::composition(false).map_err(err)?,
-        wire::limits(),
-        wire::deadline(),
-    )
-    .await
-    .map_err(err)?;
+    let channel = wire::accept(stream, wire::Role::Node, wire::deadline())
+        .await
+        .map_err(err)?;
     let link = Link::new(
         channel,
         launch.node.clone(),
@@ -161,18 +154,15 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     };
     link.send(replica_up_message(&final_upload, Owner::Fm).map_err(err)?)
         .await?;
-    let mut incoming = link
+    let incoming = link
         .receive(wire::deadline())
         .await?
         .ok_or("final upload reply timeout")?;
     wire::predecode(&incoming.message)?;
     let (uploaded, generation) = decode_replica_up_reply(&incoming.message).map_err(err)?;
     if uploaded != final_upload || generation != launch.generation {
-        link.channel.dispose();
+        link.retire();
         return Err("foreign/stale/nonfinal bootstrap upload reply".into());
-    }
-    if let Some(handoff) = incoming.handoff.as_mut() {
-        handoff.acknowledge();
     }
     // No RA/Hosting/process authority exists until BOTH native semantic
     // bootstrap exchanges completed for this original session.
@@ -457,16 +447,13 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         match ingress.peer(&mut node, &peer.node, &incoming.message, false) {
                             Ok(Some(id)) => {
                                 adapter.track_peer_command(id)?;
-                                if let Some(handoff) = incoming.handoff.as_mut() {
-                                    handoff.acknowledge();
-                                }
                                 connection.incoming = None;
                             }
                             Ok(None) => {}
                             Err(error) => {
                                 adapter.record_peer_error(error);
                                 connection.incoming = None;
-                                current.channel.dispose();
+                                current.retire();
                             }
                         }
                     }
@@ -489,7 +476,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         Ok(incoming) => fm_incoming = incoming,
                         Err(error) => {
                             adapter.record_error(error);
-                            current.channel.dispose();
+                            current.retire();
                         }
                     }
                 }
@@ -509,13 +496,10 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             if let Some(acknowledgement) = acknowledgement {
                                 adapter.track_acknowledgement(acknowledgement)?;
                             }
-                            if let Some(handoff) = incoming.handoff.as_mut() {
-                                handoff.acknowledge();
-                            }
                         }
                         Err(error) => {
                             adapter.record_error(error);
-                            current.channel.dispose();
+                            current.retire();
                         }
                     }
                 }
@@ -795,13 +779,7 @@ async fn dial_peer_to(launch: &Launch, peer: &Peer, address: &str) -> Result<Lin
     if !address.ip().is_loopback() || address.port() == 0 {
         return Err("peer requires original numeric loopback listener".into());
     }
-    let channel =
-        fube_transport::Endpoint::unsecured_tcp(address, wire::peer_composition().map_err(err)?)
-            .map_err(err)?
-            .channel_limits(wire::limits())
-            .connect_until(wire::deadline())
-            .await
-            .map_err(err)?;
+    let channel = wire::connect(address, wire::Role::Peer, wire::deadline()).await?;
     Link::new_peer(
         channel,
         launch.node.clone(),
@@ -824,14 +802,9 @@ async fn accept_peer_from(
     peer: &Peer,
     stream: tokio::net::TcpStream,
 ) -> Result<Link> {
-    let channel = fube_transport::accept_unsecured_tcp(
-        stream,
-        wire::peer_composition().map_err(err)?,
-        wire::limits(),
-        wire::deadline(),
-    )
-    .await
-    .map_err(err)?;
+    let channel = wire::accept(stream, wire::Role::Peer, wire::deadline())
+        .await
+        .map_err(err)?;
     Link::new_peer(
         channel,
         launch.node.clone(),
@@ -858,11 +831,7 @@ fn create_idle(launch: &Launch, node: &mut Node) -> Result<u64> {
 }
 
 #[cfg(test)]
-fn receive_peer(
-    launch: &Launch,
-    node: &mut Node,
-    message: &fube_transport::message::Message,
-) -> Result<Option<u64>> {
+fn receive_peer(launch: &Launch, node: &mut Node, message: &furpc::Message) -> Result<Option<u64>> {
     launch.ingress()?.peer(
         node,
         &launch.peers.first().ok_or("unbound peer ingress")?.node,
@@ -1119,7 +1088,7 @@ fn publish_failed_open(
 fn receive_command(
     launch: &Launch,
     node: &mut Node,
-    message: &fube_transport::message::Message,
+    message: &furpc::Message,
 ) -> Result<Option<(u64, SemanticAck)>> {
     match launch.ingress()?.fm(node, message, false)? {
         Admission::Submitted(acknowledgement) => Ok(acknowledgement),
@@ -1283,23 +1252,19 @@ pub(crate) mod report_tests {
 
     pub(crate) async fn links(launch: &Launch) -> Result<(Link, Link)> {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
-        let endpoint = fube_transport::Endpoint::unsecured_tcp(
-            listener.local_addr().map_err(err)?,
-            wire::composition(true).map_err(err)?,
-        )
-        .map_err(err)?
-        .channel_limits(wire::limits());
-        let (fm, node) = tokio::join!(endpoint.connect_until(wire::deadline()), async {
-            let (stream, _) = listener.accept().await.map_err(err)?;
-            fube_transport::accept_unsecured_tcp(
-                stream,
-                wire::composition(false).map_err(err)?,
-                wire::limits(),
-                wire::deadline(),
-            )
-            .await
-            .map_err(err)
-        });
+        let (fm, node) = tokio::join!(
+            wire::connect(
+                listener.local_addr().map_err(err)?,
+                wire::Role::Fm,
+                wire::deadline()
+            ),
+            async {
+                let (stream, _) = listener.accept().await.map_err(err)?;
+                wire::accept(stream, wire::Role::Node, wire::deadline())
+                    .await
+                    .map_err(err)
+            }
+        );
         Ok((
             Link::new(
                 fm.map_err(err)?,
@@ -1322,15 +1287,12 @@ pub(crate) mod report_tests {
         adapter: &mut Adapter,
         link: &Link,
     ) -> Result<()> {
-        if let Some(mut incoming) = link
+        if let Some(incoming) = link
             .receive(Instant::now() + Duration::from_millis(1))
             .await?
         {
             if let Some(ack) = receive_command(launch, node, &incoming.message)? {
                 adapter.track_acknowledgement(ack)?;
-            }
-            if let Some(handoff) = incoming.handoff.as_mut() {
-                handoff.acknowledge();
             }
         }
         Ok(())
@@ -1347,14 +1309,13 @@ pub(crate) mod report_tests {
         node.drive().map_err(err)?;
         adapter.advance(node, Some(link)).await?;
         receive(launch, node, adapter, link).await?;
-        if let Some(mut incoming) = fm
+        if let Some(incoming) = fm
             .receive(Instant::now() + Duration::from_millis(1))
             .await?
         {
-            match incoming.message.properties().map_err(err)?.action.as_str() {
+            match wire::action(&incoming.message)?.as_str() {
                 "NodeActivateReply" | "NodeDeactivateReply" => {
-                    let activate =
-                        incoming.message.properties().map_err(err)?.action == "NodeActivateReply";
+                    let activate = wire::action(&incoming.message)? == "NodeActivateReply";
                     let (body, owner) = if activate {
                         decode_node_activate_reply(&incoming.message)
                     } else {
@@ -1469,9 +1430,6 @@ pub(crate) mod report_tests {
                     traffic.idle_adds.push(body);
                 }
                 other => return Err(format!("unexpected FM test ingress {other}")),
-            }
-            if let Some(handoff) = incoming.handoff.as_mut() {
-                handoff.acknowledge();
             }
         }
         Ok(())
@@ -1927,12 +1885,12 @@ pub(crate) mod report_tests {
             replica_up_message(&old_report, Owner::Fm).map_err(err)?,
         ] {
             link.send(message).await?;
-            let mut incoming = fm
+            let incoming = fm
                 .receive(wire::deadline())
                 .await?
                 .ok_or("replay missing")?;
             wire::predecode(&incoming.message)?;
-            match incoming.message.properties().map_err(err)?.action.as_str() {
+            match wire::action(&incoming.message)?.as_str() {
                 "AddInstanceReply" => ledger.reply(
                     0,
                     decode_add_instance_reply(&incoming.message).map_err(err)?.0,
@@ -1951,9 +1909,6 @@ pub(crate) mod report_tests {
                 _ => return Err("wrong replay action".into()),
             }
             assert_eq!(ledger.status(), settled);
-            if let Some(handoff) = incoming.handoff.as_mut() {
-                handoff.acknowledge();
-            }
         }
         // A fresh valid duplicate over that same session still completes.
         traffic.added = false;
@@ -2849,12 +2804,7 @@ pub(crate) mod report_tests {
         run_case(launch, true).await
     }
 
-    async fn next_lfum(
-        upload: &mut LfumUploadState,
-        fm: &Link,
-    ) -> Result<
-        fube_transport::channel::IncomingMessage<fube_transport::native_channel::GatewayTarget>,
-    > {
+    async fn next_lfum(upload: &mut LfumUploadState, fm: &Link) -> Result<wire::Incoming> {
         if !upload.is_in_flight() {
             return Err("missing LFUM request".into());
         }
@@ -2906,11 +2856,8 @@ pub(crate) mod report_tests {
                     }
                     tokio::task::yield_now().await;
                 }
-                let mut first = next_lfum(&mut upload, &fm).await?;
+                let first = next_lfum(&mut upload, &fm).await?;
                 let frozen = decode_lfum_upload(&first.message).map_err(err)?;
-                if let Some(handoff) = first.handoff.as_mut() {
-                    handoff.acknowledge();
-                }
                 node.process_generation_update(
                     &launch.fm,
                     &GenerationUpdate::default(),
@@ -2923,9 +2870,6 @@ pub(crate) mod report_tests {
                     return Err(
                         "same-generation update changed an unchanged committed inventory".into(),
                     );
-                }
-                if let Some(handoff) = second.handoff.as_mut() {
-                    handoff.acknowledge();
                 }
                 fm.send(
                     generation_update_message(&GenerationUpdate::default(), &generation)
@@ -2957,9 +2901,6 @@ pub(crate) mod report_tests {
                     )
                     .await
                     .map_err(err)?;
-                if let Some(handoff) = second.handoff.as_mut() {
-                    handoff.acknowledge();
-                }
                 let completed = upload.receive().await;
                 let second_upload = completed.0;
                 upload.complete(&node, &launch.fm, completed, Instant::now())?;
@@ -2978,9 +2919,6 @@ pub(crate) mod report_tests {
                         "retained generation update did not resume after its owned reply".into(),
                     );
                 }
-                if let Some(handoff) = retained.handoff.as_mut() {
-                    handoff.acknowledge();
-                }
                 upload.advance(&node, &up.node, Some(&link), Instant::now())?;
                 let mut resumed = next_lfum(&mut upload, &fm).await?;
                 resumed
@@ -2993,9 +2931,6 @@ pub(crate) mod report_tests {
                     )
                     .await
                     .map_err(err)?;
-                if let Some(handoff) = resumed.handoff.as_mut() {
-                    handoff.acknowledge();
-                }
                 let completed = upload.receive().await;
                 upload.complete(&node, &launch.fm, completed, Instant::now())?;
                 drop(first);
@@ -3041,9 +2976,6 @@ pub(crate) mod report_tests {
                     )
                     .await
                     .map_err(err)?;
-                if let Some(handoff) = retry.handoff.as_mut() {
-                    handoff.acknowledge();
-                }
                 let reply = upload.receive().await;
                 upload.complete(&node, &launch.fm, reply, Instant::now())?;
                 if node.generation_state().upload_pending
@@ -3279,7 +3211,7 @@ pub(crate) mod report_tests {
                 launch.peers.first().map(|peer| &peer.node),
             )
             .await?;
-        if let Some(mut incoming) = peer
+        if let Some(incoming) = peer
             .receive(Instant::now() + Duration::from_millis(1))
             .await?
         {
@@ -3287,9 +3219,6 @@ pub(crate) mod report_tests {
                 .map_err(|error| format!("node{} peer ingress: {error}", launch.placement))?
                 .ok_or("unexpected peer command capacity in bounded test")?;
             adapter.track_peer_command(id)?;
-            if let Some(handoff) = incoming.handoff.as_mut() {
-                handoff.acknowledge();
-            }
         }
         Ok(())
     }
@@ -3661,11 +3590,10 @@ pub(crate) mod report_tests {
                         tokio::time::sleep(Duration::from_millis(2)).await;
                     }
                     source_link.send(create_replica_message(&create, &launches[0].generation).map_err(err)?).await?;
-                    let mut incoming = target_link.receive(Instant::now() + Duration::from_secs(2)).await?
+                    let incoming = target_link.receive(Instant::now() + Duration::from_secs(2)).await?
                         .ok_or("missing original Create before lookup")?;
                     let id = receive_peer(&launches[1], &mut target, &incoming.message)?.ok_or("original Create capacity")?;
                     target_adapter.track_peer_command(id)?;
-                    if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
                     target.drive().map_err(err)?;
                     while target.snapshot(entity).committed.is_none() {
                         if Instant::now() >= end { return Err("original pre-registration Create commit deadline".into()); }
@@ -4251,9 +4179,8 @@ pub(crate) mod report_tests {
                         { return Err("held late lookup ownership was released or certified early".into()); }
                         let lost = loop {
                             target_adapter.advance(&mut target, Some(&target_fm_link)).await?;
-                            if let Some(mut incoming) = target_fm.receive(Instant::now() + Duration::from_millis(1)).await? {
+                            if let Some(incoming) = target_fm.receive(Instant::now() + Duration::from_millis(1)).await? {
                                 let reply = decode_delete_replica_reply(&incoming.message).map_err(err)?.0;
-                                if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
                                 break reply;
                             }
                             if Instant::now() >= end { return Err("pre-registration semantic reply deadline".into()); }
@@ -4426,7 +4353,7 @@ pub(crate) mod report_tests {
                         None,
                     )
                     .await?;
-                    if let Some(mut incoming) = source_link
+                    if let Some(incoming) = source_link
                         .receive(Instant::now() + Duration::from_millis(1))
                         .await?
                     {
@@ -4439,9 +4366,6 @@ pub(crate) mod report_tests {
                         let command = receive_peer(&launches[0], &mut source, &incoming.message)?
                             .ok_or("late peer reply capacity")?;
                         source_adapter.track_peer_command(command)?;
-                        if let Some(handoff) = incoming.handoff.as_mut() {
-                            handoff.acknowledge();
-                        }
                         break;
                     }
                     if Instant::now() >= end {

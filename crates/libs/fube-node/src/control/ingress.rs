@@ -2,7 +2,7 @@
 use super::{err, wire, Result, SemanticAck};
 use crate::local::{Error, FmWork, Node};
 use fube_ra::{entity as ra, protocol::*};
-use fube_transport::{channel::IncomingMessage, message::Message, native_channel::GatewayTarget};
+use furpc::Message;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
@@ -86,7 +86,7 @@ pub struct Placement {
 
 pub enum Admission {
     /// Keep the original incoming frame until admission can retry.
-    /// Generation ingress may release its transport handoff so replies can drain.
+    /// Correlated replies progress independently of this bounded domain inbox.
     Retained,
     Submitted(Option<(u64, SemanticAck)>),
 }
@@ -232,18 +232,18 @@ impl Ingress {
     pub fn fm(&self, node: &mut Node, message: &Message, stopping: bool) -> Result<Admission> {
         wire::predecode(message)?;
         let mut headers = message
-            .headers
-            .iter()
-            .filter(|header| header.id == GENERATION_HEADER);
+            .headers()
+            .records()
+            .filter(|header| header.id().get() == GENERATION_HEADER);
         let generation: GenerationHeader =
-            wire::decode(&headers.next().ok_or("missing FM generation")?.value)?;
+            wire::decode(headers.next().ok_or("missing FM generation")?.value())?;
         if headers.next().is_some()
             || generation.for_fm_replica
             || generation.number != node.generation_state().receive
         {
             return Err("FM generation must match the Node's admitted receive generation".into());
         }
-        let action = message.properties().map_err(err)?.action;
+        let action = wire::action(message)?;
         if stopping
             && !matches!(
                 action.as_str(),
@@ -408,7 +408,7 @@ impl Ingress {
             .iter()
             .find(|peer| &peer.node == source)
             .ok_or("unbound peer ingress")?;
-        let action = message.properties().map_err(err)?.action;
+        let action = wire::action(message)?;
         if stopping
             && !matches!(
                 action.as_str(),
@@ -484,10 +484,10 @@ impl Ingress {
         &self,
         node: &Node,
         link: &wire::Link,
-        incoming: &mut IncomingMessage<GatewayTarget>,
+        incoming: &mut wire::Incoming,
     ) -> Result<Option<Admission>> {
         let message = &incoming.message;
-        match message.properties().map_err(err)?.action.as_str() {
+        match wire::action(message)?.as_str() {
             "GenerationProposal" => {
                 wire::predecode(message)?;
                 let header = decode_generation_proposal(message).map_err(err)?;
@@ -509,11 +509,8 @@ impl Ingress {
                 let outcome = match node.process_generation_update(&self.fm, &body, &header) {
                     Ok(outcome) => outcome,
                     Err(Error::Ra(ra::Failure::Capacity)) => {
-                        // The retained frame has a bounded local owner. Holding
-                        // transport here would block the LFUM replies that free capacity.
-                        if let Some(handoff) = incoming.handoff.as_mut() {
-                            handoff.acknowledge();
-                        }
+                        // Retain the frame locally; correlated LFUM replies
+                        // must keep progressing to free admission capacity.
                         return Ok(Some(Admission::Retained));
                     }
                     Err(error) => return Err(err(error)),

@@ -14,7 +14,7 @@ fube-local-host = { path = "../../libs/fube-local-host" }
 fube-node = { path = "../../libs/fube-node" }
 fube-ra = { path = "../../libs/fube-ra" }
 fube-ra-store = { path = "../../libs/fube-ra-store" }
-fube-transport.workspace = true
+furpc.workspace = true
 fubst.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -84,7 +84,7 @@ pub fn change_configuration_message(body: &Configuration, owner: Owner) -> Resul
 pub fn decode_change_configuration(message: &Message) -> Result<(Configuration, Owner)> {
     let actor = check_factory(message, "ChangeConfiguration", &[FM_ACTOR, FMM_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
+        decode_body(message)?,
         if actor == FM_ACTOR {
             Owner::Fm
         } else {
@@ -109,8 +109,8 @@ pub fn decode_change_configuration_reply(
 ) -> Result<(FailoverUnitReply, GenerationHeader)> {
     check_factory(message, "ChangeConfigurationReply", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 
@@ -234,8 +234,8 @@ pub fn get_lsn_message(body: &GetLsn, generation: &GenerationHeader) -> Result<M
 pub fn decode_get_lsn(message: &Message) -> Result<(GetLsn, GenerationHeader)> {
     check_factory(message, "GetLSN", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 pub fn get_lsn_reply_message(body: &GetLsnReply, generation: &GenerationHeader) -> Result<Message> {
@@ -244,8 +244,8 @@ pub fn get_lsn_reply_message(body: &GetLsnReply, generation: &GenerationHeader) 
 pub fn decode_get_lsn_reply(message: &Message) -> Result<(GetLsnReply, GenerationHeader)> {
     check_factory(message, "GetLSNReply", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 
@@ -255,8 +255,8 @@ pub fn deactivate_message(body: &Deactivate, generation: &GenerationHeader) -> R
 pub fn decode_deactivate(message: &Message) -> Result<(Deactivate, GenerationHeader)> {
     check_factory(message, "Deactivate", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 pub fn deactivate_reply_message(
@@ -268,8 +268,8 @@ pub fn deactivate_reply_message(
 pub fn decode_deactivate_reply(message: &Message) -> Result<(DeactivateReply, GenerationHeader)> {
     check_factory(message, "DeactivateReply", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 
@@ -284,8 +284,8 @@ pub fn decode_do_reconfiguration(
 ) -> Result<(DoReconfiguration, GenerationHeader)> {
     check_factory(message, "DoReconfiguration", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 pub fn do_reconfiguration_reply_message(
@@ -306,7 +306,7 @@ pub fn do_reconfiguration_reply_message(
 pub fn decode_do_reconfiguration_reply(message: &Message) -> Result<(ConfigurationReply, Owner)> {
     let actor = check_factory(message, "DoReconfigurationReply", &[FM_ACTOR, FMM_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
+        decode_body(message)?,
         if actor == FM_ACTOR {
             Owner::Fm
         } else {
@@ -320,8 +320,8 @@ pub fn activate_message(body: &Activate, generation: &GenerationHeader) -> Resul
 pub fn decode_activate(message: &Message) -> Result<(Activate, GenerationHeader)> {
     check_factory(message, "Activate", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 pub fn activate_reply_message(
@@ -333,7 +333,7 @@ pub fn activate_reply_message(
 pub fn decode_activate_reply(message: &Message) -> Result<(ActivateReply, GenerationHeader)> {
     check_factory(message, "ActivateReply", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }

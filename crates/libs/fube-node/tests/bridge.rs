@@ -7,11 +7,12 @@ use fube_ra_store::{
     Backend, BackendContext, MemoryBackend, Output, Request as StoreRequest,
     Settings as StoreSettings, Store, StoreFuture,
 };
-use fube_transport::{
-    connection::{read_message, write_message},
-    message::{Header, ListenInstance, Message, MessageId, EXPECTS_REPLY, IPC},
-};
+#[path = "../../fube-hosting/tests/support/ipc_wire.rs"]
+#[allow(dead_code)]
+mod ipc_wire;
 use fubst::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer};
+use furpc::MessageId;
+use ipc_wire::{read_message, write_message, Header, ListenInstance, Message, EXPECTS_REPLY, IPC};
 use serde::Serialize;
 use std::{
     sync::{
@@ -251,11 +252,13 @@ impl Peer {
             Header::message_id(id).unwrap(),
             Header::boolean(EXPECTS_REPLY, true).unwrap(),
             Header::timeout(50_000_000).unwrap(),
-            Header::object(IPC, |e| {
-                e.string(&self.admission.host.id)?;
-                e.u32(self.admission.host.pid).unwrap();
-                Ok(())
-            })
+            Header::native(
+                IPC,
+                &ipc_wire::Identity {
+                    host: &self.admission.host.id,
+                    pid: self.admission.host.pid,
+                },
+            )
             .unwrap(),
         ];
         if !action.is_empty() {
@@ -899,11 +902,13 @@ async fn terminal_ra_loss_fences_existing_factory_and_new_admission_without_anot
         Header::boolean(EXPECTS_REPLY, true).unwrap(),
         Header::timeout(50_000_000).unwrap(),
         Header::action("RegisterServiceTypeRequest").unwrap(),
-        Header::object(IPC, |e| {
-            e.string(&peer.admission.host.id)?;
-            e.u32(peer.admission.host.pid).unwrap();
-            Ok(())
-        })
+        Header::native(
+            IPC,
+            &ipc_wire::Identity {
+                host: &peer.admission.host.id,
+                pid: peer.admission.host.pid,
+            },
+        )
         .unwrap(),
     ];
     if write_message(
