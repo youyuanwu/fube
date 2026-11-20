@@ -721,6 +721,17 @@ class ProofFiles(fixtures.ProjectFiles):
             "partitions": [resolution_case(applications[0] + "/Named", "Named", key, index)
                            for index, key in enumerate(("blue", "green"), 7)],
         }
+        initial = notification["resolved"][0]["native"]
+        update = {
+            "name": initial["name"], "partition_id": initial["partition"]["id"],
+            "kind": initial["kind"], "endpoints": initial["endpoints"],
+        }
+        notification["furpc_notifications"] = {
+            "session_generations": [2, 3, 4], "explicit_filters_unregistered": 4,
+            "sessions_closed": 3, "initial_updates": [copy.deepcopy(update), copy.deepcopy(update)],
+            "empty_invalidations": [{**copy.deepcopy(update), "endpoints": []} for _ in range(2)],
+            "native_start_ms": int(start * 1000) + 1, "native_end_ms": int(start * 1000) + 10,
+        }
         return dict(zip(ci.NATIVE_FILES, (clear, health, names, lists, notification)))
 
     def real_policy_report(self):
@@ -1549,6 +1560,35 @@ class WorkerTests(ProofFiles):
                 mutate(broken)
                 with self.assertRaises(ci.ProofError):
                     ci.validate_notification_retry(broken)
+
+    def test_furpc_notifications_require_independent_sessions_native_updates_and_acks(self):
+        original = self.native_reports("owned", 1)[ci.NATIVE_FILES[4]]
+        self.assertEqual(ci.validate_furpc_notifications(original), [1.001, 1.010])
+        mutations = [
+            lambda value: value.pop("furpc_notifications"),
+            lambda value: value["furpc_notifications"].update(session_generations=[2, 2, 3]),
+            lambda value: value["furpc_notifications"].update(session_generations=[1, 2, 3]),
+            lambda value: value["furpc_notifications"].update(session_generations=[True, 2, 3]),
+            lambda value: value["furpc_notifications"].update(sessions_closed=True),
+            lambda value: value["furpc_notifications"].update(explicit_filters_unregistered=3),
+            lambda value: value["furpc_notifications"].update(initial_updates=[]),
+            lambda value: value["furpc_notifications"]["initial_updates"][0].update(endpoints=[]),
+            lambda value: value["furpc_notifications"]["initial_updates"][0].update(name="fabric:/foreign"),
+            lambda value: value["resolved"][0]["native"]["partition"].update(id=None),
+            lambda value: value["furpc_notifications"]["initial_updates"][0]["endpoints"][0].update(
+                role="StatefulPrimary"),
+            lambda value: value["furpc_notifications"]["empty_invalidations"][0].update(
+                endpoints=[{"role": "Stateless", "address": ""}]),
+            lambda value: value["furpc_notifications"].update(native_end_ms=1),
+            lambda value: value["ack_retry"].update(duplicate_versions=1),
+            lambda value: value.update(owned_cleanup_confirmed=False),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                broken = copy.deepcopy(original)
+                mutate(broken)
+                with self.assertRaises(ci.ProofError):
+                    ci.validate_furpc_notifications(broken)
 
     def test_furpc_names_require_native_errors_generation_and_independent_http(self):
         original = self.native_reports("owned", 1)[ci.NATIVE_FILES[2]]

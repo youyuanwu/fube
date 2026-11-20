@@ -1,22 +1,14 @@
-//! Client-owned native envelope authorization, separate from actor selection.
+//! ImageStore-owned legacy envelope authorization, separate from actor selection.
 //!
 //! These stateless checks run before channel admission. Domain body decoding,
-//! upload correlation and notification semantic processing remain in their
-//! respective client protocols, outside the connection driver.
+//! upload correlation remain outside the connection driver.
 
 use fube_transport::{
     message::{self, Message, MessageId, Properties},
-    native_demux::{ActorDemux, ActorRegistration, ChannelComposition, DuplexPolicy, OutboundKind},
+    native_demux::{ActorDemux, ActorRegistration, ChannelComposition, OutboundKind},
 };
 
 use crate::{Error, Result};
-
-fn gateway_outbound(_: &Message, props: &Properties, kind: OutboundKind) -> Result<()> {
-    if kind == OutboundKind::Reserved || props.actor != 5 || props.action.is_empty() {
-        return Err(Error::InvalidInput("unauthorized gateway submission"));
-    }
-    Ok(())
-}
 
 fn ordinary_reply(_: &Message, props: &Properties) -> Result<()> {
     // An upload envelope must never acquire RPC authority through RelatesTo.
@@ -27,48 +19,6 @@ fn ordinary_reply(_: &Message, props: &Properties) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-pub(crate) fn ordinary() -> Result<ChannelComposition> {
-    Ok(ChannelComposition {
-        outbound: gateway_outbound,
-        ordinary_reply,
-        actors: ActorDemux::new(vec![])?,
-        duplex: None,
-        requests: None,
-        ordered_ingress: false,
-    })
-}
-
-fn notification_incoming(_: &Message, props: &Properties) -> Result<()> {
-    if props.actor != 5
-        || props.action != "ServiceNotificationRequest"
-        || props.id == MessageId::default()
-        || props.relates_to != MessageId::default()
-        || !props.expects_reply
-        || !props.uncorrelated_reply
-        || props.fault.is_some()
-    {
-        return Err(Error::Protocol("unauthorized native notification envelope"));
-    }
-    Ok(())
-}
-
-fn notification_reply(_: &Message, props: &Properties) -> Result<()> {
-    if props.actor != 5 || props.action != "ServiceNotificationReply" {
-        return Err(Error::InvalidInput("unauthorized notification response"));
-    }
-    Ok(())
-}
-
-pub(crate) fn notifications() -> Result<ChannelComposition> {
-    Ok(ChannelComposition {
-        duplex: Some(DuplexPolicy {
-            incoming: notification_incoming,
-            reply: notification_reply,
-        }),
-        ..ordinary()?
-    })
 }
 
 fn upload_outbound(_: &Message, props: &Properties, kind: OutboundKind) -> Result<()> {

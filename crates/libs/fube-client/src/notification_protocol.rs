@@ -1,14 +1,16 @@
 //! Source-derived notification schemas. No endpoint description enrichment.
-use fube_transport::message::Message;
-use fubst::serde::{
-    from_slice, from_slice_with_budget, to_vec, CountedValues, Guid, ObjectArray, Pointer,
-};
+use fubst::serde::{CountedValues, Guid, ObjectArray, Pointer};
+use furpc::{Body, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    resolution::Generation, resolution_protocol::TableEntry, Error, GatewayDescription, NamingUri,
-    NodeId, NotificationResult, Result,
+    furpc_client::{action_is, check_gateway_actor, check_gateway_failure},
+    resolution::Generation,
+    resolution_protocol::TableEntry,
+    FurpcClientError, GatewayDescription, NamingUri, NodeId,
 };
+
+type Result<T> = std::result::Result<T, FurpcClientError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Interval {
@@ -64,6 +66,16 @@ pub(crate) struct Connected {
     pub gateway: Gateway,
 }
 impl Connected {
+    pub fn validate(&self) -> Result<()> {
+        // Native notification gateway descriptions intentionally omit the address.
+        if self.gateway.name.is_empty() {
+            return Err(FurpcClientError::Protocol(
+                "empty notification gateway identity",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn description(&self) -> GatewayDescription {
         GatewayDescription {
             address: self.gateway.address.clone(),
@@ -74,29 +86,22 @@ impl Connected {
         }
     }
 }
-pub(crate) fn decode_connected(message: Message) -> Result<Connected> {
-    crate::protocol::check_reply(&message, &["NotificationClientConnectionReply"])?;
-    let body: Connected = from_slice(&message.body)?;
-    // ServiceNotificationManager::CreateGatewayDescription intentionally emits
-    // an empty address: node identity/name identify the actual notification gateway.
-    if body.gateway.name.is_empty() {
-        return Err(crate::Error::Protocol(
-            "empty notification gateway identity",
+pub(crate) fn connected(response: &Response<Body>) -> Result<()> {
+    check_reply(response, "NotificationClientConnectionReply")
+}
+pub(crate) fn registered(response: &Response<Body>) -> Result<()> {
+    check_reply(response, "RegisterServiceNotificationFilterReply")
+}
+pub(crate) fn unregistered(response: &Response<Body>) -> Result<()> {
+    check_reply(response, "UnregisterServiceNotificationFilterReply")
+}
+fn check_reply(response: &Response<Body>, action: &str) -> Result<()> {
+    check_gateway_actor(response)?;
+    check_gateway_failure(response)?;
+    if !action_is(response, action) {
+        return Err(FurpcClientError::Protocol(
+            "unexpected notification session reply action",
         ));
-    }
-    Ok(body)
-}
-pub(crate) fn decode_registered(message: Message) -> Result<()> {
-    crate::protocol::check_reply(&message, &["RegisterServiceNotificationFilterReply"])?;
-    empty(&message)
-}
-pub(crate) fn decode_unregistered(message: Message) -> Result<()> {
-    crate::protocol::check_reply(&message, &["UnregisterServiceNotificationFilterReply"])?;
-    empty(&message)
-}
-fn empty(message: &Message) -> Result<()> {
-    if !message.body.is_empty() {
-        return Err(crate::Error::Protocol("filter reply has a body"));
     }
     Ok(())
 }
@@ -126,34 +131,7 @@ pub(crate) struct Page {
 pub(crate) struct PageBody {
     pub page: Pointer<Page>,
 }
-pub(crate) fn decode_page(
-    body: &[u8],
-    reserve: &mut impl FnMut(usize) -> NotificationResult<()>,
-) -> NotificationResult<Page> {
-    // Serde's format error stays shared; retain the original reservation cause
-    // separately rather than interpreting a transport diagnostic string.
-    let mut allocation_error = None;
-    let decoded = from_slice_with_budget::<PageBody>(body, &mut |bytes| {
-        reserve(bytes).map_err(|error| {
-            allocation_error = Some(error);
-            fubst::Error::ResourceLimit("decoded allocation reservation")
-        })
-    });
-    if let Some(error) = allocation_error {
-        return Err(error);
-    }
-    decoded?
-        .page
-        .0
-        .ok_or_else(|| Error::Protocol("null notification page").into())
-}
-pub(crate) fn status(success: bool) -> Result<Vec<u8>> {
-    #[derive(Serialize)]
-    struct Status {
-        error: i64,
-    }
-    // ErrorCodeValue::OperationFailed (HRESULT E_FAIL), not a Result payload.
-    Ok(to_vec(&Status {
-        error: if success { 0 } else { -2147467259 },
-    })?)
+#[derive(Serialize)]
+pub(crate) struct Status {
+    pub error: i64,
 }

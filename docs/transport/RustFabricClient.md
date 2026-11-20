@@ -16,13 +16,14 @@ methods, `PingRequest`, `NameRequest`/`NameOperation`/`NameResponse` and legacy 
 implementations have been removed. There is no compatibility wrapper or fallback.
 `FabricClient`, borrowed `GatewayClient`, `Client`/`ClientRequest` contracts,
 `ClientOptions`/`ClientLimits` and typed retained-allocation accounting are retired.
-ServiceNotificationClient owns its **own**
-notification-enabled GatewayChannel/native session; it does not adopt an
-ordinary client's channel or lifecycle. ImageStoreClient owns an independent
-GatewayChannel with registered raw ACK actors. Each client installs its own
-actor/action/envelope authorization; the native channel's minimal actor demux
-and duplex/RPC split contain no gateway/upload/notification profile switch.
-The broader actor/action router remains declarations only.
+ServiceNotificationClient owns its **own furpc Channel/native session**; it
+does not adopt an ordinary client's channel or lifecycle. Authorized furpc
+ingress and `server::Rpc::unary` decode notifications and return typed ACK data;
+the runner owns native correlation and original-generation ACK writes.
+Session/filter RPCs reuse the gateway adapter on the original furpc Peer.
+The legacy notification adapters, receiver/reply-context plumbing and allocation
+ledger are removed. Only ImageStoreClient retains an independent legacy
+GatewayChannel with registered raw ACK actors.
 Rust error/admission/lifecycle changes below
 are deliberate API breaks, not compatibility wrappers. Historical source/wire
 evidence in later sections is not a substitute for current migration receipts.
@@ -241,19 +242,29 @@ failure; subsequent concurrent resolution/Ping/node calls retained generation **
 The existing endpoint-count change, primary replacement, version progression,
 real notification ACK loss/retry and independent notification-owner teardown
 also passed. Actual resolution and retry receipts passed their validators after
-owned cleanup. Notifications still use their independent legacy transport;
-this is not furpc notification qualification or an endpoint-cache claim.
+owned cleanup. That earlier run used the independent legacy notification transport.
+
+The notification migration then reran the same targeted archive on the retained
+default-Docker **11.8.121.4** onebox. Ordinary calls retained furpc generation
+**1**, with three independent notification sessions on generations **2/3/4**.
+Native session establishment, four explicit filter unregister confirmations,
+endpoint-count/primary changes and empty invalidations passed. A real successful
+ACK was dropped, the native gateway retried under a fresh request ID, and the
+furpc runner sent its correlated ACK without duplicate application delivery.
+Actual notification/resolution/retry receipts passed independent validators and
+owned cleanup completed; the onebox was left running.
 
 Together with the earlier native runs, this qualifies thirteen reads, two naming
-writes and MovePrimary over initiating clear TCP on the observed runtime, not furpc native notifications,
-accepted-side serving, TLS, other gateway operations, or the rest of the migration.
+writes, MovePrimary and notification receiving/ACKs over initiating clear TCP on
+the observed runtime, not native notification origination, accepted-side serving,
+TLS, other gateway operations, or ImageStore over furpc.
 
-### Operation inventory and independent legacy clients
+### Operation inventory and independent clients
 
 `fube-transport` implements bounded Fabric serialization, clear frames and CRCs,
 ordered native headers, client-only ListenInstance establishment, and
 continuously driven, bounded concurrent Tokio request/reply I/O. `fube-client`
-has migrated every implemented ordinary operation to furpc.
+has migrated every implemented ordinary operation and notification sessions to furpc.
 All paged and unpaged list queries use furpc; their legacy methods,
 typed-request implementations and input-accounting adapters are retired.
 Uncached resolution and independent notification sessions add endpoint discovery
@@ -1103,8 +1114,8 @@ println!("{:?}", page.items);
 
 Request JSON retains separate `parameters` and `paging` objects. These APIs use
 the same shared declarations and list reply profile as the existing queries.
-Furpc owns all ordinary query and resolution paths; notification sessions still
-use their independently owned legacy adapter. No query
+Furpc owns all ordinary query/resolution paths and independently owned
+notification transport. No query
 adds automatic paging, retry, an endpoint cache or HTTP fallback.
 
 Native partition and replica queries accept continuation tokens but not
@@ -1334,7 +1345,7 @@ use std::time::Duration;
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = ServiceNotificationClient::endpoint_clear(
     "127.0.0.1:19000".parse()?,
-)?; // Local configuration only; installs notification-specific transport policy.
+)?; // Local furpc configuration only; start installs authorized notification ingress.
 let channel = endpoint.connect_timeout(Duration::from_secs(10)).connect().await?;
 let changes = ServiceNotificationClient::start(channel, NotificationClientOptions {
     startup_timeout: Duration::from_secs(15),
@@ -1348,9 +1359,9 @@ changes.close(None).await?;
 These are three distinct operations: Endpoint configuration performs no I/O;
 `Endpoint::connect` establishes transport; notification `start` asynchronously
 creates a fresh native session. Unlike ordinary `FurpcClient::new`, `start` is
-not local stub binding. It uses `Channel::target()` (the original established
-target), not the gateway address advertised in the native reply. The factory
-returns the shared transport `Result<Endpoint>`; startup and subsequent protocol
+not local stub binding. It captures the original established furpc Peer,
+not the gateway address advertised in the native reply. The factory
+returns `furpc::Result<furpc::Endpoint>`; startup and subsequent protocol
 operations return `NotificationResult`.
 
 `NotificationClientOptions` defaults both budgets to 30 seconds. The Endpoint's
@@ -1368,7 +1379,7 @@ use tokio::time::{timeout_at, Instant};
 let deadline = Instant::now() + Duration::from_secs(30);
 let changes = timeout_at(deadline, async {
     let channel = ServiceNotificationClient::endpoint_clear("127.0.0.1:19000".parse()?)?
-        .connect_until(deadline).await?;
+        .connect().await?;
     ServiceNotificationClient::start(channel, NotificationClientOptions {
         startup_timeout: deadline.saturating_duration_since(Instant::now()),
         default_timeout: Duration::from_secs(30),
@@ -1380,24 +1391,15 @@ changes.close(None).await?;
 ```
 
 The outer deadline also bounds startup publication; it never renews the dial
-budget. Startup cancellation retains the existing candidate-retirement behavior.
+budget. Failed/cancelled startup closes local session admission and releases its
+Channel owner; it does not add a furpc physical-retirement receipt.
 
-Use a **dedicated notification-authorized Channel**, with no other protocol
-session or competing receivers. `start` cannot add notification permissions or
-silently adopt an ordinary session; having some receiver-enabled policy is not
-proof of notification authorization. Generic Channel receiver acquisition and
-clone/concurrent-read semantics are unchanged, but competing notification
-consumers are unsupported because they can steal ordered pages/reply contexts.
-
-Both startup options validate locally before protocol responsibility begins.
-Invalid options or dropping an unpolled startup future only drop the supplied
-handle, without explicitly aborting retained clones (normal last-owner shutdown
-still applies). Once validated startup begins, failure or cancellation retires
-the candidate shared Channel. After publication, owner drop, explicit close and
-terminal failure likewise retire the Channel even if raw clones remain. Retaining
-a clone does not keep a retired native notification session usable. Shutdown can
-outlive an expired operation deadline while the existing started-frame watchdog
-and worker/socket teardown finish.
+Use a **dedicated furpc Channel with no existing ingress service**. `start`
+installs the Actor 5 notification binding and exact envelope/ACK policies before
+the native connection request. Do not retain outside Channel clones if owner
+drop must release its last owner. There is no second reader or public native
+notification receiver. Endpoint HandlerLimits govern incoming invocation
+capacity and ACK deadlines independently of the notification operation default.
 
 Keep the returned registration bound to a variable. Dropping it initiates
 bounded asynchronous cleanup; `let _ = register_filter(...).await?` immediately
@@ -1423,45 +1425,46 @@ one terminal error, then `None`, independently of a full update queue. Buffered
 updates may be discarded on terminal failure. Full-page delivery and progress
 commit before successful native ACK; application processing is not part of ACK.
 Unconfirmed filter mutations/cleanup retire only this notification session.
-Explicit close attempts deregistration under one deadline and awaits task/socket
-stop even on cleanup failure. Owner drop initiates shutdown; remote disconnect
-cleanup is eventual, not an immediate deregistration guarantee.
+Explicit close attempts deregistration under one deadline, awaits its cleanup
+worker and releases its Channel. Owner drop signals that same worker and closes
+local admission. Neither promises furpc driver/socket teardown completion or
+revokes outside Channel clones. Remote disconnect cleanup remains eventual.
+An idle physical disconnect need not wake local `recv`, because furpc has no
+independent Channel closure observer; use a caller-owned receive timeout when needed.
 
 **Notification endpoint policy:** `endpoint_clear(SocketAddr)` accepts
 explicit numeric unicast/nonzero-port NamingGateway endpoints, including
 non-loopback addresses. Unspecified, multicast and zero-port destinations fail
 InvalidInput. No hostname/advertised-address
 fallback, compatibility wrapper or TLS/claims/security expansion is supplied.
-The native session/filter API and error types otherwise remain unchanged.
-
-Construction pulls and client-charges ingress alongside Connect, then admits a
-finite pending snapshot before starting semantic draining or publishing the
-owner. Runtime staging and semantic processing are scoped inside one worker.
-Registration cancellation can retract until the first **positive** socket write;
-after visibility an unconfirmed mutation retires the session. Dropping/cancelling
-close fences the owner and stops the same worker/socket; awaitable close retains
-its worker handle and observes teardown after the shared cleanup deadline.
-An irrevocably started frame retains the separate 30-second completion watchdog.
+Session/filter RPCs are typed calls through the shared gateway adapter over a
+small Peer-backed byte service, so they cannot reconnect or replay. Early typed
+notification pages wait for Connect's native generation under furpc handler
+limits/deadlines; no pull/staging handoff or retained-allocation ledger remains.
+Furpc Attempt retraction fences cancellation against the first positive write.
+An unconfirmed committed registration terminates this domain session rather
+than leaking a filter handle or retrying the mutation.
 
 Native retries preserve logical page identity but the proxy assigns a fresh
 client-leg MessageId on every forwarding attempt
 ([pinned source:453–483](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/ServiceNotificationManagerProxy.cpp#L453-L483)).
 The client suppresses accepted versions, merges progress and ACKs each admitted
-attempt. Transport same-ID collisions still terminate without a second reply
-authority. ACK success means whole-page local acceptance, not application
+attempt. Furpc owns transport correlation without a domain transport-ID history.
+ACK success means whole-page local acceptance, not application
 consumption or a per-page fixed-body fingerprint.
 
 Notification construction, registration, receive, unregister, and close return
-`NotificationResult<T>`, whose error is `NotificationError`. Delivery-budget
+`NotificationResult<T>`, whose error is `NotificationError`. Delivery-queue
 exhaustion is `NotificationError::Lagged`; notification filter/bookkeeping/queue
 limits are `NotificationError::ResourceLimit`. Shared transport, protocol,
-timeout, input, and native faults are retained as `NotificationError::Common(Error)`,
-including genuinely shared decoder/control resource limits. The ordinary
+timeout, input, native faults and domain failures are retained as
+`NotificationError::Common(FurpcClientError)`, including original decoder/control
+resource limits. There is no legacy Error conversion. The ordinary
 `FurpcClient` uses `FurpcClientError` and has no notification-only error cases;
 notification-only failures stay above the shared channel and its opaque RPC boundary.
-This changes notification method error types, not the native payload or wire
-format. Match `NotificationError::Common(Error::Timeout)` for a notification
-timeout instead of matching `Error::Timeout` directly.
+This changes notification error/lifecycle contracts, not native payloads.
+Match `NotificationError::Common(FurpcClientError::Native(furpc::Error::Timeout(_)))`
+for a native notification-operation timeout.
 
 There is no endpoint cache, hidden description query, reconnect, filter replay,
 or snapshot. The gateway can still use its own cache: independent management
@@ -1494,7 +1497,7 @@ query-field JSON migration is described above.
 All three naming methods require a checked `NamingUri` in `furpc::Request`,
 with an absolute deadline. There are no legacy string-convenience write methods.
 
-The limits below belong only to independent legacy notification/ImageStore transports, not the
+The legacy limits below belong only to ImageStore, not the
 migrated furpc operations, which use their native frame/codec limits.
 
 | Resource | Limit |
@@ -1508,28 +1511,15 @@ migrated furpc operations, which use their native frame/codec limits.
 | Byte-array/object-array/type-information count | 4,096 |
 | Application/service rows, parameter pairs, URI segments | 4,096 each (the row bound is independent of requested count) |
 | Legacy RPC/lifetime IDs, including handshake | 4096; terminal exhaustion |
-| Legacy channel aggregate retained-byte reservation | 2 GiB notification-owned profile, not eager allocation |
+| Legacy upload channel aggregate retained-byte reservation | 1 GiB, not eager allocation |
 | Started write / partial incoming frame | 30 seconds; request expiry ends local waiting, not started frame completion |
-| Notification delivery | 256 events and 8 MiB of accounted page/delivery allocations, whichever is reached first |
-| Notification filters, including pending registration/cleanup | 32 per independently owned session |
-| Notification partition identities / version intervals | 4,096 each; exhaustion is terminal, never silent eviction |
-| Notification page queue / processing | 32 client-staged pages plus at most one transferred envelope; 33 backend ingress slots and one scoped worker |
-| Notification ordinary RPC / consuming replies | 8 / 4, independently counted under the shared channel byte ceiling |
-| Notification cleanup commands | 32, admitted independently of application delivery |
-| Notification lifetime IDs, including handshake | 4096, transport attempts not logical pages; terminal exhaustion without eviction |
 
 Native ImageStore's separate chunk, traversal, path and stale-reply limits are
 listed in [its API section](#native-imagestore-application-package-copy).
 
-Ordinary channel entries cover queued/pending/ready-undelivered work; a started
-writer retains its lease after observer abandonment. Client admission occurs
-before typed encoding and follows result/state until transfer/drop. Sealed
-schemas have compile-time element/minimum-wire bounds; vector growth, map-node
-conversion, UTF conversion and overlapping endpoint/slot copies are included
-in the conservative fixed slot. This is intentionally looser than actual memory
-usage. Unpolled futures and transferred values are caller-held. Notifications
-apply both their own channel profile and client accounting above; upload retains
-its independent upload-channel and protocol limits.
+ImageStore retains its independent upload-channel and protocol limits.
+Ordinary furpc calls and notifications do not use sealed typed budgets or
+retained-allocation leases.
 
 The decoder skips unknown/deleted header records by their bounded record
 lengths. Effective common headers use the last visible occurrence; first
@@ -1540,15 +1530,12 @@ base/derived scopes needed by node results.
 Native upload semantic ACKs additionally reject duplicate visible header IDs;
 they do not inherit the common last-occurrence acceptance policy.
 
-Notification memory accounting includes queue backing storage, input pages,
-decoded strings/vectors, conversion copies and prospective progress copies.
-Raw input capacity is reserved before queue admission. The shared native Serde
-decoder charges strings, bytes, and conservative sequence storage before owned
-allocation; the worker separately reserves endpoint-conversion and prospective
-progress copies before constructing them. There is no second notification-schema
-parser. This is an accounted allocation budget, not a bound on total process RSS;
-existing transport I/O limits and separately bounded protocol state still apply.
-A page must fit as one transaction. Delivery lag and protocol-bookkeeping/
+Notifications retain 256 queued application events, 32 filters including pending
+registration/cleanup, 4,096 partition identities and version intervals each,
+and 32 automatic cleanup commands. Furpc owns frame/codec, pending-operation,
+handler and ACK capacity; Endpoint limits are configured before dialing.
+There is no notification heap ledger, extra construction ceiling or lifetime
+transport-ID history. A page must fit as one transaction. Delivery lag and protocol-bookkeeping/
 cleanup resource failures are terminal; status does not need a queue slot.
 Local filter-admission exhaustion is instead rejected before sending without
 retiring the healthy session (`NotificationError::ResourceLimit("notification filters")`).
@@ -2250,12 +2237,18 @@ A test-only relay drops exactly one successful native processing ACK, observes a
 gateway retry, and verifies no repeated endpoint version is delivered.
 Production operations never use HTTP or this relay.
 
+The required `furpc_notifications` receipt records three actual, independent
+transport generations, confirmed unregister/close counts, initial prefix/exact
+updates and empty invalidations. Validators bind those events to the independently
+observed owned partition and require the native ACK-loss/retry witnesses.
+Initial updates can precede full placement; they are not a five-endpoint snapshot.
+
 On SF **11.8.121.4**, clear TCP, the scenario demonstrated six singleton/int64
 partition lookups plus two named lookups, previous-result refresh, native errors
 with healthy reuse, three independent notification sessions, exact/prefix/
 primary-only registration, updates, endpoint-count/primary changes, invalidation,
 unregister and independent close. The relay observed one dropped successful ACK,
-one native retry and zero duplicate delivered versions. The actual gateway
+one native retry and zero duplicate delivered versions. The original gateway
 identity was returned as node N0010; its notification address was intentionally
 empty, not replaced with an advertised/dialed private endpoint.
 

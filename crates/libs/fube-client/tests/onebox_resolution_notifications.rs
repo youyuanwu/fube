@@ -95,10 +95,16 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
         .source()
         .ok_or("missing native Ping source")?
         .generation();
+    let notification_start_ms = furpc_support::now_ms();
     let channel = ServiceNotificationClient::endpoint_clear(config.endpoint)?
         .connect_timeout(Duration::from_secs(60))
         .connect()
         .await?;
+    let notification_generation = channel
+        .peer(furpc_support::deadline())
+        .await?
+        .info()
+        .generation;
     let mut notifications = ServiceNotificationClient::start(
         channel,
         NotificationClientOptions {
@@ -109,10 +115,13 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
     .await
     .map_err(|e| format!("first notification startup: {e}"))?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let channel = ServiceNotificationClient::endpoint_clear(config.endpoint)?
-        .connect_until(deadline)
-        .await
-        .map_err(|e| format!("second notification establishment: {e}"))?;
+    let channel = tokio::time::timeout_at(
+        deadline,
+        ServiceNotificationClient::endpoint_clear(config.endpoint)?.connect(),
+    )
+    .await?
+    .map_err(|e| format!("second notification establishment: {e}"))?;
+    let independent_generation = channel.peer(deadline).await?.info().generation;
     let mut independent = tokio::time::timeout_at(
         deadline,
         ServiceNotificationClient::start(
@@ -140,9 +149,12 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
     let stateful: NamingUri = format!("{app}/Stateful").parse()?;
     let proxy = loss_proxy::LossProxy::start(config.endpoint).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let channel = ServiceNotificationClient::endpoint_clear(proxy.address)?
-        .connect_until(deadline)
-        .await?;
+    let channel = tokio::time::timeout_at(
+        deadline,
+        ServiceNotificationClient::endpoint_clear(proxy.address)?.connect(),
+    )
+    .await??;
+    let retry_generation = channel.peer(deadline).await?.info().generation;
     let mut retry_client = tokio::time::timeout_at(
         deadline,
         ServiceNotificationClient::start(
@@ -312,6 +324,7 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
     retry_filter.unregister(None).await?;
     retry_client.close(None).await?;
     proxy.stop().await;
+    let notification_end_ms = furpc_support::now_ms();
     Ok(json!({
         "runtime_version":config.runtime,"profile":"clear","allocation":config.allocation,
         "owner":config.owner, "owned_applications":journal.applications, "owned_type":journal.type_name,
@@ -323,6 +336,13 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
             "native_missing_service_code":missing_code, "native_error_origin":missing_origin,
             "missing_http_absent":missing_http_absent,
             "native_start_ms":resolution_start_ms, "native_end_ms":resolution_end_ms,
+        },
+        "furpc_notifications": {
+            "session_generations":[notification_generation, independent_generation, retry_generation],
+            "explicit_filters_unregistered":4, "sessions_closed":3,
+            "initial_updates":[live::notification_evidence(&first), live::notification_evidence(&exact_first)],
+            "empty_invalidations":[live::notification_evidence(&removed), live::notification_evidence(&exact_removed)],
+            "native_start_ms":notification_start_ms, "native_end_ms":notification_end_ms,
         },
         "passed":["native session establishment","three independent notification clients","exact/prefix/primary-only registration","singleton, named and signed-int64 resolution","previous-result refresh","independent replica endpoint/role multiset comparison","native endpoint count change and empty invalidations","owned primary replacement and versioned updates","forced successful ACK loss, gateway retry, no duplicate delivery","native error and healthy reuse","explicit unregister","independent close"],
         "unqualified":["TLS/authentication (out of scope)","automatic recovery (out of scope)","isolated primary-only content-change delivery on a service with distinct published primary addresses"]

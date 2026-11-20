@@ -5,7 +5,7 @@
 //! defaulting to furpc's Channel. It provides Ping, naming operations,
 //! cluster/topology/deployment lists, node health, MovePrimary and resolution.
 //! The old FabricClient façade, sealed request adapters and typed budgets are retired.
-//! Notification and ImageStore clients retain independently owned legacy transports.
+//! Notifications use independently owned furpc sessions; ImageStore retains legacy transport.
 //! Native connections require an explicitly selected unsecured development gateway.
 
 mod applications;
@@ -56,7 +56,7 @@ pub use resolution::*;
 pub use services::*;
 use std::time::Duration;
 
-/// Legacy transport types retained for independently owned notification/ImageStore clients.
+/// Legacy transport types retained for ImageStore and shared model validation.
 pub use fube_transport::{Channel, ChannelLimits, Endpoint, Error, Result};
 
 /// Default connection and per-operation timeout.

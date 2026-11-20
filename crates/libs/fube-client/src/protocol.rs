@@ -1,86 +1,9 @@
-use fube_transport::message::Message;
-use fubst::serde::{from_fields, from_slice};
-use fubst::Decoder;
 use serde::Deserialize;
 
-use crate::{Error, GatewayDescription, NodeId, Result};
+use crate::{GatewayDescription, NodeId};
 
 // ClientServerTransport::DeleteNameHeader: public deletion is explicit.
 pub(crate) const DELETE_NAME_HEADER: u16 = 0x8033;
-
-pub(crate) fn check_failure(message: &Message) -> Result<()> {
-    let properties = message.properties()?;
-    if let Some(fault) = properties.fault.filter(|fault| fault.code != 0) {
-        let mut code = fault.code;
-        let mut diagnostic = String::new();
-        if fault.has_body {
-            #[derive(Deserialize)]
-            struct CodeText(i64, String);
-            #[derive(Deserialize)]
-            struct Details {
-                details: CodeText,
-            }
-            match from_slice::<Details>(&message.body) {
-                Ok(Details {
-                    details: CodeText(detail_code, text),
-                }) if !text.is_empty() => {
-                    // Native ErrorCodeDetails replaces the header only for a
-                    // successfully decoded, nonempty diagnostic. Never erase
-                    // a nonzero failure with a success code.
-                    if detail_code != 0 {
-                        code = detail_code;
-                    }
-                    diagnostic = text;
-                }
-                Ok(_) => {}
-                Err(_) => diagnostic = "malformed optional fault details".into(),
-            }
-        }
-        return Err(Error::Remote {
-            code,
-            message: diagnostic,
-        });
-    }
-    if properties.action == "ClientOperationFailure" {
-        let mut code = None;
-        let mut decoder = Decoder::new(&message.body);
-        #[derive(Deserialize)]
-        struct FailureCode {
-            code: i64,
-        }
-        #[derive(Deserialize)]
-        struct Diagnostic {
-            text: String,
-        }
-        let text = decoder.object(|decoder| {
-            code = Some(from_fields::<FailureCode>(decoder)?.code);
-            Ok(from_fields::<Diagnostic>(decoder)?.text)
-        });
-        let text = text.and_then(|text| decoder.finish().map(|()| text));
-        return match code {
-            Some(code) if code != 0 => Err(Error::Remote {
-                code,
-                message: text.unwrap_or_else(|_| "missing or malformed failure diagnostic".into()),
-            }),
-            _ => Err(Error::Protocol(
-                "operation failure has no nonzero error code",
-            )),
-        };
-    }
-    Ok(())
-}
-
-pub(crate) fn check_reply(message: &Message, actions: &[&str]) -> Result<()> {
-    check_failure(message)?;
-    let properties = message.properties()?;
-    if properties.actor != 5 {
-        return Err(Error::Protocol("operation reply is not from NamingGateway"));
-    }
-    if !actions.contains(&properties.action.as_str()) {
-        return Err(Error::Protocol("unexpected operation reply action"));
-    }
-    Ok(())
-}
 
 #[derive(Deserialize)]
 struct PingNodeInstance(NodeId, u64);
@@ -121,8 +44,7 @@ pub(crate) struct NameExistsReplyBody {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::NamingUri;
+    use crate::{Error, NamingUri};
 
     #[test]
     fn uri_rejects_every_unsupported_grammar_class() {

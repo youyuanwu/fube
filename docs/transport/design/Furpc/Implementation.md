@@ -124,7 +124,8 @@ The native reply model converts without a legacy Message or transport-error
 conversion and preserves furpc response headers/source/settlement.
 The final ordinary FabricClient/GatewayClient façades, sealed Client/ClientRequest
 contracts, options and typed allocation accounting are retired. Notification and
-ImageStore clients keep their separate existing owners/transports and shared models.
+ImageStore clients kept their separate existing owners/transports and shared models
+in that resolution slice.
 The existing resolution/notification scenario now qualifies eight resolution and
 refresh cases, independent HTTP partition/endpoint-role multisets, missing-service
 failure and concurrent resolution/Ping/node reuse on the original furpc generation.
@@ -136,9 +137,30 @@ retained generation 1. Existing endpoint-count changes, primary replacement,
 version advancement, real notification ACK retry and independent teardown also
 passed. Actual resolution/retry receipts and owned cleanup were independently
 validated; the default-Docker onebox was left running.
+ServiceNotificationClient now owns an independent furpc Channel and captures its
+original Peer. Startup installs an authorized notification IngressService before
+the native session exchange. Typed server::Rpc/FubstCodec handlers commit page
+updates/version state atomically and return ACK data; furpc alone supplies native
+ACK correlation, flags, capacity and original-generation submission. Session and
+filter RPCs reuse the gateway adapter over a Peer-backed byte service, with no
+reconnect/replay. Filter guards retain bounded asynchronous cleanup.
+The legacy notification ChannelComposition, pull/staging receiver, ReplyContext
+plumbing, Message decoders and retained-allocation ledger are removed.
+There is no new furpc lifecycle API: notification close joins its own worker and
+releases Channel ownership, not a physical-driver barrier; outside clones are
+not revoked, and idle disconnection need not wake local recv.
+The same targeted native archive passed on the retained SF11.8.121.4 onebox.
+Ordinary calls used generation 1 and three independent notification sessions
+used generations 2/3/4. Four explicit unregisters, endpoint/primary changes,
+empty invalidations and independent closes passed. A dropped successful native
+ACK caused an actual gateway retry with a fresh request ID and a correlated
+furpc ACK without duplicate application delivery. Actual notification,
+resolution and retry receipts passed independent validators after owned cleanup.
+The default-Docker onebox was left running.
 Together with the earlier runs, this is initiating clear-TCP evidence for the
-thirteen migrated reads, two naming writes and MovePrimary only; it does
-not qualify accepted-side serving, notifications, TLS, or the rest of the gateway API. See the
+thirteen migrated reads, two naming writes, MovePrimary and notification receiving/ACKs.
+It does not qualify accepted-side serving, native notification origination, TLS,
+ImageStore over furpc, or the rest of the gateway API. See the
 [client slice](../../RustFabricClient.md#separate-furpc-backed-client).
 
 The public facade supports managed byte RPC by default and explicitly selected
@@ -302,8 +324,10 @@ Source qualification at the pinned native baseline covers BeginNotification,
 DuplexRequestReply's special-first dispatch, and ReceiverContext::Reply.
 In-memory exchanges cover both directions, typed ACK data, class-local routing,
 policy rejection/commit checks, shared capacity, cancellation, Faults and drain;
-independent native notification interoperability remains unqualified. TLS remains
-unimplemented.
+the fube-client migration above additionally qualifies native gateway-to-client
+notification receiving/ACKs on SF11.8.121.4, including actual ACK loss/retry.
+Native notification origination and accepted-side native interoperability remain
+unqualified. TLS remains unimplemented.
 
 ## Gap ownership and implementation order
 

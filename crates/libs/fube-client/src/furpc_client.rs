@@ -93,7 +93,7 @@ impl From<query_protocol::ReplyError> for FurpcClientError {
     }
 }
 impl FurpcClientError {
-    fn from_rpc(error: furpc::Error) -> Self {
+    pub(crate) fn from_rpc(error: furpc::Error) -> Self {
         // RpcClient preserves byte-service and codec errors as their original sources.
         match &error {
             furpc::Error::Transport { .. } => {
@@ -443,7 +443,7 @@ where
         Ok(Response::from_parts(parts, output))
     }
 
-    async fn unary<C>(
+    pub(crate) async fn unary<C>(
         &mut self,
         request: Request<C::Encode>,
         codec: C,
@@ -648,7 +648,7 @@ fn decode_body<T: DeserializeOwned>(body: &Body) -> Result<T> {
     Ok(fubst::serde::from_slice(&bytes)?)
 }
 
-fn action_is(response: &Response<Body>, action: &str) -> bool {
+pub(crate) fn action_is(response: &Response<Body>, action: &str) -> bool {
     response
         .headers()
         .effective()
@@ -658,7 +658,7 @@ fn action_is(response: &Response<Body>, action: &str) -> bool {
         .eq(action.encode_utf16())
 }
 
-fn check_gateway_failure(response: &Response<Body>) -> Result<()> {
+pub(crate) fn check_gateway_failure(response: &Response<Body>) -> Result<()> {
     if action_is(response, "ClientOperationFailure") {
         check_gateway_actor(response)?;
         let failure: protocol::GatewayFailureBody = decode_body(response.body())?;
@@ -675,7 +675,7 @@ fn check_gateway_failure(response: &Response<Body>) -> Result<()> {
     Ok(())
 }
 
-fn check_gateway_actor(response: &Response<Body>) -> Result<()> {
+pub(crate) fn check_gateway_actor(response: &Response<Body>) -> Result<()> {
     if response.headers().effective().actor != ActorId::new(5)? {
         return Err(FurpcClientError::Protocol(
             "reply is not from NamingGateway",

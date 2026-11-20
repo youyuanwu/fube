@@ -2075,6 +2075,58 @@ def validate_furpc_resolution(report):
     return [stamp / 1000 for stamp in window]
 
 
+def validate_furpc_notifications(report):
+    validate_furpc_resolution(report)
+    value = report.get("furpc_notifications")
+    require(type(value) is dict, "furpc notification session evidence required")
+    generations = value.get("session_generations")
+    require(type(generations) is list and len(generations) == 3
+            and all(integer(generation, 1) for generation in generations)
+            and len(set(generations)) == 3,
+            "three independent actual furpc notification generations")
+    resolution = report.get("furpc_resolution")
+    require(type(resolution) is dict
+            and integer(resolution.get("generation"), 1)
+            and resolution["generation"] not in generations,
+            "notification sessions must not share the ordinary furpc generation")
+    require(type(value.get("explicit_filters_unregistered")) is int
+            and value["explicit_filters_unregistered"] == 4
+            and type(value.get("sessions_closed")) is int and value["sessions_closed"] == 3,
+            "native filter confirmations and independent notification owner close")
+    true_fields(report, ("owned_cleanup_confirmed",))
+    cases, apps = report.get("resolved"), report.get("owned_applications")
+    require(type(cases) is list and len(cases) == 6 and type(cases[0]) is dict
+            and type(apps) is list and len(apps) == 2 and text(apps[0]),
+            "notification observations require the owned resolution fixture")
+    baseline = cases[0].get("native")
+    require(type(baseline) is dict and baseline.get("name") == apps[0] + "/Stateless"
+            and type(baseline.get("partition")) is dict
+            and type(baseline.get("endpoints")) is list,
+            "independently corroborated initial notification partition")
+    initial, invalidations = value.get("initial_updates"), value.get("empty_invalidations")
+    require(type(initial) is list and len(initial) == 2
+            and type(invalidations) is list and len(invalidations) == 2,
+            "prefix and exact subscription updates and empty invalidations")
+    for event, empty in [(event, False) for event in initial] + [
+            (event, True) for event in invalidations]:
+        require(type(event) is dict and event.get("name") == baseline["name"]
+                and event.get("partition_id") == baseline["partition"].get("id")
+                and event.get("kind") == "Stateless" and type(event.get("endpoints")) is list,
+                "native notification identity must match the independent owned partition")
+        endpoints = event["endpoints"]
+        require((not endpoints) if empty else bool(endpoints),
+                "actual initial update versus empty endpoint invalidation")
+        remaining = list(baseline["endpoints"])
+        for endpoint in endpoints:
+            require(type(endpoint) is dict and endpoint in remaining,
+                    "initial notification must contain observed endpoint/role occurrences")
+            remaining.remove(endpoint)
+    validate_notification_retry(report.get("ack_retry"))
+    require(all(integer(value.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+            "furpc notification observation timestamps")
+    return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
+
+
 def validate_native(reports, archive, allocation):
     clear, health, name, lists, notification = [reports[file] for file in NATIVE_FILES]
     for value in (clear, health, name, notification):
@@ -2121,6 +2173,7 @@ def validate_native(reports, archive, allocation):
             "native notification allocation/cases/actual observations")
     validate_notification_retry(notification["ack_retry"])
     furpc_resolution_window = validate_furpc_resolution(notification)
+    furpc_notification_window = validate_furpc_notifications(notification)
     windows = {
         "clear_node_queries": [stamp / 1000 for stamp in interval(
             nodes, "native_observation_start_unix_ms", "native_observation_end_unix_ms")],
@@ -2131,6 +2184,7 @@ def validate_native(reports, archive, allocation):
         "furpc_partition_replica_lists": furpc_topology_window,
         "furpc_deployment_lists": furpc_deployment_window,
         "furpc_resolution": furpc_resolution_window,
+        "furpc_notifications": furpc_notification_window,
         **furpc_health_windows,
     }
     require(all(integer(nodes.get(key), 1) for key in

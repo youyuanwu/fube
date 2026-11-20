@@ -1,33 +1,35 @@
-//! Independently owned plain-TCP gateway notification sessions.
+//! Independently owned native notification sessions over furpc.
 use std::{
     collections::HashMap,
     fmt,
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::{Arc, Mutex, Weak},
+    task::{Context, Poll},
     time::Duration,
 };
 
-use fube_transport::{
-    channel::{IncomingMessage, MessageChannel, MessageReceiver, ReplyContext, RpcChannel},
-    connection::{deadline_after, MAX_FRAME_TIME},
-    message::{Header, Message, HIGH_PRIORITY},
-    native_channel::{
-        ChannelLimits, GatewayChannel, GatewayReceiver, GatewayTarget, RequestCancellation,
-    },
+use fubst::serde::{CountedValues, ObjectArray, Pointer};
+use furpc::{
+    header, ActorId, Attempt, AttemptDisposition, Body, Channel, FubstCodec, HeaderRecord, Headers,
+    IngressLimits, IngressOptions, IngressResponse, IngressService, NotificationPolicy, Operation,
+    Peer, Reply, Request, Response, ServiceBinding, Source,
 };
-use fubst::serde::{to_vec, CountedValues, ObjectArray, Pointer};
+use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
     sync::{mpsc, oneshot, Notify},
     task::JoinHandle,
     time::{timeout_at, Instant},
 };
+use tower_service::Service;
 use uuid::Uuid;
 
 use crate::{
     notification_protocol as wire,
-    notification_state::{Memory, Progress, Receiver, MAX_CLEANUPS, MAX_FILTERS, MAX_PAGES},
+    notification_state::{Progress, Receiver, MAX_CLEANUPS, MAX_FILTERS},
     resolution::Generation,
-    Channel, Endpoint, Error, GatewayDescription, NamingUri, Result, ServiceEndpoint,
+    FurpcClient, FurpcClientError, GatewayDescription, NamingUri, ServiceEndpoint,
     ServiceEndpointVersion, ServiceKind,
 };
 
@@ -38,9 +40,9 @@ mod tests;
 /// Failures scoped to notification clients and their registration guards.
 #[derive(Debug, Clone)]
 pub enum NotificationError {
-    /// A shared transport, protocol, timeout, input, or native operation failure.
-    Common(Error),
-    /// Delivery cannot maintain notification continuity within its bounds.
+    /// An original furpc, native domain, codec, or gateway protocol failure.
+    Common(FurpcClientError),
+    /// The bounded application queue cannot maintain notification continuity.
     Lagged,
     /// A notification filter, bookkeeping, or command resource was exhausted.
     ResourceLimit(&'static str),
@@ -49,7 +51,7 @@ pub enum NotificationError {
 impl fmt::Display for NotificationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Common(error) => write!(f, "{error}"),
+            Self::Common(error) => error.fmt(f),
             Self::Lagged => f.write_str("notification delivery capacity exceeded"),
             Self::ResourceLimit(resource) => {
                 write!(f, "notification resource limit: {resource}")
@@ -67,33 +69,40 @@ impl std::error::Error for NotificationError {
     }
 }
 
-impl From<Error> for NotificationError {
-    fn from(error: Error) -> Self {
+impl From<FurpcClientError> for NotificationError {
+    fn from(error: FurpcClientError) -> Self {
         Self::Common(error)
+    }
+}
+
+impl From<furpc::Error> for NotificationError {
+    fn from(error: furpc::Error) -> Self {
+        FurpcClientError::from_rpc(error).into()
     }
 }
 
 impl From<fubst::Error> for NotificationError {
     fn from(error: fubst::Error) -> Self {
-        Self::Common(error.into())
+        FurpcClientError::Decode(error).into()
     }
 }
 
 /// Result for notification construction, registration, delivery, and shutdown.
 ///
 /// ```
-/// use fube_client::{Error, NotificationError, NotificationResult};
-/// let result: NotificationResult<()> = Err(Error::Timeout.into());
-/// assert!(matches!(result, Err(NotificationError::Common(Error::Timeout))));
+/// use fube_client::{FurpcClientError, NotificationError, NotificationResult};
+/// let result: NotificationResult<()> = Err(furpc::Error::Timeout("RPC").into());
+/// assert!(matches!(result, Err(NotificationError::Common(
+///     FurpcClientError::Native(furpc::Error::Timeout("RPC"))
+/// ))));
 /// ```
 pub type NotificationResult<T> = std::result::Result<T, NotificationError>;
 
 /// Independent native-session startup and subsequent operation budgets.
 #[derive(Debug, Clone)]
 pub struct NotificationClientOptions {
-    /// One absolute budget from polling `start` through session publication.
     pub startup_timeout: Duration,
-    /// Default for later operations and processing ACKs; `None` is not infinity.
+    /// Default for session/filter operations, not the furpc ingress-handler timeout.
     pub default_timeout: Duration,
 }
 
@@ -112,6 +121,7 @@ pub struct ServiceNotificationFilter {
     pub name_prefix: bool,
     pub primary_only: bool,
 }
+
 /// Native endpoint data; empty endpoints invalidate knowledge, not prove deletion.
 #[derive(Debug, Clone)]
 pub struct ServiceNotification {
@@ -128,6 +138,7 @@ enum RegistrationState {
     Active,
     Cleanup,
 }
+
 #[derive(Default)]
 struct Registrations {
     filters: HashMap<u64, RegistrationState>,
@@ -135,26 +146,25 @@ struct Registrations {
     closing: bool,
     closed: bool,
 }
+
 struct Cleanup {
     id: u64,
     deadline: Instant,
     complete: Option<oneshot::Sender<NotificationResult<()>>>,
 }
-struct Incoming {
-    body: Vec<u8>,
-    context: Box<dyn ReplyContext>,
-    memory: Memory,
-}
+
 struct Session {
-    channel: GatewayChannel,
-    target: Arc<GatewayTarget>,
+    peer: Peer,
     id: String,
     timeout: Duration,
     state: Mutex<Registrations>,
     cleanup: mpsc::Sender<Cleanup>,
-    receiver: Arc<Receiver>,
+    receiver: Receiver,
+    progress: Mutex<Option<Progress>>,
+    initialized: Notify,
     wake: Notify,
 }
+
 impl Session {
     fn fail(&self, error: impl Into<NotificationError>) {
         {
@@ -164,11 +174,12 @@ impl Session {
             }
             state.closed = true;
             state.filters.clear();
+            self.receiver.fail(error.into());
         }
-        self.receiver.fail(error.into());
-        self.channel.abort();
+        self.initialized.notify_waiters();
         self.wake.notify_one();
     }
+
     fn stop(&self) {
         {
             let mut state = self.state.lock().unwrap();
@@ -176,9 +187,10 @@ impl Session {
             state.filters.clear();
         }
         self.receiver.finish();
-        self.channel.abort();
+        self.initialized.notify_waiters();
         self.wake.notify_one();
     }
+
     fn enqueue(
         &self,
         id: u64,
@@ -187,13 +199,13 @@ impl Session {
     ) -> NotificationResult<()> {
         let mut state = self.state.lock().unwrap();
         if state.closed || state.closing {
-            return Err(Error::Closed.into());
+            return Err(self.receiver.common_error(furpc::Error::Closed));
         }
         let Some(registration) = state.filters.get_mut(&id) else {
-            return Err(Error::Closed.into());
+            return Err(furpc::Error::Closed.into());
         };
         if *registration != RegistrationState::Active {
-            return Err(Error::Closed.into());
+            return Err(furpc::Error::Closed.into());
         }
         *registration = RegistrationState::Cleanup;
         let result = self.cleanup.try_send(Cleanup {
@@ -209,27 +221,27 @@ impl Session {
         }
         Ok(())
     }
+
     fn drop_registration(&self, id: u64) {
-        let deadline = match deadline_after(self.timeout) {
-            Ok(deadline) => deadline,
-            Err(error) => {
-                self.fail(error);
-                return;
+        match deadline_after(self.timeout) {
+            Ok(deadline) => {
+                // Owner shutdown already owns cleanup when admission is closed.
+                let _ = self.enqueue(id, deadline, None);
             }
-        };
-        // Closed/closing means owner shutdown already owns all cleanup.
-        let _ = self.enqueue(id, deadline, None);
+            Err(error) => self.fail(error),
+        }
     }
+
     fn begin_close(&self, deadline: Instant) -> NotificationResult<()> {
         let mut state = self.state.lock().unwrap();
         if state.closed {
-            return Err(self.receiver.common_error(Error::Closed));
+            return Err(self.receiver.common_error(furpc::Error::Closed));
         }
         state.closing = true;
         let active: Vec<_> = state
             .filters
             .iter()
-            .filter(|(_, v)| **v == RegistrationState::Active)
+            .filter(|(_, value)| **value == RegistrationState::Active)
             .map(|(id, _)| *id)
             .collect();
         for id in active {
@@ -253,9 +265,28 @@ impl Session {
         self.wake.notify_one();
         Ok(())
     }
+
+    async fn process(&self, page: wire::PageBody) -> NotificationResult<()> {
+        let page = page
+            .page
+            .0
+            .ok_or(FurpcClientError::Protocol("null notification page"))?;
+        loop {
+            let initialized = self.initialized.notified();
+            tokio::pin!(initialized);
+            initialized.as_mut().enable();
+            if self.state.lock().unwrap().closed {
+                return Err(self.receiver.common_error(furpc::Error::Closed));
+            }
+            if let Some(progress) = self.progress.lock().unwrap().as_mut() {
+                return progress.commit(page, &self.receiver);
+            }
+            initialized.await;
+        }
+    }
 }
 
-/// A standalone non-cloneable gateway owner, native session and receiver.
+/// A standalone non-cloneable native session over a dedicated furpc Channel.
 ///
 /// Filters are not retroactive. Register first, resolve initial state separately,
 /// then compare versions by partition identity rather than arrival order.
@@ -269,34 +300,26 @@ pub struct ServiceNotificationClient {
     worker: Option<JoinHandle<()>>,
     gateway: GatewayDescription,
 }
+
 impl ServiceNotificationClient {
-    /// Configure notification-authorized plain-TCP transport without I/O.
-    /// `Endpoint::connect` establishes transport, not a native notification session.
-    pub fn endpoint_clear(endpoint: SocketAddr) -> Result<Endpoint> {
-        Ok(
-            Endpoint::unsecured_tcp(endpoint, crate::channel_adapter::notifications()?)?
-                .channel_limits(notification_limits()),
-        )
+    /// Configure an explicit unsecured native endpoint without I/O.
+    /// `start` installs notification ingress on the established Channel.
+    pub fn endpoint_clear(endpoint: SocketAddr) -> furpc::Result<furpc::Endpoint> {
+        FurpcClient::endpoint_clear(endpoint)
     }
 
-    /// Start a dedicated native notification session on an established Channel.
+    /// Install furpc notification ingress and establish a fresh native session.
     ///
-    /// This performs the asynchronous `NotificationClientConnectionRequest`; it
-    /// is not ordinary local stub binding and does not change installed permissions.
-    /// Use a notification-authorized endpoint and no competing protocol receivers
-    /// or sessions. Receiver acquisition alone does not prove notification permission.
-    ///
-    /// Both options validate before protocol responsibility begins. Invalid options
-    /// or an unpolled future only drop the supplied handle, without explicitly
-    /// aborting retained clones. After validation, startup failure/cancellation,
-    /// owner drop, close, or terminal failure retires the shared Channel even if raw
-    /// clones remain. A raw clone cannot keep a retired notification session alive.
+    /// Supply a dedicated Channel with no existing ingress service. Retain no
+    /// outside clones if notification-owner drop must release its last owner.
+    /// Session/filter requests bind to the initial Peer and never reconnect or
+    /// replay. Ingress handler limits/timeouts come from the furpc Endpoint.
     ///
     /// ```
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// use fube_client::{NotificationClientOptions, ServiceNotificationClient};
-    /// let endpoint = ServiceNotificationClient::endpoint_clear("127.0.0.1:19000".parse()?)?;
-    /// let channel = endpoint.connect().await?;
+    /// let channel = ServiceNotificationClient::endpoint_clear("127.0.0.1:19000".parse()?)?
+    ///     .connect().await?;
     /// let client = ServiceNotificationClient::start(channel, NotificationClientOptions::default()).await?;
     /// client.close(None).await?;
     /// # Ok(())
@@ -308,122 +331,78 @@ impl ServiceNotificationClient {
     ) -> NotificationResult<Self> {
         deadline_after(options.default_timeout)?;
         let deadline = deadline_after(options.startup_timeout)?;
-        Self::start_before_deadline(channel, options.default_timeout, deadline).await
-    }
-
-    async fn start_before_deadline(
-        channel: Channel,
-        timeout: Duration,
-        deadline: Instant,
-    ) -> NotificationResult<Self> {
-        let mut candidate = Candidate {
-            channel: channel.clone(),
-            armed: true,
-        };
-        let receiver = Arc::new(Receiver::default());
-        let (pages, incoming) = mpsc::channel(MAX_PAGES);
-        let target = channel
-            .target()
-            .map_err(|error| channel.terminal_error().unwrap_or(error))?;
-        let native = channel
-            .receiver()
-            .map_err(|error| channel.terminal_error().unwrap_or(error))?;
-        let id = Uuid::new_v4().to_string();
-        let body = to_vec(&wire::Connect {
-            client: &id,
-            generation: Generation::default(),
-            versions: Pointer(Some(wire::Versions {
-                ranges: ObjectArray(Vec::new()),
-            })),
-            filters: CountedValues(Vec::new()),
-        })?;
-        let connecting = request(
-            &channel,
-            &target,
-            "NotificationClientConnectionRequest",
-            body,
-            deadline,
-            wire::decode_connected,
-        );
-        tokio::pin!(connecting);
-        let connected = loop {
-            tokio::select! {
-                biased;
-                result = &mut connecting => break result.map_err(|error| receiver.common_error(error))?,
-                envelope = native.receive(deadline) => {
-                    stage(envelope.map_err(|error| receiver.common_error(error))?, &pages, &receiver)?;
-                }
-            }
-        };
-        // The RPC observer may run ahead of pulling earlier wire-order ingress.
-        // Admit that finite snapshot before semantic draining/publication.
-        for envelope in native
-            .drain_pending()
-            .map_err(|error| receiver.common_error(error))?
-        {
-            stage(envelope, &pages, &receiver)?;
-        }
-        if let Some(error) = receiver.error() {
-            return Err(error);
-        }
-        // A fresh session has no retained partitions to check against the delete
-        // watermark. No reconnect/deletion synchronization is implied.
-        let gateway = connected.description();
+        let peer = channel.peer(deadline).await?;
         let (cleanup, cleanups) = mpsc::channel(MAX_CLEANUPS);
         let session = Arc::new(Session {
-            channel: channel.clone(),
-            target: target.clone(),
-            id,
-            timeout,
+            peer,
+            id: Uuid::new_v4().to_string(),
+            timeout: options.default_timeout,
             state: Mutex::new(Registrations {
                 next: 1,
                 ..Default::default()
             }),
             cleanup,
-            receiver,
+            receiver: Receiver::default(),
+            progress: Mutex::new(None),
+            initialized: Notify::new(),
             wake: Notify::new(),
         });
-        let worker_session = session.clone();
-        let exit = WorkerExit(session.clone());
-        let worker = tokio::spawn(async move {
-            let _exit = exit;
-            tokio::join!(
-                stage_loop(worker_session.clone(), native, pages),
-                run(
-                    worker_session.clone(),
-                    incoming,
-                    cleanups,
-                    Progress::new(connected.generation)
+        let mut candidate = Candidate {
+            session: session.clone(),
+            armed: true,
+        };
+        channel.register_service(IngressService::new(
+            NotificationIngress {
+                session: Arc::downgrade(&session),
+            },
+            vec![ServiceBinding::actor(
+                ActorId::new(5)?,
+                IngressOptions::notifications(
+                    NotificationPolicy::new(check_notification, check_acknowledgment),
+                    IngressLimits::default(),
                 ),
-            );
-            if let Err(error) = worker_session.channel.closed(teardown_deadline()).await {
-                worker_session.receiver.fail(error.into());
-            }
+            )?],
+        )?)?;
+        let connected: wire::Connected = request(
+            &session,
+            "NotificationClientConnectionRequest",
+            wire::Connect {
+                client: &session.id,
+                generation: Generation::default(),
+                versions: Pointer(Some(wire::Versions {
+                    ranges: ObjectArray(Vec::new()),
+                })),
+                filters: CountedValues(Vec::new()),
+            },
+            deadline,
+            wire::connected,
+            None,
+        )
+        .await?;
+        connected.validate()?;
+        let gateway = connected.description();
+        *session.progress.lock().unwrap() = Some(Progress::new(connected.generation));
+        session.initialized.notify_waiters();
+        if let Some(error) = session.receiver.error() {
+            return Err(error);
+        }
+        if Instant::now() >= deadline {
+            return Err(furpc::Error::Timeout("notification startup").into());
+        }
+        let worker_session = session.clone();
+        let worker = tokio::spawn(async move {
+            let _exit = WorkerExit(worker_session.clone());
+            run(worker_session, channel, cleanups).await;
         });
-        let client = Self {
+        candidate.armed = false;
+        Ok(Self {
             session,
             worker: Some(worker),
             gateway,
-        }
-        .publish_before_deadline(deadline)?;
-        candidate.armed = false;
-        Ok(client)
+        })
     }
 
-    fn publish_before_deadline(self, deadline: Instant) -> NotificationResult<Self> {
-        if let Some(error) = self.session.receiver.error() {
-            return Err(error);
-        }
-        if let Some(error) = self.session.channel.terminal_error() {
-            return Err(error.into());
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::Timeout.into());
-        }
-        Ok(self)
-    }
-
-    /// Actual identity returned by this session, which may differ behind a load balancer.
+    /// Actual native session gateway, which may differ behind a load balancer.
     pub fn gateway(&self) -> &GatewayDescription {
         &self.gateway
     }
@@ -438,7 +417,7 @@ impl ServiceNotificationClient {
         let id = {
             let mut state = self.session.state.lock().unwrap();
             if state.closed || state.closing {
-                return Err(self.session.receiver.common_error(Error::Closed));
+                return Err(self.session.receiver.common_error(furpc::Error::Closed));
             }
             if state.filters.len() == MAX_FILTERS {
                 return Err(NotificationError::ResourceLimit("notification filters"));
@@ -451,38 +430,36 @@ impl ServiceNotificationClient {
             state.filters.insert(id, RegistrationState::Registering);
             id
         };
+        let attempt = Arc::new(Mutex::new(None));
         let mut mutation = Mutation {
             session: Arc::downgrade(&self.session),
             id,
-            sent: None,
+            attempt: attempt.clone(),
             armed: true,
         };
-        let body = to_vec(&wire::Register {
-            client: &self.session.id,
-            filter: Pointer(Some(wire::Filter {
-                id,
-                name: filter.name.clone(),
-                flags: wire::Flags {
-                    bits: u32::from(filter.name_prefix) | (u32::from(filter.primary_only) << 1),
-                },
-            })),
-        })?;
-        let message = request_message("RegisterServiceNotificationFilterRequest", body, deadline)?;
-        let (pending, sent) =
-            self.session
-                .channel
-                .request_tracked(&self.session.target, message, deadline);
-        mutation.sent = Some(sent);
-        let result = decode_reply(
-            &self.session.channel,
-            pending.await,
-            wire::decode_registered,
-        );
+        let result = request::<_, ()>(
+            &self.session,
+            "RegisterServiceNotificationFilterRequest",
+            wire::Register {
+                client: &self.session.id,
+                filter: Pointer(Some(wire::Filter {
+                    id,
+                    name: filter.name.clone(),
+                    flags: wire::Flags {
+                        bits: u32::from(filter.name_prefix) | (u32::from(filter.primary_only) << 1),
+                    },
+                })),
+            },
+            deadline,
+            wire::registered,
+            Some(attempt),
+        )
+        .await;
         match result {
             Ok(()) => {
                 let mut state = self.session.state.lock().unwrap();
                 if state.closed || state.closing {
-                    return Err(self.session.receiver.common_error(Error::Closed));
+                    return Err(self.session.receiver.common_error(furpc::Error::Closed));
                 }
                 state.filters.insert(id, RegistrationState::Active);
                 mutation.armed = false;
@@ -493,28 +470,33 @@ impl ServiceNotificationClient {
                 })
             }
             Err(error) => {
-                if matches!(error, Error::Remote { .. }) {
-                    mutation.armed = false;
-                    self.session.state.lock().unwrap().filters.remove(&id);
+                match &error {
+                    FurpcClientError::Domain(_)
+                    | FurpcClientError::Native(furpc::Error::RemoteFault(_)) => {
+                        mutation.armed = false;
+                        self.session.state.lock().unwrap().filters.remove(&id);
+                    }
+                    FurpcClientError::Native(
+                        furpc::Error::InvalidInput(_)
+                        | furpc::Error::ResourceLimit(_)
+                        | furpc::Error::Timeout(_)
+                        | furpc::Error::Cancelled,
+                    ) => {}
+                    _ => self.session.fail(error.clone()),
                 }
                 Err(self.session.receiver.common_error(error))
             }
         }
     }
 
-    /// Local receive: cancellation never consumes an event or unregisters filters.
-    /// On failure returns one terminal error, then None, even if the queue was full.
+    /// Local cancellation-safe receive. Observed session failure emits once, then None.
+    /// An idle physical disconnect is not a furpc Channel closure notification.
     pub async fn recv(&mut self) -> Option<NotificationResult<ServiceNotification>> {
-        // A known transport failure takes priority over buffered updates even
-        // when the worker has not yet been scheduled to observe driver exit.
-        if let Some(error) = self.session.channel.terminal_error() {
-            self.session.fail(error);
-        }
         self.session.receiver.recv().await
     }
 
-    /// Stop mutations, deregister under one deadline, and await owned task/socket exit.
-    /// Socket shutdown still proceeds if cleanup fails or times out.
+    /// Unregister filters under one deadline, stop the worker and release its Channel.
+    /// This does not join furpc's physical connection teardown or revoke outside clones.
     pub async fn close(mut self, timeout: Option<Duration>) -> NotificationResult<()> {
         let deadline = match deadline_after(timeout.unwrap_or(self.session.timeout)) {
             Ok(deadline) => deadline,
@@ -529,46 +511,41 @@ impl ServiceNotificationClient {
             match timeout_at(deadline, &mut *worker).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
-                    self.session
-                        .fail(Error::Protocol("notification worker failed"));
-                    result = Err(Error::Protocol("notification worker failed").into());
+                    let error = FurpcClientError::Protocol("notification worker failed");
+                    self.session.fail(error.clone());
+                    result = Err(error.into());
                 }
                 Err(_) => {
-                    self.session.fail(Error::Timeout);
+                    let error = furpc::Error::Timeout("notification close");
+                    self.session.fail(error.clone());
                     if worker.await.is_err() {
                         self.session
                             .receiver
-                            .fail(Error::Protocol("notification worker failed").into());
+                            .fail(FurpcClientError::Protocol("notification worker failed").into());
                     }
-                    result = Err(Error::Timeout.into());
+                    result = Err(error.into());
                 }
             }
         }
         self.worker = None;
-        self.session
-            .channel
-            .close(teardown_deadline())
-            .await
-            .map_err(|error| self.session.receiver.common_error(error))?;
         if let Some(error) = self.session.receiver.error() {
             return Err(error);
         }
         result
     }
+
     async fn join(&mut self) {
         if let Some(worker) = self.worker.as_mut() {
             if worker.await.is_err() {
                 self.session
                     .receiver
-                    .fail(Error::Protocol("notification worker failed").into());
+                    .fail(FurpcClientError::Protocol("notification worker failed").into());
             }
         }
         self.worker = None;
-        if let Err(error) = self.session.channel.close(teardown_deadline()).await {
-            self.session.receiver.fail(error.into());
-        }
     }
 }
+
 impl Drop for ServiceNotificationClient {
     fn drop(&mut self) {
         self.session.stop();
@@ -587,20 +564,25 @@ pub struct ServiceNotificationRegistration {
     id: u64,
     armed: bool,
 }
+
 impl ServiceNotificationRegistration {
-    /// Consume the guard and await confirmation, without a second destructor cleanup.
     pub async fn unregister(mut self, timeout: Option<Duration>) -> NotificationResult<()> {
-        let session = self.session.upgrade().ok_or(Error::Closed)?;
+        let session = self.session.upgrade().ok_or(furpc::Error::Closed)?;
         let deadline = deadline_after(timeout.unwrap_or(session.timeout))?;
         let (sender, receiver) = oneshot::channel();
         session.enqueue(self.id, deadline, Some(sender))?;
         self.armed = false;
         timeout_at(deadline, receiver)
             .await
-            .map_err(|_| session.receiver.common_error(Error::Timeout))?
-            .map_err(|_| session.receiver.common_error(Error::Closed))?
+            .map_err(|_| {
+                session
+                    .receiver
+                    .common_error(furpc::Error::Timeout("notification unregister"))
+            })?
+            .map_err(|_| session.receiver.common_error(furpc::Error::Closed))?
     }
 }
+
 impl Drop for ServiceNotificationRegistration {
     fn drop(&mut self) {
         if self.armed {
@@ -610,170 +592,260 @@ impl Drop for ServiceNotificationRegistration {
         }
     }
 }
+
+type TrackedAttempt = Arc<Mutex<Option<Attempt>>>;
+
 struct Mutation {
     session: Weak<Session>,
     id: u64,
-    sent: Option<RequestCancellation>,
+    attempt: TrackedAttempt,
     armed: bool,
 }
+
 impl Drop for Mutation {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
         if let Some(session) = self.session.upgrade() {
-            if self.sent.as_ref().is_some_and(|sent| !sent.cancel_unsent()) {
-                session.fail(Error::Protocol(
-                    "notification registration outcome is uncertain",
-                ));
-            } else {
-                session.state.lock().unwrap().filters.remove(&self.id);
+            let attempt = self.attempt.lock().unwrap();
+            if let Some(attempt) = attempt.as_ref() {
+                attempt.cancel_uncommitted();
+                if matches!(
+                    attempt.disposition(),
+                    AttemptDisposition::Committed
+                        | AttemptDisposition::LocallyWritten
+                        | AttemptDisposition::Retired { committed: true }
+                ) {
+                    session.fail(FurpcClientError::Protocol(
+                        "notification registration outcome is uncertain",
+                    ));
+                    return;
+                }
             }
+            session.state.lock().unwrap().filters.remove(&self.id);
         }
     }
 }
+
 struct Candidate {
-    channel: GatewayChannel,
+    session: Arc<Session>,
     armed: bool,
 }
+
 impl Drop for Candidate {
     fn drop(&mut self) {
         if self.armed {
-            self.channel.abort();
+            self.session.stop();
         }
     }
 }
+
 struct WorkerExit(Arc<Session>);
 impl Drop for WorkerExit {
     fn drop(&mut self) {
-        self.0
-            .fail(Error::Protocol("notification worker stopped unexpectedly"));
-    }
-}
-fn notification_limits() -> ChannelLimits {
-    ChannelLimits {
-        max_ingress: MAX_PAGES + 1,
-        max_retained_bytes: 2 * 1024 * 1024 * 1024,
-        ..ChannelLimits::default()
+        self.0.fail(FurpcClientError::Protocol(
+            "notification worker stopped unexpectedly",
+        ));
     }
 }
 
-fn teardown_deadline() -> Instant {
-    Instant::now() + MAX_FRAME_TIME + Duration::from_secs(1)
+struct SessionTransport {
+    peer: Peer,
+    attempt: Option<TrackedAttempt>,
 }
 
-fn request_message(action: &str, body: Vec<u8>, deadline: Instant) -> Result<Message> {
-    let ticks = i64::try_from(
-        deadline
-            .saturating_duration_since(Instant::now())
-            .as_nanos()
-            / 100,
-    )
-    .map_err(|_| Error::InvalidInput("notification timeout too large"))?;
-    Ok(Message {
-        headers: vec![
-            Header::actor(5)?,
-            Header::action(action)?,
-            Header::activity(Uuid::new_v4().to_bytes_le())?,
-            Header::version(1, 1)?,
-            Header::boolean(HIGH_PRIORITY, true)?,
-            Header::timeout(ticks)?,
-        ],
-        body,
-    })
-}
+impl Service<Request<Body>> for SessionTransport {
+    type Response = Response<Body>;
+    type Error = furpc::Error;
+    type Future = Operation<Response<Body>>;
 
-fn decode_reply<T>(
-    channel: &GatewayChannel,
-    result: Result<Message>,
-    decode: fn(Message) -> Result<T>,
-) -> Result<T> {
-    let result = result.and_then(decode);
-    if let Err(error @ Error::Protocol(_)) = &result {
-        channel.abort_with_error(error.clone());
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<furpc::Result<()>> {
+        Poll::Ready(Ok(()))
     }
-    result
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let deadline = request.deadline().expect("RpcClient supplies the deadline");
+        let operation = self.peer.request(request, deadline);
+        if let Some(attempt) = &self.attempt {
+            *attempt.lock().unwrap() = Some(operation.attempt());
+        }
+        operation
+    }
 }
 
-async fn request<T>(
-    channel: &GatewayChannel,
-    target: &GatewayTarget,
-    action: &str,
-    body: Vec<u8>,
+async fn request<I, O>(
+    session: &Session,
+    action: &'static str,
+    body: I,
     deadline: Instant,
-    decode: fn(Message) -> Result<T>,
-) -> Result<T> {
-    let message = request_message(action, body, deadline)?;
-    decode_reply(
-        channel,
-        channel.request(target, message, deadline).await,
-        decode,
+    validate: fn(&Response<Body>) -> std::result::Result<(), FurpcClientError>,
+    attempt: Option<TrackedAttempt>,
+) -> std::result::Result<O, FurpcClientError>
+where
+    I: Serialize + Send,
+    O: DeserializeOwned + Send,
+{
+    let response = FurpcClient::new(SessionTransport {
+        peer: session.peer.clone(),
+        attempt,
+    })
+    .unary(
+        Request::new(body).append_header(priority()?)?,
+        FubstCodec::<I, O>::default(),
+        action,
+        validate,
+        deadline,
     )
+    .await?;
+    Ok(response.into_body())
 }
 
-fn stage(
-    envelope: IncomingMessage<GatewayTarget>,
-    pages: &mpsc::Sender<Incoming>,
-    receiver: &Receiver,
-) -> NotificationResult<()> {
-    let result = (|| {
-        // Conservative fixed allowance includes the private native context.
-        let bytes = envelope
-            .message
-            .body
-            .capacity()
-            .checked_add(std::mem::size_of::<Incoming>() + 256)
-            .ok_or(NotificationError::ResourceLimit(
-                "notification ingress allocation",
-            ))?;
-        let memory = receiver.budget.reserve(bytes)?;
-        let context = envelope
-            .reply
-            .ok_or(Error::Protocol("notification reply authority missing"))?;
-        pages
-            .try_send(Incoming {
-                body: envelope.message.body,
-                context,
-                memory,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => {
-                    NotificationError::ResourceLimit("notification page queue")
-                }
-                mpsc::error::TrySendError::Closed(_) => Error::Closed.into(),
-            })
-    })();
-    if let Err(error) = &result {
-        receiver.fail(error.clone());
+#[derive(Serialize)]
+struct Priority {
+    high: bool,
+}
+
+fn priority() -> furpc::Result<HeaderRecord> {
+    HeaderRecord::native(header::HIGH_PRIORITY, &Priority { high: true })
+}
+
+fn deadline_after(timeout: Duration) -> furpc::Result<Instant> {
+    if timeout.is_zero() {
+        return Err(furpc::Error::InvalidInput(
+            "notification timeout must be positive",
+        ));
     }
-    result
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or(furpc::Error::InvalidInput("notification timeout too large"))
 }
 
-async fn stage_loop(session: Arc<Session>, native: GatewayReceiver, pages: mpsc::Sender<Incoming>) {
-    loop {
-        // This deadline bounds only a local idle receive observer, not session
-        // lifetime; expiry consumes no ingress and is retried without replay.
-        match native.receive(Instant::now() + MAX_FRAME_TIME).await {
-            Ok(envelope) => {
-                if let Err(error) = stage(envelope, &pages, &session.receiver) {
-                    session.fail(error);
-                    break;
+fn check_notification(headers: &Headers, _: &Source) -> furpc::Result<()> {
+    let common = headers.effective();
+    if common.actor.get() != 5
+        || !common
+            .action()
+            .iter()
+            .copied()
+            .eq("ServiceNotificationRequest".encode_utf16())
+        || common.message_id == furpc::MessageId::default()
+        || common.relates_to != furpc::MessageId::default()
+        || !common.expects_reply
+        || !common.uncorrelated_reply
+        || common.fault.code != 0
+    {
+        return Err(furpc::Error::Protocol(
+            "unauthorized native notification envelope",
+        ));
+    }
+    Ok(())
+}
+
+fn check_acknowledgment(headers: &Headers, _: &Source) -> furpc::Result<()> {
+    let common = headers.effective();
+    if common.actor.get() != 5
+        || !common
+            .action()
+            .iter()
+            .copied()
+            .eq("ServiceNotificationReply".encode_utf16())
+    {
+        return Err(furpc::Error::Protocol("unauthorized notification response"));
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct NotificationIngress {
+    session: Weak<Session>,
+}
+
+impl Service<Request<Body>> for NotificationIngress {
+    type Response = IngressResponse;
+    type Error = furpc::Error;
+    type Future = Pin<Box<dyn Future<Output = furpc::Result<IngressResponse>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<furpc::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let session = self.session.clone();
+        Box::pin(async move {
+            let session = session.upgrade().ok_or(furpc::Error::Closed)?;
+            let mut guard = IngressCall {
+                session: session.clone(),
+                armed: true,
+            };
+            let result = async {
+                if request
+                    .context()
+                    .map(|context| context.source().generation())
+                    != Some(session.peer.info().generation)
+                {
+                    return Err(furpc::Error::Protocol(
+                        "notification session generation changed",
+                    ));
                 }
+                furpc::server::Rpc::new(FubstCodec::<wire::Status, wire::PageBody>::default())
+                    .unary(PageHandler(session.clone()), request)
+                    .await
             }
-            Err(Error::Timeout) => continue,
-            Err(error) => {
-                session.fail(session.channel.terminal_error().unwrap_or(error));
-                break;
+            .await;
+            guard.armed = false;
+            if let Err(error) = &result {
+                session.fail(
+                    session
+                        .receiver
+                        .common_error(FurpcClientError::from_rpc(error.clone())),
+                );
             }
+            result
+        })
+    }
+}
+
+struct IngressCall {
+    session: Arc<Session>,
+    armed: bool,
+}
+
+impl Drop for IngressCall {
+    fn drop(&mut self) {
+        if self.armed {
+            self.session.fail(furpc::Error::Cancelled);
         }
     }
 }
-async fn run(
-    session: Arc<Session>,
-    mut pages: mpsc::Receiver<Incoming>,
-    mut cleanups: mpsc::Receiver<Cleanup>,
-    mut progress: Progress,
-) {
+
+struct PageHandler(Arc<Session>);
+
+impl Service<Request<wire::PageBody>> for PageHandler {
+    type Response = Reply<wire::Status>;
+    type Error = NotificationError;
+    type Future = Pin<Box<dyn Future<Output = NotificationResult<Self::Response>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<NotificationResult<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<wire::PageBody>) -> Self::Future {
+        let session = self.0.clone();
+        Box::pin(async move {
+            if let Err(error) = session.process(request.into_body()).await {
+                session.fail(error.clone());
+                return Err(error);
+            }
+            Ok(Reply::new(wire::Status { error: 0 })
+                .append_header(header::actor(ActorId::new(5)?)?)?
+                .append_header(header::action("ServiceNotificationReply")?)?
+                .append_header(priority()?)?)
+        })
+    }
+}
+
+async fn run(session: Arc<Session>, _channel: Channel, mut cleanups: mpsc::Receiver<Cleanup>) {
     loop {
         {
             let state = session.state.lock().unwrap();
@@ -790,42 +862,45 @@ async fn run(
             biased;
             _ = session.wake.notified() => {}
             cleanup = cleanups.recv() => {
-                let Some(cleanup)=cleanup else { session.fail(Error::Closed); break; };
-                let body=to_vec(&wire::Unregister {client:&session.id,id:cleanup.id});
-                let result=(match body {
-                    Ok(body)=>request(&session.channel,&session.target,"UnregisterServiceNotificationFilterRequest",body,cleanup.deadline,wire::decode_unregistered).await,
-                    Err(error)=>Err(error.into()),
-                }).map_err(|error|session.receiver.common_error(error));
-                if result.is_ok() { session.state.lock().unwrap().filters.remove(&cleanup.id); }
-                if let Some(complete)=cleanup.complete { let _=complete.send(result.clone()); }
-                if let Err(error)=result { session.fail(error); break; }
-            }
-            incoming = pages.recv() => {
-                let Some(mut incoming)=incoming else { session.fail(Error::Closed); break; };
-                let decoded = wire::decode_page(&incoming.body, &mut |bytes| incoming.memory.grow(bytes));
-                // Release input before commit releases the page reservation;
-                // an ACK wait must not retain unaccounted raw page storage.
-                drop(incoming.body);
-                let result=decoded.and_then(|page|progress.commit(page,incoming.memory,&session.receiver));
-                if let Err(error)=&result { session.receiver.fail(error.clone()); }
-                let ack=match (wire::status(result.is_ok()),deadline_after(session.timeout)) {
-                    (Ok(body),Ok(deadline))=> {
-                        let message = (|| -> Result<Message> {
-                            Ok(Message {
-                                headers: vec![Header::actor(5)?, Header::action("ServiceNotificationReply")?, Header::boolean(HIGH_PRIORITY, true)?],
-                                body,
-                            })
-                        })();
-                        match message {
-                            Ok(message) => incoming.context.reply(message,deadline).await,
-                            Err(error) => Err(error),
-                        }
-                    },
-                    (Err(error),_)|(_,Err(error))=>Err(error),
-                }.map_err(|error|session.receiver.common_error(error));
-                if let Err(error)=result.and(ack) { session.fail(error); break; }
+                let Some(cleanup) = cleanup else {
+                    session.fail(furpc::Error::Closed);
+                    break;
+                };
+                let result = tokio::select! {
+                    biased;
+                    _ = stopped(&session) => Err(session.receiver.common_error(furpc::Error::Closed)),
+                    result = request::<_, ()>(
+                        &session,
+                        "UnregisterServiceNotificationFilterRequest",
+                        wire::Unregister { client: &session.id, id: cleanup.id },
+                        cleanup.deadline,
+                        wire::unregistered,
+                        None,
+                    ) => result.map_err(|error| session.receiver.common_error(error)),
+                };
+                if result.is_ok() {
+                    session.state.lock().unwrap().filters.remove(&cleanup.id);
+                }
+                if let Some(complete) = cleanup.complete {
+                    let _ = complete.send(result.clone());
+                }
+                if let Err(error) = result {
+                    session.fail(error);
+                    break;
+                }
             }
         }
     }
-    session.channel.abort();
+}
+
+async fn stopped(session: &Session) {
+    loop {
+        let wake = session.wake.notified();
+        tokio::pin!(wake);
+        wake.as_mut().enable();
+        if session.state.lock().unwrap().closed {
+            return;
+        }
+        wake.await;
+    }
 }

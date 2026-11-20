@@ -1,6 +1,16 @@
 use super::loss_proxy::LossProxy;
 use super::*;
 
+pub fn notification_evidence(event: &ServiceNotification) -> Value {
+    json!({
+        "name": event.service_name.as_str(), "partition_id": event.partition_id,
+        "kind": format!("{:?}", event.kind),
+        "endpoints": event.endpoints.iter().map(|endpoint| json!({
+            "address": endpoint.address, "role": format!("{:?}", endpoint.role),
+        })).collect::<Vec<_>>(),
+    })
+}
+
 pub fn endpoints(result: &ResolvedServicePartition, replicas: &[Value]) -> Result<()> {
     let mut native: Vec<_> = result
         .endpoints

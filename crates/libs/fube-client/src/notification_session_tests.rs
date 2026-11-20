@@ -5,32 +5,31 @@ fn scoped_errors_preserve_common_sources_cloning_and_domain_diagnostics() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<NotificationError>();
     for error in [
-        Error::Timeout,
-        Error::Remote {
+        FurpcClientError::Native(furpc::Error::Timeout("RPC")),
+        FurpcClientError::Domain(crate::DomainFailure {
             code: -7,
             message: "native failure".into(),
-        },
-        Error::ResourceLimit("shared decoder"),
-        Error::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "peer reset",
-        )),
+        }),
+        FurpcClientError::Native(furpc::Error::ResourceLimit("shared decoder")),
+        FurpcClientError::Decode(fubst::Error::Protocol("invalid notification body")),
     ] {
         let display = error.to_string();
         let scoped = NotificationError::from(error).clone();
         assert_eq!(scoped.to_string(), display);
         let source = std::error::Error::source(&scoped)
             .unwrap()
-            .downcast_ref::<Error>()
+            .downcast_ref::<FurpcClientError>()
             .unwrap();
         match source {
-            Error::Remote { code, message } => {
-                assert_eq!(*code, -7);
-                assert_eq!(message, "native failure");
+            FurpcClientError::Domain(failure) => {
+                assert_eq!(failure.code, -7);
+                assert_eq!(failure.message, "native failure");
             }
-            Error::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
-            Error::ResourceLimit(resource) => assert_eq!(*resource, "shared decoder"),
-            Error::Timeout => {}
+            FurpcClientError::Native(furpc::Error::ResourceLimit(resource)) => {
+                assert_eq!(*resource, "shared decoder")
+            }
+            FurpcClientError::Native(furpc::Error::Timeout("RPC")) => {}
+            FurpcClientError::Decode(fubst::Error::Protocol("invalid notification body")) => {}
             _ => panic!("unexpected common error"),
         }
     }
