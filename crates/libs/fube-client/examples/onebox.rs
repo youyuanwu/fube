@@ -3,9 +3,9 @@ use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use fube_client::{
     ApplicationDefinitionKindFilter, ApplicationListFilter, ApplicationQueryDescription,
-    ClientOptions, FabricClient, FurpcClient, HealthEventsFilter, NamingUri, NodeHealthPolicy,
-    NodeHealthQueryDescription, NodeHealthQueryParameters, NodeQueryDescription, Paging,
-    ServiceListFilter, ServiceQueryDescription, ServiceQueryParameters, DEFAULT_TIMEOUT,
+    FurpcClient, HealthEventsFilter, NamingUri, NodeHealthPolicy, NodeHealthQueryDescription,
+    NodeHealthQueryParameters, NodeQueryDescription, Paging, ServiceListFilter,
+    ServiceQueryDescription, ServiceQueryParameters, DEFAULT_TIMEOUT,
 };
 
 #[derive(Parser)]
@@ -250,35 +250,6 @@ impl From<Command> for Operation {
 async fn run(arguments: Arguments) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let timeout = arguments.timeout();
     let operation = Operation::from(arguments.command);
-    if matches!(
-        operation,
-        Operation::CreateName(_) | Operation::DeleteName(_)
-    ) {
-        let channel = FabricClient::endpoint_clear(arguments.clear)?
-            .connect_timeout(timeout)
-            .connect()
-            .await?;
-        let client = FabricClient::new(
-            channel,
-            ClientOptions {
-                default_timeout: timeout,
-                ..Default::default()
-            },
-        )?;
-        match operation {
-            Operation::CreateName(name) => {
-                client.create_name(&name, Some(timeout)).await?;
-                println!("created name={name}");
-            }
-            Operation::DeleteName(name) => {
-                client.delete_name(&name, Some(timeout)).await?;
-                println!("deleted name={name}");
-            }
-            _ => unreachable!(),
-        }
-        client.close().await?;
-        return Ok(());
-    }
     let channel = FurpcClient::endpoint_clear(arguments.clear)?
         .connect_timeout(timeout)
         .connect()
@@ -350,7 +321,18 @@ async fn run(arguments: Arguments) -> std::result::Result<(), Box<dyn std::error
                     .into_body()
             );
         }
-        Operation::CreateName(_) | Operation::DeleteName(_) => unreachable!(),
+        Operation::CreateName(name) => {
+            client
+                .create_name(furpc::Request::new(name.clone()), deadline)
+                .await?;
+            println!("created name={name}");
+        }
+        Operation::DeleteName(name) => {
+            client
+                .delete_name(furpc::Request::new(name.clone()), deadline)
+                .await?;
+            println!("deleted name={name}");
+        }
     }
     Ok(())
 }

@@ -10,12 +10,12 @@ have been demonstrated against the repository's Ubuntu onebox running
 Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
 
-**Client migration:** Ping, NameExists, cluster/topology/deployment
+**Client migration:** Ping, NameExists, CreateName/DeleteName, cluster/topology/deployment
 lists and node health are implemented only by `FurpcClient` over furpc. Their old `FabricClient`
-methods, `PingRequest`, Exists naming variant and legacy query `ClientRequest`
+methods, `PingRequest`, `NameRequest`/`NameOperation`/`NameResponse` and legacy query `ClientRequest`
 implementations have been removed. There is no compatibility wrapper or fallback.
 `FabricClient` and borrowed `GatewayClient` retain the legacy typed-call layer
-for naming writes, resolution and MovePrimary.
+for resolution and MovePrimary.
 ServiceNotificationClient owns its **own**
 notification-enabled GatewayChannel/native session; it does not adopt an
 ordinary client's channel or lifecycle. ImageStoreClient owns an independent
@@ -42,13 +42,16 @@ The fubst and furpc crates retain their own codec/transport tests.
 
 ### Separate furpc-backed client
 
-`FurpcClient` is the canonical implementation of twelve read-only native operations.
+`FurpcClient` is the canonical implementation of twelve read-only native operations
+and the two naming writes.
 The remaining `FabricClient` API does not expose these operations:
 
 | Method | Typed request body | Typed response body |
 |---|---|---|
 | `ping` | `()` (zero native bytes) | `GatewayDescription` |
 | `name_exists` | `NamingUri` | `bool` |
+| `create_name` | `NamingUri` | `()` (zero native bytes) |
+| `delete_name` | `NamingUri` | `()` (zero native bytes) |
 | `get_node_list` | `NodeQueryDescription` | `NodeListPage` |
 | `get_application_list` | `ApplicationQueryDescription` | `ApplicationListPage` |
 | `get_service_list` | `ServiceQueryDescription` | `ServiceListPage` |
@@ -104,7 +107,12 @@ the reply uses its native object schema. Nested unit values remain unsupported
 and empty structs retain native object framing.
 Gateway Actor, activity and protocol 1.1 remain method-owned native headers.
 NameExists sends the structured native NamingUri and requires NamingGateway's
-NameOperationReply. GetNodeList uses the shared native query envelope and typed
+NameOperationReply. CreateName/DeleteName reuse the same checked URI and reply
+envelope, but `FubstCodec<NamingUri, ()>` requires zero success-body bytes.
+DeleteName adds native explicit-delete header `0x8033` with `true`; creation
+does not add that header. These writes use the same deadline, source/settlement
+metadata and error path as the reads, without retry or replay.
+GetNodeList uses the shared native query envelope and typed
 node schema; aggregate Actor/Action headers are optional but checked when present.
 Query error codes remain domain failures, and malformed typed payloads or
 disagreeing repeated node IDs cannot be hidden behind a nonzero query error.
@@ -193,8 +201,15 @@ generation. The four deployment methods preserved missing-node error
 CI independently validated the actual list, topology, deployment and movement
 receipts, including entry-point statistics and native/REST timestamp-label mapping.
 
-Together with the earlier native runs, this qualifies these twelve initiating
-clear-TCP operations on the observed runtime, not furpc native notifications,
+The migrated native name-lifecycle archive also passed on a fresh five-node
+**11.8.121.4** onebox. Native create/delete and NameExists matched independent
+HTTP observations; duplicate **-2147017792** and missing **-2147017791** remained
+domain errors. All successful writes, reads and three concurrent cloned
+Ping/NameExists operations retained furpc generation **1**. The actual receipt
+passed `validate_furpc_names` after owned cleanup removed the name journal.
+
+Together with the earlier native runs, this qualifies twelve reads and two naming
+writes over initiating clear TCP on the observed runtime, not furpc native notifications,
 accepted-side serving, TLS, other gateway operations, or the rest of the migration.
 
 ### Remaining legacy client and operation inventory
@@ -202,7 +217,7 @@ accepted-side serving, TLS, other gateway operations, or the rest of the migrati
 `fube-transport` implements bounded Fabric serialization, clear frames and CRCs,
 ordered native headers, client-only ListenInstance establishment, and
 continuously driven, bounded concurrent Tokio request/reply I/O. `fube-client`
-retains single-name creation/deletion, with owned results and explicit errors.
+retains only MovePrimary and uncached service resolution as ordinary operations.
 All paged and unpaged list queries use furpc; their legacy methods,
 typed-request implementations and input-accounting adapters are retired.
 Uncached resolution and independent notification sessions add endpoint discovery
@@ -265,9 +280,11 @@ let client = FabricClient::new(channel.clone(), ClientOptions {
     ..ClientOptions::default()
 })?;
 let other = client.clone();
-let (created, deleted) = tokio::try_join!(
-    client.create_name("fabric:/First", None),
-    other.delete_name("fabric:/Second", Some(Duration::from_secs(5))),
+let name = "fabric:/Example/Service".parse()?;
+let key = fube_client::PartitionKey::Singleton;
+let (first, second) = tokio::try_join!(
+    client.resolve_service_partition(&name, &key, None, None),
+    other.resolve_service_partition(&name, &key, None, Some(Duration::from_secs(5))),
 )?;
 channel.close(deadline_after(Duration::from_secs(30))?).await?;
 # Ok(())
@@ -409,9 +426,11 @@ let endpoint = "127.0.0.1:19000".parse().expect("IP socket endpoint");
 let channel = FabricClient::endpoint_clear(endpoint)?.connect().await?;
 let client = FabricClient::new(channel, ClientOptions::default())?;
 let clone = client.clone();
-let (created, deleted) = tokio::try_join!(
-    client.create_name("fabric:/First", None),
-    clone.delete_name("fabric:/Second", None),
+let name = "fabric:/Example/Service".parse()?;
+let key = fube_client::PartitionKey::Singleton;
+let (first, second) = tokio::try_join!(
+    client.resolve_service_partition(&name, &key, None, None),
+    clone.resolve_service_partition(&name, &key, None, None),
 )?;
 client.close().await?;
 # Ok(())
@@ -425,7 +444,7 @@ local resource error; there is no admission-waiter queue. Default lifetime
 identity history is **4096**, including the handshake; exhaustion terminates
 the channel without automatic reconnect, retry or replay.
 
-Ordinary methods return `ClientResult<T>` / `ClientError<DomainFailure>`:
+Remaining legacy methods return `ClientResult<T>` / `ClientError<DomainFailure>`:
 `Local(Error)` for preparation/budget, `Transport(Error)` for RPC including
 Fault, `Protocol(&'static str)` for malformed/mismatched required domain data,
 and `Domain { code, message }` for valid native operation failure. Connect/close
@@ -435,26 +454,30 @@ conversions or old-Connection compatibility wrappers.
 The shared `Client::call` future is lazy and owns a sealed `ClientRequest`.
 Preparation, admission and I/O begin on first poll. `GatewayClient::new` borrows
 an explicitly supplied channel/target; it does not clone/adopt/close an external
-owner. Concrete query descriptions, PingRequest, NameRequest and
-ResolutionRequest use existing codecs. Resolution retains owned selection and
+owner. MovePrimary's query description and ResolutionRequest use existing
+codecs. Resolution retains owned selection and
 minimal previous refresh metadata, never a cloned endpoint cache.
 
-Every remote operation takes a final `timeout: Option<Duration>` argument.
+Every remaining legacy operation takes a final `timeout: Option<Duration>` argument.
 `None` uses `ClientOptions::default_timeout`; `Some(duration)` overrides
-it for that call, including `ping` and `name_exists`. `None` does **not** mean
+it for that call. `None` does **not** mean
 infinite. Explicit durations must satisfy the same finite positive bounds as
 the configured default. There are no separate `_with_timeout` methods.
 
-`create_name(name, timeout)` and `delete_name(name, timeout)` return owned
-`ClientResult<()>` and use one deadline calculated **before URI preparation**, through
-admission and reply decoding. Both reuse the existing bounded URI encoder and
-shared driver; the supported URI grammar is unchanged.
+`FurpcClient::create_name(Request<NamingUri>, deadline)` and `delete_name` return
+`Response<()>` through `FurpcClientError`, using the earlier explicit/request-local
+absolute deadline for encoding, readiness/reconnect, submission and receipt.
+Parse the checked URI before calling. Native on-time settlement remains on time
+when observed or decoded later; the old legacy post-decode deadline check is not
+reintroduced. Both use the shared native URI schema; the supported grammar is unchanged.
 For example, with a unique caller-owned name on a disposable cluster:
 
 ```rust,no_run
-# async fn write(client: &fube_client::FabricClient, owned_name: &str) -> fube_client::ClientResult<()> {
-client.create_name(owned_name, Some(std::time::Duration::from_secs(5))).await?;
-client.delete_name(owned_name, None).await?;
+# async fn write(client: &mut fube_client::FurpcClient, owned_name: fube_client::NamingUri) -> Result<(), fube_client::FurpcClientError> {
+let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+client.create_name(furpc::Request::new(owned_name.clone()), deadline).await?;
+let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+client.delete_name(furpc::Request::new(owned_name), deadline).await?;
 # Ok(())
 # }
 ```
@@ -464,7 +487,7 @@ an already **explicitly created** name returns native `FABRIC_E_NAME_ALREADY_EXI
 (-2147017792), not an idempotent success. Deleting an absent name returns
 `FABRIC_E_NAME_DOES_NOT_EXIST` (-2147017791). Deletion is not recursive and can
 reject a nonempty name; the service may remove empty implicit ancestors.
-Native body codes/diagnostics remain `ClientError::Domain`, operation-local
+Native body codes/diagnostics remain `FurpcClientError::Domain`, operation-local
 when the stream is healthy. Write success has an empty body, unlike NameExists
 despite their shared reply action.
 
@@ -473,12 +496,12 @@ disconnect after sending **does not establish that the write failed to execute**
 replication may commit after local waiting stops. Dropping the future or closing
 the connection does not roll back a sent write.
 
-Implementation: [write facade](../../crates/libs/fube-client/src/lib.rs#L85-L136)
-and [empty-success decoder](../../crates/libs/fube-client/src/protocol.rs#L165-L171).
+Implementation: [typed stub](../../crates/libs/fube-client/src/furpc_client.rs)
+and [empty-root codec](../../crates/libs/furpc/src/codec.rs).
 Native contract: [public request construction](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/client/FabricClientImpl.cpp#L6881-L6976)
 and [gateway create reply](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/EntreeService.CreateNameAsyncOperation.cpp#L24-L49).
 
-Each operation has one local monotonic deadline covering encoding, sending,
+The remaining legacy operations below have one local monotonic deadline covering encoding, sending,
 control dispatch, receiving, and result decoding. Replies match both message
 GUID and index. Unknown, duplicate, and late replies cannot complete another
 operation; their bodies are discarded and a saturating diagnostic count is
@@ -1501,11 +1524,11 @@ structured URI object. Application/service result `name` fields,
 These field/constructor changes require callers to parse their names explicitly;
 Names remain strings in query JSON, with invalid names rejected earlier; the
 query-field JSON migration is described above.
-Legacy naming writes accept `impl AsRef<str>`. NameExists instead requires
-`FurpcClient::name_exists(Request::new(name), deadline)` with a checked `NamingUri`.
+All three naming methods require a checked `NamingUri` in `furpc::Request`,
+with an absolute deadline. There are no legacy string-convenience write methods.
 
 The limits below belong to the remaining legacy transport/adapters, not the
-migrated furpc reads, which use their native frame/codec limits.
+migrated furpc operations, which use their native frame/codec limits.
 
 | Resource | Limit |
 |---|---:|
@@ -2062,7 +2085,7 @@ records that proof **before any native mutation**. An existing candidate is
 never adopted or deleted. Existing journals are never overwritten, including
 same-owner unresolved writes.
 
-On one shared native client it confirms initial absence, creates the name,
+On one shared `FurpcClient` it confirms initial absence, creates the name,
 checks HTTP/native presence, requires duplicate-create error -2147017792 and
 healthy reuse, deletes the name, checks HTTP/native absence, then requires
 missing-delete error -2147017791 and healthy reuse/ping. Management HTTP is only
@@ -2084,11 +2107,20 @@ in-process cleanup; exact-allocation always-run teardown remains essential.
 
 `MSSF_NAME_REPORT` is written only after settled owned cleanup succeeds. It
 records independent lifecycle observations, native results/error codes,
-same-client reuse, runtime and archive identity. Keep journals private/ignored;
+same-client reuse, runtime and archive identity. Its required `furpc` section
+records the original source generation, native duplicate/missing error origins,
+independent HTTP presence/absence, three concurrent Ping/NameExists operations
+after errors, and observation timestamps. Every successful write and read checks
+the original generation. CI validates this receipt and binds its observation
+window as `furpc_naming_writes`. Keep journals private/ignored;
 after exact destruction, remove private profiles and extracted consumers.
 Never use these fixtures on a shared cluster.
 
-The native-name archive qualified on **11.8.121.4**, five logical nodes in one
+The current furpc name archive passed this lifecycle and the independent receipt
+validator on **11.8.121.4**, retaining generation 1 through native errors, write
+reuse and concurrent cloned reads. It did not rerun the other native scenarios.
+
+The earlier legacy native-name archive qualified on **11.8.121.4**, five logical nodes in one
 Ubuntu container, with **119 offline tests and all three live group scenarios**.
 Offline tests cover exact requests, call-local malformed-domain rejection, concurrent
 reordering, peer-observed cancellation/timeouts without replay, partial setup,

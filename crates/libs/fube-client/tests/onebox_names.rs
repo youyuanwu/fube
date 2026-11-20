@@ -1,7 +1,7 @@
 //! Self-contained native writes; HTTP observes and cleans only the pre-owned name.
-use std::{path::Path, time::Duration};
+use std::path::Path;
 
-use fube_client::{ClientError, ClientOptions, DomainFailure, Error, FabricClient};
+use fube_client::{DomainFailure, FurpcClient, FurpcClientError};
 use serde_json::{json, Value};
 
 #[path = "support/name_oracle.rs"]
@@ -15,29 +15,34 @@ mod furpc_support;
 mod rest;
 
 async fn mutate(
-    client: &FabricClient,
+    client: &mut FurpcClient,
+    generation: u64,
     journal: &mut Journal,
     path: &Path,
     delete: bool,
     expected_error: Option<i64>,
-) -> Result<Option<i64>> {
+) -> Result<Option<(i64, &'static str)>> {
+    let request = furpc::Request::new(journal.name.parse()?);
     journal.record(path, Stage::Pending)?;
     let outcome = if delete {
-        client
-            .delete_name(&journal.name, Some(Duration::from_secs(30)))
-            .await
+        client.delete_name(request, furpc_support::deadline()).await
     } else {
-        client.create_name(&journal.name, None).await
+        client.create_name(request, furpc_support::deadline()).await
     };
-    settle(journal, path, outcome, expected_error)
+    settle(
+        journal,
+        path,
+        outcome.map(|response| furpc_support::body(response, generation)),
+        expected_error,
+    )
 }
 
 fn settle(
     journal: &mut Journal,
     path: &Path,
-    outcome: fube_client::ClientResult<()>,
+    outcome: std::result::Result<(), FurpcClientError>,
     expected_error: Option<i64>,
-) -> Result<Option<i64>> {
+) -> Result<Option<(i64, &'static str)>> {
     // Unknown errors deliberately keep Pending, including timeout/cancel/disconnect.
     // Even an observed absence cannot prove an abandoned create will not commit later.
     match outcome {
@@ -50,14 +55,20 @@ fn settle(
             }
             Ok(None)
         }
-        Err(
-            ClientError::Domain(DomainFailure { code, .. })
-            | ClientError::Transport(Error::Remote { code, .. }),
-        ) if Some(code) == expected_error && (code == DUPLICATE || code == MISSING) => {
+        Err(error) => {
+            let (code, origin) = match &error {
+                FurpcClientError::Domain(failure) => (failure.code, "domain"),
+                FurpcClientError::Native(furpc::Error::RemoteFault(fault)) => {
+                    (fault.code(), "native_fault")
+                }
+                _ => return Err(error.into()),
+            };
+            if Some(code) != expected_error || (code != DUPLICATE && code != MISSING) {
+                return Err(error.into());
+            }
             journal.record(path, Stage::Settled)?;
-            Ok(Some(code))
+            Ok(Some((code, origin)))
         }
-        Err(error) => Err(error.into()),
     }
 }
 
@@ -77,66 +88,86 @@ async fn lifecycle() -> Result<Value> {
     let mut journal = Journal::new(owner()?, std::env::var("MSSF_TEST_ARCHIVE_SHA256")?)?;
     journal.reserve(&path)?;
     confirm_absent(&mut journal, &path, &http).await?;
-    let channel = FabricClient::endpoint_clear("127.0.0.1:19000".parse()?)?
-        .connect_timeout(Duration::from_secs(30))
-        .connect()
-        .await?;
-    let client = FabricClient::new(
-        channel,
-        ClientOptions {
-            default_timeout: Duration::from_secs(30),
-            ..Default::default()
-        },
-    )?;
-    let (mut reads, generation) = furpc_support::connect("127.0.0.1:19000").await?;
+    let native_start_ms = furpc_support::now_ms();
+    let (mut client, generation) = furpc_support::connect("127.0.0.1:19000").await?;
     let name: fube_client::NamingUri = journal.name.parse()?;
     assert!(!furpc_support::body(
-        reads
+        client
             .name_exists(furpc::Request::new(name.clone()), furpc_support::deadline())
             .await?,
         generation
     ));
-    mutate(&client, &mut journal, &path, false, None).await?;
-    assert!(http.exists(&journal.name).await?);
+    mutate(&mut client, generation, &mut journal, &path, false, None).await?;
+    let http_present_after_create = http.exists(&journal.name).await?;
+    assert!(http_present_after_create);
     assert!(furpc_support::body(
-        reads
+        client
             .name_exists(furpc::Request::new(name.clone()), furpc_support::deadline())
             .await?,
         generation
     ));
-    let duplicate = mutate(&client, &mut journal, &path, false, Some(DUPLICATE)).await?;
-    assert!(!client.is_closed());
+    let (duplicate, duplicate_origin) = mutate(
+        &mut client,
+        generation,
+        &mut journal,
+        &path,
+        false,
+        Some(DUPLICATE),
+    )
+    .await?
+    .ok_or("duplicate create did not return a native error")?;
     assert!(furpc_support::body(
-        reads
+        client
             .name_exists(furpc::Request::new(name.clone()), furpc_support::deadline())
             .await?,
         generation
     ));
-    mutate(&client, &mut journal, &path, true, None).await?;
-    assert!(!http.exists(&journal.name).await?);
+    mutate(&mut client, generation, &mut journal, &path, true, None).await?;
+    let http_present_after_delete = http.exists(&journal.name).await?;
+    assert!(!http_present_after_delete);
     assert!(!furpc_support::body(
-        reads
+        client
             .name_exists(furpc::Request::new(name.clone()), furpc_support::deadline())
             .await?,
         generation
     ));
-    let missing = mutate(&client, &mut journal, &path, true, Some(MISSING)).await?;
-    assert!(!client.is_closed());
-    mutate(&client, &mut journal, &path, false, None).await?;
-    mutate(&client, &mut journal, &path, true, None).await?;
+    let (missing, missing_origin) = mutate(
+        &mut client,
+        generation,
+        &mut journal,
+        &path,
+        true,
+        Some(MISSING),
+    )
+    .await?
+    .ok_or("missing delete did not return a native error")?;
+    let mut ping = client.clone();
+    let mut exists = client.clone();
+    let deadline = furpc_support::deadline();
+    let (first, gateway, second) = tokio::try_join!(
+        client.name_exists(furpc::Request::new(name.clone()), deadline),
+        ping.ping(furpc::Request::new(()), deadline),
+        exists.name_exists(furpc::Request::new(name.clone()), deadline),
+    )?;
+    assert!(!furpc_support::body(first, generation));
+    furpc_support::body(gateway, generation);
+    assert!(!furpc_support::body(second, generation));
+    mutate(&mut client, generation, &mut journal, &path, false, None).await?;
+    mutate(&mut client, generation, &mut journal, &path, true, None).await?;
     assert!(!furpc_support::body(
-        reads
+        client
             .name_exists(furpc::Request::new(name), furpc_support::deadline())
             .await?,
         generation
     ));
     furpc_support::body(
-        reads
+        client
             .ping(furpc::Request::new(()), furpc_support::deadline())
             .await?,
         generation,
     );
-    client.close().await?;
+    let final_http_present = http.exists(&journal.name).await?;
+    assert!(!final_http_present);
     Ok(json!({
         "profile": "clear",
         "runtime_version": runtime,
@@ -152,6 +183,18 @@ async fn lifecycle() -> Result<Value> {
         "missing_delete_code": missing,
         "reuse_after_missing": true,
         "writes_share_native_client": true,
+        "furpc": {
+            "generation": generation,
+            "same_generation_after_error": true,
+            "mixed_concurrent_operations": 3,
+            "duplicate_error_origin": duplicate_origin,
+            "missing_error_origin": missing_origin,
+            "http_present_after_create": http_present_after_create,
+            "http_present_after_delete": http_present_after_delete,
+            "final_http_present": final_http_present,
+            "native_start_ms": native_start_ms,
+            "native_end_ms": furpc_support::now_ms(),
+        },
     }))
 }
 
@@ -181,7 +224,7 @@ fn only_conclusive_success_or_expected_native_rejections_settle_ownership() {
     }
     for (outcome, expected, settled, accepted) in [
         (
-            Err(ClientError::Domain(DomainFailure {
+            Err(FurpcClientError::Domain(DomainFailure {
                 code: DUPLICATE,
                 message: "unexpected duplicate".into(),
             })),
@@ -190,7 +233,7 @@ fn only_conclusive_success_or_expected_native_rejections_settle_ownership() {
             false,
         ),
         (
-            Err(ClientError::Domain(DomainFailure {
+            Err(FurpcClientError::Domain(DomainFailure {
                 code: MISSING,
                 message: "wrong rejection".into(),
             })),
@@ -199,19 +242,27 @@ fn only_conclusive_success_or_expected_native_rejections_settle_ownership() {
             false,
         ),
         (
-            Err(ClientError::Transport(Error::Timeout)),
+            Err(FurpcClientError::Native(furpc::Error::Timeout("gateway"))),
             None,
             false,
             false,
         ),
         (
-            Err(ClientError::Protocol("malformed success")),
+            Err(FurpcClientError::Protocol("malformed success")),
             None,
             false,
             false,
         ),
         (
-            Err(ClientError::Domain(DomainFailure {
+            Err(FurpcClientError::Decode(fubst::Error::Protocol(
+                "nonempty name write success",
+            ))),
+            None,
+            false,
+            false,
+        ),
+        (
+            Err(FurpcClientError::Domain(DomainFailure {
                 code: DUPLICATE,
                 message: "expected duplicate".into(),
             })),
@@ -220,7 +271,7 @@ fn only_conclusive_success_or_expected_native_rejections_settle_ownership() {
             true,
         ),
         (
-            Err(ClientError::Transport(Error::Remote {
+            Err(FurpcClientError::Domain(DomainFailure {
                 code: MISSING,
                 message: "expected missing".into(),
             })),

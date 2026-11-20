@@ -7,9 +7,9 @@ recorded SF 11.8.121.4 coverage and explicit limitations. This does not complete
 the TLS/authentication/recovery requirements below.
 
 **Current API split:** this broader design is not the current façade contract.
-Migrated Ping, NameExists, cluster/topology/deployment lists and node health exist
+Migrated Ping, all three naming methods, cluster/topology/deployment lists and node health exist
 only on `FurpcClient` over furpc; their legacy methods and typed-request adapters
-have been removed. `FabricClient` remains for unmigrated operations. Proposed
+have been removed. `FabricClient` remains for MovePrimary and resolution. Proposed
 builder examples below are not compatibility wrappers; see the linked subset
 guide for current typed requests and absolute deadlines.
 
@@ -389,7 +389,7 @@ not structural deserialization, rejects Invalid kind and stateless persistence.
 adapter on their existing raw-byte fields; no parallel transport records remain.
 `NamingUri` is a checked semantic type with a private native component schema,
 not an arbitrary String. Naming query fields and application/service result
-names use it; string naming-call convenience remains supported. Names remain
+names use it; naming methods take checked values in furpc Requests. Names remain
 JSON strings, with invalid names rejected on construction/deserialization.
 Request structs directly declare native query names, flattened selectors,
 omissions, numeric masks and embedded JSON through stock Serde attributes and

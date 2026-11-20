@@ -338,60 +338,6 @@ fn decode_domain<T>(
     decoded(domain_failure(reply).and_then(|()| decode(reply)))
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum NameOperation {
-    Create,
-    Delete,
-}
-/// Checked naming input. Wire preparation occurs only inside the typed call.
-#[derive(Debug, Clone)]
-pub struct NameRequest {
-    pub name: NamingUri,
-    pub operation: NameOperation,
-}
-impl sealed::Request for NameRequest {
-    fn input_bytes(&self) -> usize {
-        size_of::<Self>() + self.name.capacity()
-    }
-}
-/// Successful completion of an explicit naming write.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NameResponse {
-    Written,
-}
-impl ClientRequest for NameRequest {
-    type Response = NameResponse;
-    type ReplyState = ();
-    type DomainError = DomainFailure;
-    fn encode(self, context: &CallContext) -> Result<(Message, ())> {
-        let (action, headers) = match self.operation {
-            NameOperation::Create => ("CreateNameRequest", vec![]),
-            NameOperation::Delete => (
-                "DeleteNameRequest",
-                vec![Header::boolean(protocol::DELETE_NAME_HEADER, true)?],
-            ),
-        };
-        Ok((
-            wire(
-                action,
-                headers,
-                protocol::encode_name(self.name.as_str())?,
-                context,
-            )?,
-            (),
-        ))
-    }
-    fn decode(
-        _: (),
-        reply: Message,
-        _: &CallContext,
-    ) -> std::result::Result<NameResponse, ReplyError<DomainFailure>> {
-        decode_domain(&reply, |reply| {
-            protocol::decode_name_write(reply).map(|()| NameResponse::Written)
-        })
-    }
-}
-
 impl sealed::Request for QueryDescription<movement::MovePrimary> {
     fn input_bytes(&self) -> usize {
         size_of::<Self>() + self.parameters.target.capacity()

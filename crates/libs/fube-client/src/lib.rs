@@ -4,8 +4,8 @@
 //! Existing [`FabricClient`] connections support bounded concurrency without
 //! automatic reconnect. The separate [`FurpcClient`] is a typed stub over a
 //! byte-facing Tower service, defaulting to furpc's Channel, and provides Ping,
-//! NameExists, single-page cluster/topology/deployment lists and node health.
-//! These reads are no longer available on FabricClient or its ClientRequest
+//! naming operations, single-page cluster/topology/deployment lists and node health.
+//! These operations are no longer available on FabricClient or its ClientRequest
 //! adapters. FabricClient retains the remaining, unmigrated operations.
 //! Native connections require an explicitly selected unsecured development gateway.
 
@@ -110,8 +110,8 @@ pub struct GatewayDescription {
 
 /// Cloneable client for the native clear-TCP development profile.
 ///
-/// Legacy implementation for naming writes, MovePrimary and service resolution.
-/// Migrated reads use [`FurpcClient`] only.
+/// Legacy implementation for MovePrimary and service resolution.
+/// Migrated reads and naming writes use [`FurpcClient`] only.
 ///
 /// Clones explicitly share one Channel lifecycle owner, typed budget and terminal state.
 /// A [`GatewayClient`] instead borrows a supplied foundation without adopting it.
@@ -132,9 +132,11 @@ pub struct GatewayDescription {
 /// let channel = endpoint.connect().await?;
 /// let client = FabricClient::new(channel.clone(), ClientOptions::default())?;
 /// let cloned = client.clone(); // same typed admission budget, no new handshake
-/// let (created, deleted) = tokio::try_join!(
-///     client.create_name("fabric:/First", None),
-///     cloned.delete_name("fabric:/Second", Some(Duration::from_secs(5))),
+/// let name = "fabric:/Example/Service".parse()?;
+/// let key = fube_client::PartitionKey::Singleton;
+/// let (first, second) = tokio::try_join!(
+///     client.resolve_service_partition(&name, &key, None, None),
+///     cloned.resolve_service_partition(&name, &key, None, Some(Duration::from_secs(5))),
 /// )?;
 /// channel.close(deadline_after(DEFAULT_TIMEOUT)?).await?; // shared shutdown
 /// # Ok(())
@@ -188,50 +190,6 @@ impl FabricClient {
         .await
     }
 
-    /// Explicitly create a naming entry with one deadline from preparation through decode.
-    ///
-    /// Accepts a checked [`NamingUri`] or a string parsed before sending. Native
-    /// creation may create implicit ancestors or promote an implicit entry;
-    /// an already explicitly created entry returns a native error.
-    ///
-    /// No retry or replay occurs. After sending, timeout, cancellation or
-    /// disconnection can leave the write outcome unknown: stopping local
-    /// waiting does not prove that the name was not created.
-    pub async fn create_name(
-        &self,
-        name: impl AsRef<str>,
-        timeout: Option<Duration>,
-    ) -> ClientResult<()> {
-        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
-        let request = self.name_request(name.as_ref(), NameOperation::Create, deadline)?;
-        drop(name);
-        self.call(request, CallContext { deadline })
-            .await
-            .map(|_| ())
-    }
-
-    /// Explicitly delete one naming entry with one deadline from preparation through decode.
-    ///
-    /// Accepts a checked [`NamingUri`] or a string parsed before sending. This is not recursive:
-    /// native missing-name and nonempty-name failures remain errors. The service
-    /// may also remove empty implicit ancestors.
-    ///
-    /// No retry or replay occurs. After sending, timeout, cancellation or
-    /// disconnection can leave the write outcome unknown; none proves that
-    /// deletion did not execute. Native errors are not converted to success.
-    pub async fn delete_name(
-        &self,
-        name: impl AsRef<str>,
-        timeout: Option<Duration>,
-    ) -> ClientResult<()> {
-        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
-        let request = self.name_request(name.as_ref(), NameOperation::Delete, deadline)?;
-        drop(name);
-        self.call(request, CallContext { deadline })
-            .await
-            .map(|_| ())
-    }
-
     /// Close the shared connection and wait for the background driver to exit.
     /// Dropping one clone does not close the other handles.
     pub async fn close(&self) -> Result<()> {
@@ -275,17 +233,6 @@ impl FabricClient {
 
     fn deadline(&self, timeout: Option<Duration>) -> Result<Instant> {
         deadline_after(timeout.unwrap_or(self.timeout))
-    }
-
-    fn name_request(
-        &self,
-        name: &str,
-        operation: NameOperation,
-        deadline: Instant,
-    ) -> ClientResult<NameRequest> {
-        typed::check_deadline(deadline).map_err(ClientError::Local)?;
-        let name = NamingUri::parse(name).map_err(ClientError::Local)?;
-        Ok(NameRequest { name, operation })
     }
 }
 

@@ -1933,6 +1933,30 @@ def validate_furpc_health(health):
     return windows
 
 
+def validate_furpc_names(name):
+    true_fields(name, ("initial_http_absent", "native_create_succeeded", "http_present_after_create",
+                      "reuse_after_duplicate", "native_delete_succeeded", "http_absent_after_delete",
+                      "reuse_after_missing", "writes_share_native_client", "owned_cleanup_confirmed"))
+    require(type(name.get("duplicate_create_code")) is int and name["duplicate_create_code"] == -2147017792
+            and type(name.get("missing_delete_code")) is int and name["missing_delete_code"] == -2147017791,
+            "native name negative error codes")
+    value = name.get("furpc")
+    require(type(value) is dict and integer(value.get("generation"), 1),
+            "furpc native naming generation required")
+    true_fields(value, ("same_generation_after_error", "http_present_after_create"))
+    require(type(value.get("mixed_concurrent_operations")) is int
+            and value["mixed_concurrent_operations"] == 3
+            and value.get("duplicate_error_origin") in ("domain", "native_fault")
+            and value.get("missing_error_origin") in ("domain", "native_fault"),
+            "furpc naming native errors and mixed-operation reuse")
+    require(value.get("http_present_after_delete") is False
+            and value.get("final_http_present") is False,
+            "independent HTTP absence after native deletion and reuse")
+    require(all(integer(value.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+            "furpc naming observation timestamps")
+    return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
+
+
 def validate_native(reports, archive, allocation):
     clear, health, name, lists, notification = [reports[file] for file in NATIVE_FILES]
     for value in (clear, health, name, notification):
@@ -1958,12 +1982,7 @@ def validate_native(reports, archive, allocation):
     furpc_health_windows = validate_furpc_health(health)
     require(health.get("unknown_node_management_code") == "FABRIC_E_HEALTH_ENTITY_NOT_FOUND",
             "independent missing health entity error")
-    true_fields(name, ("initial_http_absent", "native_create_succeeded", "http_present_after_create",
-                      "reuse_after_duplicate", "native_delete_succeeded", "http_absent_after_delete",
-                      "reuse_after_missing", "writes_share_native_client", "owned_cleanup_confirmed"))
-    require(type(name.get("duplicate_create_code")) is int and name["duplicate_create_code"] == -2147017792
-            and type(name.get("missing_delete_code")) is int and name["missing_delete_code"] == -2147017791,
-            "native name negative error codes")
+    furpc_names_window = validate_furpc_names(name)
     true_fields(lists, ("initial_absence_confirmed", "application_native_continuation_followed",
                        "service_native_continuation_followed", "filters_and_parameter_exclusion",
                        "mixed_furpc_connection", "reuse_after_native_error", "owned_cleanup_confirmed"))
@@ -1988,6 +2007,7 @@ def validate_native(reports, archive, allocation):
             nodes, "native_observation_start_unix_ms", "native_observation_end_unix_ms")],
         "native_move_primary": movement_window,
         "furpc_gateway_methods": furpc_window,
+        "furpc_naming_writes": furpc_names_window,
         "furpc_application_service_lists": furpc_lists_window,
         "furpc_partition_replica_lists": furpc_topology_window,
         "furpc_deployment_lists": furpc_deployment_window,

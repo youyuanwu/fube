@@ -107,7 +107,7 @@ type Result<T> = std::result::Result<T, FurpcClientError>;
 
 /// Typed gateway stub over a byte-facing Tower service.
 ///
-/// Read-only gateway queries, Ping and NameExists are implemented separately
+/// Gateway queries, Ping and naming operations are implemented separately
 /// from [`crate::FabricClient`].
 /// The default transport is a furpc Channel; clones share its lifecycle and
 /// dropping the last owner closes it. Later calls may reconnect, but a submitted
@@ -202,6 +202,50 @@ where
             )
             .await?;
         Ok(response.map(|body| body.exists))
+    }
+
+    /// Explicitly create a checked name, including implicit ancestors if needed.
+    ///
+    /// An already explicitly created name remains a native error. There is no
+    /// retry or replay: timeout, cancellation or disconnection after submission
+    /// can leave the write outcome unknown, even if the name appears absent.
+    pub async fn create_name(
+        &mut self,
+        request: Request<NamingUri>,
+        deadline: Instant,
+    ) -> Result<Response<()>> {
+        self.unary(
+            request,
+            FubstCodec::<NamingUri, ()>::default(),
+            "CreateNameRequest",
+            check_name_reply,
+            deadline,
+        )
+        .await
+    }
+
+    /// Explicitly delete one checked name, without recursive deletion or replay.
+    ///
+    /// Missing and nonempty names remain native errors. Native may remove empty
+    /// implicit ancestors. Timeout, cancellation or disconnection after submission
+    /// does not prove that deletion did not execute.
+    pub async fn delete_name(
+        &mut self,
+        request: Request<NamingUri>,
+        deadline: Instant,
+    ) -> Result<Response<()>> {
+        let request = request.append_header(HeaderRecord::native(
+            HeaderId::new(protocol::DELETE_NAME_HEADER)?,
+            &DeleteNameHeader { explicit: true },
+        )?)?;
+        self.unary(
+            request,
+            FubstCodec::<NamingUri, ()>::default(),
+            "DeleteNameRequest",
+            check_name_reply,
+            deadline,
+        )
+        .await
     }
 
     /// Get one best-effort native node page, without automatic paging or retries.
@@ -520,6 +564,10 @@ struct ProtocolVersion(i64, i64);
 #[derive(Serialize)]
 struct TimeoutHeader {
     ticks: i64,
+}
+#[derive(Serialize)]
+struct DeleteNameHeader {
+    explicit: bool,
 }
 
 fn decode_body<T: DeserializeOwned>(body: &Body) -> Result<T> {

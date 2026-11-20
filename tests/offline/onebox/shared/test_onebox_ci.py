@@ -450,7 +450,15 @@ class ProofFiles(fixtures.ProjectFiles):
             "initial_http_absent", "native_create_succeeded", "http_present_after_create",
             "reuse_after_duplicate", "native_delete_succeeded", "http_absent_after_delete",
             "reuse_after_missing", "writes_share_native_client", "owned_cleanup_confirmed"), True),
-            "duplicate_create_code": -2147017792, "missing_delete_code": -2147017791}
+            "duplicate_create_code": -2147017792, "missing_delete_code": -2147017791,
+            "furpc": {
+                "generation": 1, "same_generation_after_error": True,
+                "mixed_concurrent_operations": 3,
+                "duplicate_error_origin": "domain", "missing_error_origin": "native_fault",
+                "http_present_after_create": True, "http_present_after_delete": False,
+                "final_http_present": False, "native_start_ms": int(start * 1000) + 1,
+                "native_end_ms": int(start * 1000) + 10,
+            }}
         lists = {**common, **dict.fromkeys((
             "initial_absence_confirmed", "application_native_continuation_followed",
             "service_native_continuation_followed", "filters_and_parameter_exclusion",
@@ -1488,6 +1496,34 @@ class WorkerTests(ProofFiles):
                 mutate(broken)
                 with self.assertRaises(ci.ProofError):
                     ci.validate_notification_retry(broken)
+
+    def test_furpc_names_require_native_errors_generation_and_independent_http(self):
+        original = self.native_reports("owned", 1)[ci.NATIVE_FILES[2]]
+        self.assertEqual(ci.validate_furpc_names(original), [1.001, 1.010])
+        mutations = [
+            lambda value: value.pop("furpc"),
+            lambda value: value.update(duplicate_create_code=True),
+            lambda value: value.update(missing_delete_code=0),
+            lambda value: value.update(owned_cleanup_confirmed=False),
+            lambda value: value["furpc"].update(generation=True),
+            lambda value: value["furpc"].update(generation=0),
+            lambda value: value["furpc"].update(same_generation_after_error=False),
+            lambda value: value["furpc"].update(mixed_concurrent_operations=True),
+            lambda value: value["furpc"].update(mixed_concurrent_operations=2),
+            lambda value: value["furpc"].update(duplicate_error_origin="local"),
+            lambda value: value["furpc"].update(missing_error_origin="protocol"),
+            lambda value: value["furpc"].update(http_present_after_create=False),
+            lambda value: value["furpc"].update(http_present_after_delete=0),
+            lambda value: value["furpc"].update(final_http_present=True),
+            lambda value: value["furpc"].update(native_start_ms=True),
+            lambda value: value["furpc"].update(native_end_ms=1),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                broken = copy.deepcopy(original)
+                mutate(broken)
+                with self.assertRaises(ci.ProofError):
+                    ci.validate_furpc_names(broken)
 
     def test_native_movement_requires_owned_single_request_and_independent_role_change(self):
         archive = self.built["inputs"]["native_archive"]["sha256"]

@@ -1,16 +1,12 @@
 use fube_transport::message::Message;
-use fubst::serde::{from_fields, from_slice, to_vec};
+use fubst::serde::{from_fields, from_slice};
 use fubst::Decoder;
 use serde::Deserialize;
 
-use crate::{Error, GatewayDescription, NamingUri, NodeId, Result};
+use crate::{Error, GatewayDescription, NodeId, Result};
 
 // ClientServerTransport::DeleteNameHeader: public deletion is explicit.
 pub(crate) const DELETE_NAME_HEADER: u16 = 0x8033;
-
-pub(crate) fn encode_name(name: &str) -> Result<Vec<u8>> {
-    Ok(to_vec(&NamingUri::parse(name)?)?)
-}
 
 pub(crate) fn check_failure(message: &Message) -> Result<()> {
     let properties = message.properties()?;
@@ -123,17 +119,10 @@ pub(crate) struct NameExistsReplyBody {
     _user_service_state: i64,
 }
 
-pub(crate) fn decode_name_write(message: &Message) -> Result<()> {
-    check_reply(message, &["NameOperationReply"])?;
-    if !message.body.is_empty() {
-        return Err(Error::Protocol("name write success body must be empty"));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NamingUri;
 
     #[test]
     fn uri_rejects_every_unsupported_grammar_class() {
