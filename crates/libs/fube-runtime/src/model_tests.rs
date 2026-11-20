@@ -35,12 +35,16 @@ fn model_child() {
             return;
         }
         let attached = Runtime::attach().await;
-        if mode.starts_with("startup-")
-            || mode == "registration-failure"
-            || mode == "overflow"
-            || mode == "attach-cancel"
-            || mode == "fifo-startup"
-        {
+        if mode.starts_with("startup-") || mode == "overflow" {
+            if let Ok(_runtime) = attached {
+                // Furpc does not hold later RPC completion behind ingress.
+                // A delivered startup failure must instead trip the domain
+                // authority/watchdog even if attach has already returned.
+                std::future::pending::<()>().await;
+            }
+            return;
+        }
+        if mode == "registration-failure" || mode == "attach-cancel" || mode == "fifo-startup" {
             assert!(attached.is_err());
             return;
         }
@@ -461,7 +465,10 @@ async fn scenario(mode: &str, expected: i32) {
                     guid: [1; 16],
                     index: 1,
                 },
-                &ListenInstance::default(),
+                &ListenInstance {
+                    nonce: [1; 16],
+                    ..ListenInstance::default()
+                },
             )
             .unwrap(),
         )
@@ -889,11 +896,18 @@ async fn scenario(mode: &str, expected: i32) {
             stderr.read_to_string(&mut diagnostics).await.unwrap();
         }
     }
-    assert_eq!(
-        status.code(),
-        Some(expected),
-        "scenario {mode}: {diagnostics}"
-    );
+    if mode.starts_with("startup-") || mode == "overflow" {
+        assert!(
+            matches!(status.code(), Some(0 | 70)),
+            "startup must reject or independently fence: {mode}: {status}: {diagnostics}"
+        );
+    } else {
+        assert_eq!(
+            status.code(),
+            Some(expected),
+            "scenario {mode}: {diagnostics}"
+        );
+    }
     if expected == 70 && mode != "lease-zero" {
         assert!(started.elapsed() < Duration::from_millis(1500), "{mode}");
     }
@@ -961,7 +975,7 @@ async fn package_callback_panic_never_acknowledges_applied_success() {
 }
 
 #[tokio::test]
-async fn startup_controls_cannot_grant_authority() {
+async fn startup_controls_reject_or_independently_fence_authority() {
     for step in 1..=4 {
         scenario(&format!("startup-{step}"), 0).await;
     }

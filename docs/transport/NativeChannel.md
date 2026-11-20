@@ -233,6 +233,19 @@ implementations for those roles.
 
 ## Runtime IPC composition
 
+**Current migration:** the initiating fube-runtime client now uses
+[`ipc_client.rs`](../../crates/libs/fube-runtime/src/ipc_client.rs) over furpc,
+with typed RpcClient/FubstCodec requests, authorized ingress and one captured Peer.
+Host/PID and actual loopback checks remain consumer policy. Domain workers
+return reply data; furpc alone correlates and writes it. Retirement releases
+Channel ownership rather than joining the physical driver. Legacy ordered
+handoff/held completions and first-write runtime predicates are not emulated.
+See the [current runtime contracts](../runtime/RustStatelessRuntime.md#wire-and-ownership-invariants).
+Hosting's accepted side still uses fube-transport.
+
+The remainder of this section records the legacy IPC composition and its
+historical guarantees, not the current initiating runtime implementation.
+
 [`native_ipc::connect_unsecured_loopback`](../../crates/libs/fube-transport/src/native_ipc.rs)
 creates the IPC session above the shared channel, reuses its bounded
 TCP/ListenInstance exchange and captures a nonempty bounded host identity plus
@@ -296,7 +309,7 @@ not subsequently edited public incoming fields. Authorized normal-request IDs
 join the existing non-evicting lifetime history; duplicates/collisions fail,
 history exhaustion terminates rather than permitting unsafe reuse.
 
-[`fube-runtime/src/channel_adapter.rs`](../../crates/libs/fube-runtime/src/channel_adapter.rs)
+The retired `fube-runtime/src/channel_adapter.rs`
 owns Hosting/RAP action envelopes and timeouts, actor8/12 eligibility, finite
 handoff and domain completion work. Raw registration never installs a domain
 worker in transport. Actor8 readiness and invalidation are sampled during

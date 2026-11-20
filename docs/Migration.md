@@ -30,7 +30,19 @@ Drop releases Channel ownership, not a physical-driver join barrier or revocatio
 of outside clones. Crate-root transport re-exports are removed; Error/Result now
 mean fubst input/model validation. Remote errors use FurpcClientError,
 NotificationResult and ImageStoreError/ImageStoreResult.
-IPC's separate session setup and replication's raw-session API are unaffected.
+Runtime's initiating IPC client also uses furpc; Hosting's accepted IPC and
+replication's raw-session API remain separate migration tracks.
+
+Runtime requests now use typed furpc Request/Response and FubstCodec over the
+original Peer. Host/PID identity is added only to initiating requests and semantic
+one-way sends, never original-path replies. The legacy runtime transport adapter,
+ordered handoff and held-completion worker are removed. Runtime authority remains
+checked at domain admission/publication and completion, not at each first-write
+attempt; already-admitted output can have an unknown remote outcome after
+retirement. Close releases Channel ownership, not a physical-driver join.
+`RuntimeEvent::QueryReplySent` becomes `QueryReplyReady` with a furpc MessageId
+and means reply data was handed to the runner, not that it was written.
+No furpc lifecycle or write-fence extension is introduced.
 
 Public `ReplicationEndpointOptions` literals must set `advertised_ip`: use
 `None` for an existing concrete listener, or `Some(ip)` for the concrete IP to

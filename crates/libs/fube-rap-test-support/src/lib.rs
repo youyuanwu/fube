@@ -672,7 +672,10 @@ async fn serve(
                 guid: [0x74; 16],
                 index: 1,
             },
-            &ListenInstance::default(),
+            &ListenInstance {
+                nonce: [0x74; 16],
+                ..ListenInstance::default()
+            },
         )
         .unwrap(),
     )

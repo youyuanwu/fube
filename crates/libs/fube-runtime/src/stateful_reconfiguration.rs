@@ -1487,7 +1487,7 @@ impl Registry {
                 let fence_valid = valid.clone();
                 let fence_cancel = cancel.clone();
                 let sent = connection
-                    .send_one_way_fenced(
+                    .send_one_way_checked(
                         12,
                         "ProxyReplicaEndpointUpdated",
                         body.clone(),

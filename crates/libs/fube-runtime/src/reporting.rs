@@ -1,12 +1,9 @@
 //! Application-runtime reports, not management-client operations.
+use crate::ipc_client::{deadline_after, native_error, Check};
 use crate::{api::FaultType, lease::Authority, wire::*};
 use crate::{Error, Result};
-use fube_transport::{
-    connection::deadline_after,
-    message::{Header, Message},
-    native_channel::WritePredicate,
-};
-use fubst::serde::{from_slice, to_vec, EmptyObjectArray, NativeEnum, ObjectArray, Pointer};
+use fubst::serde::{to_vec, EmptyObjectArray, NativeEnum, ObjectArray, Pointer};
+use furpc::{HeaderId, HeaderRecord, Request};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -97,7 +94,7 @@ pub(crate) enum HealthTarget {
     Replica,
 }
 pub(crate) struct Reporting {
-    connection: crate::channel_adapter::IpcChannel,
+    connection: crate::ipc_client::IpcClient,
     valid: Arc<AtomicBool>,
     authority: Arc<Authority>,
     request: Mutex<ProxyRequest>,
@@ -162,7 +159,7 @@ impl Reporting {
         self.admission.try_acquire().unwrap()
     }
     pub(crate) fn new(
-        connection: crate::channel_adapter::IpcChannel,
+        connection: crate::ipc_client::IpcClient,
         valid: Arc<AtomicBool>,
         authority: Arc<Authority>,
         request: ProxyRequest,
@@ -198,7 +195,7 @@ impl Reporting {
         }
         Ok(())
     }
-    fn fence(self: &Arc<Self>) -> WritePredicate {
+    fn fence(self: &Arc<Self>) -> Check {
         let this = Arc::downgrade(self);
         Arc::new(move || this.upgrade().is_some_and(|s| s.check().is_ok()))
     }
@@ -314,7 +311,7 @@ impl Reporting {
         tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return Err(Error::Closed),
-            result = self.connection.send_one_way_fenced(
+            result = self.connection.send_one_way_checked(
                 12,
                 "RAPReportLoad",
                 body,
@@ -428,21 +425,36 @@ impl Reporting {
             }]),
             streams: EmptyObjectArray,
         };
-        let headers = vec![Header::activity(uuid::Uuid::new_v4().to_bytes_le())?];
-        let body = to_vec(&body)?;
+        #[derive(serde::Serialize)]
+        struct ActivityHeader {
+            id: ActivityId,
+        }
+        let request = Request::new(body)
+            .append_header(
+                HeaderRecord::native(
+                    HeaderId::new(0x8020).map_err(native_error)?,
+                    &ActivityHeader {
+                        id: ActivityId {
+                            guid: fubst::serde::Guid(uuid::Uuid::new_v4().to_bytes_le()),
+                            index: 0,
+                        },
+                    },
+                )
+                .map_err(native_error)?,
+            )
+            .map_err(native_error)?;
         let reply = tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return Err(Error::Closed),
-            result = self.connection.request_validated(
+            result = self.connection.request::<_, HealthReply>(
                 "ReportHealth",
                 7,
-                headers,
-                body,
+                request,
                 deadline_after(REPORT_TIMEOUT)?,
-                |bytes| decode_health(bytes).map_err(|error| error.transport_fault()),
-                self.fence(),
+                Some(self.fence()),
             ) => result.map_err(report_transport_error)?,
         };
+        let reply = reply.into_body();
         self.check()?;
         if reply.results.0.len() != 1 || !reply.streams.0.is_empty() {
             return Err(Error::Protocol("unexpected health result cardinality"));
@@ -590,7 +602,7 @@ impl Reporting {
                     .try_acquire()
                     .map_err(|_| Error::ResourceLimit("runtime report admission"))?;
                 self.connection
-                    .send_one_way_fenced(
+                    .send_one_way_checked(
                         12,
                         "RAReportFault",
                         body,
@@ -598,7 +610,6 @@ impl Reporting {
                         sent,
                     )
                     .await
-                    .map_err(Error::from)
             };
             let result = tokio::select! {
                 _ = self.cancel.cancelled() => break,
@@ -644,8 +655,7 @@ fn text(value: &str, empty: bool) -> Result<()> {
     }
     Ok(())
 }
-fn report_transport_error(error: fube_transport::Error) -> Error {
-    let error = Error::from(error);
+fn report_transport_error(error: Error) -> Error {
     if matches!(error, Error::Timeout) {
         error.uncertain()
     } else {
@@ -687,20 +697,6 @@ fn stopwatch() -> Result<i64> {
     }
     Ok(time.tv_sec.saturating_mul(10_000_000) + time.tv_nsec / 100)
 }
-fn decode_health(message: Message) -> Result<HealthReply> {
-    let properties = message.properties()?;
-    if let Some(fault) = properties.fault {
-        return Err(Error::Remote {
-            code: fault.code,
-            message: "health transport fault".into(),
-        });
-    }
-    if properties.actor != 16 || properties.action != "OperationSuccessAction" {
-        return Err(Error::Protocol("unexpected health reply envelope"));
-    }
-    Ok(from_slice(&message.body)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

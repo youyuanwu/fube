@@ -189,6 +189,22 @@ It does not qualify accepted-side serving, native notification origination, TLS,
 or the rest of the gateway API. See the
 [client slice](../../RustFabricClient.md#separate-furpc-backed-client).
 
+The initiating fube-runtime IPC client also uses a dedicated Channel and original
+Peer, with the same typed RpcClient/FubstCodec and byte-service structure.
+Runtime owns host/PID headers, real loopback I/O validation, registration, lease,
+RAP semantics and domain retirement; furpc owns ingress correlation/reply writes.
+The legacy channel adapter, second reader and held-completion worker are retired.
+This intentionally does not emulate its first-write predicates, ordered ingress
+barrier or physical-driver join. Domain authority checks and the independent
+watchdog remain; already-admitted output can outlive a local check. The consumer
+I/O wrapper observes stream release, not a new furpc lifecycle contract.
+Hosting's accepted side and data replication remain separate migration tracks.
+The existing native upload/provision/contact/hash journey passed with the new
+runtime executable on the retained SF11.8.121.4 onebox. Native registration,
+stateless activation and independent application RPC succeeded; owned workload
+cleanup completed and the onebox was retained. This is not a fresh full runtime
+reporting/upgrade/stateful/recovery qualification.
+
 The public facade supports managed byte RPC by default and explicitly selected
 `ConnectionOptions::raw_only()` for caller-owned one-way IDs. Endpoint owns inert URI,
 limit and service configuration; connect returns an owning Channel. Channel

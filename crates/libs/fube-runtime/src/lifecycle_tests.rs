@@ -454,12 +454,12 @@ async fn health_saturation_leaves_poll_admission_and_rejects_overload() {
     let connection = h.engine.shared.connection.clone();
     let poll = tokio::spawn(async move {
         connection
-            .request(
+            .request::<_, ()>(
                 "",
                 15,
-                vec![],
-                vec![],
+                furpc::Request::new(()),
                 deadline_after(Duration::from_secs(1)).unwrap(),
+                None,
             )
             .await
     });
@@ -740,10 +740,10 @@ impl Harness {
         let (tx, rx) = mpsc::channel(32);
         let handler = Arc::new(move |r| {
             tx.try_send(r)
-                .map_err(|_| fube_transport::Error::ResourceLimit("model ingress"))
+                .map_err(|_| Error::ResourceLimit("model ingress"))
         });
         let (client, peer) = tokio::join!(
-            crate::channel_adapter::IpcChannel::connect(
+            crate::ipc_client::IpcClient::connect(
                 address,
                 deadline_after(Duration::from_secs(2)).unwrap(),
                 &activation.host_id,
@@ -760,7 +760,10 @@ impl Harness {
                             guid: [1; 16],
                             index: 1,
                         },
-                        &ListenInstance::default(),
+                        &ListenInstance {
+                            nonce: [1; 16],
+                            ..ListenInstance::default()
+                        },
                     )
                     .unwrap(),
                 )
@@ -1001,7 +1004,12 @@ async fn dispatch_events_and_late_native_commands_preserve_shutdown_ipc() {
             .await
             .unwrap()
             .unwrap(),
-        crate::RuntimeEvent::QueryReplySent { request_id: id }
+        crate::RuntimeEvent::QueryReplyReady {
+            request_id: furpc::MessageId {
+                guid: id.guid,
+                index: id.index
+            }
+        }
     );
     assert!(!h.engine.shared.execution.has_running_callbacks());
     h.engine.begin_quiesce();
@@ -1039,7 +1047,12 @@ async fn slow_event_subscribers_do_not_backpressure_native_queries() {
                 .await
                 .unwrap()
                 .unwrap(),
-            crate::RuntimeEvent::QueryReplySent { request_id: id }
+            crate::RuntimeEvent::QueryReplyReady {
+                request_id: furpc::MessageId {
+                    guid: id.guid,
+                    index: id.index
+                }
+            }
         );
     }
     assert!(matches!(
@@ -1462,12 +1475,9 @@ async fn abort_panic_or_cleanup_timeout_never_acknowledges_disposal() {
         .unwrap();
         let cause = retired.expect("failing Abort must retire the connection");
         assert!(if mode == 12 {
-            matches!(cause, fube_transport::Error::Timeout)
+            matches!(cause, Error::Timeout)
         } else {
-            matches!(
-                cause,
-                fube_transport::Error::Protocol("service abort panicked")
-            )
+            matches!(cause, Error::Protocol("service abort panicked"))
         });
         assert!(h.engine.shared.authority.check().is_err());
         let response = tokio::time::timeout(Duration::from_secs(1), read_message(&mut h.peer))
@@ -1521,20 +1531,16 @@ async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
         drop(operation.acquire_owned().await.unwrap());
         // Model an operation already admitted but not yet polled by its task.
         h.engine.shared.authority.check().unwrap();
-        let admitted = crate::channel_adapter::IpcMessage {
+        let admitted = crate::ipc_client::IpcMessage {
             received_at: std::time::Instant::now(),
-            message: Message {
-                headers: vec![
-                    Header::actor(12).unwrap(),
-                    Header::action("ReplicaOpen").unwrap(),
-                    Header::message_id(MessageId {
-                        guid: [7; 16],
-                        index: 99,
-                    })
-                    .unwrap(),
-                ],
-                body: to_vec(&request).unwrap(),
+            deadline: deadline_after(Duration::from_secs(30)).unwrap(),
+            actor: 12,
+            action: "ReplicaOpen".into(),
+            id: furpc::MessageId {
+                guid: [7; 16],
+                index: 99,
             },
+            body: to_vec(&request).unwrap(),
             reply: None,
         };
         h.engine.shared.authority.retire();
@@ -1551,7 +1557,7 @@ async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
 }
 
 #[tokio::test]
-async fn locally_revoked_queued_stateless_success_preserves_siblings_and_close_retry() {
+async fn locally_revoked_admitted_stateless_success_preserves_siblings_and_close_retry() {
     use tokio::io::AsyncReadExt;
     for update in [false, true] {
         let mut h = Harness::new().await;
@@ -1565,7 +1571,7 @@ async fn locally_revoked_queued_stateless_success_preserves_siblings_and_close_r
         drop(unit.operation.clone().acquire_owned().await.unwrap());
         let valid = unit.state.lock().unwrap().valid.clone();
         let connection = h.engine.shared.connection.clone();
-        let mut blocker = Box::pin(connection.send_one_way_fenced(
+        let mut blocker = Box::pin(connection.send_one_way_checked(
             12,
             "RAPReportLoad",
             vec![0; fube_transport::frame::MAX_FRAME_SIZE - 4096],
@@ -1617,7 +1623,14 @@ async fn locally_revoked_queued_stateless_success_preserves_siblings_and_close_r
         })
         .await
         .unwrap();
-        h.no_reply().await;
+        // A send admitted before revocation may already be committed. Domain
+        // retirement still prevents publication and later serving work.
+        h.receive(if update {
+            "ProxyUpdateServiceDescriptionReply"
+        } else {
+            "ReplicaOpenReply"
+        })
+        .await;
         h.engine.shared.authority.check().unwrap();
         assert!(!connection.is_closed());
         h.send("RAPQuery", &sibling).await;
@@ -1628,6 +1641,30 @@ async fn locally_revoked_queued_stateless_success_preserves_siblings_and_close_r
         assert!(!connection.is_closed());
         h.engine.quiesce().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn local_rpc_encoding_failure_does_not_retire_the_runtime_session() {
+    let mut h = Harness::new().await;
+    let error = h
+        .engine
+        .shared
+        .connection
+        .request::<_, ()>(
+            "RegisterFabricRuntimeRequest",
+            9,
+            furpc::Request::new(1u8),
+            deadline_after(Duration::from_secs(2)).unwrap(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Protocol(_) | Error::InvalidInput(_)));
+    assert!(!h.engine.shared.connection.is_closed());
+    h.no_reply().await;
+    h.send("RAPQuery", &h.request(1, 1, 0)).await;
+    h.receive("RAPQueryReply").await;
+    h.engine.quiesce().await.unwrap();
 }
 
 pub(super) enum DispatchPoint {
@@ -1702,19 +1739,19 @@ async fn prove_unregister_ipc_after_drain(h: &mut Harness) {
         .await
         .unwrap();
     };
-    let send = connection.request(
+    let send = connection.request::<_, ErrorReply>(
         "UnregisterFabricRuntimeRequest",
         9,
-        vec![],
-        to_vec(&IdRequest { id }).unwrap(),
+        furpc::Request::new(IdRequest { id }),
         deadline_after(Duration::from_secs(2)).unwrap(),
+        None,
     );
     let (reply, ()) = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::join!(send, receive)
     })
     .await
     .unwrap();
-    let reply: ErrorReply = from_slice(&reply.unwrap().body).unwrap();
+    let reply = reply.unwrap().into_body();
     assert_eq!(reply.error, 0);
 }
 
@@ -1795,7 +1832,7 @@ async fn retirement_without_requested_shutdown_still_faults_dispatch_ipc() {
     let error = tokio::time::timeout(Duration::from_secs(2), h.engine.shared.connection.closed())
         .await
         .unwrap();
-    assert!(matches!(error, fube_transport::Error::Closed));
+    assert!(matches!(error, Error::Closed));
     assert_eq!(h.calls.opens.load(Ordering::SeqCst), 0);
     assert_eq!(h.engine.shared.active.load(Ordering::SeqCst), 0);
     h.engine.quiesce().await.unwrap();
@@ -1819,10 +1856,7 @@ async fn requested_shutdown_does_not_mask_selected_non_closed_dispatch_fault() {
     let error = tokio::time::timeout(Duration::from_secs(2), h.engine.shared.connection.closed())
         .await
         .unwrap();
-    assert!(
-        matches!(error, fube_transport::Error::Protocol(_)),
-        "{error:?}"
-    );
+    assert!(matches!(error, Error::Protocol(_)), "{error:?}");
     assert_eq!(h.calls.opens.load(Ordering::SeqCst), 0);
     h.engine.quiesce().await.unwrap();
 }

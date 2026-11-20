@@ -723,7 +723,7 @@ async fn stateful_fault_retry_outlives_callers_executor_and_stops_with_unit() {
 }
 
 #[tokio::test]
-async fn queued_stateful_fault_is_fenced_after_authority_retirement() {
+async fn admitted_stateful_fault_cannot_succeed_after_authority_retirement() {
     use tokio::io::AsyncReadExt;
 
     let mut h = Harness::new().await;
@@ -733,7 +733,7 @@ async fn queued_stateful_fault_is_fenced_after_authority_retirement() {
     h.receive("ReplicaOpenReply").await;
     let partition = calls.partitions.lock().unwrap()[0].clone();
     let connection = h.engine.shared.connection.clone();
-    let blocker = connection.send_one_way_fenced(
+    let blocker = connection.send_one_way_checked(
         12,
         "RAPReportLoad",
         vec![0; fube_transport::frame::MAX_FRAME_SIZE - 4096],
@@ -768,6 +768,8 @@ async fn queued_stateful_fault_is_fenced_after_authority_retirement() {
         partition.report_fault(FaultType::Permanent).await,
         Err(Error::Closed)
     ));
+    let admitted = read_message(&mut h.peer).await.unwrap();
+    assert_eq!(admitted.properties().unwrap().action, "RAReportFault");
     h.engine.shared.connection.close().await.unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(5), read_message(&mut h.peer))
@@ -820,7 +822,12 @@ async fn stateful_open_order_endpoints_access_duplicate_and_graceful_isolation()
             .await
             .unwrap()
             .unwrap(),
-        crate::RuntimeEvent::QueryReplySent { request_id: id }
+        crate::RuntimeEvent::QueryReplyReady {
+            request_id: furpc::MessageId {
+                guid: id.guid,
+                index: id.index
+            }
+        }
     );
     assert_eq!(
         (

@@ -476,11 +476,14 @@ dependencies = [
  "fube-runtime",
  "fube-transport",
  "fubst",
+ "furpc",
+ "http",
  "libc",
  "roxmltree",
  "serde",
  "serde_json",
  "tokio",
+ "tower-service",
  "uuid",
 ]
 
