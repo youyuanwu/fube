@@ -291,7 +291,19 @@ impl Registry {
     async fn reconfigure(&self, unit: &Arc<Unit>, request: w::ProxyRequest) -> Result<()> {
         // A membership update is compatible with an existing catch-up wait,
         // but cannot launch a second wait or run configuration callbacks twice.
-        let pending = unit.state.lock().unwrap().catch_up_operation.is_some();
+        let requested = role(request.local.current_role)?;
+        let pending = {
+            let state = unit.state.lock().unwrap();
+            if state.catch_up_operation.is_some() {
+                let status = state.status.lock().unwrap();
+                if status.service_role != requested || status.replicator_role != requested {
+                    return Ok(());
+                }
+                true
+            } else {
+                false
+            }
+        };
         if pending {
             if !self.admit_epoch(unit, &request)? {
                 return Ok(());
@@ -340,7 +352,6 @@ impl Registry {
         if !self.admit_epoch(unit, &request)? {
             return Ok(());
         }
-        let requested = role(request.local.current_role)?;
         if !matches!(
             requested,
             ReplicaRole::Primary | ReplicaRole::ActiveSecondary

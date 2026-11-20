@@ -199,6 +199,13 @@ barrier or physical-driver join. Domain authority checks and the independent
 watchdog remain; already-admitted output can outlive a local check. The consumer
 I/O wrapper observes stream release, not a new furpc lifecycle contract.
 Hosting's accepted side and data replication remain separate migration tracks.
+Retained runtime lifecycle/stateful/subprocess and shared RAP model peers also
+use furpc's public accepted Server, original Peer and ingress reply data.
+Test-only I/O gates preserve queued-write and partial-read coverage without
+exporting the private codec. Production Hosting/node tests independently observe
+and forward original frame bytes using public furpc headers. The direct legacy
+dependency is removed from runtime's normal/dev edges and shared RAP support;
+core/data/Hosting transitive consumers are not retired by this cleanup.
 The existing native upload/provision/contact/hash journey passed with the new
 runtime executable on the retained SF11.8.121.4 onebox. Native registration,
 stateless activation and independent application RPC succeeded; owned workload

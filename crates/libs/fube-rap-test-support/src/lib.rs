@@ -10,19 +10,17 @@ use fube_runtime::{
     ActivationContext, Cancellation, Error, ErrorKind, IStatefulServiceFactory, ReplicaRole,
     Result,
 };
-use fube_transport::{
-    connection::{read_message, write_message},
-    message::{Header, ListenInstance, Message, MessageId},
-};
 use fubst::serde::{from_slice, to_vec, ByteArray, EmptyObjectArray, Guid, ObjectArray, Pointer};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, thread::JoinHandle};
 use tokio::{
     net::TcpListener,
     sync::{broadcast, mpsc, oneshot},
 };
+use transport::{message, ModelPeer};
 
 mod primary;
 pub use primary::DelegatingPrimary;
+pub mod transport;
 
 // Field order mirrors Hosting2/ServiceModel FABRIC_FIELDS (3988b451); these
 // private model records are neither public SDK descriptors nor authority APIs.
@@ -624,28 +622,13 @@ fn control(base: &ProxyRequest) -> ProxyRequest {
     request.flags = 0;
     request
 }
-async fn send(
-    stream: &mut tokio::net::tcp::OwnedWriteHalf,
-    action: &str,
-    request: &ProxyRequest,
-    index: &mut u32,
-) -> Result<()> {
-    *index += 1;
-    write_message(
-        stream,
-        &Message {
-            headers: vec![
-                Header::actor(12)?,
-                Header::action(action)?,
-                Header::message_id(MessageId {
-                    guid: [0x73; 16],
-                    index: *index,
-                })?,
-            ],
-            body: to_vec(request)?,
-        },
-    )
-    .await?;
+async fn send(stream: &ModelPeer, action: &str, request: &ProxyRequest) -> Result<()> {
+    stream
+        .send(message(12, action, to_vec(request)?).unwrap())
+        .await
+        .map_err(|error| {
+            Error::with_cause(fube_runtime::ErrorKind::Transport, "model RAP send", error)
+        })?;
     Ok(())
 }
 async fn serve(
@@ -662,34 +645,7 @@ async fn serve(
 ) {
     let (role, epoch) = initial;
     let (events, opened_address) = observation;
-    let (mut socket, _) = listener.accept().await.unwrap();
-    let hello = read_message(&mut socket).await.unwrap();
-    assert_eq!(hello.properties().unwrap().actor, 1);
-    write_message(
-        &mut socket,
-        &Message::listen_instance(
-            MessageId {
-                guid: [0x74; 16],
-                index: 1,
-            },
-            &ListenInstance {
-                nonce: [0x74; 16],
-                ..ListenInstance::default()
-            },
-        )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-    let (mut reader, mut writer) = socket.into_split();
-    let (read, mut messages) = mpsc::channel(32);
-    let reader = tokio::spawn(async move {
-        while let Ok(message) = read_message(&mut reader).await {
-            if read.send(message).await.is_err() {
-                break;
-            }
-        }
-    });
+    let mut connection = ModelPeer::accept(listener).await.unwrap();
     let mut context = None;
     let mut local = None::<ProxyRequest>;
     let mut pending = Vec::<Pending>::new();
@@ -697,14 +653,17 @@ async fn serve(
     // complete first, preserving their original identities/results and the
     // newest acknowledged unit/epoch for the actual Close.
     let mut close_after_pending = None::<Command>;
-    let mut sequence = 100;
     let mut retry = tokio::time::interval(std::time::Duration::from_millis(10));
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            message = messages.recv() => {
-                let Some(message) = message else { break; };
-                let properties = message.properties().unwrap();
+            received = connection.receive() => {
+                let message = match received {
+                    Ok(message) => message,
+                    Err(furpc::Error::Closed) => break,
+                    Err(error) => panic!("model RAP receive: {error}"),
+                };
+                let properties = message.metadata().unwrap();
                 let action = properties.action.as_str();
                 let body = match action {
                     "StartRegisterApplicationHostRequest" => to_vec(&StartReply {
@@ -733,7 +692,7 @@ async fn serve(
                         let mut ack = control(local.as_ref().unwrap());
                         ack.runtime = context.as_ref().unwrap().id.clone();
                         ack.unit = endpoint.unit; ack.local = endpoint.local;
-                        send(&mut writer, "ProxyReplicaEndpointUpdatedReply", &ack, &mut sequence).await.unwrap();
+                        send(&connection, "ProxyReplicaEndpointUpdatedReply", &ack).await.unwrap();
                         continue;
                     },
                     action if action.ends_with("Reply") && properties.actor == 12 => {
@@ -767,7 +726,7 @@ async fn serve(
                     "RAReportFault" | "RAPReportLoad" => continue,
                     other => panic!("unexpected MODEL host action {other}"),
                 };
-                write_message(&mut writer, &Message { headers: vec![Header::relates_to(properties.id).unwrap()], body }).await.unwrap();
+                message.respond(transport::message(0, "", body).unwrap()).unwrap();
             }
             command = async {
                 if pending.is_empty() && close_after_pending.is_some() {
@@ -859,18 +818,16 @@ async fn serve(
                         "ReplicatorGetStatus"
                     },
                 };
-                send(&mut writer, action, &request, &mut sequence).await.unwrap();
+                send(&connection, action, &request).await.unwrap();
                 if closing { let _ = events.send(HostEvent::CloseFrameSent); }
                 if !command.result.is_closed() { pending.push(Pending { action, request, result: command.result }); }
             }
             _ = retry.tick(), if !pending.is_empty() => {
                 pending.retain(|p| !p.result.is_closed());
-                for call in &pending { send(&mut writer, call.action, &call.request, &mut sequence).await.unwrap(); }
+                for call in &pending { send(&connection, call.action, &call.request).await.unwrap(); }
             }
         }
     }
-    reader.abort();
-    let _ = reader.await;
 }
 
 struct Artifacts {

@@ -1,10 +1,8 @@
 //! Isolated loopback MODEL peers only; never native interoperability evidence.
 use super::*;
-use fube_transport::{
-    connection::{read_message, write_message},
-    message::{Header, ListenInstance, Message, MessageId},
-};
+use fube_rap_test_support::transport::{message, ModelPeer};
 use fubst::serde::{ObjectArray, Pointer};
+use furpc::MessageId;
 use std::{io::Write, process::Stdio};
 use tokio::{net::TcpListener, process::Command};
 
@@ -380,22 +378,6 @@ fn start_reply() -> StartReply {
         system_log: Pointer(None),
     }
 }
-fn control(action: &str, index: u32, actor: i64) -> Message {
-    Message {
-        headers: vec![
-            Header::actor(actor).unwrap(),
-            Header::action(action).unwrap(),
-            Header::message_id(MessageId {
-                guid: [7; 16],
-                index,
-            })
-            .unwrap(),
-            Header::boolean(fube_transport::message::EXPECTS_REPLY, true).unwrap(),
-        ],
-        body: vec![],
-    }
-}
-
 async fn scenario(mode: &str, expected: i32) {
     let fixture = crate::packages::tests::Fixture::new();
     if mode == "fifo-startup" {
@@ -455,33 +437,13 @@ async fn scenario(mode: &str, expected: i32) {
     let mode_owned = mode.to_owned();
     let deployment = fixture.root.to_str().unwrap().to_owned();
     let peer = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let hello = read_message(&mut stream).await.unwrap();
-        assert_eq!(hello.properties().unwrap().actor, 1);
-        write_message(
-            &mut stream,
-            &Message::listen_instance(
-                MessageId {
-                    guid: [1; 16],
-                    index: 1,
-                },
-                &ListenInstance {
-                    nonce: [1; 16],
-                    ..ListenInstance::default()
-                },
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+        let mut stream = ModelPeer::accept(listener).await.unwrap();
         let mut step = 0;
         let mut runtime_context = None::<RuntimeContext>;
         let mut stateful_request = None::<crate::wire::ProxyRequest>;
         let mut close_retry = None::<crate::wire::ProxyRequest>;
-        let mut close_index = 102;
         let mut close_tick = tokio::time::interval(Duration::from_millis(25));
         close_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let (mut reader, mut stream) = stream.into_split();
         let mut update_sent = false;
         let mut independent_open = None::<crate::wire::ProxyRequest>;
         let mut independent_started = None::<Monotonic>;
@@ -490,43 +452,38 @@ async fn scenario(mode: &str, expected: i32) {
         let mut independent_close_seen = false;
         let mut lease_polls = 0;
         loop {
-            let request = {
-                // Keep a partially read frame alive across retry ticks.
-                let next = read_message(&mut reader);
-                tokio::pin!(next);
-                loop {
-                    tokio::select! {
-                        result=&mut next=>break match result {Ok(r)=>r,Err(_)=>return},
+            let request = tokio::select! {
+                        result=stream.receive()=>match result {
+                            Ok(request) => request,
+                            Err(furpc::Error::Closed) => return,
+                            Err(error) => panic!("model receive: {error}"),
+                        },
                         _=close_tick.tick(),if close_retry.is_some() ||
                             (independent_open.is_some() && !independent_query_sent)=>{
                             if independent_peer_entered.load(std::sync::atomic::Ordering::Acquire) && !independent_query_sent {
-                                let mut query=control("RAPQuery",103,12);
-                                query.body=to_vec(independent_open.as_ref().unwrap()).unwrap();
-                                write_message(&mut stream,&query).await.unwrap();
+                                stream.request(message(12, "RAPQuery",
+                                    to_vec(independent_open.as_ref().unwrap()).unwrap()
+                                ).unwrap()).unwrap();
                                 independent_query_sent=true;
                             }
                             if let Some(close) = &close_retry {
-                              close_index+=1;
-                              if write_message(&mut stream,&Message {
-                                headers:vec![Header::actor(12).unwrap(),Header::action("ReplicaClose").unwrap(),
-                                    Header::message_id(MessageId {guid:[9;16],index:close_index}).unwrap()],
-                                body:to_vec(close).unwrap(),
-                            }).await.is_err() {return;}
+                              stream.send(message(12, "ReplicaClose", to_vec(close).unwrap()).unwrap())
+                                  .await.unwrap();
                             }
+                            continue;
                         }
-                    }
-                }
             };
-            let p = request.properties().unwrap();
-            if p.relates_to != MessageId::default() {
-                if mode_owned == "core-independent" && p.relates_to.index == 103 {
+            let p = request.metadata().unwrap();
+            if let Some(action) = request.request_action.as_deref() {
+                assert_ne!(p.relates_to, MessageId::default());
+                if mode_owned == "core-independent" && action == "RAPQuery" {
                     assert!(
                         independent_started.unwrap().elapsed() < Duration::from_millis(900),
                         "query stalled behind user constructor/poll or caller executor"
                     );
                     independent_query_seen = true;
                 }
-                if p.relates_to.index == 99
+                if action == "UpdateCodePackageContextRequest"
                     && matches!(
                         mode_owned.as_str(),
                         "live-update" | "update-block" | "update-panic"
@@ -612,23 +569,10 @@ async fn scenario(mode: &str, expected: i32) {
                     // gate. Native retries incompatible Close rather than
                     // assuming this first one-way attempt was admitted.
                     close_retry = Some(close.clone());
-                    write_message(
-                        &mut stream,
-                        &Message {
-                            headers: vec![
-                                Header::actor(12).unwrap(),
-                                Header::action("ReplicaClose").unwrap(),
-                                Header::message_id(MessageId {
-                                    guid: [9; 16],
-                                    index: 102,
-                                })
-                                .unwrap(),
-                            ],
-                            body: to_vec(&close).unwrap(),
-                        },
-                    )
-                    .await
-                    .unwrap();
+                    stream
+                        .send(message(12, "ReplicaClose", to_vec(&close).unwrap()).unwrap())
+                        .await
+                        .unwrap();
                     continue;
                 }
                 "ReplicaOpenReply" if mode_owned == "core-independent" => {
@@ -657,19 +601,15 @@ async fn scenario(mode: &str, expected: i32) {
                         // Keep the real native type-registration result
                         // blocked while the independent host core renews its
                         // lease. Insertion/enqueue cannot satisfy the call.
-                        let poll = read_message(&mut reader).await.unwrap();
-                        let poll = poll.properties().unwrap();
-                        assert_eq!(poll.actor, 15);
-                        assert!(poll.action.is_empty());
+                        let poll = stream.receive().await.unwrap();
+                        let envelope = poll.metadata().unwrap();
+                        assert_eq!(envelope.actor, 15);
+                        assert!(envelope.action.is_empty());
                         lease_polls += 1;
-                        write_message(
-                            &mut stream,
-                            &Message {
-                                headers: vec![Header::relates_to(poll.id).unwrap()],
-                                body: to_vec(&LeaseReply { ttl: 300_000_000 }).unwrap(),
-                            },
+                        poll.respond(
+                            message(0, "", to_vec(&LeaseReply { ttl: 300_000_000 }).unwrap())
+                                .unwrap(),
                         )
-                        .await
                         .unwrap();
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         peer_registration_reply_sent
@@ -687,30 +627,18 @@ async fn scenario(mode: &str, expected: i32) {
                 _ => panic!("unexpected MODEL action {}", p.action),
             };
             if mode_owned == format!("startup-{step}") {
-                write_message(&mut stream, &control("InvalidateLeaseRequest", 99, 8))
-                    .await
+                stream
+                    .request(message(8, "InvalidateLeaseRequest", vec![]).unwrap())
                     .unwrap();
             }
             if mode_owned == "overflow" && step == 1 {
-                for n in 1..=33 {
-                    if write_message(&mut stream, &control("RAPQuery", n, 12))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                for _ in 1..=33 {
+                    stream
+                        .request(message(12, "RAPQuery", vec![]).unwrap())
+                        .unwrap();
                 }
             }
-            if write_message(
-                &mut stream,
-                &Message {
-                    headers: vec![Header::relates_to(p.id).unwrap()],
-                    body,
-                },
-            )
-            .await
-            .is_err()
-            {
+            if request.respond(message(0, "", body).unwrap()).is_err() {
                 return;
             }
             if p.action == "RegisterServiceTypeRequest"
@@ -737,19 +665,10 @@ async fn scenario(mode: &str, expected: i32) {
                         }]);
                     stateful_request = Some(open.clone());
                 }
-                let message = Message {
-                    headers: vec![
-                        Header::actor(12).unwrap(),
-                        Header::action("ReplicaOpen").unwrap(),
-                        Header::message_id(MessageId {
-                            guid: [9; 16],
-                            index: 101,
-                        })
-                        .unwrap(),
-                    ],
-                    body: to_vec(&open).unwrap(),
-                };
-                write_message(&mut stream, &message).await.unwrap();
+                stream
+                    .send(message(12, "ReplicaOpen", to_vec(&open).unwrap()).unwrap())
+                    .await
+                    .unwrap();
             }
             if p.action == "RegisterServiceTypeRequest" && mode_owned == "core-independent" {
                 let context = runtime_context.as_ref().unwrap();
@@ -758,21 +677,10 @@ async fn scenario(mode: &str, expected: i32) {
                 open.service.application = context.code.application_name.clone();
                 open.service.name = format!("{}/Independent", context.code.application_name);
                 open.service.service_type.name = "ModelType".into();
-                let message = Message {
-                    headers: vec![
-                        Header::actor(12).unwrap(),
-                        Header::action("ReplicaOpen").unwrap(),
-                        Header::message_id(MessageId {
-                            guid: [7; 16],
-                            index: 101,
-                        })
-                        .unwrap(),
-                    ],
-                    body: to_vec(&open).unwrap(),
-                };
+                let message = message(12, "ReplicaOpen", to_vec(&open).unwrap()).unwrap();
                 independent_open = Some(open);
                 independent_started = Some(Monotonic::now());
-                write_message(&mut stream, &message).await.unwrap();
+                stream.send(message).await.unwrap();
             }
             if step == 4 && !update_sent {
                 update_sent = true;
@@ -782,8 +690,7 @@ async fn scenario(mode: &str, expected: i32) {
                         fixture.write(2, "new");
                         let mut code = runtime_context.as_ref().unwrap().code.clone();
                         code.version.instance += 1;
-                        let mut message = control("UpdateCodePackageContextRequest", 99, 8);
-                        message.body = to_vec(&UpdateContext {
+                        let body = to_vec(&UpdateContext {
                             code,
                             activation: CodeActivation {
                                 host: runtime_context.as_ref().unwrap().host.id.clone(),
@@ -796,32 +703,29 @@ async fn scenario(mode: &str, expected: i32) {
                             },
                         })
                         .unwrap();
-                        write_message(&mut stream, &message).await.unwrap();
+                        stream
+                            .request(message(8, "UpdateCodePackageContextRequest", body).unwrap())
+                            .unwrap();
                     }
                     "live-invalidate" => {
-                        write_message(&mut stream, &control("InvalidateLeaseRequest", 99, 8))
-                            .await
+                        stream
+                            .request(message(8, "InvalidateLeaseRequest", vec![]).unwrap())
                             .unwrap();
                     }
                     "live-context" => {
-                        let mut message = control("UpdateCodePackageContextRequest", 99, 8);
                         // A malformed required update is terminal too, not ACKed.
-                        message.body = vec![0];
-                        write_message(&mut stream, &message).await.unwrap();
+                        stream
+                            .request(
+                                message(8, "UpdateCodePackageContextRequest", vec![0]).unwrap(),
+                            )
+                            .unwrap();
                     }
                     "eof" => return,
                     "lease-zero" => {
-                        let next = read_message(&mut reader).await.unwrap();
-                        write_message(
-                            &mut stream,
-                            &Message {
-                                headers: vec![
-                                    Header::relates_to(next.properties().unwrap().id).unwrap()
-                                ],
-                                body: to_vec(&LeaseReply { ttl: 0 }).unwrap(),
-                            },
+                        let next = stream.receive().await.unwrap();
+                        next.respond(
+                            message(0, "", to_vec(&LeaseReply { ttl: 0 }).unwrap()).unwrap(),
                         )
-                        .await
                         .unwrap();
                     }
                     _ => {}

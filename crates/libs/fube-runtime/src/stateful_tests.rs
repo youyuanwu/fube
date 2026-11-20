@@ -598,7 +598,7 @@ async fn owned_stateful_fault_uses_native_identity_epochs_and_generation_fences(
         h.receive("RAReportFault")
     );
     assert_eq!(result.unwrap().attempts, 1);
-    assert_eq!(message.properties().unwrap().actor, 12);
+    assert_eq!(message.metadata().unwrap().actor, 12);
     let fault: FaultBody = from_slice(&message.body).unwrap();
     assert_eq!(fault.fault, 1);
     assert_eq!(to_vec(&fault.unit).unwrap(), to_vec(&current.unit).unwrap());
@@ -724,8 +724,6 @@ async fn stateful_fault_retry_outlives_callers_executor_and_stops_with_unit() {
 
 #[tokio::test]
 async fn admitted_stateful_fault_cannot_succeed_after_authority_retirement() {
-    use tokio::io::AsyncReadExt;
-
     let mut h = Harness::new().await;
     let calls = register(&h);
     let open = request(&h, 2, 7, 0);
@@ -733,17 +731,17 @@ async fn admitted_stateful_fault_cannot_succeed_after_authority_retirement() {
     h.receive("ReplicaOpenReply").await;
     let partition = calls.partitions.lock().unwrap()[0].clone();
     let connection = h.engine.shared.connection.clone();
+    h.peer.reads.hold_after(12);
     let blocker = connection.send_one_way_checked(
         12,
         "RAPReportLoad",
-        vec![0; fube_transport::frame::MAX_FRAME_SIZE - 4096],
+        vec![0; 4 * 1024 * 1024 - 4096],
         deadline_after(Duration::from_secs(5)).unwrap(),
         Arc::new(|| true),
     );
     tokio::pin!(blocker);
     poll_pending_once(blocker.as_mut()).await;
-    let mut fixed = [0; fube_transport::frame::FIXED_HEADER_SIZE];
-    h.peer.read_exact(&mut fixed).await.unwrap();
+    h.peer.reads.blocked().await;
     let fault = partition.report_fault(FaultType::Transient);
     tokio::pin!(fault);
     poll_pending_once(fault.as_mut()).await;
@@ -756,23 +754,20 @@ async fn admitted_stateful_fault_cannot_succeed_after_authority_retirement() {
     .unwrap();
     assert_eq!(partition.fault_delivery().unwrap().attempts, 0);
     h.engine.shared.authority.retire();
-    let size = u32::from_le_bytes(fixed[..4].try_into().unwrap()) as usize;
-    h.peer
-        .read_exact(&mut vec![0; size - fixed.len()])
-        .await
-        .unwrap();
+    h.peer.reads.resume();
     blocker.await.unwrap();
+    h.receive("RAPReportLoad").await;
     assert!(matches!(fault.await, Err(Error::Closed)));
     assert!(partition.fault_delivery().unwrap().cancelled);
     assert!(matches!(
         partition.report_fault(FaultType::Permanent).await,
         Err(Error::Closed)
     ));
-    let admitted = read_message(&mut h.peer).await.unwrap();
-    assert_eq!(admitted.properties().unwrap().action, "RAReportFault");
+    let admitted = h.peer.receive().await.unwrap();
+    assert_eq!(admitted.metadata().unwrap().action, "RAReportFault");
     h.engine.shared.connection.close().await.unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_secs(5), read_message(&mut h.peer))
+        tokio::time::timeout(Duration::from_secs(5), h.peer.receive())
             .await
             .unwrap()
             .is_err()
@@ -815,8 +810,10 @@ async fn stateful_open_order_endpoints_access_duplicate_and_graceful_isolation()
     h.receive("ReplicaOpenReply").await;
     assert_eq!(calls.events.lock().unwrap().len(), 5);
     let mut events = h.engine.subscribe_events();
-    let id = h.send("RAPQuery", &request).await;
-    let query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    h.send("RAPQuery", &request).await;
+    let response = h.receive("RAPQueryReply").await;
+    let id = response.metadata().unwrap().relates_to;
+    let query: QueryReply = from_slice(&response.body).unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await

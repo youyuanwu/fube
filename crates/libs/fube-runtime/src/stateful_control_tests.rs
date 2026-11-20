@@ -223,6 +223,45 @@ async fn demotion_orders_pre_revoke_all_epoch_all_role_and_progress() {
 }
 
 #[tokio::test]
+async fn demotion_retries_during_catchup_do_not_acknowledge_an_unapplied_role() {
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let open = request(&h, 2, 1, 21);
+    h.send("ReplicaOpen", &open).await;
+    h.receive("ReplicaOpenReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    let mut target = peer(&open.local, 3);
+    target.current_role = 4;
+    let mut local = open.local.clone();
+    local.current_role = 3;
+    local.previous_role = 4;
+    let mut demote = control(&open, "UpdateConfiguration", vec![local.clone(), target]);
+    demote.local = local;
+    demote.unit.current.configuration += 1 << 32;
+    demote.unit.previous = open.unit.current.clone();
+    demote.flags = 2;
+    h.send("UpdateConfiguration", &demote).await;
+    wait_event(&calls, "waitAll", 1).await;
+    h.send("UpdateConfiguration", &demote).await;
+    let first = tokio::time::timeout(Duration::from_millis(30), h.peer.receive()).await;
+    calls.catch_up_release.notify_one();
+    wait_event(&calls, "waitAll", 2).await;
+    h.send("UpdateConfiguration", &demote).await;
+    let second = tokio::time::timeout(Duration::from_millis(30), h.peer.receive()).await;
+    calls.catch_up_release.notify_one();
+    let reply: ProxyReply = from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    h.engine.quiesce().await.unwrap();
+    assert!(
+        first.is_err() && second.is_err(),
+        "demotion was acknowledged during catch-up"
+    );
+    assert_eq!((reply.error.error, reply.flags), (0, 2));
+    let events = calls.events.lock().unwrap();
+    assert!(events.contains(&"replicatorSecondary") && events.contains(&"serviceSecondary"));
+}
+
+#[tokio::test]
 async fn configuration_can_overlap_catchup_but_cancel_drains_before_ack_and_new_epoch_reopens() {
     let mut h = Harness::new().await;
     let calls = register(&h);
@@ -597,11 +636,11 @@ async fn promotion_endpoint_scenario(application: Option<tokio::runtime::Handle>
     h.send("UpdateConfiguration", &promote).await;
     let mut notification = None;
     for _ in 0..2 {
-        let frame = tokio::time::timeout(Duration::from_secs(2), read_message(&mut h.peer))
+        let frame = tokio::time::timeout(Duration::from_secs(2), h.peer.receive())
             .await
             .unwrap()
             .unwrap();
-        match frame.properties().unwrap().action.as_str() {
+        match frame.metadata().unwrap().action.as_str() {
             "ProxyReplicaEndpointUpdated" => notification = Some(frame),
             "UpdateConfigurationReply" => assert_eq!(
                 from_slice::<ProxyReply>(&frame.body).unwrap().error.error,

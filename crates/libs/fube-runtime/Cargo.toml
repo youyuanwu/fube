@@ -21,7 +21,6 @@ http = "1"
 tower-service = "0.3"
 
 [dev-dependencies]
-fube-transport.workspace = true
 serde_json.workspace = true
 fube-rap-test-support.workspace = true
 # Integration tests use the same nominal runtime types as the RAP harness.

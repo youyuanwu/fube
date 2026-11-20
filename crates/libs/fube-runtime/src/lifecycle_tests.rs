@@ -3,14 +3,9 @@ use super::*;
 mod reporting_tests;
 #[path = "stateful_tests.rs"]
 pub(crate) mod stateful_tests;
-use fube_transport::{
-    connection::{read_message, write_message},
-    message::{Header, ListenInstance, Message, MessageId},
-};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::Notify,
-};
+use fube_rap_test_support::transport::{message, ModelPeer, Received as Message};
+use furpc::MessageId;
+use tokio::{net::TcpListener, sync::Notify};
 
 #[derive(Default)]
 struct Calls {
@@ -145,9 +140,8 @@ impl Drop for Instance {
 }
 pub(crate) struct Harness {
     engine: Engine,
-    peer: TcpStream,
+    peer: ModelPeer,
     calls: Arc<Calls>,
-    index: u32,
 }
 
 impl Drop for Harness {
@@ -226,7 +220,7 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
     let (result, message) =
         tokio::join!(partition.report_load(&metrics), h.receive("RAPReportLoad"));
     result.unwrap();
-    assert_eq!(message.properties().unwrap().actor, 12);
+    assert_eq!(message.metadata().unwrap().actor, 12);
     let load: LoadBody = from_slice(&message.body).unwrap();
     assert_eq!(load.reports.0[0].partition, request.unit.id.id);
     assert_eq!(load.reports.0[0].secondary.0[0].value, 731);
@@ -258,7 +252,7 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
         let p = partition.clone();
         let operation = tokio::spawn(async move { p.report_health(&report).await });
         let message = h.receive("ReportHealth").await;
-        assert_eq!(message.properties().unwrap().actor, 7);
+        assert_eq!(message.metadata().unwrap().actor, 7);
         let body: HealthBody = from_slice(&message.body).unwrap();
         let report = &body.reports.0[0];
         assert_eq!(report.ttl, i64::MAX);
@@ -267,32 +261,29 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
         assert!(
             matches!(entity, HealthEntity::Instance { instance: 100, partition } if *partition == request.unit.id.id)
         );
-        write_message(
-            &mut h.peer,
-            &Message {
-                headers: vec![
-                    Header::actor(16).unwrap(),
-                    Header::action("OperationSuccessAction").unwrap(),
-                    Header::relates_to(message.properties().unwrap().id).unwrap(),
-                ],
-                body: to_vec(&HealthReply {
-                    results: ObjectArray(vec![HealthResult {
-                        kind: 2,
-                        source: report.source.clone(),
-                        sequence: report.sequence,
-                        entity_property: format!(
-                            "{}+100+Ready",
-                            uuid::Uuid::from_bytes_le(request.unit.id.id.0)
-                        ),
-                        error: code,
-                    }]),
-                    streams: ObjectArray(vec![]),
-                })
+        message
+            .respond(
+                fube_rap_test_support::transport::message(
+                    16,
+                    "OperationSuccessAction",
+                    to_vec(&HealthReply {
+                        results: ObjectArray(vec![HealthResult {
+                            kind: 2,
+                            source: report.source.clone(),
+                            sequence: report.sequence,
+                            entity_property: format!(
+                                "{}+100+Ready",
+                                uuid::Uuid::from_bytes_le(request.unit.id.id.0)
+                            ),
+                            error: code,
+                        }]),
+                        streams: ObjectArray(vec![]),
+                    })
+                    .unwrap(),
+                )
                 .unwrap(),
-            },
-        )
-        .await
-        .unwrap();
+            )
+            .unwrap();
         let result = operation.await.unwrap();
         if code == 0 {
             assert_eq!(result.unwrap().sequence, 45);
@@ -395,32 +386,29 @@ async fn abort_cancels_outstanding_health_without_retiring_sibling_authority() {
     // A late successful HM result is unmatched, not an acknowledgment for the
     // cancelled generation and not a terminal protocol error for its sibling.
     let sent: HealthBody = from_slice(&original.body).unwrap();
-    write_message(
-        &mut h.peer,
-        &Message {
-            headers: vec![
-                Header::actor(16).unwrap(),
-                Header::action("OperationSuccessAction").unwrap(),
-                Header::relates_to(original.properties().unwrap().id).unwrap(),
-            ],
-            body: to_vec(&HealthReply {
-                results: ObjectArray(vec![HealthResult {
-                    kind: 2,
-                    source: sent.reports.0[0].source.clone(),
-                    sequence: sent.reports.0[0].sequence,
-                    entity_property: format!(
-                        "{}+100+Ready",
-                        uuid::Uuid::from_bytes_le(target_request.unit.id.id.0)
-                    ),
-                    error: 0,
-                }]),
-                streams: ObjectArray(vec![]),
-            })
+    original
+        .respond(
+            message(
+                16,
+                "OperationSuccessAction",
+                to_vec(&HealthReply {
+                    results: ObjectArray(vec![HealthResult {
+                        kind: 2,
+                        source: sent.reports.0[0].source.clone(),
+                        sequence: sent.reports.0[0].sequence,
+                        entity_property: format!(
+                            "{}+100+Ready",
+                            uuid::Uuid::from_bytes_le(target_request.unit.id.id.0)
+                        ),
+                        error: 0,
+                    }]),
+                    streams: ObjectArray(vec![]),
+                })
+                .unwrap(),
+            )
             .unwrap(),
-        },
-    )
-    .await
-    .unwrap();
+        )
+        .unwrap();
     let (result, _) = tokio::join!(
         sibling.report_move_cost(crate::MoveCost::High),
         h.receive("RAPReportLoad")
@@ -463,17 +451,11 @@ async fn health_saturation_leaves_poll_admission_and_rejects_overload() {
             )
             .await
     });
-    let message = read_message(&mut h.peer).await.unwrap();
-    assert_eq!(message.properties().unwrap().actor, 15);
-    write_message(
-        &mut h.peer,
-        &Message {
-            headers: vec![Header::relates_to(message.properties().unwrap().id).unwrap()],
-            body: vec![],
-        },
-    )
-    .await
-    .unwrap();
+    let message = h.peer.receive().await.unwrap();
+    assert_eq!(message.metadata().unwrap().actor, 15);
+    message
+        .respond(fube_rap_test_support::transport::message(0, "", vec![]).unwrap())
+        .unwrap();
     poll.await.unwrap().unwrap();
     for task in reports {
         task.abort();
@@ -526,23 +508,20 @@ async fn health_validation_and_unmatched_results_never_acknowledge() {
             3 => result.entity_property = "other".into(),
             _ => {}
         }
-        write_message(
-            &mut h.peer,
-            &Message {
-                headers: vec![
-                    Header::actor(16).unwrap(),
-                    Header::action("OperationSuccessAction").unwrap(),
-                    Header::relates_to(message.properties().unwrap().id).unwrap(),
-                ],
-                body: to_vec(&HealthReply {
-                    results: ObjectArray(if wrong == 4 { vec![] } else { vec![result] }),
-                    streams: ObjectArray(vec![]),
-                })
+        message
+            .respond(
+                fube_rap_test_support::transport::message(
+                    16,
+                    "OperationSuccessAction",
+                    to_vec(&HealthReply {
+                        results: ObjectArray(if wrong == 4 { vec![] } else { vec![result] }),
+                        streams: ObjectArray(vec![]),
+                    })
+                    .unwrap(),
+                )
                 .unwrap(),
-            },
-        )
-        .await
-        .unwrap();
+            )
+            .unwrap();
         assert!(matches!(task.await.unwrap(), Err(Error::Protocol(_))));
     }
 }
@@ -750,27 +729,7 @@ impl Harness {
                 handler,
                 None
             ),
-            async {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                read_message(&mut stream).await.unwrap();
-                write_message(
-                    &mut stream,
-                    &Message::listen_instance(
-                        MessageId {
-                            guid: [1; 16],
-                            index: 1,
-                        },
-                        &ListenInstance {
-                            nonce: [1; 16],
-                            ..ListenInstance::default()
-                        },
-                    )
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-                stream
-            }
+            async { ModelPeer::accept(listener).await.unwrap() }
         );
         let authority = Authority::new(std::time::Instant::now(), 3_000_000_000).unwrap();
         let current = crate::ActivationContextHandle::new(activation);
@@ -782,7 +741,6 @@ impl Harness {
         };
         let calls = Arc::new(Calls::default());
         *calls.provider.lock().unwrap() = Some(engine.instance_integration_provider());
-        peer.set_nodelay(true).unwrap();
         engine
             .insert_factory("ModelType".into(), Arc::new(Factory(calls.clone())))
             .unwrap();
@@ -790,7 +748,6 @@ impl Harness {
             engine,
             peer,
             calls,
-            index: 2,
         }
     }
     fn request(&self, partition: u8, incarnation: i64, mode: u8) -> ProxyRequest {
@@ -885,43 +842,26 @@ impl Harness {
             flags: 0,
         }
     }
-    async fn send(&mut self, action: &str, request: &ProxyRequest) -> MessageId {
+    async fn send(&mut self, action: &str, request: &ProxyRequest) {
         let mut request = request.clone();
         if action == "RAPQuery" {
             request.flags = 0;
         }
-        let id = MessageId {
-            guid: [7; 16],
-            index: self.index,
-        };
-        self.index += 1;
-        let mut headers = vec![
-            Header::actor(12).unwrap(),
-            Header::action(action).unwrap(),
-            Header::message_id(id).unwrap(),
-        ];
+        let message = message(12, action, to_vec(&request).unwrap()).unwrap();
         if action == "RAPQuery" {
-            headers.push(Header::boolean(fube_transport::message::EXPECTS_REPLY, true).unwrap())
+            self.peer.request(message).unwrap();
+        } else {
+            self.peer.send(message).await.unwrap();
         }
-        write_message(
-            &mut self.peer,
-            &Message {
-                headers,
-                body: to_vec(&request).unwrap(),
-            },
-        )
-        .await
-        .unwrap();
-        id
     }
     async fn receive(&mut self, action: &str) -> Message {
-        let msg = tokio::time::timeout(Duration::from_secs(2), read_message(&mut self.peer))
+        let msg = tokio::time::timeout(Duration::from_secs(2), self.peer.receive())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(msg.properties().unwrap().action, action);
+        assert_eq!(msg.metadata().unwrap().action, action);
         assert_eq!(
-            msg.properties().unwrap().actor,
+            msg.metadata().unwrap().actor,
             if action == "ReportHealth" { 7 } else { 12 }
         );
         let identity = match action {
@@ -959,8 +899,7 @@ impl Harness {
         msg
     }
     async fn no_reply(&mut self) {
-        let received =
-            tokio::time::timeout(Duration::from_millis(30), self.peer.peek(&mut [0])).await;
+        let received = tokio::time::timeout(Duration::from_millis(30), self.peer.activity()).await;
         assert!(received.is_err(), "unexpected model response: {received:?}");
     }
 }
@@ -968,25 +907,47 @@ impl Harness {
 #[tokio::test]
 #[should_panic(expected = "unexpected model response")]
 async fn no_reply_rejects_a_partial_frame() {
-    use tokio::io::AsyncWriteExt;
     let mut h = Harness::new().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (client, accepted) = tokio::join!(
-        TcpStream::connect(listener.local_addr().unwrap()),
-        listener.accept()
+    let endpoint =
+        furpc::Endpoint::from_shared(format!("tcp://{}", listener.local_addr().unwrap()))
+            .unwrap()
+            .connection_options(furpc::ConnectionOptions::raw_only());
+    let (client, accepted) = tokio::join!(endpoint.connect(), ModelPeer::accept(listener));
+    h.peer = accepted.unwrap();
+    let complete = message(12, "complete", vec![7]).unwrap();
+    let header_bytes: usize = complete
+        .headers()
+        .raw_records()
+        .map(|record| 4 + record.value().len())
+        .sum();
+    h.peer
+        .reads
+        .hold_after(12 + header_bytes + complete.body().len() + 3);
+    let client = client.unwrap();
+    let sender = client
+        .peer(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    sender
+        .send(
+            complete,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    sender
+        .send(
+            message(12, "partial", vec![42; 256]).unwrap(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    h.peer.reads.blocked().await;
+    assert_eq!(
+        h.peer.receive().await.unwrap().metadata().unwrap().action,
+        "complete"
     );
-    h.peer = client.unwrap();
-    let mut writer = accepted.unwrap().0;
-    let frame = Message {
-        headers: vec![Header::action("partial").unwrap()],
-        body: vec![42; 256],
-    }
-    .to_frame()
-    .unwrap()
-    .encode()
-    .unwrap();
-    writer.write_all(&frame[..3]).await.unwrap();
-    h.peer.readable().await.unwrap();
     h.no_reply().await;
 }
 
@@ -997,8 +958,13 @@ async fn dispatch_events_and_late_native_commands_preserve_shutdown_ipc() {
     let request = h.request(1, 1, 0);
     h.send("ReplicaOpen", &request).await;
     h.receive("ReplicaOpenReply").await;
-    let id = h.send("RAPQuery", &request).await;
-    h.receive("RAPQueryReply").await;
+    h.send("RAPQuery", &request).await;
+    let id = h
+        .receive("RAPQueryReply")
+        .await
+        .metadata()
+        .unwrap()
+        .relates_to;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
@@ -1040,8 +1006,13 @@ async fn slow_event_subscribers_do_not_backpressure_native_queries() {
     let mut current = h.engine.subscribe_events();
     let request = h.request(1, 1, 0);
     for _ in 0..=crate::diagnostics::EVENT_CAPACITY {
-        let id = h.send("RAPQuery", &request).await;
-        h.receive("RAPQueryReply").await;
+        h.send("RAPQuery", &request).await;
+        let id = h
+            .receive("RAPQueryReply")
+            .await
+            .metadata()
+            .unwrap()
+            .relates_to;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), current.recv())
                 .await
@@ -1113,11 +1084,11 @@ async fn empty_endpoint_open_duplicate_and_close_observe_callbacks_and_disposal(
     // Probe the wire before any receive helper can wait for dispatch release.
     h.no_reply().await;
     h.calls.drop_release.store(true, Ordering::Release);
-    let message = tokio::time::timeout(Duration::from_secs(2), read_message(&mut h.peer))
+    let message = tokio::time::timeout(Duration::from_secs(2), h.peer.receive())
         .await
         .unwrap()
         .unwrap();
-    let properties = message.properties().unwrap();
+    let properties = message.metadata().unwrap();
     assert_eq!(properties.actor, 12);
     assert_eq!(properties.action, "ReplicaCloseReply");
     let close: ProxyReply = from_slice(&message.body).unwrap();
@@ -1203,9 +1174,12 @@ async fn open_readiness_query_duplicate_close_and_partition_invalidation() {
     native_query.service.quorum_wait = i64::MIN;
     native_query.service.standby_keep = i64::MIN;
     native_query.unit.consistency.kind = 0;
-    let id = h.send("RAPQuery", &native_query).await;
+    h.send("RAPQuery", &native_query).await;
     let response = h.receive("RAPQueryReply").await;
-    assert_eq!(response.properties().unwrap().relates_to, id);
+    assert_ne!(
+        response.metadata().unwrap().relates_to,
+        MessageId::default()
+    );
     let query: QueryReply = from_slice(&response.body).unwrap();
     assert_eq!(query.error, 0);
     assert_eq!(query.detail.instance_id, 100);
@@ -1480,7 +1454,7 @@ async fn abort_panic_or_cleanup_timeout_never_acknowledges_disposal() {
             matches!(cause, Error::Protocol("service abort panicked"))
         });
         assert!(h.engine.shared.authority.check().is_err());
-        let response = tokio::time::timeout(Duration::from_secs(1), read_message(&mut h.peer))
+        let response = tokio::time::timeout(Duration::from_secs(1), h.peer.receive())
             .await
             .unwrap();
         assert!(
@@ -1558,7 +1532,6 @@ async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
 
 #[tokio::test]
 async fn locally_revoked_admitted_stateless_success_preserves_siblings_and_close_retry() {
-    use tokio::io::AsyncReadExt;
     for update in [false, true] {
         let mut h = Harness::new().await;
         let mut request = h.request(1, 1, 0);
@@ -1571,16 +1544,16 @@ async fn locally_revoked_admitted_stateless_success_preserves_siblings_and_close
         drop(unit.operation.clone().acquire_owned().await.unwrap());
         let valid = unit.state.lock().unwrap().valid.clone();
         let connection = h.engine.shared.connection.clone();
+        h.peer.reads.hold_after(12);
         let mut blocker = Box::pin(connection.send_one_way_checked(
             12,
             "RAPReportLoad",
-            vec![0; fube_transport::frame::MAX_FRAME_SIZE - 4096],
+            vec![0; 4 * 1024 * 1024 - 4096],
             deadline_after(Duration::from_secs(5)).unwrap(),
             Arc::new(|| true),
         ));
         poll_pending_once(blocker.as_mut()).await;
-        let mut fixed = [0; fube_transport::frame::FIXED_HEADER_SIZE];
-        h.peer.read_exact(&mut fixed).await.unwrap();
+        h.peer.reads.blocked().await;
         if update {
             request.service.update_version += 1;
         }
@@ -1610,12 +1583,9 @@ async fn locally_revoked_admitted_stateless_success_preserves_siblings_and_close
         })
         .await
         .unwrap();
-        let size = u32::from_le_bytes(fixed[..4].try_into().unwrap()) as usize;
-        h.peer
-            .read_exact(&mut vec![0; size - fixed.len()])
-            .await
-            .unwrap();
+        h.peer.reads.resume();
         blocker.await.unwrap();
+        h.receive("RAPReportLoad").await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while unit.operation.available_permits() == 0 {
                 tokio::task::yield_now().await;
@@ -1725,19 +1695,11 @@ async fn prove_unregister_ipc_after_drain(h: &mut Harness) {
     let body = to_vec(&ErrorReply { error: 0 }).unwrap();
     let id = h.engine.shared.activation.runtime.id.clone();
     let receive = async {
-        let request = read_message(&mut h.peer).await.unwrap();
-        let properties = request.properties().unwrap();
+        let request = h.peer.receive().await.unwrap();
+        let properties = request.metadata().unwrap();
         assert_eq!(properties.actor, 9);
         assert_eq!(properties.action, "UnregisterFabricRuntimeRequest");
-        write_message(
-            &mut h.peer,
-            &Message {
-                headers: vec![Header::relates_to(properties.id).unwrap()],
-                body,
-            },
-        )
-        .await
-        .unwrap();
+        request.respond(message(0, "", body).unwrap()).unwrap();
     };
     let send = connection.request::<_, ErrorReply>(
         "UnregisterFabricRuntimeRequest",

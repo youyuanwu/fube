@@ -44,6 +44,16 @@ retirement. Close releases Channel ownership, not a physical-driver join.
 and means reply data was handed to the runner, not that it was written.
 No furpc lifecycle or write-fence extension is introduced.
 
+Runtime's retained lifecycle/stateful/subprocess and shared RAP model peers now
+use public furpc Server/Peer/ingress contracts, including runner-owned replies.
+Backpressure and partial-read checks use test-only I/O adapters. Hosting/node
+integration tests retain independent, byte-preserving frame observation using
+public furpc headers; they do not replace the unmigrated production Hosting server.
+Neither fube-runtime nor fube-rap-test-support directly depends on fube-transport,
+including dev-dependencies. Legacy core/data/Hosting transitive consumers remain.
+Role-changing reconfiguration retries during catch-up no longer receive a
+membership-only success before the service and replicator roles are applied.
+
 Public `ReplicationEndpointOptions` literals must set `advertised_ip`: use
 `None` for an existing concrete listener, or `Some(ip)` for the concrete IP to
 publish from a wildcard listener. The actual bound port is retained; there is
