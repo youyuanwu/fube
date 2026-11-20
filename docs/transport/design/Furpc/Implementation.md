@@ -435,7 +435,7 @@ unqualified. TLS remains unimplemented.
 
 ## Data replication migration
 
-**Implemented; native replication qualification not run.** This separate
+**Implemented; native-data qualification passed at `154b4f1`.** This separate
 consumer slice replaces `fube-data`'s normal/dev legacy transport use, including
 its native payload/header codecs and directly coupled fixtures. Runtime/RAP
 and transactional callers keep their SF-style public replication boundary;
@@ -549,12 +549,23 @@ loosening limits/deadlines or changing copy/ACK/retry policy. The same case
 passes with that original bound. Evidence logs, including the failed diagnostic
 runs, are ignored under `build/furpc-data-proof/`.
 
-Fresh native replication qualification is required before claiming migrated
-native support. Historical V1 receipts and the Hosting bootstrap/registration
-qualification do not qualify this slice. New native work must use a fresh
-exact-source bundle and actual independent observations, preserve owned
-workload cleanup and retained infrastructure, and keep native stateful/
-deployed/reporting and TLS/claims gaps explicit.
+Fresh native qualification on 2026-11-20 passed all 17 scenarios in the maintained
+`native-data` profile against SF 11.8.121.4, using clean source
+`154b4f13902263a5ef61876cf88276c48fc35a07` and a newly built strict bundle.
+Both Rust/native replication directions, nonempty copy, held application/final-copy
+ACK negatives, quorum loss/recovery, interrupted copy/epoch changes, identified
+retries, stale-wire probes and owned workload cleanup passed with zero errors.
+Six stale-wire receipts pair complete local socket acceptance with independently
+captured destination ingress; they do not prove native parse/rejection or flush.
+The minted application/type/ImageStore upload and original staging reservation
+were removed with absence checks; the caller-owned onebox remains intact.
+See the [pinned qualification record](../../../runtime/FubeData.md#furpc-native-data-qualification-2026-11-20).
+
+This qualifies that volatile clear mixed-native data profile, not the separate
+Rust-only14, full legacy/runtime three-replica profile, every stateful/reporting
+path, different listen/publish addresses, durability or TLS/claims. Historical
+V1/Hosting receipts remain historical. Future changed-source native work requires
+another fresh exact-source bundle and independently observed owned cleanup.
 
 ## Gap ownership and implementation order
 

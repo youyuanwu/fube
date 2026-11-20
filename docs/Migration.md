@@ -101,7 +101,10 @@ joins owned session/I/O lifetimes on the dedicated thread but can truncate a
 committed frame; the old first-write predicate/started-suffix flush contracts
 are retired. Local qualification write evidence is
 `complete_local_socket_acceptance` with actual observed frame bytes, not an
-explicit flush or remote ACK. Native furpc replication qualification is not run;
+explicit flush or remote ACK. Fresh native furpc replication qualification passed
+all 17 `native-data` scenarios at clean source `154b4f1` against SF 11.8.121.4,
+including both replication directions, copy/ACK/quorum and owned workload cleanup.
+See the [exact-source record and limits](runtime/FubeData.md#furpc-native-data-qualification-2026-11-20);
 historical data/Hosting receipts are not relabeled as this migration's evidence.
 
 Public `ReplicationEndpointOptions` literals must set `advertised_ip`: use

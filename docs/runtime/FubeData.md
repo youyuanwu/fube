@@ -15,12 +15,14 @@ universal V1 parity is promised. Acknowledgment is not disk durability.
 
 The [current SF/mssf four-axis alignment record](SfApiAlignment.md) separates
 canonical signature from values, completion and capability. The deployed
-results in [executed qualification](#executed-qualification) are **historical at
-their exact old source/profile**, not qualification of this breaking migration.
-Current API-alignment and furpc replication deployed/native validation is **NOT RUN**.
+furpc migration passed the 17-scenario `native-data` profile at clean source
+`154b4f1`; see [executed qualification](#furpc-native-data-qualification-2026-11-20)
+for the exact bundle, evidence and limits. Earlier results remain **historical at
+their exact old source/profile**. The separate current runtime three-replica/full
+legacy profile is not qualified by this data run.
 The [source audit and R0 corrections](#known-semantic-differences-from-native-v1)
 below record corrected lower contracts with offline regression evidence.
-They do not qualify R0 against a deployed native cluster.
+The selected native profile does not establish universal semantic parity.
 
 ## Components and selection
 
@@ -114,7 +116,8 @@ as written; the native harness still requires independent destination ingress.
 Furpc uses accelerated incremental native CRC-32 without changing wire bytes,
 checksum policy or deadlines. This and bounded send pipelining preserve the
 retained multi-megabyte full-copy regression through ordinary public runtime/txn
-construction. Historical native receipts do not qualify this new transport.
+construction. The fresh qualification below covers this new transport's selected
+native-data profile; historical receipts do not.
 
 The existing mixed `rust-runtime-app` keeps `RustRuntimeType` stateless and
 `RustStatefulRuntimeType` volatile stateful in the same executable/code package.
@@ -776,6 +779,50 @@ the production provider API. See the [detailed bridge rationale and
 tests](../../crates/samples/native-replicator-oracle/README.md#typed-abi-provenance-and-dependency-boundary).
 
 ## Executed qualification
+
+### Furpc native-data qualification (2026-11-20)
+
+All **17 scenarios passed, with zero errors**, using a fresh strict bundle built
+from clean source `154b4f13902263a5ef61876cf88276c48fc35a07`. The profile is
+Linux x86-64/SF 11.8.121.4, volatile classic V1, explicit service ACKs and clear
+trusted container-local loopback. Native nodes alone selected roles, membership,
+epochs and placement; actual activated executable hashes/mappings were checked.
+
+The maintained `native-data` chain exercised both Rust-primary/native-secondary
+and native-primary/Rust-secondary nonzero writes and nonempty replacement copy,
+held application/final-copy ACK negatives, post-copy no-write moves with native
+ACK-frontier evidence, interrupted copy/epoch change, copy cancellation/recovery,
+quorum unavailability/recovery, identical retries/lost replies, abrupt Primary
+loss, per-unit Close, authoritative changed/unchanged data loss and finite ledger
+backpressure. Six stale-wire probes used exact actual local socket acceptance
+plus independent destination-kernel ingress before unchanged-state observations;
+neither evidence establishes native parsing/rejection or an explicit flush.
+The original report's human-readable limitation still says `write/flush`; its
+structured evidence correctly requires `complete_local_socket_acceptance`.
+That wording is corrected separately without modifying or relabeling the receipt.
+
+The report records original-owner application deletion, type unprovisioning,
+native ImageStore absence and staging removal, plus process resume, hook and
+auxiliary cleanup. Zero cleanup errors were reported. Independent post-run
+queries confirmed no remaining owned application/type and verified that the approved
+caller-owned `furpc-naming` container/allocation remains intact.
+
+Local ignored artifacts are under `build/furpc-data-proof/native-154b4f1/`:
+`binaries/build-info.json` binds the exact executable/package hashes and modes;
+`native-data-report.json` retains the complete observations unchanged.
+Bundle manifest SHA-256:
+`48646a31ae9973b28e8153cd5b6ef9956cee659c5cfeaa22f33bec30d9e1b6ac`.
+Report SHA-256:
+`e14d15073782ae84ab710f36f900ed808e823511e4c68ea94baab12aff3ab559`.
+The report contains private ownership capabilities and must not be published.
+
+This is **native-data17**, not Rust-only14 or the separate full legacy/runtime
+three-replica suite. It does not qualify every stateful/reporting path, different
+listen/publish addresses, TLS/claims, persistence, transactional replication,
+rolling upgrades, whole-set restart preservation or universal native parity.
+Future changed-source qualification requires a new immutable bundle and report.
+
+### Historical qualification
 
 Source-guided port baseline:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`](https://github.com/microsoft/service-fabric/tree/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication).
