@@ -279,6 +279,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transport_records_keep_raw_native_order_guid_arrays_in_json() {
+        for guid in [[0; 16], std::array::from_fn(|i| (i + 1) as u8)] {
+            for index in [0, u32::MAX] {
+                let id = MessageId { guid, index };
+                let json = serde_json::json!({ "guid": guid, "index": index });
+                assert_eq!(serde_json::to_value(id).unwrap(), json);
+                assert_eq!(serde_json::from_value::<MessageId>(json).unwrap(), id);
+            }
+            for address in ["", "node🦀é"] {
+                let instance = ListenInstance {
+                    address: address.into(),
+                    instance: u64::MAX,
+                    nonce: guid,
+                };
+                let json = serde_json::json!({
+                    "address": address, "instance": u64::MAX, "nonce": guid,
+                });
+                assert_eq!(serde_json::to_value(&instance).unwrap(), json);
+                assert_eq!(
+                    serde_json::from_value::<ListenInstance>(json).unwrap(),
+                    instance
+                );
+            }
+        }
+        for guid in [
+            serde_json::json!(vec![0u8; 15]),
+            serde_json::json!(vec![0u8; 17]),
+            serde_json::json!(vec![256u16; 16]),
+            serde_json::json!("00000000-0000-0000-0000-000000000000"),
+        ] {
+            assert!(serde_json::from_value::<MessageId>(
+                serde_json::json!({ "guid": guid, "index": 0 })
+            )
+            .is_err());
+            assert!(serde_json::from_value::<ListenInstance>(serde_json::json!({
+                "address": "", "instance": 0, "nonce": guid,
+            }))
+            .is_err());
+        }
+    }
+
+    #[test]
     fn migrated_payloads_match_independent_pre_serde_schemas() {
         fn compare(header: Header, fields: impl FnOnce(&mut Encoder) -> fubst::Result<()>) {
             assert_eq!(header, Header::object(header.id, fields).unwrap());

@@ -1,11 +1,7 @@
 //! Test-only clear-frame relay that loses one successful ACK, not native data.
 //! No packet bodies are persisted or used as fixtures.
-use fube_transport::{
-    connection::{read_message, write_message},
-    message::MessageId,
-    Error, Result,
-};
 use fubst::Decoder;
+use furpc::{header, BoxError, Error, HeaderRecord, Headers, MessageId, Result};
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -13,10 +9,108 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Notify,
     task::JoinHandle,
 };
+
+type RelayResult<T> = std::result::Result<T, BoxError>;
+
+// Keep the qualification relay's previous local bound, not a client frame limit.
+const MAX_RELAY_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const FIXED_HEADER_BYTES: usize = 12;
+
+struct Frame {
+    bytes: Vec<u8>,
+    headers: Headers,
+    body_offset: usize,
+}
+
+impl Frame {
+    async fn read(reader: &mut (impl AsyncRead + Unpin)) -> RelayResult<Self> {
+        let mut fixed = [0; FIXED_HEADER_BYTES];
+        reader.read_exact(&mut fixed).await?;
+        let size = u32::from_le_bytes(fixed[..4].try_into()?) as usize;
+        let body_offset =
+            FIXED_HEADER_BYTES + usize::from(u16::from_le_bytes([fixed[6], fixed[7]]));
+        if !(FIXED_HEADER_BYTES..=MAX_RELAY_FRAME_BYTES).contains(&size)
+            || body_offset > size
+            || fixed[4] != 0
+        {
+            return Err(Error::Protocol("invalid native relay frame").into());
+        }
+        let mut checked = fixed;
+        checked[5] = 0;
+        checked[8..].fill(0);
+        if fixed[5] != 0 && fixed[5] != crc8(&checked) {
+            return Err(Error::Protocol("native relay header CRC mismatch").into());
+        }
+        let mut bytes = vec![0; size];
+        bytes[..FIXED_HEADER_BYTES].copy_from_slice(&fixed);
+        reader.read_exact(&mut bytes[FIXED_HEADER_BYTES..]).await?;
+        let checksum = u32::from_le_bytes(fixed[8..].try_into()?);
+        if checksum != 0 && checksum != crc32(&bytes[FIXED_HEADER_BYTES..]) {
+            return Err(Error::Protocol("native relay body CRC mismatch").into());
+        }
+        let mut area = &bytes[FIXED_HEADER_BYTES..body_offset];
+        let mut headers = Headers::new();
+        while !area.is_empty() {
+            let prefix = area
+                .get(..4)
+                .ok_or(Error::Protocol("truncated native relay record"))?;
+            let id = u16::from_le_bytes([prefix[0], prefix[1]]);
+            let len = usize::from(u16::from_le_bytes([prefix[2], prefix[3]]));
+            let value = area
+                .get(4..4 + len)
+                .filter(|value| !value.is_empty())
+                .ok_or(Error::Protocol("invalid native relay record length"))?;
+            if let Some(id) = [
+                header::ACTION,
+                header::MESSAGE_ID,
+                header::RELATES_TO,
+                header::UNCORRELATED_REPLY,
+            ]
+            .into_iter()
+            .find(|candidate| candidate.get() == id)
+            {
+                headers.append(HeaderRecord::from_encoded(id, value.to_vec())?)?;
+            }
+            area = &area[4 + len..];
+        }
+        Ok(Self {
+            bytes,
+            headers,
+            body_offset,
+        })
+    }
+
+    fn body(&self) -> &[u8] {
+        &self.bytes[self.body_offset..]
+    }
+}
+
+fn crc8(bytes: &[u8]) -> u8 {
+    let mut value = 0u8;
+    for byte in bytes {
+        value ^= byte;
+        for _ in 0..8 {
+            value = (value << 1) ^ if value & 0x80 != 0 { 0x07 } else { 0 };
+        }
+    }
+    value
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut value = u32::MAX;
+    for byte in bytes {
+        value ^= u32::from(*byte);
+        for _ in 0..8 {
+            value = (value >> 1) ^ if value & 1 != 0 { 0xedb8_8320 } else { 0 };
+        }
+    }
+    !value
+}
 
 type PageKey = ([u8; 16], u64, u64);
 #[derive(Default)]
@@ -124,10 +218,10 @@ struct Shared {
 pub struct LossProxy {
     pub address: SocketAddr,
     shared: Arc<Shared>,
-    task: JoinHandle<Result<()>>,
+    task: JoinHandle<RelayResult<()>>,
 }
 impl LossProxy {
-    pub async fn start(endpoint: SocketAddr) -> Result<Self> {
+    pub async fn start(endpoint: SocketAddr) -> RelayResult<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let shared = Arc::new(Shared::default());
@@ -141,34 +235,43 @@ impl LossProxy {
             let (mut gateway_read, mut gateway_write) = gateway.into_split();
             let server = async {
                 loop {
-                    let message = read_message(&mut gateway_read).await?;
-                    let properties = message.properties()?;
-                    if properties.action == "ServiceNotificationRequest"
+                    let frame = Frame::read(&mut gateway_read).await?;
+                    let properties = frame.headers.effective();
+                    if properties
+                        .action()
+                        .iter()
+                        .copied()
+                        .eq("ServiceNotificationRequest".encode_utf16())
                         && properties.uncorrelated_reply
                     {
-                        let (key, entries) = identity(&message.body)?;
+                        let (key, entries) = identity(frame.body())?;
                         {
-                            relay
-                                .state
-                                .lock()
-                                .unwrap()
-                                .page(properties.id, key, entries)?;
+                            relay.state.lock().unwrap().page(
+                                properties.message_id,
+                                key,
+                                entries,
+                            )?;
                         }
                         relay.changed.notify_one();
                     }
-                    write_message(&mut client_write, &message).await?;
+                    client_write.write_all(&frame.bytes).await?;
                 }
                 #[allow(unreachable_code)]
-                Ok::<(), Error>(())
+                Ok::<(), BoxError>(())
             };
             let client = async {
                 loop {
-                    let message = read_message(&mut client_read).await?;
-                    let properties = message.properties()?;
+                    let frame = Frame::read(&mut client_read).await?;
+                    let properties = frame.headers.effective();
                     let mut discard = false;
                     let mut target_retry = false;
-                    if properties.action == "ServiceNotificationReply" {
-                        let mut d = Decoder::new(&message.body);
+                    if properties
+                        .action()
+                        .iter()
+                        .copied()
+                        .eq("ServiceNotificationReply".encode_utf16())
+                    {
+                        let mut d = Decoder::new(frame.body());
                         let success = d.object(|d| d.i64())? == 0;
                         d.finish()?;
                         (discard, target_retry) = relay
@@ -179,7 +282,7 @@ impl LossProxy {
                         relay.changed.notify_one();
                     }
                     if !discard {
-                        write_message(&mut gateway_write, &message).await?;
+                        gateway_write.write_all(&frame.bytes).await?;
                         if target_retry {
                             relay
                                 .state
@@ -191,7 +294,7 @@ impl LossProxy {
                     }
                 }
                 #[allow(unreachable_code)]
-                Ok::<(), Error>(())
+                Ok::<(), BoxError>(())
             };
             tokio::try_join!(server, client)?;
             Ok(())
@@ -218,7 +321,7 @@ impl Drop for LossProxy {
         self.task.abort();
     }
 }
-fn identity(body: &[u8]) -> Result<(PageKey, u32)> {
+fn identity(body: &[u8]) -> RelayResult<(PageKey, u32)> {
     let mut d = Decoder::new(body);
     d.object(|d| {
         d.pointer(|d, _| {
@@ -231,7 +334,7 @@ fn identity(body: &[u8]) -> Result<(PageKey, u32)> {
             Ok((key, d.u32()?))
         })
     })?
-    .ok_or(Error::Protocol("null native proxy page"))
+    .ok_or_else(|| Error::Protocol("null native proxy page").into())
 }
 
 #[test]

@@ -24,9 +24,10 @@ Session/filter RPCs reuse the gateway adapter on the original furpc Peer.
 The legacy notification adapters, receiver/reply-context plumbing and allocation
 ledger are removed. ImageStoreClient now also owns an independent furpc Channel:
 Peer sends carry v1.2 transfer messages and authorized Actor 25/27 one-way
-services receive semantic ACKs. No production fube-client path depends on
-fube-transport; its remaining dependency is test-only for the native loss relay
-and historical transport-model JSON checks.
+services receive semantic ACKs. Neither production nor test fube-client paths
+depend on fube-transport. The native loss relay forwards original clear-frame
+bytes unchanged and inspects headers through public furpc types; legacy
+transport-model JSON checks live in fube-transport.
 Rust error/admission/lifecycle changes below
 are deliberate API breaks, not compatibility wrappers. Historical source/wire
 evidence in later sections is not a substitute for current migration receipts.

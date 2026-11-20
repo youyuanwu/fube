@@ -170,6 +170,9 @@ close/is_closed/terminal_error APIs are removed rather than emulated.
 The last production fube-transport dependency and transport re-exports are
 retired from fube-client. Shared model validation uses fubst Error/Result;
 ImageStore errors retain FurpcClientError or the original filesystem source.
+The remaining test-only dependency is also retired: the native notification
+loss relay preserves original frame bytes and uses public furpc headers for
+inspection, while legacy transport-model JSON checks live in fube-transport.
 The existing native upload journey passed on the retained SF11.8.121.4 onebox:
 one real SDK predecessor copy and furpc CLI replacement agreed on inventory,
 removed stale content, and matched all 14 file/marker entries, including seven

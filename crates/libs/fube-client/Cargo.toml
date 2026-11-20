@@ -15,7 +15,6 @@ uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 clap.workspace = true
-fube-transport.workspace = true
 time.workspace = true
 reqwest.workspace = true
 openapi-service-fabric.workspace = true
