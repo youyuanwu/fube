@@ -18,18 +18,33 @@ use tower_service::Service;
 use crate::{
     protocol,
     query_protocol::{self, Query, QueryRequest, Reply},
-    ApplicationListPage, ApplicationQueryDescription, DeployedApplicationListPage,
-    DeployedApplicationQueryDescription, DeployedCodePackage, DeployedCodePackageQueryDescription,
-    DeployedReplica, DeployedReplicaQueryDescription, DeployedServicePackage,
-    DeployedServicePackageQueryDescription, DomainFailure, GatewayDescription,
+    resolution_protocol, ApplicationListPage, ApplicationQueryDescription,
+    DeployedApplicationListPage, DeployedApplicationQueryDescription, DeployedCodePackage,
+    DeployedCodePackageQueryDescription, DeployedReplica, DeployedReplicaQueryDescription,
+    DeployedServicePackage, DeployedServicePackageQueryDescription, GatewayDescription,
     MovePrimaryQueryDescription, NamingUri, NodeHealth, NodeHealthQueryDescription, NodeListPage,
     NodeQueryDescription, PartitionListPage, PartitionQueryDescription, ReplicaListPage,
-    ReplicaQueryDescription, ServiceListPage, ServiceQueryDescription,
+    ReplicaQueryDescription, ResolutionRequest, ResolvedServicePartition, ServiceListPage,
+    ServiceQueryDescription,
 };
 
 const ACTIVITY: u16 = 0x8020;
 const TIMEOUT: u16 = 0x8023;
 const CLIENT_VERSION: u16 = 0x8025;
+
+/// Valid native domain failure, distinct from an RPC transport Fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainFailure {
+    pub code: i64,
+    pub message: String,
+}
+
+impl fmt::Display for DomainFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "native error {}: {}", self.code, self.message)
+    }
+}
+impl std::error::Error for DomainFailure {}
 
 /// Errors from the experimental furpc-backed client, without legacy transport conversion.
 #[derive(Debug, Clone)]
@@ -107,8 +122,8 @@ type Result<T> = std::result::Result<T, FurpcClientError>;
 
 /// Typed gateway stub over a byte-facing Tower service.
 ///
-/// Gateway queries, Ping and naming operations are implemented separately
-/// from [`crate::FabricClient`].
+/// Gateway queries, Ping, naming operations and resolution use furpc directly,
+/// without the retired FabricClient façade or typed budgets.
 /// The default transport is a furpc Channel; clones share its lifecycle and
 /// dropping the last owner closes it. Later calls may reconnect, but a submitted
 /// call is never replayed. Custom transports need not be Clone, Sync or static.
@@ -260,6 +275,38 @@ where
         deadline: Instant,
     ) -> Result<Response<()>> {
         self.query(request, deadline).await
+    }
+
+    /// Resolve a checked selection without an endpoint cache, retry or replay.
+    ///
+    /// Previous-result identity/version metadata is sent exactly as captured;
+    /// an observed endpoint address does not retarget this client's gateway.
+    /// This is not an atomic placement snapshot. Response metadata and on-time
+    /// settlement retain the same semantics as other furpc operations.
+    pub async fn resolve_service_partition(
+        &mut self,
+        request: Request<ResolutionRequest>,
+        deadline: Instant,
+    ) -> Result<Response<ResolvedServicePartition>> {
+        let name = request.body().name.clone();
+        let key = request.body().key.clone();
+        let response = self
+            .unary(
+                request,
+                ResolutionCodec::default(),
+                "ResolveServiceRequest",
+                check_resolution_reply,
+                deadline,
+            )
+            .await?;
+        let (parts, reply) = response.into_parts();
+        let result = reply.into_partition().map_err(FurpcClientError::Protocol)?;
+        if result.service_name != name || !key.selects(&result.partition_information) {
+            return Err(FurpcClientError::Protocol(
+                "resolution result does not match requested selection",
+            ));
+        }
+        Ok(Response::from_parts(parts, result))
     }
 
     /// Get one best-effort native node page, without automatic paging or retries.
@@ -520,6 +567,7 @@ fn stamp_timeout(request: Request<Body>) -> furpc::Result<Request<Body>> {
 }
 
 type QueryBody<Q> = <<<Q as QueryRequest>::Parameters as Query>::Reply as Reply>::Body;
+type ResolutionCodec = FubstCodec<ResolutionRequest, resolution_protocol::ResolveReply>;
 
 struct QueryCodec<Q>(PhantomData<fn(Q)>);
 
@@ -663,6 +711,17 @@ fn check_name_reply(response: &Response<Body>) -> Result<()> {
     check_gateway_failure(response)?;
     if !action_is(response, "NameOperationReply") {
         return Err(FurpcClientError::Protocol("unexpected naming reply action"));
+    }
+    Ok(())
+}
+
+fn check_resolution_reply(response: &Response<Body>) -> Result<()> {
+    check_gateway_actor(response)?;
+    check_gateway_failure(response)?;
+    if !action_is(response, "ResolveServiceRequest") {
+        return Err(FurpcClientError::Protocol(
+            "unexpected resolution reply action",
+        ));
     }
     Ok(())
 }

@@ -670,6 +670,57 @@ class ProofFiles(fixtures.ProjectFiles):
                                                     "page_id": [[2] * 16, 1, 0]}},
             "endpoint_change": {"from": 2, "to": 1}, "role_change": {"model": 1},
         }
+        notification.update(
+            owner=owner, owned_applications=applications, owned_type="ListType-" + stem,
+            furpc_resolution={
+                "generation": 1, "same_generation_after_error": True,
+                "mixed_concurrent_operations": 3, "missing_service": applications[0] + "/DoesNotExist",
+                "native_missing_service_code": -2147017779, "native_error_origin": "domain",
+                "missing_http_absent": True, "native_start_ms": int(start * 1000) + 1,
+                "native_end_ms": int(start * 1000) + 10,
+            },
+        )
+
+        def resolution_case(name, kind, key, index):
+            stateful = kind == "Int64"
+            partition_kind = "Int64Range" if stateful else kind
+            identity = f"{index:08x}-1111-4111-8111-111111111111"
+            low, high = ((-10, -1) if key == -10 else (0, 9)) if stateful else (0, 0)
+            info = {"Id": identity, "ServicePartitionKind": partition_kind}
+            if stateful:
+                info.update(LowKey=str(low), HighKey=str(high))
+            elif kind == "Named":
+                info["Name"] = key
+            count = 3 if stateful else (5 if kind == "Singleton" else 1)
+            replicas = [{"ServiceKind": "Stateful" if stateful else "Stateless",
+                         "ReplicaStatus": "Ready", "Address": f"opaque-{node}",
+                         "ReplicaRole": "Primary" if node == 0 else "ActiveSecondary"}
+                        for node in range(count)]
+            native = {
+                "name": name, "kind": "Stateful" if stateful else "Stateless",
+                "partition": {"id": identity, "kind": partition_kind, "name": key if kind == "Named" else "",
+                              "low_key": low, "high_key": high},
+                "endpoints": [{"address": replica["Address"], "role": (
+                    "StatefulPrimary" if node == 0 else "StatefulSecondary") if stateful else "Stateless"}
+                    for node, replica in enumerate(replicas)],
+            }
+            return {"key": {"kind": kind, **({"value": key} if key is not None else {})},
+                    "native": native, "refreshed": copy.deepcopy(native),
+                    "expected_partition": {"ServiceKind": native["kind"], "PartitionInformation": info},
+                    "expected_replicas": replicas, "refresh_order": "Equal",
+                    "native_start_ms": int(start * 1000) + 2, "native_end_ms": int(start * 1000) + 3}
+
+        notification["resolved"] = [
+            resolution_case(app + "/" + suffix, kind, key, index)
+            for index, (app, suffix, kind, key) in enumerate(
+                ((app, suffix, kind, key) for app in applications
+                 for suffix, kind, keys in (("Stateless", "Singleton", [None]), ("Stateful", "Int64", [-10, 9]))
+                 for key in keys), 1)]
+        notification["named"] = {
+            "name": applications[0] + "/Named",
+            "partitions": [resolution_case(applications[0] + "/Named", "Named", key, index)
+                           for index, key in enumerate(("blue", "green"), 7)],
+        }
         return dict(zip(ci.NATIVE_FILES, (clear, health, names, lists, notification)))
 
     def real_policy_report(self):
@@ -1579,6 +1630,39 @@ class WorkerTests(ProofFiles):
                 change(broken[ci.NATIVE_FILES[3]])
                 with self.assertRaises(ci.ProofError):
                     ci.validate_native(broken, archive, allocation)
+
+    def test_furpc_resolution_requires_all_selectors_refresh_and_independent_endpoints(self):
+        original = self.native_reports("owned", 1)[ci.NATIVE_FILES[4]]
+        self.assertEqual(ci.validate_furpc_resolution(original), [1.001, 1.010])
+        changes = [
+            lambda value: value.pop("furpc_resolution"),
+            lambda value: value["furpc_resolution"].update(generation=True),
+            lambda value: value["furpc_resolution"].update(same_generation_after_error=False),
+            lambda value: value["furpc_resolution"].update(mixed_concurrent_operations=True),
+            lambda value: value["furpc_resolution"].update(native_missing_service_code=0),
+            lambda value: value["furpc_resolution"].update(native_missing_service_code=-1),
+            lambda value: value["furpc_resolution"].update(native_error_origin="local"),
+            lambda value: value["furpc_resolution"].update(missing_http_absent=False),
+            lambda value: value.update(owned_cleanup_confirmed=False),
+            lambda value: value.update(owner="foreign"),
+            lambda value: value["resolved"].pop(),
+            lambda value: value["resolved"][1]["key"].update(value=9),
+            lambda value: value["resolved"][0]["refreshed"].update(name="fabric:/foreign"),
+            lambda value: value["resolved"][1]["native"]["partition"].update(low_key=-9),
+            lambda value: value["resolved"][0]["native"]["endpoints"].pop(),
+            lambda value: value["resolved"][1]["refreshed"]["endpoints"][0].update(role="Stateless"),
+            lambda value: value["resolved"][0]["expected_replicas"][0].update(Address="different"),
+            lambda value: value["resolved"][0].update(refresh_order="Greater"),
+            lambda value: value["named"]["partitions"][0]["refreshed"]["partition"].update(name="green"),
+            lambda value: value["named"]["partitions"].pop(),
+            lambda value: value["furpc_resolution"].update(native_end_ms=1001),
+        ]
+        for index, change in enumerate(changes):
+            with self.subTest(change=index):
+                broken = copy.deepcopy(original)
+                change(broken)
+                with self.assertRaises(ci.ProofError):
+                    ci.validate_furpc_resolution(broken)
 
     def test_furpc_topology_requires_typed_native_results_and_independent_http(self):
         original = self.native_reports("owned", 1)[ci.NATIVE_FILES[3]]

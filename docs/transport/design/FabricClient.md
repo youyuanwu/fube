@@ -7,9 +7,10 @@ recorded SF 11.8.121.4 coverage and explicit limitations. This does not complete
 the TLS/authentication/recovery requirements below.
 
 **Current API split:** this broader design is not the current façade contract.
-Migrated Ping, all three naming methods, cluster/topology/deployment lists, node health and MovePrimary exist
+Migrated Ping, all three naming methods, cluster/topology/deployment lists, node health, MovePrimary and resolution exist
 only on `FurpcClient` over furpc; their legacy methods and typed-request adapters
-have been removed. `FabricClient` remains for resolution only. Proposed
+have been removed. The ordinary `FabricClient`/`GatewayClient` façades, sealed
+request contracts and typed allocation budgets are retired. Proposed
 builder examples below are not compatibility wrappers; see the linked subset
 guide for current typed requests and absolute deadlines.
 

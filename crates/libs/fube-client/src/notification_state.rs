@@ -217,7 +217,7 @@ impl Progress {
                     .map(String::len)
                     .sum::<usize>();
             memory.grow(conversion_bytes)?;
-            let version = table.identity(page.generation)?;
+            let version = table.identity(page.generation).map_err(Error::Protocol)?;
             let lookup = version.lookup;
             if next
                 .ranges

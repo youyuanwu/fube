@@ -39,7 +39,8 @@ pub fn endpoints(result: &ResolvedServicePartition, replicas: &[Value]) -> Resul
 
 pub async fn resolve_checked(
     http: &Http,
-    client: &FabricClient,
+    client: &mut FurpcClient,
+    generation: u64,
     name: &NamingUri,
     key: &PartitionKey,
     previous: Option<&ResolvedServicePartition>,
@@ -49,14 +50,7 @@ pub async fn resolve_checked(
     let mut previous = previous.cloned();
     tokio::time::timeout(Duration::from_secs(120), async {
         loop {
-            let result = client
-                .resolve_service_partition(
-                    name,
-                    key,
-                    previous.as_ref(),
-                    Some(Duration::from_secs(15)),
-                )
-                .await?;
+            let result = resolve(client, generation, name, key, previous.as_ref()).await?;
             let replicas = http.replicas(result.partition_information.id).await?;
             if endpoints(&result, &replicas).is_ok() {
                 break Ok::<_, Box<dyn std::error::Error + Send + Sync>>(result);
@@ -68,7 +62,82 @@ pub async fn resolve_checked(
     .await?
 }
 
-pub async fn named(http: &Http, client: &FabricClient, app: &NamingUri) -> Result<Value> {
+pub async fn resolve(
+    client: &mut FurpcClient,
+    generation: u64,
+    name: &NamingUri,
+    key: &PartitionKey,
+    previous: Option<&ResolvedServicePartition>,
+) -> Result<ResolvedServicePartition> {
+    let response = client
+        .resolve_service_partition(
+            furpc::Request::new(ResolutionRequest::new(name, key, previous)?),
+            tokio::time::Instant::now() + Duration::from_secs(15),
+        )
+        .await?;
+    Ok(furpc_support::body(response, generation))
+}
+
+pub async fn resolution_case(
+    http: &Http,
+    client: &mut FurpcClient,
+    generation: u64,
+    name: &NamingUri,
+    key: &PartitionKey,
+) -> Result<Value> {
+    let start = furpc_support::now_ms();
+    let result = resolve_checked(http, client, generation, name, key, None).await?;
+    let refreshed = resolve_checked(http, client, generation, name, key, Some(&result)).await?;
+    let order = result.version.compare(&refreshed.version)?;
+    assert!(order.is_le());
+    assert_eq!(
+        result.partition_information,
+        refreshed.partition_information
+    );
+    let partitions = http.partitions(name.as_str()).await?;
+    let observed = partitions
+        .iter()
+        .find(|value| {
+            value["PartitionInformation"]["Id"]
+                .as_str()
+                .is_some_and(|id| {
+                    id.eq_ignore_ascii_case(&result.partition_information.id.to_string())
+                })
+        })
+        .ok_or("resolved partition absent from independent inventory")?;
+    let replicas = http.replicas(result.partition_information.id).await?;
+    endpoints(&result, &replicas)?;
+    endpoints(&refreshed, &replicas)?;
+    fn evidence(result: &ResolvedServicePartition) -> Value {
+        let info = &result.partition_information;
+        json!({
+            "name": result.service_name.as_str(), "kind": format!("{:?}", result.kind),
+            "partition": {"id": info.id, "kind": format!("{:?}", info.kind),
+                "name": info.name, "low_key": info.low_key, "high_key": info.high_key},
+            "endpoints": result.endpoints.iter().map(|value| json!({
+                "address": value.address, "role": format!("{:?}", value.role),
+            })).collect::<Vec<_>>(),
+        })
+    }
+    let key = match key {
+        PartitionKey::Singleton => json!({"kind": "Singleton"}),
+        PartitionKey::Int64(value) => json!({"kind": "Int64", "value": value}),
+        PartitionKey::Named(value) => json!({"kind": "Named", "value": value}),
+    };
+    Ok(json!({
+        "key": key, "native": evidence(&result), "refreshed": evidence(&refreshed),
+        "expected_partition": observed, "expected_replicas": replicas,
+        "refresh_order": format!("{order:?}"),
+        "native_start_ms": start, "native_end_ms": furpc_support::now_ms(),
+    }))
+}
+
+pub async fn named(
+    http: &Http,
+    client: &mut FurpcClient,
+    generation: u64,
+    app: &NamingUri,
+) -> Result<Value> {
     let name: NamingUri = format!("{app}/Named").parse()?;
     let management = rest::configuration(Duration::from_secs(60))?;
     management.client.post(format!("{}/Applications/{}/$/GetServices/$/Create?api-version=6.0",
@@ -98,39 +167,28 @@ pub async fn named(http: &Http, client: &FabricClient, app: &NamingUri) -> Resul
     .await??;
     let mut evidence = Vec::new();
     for key in ["blue", "green"] {
-        let result =
-            resolve_checked(http, client, &name, &PartitionKey::Named(key.into()), None).await?;
-        assert_eq!(result.partition_information.name, key);
-        let partitions = http.partitions(name.as_str()).await?;
-        let observed = partitions
-            .iter()
-            .find(|p| p["PartitionInformation"]["Name"] == key)
-            .ok_or("missing independent named key")?;
-        assert_eq!(
-            observed["PartitionInformation"]["Id"]
-                .as_str()
-                .unwrap()
-                .parse::<uuid::Uuid>()?,
-            result.partition_information.id
+        evidence.push(
+            resolution_case(
+                http,
+                client,
+                generation,
+                &name,
+                &PartitionKey::Named(key.into()),
+            )
+            .await?,
         );
-        endpoints(
-            &result,
-            &http.replicas(result.partition_information.id).await?,
-        )?;
-        evidence.push(json!({"key":key,"partition":result.partition_information.id}));
     }
     Ok(json!({"name":name.as_str(),"partitions":evidence}))
 }
 
 pub async fn endpoint_change(
     http: &Http,
-    client: &FabricClient,
+    client: &mut FurpcClient,
+    generation: u64,
     notifications: &mut ServiceNotificationClient,
     name: &NamingUri,
 ) -> Result<Value> {
-    let baseline = client
-        .resolve_service_partition(name, &PartitionKey::Singleton, None, None)
-        .await?;
+    let baseline = resolve(client, generation, name, &PartitionKey::Singleton, None).await?;
     let management = rest::configuration(Duration::from_secs(60))?;
     management
         .client
@@ -165,6 +223,7 @@ pub async fn endpoint_change(
     let resolved = resolve_checked(
         http,
         client,
+        generation,
         name,
         &PartitionKey::Singleton,
         Some(&baseline),
@@ -179,13 +238,12 @@ pub async fn endpoint_change(
 
 pub async fn role_change(
     http: &Http,
-    client: &FabricClient,
+    client: &mut FurpcClient,
+    generation: u64,
     notifications: &mut ServiceNotificationClient,
     name: &NamingUri,
 ) -> Result<Value> {
-    let baseline = client
-        .resolve_service_partition(name, &PartitionKey::Int64(-10), None, None)
-        .await?;
+    let baseline = resolve(client, generation, name, &PartitionKey::Int64(-10), None).await?;
     let replicas = http.replicas(baseline.partition_information.id).await?;
     let old = replicas
         .iter()
@@ -226,6 +284,7 @@ pub async fn role_change(
     let resolved = resolve_checked(
         http,
         client,
+        generation,
         name,
         &PartitionKey::Int64(-10),
         Some(&baseline),

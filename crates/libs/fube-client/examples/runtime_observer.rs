@@ -1,11 +1,11 @@
 //! Independent native resolution and application RPC oracle, not runtime state.
 use clap::Parser;
 use fube_client::{
-    ClientOptions, DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
-    DeployedReplicaQueryDescription, DeployedReplicaQueryParameters, FabricClient, FurpcClient,
+    DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
+    DeployedReplicaQueryDescription, DeployedReplicaQueryParameters, FurpcClient,
     MovePrimaryQueryDescription, MovePrimaryQueryParameters, NamingUri, PartitionKey,
     PartitionQueryDescription, PartitionQueryParameters, ReplicaQueryDescription,
-    ReplicaQueryParameters, ServiceEndpointRole, ServiceKind,
+    ReplicaQueryParameters, ResolutionRequest, ServiceEndpointRole, ServiceKind,
 };
 use std::{net::SocketAddr, time::Duration};
 use tokio::{
@@ -122,7 +122,6 @@ async fn http(address: &str) -> ObserverResult<serde_json::Value> {
 }
 
 async fn stateful_snapshot(
-    client: &FabricClient,
     reads: &mut FurpcClient,
     name: &NamingUri,
 ) -> ObserverResult<serde_json::Value> {
@@ -254,14 +253,17 @@ async fn stateful_snapshot(
         }
         observations.push(item);
     }
-    let resolved = client
+    let resolved = reads
         .resolve_service_partition(
-            name,
-            &PartitionKey::Singleton,
-            None,
-            Some(Duration::from_secs(10)),
+            furpc::Request::new(ResolutionRequest::new(
+                name,
+                &PartitionKey::Singleton,
+                None,
+            )?),
+            tokio::time::Instant::now() + Duration::from_secs(10),
         )
-        .await?;
+        .await?
+        .into_body();
     if resolved.kind != ServiceKind::Stateful || resolved.partition_information.id != id {
         return Err("native discovery partition/kind mismatch".into());
     }
@@ -354,19 +356,8 @@ async fn run(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-    let channel = FabricClient::endpoint_clear(args.gateway)?
-        .connect_timeout(Duration::from_secs(10))
-        .connect()
-        .await?;
-    let client = FabricClient::new(
-        channel,
-        ClientOptions {
-            default_timeout: Duration::from_secs(10),
-            ..Default::default()
-        },
-    )?;
     if let Some(target) = args.move_primary {
-        let before = stateful_snapshot(&client, &mut reads, &name).await?;
+        let before = stateful_snapshot(&mut reads, &name).await?;
         let partition = before["partition"].as_str().ok_or("partition")?.parse()?;
         if !before["replicas"]
             .as_array()
@@ -389,20 +380,22 @@ async fn run(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             serde_json::json!({"request":"MovePrimary","partition":partition.to_string(),
             "target":target,"constraints":"enforced","native_request_completed":true})
         );
-        client.close().await?;
         return Ok(());
     }
     if args.stateful {
-        let snapshot = stateful_snapshot(&client, &mut reads, &name).await?;
+        let snapshot = stateful_snapshot(&mut reads, &name).await?;
         println!("{snapshot}");
-        client.close().await?;
         return Ok(());
     }
     let key = args.partition.unwrap_or(PartitionKey::Singleton);
     let query = args.report_query.as_deref().unwrap_or("");
-    let resolved = client
-        .resolve_service_partition(&name, &key, None, Some(Duration::from_secs(10)))
-        .await?;
+    let resolved = reads
+        .resolve_service_partition(
+            furpc::Request::new(ResolutionRequest::new(&name, &key, None)?),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await?
+        .into_body();
     if resolved.endpoints.is_empty() {
         return Err("no resolved endpoints".into());
     }
@@ -475,7 +468,6 @@ async fn run(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             })
         );
     }
-    client.close().await?;
     Ok(())
 }
 #[tokio::main]

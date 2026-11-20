@@ -5,6 +5,8 @@ use std::time::Duration;
 
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/furpc.rs"]
+mod furpc_support;
 #[path = "support/notification_live_scenarios.rs"]
 mod live;
 #[path = "support/notification_live_proxy.rs"]
@@ -79,18 +81,20 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
         return Err("owned onebox runtime/readiness mismatch".into());
     }
 
-    let channel = FabricClient::endpoint_clear(config.endpoint)?
+    let resolution_start_ms = furpc_support::now_ms();
+    let channel = FurpcClient::endpoint_clear(config.endpoint)?
         .connect_timeout(Duration::from_secs(60))
         .connect()
         .await
         .map_err(|e| format!("ordinary establishment: {e}"))?;
-    let ordinary = FabricClient::new(
-        channel,
-        ClientOptions {
-            default_timeout: Duration::from_secs(60),
-            ..Default::default()
-        },
-    )?;
+    let mut ordinary = FurpcClient::new(channel);
+    let response = ordinary
+        .ping(furpc::Request::new(()), furpc_support::deadline())
+        .await?;
+    let generation = response
+        .source()
+        .ok_or("missing native Ping source")?
+        .generation();
     let channel = ServiceNotificationClient::endpoint_clear(config.endpoint)?
         .connect_timeout(Duration::from_secs(60))
         .connect()
@@ -203,48 +207,81 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
             ),
         ] {
             let name: NamingUri = format!("{app}/{suffix}").parse()?;
-            let partitions = http.partitions(name.as_str()).await?;
             for key in keys {
-                let result = live::resolve_checked(&http, &ordinary, &name, &key, None).await?;
-                let partition = partitions
-                    .iter()
-                    .find(|p| {
-                        p["PartitionInformation"]["Id"].as_str().is_some_and(|id| {
-                            id.eq_ignore_ascii_case(&result.partition_information.id.to_string())
-                        })
-                    })
-                    .ok_or("resolved identity absent from independent partition inventory")?;
-                let replicas = http.replicas(result.partition_information.id).await?;
-                if result.endpoints.is_empty() {
-                    return Err("expected nonempty independent endpoint result".into());
-                }
-                live::endpoints(&result, &replicas)?;
-                let refreshed = ordinary
-                    .resolve_service_partition(&name, &key, Some(&result), None)
-                    .await?;
-                assert!(result.version.compare(&refreshed.version)?.is_le());
-                results.push(json!({"name":name.as_str(),"partition":partition["PartitionInformation"],"endpoints":result.endpoints.iter().map(|e|json!({"address":e.address,"role":format!("{:?}",e.role)})).collect::<Vec<_>>()}));
+                results.push(
+                    live::resolution_case(&http, &mut ordinary, generation, &name, &key).await?,
+                );
             }
         }
     }
-    let named = live::named(&http, &ordinary, &app).await?;
+    let named = live::named(&http, &mut ordinary, generation, &app).await?;
     let first = update(&mut notifications, &stateless, false).await?;
     let exact_first = exact_update(&mut independent, &stateless, false).await?;
     assert_eq!(first.partition_id, exact_first.partition_id);
     let retry = live::retry(&proxy, &mut retry_client).await?;
-    let endpoint_change =
-        live::endpoint_change(&http, &ordinary, &mut notifications, &stateless).await?;
-    let role_change = live::role_change(&http, &ordinary, &mut notifications, &stateful).await?;
+    let endpoint_change = live::endpoint_change(
+        &http,
+        &mut ordinary,
+        generation,
+        &mut notifications,
+        &stateless,
+    )
+    .await?;
+    let role_change = live::role_change(
+        &http,
+        &mut ordinary,
+        generation,
+        &mut notifications,
+        &stateful,
+    )
+    .await?;
     let missing: NamingUri = format!("{app}/DoesNotExist").parse()?;
-    assert!(matches!(
+    let (missing_code, missing_origin) = furpc_support::failure(
         ordinary
-            .resolve_service_partition(&missing, &PartitionKey::Singleton, None, None)
-            .await,
-        Err(ClientError::Domain(_) | ClientError::Transport(Error::Remote { .. }))
-    ));
-    ordinary
-        .resolve_service_partition(&stateless, &PartitionKey::Singleton, None, None)
-        .await?;
+            .resolve_service_partition(
+                furpc::Request::new(ResolutionRequest::new(
+                    &missing,
+                    &PartitionKey::Singleton,
+                    None,
+                )?),
+                furpc_support::deadline(),
+            )
+            .await
+            .unwrap_err(),
+    );
+    let missing_http_absent = !http
+        .services(app.as_str())
+        .await?
+        .iter()
+        .any(|service| service["Name"] == missing.as_str());
+    assert!(missing_http_absent);
+    {
+        let mut ping = ordinary.clone();
+        let mut nodes = ordinary.clone();
+        let (resolved, ping, nodes) = tokio::try_join!(
+            ordinary.resolve_service_partition(
+                furpc::Request::new(ResolutionRequest::new(
+                    &stateless,
+                    &PartitionKey::Singleton,
+                    None
+                )?),
+                furpc_support::deadline(),
+            ),
+            ping.ping(furpc::Request::new(()), furpc_support::deadline()),
+            nodes.get_node_list(
+                furpc::Request::new(NodeQueryDescription::default()),
+                furpc_support::deadline()
+            ),
+        )?;
+        let result = furpc_support::body(resolved, generation);
+        live::endpoints(
+            &result,
+            &http.replicas(result.partition_information.id).await?,
+        )?;
+        furpc_support::body(ping, generation);
+        assert_eq!(furpc_support::body(nodes, generation).items.len(), 5);
+    }
+    let resolution_end_ms = furpc_support::now_ms();
     // Only a service under the exact owned application journal is mutated.
     let management = rest::configuration(Duration::from_secs(60))?;
     management
@@ -263,8 +300,8 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
     assert_eq!(removed.partition_id, first.partition_id);
     assert_eq!(exact_removed.partition_id, first.partition_id);
     assert!(first.version.compare(&removed.version)?.is_lt());
-    ordinary.close().await?;
-    // Closing the ordinary connection has not retired either subscription.
+    drop(ordinary);
+    // Dropping the last ordinary owner has not retired either subscription.
     primary.unregister(None).await?;
     prefix.unregister(None).await?;
     notifications.close(None).await?;
@@ -277,8 +314,16 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
     proxy.stop().await;
     Ok(json!({
         "runtime_version":config.runtime,"profile":"clear","allocation":config.allocation,
+        "owner":config.owner, "owned_applications":journal.applications, "owned_type":journal.type_name,
         "gateway":{"address":gateway.address,"node_id":gateway.node_id.to_string(),"node_instance":gateway.node_instance,"node_name":gateway.node_name},
         "resolved":results,"named":named,"ack_retry":retry,"endpoint_change":endpoint_change,"role_change":role_change,
+        "furpc_resolution": {
+            "generation":generation, "same_generation_after_error":true,
+            "mixed_concurrent_operations":3, "missing_service":missing,
+            "native_missing_service_code":missing_code, "native_error_origin":missing_origin,
+            "missing_http_absent":missing_http_absent,
+            "native_start_ms":resolution_start_ms, "native_end_ms":resolution_end_ms,
+        },
         "passed":["native session establishment","three independent notification clients","exact/prefix/primary-only registration","singleton, named and signed-int64 resolution","previous-result refresh","independent replica endpoint/role multiset comparison","native endpoint count change and empty invalidations","owned primary replacement and versioned updates","forced successful ACK loss, gateway retry, no duplicate delivery","native error and healthy reuse","explicit unregister","independent close"],
         "unqualified":["TLS/authentication (out of scope)","automatic recovery (out of scope)","isolated primary-only content-change delivery on a service with distinct published primary addresses"]
     }))

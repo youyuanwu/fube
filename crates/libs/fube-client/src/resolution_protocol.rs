@@ -1,19 +1,19 @@
-use fube_transport::message::Message;
-use fubst::serde::{from_slice, to_vec, CountedStrings, Guid, Pointer};
+use fubst::serde::{CountedStrings, Guid, Pointer};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     resolution::{Generation, Refresh},
-    Error, NamingUri, PartitionInformation, PartitionKey, PartitionKind, ResolvedServicePartition,
-    Result, ServiceEndpoint, ServiceEndpointRole, ServiceEndpointVersion, ServiceKind,
+    NamingUri, PartitionInformation, PartitionKey, PartitionKind, ResolutionRequest,
+    ResolvedServicePartition, ServiceEndpoint, ServiceEndpointRole, ServiceEndpointVersion,
+    ServiceKind,
 };
 
 #[derive(Serialize)]
-struct Key {
+struct Key<'a> {
     kind: i64,
     integer: i64,
-    name: String,
+    name: &'a str,
     whole_service: bool,
 }
 #[derive(Serialize)]
@@ -27,8 +27,8 @@ pub(crate) struct Cuid {
     pub id: Guid,
 }
 #[derive(Serialize)]
-struct RequestData {
-    key: Key,
+struct RequestData<'a> {
+    key: Key<'a>,
     version: LocationVersion,
     cuid: Cuid,
     include_description: bool,
@@ -36,61 +36,64 @@ struct RequestData {
 #[derive(Serialize)]
 struct Request<'a> {
     name: &'a NamingUri,
-    request: RequestData,
+    request: RequestData<'a>,
     bypass_cache: bool,
 }
 
-pub(crate) fn encode_refresh(
-    name: &NamingUri,
-    key: &PartitionKey,
-    previous: Option<&Refresh>,
-) -> Result<Vec<u8>> {
-    key.validate()?;
-    let key = match key {
-        PartitionKey::Singleton => Key {
-            kind: 1,
-            integer: 0,
-            name: String::new(),
-            whole_service: false,
-        },
-        PartitionKey::Int64(value) => Key {
-            kind: 2,
-            integer: *value,
-            name: String::new(),
-            whole_service: false,
-        },
-        PartitionKey::Named(value) => Key {
-            kind: 3,
-            integer: 0,
-            name: value.clone(),
-            whole_service: false,
-        },
-    };
-    let (lookup, generation, store, id) =
-        previous.map_or((-1, Generation::default(), -1, Uuid::nil()), |p| {
-            (
-                p.version.lookup,
-                p.version.generation,
-                p.store,
-                p.partition.id,
-            )
-        });
-    Ok(to_vec(&Request {
-        name,
-        request: RequestData {
-            key,
-            version: LocationVersion {
-                lookup,
-                generation,
-                store,
+impl Serialize for ResolutionRequest {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let key = match &self.key {
+            PartitionKey::Singleton => Key {
+                kind: 1,
+                integer: 0,
+                name: "",
+                whole_service: false,
             },
-            cuid: Cuid {
-                id: Guid(id.to_bytes_le()),
+            PartitionKey::Int64(value) => Key {
+                kind: 2,
+                integer: *value,
+                name: "",
+                whole_service: false,
             },
-            include_description: false,
-        },
-        bypass_cache: false,
-    })?)
+            PartitionKey::Named(value) => Key {
+                kind: 3,
+                integer: 0,
+                name: value,
+                whole_service: false,
+            },
+        };
+        let (lookup, generation, store, id) =
+            self.previous
+                .as_ref()
+                .map_or((-1, Generation::default(), -1, Uuid::nil()), |p| {
+                    (
+                        p.version.lookup,
+                        p.version.generation,
+                        p.store,
+                        p.partition.id,
+                    )
+                });
+        Request {
+            name: &self.name,
+            request: RequestData {
+                key,
+                version: LocationVersion {
+                    lookup,
+                    generation,
+                    store,
+                },
+                cuid: Cuid {
+                    id: Guid(id.to_bytes_le()),
+                },
+                include_description: false,
+            },
+            bypass_cache: false,
+        }
+        .serialize(serializer)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,12 +141,14 @@ impl TableEntry {
         )
     }
 
-    pub fn identity(&self, generation: Generation) -> Result<ServiceEndpointVersion> {
-        let name = NamingUri::parse(&self.name)
-            .map_err(|_| Error::Protocol("invalid endpoint service name"))?;
+    pub fn identity(
+        &self,
+        generation: Generation,
+    ) -> std::result::Result<ServiceEndpointVersion, &'static str> {
+        let name = NamingUri::parse(&self.name).map_err(|_| "invalid endpoint service name")?;
         let partition = Uuid::from_bytes_le(self.cuid.id.0);
         if partition.is_nil() || self.replicas.lookup < 0 {
-            return Err(Error::Protocol("invalid endpoint identity/version"));
+            return Err("invalid endpoint identity/version");
         }
         Ok(ServiceEndpointVersion {
             name,
@@ -174,48 +179,47 @@ pub(crate) struct ResolveReply {
     pub description: Pointer<Description>,
 }
 
-pub(crate) fn decode(message: Message) -> Result<ResolvedServicePartition> {
-    // NamingMessage::GetResolveServiceReply actually uses ResolveServiceAction.
-    crate::protocol::check_reply(&message, &["ResolveServiceRequest"])?;
-    let reply: ResolveReply = from_slice(&message.body)?;
-    if reply.group {
-        return Err(Error::InvalidInput(
-            "service-group resolution is unsupported",
-        ));
-    }
+impl ResolveReply {
+    pub(crate) fn into_partition(
+        self,
+    ) -> std::result::Result<ResolvedServicePartition, &'static str> {
+        let reply = self;
+        if reply.group {
+            return Err("service-group resolution is unsupported");
+        }
 
-    let version = reply.locations.identity(reply.generation)?;
-    if !reply.locations.found {
-        return Err(Error::Protocol(
-            "successful resolution has no service location",
-        ));
+        let version = reply.locations.identity(reply.generation)?;
+        if !reply.locations.found {
+            return Err("successful resolution has no service location");
+        }
+        let info = PartitionInformation {
+            kind: reply.partition.kind,
+            id: version.partition,
+            name: reply.partition.name,
+            low_key: reply.partition.low,
+            high_key: reply.partition.high,
+        };
+        if (info.kind == PartitionKind::Int64Range && info.low_key > info.high_key)
+            || (info.kind == PartitionKind::Named
+                && (info.name.is_empty() || info.name.contains('\0')))
+        {
+            return Err("invalid resolved partition details");
+        }
+        let (kind, endpoints) = reply.locations.endpoints();
+        Ok(ResolvedServicePartition {
+            service_name: version.name.clone(),
+            partition_information: info.clone(),
+            kind,
+            endpoints,
+            refresh: Refresh {
+                name: version.name.clone(),
+                partition: info,
+                version: version.clone(),
+                store: reply.store,
+            },
+            version,
+        })
     }
-    let info = PartitionInformation {
-        kind: reply.partition.kind,
-        id: version.partition,
-        name: reply.partition.name,
-        low_key: reply.partition.low,
-        high_key: reply.partition.high,
-    };
-    if (info.kind == PartitionKind::Int64Range && info.low_key > info.high_key)
-        || (info.kind == PartitionKind::Named && (info.name.is_empty() || info.name.contains('\0')))
-    {
-        return Err(Error::Protocol("invalid resolved partition details"));
-    }
-    let (kind, endpoints) = reply.locations.endpoints();
-    Ok(ResolvedServicePartition {
-        service_name: version.name.clone(),
-        partition_information: info.clone(),
-        kind,
-        endpoints,
-        refresh: Refresh {
-            name: version.name.clone(),
-            partition: info,
-            version: version.clone(),
-            store: reply.store,
-        },
-        version,
-    })
 }
 
 #[cfg(test)]

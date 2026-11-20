@@ -105,8 +105,7 @@ node names fail before submission. There is no force/ignore option, paging,
 retry or replay; an acknowledged request is not an observed placement transition,
 and an abandoned submitted mutation can still execute.
 Its legacy method, request adapter, input accounting and the last legacy query
-encode/decode entry points are retired. Only resolution retains the ordinary
-legacy client. The existing owned list scenario now submits one movement on the
+encode/decode entry points are retired. The existing owned list scenario now submits one movement on the
 original furpc generation, independently observes the native/HTTP role swap
 and checks concurrent replica/partition/Ping reuse on clones. The existing
 movement validator requires the actual mutation response generation to match
@@ -117,8 +116,28 @@ on N0040, with unchanged replica identities independently observed through
 native reads and HTTP. The mutation and subsequent cloned mixed reads retained
 generation 1. Actual list/topology/deployment/movement receipts passed the
 independent validators and owned cleanup completed; the onebox was left running.
+Resolution now uses its own native FubstCodec rather than the query envelope,
+with checked `ResolutionRequest` selection and private previous-result metadata.
+Service/partition/version binding, signed/named keys and endpoint roles remain
+validated without a local endpoint cache, hidden description query or replay.
+The native reply model converts without a legacy Message or transport-error
+conversion and preserves furpc response headers/source/settlement.
+The final ordinary FabricClient/GatewayClient façades, sealed Client/ClientRequest
+contracts, options and typed allocation accounting are retired. Notification and
+ImageStore clients keep their separate existing owners/transports and shared models.
+The existing resolution/notification scenario now qualifies eight resolution and
+refresh cases, independent HTTP partition/endpoint-role multisets, missing-service
+failure and concurrent resolution/Ping/node reuse on the original furpc generation.
+Its required receipt is independently validated as `furpc_resolution`.
+The updated targeted archive passed on the retained SF11.8.121.4 onebox: all
+eight resolution/refresh cases matched independent HTTP partition and complete
+endpoint-role inventories. Missing-service failure and concurrent mixed calls
+retained generation 1. Existing endpoint-count changes, primary replacement,
+version advancement, real notification ACK retry and independent teardown also
+passed. Actual resolution/retry receipts and owned cleanup were independently
+validated; the default-Docker onebox was left running.
 Together with the earlier runs, this is initiating clear-TCP evidence for the
-twelve migrated reads, two naming writes and MovePrimary only; it does
+thirteen migrated reads, two naming writes and MovePrimary only; it does
 not qualify accepted-side serving, notifications, TLS, or the rest of the gateway API. See the
 [client slice](../../RustFabricClient.md#separate-furpc-backed-client).
 

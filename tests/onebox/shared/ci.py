@@ -1969,6 +1969,112 @@ def validate_furpc_names(name):
     return [stamp / 1000 for stamp in interval(value, "native_start_ms", "native_end_ms")]
 
 
+def validate_furpc_resolution(report):
+    value = report.get("furpc_resolution")
+    require(type(value) is dict and integer(value.get("generation"), 1),
+            "furpc resolution generation required")
+    true_fields(value, ("same_generation_after_error", "missing_http_absent"))
+    true_fields(report, ("owned_cleanup_confirmed",))
+    require(type(value.get("mixed_concurrent_operations")) is int
+            and value["mixed_concurrent_operations"] == 3
+            and type(value.get("native_missing_service_code")) is int
+            and value["native_missing_service_code"] == -2147017779
+            and value.get("native_error_origin") in ("domain", "native_fault"),
+            "furpc resolution native error and mixed-operation reuse")
+    owner, apps = report.get("owner"), report.get("owned_applications")
+    require(text(owner) and type(apps) is list and len(apps) == 2 and text(apps[0])
+            and re.fullmatch(r"fabric:/native-lists-" + re.escape(owner) + r"-[a-f0-9]{32}-a", apps[0]),
+            "resolution must use the exact owned application fixture")
+    stem = apps[0].removeprefix("fabric:/")[:-2]
+    require(apps == [f"fabric:/{stem}-a", f"fabric:/{stem}-b"]
+            and report.get("owned_type") == "ListType-" + stem
+            and value.get("missing_service") == apps[0] + "/DoesNotExist",
+            "resolution owned identities and absent service")
+    require(all(integer(value.get(key), 1) for key in ("native_start_ms", "native_end_ms")),
+            "resolution observation timestamps")
+    window = interval(value, "native_start_ms", "native_end_ms")
+    cases, named = report.get("resolved"), report.get("named")
+    require(type(cases) is list and len(cases) == 6 and type(named) is dict
+            and named.get("name") == apps[0] + "/Named"
+            and type(named.get("partitions")) is list and len(named["partitions"]) == 2,
+            "six singleton/int64 and two named resolution/refresh cases")
+    expected_cases = [(app + "/" + suffix, kind, key) for app in apps
+                      for suffix, kind, keys in (("Stateless", "Singleton", [None]),
+                                                ("Stateful", "Int64", [-10, 9]))
+                      for key in keys]
+    expected_cases += [(apps[0] + "/Named", "Named", key) for key in ("blue", "green")]
+
+    def signed(item):
+        require(type(item) is int or (text(item) and re.fullmatch(r"-?[0-9]{1,19}", item)),
+                "independent signed partition bound")
+        result = int(item)
+        require(-(2 ** 63) <= result < 2 ** 63, "signed partition bound overflow")
+        return result
+
+    for case, (name, kind, key) in zip(cases + named["partitions"], expected_cases):
+        expected_key = {"kind": kind, **({"value": key} if key is not None else {})}
+        require(type(case) is dict and same(case.get("key"), expected_key)
+                and case.get("refresh_order") in ("Equal", "Less"),
+                "exact resolution selector and identity-scoped refresh ordering")
+        require(all(integer(case.get(field), 1) for field in ("native_start_ms", "native_end_ms")),
+                "resolution case timestamps")
+        start, end = interval(case, "native_start_ms", "native_end_ms")
+        require(window[0] <= start <= end <= window[1], "resolution case outside native window")
+        observed, replicas = case.get("expected_partition"), case.get("expected_replicas")
+        service_kind = "Stateful" if kind == "Int64" else "Stateless"
+        partition_kind = "Int64Range" if kind == "Int64" else kind
+        require(type(observed) is dict and observed.get("ServiceKind") == service_kind
+                and type(observed.get("PartitionInformation")) is dict
+                and type(replicas) is list, "independent resolution partition and replicas")
+        info = observed["PartitionInformation"]
+        identity = info.get("Id")
+        require(type(identity) is str
+                and re.fullmatch(r"[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}", identity)
+                and identity != "00000000-0000-0000-0000-000000000000"
+                and info.get("ServicePartitionKind") == partition_kind,
+                "independent resolution partition identity/kind")
+        expected_endpoints = []
+        for replica in replicas:
+            require(type(replica) is dict, "independent resolution replica record")
+            if replica.get("ReplicaStatus") != "Ready":
+                continue
+            role = ("Stateless" if service_kind == "Stateless" else
+                    {"Primary": "StatefulPrimary", "ActiveSecondary": "StatefulSecondary"}
+                    .get(replica.get("ReplicaRole")))
+            require(replica.get("ServiceKind") == service_kind and role is not None
+                    and type(replica.get("Address")) is str, "independent ready endpoint/role")
+            expected_endpoints.append((role, replica["Address"]))
+        expected_count = 3 if kind == "Int64" else (5 if kind == "Singleton" else 1)
+        require(len(expected_endpoints) == expected_count,
+                "complete independently observed fixture endpoint inventory")
+        for field in ("native", "refreshed"):
+            result = case.get(field)
+            require(type(result) is dict and result.get("name") == name
+                    and result.get("kind") == service_kind
+                    and type(result.get("partition")) is dict, "typed native resolution identity/kind")
+            partition = result["partition"]
+            require(partition.get("id") == identity.lower() and partition.get("kind") == partition_kind
+                    and type(partition.get("name")) is str
+                    and all(type(partition.get(bound)) is int
+                            and -(2 ** 63) <= partition[bound] < 2 ** 63
+                            for bound in ("low_key", "high_key")),
+                    "native resolution partition must match independent identity")
+            if kind == "Int64":
+                require(partition["low_key"] == signed(info.get("LowKey"))
+                        and partition["high_key"] == signed(info.get("HighKey"))
+                        and partition["low_key"] <= key <= partition["high_key"],
+                        "resolved range must select the signed key")
+            elif kind == "Named":
+                require(partition["name"] == info.get("Name") == key, "resolved named selector")
+            endpoints = result.get("endpoints")
+            require(type(endpoints) is list and all(type(endpoint) is dict
+                    and type(endpoint.get("role")) is str and type(endpoint.get("address")) is str
+                    for endpoint in endpoints), "typed native endpoint multiset")
+            require(sorted((endpoint["role"], endpoint["address"]) for endpoint in endpoints)
+                    == sorted(expected_endpoints), "native/HTTP endpoint and role multisets")
+    return [stamp / 1000 for stamp in window]
+
+
 def validate_native(reports, archive, allocation):
     clear, health, name, lists, notification = [reports[file] for file in NATIVE_FILES]
     for value in (clear, health, name, notification):
@@ -2014,6 +2120,7 @@ def validate_native(reports, archive, allocation):
                     ("resolved", "named", "ack_retry", "endpoint_change", "role_change")),
             "native notification allocation/cases/actual observations")
     validate_notification_retry(notification["ack_retry"])
+    furpc_resolution_window = validate_furpc_resolution(notification)
     windows = {
         "clear_node_queries": [stamp / 1000 for stamp in interval(
             nodes, "native_observation_start_unix_ms", "native_observation_end_unix_ms")],
@@ -2023,6 +2130,7 @@ def validate_native(reports, archive, allocation):
         "furpc_application_service_lists": furpc_lists_window,
         "furpc_partition_replica_lists": furpc_topology_window,
         "furpc_deployment_lists": furpc_deployment_window,
+        "furpc_resolution": furpc_resolution_window,
         **furpc_health_windows,
     }
     require(all(integer(nodes.get(key), 1) for key in
