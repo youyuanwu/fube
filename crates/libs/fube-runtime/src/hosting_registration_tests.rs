@@ -9,11 +9,9 @@ use fube_ra_store::{
     Backend, BackendContext, MemoryBackend, Output, Request, Settings as StoreSettings, Store,
     StoreFuture,
 };
-use fube_transport::{
-    connection::{read_message, write_message},
-    message::MessageId,
-};
+use fube_rap_test_support::transport::relay;
 use fubst::serde::{from_slice, to_vec};
+use furpc::MessageId;
 use std::{collections::HashMap, process::Stdio, time::Instant};
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -184,22 +182,18 @@ async fn run(mode: &str) {
         let (mut sr, mut sw) = server.into_split();
         let upstream = observed.clone();
         let requests = async move {
-            while let Ok(m) = read_message(&mut cr).await {
+            relay::forward(&mut cr, &mut sw, |m| {
                 upstream.try_send(Observation::Request(m.clone())).unwrap();
-                if write_message(&mut sw, &m).await.is_err() {
-                    break;
-                }
-            }
+            })
+            .await
         };
         let replies = async move {
-            while let Ok(m) = read_message(&mut sr).await {
+            relay::forward(&mut sr, &mut cw, |m| {
                 observed.try_send(Observation::Reply(m.clone())).unwrap();
-                if write_message(&mut cw, &m).await.is_err() {
-                    break;
-                }
-            }
+            })
+            .await
         };
-        tokio::select! { _ = requests => {}, _ = replies => {} }
+        tokio::select! { result = requests => result.unwrap(), result = replies => result.unwrap() }
     });
     let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap());
     let mut correlations = HashMap::<MessageId, (i64, String)>::new();

@@ -6,10 +6,8 @@ pub(crate) const EVENT_CAPACITY: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RuntimeEvent {
-    /// The reply was written, not necessarily received by the native caller.
-    QueryReplySent {
-        request_id: fube_transport::message::MessageId,
-    },
+    /// Reply data handed to furpc, not an observed native ACK or completed write.
+    QueryReplyReady { request_id: furpc::MessageId },
     /// Dispatch tasks have drained; service disposal/unregistration may remain.
     DispatchStopped,
 }

@@ -2,11 +2,9 @@
 //! frames. This is not native-library or original native-node qualification.
 use super::*;
 use fube_hosting::{ipc, wire as hosting_wire};
-use fube_transport::{
-    connection::{read_message, write_message},
-    message::{Message, MessageId},
-};
+use fube_rap_test_support::transport::relay::{self, Frame};
 use fubst::serde::{from_slice, to_vec, ObjectArray, Pointer};
+use furpc::MessageId;
 use std::{collections::HashMap, io::Write, process::Stdio, time::Instant};
 use tokio::{
     io::AsyncBufReadExt,
@@ -103,8 +101,8 @@ fn hosting_child() {
 }
 
 pub(super) enum Observation {
-    Request(Message),
-    Reply(Message),
+    Request(Frame),
+    Reply(Frame),
 }
 
 pub(super) fn node(root: &std::path::Path) -> hosting_wire::StartReply {
@@ -210,28 +208,22 @@ async fn scenario(mode: &str) {
         let (mut hr, mut hw) = hosting.into_split();
         let requests = observations.clone();
         let upstream = async move {
-            while let Ok(message) = read_message(&mut cr).await {
+            relay::forward(&mut cr, &mut hw, |message| {
                 requests
                     .try_send(Observation::Request(message.clone()))
                     .unwrap();
-                if write_message(&mut hw, &message).await.is_err() {
-                    break;
-                }
-            }
+            }).await
         };
         let downstream = async move {
-            while let Ok(message) = read_message(&mut hr).await {
+            relay::forward(&mut hr, &mut cw, |message| {
                 observations
                     .try_send(Observation::Reply(message.clone()))
                     .unwrap();
-                if write_message(&mut cw, &message).await.is_err() {
-                    break;
-                }
-            }
+            }).await
         };
         // One owned task, two directly owned futures: cancelling either path
         // discards both partially read/written streams, with no nested tasks.
-        tokio::select! { _ = upstream => {}, _ = downstream => {} }
+        tokio::select! { result = upstream => result.unwrap(), result = downstream => result.unwrap() }
     });
     let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap());
     let mut correlations: HashMap<MessageId, (i64, String)> = HashMap::new();
@@ -305,7 +297,7 @@ pub(super) fn observe(
 ) {
     match observation {
         Observation::Request(message) => {
-            let p = message.properties().unwrap();
+            let p = message.metadata().unwrap();
             if p.actor == 1 {
                 return;
             }
@@ -313,13 +305,13 @@ pub(super) fn observe(
                 .insert(p.id, (p.actor, p.action.clone()))
                 .is_none());
             if p.actor == 15 {
-                assert!(p.action.is_empty() && message.body.is_empty());
+                assert!(p.action.is_empty() && message.body().is_empty());
             } else {
                 actions.push((p.actor, p.action));
             }
         }
         Observation::Reply(message) => {
-            let p = message.properties().unwrap();
+            let p = message.metadata().unwrap();
             if p.actor == 1 {
                 return;
             }
@@ -328,7 +320,7 @@ pub(super) fn observe(
                 .expect("uncorrelated actual reply");
             assert!(p.action.is_empty());
             if actor == 15 {
-                leases.push(from_slice::<wire::LeaseReply>(&message.body).unwrap().ttl);
+                leases.push(from_slice::<wire::LeaseReply>(message.body()).unwrap().ttl);
             }
         }
     }

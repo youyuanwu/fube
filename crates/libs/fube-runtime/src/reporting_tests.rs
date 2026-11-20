@@ -48,7 +48,7 @@ pub(super) fn assert_fault(
     incarnation: i64,
     fault: i64,
 ) {
-    let p = message.properties().unwrap();
+    let p = message.metadata().unwrap();
     assert_eq!((p.actor, p.action.as_str()), (12, "RAReportFault"));
     let mut d = Decoder::new(&message.body);
     d.object(|d| {
@@ -141,7 +141,7 @@ fn hex(s: &str) -> Vec<u8> {
         .collect()
 }
 pub(super) fn assert_health(message: &Message, kind: i64, ttl: i64, sequence: Option<i64>) -> i64 {
-    let properties = message.properties().unwrap();
+    let properties = message.metadata().unwrap();
     assert_eq!(
         (properties.actor, properties.action.as_str()),
         (7, "ReportHealth")
@@ -213,7 +213,7 @@ pub(super) fn assert_health(message: &Message, kind: i64, ttl: i64, sequence: Op
     reports[0]
 }
 pub(super) async fn health_reply(
-    h: &mut Harness,
+    _h: &mut Harness,
     message: &Message,
     kind: i64,
     sequence: i64,
@@ -251,19 +251,12 @@ pub(super) async fn health_reply(
         e.object_array::<()>(&[], |_, _| Ok(()))
     })
     .unwrap();
-    write_message(
-        &mut h.peer,
-        &Message {
-            headers: vec![
-                Header::actor(16).unwrap(),
-                Header::action("OperationSuccessAction").unwrap(),
-                Header::relates_to(message.properties().unwrap().id).unwrap(),
-            ],
-            body: e.finish(),
-        },
-    )
-    .await
-    .unwrap();
+    message
+        .respond(
+            fube_rap_test_support::transport::message(16, "OperationSuccessAction", e.finish())
+                .unwrap(),
+        )
+        .unwrap();
 }
 pub(super) fn assert_load(
     message: &Message,
@@ -274,8 +267,8 @@ pub(super) fn assert_load(
 ) {
     assert_eq!(
         (
-            message.properties().unwrap().actor,
-            message.properties().unwrap().action
+            message.metadata().unwrap().actor,
+            message.metadata().unwrap().action
         ),
         (12, "RAPReportLoad".into())
     );
@@ -472,14 +465,32 @@ async fn canonical_stateless_reporting_native_literals_immediate_and_per_record_
     assert_eq!(second_error.kind(), crate::ErrorKind::ResourceExhausted);
     assert!(second_record.result().unwrap().is_err());
     assert!(first_record.result().is_none());
-    // An unrelated transport correlation cannot finish the held call.
-    let mut unrelated = message.clone();
-    unrelated.headers = vec![Header::message_id(MessageId {
-        guid: [0x99; 16],
-        index: 999,
-    })
-    .unwrap()];
-    health_reply(&mut h, &unrelated, 3, 45, None).await;
+    // A real independent lease reply cannot finish the held health call.
+    let connection = h.engine.shared.connection.clone();
+    let poll = tokio::spawn(async move {
+        connection
+            .request::<_, LeaseReply>(
+                "",
+                15,
+                furpc::Request::new(()),
+                deadline_after(Duration::from_secs(2)).unwrap(),
+                None,
+            )
+            .await
+    });
+    let unrelated = h.peer.receive().await.unwrap();
+    assert_eq!(unrelated.metadata().unwrap().actor, 15);
+    unrelated
+        .respond(
+            fube_rap_test_support::transport::message(
+                0,
+                "",
+                to_vec(&LeaseReply { ttl: 300_000_000 }).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    poll.await.unwrap().unwrap();
     assert!(first_record.result().is_none());
     health_reply(&mut h, &message, 3, 45, None).await;
     first_call.await.unwrap();

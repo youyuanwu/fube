@@ -87,11 +87,8 @@ async fn close_drains_configuration_dispatch_references_even_after_callback_flag
                 h.engine.shared.authority.check().is_err(),
                 "overlap's final destructor outlived its cleanup deadline with authority live"
             );
-            let reply = tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                read_message(&mut h.peer),
-            )
-            .await;
+            let reply =
+                tokio::time::timeout(std::time::Duration::from_millis(100), h.peer.receive()).await;
             assert!(
                 !matches!(reply, Ok(Ok(_))),
                 "blocked final destructor emitted a semantic Close reply"

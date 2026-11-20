@@ -3,7 +3,7 @@ use crate::{Error, Result};
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 pub(crate) mod tests;
-use fube_transport::connection::deadline_after;
+use crate::ipc_client::deadline_after;
 use fubst::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer};
 use std::{
     collections::{HashMap, HashSet},
@@ -61,7 +61,7 @@ struct Shared {
     active: AtomicUsize,
     activation: ActivationContext,
     authority: Arc<Authority>,
-    connection: crate::channel_adapter::IpcChannel,
+    connection: crate::ipc_client::IpcClient,
     metrics: Arc<RuntimeMetrics>,
     reports: Arc<Semaphore>,
     execution: crate::extensions::ExecutionRuntime,
@@ -72,8 +72,8 @@ struct Shared {
 pub(crate) struct Engine {
     shared: Arc<Shared>,
     stop: watch::Sender<bool>,
-    task: JoinHandle<Option<mpsc::Receiver<crate::channel_adapter::IpcMessage>>>,
-    retired_incoming: Option<mpsc::Receiver<crate::channel_adapter::IpcMessage>>,
+    task: JoinHandle<Option<mpsc::Receiver<crate::ipc_client::IpcMessage>>>,
+    retired_incoming: Option<mpsc::Receiver<crate::ipc_client::IpcMessage>>,
     active_at_stop: bool,
 }
 struct FactorySlot {
@@ -180,8 +180,8 @@ impl Engine {
     pub(crate) fn start(
         current: crate::ActivationContextHandle,
         authority: Arc<Authority>,
-        connection: crate::channel_adapter::IpcChannel,
-        incoming: mpsc::Receiver<crate::channel_adapter::IpcMessage>,
+        connection: crate::ipc_client::IpcClient,
+        incoming: mpsc::Receiver<crate::ipc_client::IpcMessage>,
     ) -> Self {
         let execution = crate::execution::new(authority.clone(), tokio::runtime::Handle::current());
         Self::start_with_execution(current, authority, connection, incoming, execution)
@@ -189,8 +189,8 @@ impl Engine {
     pub(crate) fn start_with_execution(
         current: crate::ActivationContextHandle,
         authority: Arc<Authority>,
-        connection: crate::channel_adapter::IpcChannel,
-        mut incoming: mpsc::Receiver<crate::channel_adapter::IpcMessage>,
+        connection: crate::ipc_client::IpcClient,
+        mut incoming: mpsc::Receiver<crate::ipc_client::IpcMessage>,
         execution: crate::extensions::ExecutionRuntime,
     ) -> Self {
         let activation = (*current.snapshot()).clone();
@@ -240,7 +240,7 @@ impl Engine {
                     _=deadline_poll.tick(), if !work.is_empty() => {
                         if task_shared.authority.callback_expired() {
                             task_shared.authority.retire();
-                            task_shared.connection.abort_with_error(Error::Timeout.transport_fault());
+                            task_shared.connection.abort_with_error(Error::Timeout);
                             break;
                         }
                     }
@@ -262,7 +262,7 @@ impl Engine {
                                 _=>Error::Protocol("lifecycle callback task panicked"),
                             };
                             task_shared.authority.retire();
-                            task_shared.connection.abort_with_error(error.transport_fault()); break;
+                            task_shared.connection.abort_with_error(error); break;
                         }
                     }
                     request=incoming.recv() => {
@@ -480,15 +480,14 @@ fn unit(shared: &Shared, request: &ProxyRequest, create: bool) -> Result<Option<
     units.insert(request.unit.id.id.0, unit.clone());
     Ok(Some(unit))
 }
-async fn dispatch(shared: Arc<Shared>, incoming: crate::channel_adapter::IpcMessage) -> Result<()> {
-    let props = incoming.message.properties()?;
-    let request: ProxyRequest = from_slice(&incoming.message.body)?;
+async fn dispatch(shared: Arc<Shared>, incoming: crate::ipc_client::IpcMessage) -> Result<()> {
+    let request: ProxyRequest = from_slice(&incoming.body)?;
     let owner = {
         let mut owners = shared.owners.lock().unwrap();
         let id = request.unit.id.id.0;
         match owners.get(&id).copied() {
             Some(stateful) => {
-                if matches!(props.action.as_str(), "ReplicaOpen" | "ReplicaClose")
+                if matches!(incoming.action.as_str(), "ReplicaOpen" | "ReplicaClose")
                     && stateful != request.service.stateful
                 {
                     return Err(Error::Protocol(
@@ -497,7 +496,7 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::channel_adapter::IpcMess
                 }
                 Some(stateful)
             }
-            None if matches!(props.action.as_str(), "ReplicaOpen" | "ReplicaClose") => {
+            None if matches!(incoming.action.as_str(), "ReplicaOpen" | "ReplicaClose") => {
                 if owners.len() >= MAX_TOMBSTONES {
                     return Err(Error::ResourceLimit("service tombstones"));
                 }
@@ -510,18 +509,18 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::channel_adapter::IpcMess
     if owner == Some(true) || request.service.stateful {
         let result = shared
             .stateful
-            .dispatch(&props.action, request, incoming.reply)
+            .dispatch(&incoming.action, request, incoming.reply)
             .await;
-        if props.action == "RAPQuery" && result.is_ok() {
-            let _ = shared.events.send(crate::RuntimeEvent::QueryReplySent {
-                request_id: props.id,
+        if incoming.action == "RAPQuery" && result.is_ok() {
+            let _ = shared.events.send(crate::RuntimeEvent::QueryReplyReady {
+                request_id: incoming.id,
             });
         }
         return result;
     }
     if owner.is_none()
         && matches!(
-            props.action.as_str(),
+            incoming.action.as_str(),
             "UpdateConfiguration"
                 | "ReplicatorBuildIdleReplica"
                 | "ReplicatorRemoveIdleReplica"
@@ -534,7 +533,7 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::channel_adapter::IpcMess
         // Native retries/delayed controls cannot create a missing replica.
         return Ok(());
     }
-    if props.action == "RAPQuery" {
+    if incoming.action == "RAPQuery" {
         // Native Query.HostQueryAsyncOperation uses a fully serialized DEFAULT
         // ServiceDescription, not the manifest identity from ReplicaOpen.
         // Query authority is the routed runtime + existing unit/replica, not
@@ -551,7 +550,7 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::channel_adapter::IpcMess
             .ok_or(Error::Protocol("RAPQuery requires correlation"))?;
         let authority = Arc::downgrade(&shared.authority);
         let result = reply
-            .reply_with_action_fenced(
+            .reply_checked(
                 12,
                 Some("RAPQueryReply"),
                 to_vec(&query(&shared, &request)?)?,
@@ -562,11 +561,10 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::channel_adapter::IpcMess
                         .is_some_and(|authority| authority.check().is_ok())
                 }),
             )
-            .await
-            .map_err(Error::from);
+            .await;
         if result.is_ok() {
-            let _ = shared.events.send(crate::RuntimeEvent::QueryReplySent {
-                request_id: props.id,
+            let _ = shared.events.send(crate::RuntimeEvent::QueryReplyReady {
+                request_id: incoming.id,
             });
         }
         return result;
@@ -576,21 +574,21 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::channel_adapter::IpcMess
         return Err(Error::Protocol("lifecycle uses semantic one-way replies"));
     }
     if !matches!(
-        props.action.as_str(),
+        incoming.action.as_str(),
         "ReplicaOpen" | "ReplicaClose" | "ProxyUpdateServiceDescription"
     ) {
         return Err(Error::Protocol("unsupported stateless RAP action"));
     }
-    if props.action == "ReplicaOpen" {
+    if incoming.action == "ReplicaOpen" {
         shared.metrics.opens.fetch_add(1, Ordering::Relaxed);
     }
-    if props.action == "ReplicaClose" {
+    if incoming.action == "ReplicaClose" {
         shared.metrics.closes.fetch_add(1, Ordering::Relaxed);
         if request.flags & 4 != 0 {
             shared.metrics.aborts.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let create = matches!(props.action.as_str(), "ReplicaOpen" | "ReplicaClose");
+    let create = matches!(incoming.action.as_str(), "ReplicaOpen" | "ReplicaClose");
     let Some(unit) = unit(&shared, &request, create)? else {
         return Ok(());
     };
@@ -608,7 +606,7 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::channel_adapter::IpcMess
         Err(_) => {
             // Native RA retries incompatible work. Abort/drop cancels opening;
             // never invoke a second callback while the first still owns the unit.
-            if props.action == "ReplicaClose" && request.flags & 12 != 0 {
+            if incoming.action == "ReplicaClose" && request.flags & 12 != 0 {
                 let state = unit.state.lock().unwrap();
                 state.valid.store(false, Ordering::Release);
                 state.cancel.cancel();
@@ -629,7 +627,7 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::channel_adapter::IpcMess
             }
         }
     }
-    match props.action.as_str() {
+    match incoming.action.as_str() {
         "ReplicaOpen" => open(&shared, &unit, request).await,
         "ReplicaClose" => close(&shared, &unit, request).await,
         "ProxyUpdateServiceDescription" => update(&shared, &unit, request).await,
@@ -696,8 +694,7 @@ async fn reply(
                             .is_some_and(|valid| valid.load(Ordering::Acquire)))
             }),
         )
-        .await
-        .map_err(Error::from);
+        .await;
     match sent {
         Err(Error::Closed)
             if publish
@@ -1049,8 +1046,7 @@ async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<(
                         .is_some_and(|authority| authority.check().is_ok())
             }),
         )
-        .await
-        .map_err(Error::from);
+        .await;
     match sent {
         Err(Error::Closed)
             if !valid.load(Ordering::Acquire)

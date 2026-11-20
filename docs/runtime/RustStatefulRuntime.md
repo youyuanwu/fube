@@ -108,7 +108,9 @@ acknowledgment, persistence or replacement**.
 `NativeRuntimeIntegration::fault_delivery()` exposes the
 bounded retry/error/cancellation snapshot. Retries run on the installing Runtime
 executor until unit disposal, not on a calling provider/engine executor; stale
-handles and retired process authority cannot start queued fault frames.
+handles and retired process authority cannot admit new fault sends or publish
+successful completion. Already-admitted output can still reach the node after
+retirement; furpc has no runtime first-write predicate.
 The lower reports through a narrow runtime-owned health adapter, which sends one transient
 notification for a terminal engine fault (including an internal provider
 barrier failure without an active RAP callback), never for normal Close/Abort
@@ -229,16 +231,16 @@ until an exact incarnation/role/location acknowledgment or disposal. Volatile
 access revokes locally; persisted-only read/write-revoked notifications are not
 invented.
 
-Hosting/RAP now uses the [shared native IPC composition](../transport/NativeChannel.md#runtime-ipc-composition),
-not a parallel legacy Connection. The runtime adapter retains all actor/action
-and per-operation metadata policy; the transport only supplies identity,
-correlation, finite delivery, original-source consuming grants and write fencing.
-Stateful generation/revision/cancellation checks, execution-owned binding and
-actual disposal remain runtime-owned. A queued obsolete reply/report is suppressed
-before positive socket progress; a started frame is completed even if its observer
-or generation disappears. Load/fault/endpoint traffic remains semantic one-way
-with host/PID identity; RAPQuery alone uses its original correlated reply grant.
-These source boundaries are not a new deployed qualification receipt.
+Initiating Hosting/RAP IPC now uses the
+[furpc client](../../crates/libs/fube-runtime/src/ipc_client.rs), not a parallel
+legacy Connection. Runtime retains host/PID identity, actor/action metadata,
+generation/revision/cancellation checks, execution-owned binding and disposal.
+Furpc supplies correlation, bounded ingress and original-source reply writes.
+Domain checks run before submission and after observed completion, not at every
+first-write attempt; already-admitted obsolete output can still reach the node.
+Load/fault/endpoint traffic remains semantic one-way with host/PID identity.
+RAPQuery workers return only reply data to furpc's original runner.
+These changes do not constitute a fresh deployed stateful qualification.
 
 `extensions::ReplicaDiagnostics` retains full RAP current/previous epochs and service versus
 replicator roles. Access uses native role/stage/minimum/PC/CC availability rules,

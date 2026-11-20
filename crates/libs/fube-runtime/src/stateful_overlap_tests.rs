@@ -198,17 +198,14 @@ async fn query_observes_blocked_role_callback_without_protocol_locks_or_access_g
     calls.release.notify_one();
     let mut notification = None;
     for _ in 0..2 {
-        let frame = tokio::time::timeout(Duration::from_secs(2), read_message(&mut h.peer))
+        let frame = tokio::time::timeout(Duration::from_secs(2), h.peer.receive())
             .await
             .unwrap()
             .unwrap();
-        if frame.properties().unwrap().action == "ProxyReplicaEndpointUpdated" {
+        if frame.metadata().unwrap().action == "ProxyReplicaEndpointUpdated" {
             notification = Some(from_slice::<ReplicaMessage>(&frame.body).unwrap());
         } else {
-            assert_eq!(
-                frame.properties().unwrap().action,
-                "UpdateConfigurationReply"
-            );
+            assert_eq!(frame.metadata().unwrap().action, "UpdateConfigurationReply");
         }
     }
     let mut ack = query;

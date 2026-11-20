@@ -455,10 +455,11 @@ name = "fube-rap-test-support"
 version = "0.1.0"
 dependencies = [
  "fube-runtime",
- "fube-transport",
  "fubst",
+ "furpc",
  "serde",
  "tokio",
+ "tower-service",
  "uuid",
 ]
 
@@ -474,13 +475,15 @@ dependencies = [
  "fube-ra-store",
  "fube-rap-test-support",
  "fube-runtime",
- "fube-transport",
  "fubst",
+ "furpc",
+ "http",
  "libc",
  "roxmltree",
  "serde",
  "serde_json",
  "tokio",
+ "tower-service",
  "uuid",
 ]
 

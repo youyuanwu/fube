@@ -97,7 +97,6 @@
 //! ```
 
 mod api;
-mod channel_adapter;
 mod context;
 mod diagnostics;
 mod error;
@@ -108,6 +107,7 @@ mod hosting_registration_tests;
 #[cfg(test)]
 mod hosting_tests;
 mod instance_integration;
+mod ipc_client;
 mod lease;
 mod lifecycle;
 mod managed_participants;
@@ -138,10 +138,10 @@ use std::{
     time::{Duration, Instant as Monotonic},
 };
 
-use channel_adapter::{IpcChannel, IpcMessage};
 pub use error::{Error, ErrorKind, RejectedRegistrationInput, Result};
-use fube_transport::connection::deadline_after;
 use fubst::serde::{from_slice, to_vec};
+use ipc_client::deadline_after;
+use ipc_client::{IpcClient, IpcMessage};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 pub(crate) use api::PartitionKind;
@@ -203,7 +203,7 @@ pub struct Runtime {
     activation: ActivationContext,
     current: ActivationContextHandle,
     node: NodeContext,
-    connection: IpcChannel,
+    connection: IpcClient,
     authority: Arc<Authority>,
     tasks: Vec<JoinHandle<()>>,
     lifecycle: lifecycle::Engine,
@@ -225,49 +225,39 @@ fn success(reply: ErrorReply) -> Result<()> {
     }
 }
 
-async fn call<T: serde::Serialize, R: serde::de::DeserializeOwned>(
-    connection: &IpcChannel,
+async fn call<
+    T: serde::Serialize + Send + 'static,
+    R: serde::de::DeserializeOwned + Send + 'static,
+>(
+    connection: &IpcClient,
     actor: i64,
     action: &str,
-    value: &T,
+    value: T,
 ) -> Result<R> {
     let reply = connection
         .request(
             action,
             actor,
-            vec![],
-            to_vec(value)?,
+            furpc::Request::new(value),
             deadline_after(REGISTRATION_TIMEOUT)?,
+            None,
         )
         .await?;
-    let props = reply.properties()?;
-    if let Some(fault) = props.fault.filter(|f| f.code != 0) {
-        return Err(Error::Remote {
-            code: fault.code,
-            message: "hosting transport fault".into(),
-        });
-    }
-    Ok(from_slice(&reply.body)?)
+    Ok(reply.into_body())
 }
 
-async fn poll_lease(connection: &IpcChannel) -> Result<(Monotonic, i64)> {
+async fn poll_lease(connection: &IpcClient) -> Result<(Monotonic, i64)> {
     let sent = Monotonic::now();
     let reply = connection
         .request(
             "",
             15,
-            vec![],
-            vec![],
+            furpc::Request::new(()),
             deadline_after(Duration::from_secs(5))?,
+            None,
         )
         .await?;
-    if let Some(fault) = reply.properties()?.fault.filter(|fault| fault.code != 0) {
-        return Err(Error::Remote {
-            code: fault.code,
-            message: "lease poll transport fault".into(),
-        });
-    }
-    let lease: LeaseReply = from_slice(&reply.body)?;
+    let lease: LeaseReply = reply.into_body();
     Ok((sent, lease.ttl))
 }
 
@@ -341,31 +331,24 @@ impl Runtime {
         let (control_tx, mut controls) =
             mpsc::channel::<(Monotonic, IpcMessage)>(MAX_INCOMING_COMMANDS);
         let (command_tx, incoming) = mpsc::channel::<IpcMessage>(MAX_INCOMING_COMMANDS);
-        let handler = Arc::new(move |request: IpcMessage| {
-            let p = request.message.properties()?;
-            match p.actor {
-                8 => {
-                    if p.action != "UpdateCodePackageContextRequest"
-                        || !ingress_ready.load(std::sync::atomic::Ordering::Acquire)
-                    {
-                        ingress_authority.retire();
-                    }
-                    control_tx
-                        .try_send((request.received_at, request))
-                        .map_err(|_| {
-                            fube_transport::Error::ResourceLimit("runtime control ingress")
-                        })
+        let handler = Arc::new(move |request: IpcMessage| match request.actor {
+            8 => {
+                if request.action != "UpdateCodePackageContextRequest"
+                    || !ingress_ready.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    ingress_authority.retire();
                 }
-                12 => command_tx
-                    .try_send(request)
-                    .map_err(|_| fube_transport::Error::ResourceLimit("runtime ingress")),
-                _ => Err(fube_transport::Error::Protocol(
-                    "unsupported application IPC actor",
-                )),
+                control_tx
+                    .try_send((request.received_at, request))
+                    .map_err(|_| Error::ResourceLimit("runtime control ingress"))
             }
+            12 => command_tx
+                .try_send(request)
+                .map_err(|_| Error::ResourceLimit("runtime ingress")),
+            _ => Err(Error::Protocol("unsupported application IPC actor")),
         });
         let send_authority = Arc::downgrade(&authority);
-        let connection = IpcChannel::connect(
+        let connection = IpcClient::connect(
             activation.address,
             deadline_after(REGISTRATION_TIMEOUT)?,
             &activation.host_id,
@@ -381,7 +364,7 @@ impl Runtime {
             &connection,
             7,
             "StartRegisterApplicationHostRequest",
-            &StartRequest {
+            StartRequest {
                 id: activation.host_id.clone(),
                 kind: 1,
                 pid: std::process::id(),
@@ -414,7 +397,7 @@ impl Runtime {
                 &connection,
                 7,
                 "FinishRegisterApplicationHostRequest",
-                &IdRequest {
+                IdRequest {
                     id: activation.host_id.clone(),
                 },
             )
@@ -426,7 +409,7 @@ impl Runtime {
                 &connection,
                 9,
                 "RegisterFabricRuntimeRequest",
-                &RuntimeRequest {
+                RuntimeRequest {
                     context: activation.runtime.clone(),
                 },
             )
@@ -488,12 +471,11 @@ impl Runtime {
         let control = tokio::spawn(async move {
             while let Some((received, request)) = controls.recv().await {
                 let result: Result<()> = async {
-                    let p = request.message.properties()?;
                     let reply = request
                         .reply
                         .ok_or(Error::Protocol("host control requires correlation"))?;
-                    match p.action.as_str() {
-                        "InvalidateLeaseRequest" if request.message.body.is_empty() => {
+                    match request.action.as_str() {
+                        "InvalidateLeaseRequest" if request.body.is_empty() => {
                             control_authority.retire();
                             reply
                                 .reply(
@@ -502,13 +484,14 @@ impl Runtime {
                                     to_vec(&ErrorReply { error: 0 })?,
                                     deadline_after(Duration::from_millis(250))?,
                                 )
-                                .await.map_err(Error::from)
+                                .await
                         }
                         "UpdateCodePackageContextRequest" => {
-                            let update: UpdateContext = from_slice(&request.message.body)?;
+                            let update: UpdateContext = from_slice(&request.body)?;
                             if update.timeout <= 0 { return Err(Error::Timeout); }
                             let duration = Duration::from_nanos((update.timeout.min(300_000_000) as u64)*100);
-                            let deadline = received.checked_add(duration).ok_or(Error::Timeout)?;
+                            let deadline = received.checked_add(duration).ok_or(Error::Timeout)?
+                                .min(request.deadline.into_std());
                             control_authority.check()?;
                             if Monotonic::now() >= deadline { return Err(Error::Timeout); }
                             let call_permit = control_execution.reserve(
@@ -527,9 +510,9 @@ impl Runtime {
                                 _ = control_connection.closed() => return Err(Error::Closed),
                             }
                             let authority = control_authority.clone();
-                            reply.reply_fenced(8,to_vec(&ErrorReply {error:0})?,
+                            reply.reply_checked(8,None,to_vec(&ErrorReply {error:0})?,
                                 tokio::time::Instant::from_std(deadline),
-                                Arc::new(move || authority.check().is_ok())).await.map_err(Error::from)
+                                Arc::new(move || authority.check().is_ok())).await
                         }
                         _ => Err(Error::Protocol("unsupported host control")),
                     }
@@ -683,7 +666,7 @@ impl Runtime {
                     &connection,
                     9,
                     "RegisterServiceTypeRequest",
-                    &TypeRequest {
+                    TypeRequest {
                         context: activation.runtime.clone(),
                         id: TypeId {
                             package: activation.runtime.code.id.package.clone(),
@@ -735,7 +718,7 @@ impl Runtime {
     }
 
     pub async fn closed(&self) -> Error {
-        self.connection.closed().await.into()
+        self.connection.closed().await
     }
 
     /// Orderly host/runtime unregistration. A failed shutdown remains terminal
@@ -785,7 +768,7 @@ impl Runtime {
                 &self.connection,
                 9,
                 "UnregisterFabricRuntimeRequest",
-                &IdRequest {
+                IdRequest {
                     id: self.activation.runtime.id.clone(),
                 },
             )
@@ -796,7 +779,7 @@ impl Runtime {
                 &self.connection,
                 7,
                 "UnregisterApplicationHostRequest",
-                &UnregisterHost {
+                UnregisterHost {
                     activity: Activity {
                         id: ActivityId {
                             guid: fubst::serde::Guid(uuid::Uuid::new_v4().to_bytes_le()),

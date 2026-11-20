@@ -10,13 +10,15 @@ test-hooks = ["fube-data/test-hooks"]
 [dependencies]
 fube-core.workspace = true
 fube-data.workspace = true
-fube-transport.workspace = true
+furpc.workspace = true
 fubst.workspace = true
 serde.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 libc = "0.2"
 roxmltree = "0.21"
+http = "1"
+tower-service = "0.3"
 
 [dev-dependencies]
 serde_json.workspace = true

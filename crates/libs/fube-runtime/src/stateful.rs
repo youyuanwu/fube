@@ -1,11 +1,11 @@
 //! Native stateful RAP lifecycle. Wire records are never the public API.
 use crate::extensions::EpochDomains;
+use crate::ipc_client::deadline_after;
 use crate::{
     lease::Authority, stateful_api::*, wire as w, ActivationContextHandle, Cancellation,
     PartitionKind, RuntimeMetrics,
 };
 use crate::{Error, OpenMode, Result};
-use fube_transport::connection::deadline_after;
 use fubst::serde::{to_vec, Guid, ObjectArray, Pointer};
 use std::{
     collections::HashMap,
@@ -75,7 +75,7 @@ pub(crate) struct Registry {
     factories: Mutex<HashMap<String, Arc<dyn IStatefulServiceFactory>>>,
     current: ActivationContextHandle,
     authority: Arc<Authority>,
-    connection: crate::channel_adapter::IpcChannel,
+    connection: crate::ipc_client::IpcClient,
     live: Arc<Semaphore>,
     metrics: Arc<RuntimeMetrics>,
     reports: Arc<Semaphore>,
@@ -130,7 +130,7 @@ impl Registry {
     pub(crate) fn new(
         current: ActivationContextHandle,
         authority: Arc<Authority>,
-        connection: crate::channel_adapter::IpcChannel,
+        connection: crate::ipc_client::IpcClient,
         live: Arc<Semaphore>,
         metrics: Arc<RuntimeMetrics>,
         reports: Arc<Semaphore>,
@@ -332,7 +332,7 @@ impl Registry {
         &self,
         action: &str,
         request: w::ProxyRequest,
-        correlation: Option<crate::channel_adapter::IpcResponse>,
+        correlation: Option<crate::ipc_client::IpcResponse>,
     ) -> Result<()> {
         self.authority.check()?;
         if action == "RAPQuery" {
@@ -347,7 +347,7 @@ impl Registry {
             let authority = Arc::downgrade(&self.authority);
             return correlation
                 .ok_or(Error::Protocol("RAPQuery requires correlation"))?
-                .reply_with_action_fenced(
+                .reply_checked(
                     12,
                     Some("RAPQueryReply"),
                     to_vec(&self.query(&request)?)?,
@@ -358,8 +358,7 @@ impl Registry {
                             .is_some_and(|authority| authority.check().is_ok())
                     }),
                 )
-                .await
-                .map_err(Error::from);
+                .await;
         }
         if correlation.is_some() {
             return Err(Error::Protocol(
@@ -1171,7 +1170,7 @@ impl Registry {
         let frame_valid = valid.clone();
         let sent = self
             .connection
-            .send_one_way_fenced(
+            .send_one_way_checked(
                 12,
                 "ProxyUpdateServiceDescriptionReply",
                 to_vec(&response)?,
@@ -1183,8 +1182,7 @@ impl Registry {
                             .is_some_and(|authority| authority.check().is_ok())
                 }),
             )
-            .await
-            .map_err(Error::from);
+            .await;
         match sent {
             Err(Error::Closed)
                 if !valid.load(Ordering::Acquire) && self.authority.check().is_ok() =>
@@ -1329,7 +1327,7 @@ impl Registry {
         }
         let sent = self
             .connection
-            .send_one_way_fenced(
+            .send_one_way_checked(
                 12,
                 action,
                 to_vec(&reply)?,
@@ -1347,8 +1345,7 @@ impl Registry {
                         )
                 }),
             )
-            .await
-            .map_err(Error::from);
+            .await;
         match sent {
             // A locally revoked queued Open reply is suppressed, not a
             // successful endpoint publication or a process-wide fault.

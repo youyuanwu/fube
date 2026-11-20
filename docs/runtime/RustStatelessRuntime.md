@@ -9,7 +9,11 @@ The native SF node, deployment tools and OS libraries are still expected.
 Current contracts are a [breaking SF/mssf alignment](SfApiAlignment.md).
 The native outcomes later in this page are **dated historical evidence at their
 recorded source/profile**, not qualification of the changed whole implementation.
-No live/deployed qualification was run in the current alignment workflow.
+The broad alignment profile below has not been rerun as a whole. The initiating
+furpc IPC slice passed the existing upload/provision/contact/hash journey on
+SF 11.8.121.4: native host/runtime/type registration, stateless activation and
+independent application RPC succeeded. This does not requalify the full native
+reporting, configuration-upgrade, stateful or recovery profiles.
 The separate [owned local Hosting profile](../cluster/HostingLocalActivation.md)
 now runs a minimal native-free stateless package through actual process/IPC
 registration and H2 teardown. It does not replace the native deployment profile
@@ -18,13 +22,14 @@ or qualify production RA/RAP service callbacks by itself. The separate
 this runtime through actual owned activation/registration/lifecycle traffic and
 independently observes callbacks, resource disposal and physical cleanup.
 
-Runtime IPC establishes the same public `fube_transport::Channel` backend as
-ordinary clients and upload, then takes its original `target()`. Actual host/PID
-envelopes remain in outgoing `native_ipc` setup; registration/lease/RA-RAP work
-stays above transport. Adapter clones share one logical owner and ordered ingress
-driver, not independent inbox pumps. The last logical runtime-owner retirement
-can close surviving raw observers; this is not a public arbitrary-Channel runtime
-constructor or interchangeable-session promise.
+Runtime IPC now uses a dedicated furpc Channel and its original Peer.
+The [typed IPC client](../../crates/libs/fube-runtime/src/ipc_client.rs) follows
+fube-client's RpcClient/FubstCodec and byte-facing Tower service structure.
+Host/PID envelopes, registration, lease and RA/RAP policy remain in runtime.
+Authorized furpc ingress owns correlation and original-generation reply writes;
+there is no second socket reader, legacy transport adapter or reconnect/replay.
+The connector checks actual loopback socket endpoints and observes I/O release
+for local session retirement without adding a furpc lifecycle API.
 
 ## Qualified profile
 
@@ -202,37 +207,39 @@ code-activation instance is **first learned** on the original trusted IPC
 connection after startup identity/sequence matches, then pinned. It is not aliased
 to another counter or independently prevalidated from startup environment.
 
-Success is replied only after publication and callbacks, with deadline/cancellation/
-authority checked again at the transport writer's pre-frame boundary. Sender
-cancellation is not remotely observable, and local failure does not roll back an
-already-published snapshot or revoke delivered callbacks/already-started frames
-([shared writer fencing](../transport/NativeChannel.md#runtime-ipc-composition)).
+Success reply data is prepared only after publication and callbacks, with
+deadline and authority checked at that domain boundary. Furpc owns the actual
+write; there is no per-operation runtime predicate in its writer. Cancellation
+does not roll back an already-published snapshot or revoke delivered callbacks,
+and already-admitted output can still reach the node after local retirement.
 
 ## Wire and ownership invariants
 
-Runtime IPC composes the shared native channel and actor-only demux, separate
+Runtime IPC composes furpc's Channel, Peer and Actor/Action Router, separate
 from ordinary, notification and ImageStore owners. Runtime actor/action/readiness
-policy remains in its [adapter](../../crates/libs/fube-runtime/src/channel_adapter.rs),
+policy remains in its [client](../../crates/libs/fube-runtime/src/ipc_client.rs),
 not transport. Requests and one-way sends carry host/PID IPC identity; consuming
 correlated replies do not. Lifecycle RA actor **12** is used in both directions;
 Open/Close semantic replies are one-way, not `RelatesTo` responses
 ([source-backed IPC boundary](../transport/NativeChannel.md#runtime-ipc-composition)).
 
-Normal IPC ExpectsReply grants are independently authorized and are not the
-notification IsUncorrelatedReply exception. Original source/socket/MessageId and
-consuming response permission cannot be redirected by public envelope edits.
-Ordered bounded ingress handoff preserves early actor8 readiness/invalidation
-before a following lease/registration completion; original receipt time survives
-queueing. Malformed health protocol success is decoded by bounded runtime-owned
-work before later correlated delivery, not by a codec in transport.
+Normal IPC ExpectsReply requests are independently authorized and are not the
+notification IsUncorrelatedReply exception. Furpc's runner retains original
+source/socket/MessageId reply authority; domain workers return only reply data.
+Ingress and RPC completions are concurrent: there is no legacy ordered handoff
+or held-health-completion barrier. Observed malformed replies retire the domain
+session, but do not retroactively revoke another completed call. Startup controls
+can reject attach or retire an already-returned runtime; the independent lease
+authority/watchdog remains terminal in either case.
 
-The runtime retains 32 ordinary admissions, 32 independent reply/semantic
-response slots, 32 backend ingress slots and the existing 16 global report
-admissions. Applicable serving authority/generation predicates are sampled at
-each pre-positive-write attempt; explicit cancellation is serialized at the first
-positive write, and started suffixes remain owned. Invalidation's 250ms original
-acknowledgment and orderly unregister use distinct bounded control/cleanup
-authority after serving retirement; neither permits serving revival.
+The runtime retains 32 ordinary admissions, 32 independent semantic-response
+slots, 32 furpc handler slots/readiness waiters and 16 global report admissions.
+Authority/generation checks run before submission and after observed completion;
+they are not first-positive-write fences. A locally rejected result can have an
+unknown remote outcome. Invalidation's 250ms domain response budget and orderly
+unregister remain permitted after serving retirement, without reviving authority.
+Session close/drop releases Channel ownership, not a physical-driver join.
+`RuntimeEvent::QueryReplyReady` records reply-data handoff, not a completed write.
 
 Each service unit has independent operation ownership; callbacks never run on
 the socket reader or under registry/state locks. Duplicate Open reuses the
@@ -415,7 +422,7 @@ new reports; load/move have no automatic retry.
 
 Queues do not silently discard required replies. Source/model limits and resource
 tests are in [shared IPC tests](../../crates/libs/fube-transport/src/native_channel_ipc_tests.rs),
-[runtime adapter tests](../../crates/libs/fube-runtime/src/channel_adapter_tests.rs),
+[typed IPC client tests](../../crates/libs/fube-runtime/src/ipc_client_tests.rs),
 [runtime models](../../crates/libs/fube-runtime/src/model_tests.rs) and
 [lifecycle models](../../crates/libs/fube-runtime/src/lifecycle_tests.rs).
 

@@ -748,16 +748,18 @@ async fn public_factory_advertises_wildcard_listener_without_changing_replica_id
         advertised_ip
     );
     tokio::time::timeout(Duration::from_secs(3), async {
-        let mut socket = tokio::net::TcpStream::connect(&endpoint.address)
+        let channel = furpc::Endpoint::from_shared(format!("tcp://{}", endpoint.address))
+            .unwrap()
+            .connection_options(furpc::ConnectionOptions::raw_only())
+            .connect()
             .await
             .unwrap();
-        let hello = fube_transport::connection::read_message(&mut socket)
+        let peer = channel
+            .peer(tokio::time::Instant::now() + Duration::from_secs(3))
             .await
             .unwrap();
         assert_eq!(
-            fube_transport::message::ListenInstance::decode(&hello.body)
-                .unwrap()
-                .address,
+            String::from_utf16(&peer.info().listen_address).unwrap(),
             endpoint.address
         );
     })
