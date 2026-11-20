@@ -48,7 +48,8 @@ composes an owning initiating Channel, per-socket accepted Server, raw one-way
 IngressService and original-generation Peer. The public native headers/messages
 carry the unchanged classic payload schemas; no legacy framing/session backend,
 second reader or private furpc codec is used. The direct normal/dev legacy
-dependency is retired; core/RA/node legacy consumers remain separate.
+dependency is retired; RA/node control has its own furpc adapter, while
+core/CLI/test-host legacy edges remain separate.
 Production engine/runtime/app
 have no FabricRuntime, FabricCommon, COM or native replicator dependency.
 See [crate exports](../../crates/libs/fube-data/src/lib.rs),

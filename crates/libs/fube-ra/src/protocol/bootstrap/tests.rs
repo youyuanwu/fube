@@ -3,9 +3,14 @@
 //! string-vector metadata and map flattening. This is source conformance only;
 //! no native serializer or native node is executed by these tests.
 
+#[path = "../../../examples/support/envelope.rs"]
+mod envelope;
+
+use self::envelope::{
+    bytes, edit_body, edit_headers, headers, Header, ACTION, ACTOR, HIGH_PRIORITY,
+};
 use super::*;
 use crate::protocol::{PackageVersion, RA_ACTOR};
-use fube_transport::message::Header;
 use fubst::{
     serde::{from_slice, to_vec},
     Encoder,
@@ -353,42 +358,24 @@ fn fresh_constructors_and_factories_preserve_native_header_asymmetry() {
     assert_eq!(node.node.version, version);
     node.validate_fresh_stateless().unwrap();
     let message = node_up_message(&node).unwrap();
-    assert!(!message.headers.iter().any(|h| h.id == GENERATION_HEADER));
+    assert!(!headers(&message).iter().any(|h| h.id == GENERATION_HEADER));
+    assert_eq!(message.headers().effective().actor.get(), 11);
     assert_eq!(
-        unique(&message, ACTOR).unwrap().read(|d| d.i64()).unwrap(),
-        11
-    );
-    assert_eq!(
-        unique(&message, ACTION)
-            .unwrap()
-            .read(|d| d.string())
-            .unwrap(),
+        String::from_utf16(message.headers().effective().action()).unwrap(),
         "NodeUp"
     );
-    assert!(unique(&message, HIGH_PRIORITY)
-        .unwrap()
-        .read(|d| d.boolean())
-        .unwrap());
+    assert!(message.headers().effective().high_priority);
     assert_eq!(decode_node_up(&message).unwrap(), node);
     let ack = NodeUpAck::fresh_activated(version.clone(), 42).unwrap();
     ack.validate_fresh_activated(&version).unwrap();
     assert_eq!(ack.activation_sequence, 42);
     let reply = node_up_ack_message(&ack, &generation()).unwrap();
+    assert_eq!(reply.headers().effective().actor.get(), 13);
     assert_eq!(
-        unique(&reply, ACTOR).unwrap().read(|d| d.i64()).unwrap(),
-        13
-    );
-    assert_eq!(
-        unique(&reply, ACTION)
-            .unwrap()
-            .read(|d| d.string())
-            .unwrap(),
+        String::from_utf16(reply.headers().effective().action()).unwrap(),
         "NodeUpAck"
     );
-    assert!(unique(&reply, HIGH_PRIORITY)
-        .unwrap()
-        .read(|d| d.boolean())
-        .unwrap());
+    assert!(reply.headers().effective().high_priority);
     assert_eq!(decode_node_up_ack(&reply).unwrap(), (ack, generation()));
     assert!(decode_node_up(&reply).is_err());
     assert!(decode_node_up_ack(&message).is_err());
@@ -464,26 +451,34 @@ fn bootstrap_rejects_wrong_missing_duplicate_and_malformed_contract_headers() {
         }
         for id in required {
             let mut bad = original.clone();
-            bad.headers.retain(|h| h.id != id);
+            edit_headers(&mut bad, |values| {
+                values.retain(|h| h.id != id);
+            })
+            .unwrap();
             assert!(decode(&bad).is_err());
             let mut bad = original.clone();
-            bad.headers.push(unique(&original, id).unwrap().clone());
+            edit_headers(&mut bad, |values| {
+                values.push(headers(&original).into_iter().find(|h| h.id == id).unwrap());
+            })
+            .unwrap();
             assert!(decode(&bad).is_err());
             let mut bad = original.clone();
-            bad.headers
-                .iter_mut()
-                .find(|h| h.id == id)
-                .unwrap()
-                .value
-                .clear();
-            assert!(decode(&bad).is_err());
+            assert!(edit_headers(&mut bad, |values| {
+                values
+                    .iter_mut()
+                    .find(|h| h.id == id)
+                    .unwrap()
+                    .value
+                    .clear();
+            })
+            .is_err());
         }
         let mut bad = original;
-        bad.headers
-            .iter_mut()
-            .find(|h| h.id == ACTOR)
-            .unwrap()
-            .value = Header::actor(RA_ACTOR).unwrap().value;
+        edit_headers(&mut bad, |values| {
+            values.iter_mut().find(|h| h.id == ACTOR).unwrap().value =
+                Header::actor(RA_ACTOR).unwrap().value;
+        })
+        .unwrap();
         assert!(decode(&bad).is_err());
     }
 }
@@ -505,27 +500,38 @@ fn bounded_decode_rejects_truncation_trailing_bytes_and_reservation_exhaustion()
             }
         };
         let mut bad = original.clone();
-        for end in 0..original.body.len() {
-            bad.body = original.body[..end].to_vec();
+        for end in 0..bytes(&original).len() {
+            edit_body(&mut bad, |value| {
+                *value = bytes(&original)[..end].to_vec();
+            });
             assert!(decode(&bad).is_err());
         }
         bad = original.clone();
-        bad.body.push(0);
+        edit_body(&mut bad, |value| {
+            value.push(0);
+        });
         assert!(decode(&bad).is_err());
-        bad.body = vec![0; BOOTSTRAP_MAX_BODY_BYTES + 1];
-        assert!(matches!(decode(&bad), Err(Error::ResourceLimit(_))));
-        bad = original.clone();
-        bad.headers.push(Header {
-            id: 0xffff,
-            value: vec![0; BOOTSTRAP_MAX_HEADER_BYTES],
+        edit_body(&mut bad, |value| {
+            *value = vec![0; BOOTSTRAP_MAX_BODY_BYTES + 1];
         });
         assert!(matches!(decode(&bad), Err(Error::ResourceLimit(_))));
         bad = original.clone();
-        bad.headers
-            .extend((0..BOOTSTRAP_MAX_HEADERS).map(|_| Header {
+        edit_headers(&mut bad, |values| {
+            values.push(Header {
                 id: 0xffff,
-                value: vec![],
+                value: vec![0; BOOTSTRAP_MAX_HEADER_BYTES],
+            });
+        })
+        .unwrap();
+        assert!(matches!(decode(&bad), Err(Error::ResourceLimit(_))));
+        bad = original.clone();
+        edit_headers(&mut bad, |values| {
+            values.extend((0..BOOTSTRAP_MAX_HEADERS).map(|_| Header {
+                id: 0xffff,
+                value: vec![0],
             }));
+        })
+        .unwrap();
         assert!(matches!(decode(&bad), Err(Error::ResourceLimit(_))));
         let mut charges = vec![];
         let mut reserve = |bytes| {
@@ -590,7 +596,7 @@ fn compact_wire_arrays_cannot_amplify_past_default_allocation_budget() {
         2000
     ]);
     let message = node_up_message(&node).unwrap();
-    assert!(message.body.len() < BOOTSTRAP_MAX_BODY_BYTES);
+    assert!(bytes(&message).len() < BOOTSTRAP_MAX_BODY_BYTES);
     assert!(matches!(
         decode_node_up(&message),
         Err(Error::ResourceLimit("bootstrap decode allocation"))

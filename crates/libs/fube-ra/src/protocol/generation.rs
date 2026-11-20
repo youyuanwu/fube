@@ -16,28 +16,28 @@ pub fn lfum_upload_message(body: &LfumUpload) -> Result<Message> {
 
 pub fn decode_lfum_upload(message: &Message) -> Result<LfumUpload> {
     without_generation(message, "LFUMUpload")?;
-    Ok(from_slice(&message.body)?)
+    decode_body(message)
 }
 
 pub fn lfum_upload_reply_message(generation: &GenerationHeader) -> Result<Message> {
     ordinary_fm(generation)?;
-    Ok(Message {
-        headers: vec![
-            Header::actor(RA_ACTOR)?,
-            Header::action("LFUMUploadReply")?,
-            Header::boolean(HIGH_PRIORITY, true)?,
+    envelope(
+        vec![
+            header::actor(ActorId::new(RA_ACTOR)?)?,
+            header::action("LFUMUploadReply")?,
+            priority(true)?,
             generation.header()?,
         ],
-        body: Vec::new(),
-    })
+        Vec::new(),
+    )
 }
 
 pub fn decode_lfum_upload_reply(message: &Message) -> Result<GenerationHeader> {
     check_factory(message, "LFUMUploadReply", &[RA_ACTOR])?;
-    if !message.body.is_empty() {
+    if !message.body().is_empty() {
         return Err(Error::Protocol("LFUMUploadReply must be bodyless"));
     }
-    let generation = from_slice(&unique(message, GENERATION_HEADER)?.value)?;
+    let generation = from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?;
     ordinary_fm(&generation)?;
     Ok(generation)
 }
@@ -57,23 +57,23 @@ pub struct GenerationUpdate {
 /// Submit through a correlated request context, not a one-way sender.
 /// The request transport owns MessageId/correlation metadata.
 pub fn generation_proposal_message(generation: &GenerationHeader) -> Result<Message> {
-    Ok(Message {
-        headers: vec![
-            Header::actor(RA_ACTOR)?,
-            Header::action("GenerationProposal")?,
-            Header::boolean(HIGH_PRIORITY, true)?,
+    envelope(
+        vec![
+            header::actor(ActorId::new(RA_ACTOR)?)?,
+            header::action("GenerationProposal")?,
+            priority(true)?,
             generation.header()?,
         ],
-        body: Vec::new(),
-    })
+        Vec::new(),
+    )
 }
 
 pub fn decode_generation_proposal(message: &Message) -> Result<GenerationHeader> {
     check_factory(message, "GenerationProposal", &[RA_ACTOR])?;
-    if !message.body.is_empty() {
+    if !message.body().is_empty() {
         return Err(Error::Protocol("GenerationProposal must be bodyless"));
     }
-    Ok(from_slice(&unique(message, GENERATION_HEADER)?.value)?)
+    from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())
 }
 
 /// Reply on the original request context. Unlike SendToFMM, that path does not
@@ -84,7 +84,11 @@ pub fn generation_proposal_reply_message(body: &GenerationProposalReply) -> Resu
 
 fn without_generation(message: &Message, action: &str) -> Result<()> {
     check_factory(message, action, &[FM_ACTOR])?;
-    if message.headers.iter().any(|h| h.id == GENERATION_HEADER) {
+    if message
+        .headers()
+        .records()
+        .any(|h| h.id().get() == GENERATION_HEADER)
+    {
         return Err(Error::Protocol("unexpected generation negotiation header"));
     }
     Ok(())
@@ -92,7 +96,7 @@ fn without_generation(message: &Message, action: &str) -> Result<()> {
 
 pub fn decode_generation_proposal_reply(message: &Message) -> Result<GenerationProposalReply> {
     without_generation(message, "GenerationProposalReply")?;
-    Ok(from_slice(&message.body)?)
+    decode_body(message)
 }
 
 fn ordinary_fm(generation: &GenerationHeader) -> Result<()> {
@@ -112,9 +116,9 @@ pub fn generation_update_message(
 
 pub fn decode_generation_update(message: &Message) -> Result<(GenerationUpdate, GenerationHeader)> {
     check_factory(message, "GenerationUpdate", &[RA_ACTOR])?;
-    let generation = from_slice(&unique(message, GENERATION_HEADER)?.value)?;
+    let generation = from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?;
     ordinary_fm(&generation)?;
-    Ok((from_slice(&message.body)?, generation))
+    Ok((decode_body(message)?, generation))
 }
 
 /// Ordinary-FM one-way rejection: the body itself is the current proposal.
@@ -125,5 +129,5 @@ pub fn generation_update_reject_message(body: &GenerationNumber) -> Result<Messa
 
 pub fn decode_generation_update_reject(message: &Message) -> Result<GenerationNumber> {
     without_generation(message, "GenerationUpdateReject")?;
-    Ok(from_slice(&message.body)?)
+    decode_body(message)
 }

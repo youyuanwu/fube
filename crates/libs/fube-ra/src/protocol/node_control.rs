@@ -88,7 +88,7 @@ pub fn report_load_message(body: &ReportLoad) -> Result<Message> {
 }
 pub fn decode_report_load(message: &Message) -> Result<ReportLoad> {
     check_factory(message, "ReportLoad", &[FM_ACTOR])?;
-    Ok(from_slice(&message.body)?)
+    decode_body(message)
 }
 
 fn request<T: Serialize>(body: &T, action: &str, generation: &GenerationHeader) -> Result<Message> {
@@ -100,8 +100,8 @@ fn decode_request<T: serde::de::DeserializeOwned>(
 ) -> Result<(T, GenerationHeader)> {
     check_factory(message, action, &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 fn decode_reply<T: serde::de::DeserializeOwned>(
@@ -110,7 +110,7 @@ fn decode_reply<T: serde::de::DeserializeOwned>(
 ) -> Result<(T, Owner)> {
     let actor = check_factory(message, action, &[FM_ACTOR, FMM_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
+        decode_body(message)?,
         if actor == FM_ACTOR {
             Owner::Fm
         } else {
@@ -189,11 +189,11 @@ pub fn service_type_disabled_message(body: &ServiceTypeUpdate) -> Result<Message
 }
 pub fn decode_service_type_enabled(message: &Message) -> Result<ServiceTypeUpdate> {
     check_factory(message, "ServiceTypeEnabled", &[FM_ACTOR])?;
-    Ok(from_slice(&message.body)?)
+    decode_body(message)
 }
 pub fn decode_service_type_disabled(message: &Message) -> Result<ServiceTypeUpdate> {
     check_factory(message, "ServiceTypeDisabled", &[FM_ACTOR])?;
-    Ok(from_slice(&message.body)?)
+    decode_body(message)
 }
 pub fn service_type_enabled_reply_message(
     body: &ServiceTypeUpdateReply,

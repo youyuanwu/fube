@@ -3,22 +3,65 @@ use super::{err, Result, MAX_BODY_BYTES as LIMIT};
 use fube_ra::protocol::{
     GenerationHeader, NodeInstance, FM_ACTOR, GENERATION_HEADER, RA_ACTOR, RS_ACTOR,
 };
-use fube_transport::{
-    channel::{IncomingMessage, MessageReceiver},
-    message::{Header, Message, Properties},
-    native_channel::GatewayTarget,
-    native_demux::{
-        ActorDemux, ActorRegistration, ChannelComposition, OutboundKind, RequestPolicy,
-    },
-    Channel, ChannelLimits,
-};
-use fubst::serde::{from_slice_with_budget, to_vec};
+use fubst::serde::from_slice_with_budget;
+use furpc::{HeaderId, HeaderRecord, Message};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::time::Instant;
+
+mod session;
+pub use session::{Failure, Incoming, Session};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Fm,
+    Node,
+    Peer,
+}
+
+struct Properties {
+    actor: i64,
+    action: String,
+    expects_reply: bool,
+    uncorrelated_reply: bool,
+    high_priority: bool,
+}
+impl Properties {
+    fn new(message: &Message) -> furpc::Result<Self> {
+        let common = message.headers().effective();
+        Ok(Self {
+            actor: common.actor.get(),
+            action: String::from_utf16(common.action())
+                .map_err(|_| furpc::Error::Protocol("invalid reliability action"))?,
+            expects_reply: common.expects_reply,
+            uncorrelated_reply: common.uncorrelated_reply,
+            high_priority: common.high_priority,
+        })
+    }
+}
+pub fn action(message: &Message) -> Result<String> {
+    Properties::new(message).map(|p| p.action).map_err(err)
+}
+pub async fn connect(address: std::net::SocketAddr, role: Role, until: Instant) -> Result<Session> {
+    let stream = tokio::time::timeout_at(until, tokio::net::TcpStream::connect(address))
+        .await
+        .map_err(err)?
+        .map_err(err)?;
+    initiate(stream, role, until).await
+}
+pub async fn initiate(
+    stream: tokio::net::TcpStream,
+    role: Role,
+    until: Instant,
+) -> Result<Session> {
+    session::establish(stream, role, until, false).await
+}
+pub async fn accept(stream: tokio::net::TcpStream, role: Role, until: Instant) -> Result<Session> {
+    session::establish(stream, role, until, true).await
+}
 
 // Native pin 3988b451: Federation/PToPHeader.h FABRIC_FIELDS_06;
 // PToPActor.h Direct=0; Transport/MessageHeaderId.h PToP=0x8013.
@@ -34,21 +77,21 @@ struct PToP {
 }
 const PTOP: u16 = 0x8013;
 
-fn bounded(message: &Message) -> fube_transport::Result<()> {
-    if message.body.len() > LIMIT
-        || message.headers.len() > 16
+fn bounded(message: &Message) -> furpc::Result<()> {
+    if message.body().len() > LIMIT
+        || message.headers().records().count() > 16
         || message
-            .headers
-            .iter()
-            .map(|header| header.value.len())
+            .headers()
+            .records()
+            .map(|header| header.value().len())
             .sum::<usize>()
             > 4096
     {
-        return Err(fube_transport::Error::ResourceLimit("cluster envelope"));
+        return Err(furpc::Error::ResourceLimit("cluster envelope"));
     }
     Ok(())
 }
-fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<()> {
+fn fm_ingress(message: &Message, props: &Properties) -> furpc::Result<()> {
     bounded(message)?;
     if props.actor != FM_ACTOR
         || props.uncorrelated_reply
@@ -93,11 +136,11 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                     | "GenerationUpdateReject"
             )
     {
-        return Err(fube_transport::Error::Protocol("unsupported FM ingress"));
+        return Err(furpc::Error::Protocol("unsupported FM ingress"));
     }
     Ok(())
 }
-fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result<()> {
+fn node_ingress(message: &Message, props: &Properties) -> furpc::Result<()> {
     bounded(message)?;
     if props.actor != RA_ACTOR
         || props.expects_reply != (props.action == "GenerationProposal")
@@ -139,11 +182,11 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
                 | "GenerationUpdate"
         )
     {
-        return Err(fube_transport::Error::Protocol("unsupported node ingress"));
+        return Err(furpc::Error::Protocol("unsupported node ingress"));
     }
     Ok(())
 }
-fn ack(message: &Message, props: &Properties) -> fube_transport::Result<()> {
+fn ack(message: &Message, props: &Properties) -> furpc::Result<()> {
     bounded(message)?;
     if !matches!(
         (props.actor, props.action.as_str()),
@@ -152,13 +195,11 @@ fn ack(message: &Message, props: &Properties) -> fube_transport::Result<()> {
         || props.uncorrelated_reply
         || !props.high_priority
     {
-        return Err(fube_transport::Error::Protocol(
-            "unsupported bootstrap reply",
-        ));
+        return Err(furpc::Error::Protocol("unsupported bootstrap reply"));
     }
     Ok(())
 }
-fn proposal_ack(message: &Message, props: &Properties) -> fube_transport::Result<()> {
+fn proposal_ack(message: &Message, props: &Properties) -> furpc::Result<()> {
     bounded(message)?;
     if props.actor != FM_ACTOR
         || props.action != "GenerationProposalReply"
@@ -166,34 +207,30 @@ fn proposal_ack(message: &Message, props: &Properties) -> fube_transport::Result
         || props.uncorrelated_reply
         || !props.high_priority
     {
-        return Err(fube_transport::Error::Protocol(
+        return Err(furpc::Error::Protocol(
             "unsupported generation proposal reply",
         ));
     }
     Ok(())
 }
-fn fm_out(message: &Message, props: &Properties, kind: OutboundKind) -> fube_transport::Result<()> {
-    if (kind == OutboundKind::Rpc) != (props.action == "GenerationProposal") {
-        return Err(fube_transport::Error::Protocol("wrong FM send mechanism"));
+fn fm_out(message: &Message, props: &Properties, request: bool) -> furpc::Result<()> {
+    if request != (props.action == "GenerationProposal") {
+        return Err(furpc::Error::Protocol("wrong FM send mechanism"));
     }
-    let mut canonical = message.properties()?;
+    let mut canonical = Properties::new(message)?;
     canonical.expects_reply = canonical.action == "GenerationProposal";
     node_ingress(message, &canonical)
 }
-fn node_out(
-    message: &Message,
-    props: &Properties,
-    kind: OutboundKind,
-) -> fube_transport::Result<()> {
-    if (kind == OutboundKind::Rpc) != matches!(props.action.as_str(), "NodeUp" | "LFUMUpload") {
-        return Err(fube_transport::Error::Protocol("wrong node send mechanism"));
+fn node_out(message: &Message, props: &Properties, request: bool) -> furpc::Result<()> {
+    if request != matches!(props.action.as_str(), "NodeUp" | "LFUMUpload") {
+        return Err(furpc::Error::Protocol("wrong node send mechanism"));
     }
     // RPC adds ExpectsReply below outbound policy.
-    let mut canonical = message.properties()?;
+    let mut canonical = Properties::new(message)?;
     canonical.expects_reply = matches!(canonical.action.as_str(), "NodeUp" | "LFUMUpload");
     fm_ingress(message, &canonical)
 }
-fn peer_ingress(message: &Message, props: &Properties) -> fube_transport::Result<()> {
+fn peer_ingress(message: &Message, props: &Properties) -> furpc::Result<()> {
     bounded(message)?;
     if props.actor != RA_ACTOR
         || !props.high_priority
@@ -212,70 +249,36 @@ fn peer_ingress(message: &Message, props: &Properties) -> fube_transport::Result
                 | "DoReconfiguration"
         )
         || message
-            .headers
-            .iter()
-            .filter(|header| header.id == GENERATION_HEADER)
+            .headers()
+            .records()
+            .filter(|header| header.id().get() == GENERATION_HEADER)
             .count()
             != 1
     {
-        return Err(fube_transport::Error::Protocol("unsupported peer ingress"));
+        return Err(furpc::Error::Protocol("unsupported peer ingress"));
     }
     Ok(())
 }
-fn peer_out(
-    message: &Message,
-    props: &Properties,
-    kind: OutboundKind,
-) -> fube_transport::Result<()> {
-    if kind == OutboundKind::Rpc {
-        return Err(fube_transport::Error::Protocol("peer traffic is one-way"));
+fn peer_out(message: &Message, props: &Properties, request: bool) -> furpc::Result<()> {
+    if request {
+        return Err(furpc::Error::Protocol("peer traffic is one-way"));
     }
     peer_ingress(message, props)
 }
-pub fn peer_composition() -> fube_transport::Result<ChannelComposition> {
-    Ok(ChannelComposition {
-        outbound: peer_out,
-        ordinary_reply: peer_ingress,
-        actors: ActorDemux::new(vec![ActorRegistration {
-            actor: RA_ACTOR,
-            authorize: peer_ingress,
-        }])?,
-        requests: None,
-        duplex: None,
-        ordered_ingress: true,
-    })
+fn inbound(role: Role, message: &Message) -> furpc::Result<()> {
+    let props = Properties::new(message)?;
+    match role {
+        Role::Fm => fm_ingress(message, &props),
+        Role::Node => node_ingress(message, &props),
+        Role::Peer => peer_ingress(message, &props),
+    }
 }
-pub fn composition(fm: bool) -> fube_transport::Result<ChannelComposition> {
-    Ok(ChannelComposition {
-        outbound: if fm { fm_out } else { node_out },
-        ordinary_reply: if fm { proposal_ack } else { ack },
-        actors: ActorDemux::new(vec![ActorRegistration {
-            actor: if fm { FM_ACTOR } else { RA_ACTOR },
-            authorize: if fm { fm_ingress } else { node_ingress },
-        }])?,
-        requests: if fm {
-            Some(RequestPolicy {
-                incoming: fm_ingress,
-                reply: ack,
-            })
-        } else {
-            Some(RequestPolicy {
-                incoming: node_ingress,
-                reply: proposal_ack,
-            })
-        },
-        duplex: None,
-        ordered_ingress: true,
-    })
-}
-pub fn limits() -> ChannelLimits {
-    ChannelLimits {
-        max_operations: 8,
-        max_replies: 4,
-        max_ingress: 8,
-        max_frame_bytes: LIMIT,
-        max_retained_bytes: 32 * 1024 * 1024,
-        max_history: 4096,
+fn outbound(role: Role, message: &Message, request: bool) -> furpc::Result<()> {
+    let props = Properties::new(message)?;
+    match role {
+        Role::Fm => fm_out(message, &props, request),
+        Role::Node => node_out(message, &props, request),
+        Role::Peer => peer_out(message, &props, request),
     }
 }
 pub fn deadline() -> Instant {
@@ -295,83 +298,85 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 // Bound allocations before the existing action/header/body factory decoders
 // run. Their second decode is then bounded by this validated full schema.
 pub fn predecode(message: &Message) -> Result<()> {
+    bounded(message).map_err(err)?;
+    let body: Vec<_> = message.body().segments().flatten().copied().collect();
     use fube_ra::protocol::*;
-    match message.properties().map_err(err)?.action.as_str() {
+    match action(message)?.as_str() {
         "GetLSN" => {
-            decode::<GetLsn>(&message.body)?;
+            decode::<GetLsn>(&body)?;
         }
         "GetLSNReply" => {
-            decode::<GetLsnReply>(&message.body)?;
+            decode::<GetLsnReply>(&body)?;
         }
         "ReplicaEndpointUpdated" => {
-            decode::<AddInstance>(&message.body)?;
+            decode::<AddInstance>(&body)?;
         }
         "ReplicaEndpointUpdatedReply" => {
-            decode::<AddInstanceReply>(&message.body)?;
+            decode::<AddInstanceReply>(&body)?;
         }
         "DoReconfiguration" => {
-            decode::<DoReconfiguration>(&message.body)?;
+            decode::<DoReconfiguration>(&body)?;
         }
         "DoReconfigurationReply" => {
-            decode::<ConfigurationReply>(&message.body)?;
+            decode::<ConfigurationReply>(&body)?;
         }
         "ChangeConfiguration" => {
-            decode::<Configuration>(&message.body)?;
+            decode::<Configuration>(&body)?;
         }
         "ChangeConfigurationReply" => {
-            decode::<FailoverUnitReply>(&message.body)?;
+            decode::<FailoverUnitReply>(&body)?;
         }
         "Activate" => {
-            decode::<Activate>(&message.body)?;
+            decode::<Activate>(&body)?;
         }
         "ActivateReply" => {
-            decode::<ActivateReply>(&message.body)?;
+            decode::<ActivateReply>(&body)?;
         }
         "Deactivate" => {
-            decode::<Deactivate>(&message.body)?;
+            decode::<Deactivate>(&body)?;
         }
         "DeactivateReply" => {
-            decode::<DeactivateReply>(&message.body)?;
+            decode::<DeactivateReply>(&body)?;
         }
         "GenerationProposal" => {
-            if !message.body.is_empty() {
+            if !message.body().is_empty() {
                 return Err("GenerationProposal must be bodyless".into());
             }
         }
         "LFUMUpload" => {
-            decode::<LfumUpload>(&message.body)?;
+            decode::<LfumUpload>(&body)?;
         }
         "LFUMUploadReply" => {
-            if !message.body.is_empty() {
+            if !message.body().is_empty() {
                 return Err("LFUMUploadReply must be bodyless".into());
             }
         }
         "GenerationProposalReply" => {
-            decode::<fube_ra::protocol::GenerationProposalReply>(&message.body)?;
+            decode::<fube_ra::protocol::GenerationProposalReply>(&body)?;
         }
         "GenerationUpdate" => {
-            decode::<GenerationUpdate>(&message.body)?;
+            decode::<GenerationUpdate>(&body)?;
         }
         "GenerationUpdateReject" => {
-            decode::<GenerationNumber>(&message.body)?;
+            decode::<GenerationNumber>(&body)?;
         }
         "NodeUp" => {
-            decode::<NodeUp>(&message.body)?;
+            decode::<NodeUp>(&body)?;
         }
         "NodeUpAck" => {
-            decode::<NodeUpAck>(&message.body)?;
+            decode::<NodeUpAck>(&body)?;
         }
         "AddInstance" | "AddPrimary" | "AddReplica" | "RemoveReplica" => {
-            decode::<AddInstance>(&message.body)?;
+            decode::<AddInstance>(&body)?;
         }
         "CreateReplica" => {
-            decode::<CreateReplica>(&message.body)?;
+            decode::<CreateReplica>(&body)?;
         }
         "CreateReplicaReply" => {
-            decode::<CreateReplicaReply>(&message.body)?;
+            decode::<CreateReplicaReply>(&body)?;
         }
         "RemoveInstance" | "DeleteReplica" => {
-            decode::<RemoveInstance>(&message.body)?;
+            decode::<RemoveInstance>(&body)?;
         }
         "AddInstanceReply"
         | "AddPrimaryReply"
@@ -379,34 +384,34 @@ pub fn predecode(message: &Message) -> Result<()> {
         | "RemoveReplicaReply"
         | "RemoveInstanceReply"
         | "DeleteReplicaReply" => {
-            decode::<AddInstanceReply>(&message.body)?;
+            decode::<AddInstanceReply>(&body)?;
         }
         "ReplicaUp" | "ReplicaUpReply" => {
-            decode::<ReplicaUp>(&message.body)?;
+            decode::<ReplicaUp>(&body)?;
         }
         "ServiceTypeNotification" | "ServiceTypeNotificationReply" => {
-            decode::<ServiceTypeNotification>(&message.body)?;
+            decode::<ServiceTypeNotification>(&body)?;
         }
         "NodeActivateRequest" | "NodeDeactivateRequest" => {
-            decode::<NodeActivationRequest>(&message.body)?;
+            decode::<NodeActivationRequest>(&body)?;
         }
         "NodeActivateReply" | "NodeDeactivateReply" => {
-            decode::<NodeActivationReply>(&message.body)?;
+            decode::<NodeActivationReply>(&body)?;
         }
         "NodeUpdateServiceRequest" => {
-            decode::<NodeUpdateServiceRequest>(&message.body)?;
+            decode::<NodeUpdateServiceRequest>(&body)?;
         }
         "NodeUpdateServiceReply" => {
-            decode::<NodeUpdateServiceReply>(&message.body)?;
+            decode::<NodeUpdateServiceReply>(&body)?;
         }
         "ServiceTypeEnabled" | "ServiceTypeDisabled" => {
-            decode::<ServiceTypeUpdate>(&message.body)?;
+            decode::<ServiceTypeUpdate>(&body)?;
         }
         "ServiceTypeEnabledReply" | "ServiceTypeDisabledReply" => {
-            decode::<ServiceTypeUpdateReply>(&message.body)?;
+            decode::<ServiceTypeUpdateReply>(&body)?;
         }
         "ReportLoad" => {
-            decode::<ReportLoad>(&message.body)?;
+            decode::<ReportLoad>(&body)?;
         }
         _ => return Err("unsupported native action retained at boundary".into()),
     }
@@ -415,8 +420,7 @@ pub fn predecode(message: &Message) -> Result<()> {
 
 #[derive(Clone)]
 pub struct Link {
-    pub channel: Channel,
-    target: Arc<GatewayTarget>,
+    session: Arc<Session>,
     local: NodeInstance,
     remote: NodeInstance,
     generation: Arc<Mutex<GenerationHeader>>,
@@ -441,15 +445,13 @@ impl Link {
     // admitted Channel. Deployment/session binding is local capability state,
     // not a fabricated universal native header or a reconnect credential.
     pub fn new(
-        channel: Channel,
+        session: Session,
         local: NodeInstance,
         remote: NodeInstance,
         generation: GenerationHeader,
     ) -> Result<Self> {
-        let target = channel.target().map_err(err)?;
         Ok(Self {
-            channel,
-            target,
+            session: Arc::new(session),
             local,
             remote,
             generation: Arc::new(Mutex::new(generation)),
@@ -458,31 +460,40 @@ impl Link {
     }
     /// Bind an original RA peer Channel; stale generations are native message drops.
     pub fn new_peer(
-        channel: Channel,
+        session: Session,
         local: NodeInstance,
         remote: NodeInstance,
         generation: GenerationHeader,
     ) -> Result<Self> {
-        let mut link = Self::new(channel, local, remote, generation)?;
+        let mut link = Self::new(session, local, remote, generation)?;
         link.kind = LinkKind::Peer;
         Ok(link)
     }
-    pub fn seal(&self, mut message: Message) -> Result<Message> {
-        if message.headers.iter().any(|header| header.id == PTOP) {
+    pub fn seal(&self, message: Message) -> Result<Message> {
+        if message
+            .headers()
+            .records()
+            .any(|header| header.id().get() == PTOP)
+        {
             return Err("duplicate source header".into());
         }
-        message.headers.push(Header {
-            id: PTOP,
-            value: to_vec(&PToP {
+        let source = HeaderRecord::native(
+            HeaderId::new(PTOP).map_err(err)?,
+            &PToP {
                 from: self.local.clone(),
                 to: self.remote.clone(),
                 actor: 0,
                 from_ring: String::new(),
                 to_ring: String::new(),
                 exact_instance: true,
-            })
-            .map_err(err)?,
-        });
+            },
+        )
+        .map_err(err)?;
+        let mut builder = Message::builder().body(message.body().clone());
+        for header in message.headers().records() {
+            builder = builder.append_header(header.to_owned());
+        }
+        let message = builder.append_header(source).build().map_err(err)?;
         bounded(&message).map_err(err)?;
         Ok(message)
     }
@@ -495,13 +506,13 @@ impl Link {
     fn is_current(&self, message: &Message) -> Result<bool> {
         validate_source(message, &self.local, &self.remote)?;
         let mut headers = message
-            .headers
-            .iter()
-            .filter(|header| header.id == GENERATION_HEADER);
+            .headers()
+            .records()
+            .filter(|header| header.id().get() == GENERATION_HEADER);
         if let Some(header) = headers.next() {
-            let generation: GenerationHeader = decode(&header.value)?;
+            let generation: GenerationHeader = decode(header.value())?;
             let generation_independent = matches!(
-                message.properties().map_err(err)?.action.as_str(),
+                action(message)?.as_str(),
                 "GenerationProposal" | "GenerationUpdate" | "LFUMUploadReply"
             );
             if headers.next().is_some() || generation.for_fm_replica {
@@ -514,8 +525,8 @@ impl Link {
         Ok(true)
     }
     pub async fn send(&self, message: Message) -> Result<()> {
-        self.channel
-            .send_reserved(&self.target, self.seal(message)?, deadline(), None)
+        self.session
+            .send(self.seal(message)?, deadline())
             .await
             .map_err(err)
     }
@@ -525,18 +536,22 @@ impl Link {
             .ok_or("native request reply timeout".into())
     }
     pub async fn request_optional(&self, message: Message) -> Result<Option<Message>> {
-        let (future, _) =
-            self.channel
-                .request_tracked(&self.target, self.seal(message)?, deadline());
-        let reply = match future.await {
+        let reply = match self.session.request(self.seal(message)?, deadline()).await {
             Ok(reply) => reply,
-            Err(fube_transport::Error::Timeout) => return Ok(None),
+            Err(furpc::Error::Timeout(_)) => return Ok(None),
             Err(error) => return Err(err(error)),
         };
+        let props = Properties::new(&reply).map_err(err)?;
+        match self.session.role() {
+            Role::Node => ack(&reply, &props),
+            Role::Fm => proposal_ack(&reply, &props),
+            Role::Peer => return Err("peer RPC is unsupported".into()),
+        }
+        .map_err(err)?;
         self.validate(&reply)?;
         Ok(Some(reply))
     }
-    pub async fn receive(&self, until: Instant) -> Result<Option<IncomingMessage<GatewayTarget>>> {
+    pub async fn receive(&self, until: Instant) -> Result<Option<Incoming>> {
         self.receive_checked(until)
             .await
             .map_err(|error| error.to_string())
@@ -545,19 +560,11 @@ impl Link {
     pub async fn receive_checked(
         &self,
         until: Instant,
-    ) -> std::result::Result<Option<IncomingMessage<GatewayTarget>>, ReceiveError> {
-        match self
-            .channel
-            .receiver()
-            .map_err(|error| {
-                ReceiveError::Transport(self.channel.terminal_error().unwrap_or(error))
-            })?
-            .receive(until)
-            .await
-        {
-            Ok(mut incoming) => {
-                if !Arc::ptr_eq(&incoming.source, &self.target) {
-                    self.channel.dispose();
+    ) -> std::result::Result<Option<Incoming>, ReceiveError> {
+        match self.session.receive(until).await {
+            Ok(Some(incoming)) => {
+                if incoming.source.generation() != self.session.peer.info().generation {
+                    self.retire();
                     return Err(ReceiveError::Invalid(
                         "foreign Channel source capability".into(),
                     ));
@@ -566,38 +573,44 @@ impl Link {
                     Ok(true) => {}
                     Ok(false) => {
                         if self.kind != LinkKind::Peer {
-                            self.channel.dispose();
+                            self.retire();
                             return Err(ReceiveError::Invalid(
                                 "foreign/stale/duplicate native FM generation".into(),
                             ));
-                        }
-                        if let Some(handoff) = incoming.handoff.as_mut() {
-                            handoff.acknowledge();
                         }
                         eprintln!("ignored native message from older FM generation");
                         return Ok(None);
                     }
                     Err(error) => {
-                        self.channel.dispose();
+                        self.retire();
                         return Err(ReceiveError::Invalid(error));
                     }
                 }
                 Ok(Some(incoming))
             }
-            Err(fube_transport::Error::Timeout) => Ok(None),
-            Err(error) => Err(ReceiveError::Transport(
-                self.channel.terminal_error().unwrap_or(error),
-            )),
+            Ok(None) => Ok(None),
+            Err(error) => Err(ReceiveError::Transport(error)),
         }
     }
+    pub fn is_live(&self) -> bool {
+        self.terminal_error().is_none()
+    }
+    pub fn terminal_error(&self) -> Option<Failure> {
+        self.session.terminal_error()
+    }
+    pub fn retire(&self) {
+        self.session.retire();
+    }
+    pub async fn closed(&self, until: Instant) -> Result<()> {
+        self.session.closed(until).await
+    }
     pub async fn close(&self) -> Result<()> {
-        self.channel.dispose();
-        self.channel.closed(deadline()).await.map_err(err)
+        self.closed(deadline()).await
     }
 }
 #[derive(Debug)]
 pub enum ReceiveError {
-    Transport(fube_transport::Error),
+    Transport(Failure),
     Invalid(String),
 }
 impl std::fmt::Display for ReceiveError {
@@ -610,13 +623,16 @@ impl std::fmt::Display for ReceiveError {
 }
 fn validate_source(message: &Message, local: &NodeInstance, remote: &NodeInstance) -> Result<()> {
     bounded(message).map_err(err)?;
-    let mut headers = message.headers.iter().filter(|header| header.id == PTOP);
+    let mut headers = message
+        .headers()
+        .records()
+        .filter(|header| header.id().get() == PTOP);
     let header = headers.next().ok_or("missing native source identity")?;
     if headers.next().is_some() {
         return Err("duplicate native source identity".into());
     }
     let mut budget = 8192usize;
-    let value: PToP = from_slice_with_budget(&header.value, &mut |bytes| {
+    let value: PToP = from_slice_with_budget(header.value(), &mut |bytes| {
         budget = budget
             .checked_sub(bytes)
             .ok_or(fubst::Error::ResourceLimit("PToP decode"))?;
@@ -645,31 +661,14 @@ mod tests {
 
     async fn links(peer: bool) -> (Link, Link) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = fube_transport::Endpoint::unsecured_tcp(
+        let sender = connect(
             listener.local_addr().unwrap(),
-            if peer {
-                peer_composition()
-            } else {
-                composition(false)
-            }
-            .unwrap(),
-        )
-        .unwrap()
-        .channel_limits(limits());
-        let (sender, receiver) = tokio::join!(endpoint.connect_until(deadline()), async {
+            if peer { Role::Peer } else { Role::Node },
+            deadline(),
+        );
+        let (sender, receiver) = tokio::join!(sender, async {
             let (stream, _) = listener.accept().await.unwrap();
-            fube_transport::accept_unsecured_tcp(
-                stream,
-                if peer {
-                    peer_composition()
-                } else {
-                    composition(true)
-                }
-                .unwrap(),
-                limits(),
-                deadline(),
-            )
-            .await
+            accept(stream, if peer { Role::Peer } else { Role::Fm }, deadline()).await
         });
         let local = NodeInstance {
             id: [1; 16],
@@ -720,40 +719,40 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(receiver.channel.terminal_error().is_none());
+        assert!(receiver.terminal_error().is_none());
         sender
             .send(get_lsn_reply_message(&GetLsnReply::default(), &current).unwrap())
             .await
             .unwrap();
-        let mut incoming = receiver.receive_checked(deadline()).await.unwrap().unwrap();
+        let incoming = receiver.receive_checked(deadline()).await.unwrap().unwrap();
         assert_eq!(decode_get_lsn_reply(&incoming.message).unwrap().1, current);
-        if let Some(handoff) = incoming.handoff.as_mut() {
-            handoff.acknowledge();
-        }
-        let mut invalid = sender
+        let invalid = sender
             .seal(get_lsn_reply_message(&GetLsnReply::default(), &old).unwrap())
             .unwrap();
         let mut foreign = sender.local.clone();
         foreign.instance += 1;
-        invalid
-            .headers
-            .iter_mut()
-            .find(|h| h.id == PTOP)
-            .unwrap()
-            .value = to_vec(&PToP {
-            from: foreign,
-            to: sender.remote.clone(),
-            actor: 0,
-            from_ring: String::new(),
-            to_ring: String::new(),
-            exact_instance: true,
-        })
-        .unwrap();
-        sender
-            .channel
-            .send_reserved(&sender.target, invalid, deadline(), None)
-            .await
+        let mut builder = Message::builder().body(invalid.body().clone());
+        for header in invalid.headers().records().filter(|h| h.id().get() != PTOP) {
+            builder = builder.append_header(header.to_owned());
+        }
+        let invalid = builder
+            .append_header(
+                HeaderRecord::native(
+                    HeaderId::new(PTOP).unwrap(),
+                    &PToP {
+                        from: foreign,
+                        to: sender.remote.clone(),
+                        actor: 0,
+                        from_ring: String::new(),
+                        to_ring: String::new(),
+                        exact_instance: true,
+                    },
+                )
+                .unwrap(),
+            )
+            .build()
             .unwrap();
+        sender.session.send(invalid, deadline()).await.unwrap();
         assert!(matches!(
             receiver.receive_checked(deadline()).await,
             Err(ReceiveError::Invalid(_))
@@ -786,14 +785,107 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            if let Some(handoff) = incoming.handoff.as_mut() {
-                handoff.acknowledge();
-            }
         });
         assert_eq!(decode_lfum_upload_reply(&reply.unwrap()).unwrap(), old);
         assert_eq!(fm.generation(), current);
         node.close().await.unwrap();
         fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_close_joins_original_io_and_revokes_retained_response_slots() {
+        let (node, fm) = links(false).await;
+        let request_owner = node.clone();
+        let request = tokio::spawn(async move {
+            request_owner
+                .request(lfum_upload_message(&LfumUpload::default()).unwrap())
+                .await
+        });
+        let mut incoming = fm.receive(deadline()).await.unwrap().unwrap();
+        let clone = node.clone();
+        let (first, second) = tokio::join!(node.close(), clone.close());
+        first.unwrap();
+        second.unwrap();
+        assert!(!node.is_live());
+        assert!(request.await.unwrap().is_err());
+        fm.close().await.unwrap();
+        assert!(incoming
+            .reply
+            .take()
+            .unwrap()
+            .reply(
+                fm.seal(lfum_upload_reply_message(&fm.generation()).unwrap())
+                    .unwrap(),
+                deadline(),
+            )
+            .await
+            .is_err());
+        assert!(node
+            .send(replica_up_message(&ReplicaUp::default(), Owner::Fm).unwrap())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_receive_waits_share_the_original_absolute_deadline() {
+        let (sender, receiver) = links(true).await;
+        let other = receiver.clone();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(async move {
+            entered.send(()).unwrap();
+            other.receive(deadline()).await
+        });
+        waiting.await.unwrap();
+        let until = Instant::now() + Duration::from_millis(5);
+        assert!(tokio::time::timeout_at(
+            until + Duration::from_millis(100),
+            receiver.receive(until)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .is_none());
+        receiver.close().await.unwrap();
+        assert!(first.await.unwrap().is_err());
+        sender.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verified_domain_inbox_overflow_retires_its_original_session() {
+        let (sender, receiver) = links(true).await;
+        for count in 1..=8 {
+            sender
+                .send(get_lsn_reply_message(&GetLsnReply::default(), &sender.generation()).unwrap())
+                .await
+                .unwrap();
+            tokio::time::timeout_at(deadline(), async {
+                while receiver.session.queued() != count {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        sender
+            .send(get_lsn_reply_message(&GetLsnReply::default(), &sender.generation()).unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout_at(deadline(), async {
+            while receiver.terminal_error().is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            receiver.terminal_error(),
+            Some(Failure::Native(furpc::Error::ResourceLimit(
+                "Node control inbox"
+            )))
+        ));
+        receiver.close().await.unwrap();
+        assert_eq!(receiver.session.queued(), 0);
+        sender.close().await.unwrap();
     }
 
     #[test]
@@ -811,48 +903,52 @@ mod tests {
             create_replica_message(&body, &generation).unwrap(),
             create_replica_reply_message(&CreateReplicaReply::default(), &generation).unwrap(),
         ] {
-            let properties = message.properties().unwrap();
+            let properties = Properties::new(&message).unwrap();
             peer_ingress(&message, &properties).unwrap();
             predecode(&message).unwrap();
-            assert!(peer_out(&message, &properties, OutboundKind::Rpc).is_err());
+            assert!(peer_out(&message, &properties, true).is_err());
             for invalid in [
                 Properties {
                     actor: FM_ACTOR,
-                    ..message.properties().unwrap()
+                    ..Properties::new(&message).unwrap()
                 },
                 Properties {
                     high_priority: false,
-                    ..message.properties().unwrap()
+                    ..Properties::new(&message).unwrap()
                 },
                 Properties {
                     expects_reply: true,
-                    ..message.properties().unwrap()
+                    ..Properties::new(&message).unwrap()
                 },
                 Properties {
                     uncorrelated_reply: true,
-                    ..message.properties().unwrap()
+                    ..Properties::new(&message).unwrap()
                 },
                 Properties {
                     action: "AddPrimary".into(),
-                    ..message.properties().unwrap()
+                    ..Properties::new(&message).unwrap()
                 },
             ] {
                 assert!(peer_ingress(&message, &invalid).is_err());
             }
-            let mut missing = message.clone();
-            missing
-                .headers
-                .retain(|header| header.id != GENERATION_HEADER);
+            let mut builder = Message::builder().body(message.body().clone());
+            for h in message
+                .headers()
+                .records()
+                .filter(|h| h.id().get() != GENERATION_HEADER)
+            {
+                builder = builder.append_header(h.to_owned());
+            }
+            let missing = builder.build().unwrap();
             assert!(peer_ingress(&missing, &properties).is_err());
-            let mut duplicate = message.clone();
-            duplicate.headers.push(
-                message
-                    .headers
-                    .iter()
-                    .find(|header| header.id == GENERATION_HEADER)
-                    .unwrap()
-                    .clone(),
-            );
+            let mut builder = Message::builder().body(message.body().clone());
+            for h in message.headers().records() {
+                builder = builder.append_header(h.to_owned());
+            }
+            let duplicate = builder
+                .append_header(generation.header().unwrap())
+                .build()
+                .unwrap();
             assert!(peer_ingress(&duplicate, &properties).is_err());
         }
     }
@@ -875,12 +971,13 @@ mod tests {
             to_ring: String::new(),
             exact_instance: true,
         };
-        let message = |identity: &PToP| Message {
-            headers: vec![Header {
-                id: PTOP,
-                value: to_vec(identity).unwrap(),
-            }],
-            body: vec![],
+        let message = |identity: &PToP| {
+            Message::builder()
+                .append_header(
+                    HeaderRecord::native(HeaderId::new(PTOP).unwrap(), identity).unwrap(),
+                )
+                .build()
+                .unwrap()
         };
         validate_source(&message(&identity), &local, &remote).unwrap();
         let mut stale = identity.clone();
@@ -895,8 +992,11 @@ mod tests {
         stale = identity.clone();
         stale.exact_instance = false;
         assert!(validate_source(&message(&stale), &local, &remote).is_err());
-        let mut duplicate = message(&identity);
-        duplicate.headers.push(duplicate.headers[0].clone());
+        let duplicate = Message::builder()
+            .append_header(HeaderRecord::native(HeaderId::new(PTOP).unwrap(), &identity).unwrap())
+            .append_header(HeaderRecord::native(HeaderId::new(PTOP).unwrap(), &identity).unwrap())
+            .build()
+            .unwrap();
         assert!(validate_source(&duplicate, &local, &remote).is_err());
     }
 }

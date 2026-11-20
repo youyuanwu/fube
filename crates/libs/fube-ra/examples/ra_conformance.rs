@@ -1,10 +1,14 @@
 //! Compiler-free consumer of independently native-produced fixtures.
 mod support;
 
+#[path = "support/envelope.rs"]
+mod envelope;
+
+use self::envelope::*;
 use clap::Parser;
 use fube_ra::protocol::*;
-use fube_transport::message::{Header, Message, ACTION, ACTOR, HIGH_PRIORITY};
 use fubst::serde::{from_slice, to_vec, CountedStrings, ObjectArray};
+use furpc::Message;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     fmt::Debug,
@@ -365,10 +369,11 @@ fn native_envelope(input: &Path, body: &str, ack: bool) -> Message {
             value: fs::read(input.join("fm-generation.bin")).unwrap(),
         });
     }
-    Message {
+    native(
         headers,
-        body: fs::read(input.join(format!("{body}.bin"))).unwrap(),
-    }
+        fs::read(input.join(format!("{body}.bin"))).unwrap(),
+    )
+    .unwrap()
 }
 
 fn factory_contract(native: &Message, rust: &Message) {
@@ -377,7 +382,7 @@ fn factory_contract(native: &Message, rust: &Message) {
     assert_eq!(actual.actor, expected.actor);
     assert_eq!(actual.action, expected.action);
     assert_eq!(actual.high_priority, expected.high_priority);
-    assert_eq!(rust.headers.len(), native.headers.len());
+    assert_eq!(headers(rust).len(), headers(native).len());
 }
 
 fn reject_prefixes<T: DeserializeOwned>(input: &Path, name: &str) {
@@ -437,10 +442,11 @@ fn stage_two_envelope(
             .unwrap(),
         });
     }
-    Message {
+    native(
         headers,
-        body: fs::read(input.join(format!("{name}.bin"))).unwrap(),
-    }
+        fs::read(input.join(format!("{name}.bin"))).unwrap(),
+    )
+    .unwrap()
 }
 
 fn check_incoming<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
@@ -449,8 +455,8 @@ fn check_incoming<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
     name: &str,
     action: &str,
     expected: T,
-    make: fn(&T, &GenerationHeader) -> fube_transport::Result<Message>,
-    decode: fn(&Message) -> fube_transport::Result<(T, GenerationHeader)>,
+    make: fn(&T, &GenerationHeader) -> furpc::Result<Message>,
+    decode: fn(&Message) -> furpc::Result<(T, GenerationHeader)>,
 ) {
     check(input, output, name, expected.clone());
     for fmm in [false, true] {
@@ -463,7 +469,7 @@ fn check_incoming<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
         let made = make(&expected, &generation).unwrap();
         factory_contract(&native, &made);
         assert_eq!(
-            made.body,
+            bytes(&made),
             fs::read(output.join(format!("{name}.bin"))).unwrap()
         );
         assert_eq!(decode(&made).unwrap(), (expected.clone(), generation));
@@ -477,8 +483,8 @@ fn check_owner_outgoing<T: Serialize + DeserializeOwned + Debug + PartialEq + Cl
     name: &str,
     action: &str,
     expected: T,
-    make: fn(&T, Owner) -> fube_transport::Result<Message>,
-    decode: fn(&Message) -> fube_transport::Result<(T, Owner)>,
+    make: fn(&T, Owner) -> furpc::Result<Message>,
+    decode: fn(&Message) -> furpc::Result<(T, Owner)>,
 ) {
     check(input, output, name, expected.clone());
     for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
@@ -487,7 +493,7 @@ fn check_owner_outgoing<T: Serialize + DeserializeOwned + Debug + PartialEq + Cl
         let made = make(&expected, owner).unwrap();
         factory_contract(&native, &made);
         assert_eq!(
-            made.body,
+            bytes(&made),
             fs::read(output.join(format!("{name}.bin"))).unwrap()
         );
         assert_eq!(decode(&made).unwrap(), (expected.clone(), owner));
@@ -501,8 +507,8 @@ fn check_fm_outgoing<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone
     name: &str,
     action: &str,
     expected: T,
-    make: fn(&T) -> fube_transport::Result<Message>,
-    decode: fn(&Message) -> fube_transport::Result<T>,
+    make: fn(&T) -> furpc::Result<Message>,
+    decode: fn(&Message) -> furpc::Result<T>,
 ) {
     check(input, output, name, expected.clone());
     let native = stage_two_envelope(input, name, action, "actor-11", None);
@@ -510,7 +516,7 @@ fn check_fm_outgoing<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone
     let made = make(&expected).unwrap();
     factory_contract(&native, &made);
     assert_eq!(
-        made.body,
+        bytes(&made),
         fs::read(output.join(format!("{name}.bin"))).unwrap()
     );
     assert_eq!(decode(&made).unwrap(), expected);
@@ -794,12 +800,14 @@ fn configuration_contracts(input: &Path, output: &Path) {
         check(input, output, name, body.clone());
         for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
             let mut native = stage_two_envelope(input, name, "ChangeConfiguration", actor, None);
-            native
-                .headers
-                .iter_mut()
-                .find(|h| h.id == HIGH_PRIORITY)
-                .unwrap()
-                .value = fs::read(input.join("priority.bin")).unwrap();
+            edit_headers(&mut native, |values| {
+                values
+                    .iter_mut()
+                    .find(|h| h.id == HIGH_PRIORITY)
+                    .unwrap()
+                    .value = fs::read(input.join("priority.bin")).unwrap();
+            })
+            .unwrap();
             assert_eq!(
                 decode_change_configuration(&native).unwrap(),
                 (body.clone(), owner)
@@ -1011,12 +1019,14 @@ fn configuration_contracts(input: &Path, output: &Path) {
         check(input, output, name, body.clone());
         for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
             let mut native = stage_two_envelope(input, name, "DoReconfigurationReply", actor, None);
-            native
-                .headers
-                .iter_mut()
-                .find(|h| h.id == HIGH_PRIORITY)
-                .unwrap()
-                .value = fs::read(input.join("priority.bin")).unwrap();
+            edit_headers(&mut native, |values| {
+                values
+                    .iter_mut()
+                    .find(|h| h.id == HIGH_PRIORITY)
+                    .unwrap()
+                    .value = fs::read(input.join("priority.bin")).unwrap();
+            })
+            .unwrap();
             assert_eq!(
                 decode_do_reconfiguration_reply(&native).unwrap(),
                 (body.clone(), owner)
@@ -1101,12 +1111,14 @@ fn replica_contracts(input: &Path, output: &Path) {
         check(input, output, &name, body.clone());
         for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
             let mut native = stage_two_envelope(input, &name, "AddReplicaReply", actor, None);
-            native
-                .headers
-                .iter_mut()
-                .find(|h| h.id == HIGH_PRIORITY)
-                .unwrap()
-                .value = fs::read(input.join("priority.bin")).unwrap();
+            edit_headers(&mut native, |values| {
+                values
+                    .iter_mut()
+                    .find(|h| h.id == HIGH_PRIORITY)
+                    .unwrap()
+                    .value = fs::read(input.join("priority.bin")).unwrap();
+            })
+            .unwrap();
             assert_eq!(
                 decode_add_replica_reply(&native).unwrap(),
                 (body.clone(), owner)
@@ -1165,12 +1177,14 @@ fn replica_contracts(input: &Path, output: &Path) {
         check(input, output, &name, body.clone());
         for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
             let mut native = stage_two_envelope(input, &name, "RemoveReplicaReply", actor, None);
-            native
-                .headers
-                .iter_mut()
-                .find(|h| h.id == HIGH_PRIORITY)
-                .unwrap()
-                .value = fs::read(input.join("priority.bin")).unwrap();
+            edit_headers(&mut native, |values| {
+                values
+                    .iter_mut()
+                    .find(|h| h.id == HIGH_PRIORITY)
+                    .unwrap()
+                    .value = fs::read(input.join("priority.bin")).unwrap();
+            })
+            .unwrap();
             assert_eq!(
                 decode_remove_replica_reply(&native).unwrap(),
                 (body.clone(), owner)
@@ -1207,18 +1221,20 @@ fn check_peer<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
     name: &str,
     action: &str,
     expected: T,
-    make: fn(&T, &GenerationHeader) -> fube_transport::Result<Message>,
-    decode: fn(&Message) -> fube_transport::Result<(T, GenerationHeader)>,
+    make: fn(&T, &GenerationHeader) -> furpc::Result<Message>,
+    decode: fn(&Message) -> furpc::Result<(T, GenerationHeader)>,
 ) {
     check(input, output, name, expected.clone());
     for fmm in [false, true] {
         let mut native = stage_two_envelope(input, name, action, "actor-12", Some(fmm));
-        native
-            .headers
-            .iter_mut()
-            .find(|h| h.id == HIGH_PRIORITY)
-            .unwrap()
-            .value = fs::read(input.join("priority.bin")).unwrap();
+        edit_headers(&mut native, |values| {
+            values
+                .iter_mut()
+                .find(|h| h.id == HIGH_PRIORITY)
+                .unwrap()
+                .value = fs::read(input.join("priority.bin")).unwrap();
+        })
+        .unwrap();
         let generation = support::rich_generation(fmm);
         assert_eq!(
             decode(&native).unwrap(),
@@ -1226,9 +1242,12 @@ fn check_peer<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
         );
         let made = make(&expected, &generation).unwrap();
         factory_contract(&native, &made);
-        assert_eq!(made.body, to_vec(&expected).unwrap());
+        assert_eq!(bytes(&made), to_vec(&expected).unwrap());
         assert_eq!(decode(&made).unwrap(), (expected.clone(), generation));
-        native.headers.retain(|h| h.id != GENERATION_HEADER);
+        edit_headers(&mut native, |values| {
+            values.retain(|h| h.id != GENERATION_HEADER);
+        })
+        .unwrap();
         assert!(decode(&native).is_err());
     }
     reject_prefixes::<T>(input, name);
@@ -1248,57 +1267,76 @@ fn generation_envelope(
         if incoming { "actor-12" } else { "actor-11" },
         incoming.then_some(fmm),
     );
-    message.headers[2] = Header {
-        id: HIGH_PRIORITY,
-        value: fs::read(input.join("priority.bin")).unwrap(),
-    };
+    edit_headers(&mut message, |values| {
+        values[2] = Header {
+            id: HIGH_PRIORITY,
+            value: fs::read(input.join("priority.bin")).unwrap(),
+        };
+    })
+    .unwrap();
     message
 }
 
 fn reject_generation_envelopes(
     original: &Message,
     with_generation: bool,
-    decode: fn(&Message) -> fube_transport::Result<()>,
+    decode: fn(&Message) -> furpc::Result<()>,
 ) {
     for id in [ACTOR, ACTION, HIGH_PRIORITY]
         .into_iter()
         .chain(with_generation.then_some(GENERATION_HEADER))
     {
         let mut missing = original.clone();
-        missing.headers.retain(|h| h.id != id);
+        edit_headers(&mut missing, |values| {
+            values.retain(|h| h.id != id);
+        })
+        .unwrap();
         assert!(decode(&missing).is_err());
-        let header = original.headers.iter().find(|h| h.id == id).unwrap();
+        let header = headers(original).into_iter().find(|h| h.id == id).unwrap();
         let mut duplicate = original.clone();
-        duplicate.headers.push(header.clone());
+        edit_headers(&mut duplicate, |values| {
+            values.push(header.clone());
+        })
+        .unwrap();
         assert!(decode(&duplicate).is_err());
         let mut malformed = original.clone();
-        malformed
-            .headers
-            .iter_mut()
-            .find(|h| h.id == id)
-            .unwrap()
-            .value
-            .pop();
-        assert!(decode(&malformed).is_err());
+        let malformed_result = edit_headers(&mut malformed, |values| {
+            values.iter_mut().find(|h| h.id == id).unwrap().value.pop();
+        });
+        assert!(malformed_result.and_then(|_| decode(&malformed)).is_err());
     }
     let mut wrong = original.clone();
-    wrong.headers[0] = Header::actor(FMM_ACTOR).unwrap();
+    edit_headers(&mut wrong, |values| {
+        values[0] = Header::actor(FMM_ACTOR).unwrap();
+    })
+    .unwrap();
     assert!(decode(&wrong).is_err());
-    wrong.headers[0] = original.headers[0].clone();
-    wrong.headers[1] = Header::action("UnsupportedGenerationAction").unwrap();
+    edit_headers(&mut wrong, |values| {
+        values[0] = headers(original)[0].clone();
+    })
+    .unwrap();
+    edit_headers(&mut wrong, |values| {
+        values[1] = Header::action("UnsupportedGenerationAction").unwrap();
+    })
+    .unwrap();
     assert!(decode(&wrong).is_err());
     if !with_generation {
         let mut unexpected = original.clone();
-        unexpected
-            .headers
-            .push(GenerationHeader::default().header().unwrap());
+        edit_headers(&mut unexpected, |values| {
+            values.push(GenerationHeader::default().header().unwrap().into());
+        })
+        .unwrap();
         assert!(decode(&unexpected).is_err());
     }
     let mut trailing = original.clone();
-    trailing.body.push(0);
+    edit_body(&mut trailing, |value| {
+        value.push(0);
+    });
     assert!(decode(&trailing).is_err());
     let mut shape = original.clone();
-    shape.body = to_vec(&GenerationHeader::default()).unwrap();
+    edit_body(&mut shape, |value| {
+        *value = to_vec(&GenerationHeader::default()).unwrap();
+    });
     assert!(decode(&shape).is_err());
 }
 
@@ -1317,11 +1355,13 @@ fn generation_handshake(input: &Path, output: &Path) {
         assert_eq!(decode_generation_proposal(&native).unwrap(), expected);
         let made = generation_proposal_message(&expected).unwrap();
         factory_contract(&native, &made);
-        assert_eq!(made.body, empty);
+        assert_eq!(bytes(&made), empty);
         assert_eq!(decode_generation_proposal(&made).unwrap(), expected);
         reject_generation_envelopes(&native, true, |m| decode_generation_proposal(m).map(|_| ()));
         let mut bad = native.clone();
-        bad.body = to_vec(&GenerationNumber::default()).unwrap();
+        edit_body(&mut bad, |value| {
+            *value = to_vec(&GenerationNumber::default()).unwrap();
+        });
         assert!(decode_generation_proposal(&bad).is_err());
     }
     fs::write(output.join("empty-generation-proposal.bin"), []).unwrap();
@@ -1361,7 +1401,7 @@ fn generation_handshake(input: &Path, output: &Path) {
         let made = generation_proposal_reply_message(&body).unwrap();
         factory_contract(&native, &made);
         assert_eq!(
-            made.body,
+            bytes(&made),
             fs::read(output.join(format!("{name}.bin"))).unwrap()
         );
         assert_eq!(decode_generation_proposal_reply(&made).unwrap(), body);
@@ -1396,7 +1436,7 @@ fn generation_handshake(input: &Path, output: &Path) {
         let made = generation_update_message(&body, &generation).unwrap();
         factory_contract(&native, &made);
         assert_eq!(
-            made.body,
+            bytes(&made),
             fs::read(output.join(format!("{name}.bin"))).unwrap()
         );
         assert_eq!(
@@ -1406,7 +1446,9 @@ fn generation_handshake(input: &Path, output: &Path) {
         reject_generation_envelopes(&native, true, |m| decode_generation_update(m).map(|_| ()));
         let mut fmm = generation_envelope(input, name, "GenerationUpdate", true, true);
         assert!(decode_generation_update(&fmm).is_err());
-        fmm.body.clear();
+        edit_body(&mut fmm, |value| {
+            value.clear();
+        });
         assert!(decode_generation_update(&fmm).is_err());
         assert!(generation_update_message(&body, &support::rich_generation(true)).is_err());
         reject_prefixes::<GenerationUpdate>(input, name);
@@ -1425,7 +1467,7 @@ fn generation_handshake(input: &Path, output: &Path) {
         let made = generation_update_reject_message(&body).unwrap();
         factory_contract(&native, &made);
         assert_eq!(
-            made.body,
+            bytes(&made),
             fs::read(output.join(format!("{name}.bin"))).unwrap()
         );
         assert_eq!(decode_generation_update_reject(&made).unwrap(), body);
@@ -1467,14 +1509,19 @@ fn lfum_contracts(input: &Path, output: &Path) {
     assert_eq!(decode_lfum_upload_reply(&native).unwrap(), generation);
     let made = lfum_upload_reply_message(&generation).unwrap();
     factory_contract(&native, &made);
-    assert!(made.body.is_empty());
+    assert!(bytes(&made).is_empty());
     reject_generation_envelopes(&native, true, |message| {
         decode_lfum_upload_reply(message).map(|_| ())
     });
     let mut fmm = native;
-    fmm.headers.retain(|header| header.id != GENERATION_HEADER);
-    fmm.headers
-        .push(support::rich_generation(true).header().unwrap());
+    edit_headers(&mut fmm, |values| {
+        values.retain(|header| header.id != GENERATION_HEADER);
+    })
+    .unwrap();
+    edit_headers(&mut fmm, |values| {
+        values.push(support::rich_generation(true).header().unwrap().into());
+    })
+    .unwrap();
     assert!(decode_lfum_upload_reply(&fmm).is_err());
     fs::write(output.join("empty-lfum-upload-reply.bin"), []).unwrap();
 }
@@ -1527,8 +1574,8 @@ fn main() {
         ("default-primary", AddPrimary::default()),
         ("rich-primary", primary),
     ] {
-        let native = Message {
-            headers: [
+        let native = native(
+            [
                 (ACTOR, "actor-12"),
                 (ACTION, "action-AddPrimary"),
                 (HIGH_PRIORITY, "priority"),
@@ -1540,8 +1587,9 @@ fn main() {
                 value: fs::read(input.join(format!("{name}.bin"))).unwrap(),
             })
             .collect(),
-            body: fs::read(input.join(format!("{name}.bin"))).unwrap(),
-        };
+            fs::read(input.join(format!("{name}.bin"))).unwrap(),
+        )
+        .unwrap();
         let generation = support::rich_generation(false);
         assert_eq!(
             decode_add_primary(&native).unwrap(),
@@ -1556,8 +1604,8 @@ fn main() {
         ("rich-primary-reply", primary_reply),
     ] {
         for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
-            let native = Message {
-                headers: [
+            let native = native(
+                [
                     (ACTOR, actor),
                     (ACTION, "action-AddPrimaryReply"),
                     (HIGH_PRIORITY, "priority"),
@@ -1568,8 +1616,9 @@ fn main() {
                     value: fs::read(input.join(format!("{name}.bin"))).unwrap(),
                 })
                 .collect(),
-                body: fs::read(input.join(format!("{name}.bin"))).unwrap(),
-            };
+                fs::read(input.join(format!("{name}.bin"))).unwrap(),
+            )
+            .unwrap();
             assert_eq!(
                 decode_add_primary_reply(&native).unwrap(),
                 (body.clone(), owner)
@@ -1647,8 +1696,8 @@ fn main() {
     ] {
         check(input, output, name, body.clone());
         for from_fmm in [false, true] {
-            let native = Message {
-                headers: [
+            let native = native(
+                [
                     (ACTOR, "actor-12"),
                     (ACTION, "action-DeleteReplica"),
                     (HIGH_PRIORITY, "priority"),
@@ -1667,8 +1716,9 @@ fn main() {
                     value: fs::read(input.join(format!("{name}.bin"))).unwrap(),
                 })
                 .collect(),
-                body: fs::read(input.join(format!("{name}.bin"))).unwrap(),
-            };
+                fs::read(input.join(format!("{name}.bin"))).unwrap(),
+            )
+            .unwrap();
             let generation = support::rich_generation(from_fmm);
             assert_eq!(
                 decode_delete_replica(&native).unwrap(),
@@ -1698,8 +1748,8 @@ fn main() {
     ] {
         check(input, output, name, body.clone());
         for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
-            let native = Message {
-                headers: [
+            let native = native(
+                [
                     (ACTOR, actor),
                     (ACTION, "action-DeleteReplicaReply"),
                     (HIGH_PRIORITY, "priority"),
@@ -1710,8 +1760,9 @@ fn main() {
                     value: fs::read(input.join(format!("{name}.bin"))).unwrap(),
                 })
                 .collect(),
-                body: fs::read(input.join(format!("{name}.bin"))).unwrap(),
-            };
+                fs::read(input.join(format!("{name}.bin"))).unwrap(),
+            )
+            .unwrap();
             assert_eq!(
                 decode_delete_replica_reply(&native).unwrap(),
                 (body.clone(), owner)

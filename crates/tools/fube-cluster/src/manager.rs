@@ -187,15 +187,7 @@ impl Manager {
         self.validate_metadata(index, &metadata, false)?;
         self.children[index].metadata = Some(metadata.clone());
         let end = Instant::now() + Duration::from_secs(30);
-        let channel = fube_transport::Endpoint::unsecured_tcp(
-            metadata.address,
-            wire::composition(true).map_err(err)?,
-        )
-        .map_err(err)?
-        .channel_limits(wire::limits())
-        .connect_until(end)
-        .await
-        .map_err(err)?;
+        let channel = wire::connect(metadata.address, wire::Role::Fm, end).await?;
         self.children[index].link = Some(Link::new(
             channel,
             launch.fm.clone(),
@@ -281,16 +273,14 @@ impl Manager {
     pub(crate) async fn receive_message(
         &mut self,
         index: usize,
-        mut incoming: fube_transport::channel::IncomingMessage<
-            fube_transport::native_channel::GatewayTarget,
-        >,
+        mut incoming: wire::Incoming,
     ) -> Result<()> {
         let link = self.children[index]
             .link
             .as_ref()
             .ok_or("original node link absent")?;
         wire::predecode(&incoming.message)?;
-        let action = incoming.message.properties().map_err(err)?.action;
+        let action = wire::action(&incoming.message)?;
         let generation = self.children[index].generation();
         match action.as_str() {
             "LFUMUpload" => {
@@ -442,16 +432,10 @@ impl Manager {
                     return Err("FMM report unsupported".into());
                 }
                 if self.ledger.generation_pending() {
-                    if let Some(handoff) = incoming.handoff.as_mut() {
-                        handoff.acknowledge();
-                    }
                     return Ok(()); // Rebuild cannot acknowledge inventory without LFUM support.
                 }
                 let response = self.ledger.report(index, &body)?;
                 let Some(response) = response else {
-                    if let Some(handoff) = incoming.handoff.as_mut() {
-                        handoff.acknowledge();
-                    }
                     return Ok(()); // Known retired lifetime: no semantic ACK or link loss.
                 };
                 if !body.replicas.0.is_empty()
@@ -528,9 +512,6 @@ impl Manager {
             }
             _ => return Err("unsupported native ingress; no successful ACK".into()),
         }
-        if let Some(handoff) = incoming.handoff.as_mut() {
-            handoff.acknowledge();
-        }
         Ok(())
     }
     pub async fn drive(&mut self) {
@@ -578,7 +559,7 @@ impl Manager {
             if let Err(error) = result {
                 self.ledger.lost(index, error);
                 if let Some(link) = &self.children[index].link {
-                    link.channel.dispose();
+                    link.retire();
                 }
             }
         }

@@ -95,8 +95,8 @@ pub fn create_replica_reply_message(
 pub fn decode_create_replica(message: &Message) -> Result<(CreateReplica, GenerationHeader)> {
     check_factory(message, "CreateReplica", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }
 
@@ -105,7 +105,7 @@ pub fn decode_create_replica_reply(
 ) -> Result<(CreateReplicaReply, GenerationHeader)> {
     check_factory(message, "CreateReplicaReply", &[RA_ACTOR])?;
     Ok((
-        from_slice(&message.body)?,
-        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+        decode_body(message)?,
+        from_slice(unique(message, HeaderId::new(GENERATION_HEADER)?)?.value())?,
     ))
 }

@@ -349,8 +349,8 @@ dependencies = [
  "fube-node",
  "fube-ra",
  "fube-ra-store",
- "fube-transport",
  "fubst",
+ "furpc",
  "libc",
  "serde",
  "serde_json",
@@ -419,11 +419,12 @@ dependencies = [
  "fube-hosting",
  "fube-ra",
  "fube-ra-store",
- "fube-transport",
+ "fube-rap-test-support",
  "fubst",
  "furpc",
  "serde",
  "tokio",
+ "tower-service",
  "uuid",
 ]
 
@@ -437,8 +438,8 @@ dependencies = [
  "fube-node",
  "fube-ra",
  "fube-ra-store",
- "fube-transport",
  "fubst",
+ "furpc",
  "serde",
  "serde_json",
  "tokio",
@@ -451,8 +452,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fube-ra-store",
- "fube-transport",
  "fubst",
+ "furpc",
  "serde",
  "tokio",
 ]

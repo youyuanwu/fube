@@ -339,10 +339,10 @@ For healthy whole-deployment teardown:
 2. Send SIGTERM or SIGINT to each original runner through the process supervisor.
    Signals may arrive independently. The runner drives ordinary native Close
    (or continues an already accepted close/deletion), application/group reaping, Hosting-root
-   cleanup, RA/executor/store close and original Channel disposal/join.
+   cleanup, RA/executor/store close and original control-session task/socket join.
 3. Observe process exit and final status. Exit code zero requires clean local
    shutdown with no startup, protocol/authority or cleanup failure. Original
-   Channel loss is retained separately in `control_unknown` and
+   Session loss is retained separately in `control_unknown` and
    `cleanup.control_error`; it does not prevent explicit local shutdown from
    succeeding. Other failures still produce a failure exit even when physical
    resources were subsequently cleaned.
@@ -353,6 +353,15 @@ shutdown does not clear prior control uncertainty. `cleanup.pending_work` report
 obligations separately. Neither a transport write, `DeleteReplicaReply` nor a
 termination signal is by itself proof of complete physical cleanup. An outer
 forced kill is not graceful provider disposal.
+
+Control now composes public furpc Endpoint/Server, original-generation Peer and
+runner-owned correlated replies through the Node adapter. Its bounded inbox
+replaces the legacy reader-level handoff; generic furpc rejection may discard,
+while invalid admitted domain envelopes or inbox overflow retire the session.
+Reply handoff is not a write receipt or a semantic ACK. Completed local close
+awaits actual owned driver/socket release; committed output may race retirement
+or be truncated. No reconnect, new native authentication or native FM/Federation
+interoperability is added.
 
 The run directory and final status are retained. Before a fresh deployment,
 independently verify that all old Nodes/applications stopped and choose fresh

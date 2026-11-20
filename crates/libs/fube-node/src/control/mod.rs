@@ -2,7 +2,7 @@
 //!
 //! Transport writes, applied RA commands, semantic ACKs and physical cleanup
 //! remain separate. Shared ingress owns capability admission and dispatch;
-//! compositions retain original Channels and process ownership. The adapter
+//! compositions retain original furpc sessions and process ownership. The adapter
 //! retains bounded sends, timers and ACK observations.
 
 pub mod ingress;
@@ -53,8 +53,7 @@ pub enum SemanticAck {
     Notification(ServiceTypeNotification),
     Report(ReplicaUp),
 }
-type UploadRequest =
-    Pin<Box<dyn Future<Output = Result<Option<fube_transport::message::Message>>> + Send>>;
+type UploadRequest = Pin<Box<dyn Future<Output = Result<Option<furpc::Message>>> + Send>>;
 
 struct LfumRequest {
     upload: u64,
@@ -88,7 +87,7 @@ impl LfumUploadState {
     }
 
     /// Poll original requests independently, or wait while none is in flight.
-    pub async fn receive(&mut self) -> (u64, Result<Option<fube_transport::message::Message>>) {
+    pub async fn receive(&mut self) -> (u64, Result<Option<furpc::Message>>) {
         std::future::poll_fn(|context| {
             for upload in &mut self.uploads {
                 if let Some(request) = &mut upload.request {
@@ -106,7 +105,7 @@ impl LfumUploadState {
         &mut self,
         node: &Node,
         source: &NodeInstance,
-        completed: (u64, Result<Option<fube_transport::message::Message>>),
+        completed: (u64, Result<Option<furpc::Message>>),
         now: Instant,
     ) -> Result<()> {
         let (upload, reply) = completed;
@@ -334,12 +333,8 @@ impl Adapter {
         self.peer_replies.pop_front()
     }
 
-    pub fn reject_deprecated(
-        &mut self,
-        node: &Node,
-        message: &fube_transport::message::Message,
-    ) -> Result<bool> {
-        if message.properties().map_err(err)?.action != "ChangeConfigurationReply" {
+    pub fn reject_deprecated(&mut self, node: &Node, message: &furpc::Message) -> Result<bool> {
+        if wire::action(message)? != "ChangeConfigurationReply" {
             return Ok(false);
         }
         wire::predecode(message)?;
@@ -675,7 +670,7 @@ impl Adapter {
                 }
                 Err(error) => {
                     self.peer_error = Some(error);
-                    link.channel.dispose();
+                    link.retire();
                 }
             }
         }

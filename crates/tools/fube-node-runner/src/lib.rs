@@ -19,7 +19,6 @@ use fube_node::{
 };
 use fube_ra::{entity as ra, protocol::*};
 use fube_ra_store::{MemoryBackend, Settings, Store};
-use fube_transport::{channel::IncomingMessage, native_channel::GatewayTarget, Endpoint};
 use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
@@ -34,7 +33,7 @@ use std::{
 use tokio::{net::TcpListener, time::Instant};
 
 pub type Result<T> = std::result::Result<T, String>;
-type Incoming = IncomingMessage<GatewayTarget>;
+type Incoming = wire::Incoming;
 
 pub(crate) fn err(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
@@ -158,7 +157,7 @@ impl Owner {
     }
 
     fn live(link: &Link) -> bool {
-        link.channel.target().is_ok()
+        link.is_live()
     }
 
     fn control_error(&self) -> Option<&str> {
@@ -168,19 +167,11 @@ impl Owner {
     }
 
     fn observe_channels(&mut self, stopping: bool) -> Result<()> {
-        if let Some(error) = self
-            .fm
-            .as_ref()
-            .and_then(|link| link.channel.terminal_error())
-        {
+        if let Some(error) = self.fm.as_ref().and_then(|link| link.terminal_error()) {
             channel_loss(&mut self.fm_loss, "FM", error, stopping)?;
         }
         for peer in &mut self.peers {
-            if let Some(error) = peer
-                .link
-                .as_ref()
-                .and_then(|link| link.channel.terminal_error())
-            {
+            if let Some(error) = peer.link.as_ref().and_then(|link| link.terminal_error()) {
                 channel_loss(
                     &mut peer.loss,
                     &format!("peer {}", peer.placement.identity.id),
@@ -273,19 +264,26 @@ impl Owner {
     }
 
     async fn connect(&self, target: SocketAddr, peer: bool, deadline: Instant) -> Result<Link> {
-        let composition = if peer {
-            wire::peer_composition()
-        } else {
-            wire::composition(false)
-        }
-        .map_err(err)?;
-        let endpoint = Endpoint::unsecured_tcp(target, composition)
-            .map_err(err)?
-            .local_ip((*self.config.node.address.ip()).into())
-            .channel_limits(wire::limits());
         loop {
-            match endpoint.connect_until(deadline).await {
-                Ok(channel) => {
+            let socket = tokio::net::TcpSocket::new_v4().map_err(err)?;
+            socket
+                .bind(SocketAddr::new((*self.config.node.address.ip()).into(), 0))
+                .map_err(err)?;
+            match tokio::time::timeout_at(deadline, socket.connect(target))
+                .await
+                .map_err(err)?
+            {
+                Ok(stream) => {
+                    let channel = wire::initiate(
+                        stream,
+                        if peer {
+                            wire::Role::Peer
+                        } else {
+                            wire::Role::Node
+                        },
+                        deadline,
+                    )
+                    .await?;
                     let remote = if peer {
                         self.peers
                             .iter()
@@ -304,7 +302,7 @@ impl Owner {
                         self.config.generation()?,
                     );
                 }
-                Err(fube_transport::Error::Io(error)) if Instant::now() < deadline => {
+                Err(error) if Instant::now() < deadline => {
                     if deadline.saturating_duration_since(Instant::now())
                         <= Duration::from_millis(20)
                     {
@@ -376,10 +374,9 @@ impl Owner {
                 drop(stream);
                 continue;
             };
-            let channel = fube_transport::accept_unsecured_tcp(
+            let channel = wire::accept(
                 stream,
-                wire::peer_composition().map_err(err)?,
-                wire::limits(),
+                wire::Role::Peer,
                 deadline.min(Instant::now() + Duration::from_secs(3)),
             )
             .await
@@ -421,7 +418,7 @@ impl Owner {
         };
         link.send(replica_up_message(&upload, fube_ra::protocol::Owner::Fm).map_err(err)?)
             .await?;
-        let mut incoming = link
+        let incoming = link
             .receive(deadline)
             .await?
             .ok_or("final inventory reply timeout")?;
@@ -429,9 +426,6 @@ impl Owner {
         let (body, generation) = decode_replica_up_reply(&incoming.message).map_err(err)?;
         if body != upload || generation != self.config.generation()? {
             return Err("fresh bootstrap requires the matching final empty inventory reply".into());
-        }
-        if let Some(handoff) = incoming.handoff.as_mut() {
-            handoff.acknowledge();
         }
         self.store = Some(Arc::new(
             Store::new(Box::new(MemoryBackend::new()), Settings::default())
@@ -573,7 +567,7 @@ impl Owner {
                     Err(wire::ReceiveError::Invalid(error)) => return Err(error),
                 }
             }
-            if let Some(mut incoming) = peer.incoming.take() {
+            if let Some(incoming) = peer.incoming.take() {
                 match self.ingress.peer(
                     node,
                     &peer.placement.identity.native()?,
@@ -582,9 +576,6 @@ impl Owner {
                 )? {
                     Some(id) => {
                         self.adapter.track_peer_command(id)?;
-                        if let Some(handoff) = incoming.handoff.as_mut() {
-                            handoff.acknowledge();
-                        }
                     }
                     None => peer.incoming = Some(incoming),
                 }
@@ -614,19 +605,12 @@ impl Owner {
                     {
                         match admission {
                             Admission::Retained => self.fm_incoming = Some(incoming),
-                            Admission::Submitted(_) => {
-                                if let Some(handoff) = incoming.handoff.as_mut() {
-                                    handoff.acknowledge();
-                                }
-                            }
+                            Admission::Submitted(_) => {}
                         }
                         return Ok(());
                     }
                 }
                 if self.adapter.reject_deprecated(node, &incoming.message)? {
-                    if let Some(handoff) = incoming.handoff.as_mut() {
-                        handoff.acknowledge();
-                    }
                     return Ok(());
                 }
                 match self.ingress.fm(node, &incoming.message, stopping)? {
@@ -634,9 +618,6 @@ impl Owner {
                     Admission::Submitted(acknowledgement) => {
                         if let Some(acknowledgement) = acknowledgement {
                             self.adapter.track_acknowledgement(acknowledgement)?;
-                        }
-                        if let Some(handoff) = incoming.handoff.as_mut() {
-                            handoff.acknowledge();
                         }
                     }
                 }
@@ -754,8 +735,8 @@ impl Owner {
             .iter()
             .chain(self.peers.iter().filter_map(|peer| peer.link.as_ref()))
         {
-            link.channel.dispose();
-            if let Err(error) = link.channel.closed(deadline).await {
+            link.retire();
+            if let Err(error) = link.closed(deadline).await {
                 channels_closed = false;
                 self.adapter.record_error(format!(
                     "original control Channel cleanup failed: {error:?}"
@@ -787,12 +768,13 @@ impl Owner {
 fn channel_loss(
     retained: &mut Option<String>,
     name: &str,
-    error: fube_transport::Error,
+    error: wire::Failure,
     stopping: bool,
 ) -> Result<()> {
     if !matches!(
         error,
-        fube_transport::Error::Io(_) | fube_transport::Error::Closed
+        wire::Failure::Io(_)
+            | wire::Failure::Native(furpc::Error::Transport { .. } | furpc::Error::Closed)
     ) {
         return Err(format!("original {name} Channel failed: {error:?}"));
     }
