@@ -44,7 +44,7 @@ struct Boolean {
     value: bool,
 }
 
-pub(super) fn hello(
+pub(crate) fn hello(
     local: LocalInstance,
     role: Role,
     config: &ConnectionConfig,

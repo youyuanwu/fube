@@ -15,6 +15,20 @@ verifies ListenInstance before opening application submission/delivery, accepts
 verified ListenInstance updates, and keeps transmit/receive wire contexts
 separate. Clear transport does not authenticate the advertised address.
 
+Endpoint and ServerBuilder now support native-style listen_address/instance
+configuration through that same establishment engine, without exposing
+ListenInstance or allowing live instance mutation. Explicit listener addresses
+use native default instance zero; omitted settings preserve the existing
+initiating empty/zero and accepted adapter-derived address/instance behavior.
+Empty explicit addresses, instance-without-listener and configured hello-frame
+overflow fail before connector readiness or acceptance. The advertisement
+never changes the remote URI, actual IoInfo, nonce generation or Peer authority.
+Offline public API cases cover both correlation modes, full native u64 instances,
+strings beyond the legacy codec limits, fresh accepted/zero initiating nonces,
+actual wildcard-listener TCP metadata, Endpoint clone/reconnect snapshots and
+original-generation retirement. This is listener API evidence, not native
+replication qualification; the fube-data migration remains proposed below.
+
 The driver owns cooperative preparation, scalar/vectored partial output,
 queued serialized-frame bytes, precommit cancellation/deadlines, local-write
 receipts, partial-frame/discard/committed-write watchdogs, and drain/abort.
@@ -418,6 +432,118 @@ the fube-client migration above additionally qualifies native gateway-to-client
 notification receiving/ACKs on SF11.8.121.4, including actual ACK loss/retry.
 Native notification origination and accepted-side native interoperability remain
 unqualified. TLS remains unimplemented.
+
+## Proposed data replication migration
+
+**Consumer design only; migration and native qualification not run.** The next separate
+consumer slice replaces `fube-data`'s normal/dev legacy transport use, including
+its native payload/header codecs and directly coupled fixtures. Runtime/RAP
+and transactional callers keep their SF-style public replication boundary;
+RA/node control traffic and global legacy-crate retirement are not included.
+
+The selected approach is **redesign on furpc**, not preservation of every
+legacy raw-session guarantee. Its furpc prerequisite is the now-implemented
+[native-style listen_address/instance settings](Connections.md#native-style-listener-configuration)
+on Endpoint and ServerBuilder, without a public ListenInstance value.
+Other requirements compose existing public
+Endpoint/Channel, Server/Accept, raw IngressService, Request context, Peer,
+Operation/Attempt and native header/message APIs. Do not export the private
+frame codec, add another socket reader, or retain a compatibility backend.
+
+### Ownership and data path
+
+The replication adapter retains its dedicated, joined network thread, actual
+listener, bounded outgoing/incoming control and data queues, route table,
+and combined initiating/accepted connection cap including handshakes. A bound
+listener supplies one validated transport listen address/instance for those
+settings on both roles; actual socket diagnostics remain independent.
+The current equal listen/publish-address profile remains a domain restriction,
+not a universal native rule. Different-address native producers require a
+separate explicit publication/membership mapping and qualification.
+
+Initiating connections retain an owning Channel and its original Peer.
+Accepted connections use an owned serving future and an explicitly restricted
+peer-ready hook. A per-socket finite Accept source permits the domain supervisor
+to retire just that connection. Both roles install the same raw one-way ingress
+service before application traffic. Raw-only mode preserves caller-owned
+one-way MessageIds; no synthetic Actor header or Actor-0 binding is introduced.
+
+Header checks validate the clear replication envelope and native ReplicationFrom/
+ReplicationActor schemas using public Headers and the original Source.
+Furpc retains control classification, integrity and body verification. The
+byte-facing service then decodes the native replication packet, validates
+the remote listener/source identity and operation bounds, and tries the
+appropriate bounded domain handoff. It returns NoReply promptly, without
+waiting for provider application, copy completion or quorum. Malformed domain
+input and terminal control-handoff failures notify the supervisor to retire
+that exact session; data-capacity drops are diagnosed without admitting or
+acknowledging the rejected operation.
+
+Each private engine ingress item carries the packet, its domain byte lease,
+and its restricted original-generation Peer/session grant together. Consumer
+transfer releases the adapter lease; engine retention keeps its existing
+independent charge. Fully delivered input keeps its historical source identity
+after EOF, but cannot write through a retired target. Membership registration,
+same-address duplicates, route relearning and reconnection cannot recreate or
+retarget this grant. Ordinary authoritative membership sends may select a
+current route; immediate and delayed secondary ACKs must use their original
+source Peer.
+
+ACK/retry, provider/application acknowledgment, copy/copy-context streams,
+operation queues, epochs, configuration/quorum and replica removal remain
+fube-data policy. Successful queue admission or local writing never fabricates
+a semantic ACK or advances replication completion.
+
+### Approved contract changes
+
+| Area | Proposed migration contract |
+| --- | --- |
+| Body admission | Furpc's private frame/header/binding/HandlerLimits gates still precede body retention. Fube-data's control/data byte and queue accounting occurs after verified delivery, before domain handoff, not inside that private gate. |
+| Resource isolation | Existing global control/data queue/byte allowances remain independent domain policies, including retained ingress and outgoing captures. They do not account for furpc's body backing or in-flight handlers and do not imply a total heap bound. ACK/RequestAck is ordinary native traffic, not privileged transport control. |
+| Scheduling | Select ready control before queued data in the domain dispatcher. Do not promise priority over data already admitted to furpc, preemption of a started frame, or independence from a large earlier frame on the same TCP stream. |
+| Rejection | Furpc may diagnose and discard unbound, wrong-kind or header-policy/capacity-rejected ingress without closing. Input actually reaching the domain still follows its strict sender/schema/control-capacity retirement policy. No rejected data receives a new ACK. |
+| Send authority/cancellation | Keep one admission-started absolute deadline through route selection, connect, Peer acquisition and send. Use original Peer and Operation/Attempt cancellation; do not recreate custom first-positive-write predicates. Admitted or committed output can race domain retirement and have an unknown remote outcome. |
+| Shutdown | Stop new domain work, cancel owned operations and retire Channels/serving futures. A started suffix may be cut short by cancellation/connection retirement; the legacy guarantee of flushing every started frame before joined shutdown is removed. |
+| Physical retirement | The domain still owns and joins its network thread/tasks and observes release of its actual I/O adapters before publishing completed shutdown. Channel drop alone, a furpc error, or an Attempt disposition is not join evidence. No new public furpc join/closure observer is proposed. |
+| Write evidence | Furpc WriteReceipt proves complete local socket acceptance, not an explicit flush, remote parse or ACK. Qualification receipts must use that classification. Exact frame-byte evidence, when required, must come from an independent observer of actual bytes, not a reconstructed frame labeled as written. |
+
+Domain sends retain their existing finite queue captures/permits until local
+completion or disposal. A consumer-owned cancellation signal can retract
+uncommitted furpc work; committed work is not a rollback. Retiring a route
+must preserve another authoritative actor's shared socket and already-owned
+captures under the existing bounded policy. Old session teardown must not
+remove a newer route or admit a late send task.
+
+### Delivery and qualification
+
+The advertised-listener API is implemented using the same internal hello
+engine on both roles, with the offline coverage recorded above. Its delivery
+does not claim native execution or change fube-data's existing transport.
+
+Then replace replication framing/session composition and migrate Packet codecs
+to public furpc headers/messages while retaining the exact native schemas,
+segmentation and domain limits. Remove direct legacy normal/dev dependency
+edges only after their production and fixture uses are gone. Keep independent
+native-source schema/adversarial socket fixtures; do not expose private furpc
+internals or use a managed Rust peer as native interoperability evidence.
+
+Focused consumer cases must retain duplex accepted reuse, exact source/actor
+validation, duplicate listener affinity and delayed application ACKs,
+independent control/data saturation, operation metadata accounting, shared
+address route removal, combined connection limits, fragmented/expired
+handshakes/frames, and terminal joined socket/task disposal under backpressure.
+Tests asserting retired pre-body admission, universal rejection closure,
+explicit flush evidence or guaranteed started-suffix completion must change
+with the documented contract, not weaken semantic ACK/queue/affinity checks.
+Exercise real replication copy/apply/quorum and coupled runtime/txn consumers
+through their existing supported boundaries.
+
+Fresh native replication qualification is required before claiming migrated
+native support. Historical V1 receipts and the Hosting bootstrap/registration
+qualification do not qualify this slice. New native work must use a fresh
+exact-source bundle and actual independent observations, preserve owned
+workload cleanup and retained infrastructure, and keep native stateful/
+deployed/reporting and TLS/claims gaps explicit.
 
 ## Gap ownership and implementation order
 

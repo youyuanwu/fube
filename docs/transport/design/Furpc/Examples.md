@@ -105,11 +105,16 @@ let ingress = IngressService::new(
             .with_send_policy(ack_policy),
     )?],
 )?;
+// The domain has already bound and validated this listener.
 let endpoint = Endpoint::from_shared(destination)?
     .connection_options(ConnectionOptions::raw_only())
+    .listen_address(transport_listener.clone())?
+    .instance(listener_instance)
     .handler_limits(HandlerLimits::default())
     .service(ingress.clone())?;
 let server = Server::builder()
+    .listen_address(transport_listener)?
+    .instance(listener_instance)
     .service(ingress)?
     .build()?;
 ```
@@ -119,6 +124,11 @@ concurrently as the topology requires; pass ConnectionOptions::raw_only() to
 serve. Both owners invoke the same service contract directly,
 but have independent runners and HandlerLimits under their shared native budget.
 The application's service clones may intentionally share domain state.
+The listen_address/instance builder methods configure
+[local native hello fields](Connections.md#native-style-listener-configuration).
+Do not substitute fake IoInfo socket addresses to obtain that behavior.
+Native replication's published REFrom endpoint is separate domain policy;
+equal listen/publish addresses are a supported profile choice, not a furpc rule.
 
 For classic replication, `check` validates native ReplicationActor/
 ReplicationFrom headers before body retention. `replication_service` receives

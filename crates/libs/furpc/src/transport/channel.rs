@@ -19,8 +19,8 @@ use tower_service::Service;
 
 use super::{
     io::{tcp_destination, validate_uri},
-    session, validate_timeout, BoxFuture, Connected, ConnectionOptions, TcpConnector, TransportIo,
-    TransportLimits,
+    session, validate_timeout, BoxFuture, Connected, ConnectionOptions, ListenerConfig,
+    TcpConnector, TransportIo, TransportLimits,
 };
 use crate::{
     connection::Role,
@@ -38,6 +38,7 @@ pub struct Endpoint {
     handler_limits: HandlerLimits,
     connect_timeout: Duration,
     options: ConnectionOptions,
+    listener: ListenerConfig,
     service: Option<Arc<StoredService>>,
 }
 impl TryFrom<Uri> for Endpoint {
@@ -50,6 +51,7 @@ impl TryFrom<Uri> for Endpoint {
             handler_limits: HandlerLimits::default(),
             connect_timeout: Duration::from_secs(30),
             options: ConnectionOptions::managed(),
+            listener: ListenerConfig::default(),
             service: None,
         })
     }
@@ -97,6 +99,17 @@ impl Endpoint {
         self.options = options;
         self
     }
+    /// Advertise a consumer-owned listener without changing the destination or I/O metadata.
+    pub fn listen_address(mut self, address: impl Into<String>) -> Result<Self> {
+        self.listener = self.listener.listen_address(address.into())?;
+        Ok(self)
+    }
+    /// Select the local listener instance; requires listen_address before connect.
+    /// This configures new connections, not a live connection reset.
+    pub fn instance(mut self, instance: u64) -> Self {
+        self.listener = self.listener.instance(instance);
+        self
+    }
     pub fn service<S>(mut self, service: IngressService<S>) -> Result<Self>
     where
         S: Service<Request<Body>, Response = IngressResponse> + Clone + Send + 'static,
@@ -128,6 +141,7 @@ impl Endpoint {
         self.limits.validate()?;
         self.handler_limits.validate()?;
         validate_timeout(self.connect_timeout)?;
+        self.listener.validate(Role::Initiating, &self.limits)?;
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|error| Error::transport("runtime", error))?;
         let attempt = Arc::new(Establishment::new());
@@ -470,6 +484,7 @@ async fn supervise<C, I>(
                 connected.io,
                 connected.info,
                 Role::Initiating,
+                &endpoint.listener,
                 logical.registry.clone(),
                 &endpoint.limits,
                 Duration::from_secs(30),

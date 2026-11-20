@@ -30,7 +30,7 @@ use crate::{
 pub(crate) mod driver;
 mod native;
 
-pub(crate) use native::{ListenInstance, LocalInstance, Role};
+pub(crate) use native::{hello, ListenInstance, LocalInstance, Role};
 
 pub(crate) type ConnectionResult<T> = Result<T, Arc<ConnectionError>>;
 

@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use crate::{
-    connection::{ConnectionConfig, Ingress},
+    connection::{hello, ConnectionConfig, Ingress, LocalInstance, Role},
     wire::{frame::FrameWireContext, headers::HeaderDecodeContext},
     Error, Result,
 };
@@ -35,6 +35,67 @@ impl ConnectionOptions {
 
     pub(crate) fn is_managed(&self) -> bool {
         !self.raw_only
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ListenerConfig {
+    address: Option<String>,
+    instance: Option<u64>,
+}
+
+impl ListenerConfig {
+    fn listen_address(mut self, address: String) -> Result<Self> {
+        if address.is_empty() {
+            return Err(Error::InvalidInput("local listen address is empty"));
+        }
+        self.address = Some(address);
+        self.validate(Role::Accepted, &TransportLimits::default())?;
+        Ok(self)
+    }
+
+    fn instance(mut self, instance: u64) -> Self {
+        self.instance = Some(instance);
+        self
+    }
+
+    fn validate(&self, role: Role, limits: &TransportLimits) -> Result<()> {
+        if self.address.is_none() {
+            return if self.instance.is_some() {
+                Err(Error::InvalidInput(
+                    "instance requires a local listen address",
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        hello(
+            self.local(role, &IoInfo::unknown()),
+            role,
+            &limits.connection(Duration::from_secs(30)),
+        )
+        .map(|_| ())
+        .map_err(Error::from)
+    }
+
+    fn local(&self, role: Role, info: &IoInfo) -> LocalInstance {
+        if let Some(address) = &self.address {
+            return LocalInstance {
+                address: address.clone(),
+                instance: self.instance.unwrap_or(0),
+            };
+        }
+        let address = match role {
+            Role::Initiating => String::new(),
+            Role::Accepted => info
+                .local_addr
+                .map(|address| address.to_string())
+                .unwrap_or_default(),
+        };
+        LocalInstance {
+            instance: u64::from(!address.is_empty()),
+            address,
+        }
     }
 }
 

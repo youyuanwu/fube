@@ -10,7 +10,10 @@ use tokio::{
 };
 use tower_service::Service;
 
-use super::{session, validate_timeout, Accept, BoxFuture, ConnectionOptions, TransportLimits};
+use super::{
+    session, validate_timeout, Accept, BoxFuture, ConnectionOptions, ListenerConfig,
+    TransportLimits,
+};
 use crate::{
     connection::Role,
     service::{Registry, StoredService},
@@ -47,6 +50,7 @@ pub struct ServerBuilder {
     handshake_timeout: Duration,
     peer_ready_timeout: Duration,
     drain_timeout: Duration,
+    listener: ListenerConfig,
     service: Option<Arc<StoredService>>,
     hook: Option<ReadyHook>,
 }
@@ -58,6 +62,7 @@ impl Default for ServerBuilder {
             handshake_timeout: Duration::from_secs(30),
             peer_ready_timeout: Duration::from_secs(30),
             drain_timeout: Duration::from_secs(30),
+            listener: ListenerConfig::default(),
             service: None,
             hook: None,
         }
@@ -66,6 +71,17 @@ impl Default for ServerBuilder {
 impl ServerBuilder {
     pub fn limits(mut self, limits: TransportLimits) -> Self {
         self.limits = limits;
+        self
+    }
+    /// Advertise a consumer-owned listener independently of Accept's actual I/O metadata.
+    pub fn listen_address(mut self, address: impl Into<String>) -> Result<Self> {
+        self.listener = self.listener.listen_address(address.into())?;
+        Ok(self)
+    }
+    /// Select the local listener instance; requires listen_address before build.
+    /// This configures new connections, not a live connection reset.
+    pub fn instance(mut self, instance: u64) -> Self {
+        self.listener = self.listener.instance(instance);
         self
     }
     pub fn handler_limits(mut self, limits: HandlerLimits) -> Self {
@@ -126,6 +142,7 @@ impl ServerBuilder {
     pub fn build(mut self) -> Result<Server> {
         self.limits.validate()?;
         self.handler_limits.validate()?;
+        self.listener.validate(Role::Accepted, &self.limits)?;
         for timeout in [
             self.handshake_timeout,
             self.peer_ready_timeout,
@@ -220,6 +237,7 @@ impl Server {
                         Some(accepted) => {
                             let registry = registry.clone();
                             let limits = config.limits.clone();
+                            let listener = config.listener.clone();
                             let hook = config.hook.clone();
                             let handshake_deadline = Instant::now() + config.handshake_timeout;
                             let drain_timeout = config.drain_timeout;
@@ -230,7 +248,7 @@ impl Server {
                                     biased;
                                     _ = stop.changed() => return Ok(()),
                                     session = session::establish(
-                                        accepted.io, accepted.info, Role::Accepted, registry,
+                                        accepted.io, accepted.info, Role::Accepted, &listener, registry,
                                         &limits, drain_timeout, handshake_deadline,
                                     ) => session?,
                                 };

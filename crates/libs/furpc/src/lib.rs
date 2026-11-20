@@ -7,6 +7,9 @@
 //! generation. [`Server::serve_with_shutdown`] runs accepted I/O with the same
 //! driver and canonical [`IngressService`] execution. Managed correlation is the
 //! default; [`ConnectionOptions::raw_only`] keeps caller-owned one-way IDs.
+//! [`Endpoint::listen_address`] and [`ServerBuilder::listen_address`] configure
+//! a consumer-owned local listener advertisement; their `instance` methods select
+//! its native instance. These settings neither bind I/O nor reset live connections.
 //! [`RpcClient`] adapts that byte service with a consumed application [`Codec`]
 //! per call. [`server::Rpc`] adapts typed handlers inside byte-facing services.
 //! [`Router`] optionally selects exact native Actor/Action services; raw ingress
