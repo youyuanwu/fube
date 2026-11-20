@@ -1105,8 +1105,8 @@ def wire_capture_scope(source: dict) -> list:
 def wire_delivery(reply: dict, own: dict, selected: dict, observation: dict | None) -> dict:
     delivery = reply.get("delivery")
     if not isinstance(delivery, dict) or reply.get("admission_only") is not False:
-        raise MissingEvidence("exact invalid frame socket write/flush completion missing (admission is insufficient)")
-    require(delivery.get("classification") == "socket_write_all_and_flush"
+        raise MissingEvidence("exact invalid frame local socket acceptance missing (admission is insufficient)")
+    require(delivery.get("classification") == "complete_local_socket_acceptance"
             and type(delivery.get("session")) is int and delivery["session"] > 0
             and delivery.get("remote_listener") == selected["address"], "wire completion session/listener mismatch")
     frame_hex = delivery.get("frame_hex")

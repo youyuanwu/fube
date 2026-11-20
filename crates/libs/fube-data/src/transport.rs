@@ -4,7 +4,7 @@
 // Source-guided peer exchange: Service Fabric Transport/TcpConnection.cpp and
 // Transport/ListenInstance.{h,cpp}, revision
 // 3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d. Framing/serialization are reused
-// from fube-transport, not reimplemented here.
+// from furpc, not reimplemented here.
 
 //! Bounded clear-TCP classic peer sessions. Admission is not delivery or commit.
 //!
@@ -25,34 +25,32 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use fube_transport::{
-    frame::{Frame, MAX_FRAME_SIZE},
-    message::{ListenInstance, Message, MessageId, ACTOR, IPC, MESSAGE_ID},
-    raw_session::{self, Admission, SessionState},
-};
+use furpc::{Message, MessageId, Peer};
 use tokio::{
-    io::AsyncRead,
     net::{TcpListener, TcpStream},
-    sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
     time::Instant,
 };
 use uuid::Uuid;
 
-#[cfg(any(test, feature = "qualification"))]
-use tokio::{io::AsyncWriteExt, time::timeout_at};
 #[cfg(test)]
-use {
-    fube_transport::{
-        connection::{read_message, write_message},
-        frame::{validate_fixed, FIXED_HEADER_SIZE},
-    },
-    tokio::{io::AsyncReadExt, time::timeout},
-};
+use tokio::{io::AsyncReadExt, time::timeout};
 
 use crate::{
-    wire::{Actor, Body, Endpoint, Packet},
+    wire::{Actor, Body, Endpoint, Packet, MAX_FRAME_SIZE},
     Error, Result, Settings,
+};
+
+mod connection;
+use connection::run_session;
+#[cfg(test)]
+#[path = "../tests/support/ipc_wire.rs"]
+pub(crate) mod ipc_wire;
+#[cfg(test)]
+use ipc_wire::{
+    decode_message, read_message, validate_fixed, write_message, ListenInstance, MessageExt,
+    FIXED_HEADER_SIZE,
 };
 
 #[cfg(test)]
@@ -74,6 +72,7 @@ pub(crate) struct SourceTarget {
     actor: Actor,
     address: String,
     state: Weak<SessionState<Error>>,
+    peer: Arc<Peer>,
 }
 
 impl SourceTarget {
@@ -166,13 +165,57 @@ struct Network {
     routes: Mutex<HashMap<Actor, Route>>,
     data: Class,
     control: Class,
-    local: ListenInstance,
+    local: LocalListener,
     retired_addresses: Mutex<HashSet<String>>,
     outgoing_addresses: Mutex<HashMap<String, usize>>,
     live_addresses: Mutex<HashMap<String, usize>>,
     route_revision: watch::Sender<u64>,
     #[cfg(any(test, feature = "qualification"))]
     diagnostics: Mutex<std::collections::BTreeMap<&'static str, (u64, String)>>,
+}
+
+struct LocalListener {
+    address: String,
+    instance: u64,
+}
+
+struct SessionState<E> {
+    error: Mutex<Option<E>>,
+    changed: Notify,
+}
+
+impl<E> Default for SessionState<E> {
+    fn default() -> Self {
+        Self {
+            error: Mutex::new(None),
+            changed: Notify::new(),
+        }
+    }
+}
+
+impl<E: Clone> SessionState<E> {
+    fn error(&self) -> Option<E> {
+        self.error.lock().unwrap().clone()
+    }
+    fn terminate(&self, error: E) {
+        let mut current = self.error.lock().unwrap();
+        if current.is_none() {
+            *current = Some(error);
+        }
+        drop(current);
+        self.changed.notify_waiters();
+    }
+    async fn stopped(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.error().is_some() {
+                return;
+            }
+            changed.await;
+        }
+    }
 }
 
 struct Class {
@@ -215,7 +258,8 @@ impl Class {
 
 struct Outgoing {
     route: Route,
-    bytes: Vec<u8>,
+    message: Message,
+    peer: Option<Arc<Peer>>,
     _bytes: OwnedSemaphorePermit,
     _slot: OwnedSemaphorePermit,
     _address: AddressOwner,
@@ -301,7 +345,7 @@ pub(crate) struct WriteReceipt {
 impl WriteReceipt {
     pub(crate) fn evidence(&self) -> serde_json::Value {
         serde_json::json!({
-            "classification": "socket_write_all_and_flush",
+            "classification": "complete_local_socket_acceptance",
             "session": self.session,
             "local": self.local.to_string(), "remote": self.remote.to_string(),
             "remote_listener": self.remote_listener,
@@ -370,14 +414,13 @@ impl PeerTransport {
                 outgoing_slots: Arc::new(Semaphore::new(settings.control_messages)),
                 incoming: in_control.downgrade(),
             },
-            local: ListenInstance {
+            local: LocalListener {
                 address: address.clone(),
                 instance: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_micros()
                     .clamp(1, u64::MAX as u128) as u64,
-                nonce: [0; 16],
             },
             settings,
             routes: Mutex::new(HashMap::new()),
@@ -576,18 +619,25 @@ impl PeerTransport {
             .map_err(|_| Error::ResourceLimit("outgoing peer queue"))?;
         let message = packet.encode(true)?;
         #[cfg(any(test, feature = "qualification"))]
-        let message_id = message.properties()?.id;
-        let bytes = message.to_frame()?.encode()?;
+        let message_id = message.headers().effective().message_id;
+        let size = 12
+            + message
+                .headers()
+                .records()
+                .map(|header| 4 + header.value().len())
+                .sum::<usize>()
+            + message.body().len();
         #[cfg(any(test, feature = "qualification"))]
-        if completion.is_some() && bytes.len() > 16 * 1024 {
+        if completion.is_some() && size > 16 * 1024 {
             return Err(Error::ResourceLimit("qualification frame bytes"));
         }
-        let permit = class.reserve(bytes.len() + route.address.len() + 128)?;
+        let permit = class.reserve(size + route.address.len() + 128)?;
         let outgoing = Outgoing {
             _address: self.handle.network.own_address(&route.address),
             deadline,
             route,
-            bytes,
+            message,
+            peer: source.map(|source| source.peer.clone()),
             _bytes: permit,
             _slot: slot,
             #[cfg(any(test, feature = "qualification"))]
@@ -944,355 +994,6 @@ enum Socket {
     Accepted(TcpStream),
 }
 
-fn raw_limits(settings: &Settings) -> raw_session::Limits {
-    raw_session::Limits {
-        max_frame_bytes: MAX_FRAME_SIZE,
-        frame_time: settings.callback_timeout,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_session(
-    socket: Socket,
-    id: u64,
-    network: Arc<Network>,
-    ready: mpsc::Sender<Ready>,
-    data: mpsc::Receiver<Outgoing>,
-    control: mpsc::Receiver<Outgoing>,
-    state: Arc<SessionState<Error>>,
-    deadline: Instant,
-) -> Result<()> {
-    let establish = async {
-        let hello_id = MessageId {
-            guid: Uuid::new_v4().to_bytes_le(),
-            index: 1,
-        };
-        let limits = raw_limits(&network.settings);
-        Ok(match socket {
-            Socket::Connect(address) => {
-                raw_session::connect(
-                    address,
-                    network.local.clone(),
-                    hello_id,
-                    limits,
-                    deadline,
-                    |headers, size| peer_admission(headers, size, &network),
-                )
-                .await?
-            }
-            Socket::Accepted(stream) => {
-                stream.set_nodelay(true)?;
-                raw_session::establish(
-                    stream,
-                    raw_session::Role::Accepted,
-                    network.local.clone(),
-                    hello_id,
-                    limits,
-                    deadline,
-                    |headers, size| peer_admission(headers, size, &network),
-                )
-                .await?
-            }
-        })
-    };
-    let established: Result<_> = tokio::select! {
-        biased;
-        _ = state.stopped() => Err(state.error().unwrap_or(Error::Closed)),
-        result = establish => result,
-    };
-    let result = match established {
-        Ok((stream, hello)) => {
-            run_session_inner(
-                stream,
-                hello,
-                id,
-                network.clone(),
-                ready,
-                data,
-                control,
-                state.clone(),
-            )
-            .await
-        }
-        Err(error) => Err(error),
-    };
-    state.terminate(result.as_ref().err().cloned().unwrap_or(Error::Closed));
-    #[cfg(any(test, feature = "qualification"))]
-    if let Err(error) = &result {
-        network.note("connection_error", format!("{id}: {error:?}"));
-    }
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_session_inner(
-    stream: TcpStream,
-    hello: raw_session::Received<(OwnedSemaphorePermit, usize)>,
-    id: u64,
-    network: Arc<Network>,
-    ready: mpsc::Sender<Ready>,
-    mut data: mpsc::Receiver<Outgoing>,
-    mut control: mpsc::Receiver<Outgoing>,
-    state: Arc<SessionState<Error>>,
-) -> Result<()> {
-    let peer_socket = stream.peer_addr()?;
-    #[cfg(any(test, feature = "qualification"))]
-    let local = stream.local_addr()?;
-    let (mut reader, mut writer) = stream.into_split();
-    let remote = hello.message;
-    let properties = remote.properties()?;
-    if properties.actor != 1
-        || properties.id == MessageId::default()
-        || !properties.action.is_empty()
-        || remote.headers.iter().filter(|h| h.id == ACTOR).count() != 1
-        || remote
-            .headers
-            .iter()
-            .any(|h| matches!(h.id, IPC | 0x8029 | 0x8048))
-        || remote.headers.iter().filter(|h| h.id == MESSAGE_ID).count() != 1
-        || properties.expects_reply
-        || properties.uncorrelated_reply
-        || properties.relates_to != MessageId::default()
-    {
-        return Err(Error::Protocol("expected native peer ListenInstance"));
-    }
-    let remote_instance = ListenInstance::decode(&remote.body)?;
-    if remote_instance.address.is_empty() {
-        return Err(Error::Protocol("invalid peer ListenInstance"));
-    }
-    // Reuse endpoint validation without resolving peer-supplied hostnames.
-    Endpoint {
-        address: remote_instance.address.clone(),
-        actor: Actor {
-            partition: Uuid::new_v4(),
-            replica: 1,
-            incarnation: Uuid::new_v4(),
-        },
-        transport_id: None,
-    }
-    .to_string()
-    .parse::<Endpoint>()?;
-    drop(remote);
-    drop(hello.admission);
-    let remote_listener = match remote_instance.address.parse::<SocketAddr>() {
-        Ok(socket) => socket,
-        Err(_) => {
-            // The advertised hostname is still the exact wire identity. For
-            // socket ownership use its listener port and the connected IP,
-            // without a blocking DNS lookup on the network reader.
-            let port = remote_instance
-                .address
-                .rsplit_once(':')
-                .and_then(|(_, port)| port.parse::<u16>().ok())
-                .filter(|port| *port != 0)
-                .ok_or(Error::Protocol("invalid peer listener port"))?;
-            SocketAddr::new(peer_socket.ip(), port)
-        }
-    };
-    let remote_address = remote_listener.to_string();
-    let _socket_owner = network.own_socket_address(&remote_address);
-    ready
-        .try_send(Ready {
-            id,
-            address: remote_address.clone(),
-        })
-        .map_err(|_| Error::ResourceLimit("session announcements"))?;
-    let read = async {
-        loop {
-            tokio::task::yield_now().await;
-            let Some(frame) = read_frame(&mut reader, &network).await? else {
-                continue;
-            };
-            let properties = frame.message.properties()?;
-            if properties.actor != 0
-                || properties.expects_reply
-                || properties.relates_to != MessageId::default()
-                || frame
-                    .message
-                    .headers
-                    .iter()
-                    .filter(|header| header.id == ACTOR)
-                    .count()
-                    > 1
-                || frame.message.headers.iter().any(|header| header.id == IPC)
-            {
-                return Err(Error::Protocol("invalid classic peer envelope"));
-            }
-            let packet = Packet::decode(&frame.message)?;
-            #[cfg(any(test, feature = "qualification"))]
-            network.note(
-                if is_data(&packet.body) {
-                    "received_data"
-                } else {
-                    "received_control"
-                },
-                format!(
-                    "{}:{}",
-                    id,
-                    match &packet.body {
-                        Body::Replication { operations, .. } =>
-                            operations.first().map_or(0, |o| o.sequence),
-                        Body::Copy { sequence, .. } | Body::CopyContext { sequence, .. } =>
-                            *sequence,
-                        _ => 0,
-                    }
-                ),
-            );
-            if packet.from.address != remote_instance.address {
-                return Err(Error::Protocol("packet source differs from ListenInstance"));
-            }
-            validate_operation_limits(&packet, &network.settings)?;
-            {
-                let mut routes = network.routes.lock().unwrap();
-                let full = routes.len() >= network.settings.connections;
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    routes.entry(packet.from.actor)
-                {
-                    if full {
-                        return Err(Error::ResourceLimit("peer routes"));
-                    }
-                    entry.insert(Route {
-                        address: remote_address.clone(),
-                        socket: Some(remote_listener),
-                        learned_on: Some(id),
-                    });
-                }
-            }
-            let data = is_data(&packet.body);
-            let class = network.class(data);
-            let source = SourceTarget {
-                route: Route {
-                    address: remote_address.clone(),
-                    socket: None,
-                    learned_on: Some(id),
-                },
-                actor: packet.from.actor,
-                address: packet.from.address.clone(),
-                state: Arc::downgrade(&state),
-            };
-            let charge = (packet_bytes(&packet) - std::mem::size_of::<Packet>()
-                + std::mem::size_of::<Ingress>()
-                + source.address.len()
-                + source.route.address.len())
-            .max(frame.charge);
-            // Replace the frame charge only after disposal of its decoded
-            // message. Metadata (including empty segments) counts as bytes.
-            drop(frame.message);
-            let permit = if charge == frame.charge {
-                frame.permit
-            } else {
-                drop(frame.permit);
-                match class.reserve(charge) {
-                    Ok(permit) => permit,
-                    Err(_) if data => continue,
-                    Err(error) => return Err(error),
-                }
-            };
-            match class.deliver(packet, permit, source) {
-                Ok(()) => {}
-                Err(Error::ResourceLimit(_)) if data => {
-                    #[cfg(any(test, feature = "qualification"))]
-                    network.note("incoming_drop", "capacity".into());
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    };
-    let write = async {
-        loop {
-            tokio::task::yield_now().await;
-            let outgoing = tokio::select! {
-                biased;
-                _ = state.stopped() => return Ok(()),
-                Some(outgoing) = control.recv() => outgoing,
-                Some(outgoing) = data.recv() => outgoing,
-                else => return Ok(()),
-            };
-            #[cfg(any(test, feature = "qualification"))]
-            if outgoing
-                .completion
-                .as_ref()
-                .is_some_and(|(_, sender)| sender.is_closed())
-            {
-                continue;
-            }
-            let written = raw_session::write_frame(
-                &mut writer,
-                &outgoing.bytes,
-                outgoing.deadline,
-                raw_limits(&network.settings),
-                &state.changed,
-                |write| {
-                    state.attempt(
-                        || {
-                            if Instant::now() >= outgoing.deadline {
-                                return false;
-                            }
-                            #[cfg(any(test, feature = "qualification"))]
-                            if outgoing
-                                .completion
-                                .as_ref()
-                                .is_some_and(|(_, sender)| sender.is_closed())
-                            {
-                                return false;
-                            }
-                            true
-                        },
-                        write,
-                    )
-                },
-            )
-            .await?;
-            if !written {
-                continue;
-            }
-            #[cfg(any(test, feature = "qualification"))]
-            if outgoing.completion.is_some() {
-                timeout_at(
-                    Instant::now() + network.settings.callback_timeout,
-                    writer.flush(),
-                )
-                .await
-                .map_err(|_| Error::Timeout)??;
-            }
-            #[cfg(any(test, feature = "qualification"))]
-            network.note(
-                if outgoing.data {
-                    "written_data"
-                } else {
-                    "written_control"
-                },
-                id.to_string(),
-            );
-            #[cfg(any(test, feature = "qualification"))]
-            if let Some((message_id, sender)) = outgoing.completion {
-                let _ = sender.send(WriteReceipt {
-                    session: id,
-                    local,
-                    remote: peer_socket,
-                    remote_listener: remote_instance.address.clone(),
-                    message_id,
-                    frame: outgoing.bytes,
-                    _bytes: outgoing._bytes,
-                    _slot: outgoing._slot,
-                });
-            }
-        }
-    };
-    raw_session::join_io(
-        read,
-        write,
-        state.stopped(),
-        |error| state.terminate(error),
-        Error::Closed,
-    )
-    .await;
-    let result = Err(state.error().unwrap_or(Error::Closed));
-    #[cfg(any(test, feature = "qualification"))]
-    network.note("session_end", format!("{id}: {result:?}"));
-    result
-}
-
 fn packet_bytes(packet: &Packet) -> usize {
     let segments =
         |data: &[Vec<u8>]| std::mem::size_of_val(data) + data.iter().map(Vec::len).sum::<usize>();
@@ -1309,69 +1010,4 @@ fn packet_bytes(packet: &Packet) -> usize {
         _ => 0,
     };
     std::mem::size_of::<Packet>() + packet.from.address.len() + body
-}
-
-struct ReadFrame {
-    message: Message,
-    permit: OwnedSemaphorePermit,
-    charge: usize,
-}
-
-/// Idle reads have no deadline. Once a frame starts, its entire remaining
-/// header/body (including a discarded data body) has one bounded deadline.
-async fn read_frame<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    network: &Network,
-) -> Result<Option<ReadFrame>> {
-    let frame = raw_session::read_frame(reader, raw_limits(&network.settings), |headers, size| {
-        peer_admission(headers, size, network)
-    })
-    .await?;
-    Ok(frame.map(|frame| ReadFrame {
-        message: frame.message,
-        permit: frame.admission.0,
-        charge: frame.admission.1,
-    }))
-}
-
-fn peer_admission(
-    headers: &[u8],
-    size: usize,
-    network: &Network,
-) -> fube_transport::Result<Admission<(OwnedSemaphorePermit, usize)>> {
-    use fube_transport::Error;
-    let headers = Message::from_frame(Frame {
-        headers: headers.to_vec(),
-        body: Vec::new(),
-    })?;
-    let properties = headers.properties()?;
-    if !matches!(properties.actor, 0 | 1)
-        || properties.expects_reply
-        || properties.relates_to != MessageId::default()
-        || headers
-            .headers
-            .iter()
-            .filter(|header| header.id == ACTOR)
-            .count()
-            > 1
-        || headers
-            .headers
-            .iter()
-            .any(|header| matches!(header.id, IPC | 0x8029 | 0x8048))
-    {
-        return Err(Error::Protocol("invalid clear-TCP peer headers"));
-    }
-    let data = matches!(
-        properties.action.as_str(),
-        "ReplicationOperation" | "CopyOperation" | "CopyContextOperation"
-    );
-    let charge = size + std::mem::size_of::<Packet>();
-    let permit = match network.class(data).reserve(charge) {
-        Ok(permit) => permit,
-        Err(_) if data => {
-            return Ok(Admission::Drain);
-        }
-        Err(_) => return Err(fube_transport::Error::ResourceLimit("peer bytes")),
-    };
-    Ok(Admission::Retain((permit, charge)))
 }

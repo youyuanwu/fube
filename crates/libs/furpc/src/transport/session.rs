@@ -13,12 +13,12 @@ use tokio::{
 use super::{
     io::{IoInfo, TransportIo},
     server::ReadyHook,
-    BoxFuture, TransportLimits,
+    BoxFuture, ListenerConfig, TransportLimits,
 };
 use crate::{
     connection::{
         driver::{ConnectionDriver, ConnectionEvent, DropReason},
-        ConnectionError, LocalInstance, Role,
+        ConnectionError, Role,
     },
     peer::Generation,
     service::{Dispatch, Registry},
@@ -30,10 +30,12 @@ pub(crate) struct Session<I: TransportIo> {
     pub(crate) core: Arc<Generation>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn establish<I: TransportIo>(
     io: I,
     info: IoInfo,
     role: Role,
+    listener: &ListenerConfig,
     registry: Arc<Registry>,
     limits: &TransportLimits,
     drain_timeout: Duration,
@@ -42,17 +44,7 @@ pub(crate) async fn establish<I: TransportIo>(
     if registry.is_stopping() {
         return Err(Error::Closed);
     }
-    let address = match role {
-        Role::Initiating => String::new(),
-        Role::Accepted => info
-            .local_addr
-            .map(|address| address.to_string())
-            .unwrap_or_default(),
-    };
-    let local = LocalInstance {
-        instance: u64::from(!address.is_empty()),
-        address,
-    };
+    let local = listener.local(role, &info);
     let (handle, mut driver) =
         ConnectionDriver::new(io, role, local, limits.connection(drain_timeout), deadline)
             .map_err(Error::from)?;

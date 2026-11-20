@@ -11,7 +11,6 @@
 // src/prod/src/prebuilt/sdk/FabricTypes.h:2203-2216.
 
 use super::*;
-use fube_transport::frame::Frame;
 
 const PARTITION: &str = "00112233-4455-6677-8899-aabbccddeeff";
 const INCARNATION: &str = "10213243-5465-7687-98a9-bacbdcedfe0f";
@@ -112,7 +111,7 @@ fn replication_fields() -> Vec<u8> {
 }
 
 fn fixture_message(action: &str, header: Option<(u16, Vec<u8>)>, body: Vec<u8>) -> Message {
-    let mut message = packet(Body::RequestAck).encode(false).unwrap();
+    let mut message = packet(Body::RequestAck).encode_parts(false).unwrap();
     message
         .headers
         .iter_mut()
@@ -133,12 +132,7 @@ fn header_mut(message: &mut Message, id: u16) -> &mut Header {
 fn roundtrip(packet: Packet) {
     for in_body in [false, true] {
         let message = packet.encode(in_body).unwrap();
-        let bytes = message
-            .to_frame()
-            .unwrap()
-            .encode_with_body_crc(true)
-            .unwrap();
-        let message = Message::from_frame(Frame::decode(&bytes).unwrap()).unwrap();
+        assert!(message.headers().first_actor().is_none());
         assert_eq!(Packet::decode(&message).unwrap(), packet);
     }
 }
@@ -188,7 +182,7 @@ fn endpoint_native_delimiters_signed_ids_and_transport_suffix() {
 
 #[test]
 fn exact_inline_actor_from_and_guid_byte_order() {
-    let message = packet(Body::RequestAck).encode(false).unwrap();
+    let message = packet(Body::RequestAck).encode_parts(false).unwrap();
     let actor_fields = hex("0c 33 22 11 00 55 44 77 66 88 99 aa bb cc dd ee ff
          09 7e
          0c 43 32 21 10 65 54 87 76 98 a9 ba cb dc ed fe 0f");
@@ -207,7 +201,7 @@ fn exact_inline_actor_from_and_guid_byte_order() {
     let mut with_suffix = packet(Body::RequestAck);
     with_suffix.from.transport_id = Some("routing-only".into());
     assert_eq!(
-        Packet::decode(&with_suffix.encode(false).unwrap())
+        Packet::decode_parts(&with_suffix.encode_parts(false).unwrap())
             .unwrap()
             .from
             .transport_id,
@@ -219,7 +213,7 @@ fn exact_inline_actor_from_and_guid_byte_order() {
 fn exact_native_replication_batch_and_both_header_locations() {
     let expected_header = native_object(&replication_fields());
     for in_body in [false, true] {
-        let message = replication().encode(in_body).unwrap();
+        let message = replication().encode_parts(in_body).unwrap();
         assert_eq!(
             required_header(&message, ACTION)
                 .unwrap()
@@ -244,14 +238,14 @@ fn exact_native_replication_batch_and_both_header_locations() {
             );
             assert_eq!(message.body, b"abc");
         }
-        assert_eq!(Packet::decode(&message).unwrap(), replication());
+        assert_eq!(Packet::decode_parts(&message).unwrap(), replication());
     }
     let message = fixture_message(
         "ReplicationOperation",
         Some((RE_OPERATION, expected_header)),
         b"abc".to_vec(),
     );
-    assert_eq!(Packet::decode(&message).unwrap(), replication());
+    assert_eq!(Packet::decode_parts(&message).unwrap(), replication());
 }
 
 #[test]
@@ -262,10 +256,10 @@ fn exact_native_start_copy_ack_context_and_fault_fixtures() {
         start: 9,
     });
     let fields = [hex(EPOCH_PRIMARY), hex("09 13 09 09")].concat();
-    let start_message = start.encode(false).unwrap();
+    let start_message = start.encode_parts(false).unwrap();
     assert_eq!(start_message.body, native_object(&fields));
     assert_eq!(
-        Packet::decode(&fixture_message("StartCopy", None, native_object(&fields))).unwrap(),
+        Packet::decode_parts(&fixture_message("StartCopy", None, native_object(&fields))).unwrap(),
         start
     );
 
@@ -276,19 +270,19 @@ fn exact_native_start_copy_ack_context_and_fault_fixtures() {
         copy_applied: 7,
         error: -2,
     });
-    let message = ack.encode(false).unwrap();
+    let message = ack.encode_parts(false).unwrap();
     assert_eq!(message.body, native_object(&hex("09 0c 09 0a 09 7f 09 07")));
     assert_eq!(
         required_header(&message, OPERATION_ERROR).unwrap().value,
         native_object(&hex("07 7e"))
     );
-    assert_eq!(Packet::decode(&message).unwrap(), ack);
+    assert_eq!(Packet::decode_parts(&message).unwrap(), ack);
 
     let context_ack = packet(Body::CopyContextAck {
         sequence: 7,
         error: 0,
     });
-    let message = context_ack.encode(false).unwrap();
+    let message = context_ack.encode_parts(false).unwrap();
     assert_eq!(message.body, native_object(&hex("09 07")));
     assert_eq!(
         required_header(&message, ACTION)
@@ -305,9 +299,12 @@ fn exact_native_start_copy_ack_context_and_fault_fixtures() {
         reason: "x".into(),
     });
     let fields = hex("09 13 0c 43 32 21 10 65 54 87 76 98 a9 ba cb dc ed fe 0f 8d 01 78 00");
-    assert_eq!(fault.encode(false).unwrap().body, native_object(&fields));
     assert_eq!(
-        Packet::decode(&fixture_message(
+        fault.encode_parts(false).unwrap().body,
+        native_object(&fields)
+    );
+    assert_eq!(
+        Packet::decode_parts(&fixture_message(
             "InduceFault",
             None,
             native_object(&fields)
@@ -337,14 +334,14 @@ fn exact_native_copy_and_copy_context_metadata_order_and_segmentation() {
     .concat();
     let expected = native_object(&fields);
     for in_body in [false, true] {
-        let message = copy.encode(in_body).unwrap();
+        let message = copy.encode_parts(in_body).unwrap();
         let (header, payload) = operation_parts(&message, COPY_OPERATION).unwrap();
         assert_eq!(header, expected);
         assert_eq!(payload, b"ab");
-        assert_eq!(Packet::decode(&message).unwrap(), copy);
+        assert_eq!(Packet::decode_parts(&message).unwrap(), copy);
     }
     assert_eq!(
-        Packet::decode(&fixture_message(
+        Packet::decode_parts(&fixture_message(
             "CopyOperation",
             Some((COPY_OPERATION, expected)),
             b"ab".to_vec()
@@ -358,14 +355,14 @@ fn exact_native_copy_and_copy_context_metadata_order_and_segmentation() {
         last: true,
     });
     let fields = [metadata, hex("88 02 00 02 42")].concat();
-    let message = context.encode(true).unwrap();
+    let message = context.encode_parts(true).unwrap();
     assert_eq!(
         required_header(&message, COPY_CONTEXT).unwrap().value,
         native_object(&fields)
     );
     assert!(unique_header(&message, OPERATION_BODY).unwrap().is_none());
     assert_eq!(message.body, b"ab");
-    assert_eq!(Packet::decode(&message).unwrap(), context);
+    assert_eq!(Packet::decode_parts(&message).unwrap(), context);
 }
 
 #[test]
@@ -461,11 +458,11 @@ fn native_legacy_single_operation_without_batch_suffix_and_optional_completed() 
                 b"abc".to_vec(),
             )
         };
-        assert_eq!(Packet::decode(&message).unwrap(), expected);
+        assert_eq!(Packet::decode_parts(&message).unwrap(), expected);
     }
     let fields = [fields, hex("49 49 49 c8 49")].concat();
     assert_eq!(
-        Packet::decode(&fixture_message(
+        Packet::decode_parts(&fixture_message(
             "ReplicationOperation",
             Some((RE_OPERATION, native_object(&fields))),
             b"abc".to_vec(),
@@ -486,7 +483,7 @@ fn native_legacy_single_operation_without_batch_suffix_and_optional_completed() 
     if let Body::Replication { completed, .. } = &mut expected.body {
         *completed = 0;
     }
-    assert_eq!(Packet::decode(&message).unwrap(), expected);
+    assert_eq!(Packet::decode_parts(&message).unwrap(), expected);
     // A native reader skips supported fields added after its known suffix.
     fields.extend(hex("49 88 02 00 81 00"));
     let message = fixture_message(
@@ -494,7 +491,7 @@ fn native_legacy_single_operation_without_batch_suffix_and_optional_completed() 
         Some((RE_OPERATION, native_object(&fields))),
         b"abc".to_vec(),
     );
-    assert_eq!(Packet::decode(&message).unwrap(), expected);
+    assert_eq!(Packet::decode_parts(&message).unwrap(), expected);
 }
 
 #[test]
@@ -533,7 +530,7 @@ fn ack_initial_in_progress_and_completed_copy_sentinels_are_distinct() {
             copy_applied,
             error: 0,
         });
-        assert!(value.encode(false).is_err());
+        assert!(value.encode_parts(false).is_err());
         let body = object(|e| {
             for n in [received, applied, copy_received, copy_applied] {
                 e.i64(n).unwrap();
@@ -541,51 +538,53 @@ fn ack_initial_in_progress_and_completed_copy_sentinels_are_distinct() {
             Ok(())
         })
         .unwrap();
-        assert!(Packet::decode(&fixture_message("ReplicationAck", None, body)).is_err());
+        assert!(Packet::decode_parts(&fixture_message("ReplicationAck", None, body)).is_err());
     }
     for sequence in [-1, i64::MIN] {
         assert!(packet(Body::CopyContextAck { sequence, error: 0 })
-            .encode(false)
+            .encode_parts(false)
             .is_err());
         let body = object(|e| {
             e.i64(sequence).unwrap();
             Ok(())
         })
         .unwrap();
-        assert!(Packet::decode(&fixture_message("CopyContextAckAction", None, body)).is_err());
+        assert!(
+            Packet::decode_parts(&fixture_message("CopyContextAckAction", None, body)).is_err()
+        );
     }
 }
 
 #[test]
 fn rejects_duplicate_missing_conflicting_and_action_mismatched_headers() {
-    let message = replication().encode(false).unwrap();
+    let message = replication().encode_parts(false).unwrap();
     for id in [RE_FROM, RE_ACTOR, ACTION, MESSAGE_ID, RE_OPERATION] {
         let mut duplicate = message.clone();
         duplicate
             .headers
             .push(required_header(&message, id).unwrap().clone());
-        assert!(Packet::decode(&duplicate).is_err(), "{id:x}");
+        assert!(Packet::decode_parts(&duplicate).is_err(), "{id:x}");
         let mut missing = message.clone();
         missing.headers.retain(|h| h.id != id);
-        assert!(Packet::decode(&missing).is_err(), "{id:x}");
+        assert!(Packet::decode_parts(&missing).is_err(), "{id:x}");
     }
-    let mut in_body = replication().encode(true).unwrap();
+    let mut in_body = replication().encode_parts(true).unwrap();
     in_body
         .headers
         .push(required_header(&message, RE_OPERATION).unwrap().clone());
-    assert!(Packet::decode(&in_body).is_err());
-    let mut duplicate = replication().encode(true).unwrap();
+    assert!(Packet::decode_parts(&in_body).is_err());
+    let mut duplicate = replication().encode_parts(true).unwrap();
     duplicate
         .headers
         .push(required_header(&duplicate, OPERATION_BODY).unwrap().clone());
-    assert!(Packet::decode(&duplicate).is_err());
+    assert!(Packet::decode_parts(&duplicate).is_err());
     for id in [COPY_OPERATION, COPY_CONTEXT, OPERATION_ERROR] {
         let mut mismatch = message.clone();
         mismatch.headers.push(Header {
             id,
             value: native_object(&[]),
         });
-        assert!(Packet::decode(&mismatch).is_err());
+        assert!(Packet::decode_parts(&mismatch).is_err());
     }
     let mut ack = packet(Body::Ack {
         received: 1,
@@ -594,43 +593,34 @@ fn rejects_duplicate_missing_conflicting_and_action_mismatched_headers() {
         copy_applied: -1,
         error: 2,
     })
-    .encode(false)
+    .encode_parts(false)
     .unwrap();
     ack.headers
         .push(required_header(&ack, OPERATION_ERROR).unwrap().clone());
-    assert!(Packet::decode(&ack).is_err());
+    assert!(Packet::decode_parts(&ack).is_err());
     for action in ["ReplicationOperationBody", "CopyContextAck", "", "Unknown"] {
         let mut mismatch = message.clone();
         header_mut(&mut mismatch, ACTION).value = Header::action(action).unwrap().value;
-        assert!(Packet::decode(&mismatch).is_err(), "{action}");
+        assert!(Packet::decode_parts(&mismatch).is_err(), "{action}");
     }
     let mut unknown = message;
     unknown.headers.push(Header {
         id: 0x8123,
         value: native_object(&[]),
     });
-    assert_eq!(Packet::decode(&unknown).unwrap(), replication());
+    assert_eq!(Packet::decode_parts(&unknown).unwrap(), replication());
 }
 
 #[test]
-fn security_rejection_uses_shared_frame_and_explicit_header_profile() {
+fn security_rejection_uses_explicit_header_profile() {
     for id in [MESSAGE_SECURITY, SECURITY_NEGOTIATION] {
-        let mut message = packet(Body::RequestAck).encode(false).unwrap();
+        let mut message = packet(Body::RequestAck).encode_parts(false).unwrap();
         message.headers.push(Header {
             id,
             value: native_object(&[]),
         });
-        assert!(Packet::decode(&message).is_err());
+        assert!(Packet::decode_parts(&message).is_err());
     }
-    let mut frame = packet(Body::RequestAck)
-        .encode(false)
-        .unwrap()
-        .to_frame()
-        .unwrap()
-        .encode()
-        .unwrap();
-    frame[4] = 1;
-    assert!(Frame::decode(&frame).is_err());
 }
 
 #[test]
@@ -647,32 +637,32 @@ fn rejects_truncated_header_prefix_bad_in_body_sizes_and_extra_payload() {
                 last: false,
             })
         };
-        let original = value.encode(false).unwrap();
+        let original = value.encode_parts(false).unwrap();
         let full = required_header(&original, id).unwrap().value.clone();
         for length in 0..full.len() {
             let mut message = original.clone();
             header_mut(&mut message, id).value.truncate(length);
-            assert!(Packet::decode(&message).is_err(), "{id:x}, {length}");
+            assert!(Packet::decode_parts(&message).is_err(), "{id:x}, {length}");
         }
         for size in [0, 1, u32::MAX] {
-            let mut message = value.encode(true).unwrap();
+            let mut message = value.encode_parts(true).unwrap();
             header_mut(&mut message, OPERATION_BODY).value = object(|e| {
                 e.u32(size).unwrap();
                 Ok(())
             })
             .unwrap();
-            assert!(Packet::decode(&message).is_err(), "{id:x}, {size}");
+            assert!(Packet::decode_parts(&message).is_err(), "{id:x}, {size}");
         }
         let mut short = original.clone();
         short.body.pop();
-        assert!(Packet::decode(&short).is_err());
+        assert!(Packet::decode_parts(&short).is_err());
         let mut extra = original;
         extra.body.push(0);
-        assert!(Packet::decode(&extra).is_err());
+        assert!(Packet::decode_parts(&extra).is_err());
     }
-    let mut request = packet(Body::RequestAck).encode(false).unwrap();
+    let mut request = packet(Body::RequestAck).encode_parts(false).unwrap();
     request.body.push(0);
-    assert!(Packet::decode(&request).is_err());
+    assert!(Packet::decode_parts(&request).is_err());
 }
 
 #[test]
@@ -688,29 +678,29 @@ fn abi_sizes_reserved_pointers_types_sequences_and_native_padding() {
     for offset in [2, 2 + 24, 34 + 2 + 16, 34 + 26 + 2 + 16] {
         let mut fields = valid.clone();
         fields[offset] = if offset == 2 { 3 } else { 1 };
-        assert!(Packet::decode(&make(&fields)).is_err(), "{offset}");
+        assert!(Packet::decode_parts(&make(&fields)).is_err(), "{offset}");
     }
     for length in [0, 24, 31, 33] {
         let mut fields = valid.clone();
         fields[1] = length;
-        assert!(Packet::decode(&make(&fields)).is_err());
+        assert!(Packet::decode_parts(&make(&fields)).is_err());
     }
     for offset in [2 + 8, 2 + 16, 34 + 2, 34 + 2 + 8] {
         let mut fields = valid.clone();
         fields[offset..offset + 8].copy_from_slice(&(-2i64).to_le_bytes());
-        assert!(Packet::decode(&make(&fields)).is_err(), "{offset}");
+        assert!(Packet::decode_parts(&make(&fields)).is_err(), "{offset}");
     }
     let mut fields = valid.clone();
     fields[2 + 8..2 + 16].fill(0);
-    assert!(Packet::decode(&make(&fields)).is_err());
+    assert!(Packet::decode_parts(&make(&fields)).is_err());
     let mut fields = valid;
     fields[2 + 4..2 + 8].copy_from_slice(&[0xab, 0xcd, 0xef, 0x12]);
-    assert_eq!(Packet::decode(&make(&fields)).unwrap(), replication());
+    assert_eq!(Packet::decode_parts(&make(&fields)).unwrap(), replication());
 
-    let mut message = packet(Body::RequestAck).encode(false).unwrap();
+    let mut message = packet(Body::RequestAck).encode_parts(false).unwrap();
     header_mut(&mut message, RE_ACTOR).value = native_object(&hex("4c 49 4c"));
-    assert!(Packet::decode(&message).is_err());
-    let mut message = packet(Body::RequestAck).encode(false).unwrap();
+    assert!(Packet::decode_parts(&message).is_err());
+    let mut message = packet(Body::RequestAck).encode_parts(false).unwrap();
     header_mut(&mut message, RE_FROM).value = Header::object(RE_FROM, |e| {
         e.string("host:65536")?;
         actor(1).write(e)?;
@@ -718,7 +708,7 @@ fn abi_sizes_reserved_pointers_types_sequences_and_native_padding() {
     })
     .unwrap()
     .value;
-    assert!(Packet::decode(&message).is_err());
+    assert!(Packet::decode_parts(&message).is_err());
 }
 
 #[test]
@@ -730,7 +720,7 @@ fn copy_metadata_preserves_native_last_override_and_rejects_bad_sequences() {
         data: vec![b"ab".to_vec()],
         last: false,
     })
-    .encode(false)
+    .encode_parts(false)
     .unwrap();
     let fields = [
         hex("09 13"),
@@ -751,7 +741,7 @@ fn copy_metadata_preserves_native_last_override_and_rejects_bad_sequences() {
         malformed[offset..offset + bytes.len()].copy_from_slice(&bytes);
         let mut message = valid.clone();
         header_mut(&mut message, COPY_OPERATION).value = native_object(&malformed);
-        assert!(Packet::decode(&message).is_err());
+        assert!(Packet::decode_parts(&message).is_err());
     }
     // Native GetCopyOperationFromMessage overwrites Type when isLast is set.
     let mut fields = fields;
@@ -762,7 +752,7 @@ fn copy_metadata_preserves_native_last_override_and_rejects_bad_sequences() {
         b"ab".to_vec(),
     );
     assert!(matches!(
-        Packet::decode(&message).unwrap().body,
+        Packet::decode_parts(&message).unwrap().body,
         Body::Copy { last: true, .. }
     ));
 
@@ -823,7 +813,7 @@ fn rejects_impossible_batch_ranges_counts_and_integer_overflow() {
             Some((RE_OPERATION, header)),
             b"abc".to_vec(),
         );
-        assert!(Packet::decode(&message).is_err());
+        assert!(Packet::decode_parts(&message).is_err());
     }
     // A suffix that has started must not masquerade as an absent V1 suffix.
     let base = [
@@ -835,7 +825,7 @@ fn rejects_impossible_batch_ranges_counts_and_integer_overflow() {
     .concat();
     for suffix in ["09 07", "09 07 09 08", "09 07 09 08 09 09"] {
         let fields = [base.clone(), hex(suffix)].concat();
-        assert!(Packet::decode(&fixture_message(
+        assert!(Packet::decode_parts(&fixture_message(
             "ReplicationOperation",
             Some((RE_OPERATION, native_object(&fields))),
             b"abc".to_vec()
@@ -846,12 +836,12 @@ fn rejects_impossible_batch_ranges_counts_and_integer_overflow() {
     if let Body::Replication { operations, .. } = &mut value.body {
         operations[1].sequence = 10;
     }
-    assert!(value.encode(false).is_err());
+    assert!(value.encode_parts(false).is_err());
     if let Body::Replication { operations, .. } = &mut value.body {
         operations[1].sequence = 8;
         operations[1].atomic_group = 42;
     }
-    assert!(value.encode(false).is_err());
+    assert!(value.encode_parts(false).is_err());
 }
 
 #[test]
@@ -865,7 +855,7 @@ fn operation_batch_and_aggregate_limits_apply_before_provider_allocation() {
     if let Body::CopyContext { data, .. } = &mut value.body {
         data[0].push(0);
     }
-    assert!(value.encode(false).is_err());
+    assert!(value.encode_parts(false).is_err());
     let fields = [
         hex(METADATA_SEVEN),
         {
@@ -876,7 +866,7 @@ fn operation_batch_and_aggregate_limits_apply_before_provider_allocation() {
         hex("72"),
     ]
     .concat();
-    assert!(Packet::decode(&fixture_message(
+    assert!(Packet::decode_parts(&fixture_message(
         "CopyContextOperation",
         Some((COPY_CONTEXT, native_object(&fields))),
         vec![0; MAX_OPERATION_BYTES + 1]
@@ -892,7 +882,7 @@ fn operation_batch_and_aggregate_limits_apply_before_provider_allocation() {
     if let Body::CopyContext { data, .. } = &mut value.body {
         data.push(vec![]);
     }
-    assert!(value.encode(false).is_err());
+    assert!(value.encode_parts(false).is_err());
     let header = batch_header(
         &vec![0; MAX_SEGMENTS + 1],
         7,
@@ -901,7 +891,7 @@ fn operation_batch_and_aggregate_limits_apply_before_provider_allocation() {
         &[(MAX_SEGMENTS + 1) as u32],
         0,
     );
-    assert!(Packet::decode(&fixture_message(
+    assert!(Packet::decode_parts(&fixture_message(
         "ReplicationOperation",
         Some((RE_OPERATION, header)),
         vec![]
@@ -932,7 +922,7 @@ fn operation_batch_and_aggregate_limits_apply_before_provider_allocation() {
             data: vec![],
         });
     }
-    assert!(value.encode(true).is_err());
+    assert!(value.encode_parts(true).is_err());
     let header = batch_header(
         &[],
         7,
@@ -941,7 +931,7 @@ fn operation_batch_and_aggregate_limits_apply_before_provider_allocation() {
         &vec![0; MAX_BATCH_OPERATIONS + 1],
         0,
     );
-    assert!(Packet::decode(&fixture_message(
+    assert!(Packet::decode_parts(&fixture_message(
         "ReplicationOperation",
         Some((RE_OPERATION, header)),
         vec![]
@@ -964,8 +954,8 @@ fn operation_batch_and_aggregate_limits_apply_before_provider_allocation() {
         completed: 0,
     });
     // Four 1 MiB operations plus native headers exceed the complete frame bound.
-    assert!(value.encode(true).is_err());
-    assert!(value.encode(false).is_err());
+    assert!(value.encode_parts(true).is_err());
+    assert!(value.encode_parts(false).is_err());
     let header = batch_header(
         &[MAX_OPERATION_BYTES as u32; 4],
         7,
@@ -974,7 +964,7 @@ fn operation_batch_and_aggregate_limits_apply_before_provider_allocation() {
         &[1, 1, 1, 1],
         0,
     );
-    assert!(Packet::decode(&fixture_message(
+    assert!(Packet::decode_parts(&fixture_message(
         "ReplicationOperation",
         Some((RE_OPERATION, header)),
         vec![0; MAX_FRAME_SIZE]

@@ -15,6 +15,7 @@ http = "1"
 tower-service = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 tracing = "0.1"
+crc32fast.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

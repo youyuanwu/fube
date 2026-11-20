@@ -27,6 +27,8 @@ use tokio::{
 };
 use tower_service::Service;
 
+#[path = "transport/listener.rs"]
+mod listener;
 #[path = "transport/notifications.rs"]
 mod notifications;
 #[path = "transport/routing.rs"]
@@ -1262,9 +1264,17 @@ async fn reconnect_is_coalesced_reuses_send_only_connector_and_never_retargets_o
     ));
     let second_server = tokio::spawn(
         Server::builder()
+            .listen_address("server-listener:31002")
+            .unwrap()
+            .instance(9)
             .on_peer_ready(
                 SendPolicy::new(control_sends),
                 Function(|peer: Peer| async move {
+                    assert_eq!(
+                        String::from_utf16(&peer.info().listen_address).unwrap(),
+                        "client-listener:31001"
+                    );
+                    assert_eq!(peer.info().listen_instance, u64::MAX);
                     peer.send(packet("bootstrap", b"new generation"), deadline())
                         .await?;
                     Ok::<_, Error>(())
@@ -1279,7 +1289,18 @@ async fn reconnect_is_coalesced_reuses_send_only_connector_and_never_retargets_o
                 pending(),
             ),
     );
-    let channel = bounded(raw("memory://original/path?key=1").connect_with_connector(connector))
+    let endpoint = raw("memory://original/path?key=1")
+        .listen_address("client-listener:31001")
+        .unwrap()
+        .instance(u64::MAX);
+    let original = endpoint.clone();
+    drop(
+        endpoint
+            .listen_address("unused-listener:31003")
+            .unwrap()
+            .instance(2),
+    );
+    let channel = bounded(original.connect_with_connector(connector))
         .await
         .unwrap();
     let old = channel.peer(deadline()).await.unwrap();
@@ -1349,6 +1370,11 @@ async fn reconnect_is_coalesced_reuses_send_only_connector_and_never_retargets_o
     let peers = bounded(join_all(waiters)).await;
     let generation = peers[0].as_ref().unwrap().info().generation;
     assert_ne!(generation, old.info().generation);
+    assert_eq!(
+        String::from_utf16(&peers[0].as_ref().unwrap().info().listen_address).unwrap(),
+        "server-listener:31002"
+    );
+    assert_eq!(peers[0].as_ref().unwrap().info().listen_instance, 9);
     assert!(peers
         .iter()
         .all(|peer| peer.as_ref().unwrap().info().generation == generation));

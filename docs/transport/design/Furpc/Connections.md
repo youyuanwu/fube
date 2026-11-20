@@ -148,6 +148,8 @@ impl Server {
 
 impl ServerBuilder {
     pub fn limits(self, limits: TransportLimits) -> Self;
+    pub fn listen_address(self, address: impl Into<String>) -> Result<Self>;
+    pub fn instance(self, instance: u64) -> Self;
     pub fn handshake_timeout(self, timeout: Duration) -> Self;
     pub fn peer_ready_timeout(self, timeout: Duration) -> Self;
     pub fn on_peer_ready<S>(self, send_policy: SendPolicy, service: S) -> Result<Self>
@@ -168,6 +170,8 @@ impl Endpoint {
     pub fn limits(self, limits: TransportLimits) -> Self;
     pub fn connect_timeout(self, timeout: Duration) -> Self;
     pub fn connection_options(self, options: ConnectionOptions) -> Self;
+    pub fn listen_address(self, address: impl Into<String>) -> Result<Self>;
+    pub fn instance(self, instance: u64) -> Self;
 
     pub async fn connect(&self) -> Result<Channel>;
     pub async fn connect_with_connector<C, I>(&self, connector: C) -> Result<Channel>
@@ -234,6 +238,96 @@ Endpoint and Channel have no accept/serve API; Server has no dial/connect API.
 Their registries, private connection drivers, codecs, and messaging algorithms
 use the same implementation, not separate protocol stacks. Either direction
 can carry native reverse ingress or authorized outbound messaging.
+
+### Native-style listener configuration
+
+Configure the local transport listen address and instance directly on Endpoint
+and ServerBuilder. These settings are implemented for clear transport; no
+public LocalListenInstance value is exposed. The wire ListenInstance and its
+nonce remain private transport machinery. Offline API evidence is recorded in
+[implementation](Implementation.md#current-implementation), not native
+replication qualification.
+
+At the pinned native baseline, [CreateTcp(address, id, owner)][sf-create-tcp]
+constructs a listening transport, while CreateTcpClient has no listen address.
+[IDatagramTransport::SetInstance][sf-set-instance-api] sets its local instance;
+the native default is zero. TcpConnection internally constructs ListenInstance
+from [ListenAddress(), Instance(), and ListenSideNonce()][sf-local-hello].
+The corresponding Rust configuration is:
+
+```rust,ignore
+let endpoint = Endpoint::from_shared(destination)?
+    .listen_address(local_listener)?
+    .instance(listener_instance);
+
+let server = Server::builder()
+    .listen_address(local_listener)?
+    .instance(listener_instance)
+    .build()?;
+```
+
+These are pre-start builder settings, not runtime mutation APIs. Both feed the
+same establishment engine, independently of ConnectionOptions' managed/raw-only
+selection. No public hello Message, native codec, per-connection callback or
+new shared DatagramTransport owner is introduced. Endpoint still owns only
+configuration and dials the remote URI; Server still consumes externally owned
+I/O through Accept. Unlike native CreateTcp, these setters do not bind sockets.
+
+| Configuration | Initiating hello | Accepted hello |
+| --- | --- | --- |
+| Both settings omitted | Empty address, instance zero, as today. | Actual adapter local address and instance one when available; empty address and zero otherwise, as today. |
+| Explicit listen_address, instance omitted | Exact configured address, native default instance zero. | Exact configured address, native default instance zero. |
+| Explicit listen_address and instance | Exact configured address and instance. | Exact configured address and instance, independently of adapter diagnostics. |
+| Either role | Transport-generated zero nonce when initiating. | Fresh transport-generated nonzero nonce when accepting. |
+
+The existing implicit accepted instance one is a furpc default, not native
+parity; this slice preserves it for existing consumers. Explicit named-listener
+configuration uses native's default zero and can select any `u64` instance.
+Changing implicit defaults globally would be a separate behavioral change.
+
+`listen_address` rejects an empty explicit listener and validates native
+string/control representability without DNS, URI interpretation, SocketAddr
+requirements or arbitrary construction ceilings. Client-only use omits the
+setting. An explicit `instance` requires an explicit nonempty listen_address,
+matching native's requirement that SetInstance has a listening transport.
+Setters can be ordered either way; Server build and Endpoint connect reject
+incomplete configuration before accepting/acquiring I/O. They also validate
+the configured hello against the selected native send-frame limit. Errors
+preserve native serialization/resource causes without truncation or fallback.
+
+Cloning Endpoint copies these settings. Explicit connects and demand-driven
+reconnects use that snapshot; a Server uses its snapshot for every yielded
+connection. Reconnect does not allocate a new listener instance or revive
+an original Peer. Physical generations and directional nonces remain distinct
+from the transport instance.
+
+Native's [live SetInstance closes existing connections][sf-set-instance-reset]
+because they may have advertised the old instance. Rust's consuming builder
+method cannot mutate a live Channel/Server and does not claim that reset
+contract. A domain changing its listener identity must retire the old owning
+scopes, then construct replacements. An in-place reset API, if ever required,
+needs a separate lifecycle design; it is not part of these settings.
+
+The configured listen address does not rewrite IoInfo, the remote URI, DNS
+results or actual socket endpoints. Furpc does not prove ownership of that
+listener, resolve it, use it as a reconnect destination or authenticate it.
+Custom adapters must not spoof socket metadata to obtain an advertisement.
+The domain owns listener lifetime and validation of its configuration.
+
+Native replication separately [constructs its published endpoint][sf-repl-publish]
+and [serializes it in REFrom][sf-repl-from]. Therefore ListenAddress and REFrom
+address equality is not a universal native contract. Keep publication/membership
+policy above furpc; do not add a generic publish_address setter or use an
+untrusted published address to recreate a source-session grant.
+
+For this migration, fube-data retains its current equal-address supported
+profile: bind first, validate the advertised IP/address family, and configure
+the same transport listener address/instance on both roles. Its exact REFrom
+check remains a documented domain-profile restriction, not native parity.
+Supporting different native listen/publish addresses requires an explicit
+domain mapping/admission policy and independent native qualification; this
+design does not silently relax identity checks. TLS/claims remains deferred
+and never turns either address into authenticated identity by itself.
 
 `from_shared` is the fallible tonic-shaped URI constructor; callers can pass
 owned String/bytes or static strings. `TryFrom<http::Uri>` accepts an already
@@ -812,3 +906,9 @@ If it retires, that call fails; recovery is for later calls, not replay.
 [http-uri]: https://docs.rs/http/latest/http/uri/struct.Uri.html
 [sf-accepted-api]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/IDatagramTransport.h#L75-L106
 [sf-accepted-callback]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/TcpDatagramTransport.cpp#L1346-L1394
+[sf-create-tcp]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/DatagramTransportFactory.h#L12-L19
+[sf-set-instance-api]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/IDatagramTransport.h#L24
+[sf-local-hello]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/TcpConnection.cpp#L206-L209
+[sf-set-instance-reset]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Transport/TcpDatagramTransport.cpp#L137-L170
+[sf-repl-publish]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/ReplicationTransport.cpp#L137-L145
+[sf-repl-from]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/ReplicationTransport.cpp#L920-L925

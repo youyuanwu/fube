@@ -22,6 +22,7 @@ substitute HTTP/2 or gRPC or reproduce the entire ecosystem's abstractions.
 | Foundation | Immutable raw messages, segmented bodies, and one driver per physical generation. Standalone `Message::builder`/header construction is bounded; submission enforces scope policy. RPC is optional composition above raw messaging. |
 | Ownership | Channel clones and submitted service futures share one private dialed scope. There is no separate public dialed owner. `Server` configuration is consumed by one `serve_with_shutdown` future owning accepted work. Native Peer capabilities do not own either scope. |
 | Connections | URI-based Endpoint configures a stable logical Channel. Reusable `Service<http::Uri>` connectors establish/re-establish generations using the original URI on shared demand. Built-in TCP requires `tcp://host:port`; no HTTP wire semantics or implicit port/TLS defaults. Channel is the sole built-in client transport; Peer stays generation-bound. No replay/pooling/balancing. |
+| Local listener | Native-style listen_address/instance builder settings on Endpoint and ServerBuilder; wire ListenInstance stays internal. Explicit listeners default to native instance zero; existing omitted behavior is preserved. Socket binding, publication, actual I/O diagnostics and authentication remain separate. |
 | Requests | http-shaped, body-first `Request<B>` is shared by outbound calls, server middleware, and decoded handlers. Requests and parts allow bounded ordered-header edits; trusted context and original admission remain protected. Message/request/reply envelopes use generic header insertion; Actor/Action helpers are not special envelope fields. Body adaptation preserves current headers and context. |
 | Responses | http-shaped `Response<T>` body access and parts reassembly preserve editable headers, read-only native provenance/settlement, and accounting. No HTTP status/version semantics. |
 | Codecs | Native header/control serialization is fixed internally using `fubst`. `RpcClient<T>` wraps a byte-facing Tower transport (default Channel), uses ordinary mutable async calls, and consumes codecs per call under explicit client codec limits. Peer request/notify operations remain byte-facing; typed notifications reuse RpcClient over an explicit notify byte-service adapter. Server method services construct `server::Rpc<C>`; routers are codec-free. |
@@ -63,6 +64,15 @@ For the shortest usage path, read Connections, Requests, Routing, and Examples.
 For core work, read Architecture, Resources, Operations, Framing, and Lifecycle.
 Cross-topic references point to the owning contract rather than duplicating
 signatures or inventing a second control path.
+
+The delivered consumer slices now include
+[data replication](Implementation.md#data-replication-migration).
+Its furpc API prerequisite,
+[native-style listener configuration](Connections.md#native-style-listener-configuration),
+is now implemented for clear transport;
+the adapter uses the existing raw service/Peer contracts and
+explicitly changes the legacy adapter's admission and cancellation guarantees.
+The consumer migration is implemented; native replication qualification remains pending.
 
 ## Non-goals and evidence
 

@@ -265,7 +265,7 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
         assert_eq!(receipt["admission_only"], false);
         assert_eq!(
             receipt["delivery"]["classification"],
-            "socket_write_all_and_flush"
+            "complete_local_socket_acceptance"
         );
         assert!(receipt["delivery"]["session"].as_u64().unwrap() > 0);
         assert!(!receipt["delivery"]["frame_hex"]

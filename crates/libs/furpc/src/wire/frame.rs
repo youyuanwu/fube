@@ -248,25 +248,22 @@ fn crc8(bytes: &[u8]) -> u8 {
 /// Incremental native CRC-32 over segments; observing the value does not reset it.
 #[derive(Debug)]
 pub(crate) struct Crc32 {
-    state: u32,
+    state: crc32fast::Hasher,
 }
 
 impl Crc32 {
     pub(crate) fn new() -> Self {
-        Self { state: u32::MAX }
-    }
-
-    pub(crate) fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.state ^= u32::from(*byte);
-            for _ in 0..8 {
-                self.state = (self.state >> 1) ^ if self.state & 1 != 0 { 0xedb8_8320 } else { 0 };
-            }
+        Self {
+            state: crc32fast::Hasher::new(),
         }
     }
 
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        self.state.update(bytes);
+    }
+
     pub(crate) fn value(&self) -> u32 {
-        !self.state
+        self.state.clone().finalize()
     }
 }
 
@@ -315,6 +312,22 @@ mod tests {
         assert_eq!(crc.value(), 0xfc86_d6b5);
         crc.update(b"this is a part 2 of s1");
         assert_eq!(crc.value(), 0x36af_107a);
+        // Independent zlib IEEE CRC-32 vectors exercise accelerated long input.
+        for (bytes, expected) in [
+            (vec![0; 200 * 1024], 0xd537_4f3f),
+            (
+                (0..=255).cycle().take(1024 * 1024).collect::<Vec<u8>>(),
+                0x04d0_e435,
+            ),
+        ] {
+            for chunk in [31, 4096, 65536] {
+                let mut crc = Crc32::new();
+                for bytes in bytes.chunks(chunk) {
+                    crc.update(bytes);
+                }
+                assert_eq!(crc.value(), expected, "chunk {chunk}");
+            }
+        }
     }
 
     #[test]
