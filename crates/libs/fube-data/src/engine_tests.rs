@@ -863,9 +863,16 @@ async fn all_sixty_four_copy_callbacks_allow_callback_free_terminal_retirement_a
                 Some(packet) = incoming.recv_control() => {
                     if let Body::StartCopy { target, .. } = packet.body {
                         let destination = &replicas[(target - 2) as usize].1;
-                        raw_send(&network, destination, &p, Body::Ack {
-                            received: 0, applied: 0, copy_received: 0, copy_applied: 0, error: 0,
-                        });
+                        let written = network.send_observed(Packet {
+                            from: destination.clone(),
+                            to: p.endpoint.actor,
+                            body: Body::Ack {
+                                received: 0, applied: 0, copy_received: 0, copy_applied: 0, error: 0,
+                            },
+                        }).unwrap();
+                        // Saturate provider callbacks, not the fixture's ACK queue.
+                        // This is local writing only; callback admission remains observed below.
+                        drop(timeout(std::time::Duration::from_secs(2), written).await.unwrap().unwrap());
                     }
                 },
                 _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
