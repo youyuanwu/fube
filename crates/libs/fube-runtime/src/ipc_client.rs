@@ -27,7 +27,7 @@ use tokio::{
 };
 use tower_service::Service;
 
-use crate::{Error, ErrorKind, Result};
+use crate::{wire, Error, ErrorKind, Result};
 
 #[cfg(test)]
 #[path = "ipc_client_tests.rs"]
@@ -142,7 +142,7 @@ pub(crate) struct IpcClient {
     session: Arc<Session>,
     peer: Peer,
     identity: HeaderRecord,
-    serving: Option<Check>,
+    hosting: HostingClient<PeerService>,
 }
 
 impl IpcClient {
@@ -250,11 +250,17 @@ impl IpcClient {
             }
             connection.channel = Some(channel);
         }
+        let hosting = HostingClient::new(
+            PeerService(peer.clone()),
+            identity.clone(),
+            session.clone(),
+            serving,
+        );
         Ok(Self {
             session,
             peer,
             identity,
-            serving,
+            hosting,
         })
     }
 
@@ -288,77 +294,9 @@ impl IpcClient {
         Ok(())
     }
 
-    pub(crate) async fn request<Q, R>(
-        &self,
-        action: &str,
-        actor: i64,
-        mut request: Request<Q>,
-        deadline: Instant,
-        valid: Option<Check>,
-    ) -> Result<Response<R>>
-    where
-        Q: Serialize + Send + 'static,
-        R: DeserializeOwned + Send + 'static,
-    {
-        let deadline = request
-            .deadline()
-            .map_or(deadline, |local| local.min(deadline));
-        let _admission = timeout_at(deadline, self.session.ordinary.acquire())
-            .await
-            .map_err(|_| Error::Timeout)?
-            .map_err(|_| Error::Closed)?;
-        self.session.check()?;
-        let cleanup = matches!(
-            action,
-            "UnregisterFabricRuntimeRequest" | "UnregisterApplicationHostRequest"
-        );
-        let serving = (!cleanup).then(|| self.serving.clone()).flatten();
-        let check = Arc::new(move || {
-            serving.as_ref().is_none_or(|check| check())
-                && valid.as_ref().is_none_or(|check| check())
-        });
-        request
-            .headers_mut()
-            .append(header::actor(self::actor(actor)?).map_err(native_error)?)
-            .map_err(native_error)?;
-        if !action.is_empty() {
-            request
-                .headers_mut()
-                .append(header::action(action).map_err(native_error)?)
-                .map_err(native_error)?;
-        }
-        let mut rpc = RpcClient::new(IpcService {
-            transport: PeerService(self.peer.clone()),
-            identity: self.identity.clone(),
-            health: action == "ReportHealth",
-            valid: check.clone(),
-        });
-        let result = rpc
-            .call(request, FubstCodec::<Q, R>::default(), deadline)
-            .await;
-        let encoding = matches!(
-            &result,
-            Err(furpc::Error::Codec {
-                phase: "encode",
-                ..
-            })
-        );
-        let result = result.map_err(native_error);
-        if let Err(error) = &result {
-            if !encoding
-                && (matches!(error, Error::Protocol(_))
-                    || (matches!(error.kind(), ErrorKind::ObjectClosed | ErrorKind::Transport)
-                        && check()))
-            {
-                self.session.retire(error.clone());
-            }
-        }
-        let response = result?;
-        self.session.check()?;
-        if !check() {
-            return Err(Error::Closed);
-        }
-        Ok(response)
+    /// Clone the typed stub for independent calls on the original generation.
+    pub(crate) fn hosting(&self) -> HostingClient<PeerService> {
+        self.hosting.clone()
     }
 
     pub(crate) async fn send_one_way(
@@ -438,6 +376,218 @@ impl IpcClient {
             return Err(Error::Closed);
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum HostingMethod {
+    StartHost,
+    FinishHost,
+    RegisterRuntime,
+    RegisterType,
+    UnregisterRuntime,
+    UnregisterHost,
+    Lease,
+    Health,
+}
+
+impl HostingMethod {
+    fn envelope(self) -> (i64, &'static str) {
+        match self {
+            Self::StartHost => (7, "StartRegisterApplicationHostRequest"),
+            Self::FinishHost => (7, "FinishRegisterApplicationHostRequest"),
+            Self::RegisterRuntime => (9, "RegisterFabricRuntimeRequest"),
+            Self::RegisterType => (9, "RegisterServiceTypeRequest"),
+            Self::UnregisterRuntime => (9, "UnregisterFabricRuntimeRequest"),
+            Self::UnregisterHost => (7, "UnregisterApplicationHostRequest"),
+            Self::Lease => (15, ""),
+            Self::Health => (7, "ReportHealth"),
+        }
+    }
+
+    fn cleanup(self) -> bool {
+        matches!(self, Self::UnregisterRuntime | Self::UnregisterHost)
+    }
+
+    fn reply_validator(self) -> fn(&Response<Body>) -> Result<()> {
+        match self {
+            Self::Health => check_health_reply,
+            _ => check_hosting_reply,
+        }
+    }
+}
+
+/// Typed Hosting RPCs over a byte service; clone explicitly for concurrent calls.
+#[derive(Clone)]
+pub(crate) struct HostingClient<T> {
+    inner: RpcClient<IpcService<T>>,
+    session: Arc<Session>,
+    serving: Option<Check>,
+}
+
+impl<T> HostingClient<T> {
+    fn new(
+        transport: T,
+        identity: HeaderRecord,
+        session: Arc<Session>,
+        serving: Option<Check>,
+    ) -> Self {
+        Self {
+            inner: RpcClient::new(IpcService {
+                transport,
+                identity,
+                validate_reply: check_hosting_reply,
+                valid: Arc::new(|| true),
+            }),
+            session,
+            serving,
+        }
+    }
+}
+
+impl<T> HostingClient<T>
+where
+    T: Service<Request<Body>, Response = Response<Body>> + Send,
+    T::Future: Send + 'static,
+    T::Error: Into<BoxError>,
+{
+    pub(crate) async fn start_register_application_host(
+        &mut self,
+        request: Request<wire::StartRequest>,
+        deadline: Instant,
+    ) -> Result<Response<wire::StartReply>> {
+        self.unary(request, HostingMethod::StartHost, deadline, None)
+            .await
+    }
+
+    pub(crate) async fn finish_register_application_host(
+        &mut self,
+        request: Request<wire::IdRequest>,
+        deadline: Instant,
+    ) -> Result<Response<wire::ErrorReply>> {
+        self.unary(request, HostingMethod::FinishHost, deadline, None)
+            .await
+    }
+
+    pub(crate) async fn register_fabric_runtime(
+        &mut self,
+        request: Request<wire::RuntimeRequest>,
+        deadline: Instant,
+    ) -> Result<Response<wire::ErrorReply>> {
+        self.unary(request, HostingMethod::RegisterRuntime, deadline, None)
+            .await
+    }
+
+    pub(crate) async fn register_service_type(
+        &mut self,
+        request: Request<wire::TypeRequest>,
+        deadline: Instant,
+    ) -> Result<Response<wire::ErrorReply>> {
+        self.unary(request, HostingMethod::RegisterType, deadline, None)
+            .await
+    }
+
+    pub(crate) async fn unregister_fabric_runtime(
+        &mut self,
+        request: Request<wire::IdRequest>,
+        deadline: Instant,
+    ) -> Result<Response<wire::ErrorReply>> {
+        self.unary(request, HostingMethod::UnregisterRuntime, deadline, None)
+            .await
+    }
+
+    pub(crate) async fn unregister_application_host(
+        &mut self,
+        request: Request<wire::UnregisterHost>,
+        deadline: Instant,
+    ) -> Result<Response<wire::ErrorReply>> {
+        self.unary(request, HostingMethod::UnregisterHost, deadline, None)
+            .await
+    }
+
+    pub(crate) async fn poll_lease(
+        &mut self,
+        request: Request<()>,
+        deadline: Instant,
+    ) -> Result<Response<wire::LeaseReply>> {
+        self.unary(request, HostingMethod::Lease, deadline, None)
+            .await
+    }
+
+    pub(crate) async fn report_health(
+        &mut self,
+        request: Request<wire::HealthBody>,
+        deadline: Instant,
+        valid: Check,
+    ) -> Result<Response<wire::HealthReply>> {
+        self.unary(request, HostingMethod::Health, deadline, Some(valid))
+            .await
+    }
+
+    pub(super) async fn unary<Q, R>(
+        &mut self,
+        mut request: Request<Q>,
+        method: HostingMethod,
+        deadline: Instant,
+        valid: Option<Check>,
+    ) -> Result<Response<R>>
+    where
+        Q: Serialize + Send + 'static,
+        R: DeserializeOwned + Send + 'static,
+    {
+        let deadline = request
+            .deadline()
+            .map_or(deadline, |local| local.min(deadline));
+        let _admission = timeout_at(deadline, self.session.ordinary.acquire())
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::Closed)?;
+        self.session.check()?;
+        let serving = (!method.cleanup()).then(|| self.serving.clone()).flatten();
+        let check = Arc::new(move || {
+            serving.as_ref().is_none_or(|check| check())
+                && valid.as_ref().is_none_or(|check| check())
+        });
+        let (actor, action) = method.envelope();
+        request
+            .headers_mut()
+            .append(header::actor(self::actor(actor)?).map_err(native_error)?)
+            .map_err(native_error)?;
+        if !action.is_empty() {
+            request
+                .headers_mut()
+                .append(header::action(action).map_err(native_error)?)
+                .map_err(native_error)?;
+        }
+        self.inner.get_mut().validate_reply = method.reply_validator();
+        self.inner.get_mut().valid = check.clone();
+        let result = self
+            .inner
+            .call(request, FubstCodec::<Q, R>::default(), deadline)
+            .await;
+        let encoding = matches!(
+            &result,
+            Err(furpc::Error::Codec {
+                phase: "encode",
+                ..
+            })
+        );
+        let result = result.map_err(native_error);
+        if let Err(error) = &result {
+            if !encoding
+                && (matches!(error, Error::Protocol(_))
+                    || (matches!(error.kind(), ErrorKind::ObjectClosed | ErrorKind::Transport)
+                        && check()))
+            {
+                self.session.retire(error.clone());
+            }
+        }
+        let response = result?;
+        self.session.check()?;
+        if !check() {
+            return Err(Error::Closed);
+        }
+        Ok(response)
     }
 }
 
@@ -541,8 +691,29 @@ fn response(headers: &Headers, _: &Source) -> furpc::Result<()> {
 struct IpcService<T> {
     transport: T,
     identity: HeaderRecord,
-    health: bool,
+    validate_reply: fn(&Response<Body>) -> Result<()>,
     valid: Check,
+}
+
+fn check_hosting_reply(response: &Response<Body>) -> Result<()> {
+    if matches!(response.headers().effective().actor.get(), 25 | 27) {
+        return Err(Error::Protocol("unexpected runtime IPC reply envelope"));
+    }
+    Ok(())
+}
+
+fn check_health_reply(response: &Response<Body>) -> Result<()> {
+    let properties = response.headers().effective();
+    if properties.actor.get() != 16
+        || !properties
+            .action()
+            .iter()
+            .copied()
+            .eq("OperationSuccessAction".encode_utf16())
+    {
+        return Err(Error::Protocol("unexpected runtime IPC reply envelope"));
+    }
+    Ok(())
 }
 
 impl<T> Service<Request<Body>> for IpcService<T>
@@ -604,28 +775,17 @@ where
             return Box::pin(async move { Err(error) });
         }
         let future = self.transport.call(request);
-        let health = self.health;
+        let validate_reply = self.validate_reply;
         Box::pin(async move {
             let response = future.await.map_err(|error| service_error(error.into()))?;
-            let properties = response.headers().effective();
-            if matches!(properties.actor.get(), 25 | 27)
-                || (health
-                    && (properties.actor.get() != 16
-                        || !properties
-                            .action()
-                            .iter()
-                            .copied()
-                            .eq("OperationSuccessAction".encode_utf16())))
-            {
-                return Err(Error::Protocol("unexpected runtime IPC reply envelope"));
-            }
+            validate_reply(&response)?;
             Ok(response)
         })
     }
 }
 
 #[derive(Clone)]
-struct PeerService(Peer);
+pub(crate) struct PeerService(Peer);
 
 impl Service<Request<Body>> for PeerService {
     type Response = Response<Body>;

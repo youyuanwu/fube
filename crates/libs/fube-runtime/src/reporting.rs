@@ -443,15 +443,14 @@ impl Reporting {
                 .map_err(native_error)?,
             )
             .map_err(native_error)?;
+        let mut hosting = self.connection.hosting();
         let reply = tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return Err(Error::Closed),
-            result = self.connection.request::<_, HealthReply>(
-                "ReportHealth",
-                7,
+            result = hosting.report_health(
                 request,
                 deadline_after(REPORT_TIMEOUT)?,
-                Some(self.fence()),
+                self.fence(),
             ) => result.map_err(report_transport_error)?,
         };
         let reply = reply.into_body();

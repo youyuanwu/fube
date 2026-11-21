@@ -225,40 +225,16 @@ fn success(reply: ErrorReply) -> Result<()> {
     }
 }
 
-async fn call<
-    T: serde::Serialize + Send + 'static,
-    R: serde::de::DeserializeOwned + Send + 'static,
->(
-    connection: &IpcClient,
-    actor: i64,
-    action: &str,
-    value: T,
-) -> Result<R> {
-    let reply = connection
-        .request(
-            action,
-            actor,
-            furpc::Request::new(value),
-            deadline_after(REGISTRATION_TIMEOUT)?,
-            None,
-        )
-        .await?;
-    Ok(reply.into_body())
-}
-
 async fn poll_lease(connection: &IpcClient) -> Result<(Monotonic, i64)> {
     let sent = Monotonic::now();
     let reply = connection
-        .request(
-            "",
-            15,
+        .hosting()
+        .poll_lease(
             furpc::Request::new(()),
             deadline_after(Duration::from_secs(5))?,
-            None,
         )
         .await?;
-    let lease: LeaseReply = reply.into_body();
-    Ok((sent, lease.ttl))
+    Ok((sent, reply.into_body().ttl))
 }
 
 impl Runtime {
@@ -360,20 +336,21 @@ impl Runtime {
             })),
         )
         .await?;
-        let start: StartReply = call(
-            &connection,
-            7,
-            "StartRegisterApplicationHostRequest",
-            StartRequest {
-                id: activation.host_id.clone(),
-                kind: 1,
-                pid: std::process::id(),
-                timeout: 300_000_000,
-                container: false,
-                activator: false,
-            },
-        )
-        .await?;
+        let mut hosting = connection.hosting();
+        let start = hosting
+            .start_register_application_host(
+                furpc::Request::new(StartRequest {
+                    id: activation.host_id.clone(),
+                    kind: 1,
+                    pid: std::process::id(),
+                    timeout: 300_000_000,
+                    container: false,
+                    activator: false,
+                }),
+                deadline_after(REGISTRATION_TIMEOUT)?,
+            )
+            .await?
+            .into_body();
         success(ErrorReply { error: start.error })?;
         authority.check()?;
         if start.lease_handle == 0 || start.node_id.is_empty() || start.node_name.is_empty() {
@@ -393,27 +370,27 @@ impl Runtime {
         activation.endpoints = packages.endpoints().clone();
         activation.packages = Some(Arc::new(packages));
         success(
-            call(
-                &connection,
-                7,
-                "FinishRegisterApplicationHostRequest",
-                IdRequest {
-                    id: activation.host_id.clone(),
-                },
-            )
-            .await?,
+            hosting
+                .finish_register_application_host(
+                    furpc::Request::new(IdRequest {
+                        id: activation.host_id.clone(),
+                    }),
+                    deadline_after(REGISTRATION_TIMEOUT)?,
+                )
+                .await?
+                .into_body(),
         )?;
         authority.check()?;
         success(
-            call(
-                &connection,
-                9,
-                "RegisterFabricRuntimeRequest",
-                RuntimeRequest {
-                    context: activation.runtime.clone(),
-                },
-            )
-            .await?,
+            hosting
+                .register_fabric_runtime(
+                    furpc::Request::new(RuntimeRequest {
+                        context: activation.runtime.clone(),
+                    }),
+                    deadline_after(REGISTRATION_TIMEOUT)?,
+                )
+                .await?
+                .into_body(),
         )?;
         authority.check()?;
         // Initial TTL source ambiguity never grants serving authority. A fresh
@@ -662,18 +639,22 @@ impl Runtime {
         }
         registrations.spawn_on(
             async move {
-                let reply: Result<ErrorReply> = call(
-                    &connection,
-                    9,
-                    "RegisterServiceTypeRequest",
-                    TypeRequest {
-                        context: activation.runtime.clone(),
-                        id: TypeId {
-                            package: activation.runtime.code.id.package.clone(),
-                            name,
-                        },
-                    },
-                )
+                let reply = async {
+                    connection
+                        .hosting()
+                        .register_service_type(
+                            furpc::Request::new(TypeRequest {
+                                context: activation.runtime.clone(),
+                                id: TypeId {
+                                    package: activation.runtime.code.id.package.clone(),
+                                    name,
+                                },
+                            }),
+                            deadline_after(REGISTRATION_TIMEOUT)?,
+                        )
+                        .await
+                        .map(furpc::Response::into_body)
+                }
                 .await;
                 let result = match reply {
                     Ok(reply) if reply.error == 0 || reply.error == 0x80071d31u32 as i32 as i64 => {
@@ -763,34 +744,35 @@ impl Runtime {
         }
         self.current.quiescent()?;
         self.lifecycle.quiesce().await?;
+        let mut hosting = self.connection.hosting();
         success(
-            call(
-                &self.connection,
-                9,
-                "UnregisterFabricRuntimeRequest",
-                IdRequest {
-                    id: self.activation.runtime.id.clone(),
-                },
-            )
-            .await?,
+            hosting
+                .unregister_fabric_runtime(
+                    furpc::Request::new(IdRequest {
+                        id: self.activation.runtime.id.clone(),
+                    }),
+                    deadline_after(REGISTRATION_TIMEOUT)?,
+                )
+                .await?
+                .into_body(),
         )?;
         success(
-            call(
-                &self.connection,
-                7,
-                "UnregisterApplicationHostRequest",
-                UnregisterHost {
-                    activity: Activity {
-                        id: ActivityId {
-                            guid: fubst::serde::Guid(uuid::Uuid::new_v4().to_bytes_le()),
-                            index: 0,
+            hosting
+                .unregister_application_host(
+                    furpc::Request::new(UnregisterHost {
+                        activity: Activity {
+                            id: ActivityId {
+                                guid: fubst::serde::Guid(uuid::Uuid::new_v4().to_bytes_le()),
+                                index: 0,
+                            },
+                            kind: 0,
                         },
-                        kind: 0,
-                    },
-                    id: self.activation.host_id.clone(),
-                },
-            )
-            .await?,
+                        id: self.activation.host_id.clone(),
+                    }),
+                    deadline_after(REGISTRATION_TIMEOUT)?,
+                )
+                .await?
+                .into_body(),
         )?;
         for task in &self.tasks {
             task.abort();

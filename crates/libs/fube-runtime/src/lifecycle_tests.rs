@@ -442,19 +442,24 @@ async fn health_saturation_leaves_poll_admission_and_rejects_overload() {
     let connection = h.engine.shared.connection.clone();
     let poll = tokio::spawn(async move {
         connection
-            .request::<_, ()>(
-                "",
-                15,
+            .hosting()
+            .poll_lease(
                 furpc::Request::new(()),
                 deadline_after(Duration::from_secs(1)).unwrap(),
-                None,
             )
             .await
     });
     let message = h.peer.receive().await.unwrap();
     assert_eq!(message.metadata().unwrap().actor, 15);
     message
-        .respond(fube_rap_test_support::transport::message(0, "", vec![]).unwrap())
+        .respond(
+            fube_rap_test_support::transport::message(
+                0,
+                "",
+                to_vec(&LeaseReply { ttl: 300_000_000 }).unwrap(),
+            )
+            .unwrap(),
+        )
         .unwrap();
     poll.await.unwrap().unwrap();
     for task in reports {
@@ -1620,10 +1625,10 @@ async fn local_rpc_encoding_failure_does_not_retire_the_runtime_session() {
         .engine
         .shared
         .connection
-        .request::<_, ()>(
-            "RegisterFabricRuntimeRequest",
-            9,
+        .hosting()
+        .unary::<_, ()>(
             furpc::Request::new(1u8),
+            crate::ipc_client::HostingMethod::RegisterRuntime,
             deadline_after(Duration::from_secs(2)).unwrap(),
             None,
         )
@@ -1701,12 +1706,10 @@ async fn prove_unregister_ipc_after_drain(h: &mut Harness) {
         assert_eq!(properties.action, "UnregisterFabricRuntimeRequest");
         request.respond(message(0, "", body).unwrap()).unwrap();
     };
-    let send = connection.request::<_, ErrorReply>(
-        "UnregisterFabricRuntimeRequest",
-        9,
+    let mut hosting = connection.hosting();
+    let send = hosting.unregister_fabric_runtime(
         furpc::Request::new(IdRequest { id }),
         deadline_after(Duration::from_secs(2)).unwrap(),
-        None,
     );
     let (reply, ()) = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::join!(send, receive)

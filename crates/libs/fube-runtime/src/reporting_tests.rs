@@ -469,12 +469,10 @@ async fn canonical_stateless_reporting_native_literals_immediate_and_per_record_
     let connection = h.engine.shared.connection.clone();
     let poll = tokio::spawn(async move {
         connection
-            .request::<_, LeaseReply>(
-                "",
-                15,
+            .hosting()
+            .poll_lease(
                 furpc::Request::new(()),
                 deadline_after(Duration::from_secs(2)).unwrap(),
-                None,
             )
             .await
     });

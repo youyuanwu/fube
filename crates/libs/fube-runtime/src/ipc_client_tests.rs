@@ -47,7 +47,11 @@ fn service(response: Response<Body>, health: bool, valid: Check) -> (IpcService<
                 },
             )
             .unwrap(),
-            health,
+            validate_reply: if health {
+                check_health_reply
+            } else {
+                check_hosting_reply
+            },
             valid,
         },
         received,
@@ -64,22 +68,52 @@ fn request(actor: i64, action: &str) -> Request<IdRequest> {
     .unwrap()
 }
 
+fn client(response: Response<Body>, serving: Option<Check>) -> (HostingClient<Probe>, Captured) {
+    let (service, captured) = service(response, false, Arc::new(|| true));
+    let session = Arc::new(Session {
+        connection: Mutex::new(Connection {
+            channel: None,
+            error: None,
+        }),
+        stopped: watch::channel(None).0,
+        ordinary: Semaphore::new(OPERATIONS),
+        replies: Semaphore::new(OPERATIONS),
+    });
+    (
+        HostingClient::new(service.transport, service.identity, session, serving),
+        captured,
+    )
+}
+
+fn health_request() -> Request<wire::HealthBody> {
+    Request::new(wire::HealthBody {
+        reports: fubst::serde::ObjectArray(vec![]),
+        streams: fubst::serde::EmptyObjectArray,
+    })
+}
+
 #[tokio::test]
 async fn typed_rpc_projects_identity_and_remaining_deadline_without_legacy_messages() {
     let response =
         Response::new(Body::from_bytes(to_vec(&ErrorReply { error: 0 }).unwrap()).unwrap());
-    let (service, received) = service(response, false, Arc::new(|| true));
+    let (mut client, received) = client(response, None);
     let deadline = deadline_after(Duration::from_secs(2)).unwrap();
-    let reply = RpcClient::new(service)
-        .call(
-            request(9, "RegisterFabricRuntimeRequest"),
-            FubstCodec::<IdRequest, ErrorReply>::default(),
+    let reply = client
+        .finish_register_application_host(
+            Request::new(IdRequest {
+                id: "runtime".into(),
+            }),
             deadline,
         )
         .await
         .unwrap();
     assert_eq!(reply.into_body().error, 0);
     let sent = received.lock().unwrap().take().unwrap();
+    assert_eq!(sent.headers().effective().actor.get(), 7);
+    assert_eq!(
+        action(sent.headers()).unwrap(),
+        "FinishRegisterApplicationHostRequest"
+    );
     let identity: Identity = from_slice(
         sent.headers()
             .first_raw(HeaderId::new(IPC).unwrap())
@@ -112,19 +146,90 @@ async fn health_envelope_is_rejected_before_success_body_decoding() {
         .headers_mut()
         .append(header::actor(actor(8).unwrap()).unwrap())
         .unwrap();
-    let (service, _) = service(response, true, Arc::new(|| true));
-    let error = RpcClient::new(service)
-        .call(
-            request(7, "ReportHealth"),
-            FubstCodec::<IdRequest, ErrorReply>::default(),
+    let (mut client, _) = client(response, None);
+    let error = client
+        .report_health(
+            health_request(),
             deadline_after(Duration::from_secs(2)).unwrap(),
+            Arc::new(|| true),
         )
         .await
         .unwrap_err();
     assert!(matches!(
-        native_error(error),
+        error,
         Error::Protocol("unexpected runtime IPC reply envelope")
     ));
+    assert!(client.session.check().is_err());
+}
+
+#[tokio::test]
+async fn typed_lease_poll_uses_empty_native_body_and_decodes_ttl() {
+    let response =
+        Response::new(Body::from_bytes(to_vec(&wire::LeaseReply { ttl: 123 }).unwrap()).unwrap());
+    let (mut client, received) = client(response, None);
+    let reply = client
+        .poll_lease(
+            Request::new(()),
+            deadline_after(Duration::from_secs(2)).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.into_body().ttl, 123);
+    let sent = received.lock().unwrap().take().unwrap();
+    assert_eq!(sent.headers().effective().actor.get(), 15);
+    assert!(sent.headers().first_raw(header::ACTION).is_none());
+    assert!(sent.body().is_empty());
+}
+
+#[tokio::test]
+async fn unregister_preserves_cleanup_exemption_after_serving_authority_retires() {
+    let response =
+        Response::new(Body::from_bytes(to_vec(&ErrorReply { error: 0 }).unwrap()).unwrap());
+    let (mut client, received) = client(response, Some(Arc::new(|| false)));
+    let error = client
+        .finish_register_application_host(
+            Request::new(IdRequest { id: "host".into() }),
+            deadline_after(Duration::from_secs(2)).unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Closed));
+    assert!(received.lock().unwrap().is_none());
+    assert!(client.session.check().is_ok());
+
+    let reply = client
+        .unregister_fabric_runtime(
+            Request::new(IdRequest {
+                id: "runtime".into(),
+            }),
+            deadline_after(Duration::from_secs(2)).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.into_body().error, 0);
+    let sent = received.lock().unwrap().take().unwrap();
+    assert_eq!(sent.headers().effective().actor.get(), 9);
+    assert_eq!(
+        action(sent.headers()).unwrap(),
+        "UnregisterFabricRuntimeRequest"
+    );
+}
+
+#[tokio::test]
+async fn typed_health_method_retains_its_per_report_admission_fence() {
+    let response = Response::new(Body::empty());
+    let (mut client, received) = client(response, None);
+    let error = client
+        .report_health(
+            health_request(),
+            deadline_after(Duration::from_secs(2)).unwrap(),
+            Arc::new(|| false),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Closed));
+    assert!(received.lock().unwrap().is_none());
+    assert!(client.session.check().is_ok());
 }
 
 #[tokio::test]
