@@ -5,6 +5,7 @@ pub mod actor {
     //! [the pinned enumeration](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/Actor.h).
     //! Naming a subsystem does not authorize its traffic or qualify its protocol.
 
+    pub const EMPTY: i64 = 0;
     pub const APPLICATION_HOST_MANAGER: i64 = 7;
     pub const APPLICATION_HOST: i64 = 8;
     pub const FABRIC_RUNTIME_MANAGER: i64 = 9;

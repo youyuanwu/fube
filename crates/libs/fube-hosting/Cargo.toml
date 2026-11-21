@@ -9,6 +9,7 @@ description = "Bounded Hosting2 registration, residency and bootstrap-only local
 qualification = []
 
 [dependencies]
+fube-core.workspace = true
 fube-local-host = { path = "../fube-local-host" }
 uuid.workspace = true
 furpc.workspace = true

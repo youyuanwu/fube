@@ -1,7 +1,6 @@
 //! Typed Hosting methods; domain admission precedes bounded DTO decoding.
-use super::{
-    admit_dispatch, deadline, dispatch, protocol, reply_budget, transport, wire, Entry, Shared,
-};
+use super::{admit_dispatch, deadline, dispatch, protocol, reply_budget, wire, Entry, Shared};
+use fube_core::protocol::actor as actors;
 use furpc::{
     header, ActorId, Body, Codec, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder, Error,
     FubstCodec, IngressResponse, Reply, Request, Result,
@@ -40,13 +39,28 @@ impl Method {
 
     pub(super) fn envelope(self) -> (i64, &'static str) {
         match self {
-            Self::Start => (7, "StartRegisterApplicationHostRequest"),
-            Self::Finish => (7, "FinishRegisterApplicationHostRequest"),
-            Self::RegisterRuntime => (9, "RegisterFabricRuntimeRequest"),
-            Self::RegisterType => (9, "RegisterServiceTypeRequest"),
-            Self::UnregisterRuntime => (9, "UnregisterFabricRuntimeRequest"),
-            Self::UnregisterHost => (7, "UnregisterApplicationHostRequest"),
-            Self::Lease => (15, ""),
+            Self::Start => (
+                actors::APPLICATION_HOST_MANAGER,
+                "StartRegisterApplicationHostRequest",
+            ),
+            Self::Finish => (
+                actors::APPLICATION_HOST_MANAGER,
+                "FinishRegisterApplicationHostRequest",
+            ),
+            Self::RegisterRuntime => (
+                actors::FABRIC_RUNTIME_MANAGER,
+                "RegisterFabricRuntimeRequest",
+            ),
+            Self::RegisterType => (actors::FABRIC_RUNTIME_MANAGER, "RegisterServiceTypeRequest"),
+            Self::UnregisterRuntime => (
+                actors::FABRIC_RUNTIME_MANAGER,
+                "UnregisterFabricRuntimeRequest",
+            ),
+            Self::UnregisterHost => (
+                actors::APPLICATION_HOST_MANAGER,
+                "UnregisterApplicationHostRequest",
+            ),
+            Self::Lease => (actors::HOSTING, ""),
         }
     }
 
@@ -117,6 +131,10 @@ impl HostingRpc {
         HostingCodec(self.clone())
     }
 
+    pub(super) fn method(&self) -> Method {
+        self.method
+    }
+
     pub(super) async fn unary(self, request: Request<Body>) -> Result<IngressResponse> {
         let mut rpc = furpc::server::Rpc::new(self.codec());
         let lease = self.method == Method::Lease;
@@ -155,12 +173,12 @@ impl HostingRpc {
             admit_dispatch(&self.shared, &self.entry, self.method, self.type_deadline)?;
         let budget = self.shared.config.decode_bytes;
         Ok(match self.method {
-            Method::Start => Call::Start(decode(src, budget)?),
-            Method::Finish => Call::Finish(decode(src, budget)?),
-            Method::RegisterRuntime => Call::RegisterRuntime(decode(src, budget)?),
-            Method::RegisterType => Call::RegisterType(decode(src, budget)?),
-            Method::UnregisterRuntime => Call::UnregisterRuntime(decode(src, budget)?),
-            Method::UnregisterHost => Call::UnregisterHost(decode(src, budget)?),
+            Method::Start => Call::Start(decode_body(src, budget)?),
+            Method::Finish => Call::Finish(decode_body(src, budget)?),
+            Method::RegisterRuntime => Call::RegisterRuntime(decode_body(src, budget)?),
+            Method::RegisterType => Call::RegisterType(decode_body(src, budget)?),
+            Method::UnregisterRuntime => Call::UnregisterRuntime(decode_body(src, budget)?),
+            Method::UnregisterHost => Call::UnregisterHost(decode_body(src, budget)?),
             Method::Lease => return Err(Error::Internal("Hosting RPC method")),
         })
     }
@@ -192,7 +210,7 @@ impl Service<Request<Call>> for HostingRpc {
             } else {
                 dispatch(&self.shared, &self.entry, call, self.type_deadline)?
             };
-            Reply::new(response).append_header(header::actor(ActorId::new(0)?)?)
+            Reply::new(response).append_header(header::actor(ActorId::new(actors::EMPTY)?)?)
         })())
     }
 }
@@ -249,18 +267,32 @@ impl Encoder for ResponseEncoder {
     }
 }
 
-fn decode<T: DeserializeOwned>(src: &mut DecodeBuf<'_>, budget: usize) -> Result<T> {
+pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<T> {
+    let mut left = limit;
+    fubst::serde::from_slice_with_budget(bytes, &mut |capacity| {
+        left = left
+            .checked_sub(capacity)
+            .ok_or(fubst::Error::ResourceLimit("Hosting decode budget"))?;
+        Ok(())
+    })
+    .map_err(|source| Error::Codec {
+        phase: "decode",
+        source: source.into(),
+    })
+}
+
+fn decode_body<T: DeserializeOwned>(src: &mut DecodeBuf<'_>, budget: usize) -> Result<T> {
     let map = |source| Error::Codec {
         phase: "decode",
         source,
     };
     let len = src.remaining();
     if src.chunk().len() == len {
-        let value = transport::decode(src.chunk(), budget)?;
+        let value = decode(src.chunk(), budget)?;
         src.advance(len).map_err(map)?;
         Ok(value)
     } else {
-        transport::decode(&src.copy_remaining().map_err(map)?, budget)
+        decode(&src.copy_remaining().map_err(map)?, budget)
     }
 }
 
@@ -280,10 +312,10 @@ mod tests {
                 Body::from_bytes(bytes[split..].to_vec()).unwrap(),
             ])
             .unwrap();
-            let decoded: wire::IdRequest = decode(&mut DecodeBuf::new(&body), 4096).unwrap();
+            let decoded: wire::IdRequest = decode_body(&mut DecodeBuf::new(&body), 4096).unwrap();
             assert_eq!(decoded.id, value.id);
             assert!(matches!(
-                decode::<wire::IdRequest>(&mut DecodeBuf::new(&body), 1),
+                decode_body::<wire::IdRequest>(&mut DecodeBuf::new(&body), 1),
                 Err(Error::Codec {
                     phase: "decode",
                     source: CodecError::ResourceLimit { .. },

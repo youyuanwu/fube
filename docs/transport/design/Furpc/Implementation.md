@@ -382,6 +382,25 @@ construction and the outbound guard. Public action/body inputs, send admission,
 authority checks, retained local-write observations and joined shutdown remain
 Hosting policy. This refactor adds no furpc API and does not update the
 exact-source native Hosting qualification recorded below.
+Private HostingServer and LifecycleClient facades now separate protocol
+composition from the connection/domain executor. HostingServer owns actor-wide
+ingress bindings, method dispatch and opaque deferred RPC/semantic invocations;
+the executor inspects immutable headers for identity/replay admission before
+routing. Header-action errors retain their original validation point, while
+unsupported methods are rejected only after source attachment admission, so
+they retire that exact owner instead of being silently discarded or leaving a
+reusable admission. RPC invocations retain the original request/context and
+response handoff and reject a mismatched typed handler before decoding.
+Semantic completion remains bounded enqueue, not execution or an ACK.
+LifecycleClient owns outbound profiles, opaque prepared requests and byte
+submission on the original Peer. Node retains RA payload/effect interpretation;
+Hosting retains send admission, authority checks and joined task ownership.
+The transport adapter owns only accepted socket validation, ready observation
+and inline furpc serving. No new generic layer, public Hosting API, retry/reconnection
+policy or native qualification is introduced.
+Hosting's wire Actor identifiers, including Empty replies, reuse the pinned
+fube-core::protocol::actor definitions through a direct core dependency.
+The numeric wire values are unchanged; SF identifiers remain outside furpc.
 The Hosting and owned-app sample direct legacy dependency edges are retired;
 RA/node control uses the separate migrated adapter below. Offline managed
 furpc-client and independent adversarial socket fixtures cover the accepted path;

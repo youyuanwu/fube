@@ -5,11 +5,11 @@
 //! an owned consumer boundary; reports, deployed RA/RAP and distributed Federation
 //! capability are not implied. Node composition owns actual event consumers.
 use crate::{lease::Authority, wire, Hosting};
+use fube_core::protocol::actor as actors;
 use fubst::serde::to_vec;
-use furpc::{
-    header, Body, Error as TransportError, Headers, MessageId, OneWayClient, PeerSendService,
-    Result as TransportResult,
-};
+#[cfg(test)]
+use furpc::Body;
+use furpc::{header, Error as TransportError, Headers, MessageId, Result as TransportResult};
 use serde::Deserialize;
 use std::{
     collections::{HashSet, VecDeque},
@@ -27,10 +27,13 @@ use tokio::{
     task::JoinSet,
 };
 
+mod client;
 mod rpc;
+mod server;
 mod transport;
-use rpc::{Call as RpcCall, Method as RpcMethod, Response as RpcResponse};
-use transport::{decode, IpcMessage, LifecycleMethod, PreparedBodyCodec};
+use client::{LifecycleClient, Method as LifecycleMethod};
+use rpc::{decode, Call as RpcCall, Method as RpcMethod, Response as RpcResponse};
+use server::{Call as IngressCall, IpcMessage};
 
 const IO_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_INPUT: usize = 64 * 1024;
@@ -113,7 +116,7 @@ struct Entry {
 }
 #[derive(Clone)]
 struct Session {
-    lifecycle: OneWayClient<PeerSendService>,
+    lifecycle: LifecycleClient,
     executor: tokio::runtime::Handle,
     tasks: Arc<Mutex<Option<JoinSet<()>>>>,
 }
@@ -151,7 +154,7 @@ pub struct LifecycleReply {
 }
 impl LifecycleReply {
     pub fn action(&self) -> TransportResult<String> {
-        transport::action(&self.message.headers)
+        action(&self.message.headers)
     }
     pub fn body(&self) -> &[u8] {
         &self.message.body
@@ -243,15 +246,9 @@ impl HostLease {
         action: &str,
         body: Vec<u8>,
     ) -> TransportResult<LifecycleReply> {
-        if !matches!(action, "ReplicaOpenReply" | "ReplicaCloseReply") || body.len() > MAX_INPUT {
-            return Err(protocol("invalid qualification reply"));
-        }
         Ok(LifecycleReply {
             entry: self.entry.clone(),
-            message: IpcMessage {
-                headers: transport::message(12, action, vec![])?.headers().clone(),
-                body,
-            },
+            message: IpcMessage::qualification(action, body)?,
         })
     }
     pub fn stop_renewal(&self) {
@@ -295,7 +292,7 @@ impl HostLease {
             _permit: permit.clone(),
         };
         let entry = self.entry.clone();
-        let request = method.request(Body::from_bytes(body)?)?;
+        let request = method.prepare(body)?;
         let mut lifecycle = session.lifecycle.clone();
         let mut guard = session.tasks.lock().unwrap();
         let tasks = guard.as_mut().ok_or(TransportError::Closed)?;
@@ -309,11 +306,7 @@ impl HostLease {
                         return Err(TransportError::Closed);
                     }
                     lifecycle
-                        .send(
-                            request,
-                            PreparedBodyCodec,
-                            tokio::time::Instant::now() + IO_DEADLINE,
-                        )
+                        .send(request, tokio::time::Instant::now() + IO_DEADLINE)
                         .await?;
                     if !session_live(&entry) {
                         return Err(TransportError::Closed);
@@ -1195,12 +1188,17 @@ fn unique_headers(headers: &Headers) -> TransportResult<()> {
 const IPC: u16 = 0x800b;
 const TIMEOUT: u16 = 0x8023;
 
+fn action(headers: &Headers) -> TransportResult<String> {
+    String::from_utf16(headers.effective().action())
+        .map_err(|_| TransportError::Protocol("invalid Hosting action"))
+}
+
 fn envelope(headers: &Headers, decode_limit: usize) -> TransportResult<(String, u32, Option<i64>)> {
     unique_headers(headers)?;
     let p = headers.effective();
     if p.message_id == MessageId::default()
         || p.relates_to != MessageId::default()
-        || (p.actor.get() == 12) == p.expects_reply
+        || (p.actor.get() == actors::RA) == p.expects_reply
         || headers.first_raw(header::FAULT).is_some()
         || p.uncorrelated_reply
         || headers.first_raw(header::ACTOR).is_none()
@@ -1289,17 +1287,16 @@ async fn run_connection(
                 _ = tokio::time::sleep(Duration::from_secs(30)) => return Err(TransportError::Timeout("Hosting first request")),
             }
         };
-        if tokio::time::Instant::now() >= incoming.deadline {
+        if tokio::time::Instant::now() >= incoming.deadline() {
             return Err(TransportError::Timeout("Hosting ingress"));
         }
-        let arrived = incoming.received_at;
-        let request = incoming.request;
-        let (host, pid, timeout) = envelope(request.headers(), shared.config.decode_bytes)?;
+        let arrived = incoming.received_at();
+        let ingress_deadline = incoming.deadline();
+        let (host, pid, timeout) = envelope(incoming.headers(), shared.config.decode_bytes)?;
         let has_timeout = timeout.is_some();
-        let p = request.headers().effective();
+        let p = incoming.headers().effective();
         let id = p.message_id;
-        let actor = p.actor.get();
-        let action = transport::action(request.headers())?;
+        incoming.validate_action()?;
         if id.guid == [0; 16]
             || guid.is_some_and(|guid| id.guid != guid)
             || seen.len() == 4096
@@ -1329,75 +1326,51 @@ async fn run_connection(
             r.claimed = true;
             r.entry.connected.store(true, Ordering::SeqCst);
             *r.entry.session.lock().unwrap() = Some(Session {
-                lifecycle: OneWayClient::new(PeerSendService::new(peer.clone()))
-                    .max_encoded_body_bytes(MAX_INPUT)?,
+                lifecycle: LifecycleClient::new(peer.clone())?,
                 executor: tokio::runtime::Handle::current(),
                 tasks: Arc::new(Mutex::new(Some(JoinSet::new()))),
             });
             *claimed = Some(r.entry.clone());
         }
         let entry = claimed.as_ref().expect("claimed session");
-        if !has_timeout && actor != 12 && entry.admission.deadlines == RequestDeadlines::Propagated
+        if !has_timeout
+            && !incoming.is_semantic()
+            && entry.admission.deadlines == RequestDeadlines::Propagated
         {
             return Err(protocol("missing propagated Hosting timeout"));
         }
         if entry.admission.host.id != host || entry.admission.host.pid != pid {
             return Err(protocol("Hosting identity changed"));
         }
-        if actor == 12 {
-            if !entry.ready.load(Ordering::SeqCst)
-                || !matches!(
-                    action.as_str(),
-                    "ReplicaOpenReply"
-                        | "ReplicaCloseReply"
-                        | "ProxyUpdateServiceDescriptionReply"
-                        | "ReplicatorBuildIdleReplicaReply"
-                        | "ReplicatorRemoveIdleReplicaReply"
-                        | "UpdateConfigurationReply"
-                        | "ReplicatorUpdateEpochAndGetStatusReply"
-                        | "ProxyReplicaEndpointUpdated"
-                        | "RAPReportLoad"
-                )
-            {
-                return Err(protocol("unsupported semantic RAP input"));
+        match incoming.route()? {
+            IngressCall::Semantic(call) => {
+                if !entry.ready.load(Ordering::SeqCst) {
+                    return Err(protocol("unsupported semantic RAP input"));
+                }
+                let mut queue = entry.semantic.lock().unwrap();
+                if queue.len() == 4 {
+                    return Err(TransportError::ResourceLimit("Hosting semantic inbox"));
+                }
+                call.enqueue(&mut queue)?;
             }
-            let mut queue = entry.semantic.lock().unwrap();
-            if queue.len() == 4 {
-                return Err(TransportError::ResourceLimit("Hosting semantic inbox"));
-            }
-            let (parts, body) = request.into_parts();
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(body.len())
-                .map_err(|_| TransportError::ResourceLimit("Hosting semantic body"))?;
-            for segment in body.segments() {
-                bytes.extend_from_slice(segment);
-            }
-            queue.push_back(IpcMessage {
-                headers: parts.headers,
-                body: bytes,
-            });
-            incoming
-                .response
-                .send(furpc::IngressResponse::NoReply)
-                .map_err(|_| TransportError::Closed)?;
-            continue;
-        }
-        let method = RpcMethod::select(actor, &action)?;
-        let type_deadline = (method == RpcMethod::RegisterType).then(|| {
-            (arrived
-                + Duration::from_nanos(
-                    timeout.unwrap_or(300_000_000).min(300_000_000) as u64 * 100,
+            IngressCall::Rpc(call) => {
+                let method = call.method();
+                let type_deadline = (method == RpcMethod::RegisterType).then(|| {
+                    (arrived
+                        + Duration::from_nanos(
+                            timeout.unwrap_or(300_000_000).min(300_000_000) as u64 * 100,
+                        ))
+                    .min(ingress_deadline.into_std())
+                });
+                call.unary(rpc::HostingRpc::new(
+                    shared.clone(),
+                    entry.clone(),
+                    method,
+                    type_deadline,
                 ))
-            .min(incoming.deadline.into_std())
-        });
-        let response = rpc::HostingRpc::new(shared.clone(), entry.clone(), method, type_deadline)
-            .unary(request)
-            .await?;
-        incoming
-            .response
-            .send(response)
-            .map_err(|_| TransportError::Closed)?;
+                .await?;
+            }
+        }
     }
 }
 
