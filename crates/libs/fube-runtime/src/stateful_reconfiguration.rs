@@ -1483,7 +1483,7 @@ impl Registry {
             let mut local = request.local.clone();
             local.service_endpoint = status.service_address.clone();
             local.replication_endpoint = status.replication_address.clone();
-            let body = crate::ipc_client::IpcClient::prepare_endpoint_update(w::ReplicaMessage {
+            let body = crate::ipc_client::ReplicaEndpointUpdate::prepare(w::ReplicaMessage {
                 unit: request.unit.clone(),
                 local,
                 service: state.request.service.clone(),
@@ -1497,11 +1497,12 @@ impl Registry {
             return Err(Error::ResourceLimit("endpoint retry owners"));
         }
         let task = self.core.spawn(async move {
+            let mut rap = connection.rap();
             loop {
                 let fence_authority = Arc::downgrade(&authority);
                 let fence_valid = valid.clone();
                 let fence_cancel = cancel.clone();
-                let sent = connection
+                let sent = rap
                     .notify_replica_endpoint_updated(
                         body.clone(),
                         match deadline_after(Duration::from_secs(5)) {

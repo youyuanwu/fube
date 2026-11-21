@@ -232,8 +232,8 @@ Keep the original Channel or server execution alive.
 
 **Status:** implemented. RpcClient supports request/reply exchanges, OneWayClient
 adapts typed one-way sends, and Peer::send still accepts an already-built Message.
-The runtime's outbound RAP methods are typed, but their encoding and byte-send
-adaptation remain consumer-local.
+Runtime's typed RapClient now uses OneWayClient over its SF policy middleware
+and PeerSendService; HostingClient uses PeerRequestService.
 
 ### Typed one-way client
 
@@ -320,14 +320,14 @@ not implement Service, and Channel remains the reconnecting logical transport.
 Readiness is immediate and reserves no native operation capacity; the underlying
 Peer operation performs its existing admission when first polled.
 PeerSendService supplies the one-way client's native byte service.
-PeerRequestService can replace repetitive request-only consumer adapters such
-as runtime's PeerService; that consumer migration is separate. Peer::notify remains a separate
+PeerRequestService replaces runtime's former request-only PeerService adapter.
+Peer::notify remains a separate
 explicit operation and is not silently selected by either adapter.
 
 SF actors/actions, IPC host/PID and timeout headers, allowed-action policy such
 as runtime's outbound(), serving-authority checks, cleanup exemptions, and
 ordinary versus reserved reply admission remain in consumer middleware.
-A dedicated runtime RapClient can compose OneWayClient over that middleware;
+A dedicated runtime RapClient composes OneWayClient over that middleware;
 none of those domain rules belongs in furpc. Local-write success still does not
 mean a successful RAP semantic reply, and no first-write authority fence is added.
 

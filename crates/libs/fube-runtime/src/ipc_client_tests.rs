@@ -1,6 +1,6 @@
 use super::*;
 use crate::wire::{ErrorReply, IdRequest};
-use fubst::serde::{from_slice, to_vec};
+use fubst::serde::{from_slice, to_vec, ByteArray, Guid, ObjectArray};
 use std::future::{ready, Ready};
 
 type Captured = Arc<Mutex<Option<Request<Body>>>>;
@@ -31,6 +31,29 @@ struct Identity {
     pid: u32,
 }
 
+fn identity() -> HeaderRecord {
+    HeaderRecord::native(
+        HeaderId::new(IPC).unwrap(),
+        &Identity {
+            host: "owned-host".into(),
+            pid: 17,
+        },
+    )
+    .unwrap()
+}
+
+fn session() -> Arc<Session> {
+    Arc::new(Session {
+        state: Mutex::new(SessionState {
+            channel: None,
+            error: None,
+        }),
+        stopped: watch::channel(None).0,
+        ordinary: Arc::new(Semaphore::new(OPERATIONS)),
+        replies: Arc::new(Semaphore::new(OPERATIONS)),
+    })
+}
+
 fn service(response: Response<Body>, health: bool, valid: Check) -> (IpcService<Probe>, Captured) {
     let received = Arc::new(Mutex::new(None));
     (
@@ -39,14 +62,7 @@ fn service(response: Response<Body>, health: bool, valid: Check) -> (IpcService<
                 received: received.clone(),
                 response: Some(response),
             },
-            identity: HeaderRecord::native(
-                HeaderId::new(IPC).unwrap(),
-                &Identity {
-                    host: "owned-host".into(),
-                    pid: 17,
-                },
-            )
-            .unwrap(),
+            identity: identity(),
             validate_reply: if health {
                 check_health_reply
             } else {
@@ -70,17 +86,8 @@ fn request(actor: i64, action: &str) -> Request<IdRequest> {
 
 fn client(response: Response<Body>, serving: Option<Check>) -> (HostingClient<Probe>, Captured) {
     let (service, captured) = service(response, false, Arc::new(|| true));
-    let session = Arc::new(Session {
-        state: Mutex::new(SessionState {
-            channel: None,
-            error: None,
-        }),
-        stopped: watch::channel(None).0,
-        ordinary: Semaphore::new(OPERATIONS),
-        replies: Semaphore::new(OPERATIONS),
-    });
     (
-        HostingClient::new(service.transport, service.identity, session, serving),
+        HostingClient::new(service.transport, service.identity, session(), serving),
         captured,
     )
 }
@@ -262,4 +269,250 @@ fn reply_codec_resource_failure_retains_resource_classification_and_source() {
     });
     assert_eq!(error.kind(), ErrorKind::ResourceExhausted);
     assert!(std::error::Error::source(&error).is_some());
+}
+
+struct SendProbe {
+    received: Captured,
+    ready: bool,
+}
+
+impl Service<Request<Body>> for SendProbe {
+    type Response = WriteReceipt;
+    type Error = Error;
+    type Future = Ready<Result<WriteReceipt>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
+        self.ready = true;
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        assert!(std::mem::replace(&mut self.ready, false));
+        *self.received.lock().unwrap() = Some(request);
+        ready(Err(Error::InvalidInput("send probe")))
+    }
+}
+
+fn rap_client() -> (RapClient<SendProbe>, Captured) {
+    let received = Arc::new(Mutex::new(None));
+    (
+        RapClient::new(
+            SendProbe {
+                received: received.clone(),
+                ready: false,
+            },
+            identity(),
+            session(),
+        ),
+        received,
+    )
+}
+
+fn proxy_reply() -> wire::ProxyReply {
+    let id = wire::PartitionId { id: Guid([1; 16]) };
+    let rollout = wire::Rollout { major: 1, minor: 0 };
+    wire::ProxyReply {
+        unit: wire::FailoverUnit {
+            id: id.clone(),
+            consistency: wire::ConsistencyUnit {
+                id,
+                low: 0,
+                high: 0,
+                name: String::new(),
+                kind: 1,
+            },
+            current: wire::Epoch {
+                configuration: 1,
+                data_loss: 0,
+            },
+            previous: wire::Epoch {
+                configuration: 0,
+                data_loss: 0,
+            },
+            target: 1,
+            minimum: 1,
+        },
+        local: wire::Replica {
+            node: wire::Node {
+                id: ByteArray(vec![1; 16]),
+                instance: 1,
+            },
+            id: 1,
+            instance: 1,
+            current_role: 0,
+            previous_role: 0,
+            up: true,
+            last_lsn: -1,
+            first_lsn: -1,
+            state: 2,
+            version: wire::VersionInstance {
+                version: wire::PackageVersion {
+                    application: wire::ApplicationVersion {
+                        value: rollout.clone(),
+                    },
+                    value: rollout,
+                },
+                instance: 1,
+            },
+            service_endpoint: String::new(),
+            replication_endpoint: String::new(),
+        },
+        remote: ObjectArray(vec![]),
+        error: wire::ProxyError {
+            error: 0,
+            message: String::new(),
+            api: wire::ApiName {
+                api: 0,
+                interface: 0,
+                metadata: String::new(),
+            },
+        },
+        flags: 0,
+    }
+}
+
+fn fault_report() -> FaultReport {
+    let reply = proxy_reply();
+    FaultReport::prepare(wire::FaultBody {
+        unit: reply.unit,
+        local: reply.local,
+        fault: 1,
+        activity: wire::Activity {
+            id: wire::ActivityId {
+                guid: Guid([7; 16]),
+                index: 17,
+            },
+            kind: 2,
+        },
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn typed_rap_replies_preserve_distinct_lanes_and_ipc_metadata_for_the_same_action() {
+    let (mut client, received) = rap_client();
+    let session = client.inner.get_mut().session.clone();
+    let _ordinary = session
+        .ordinary
+        .clone()
+        .try_acquire_many_owned(OPERATIONS as u32)
+        .unwrap();
+    let deadline = deadline_after(Duration::from_secs(2)).unwrap();
+    let error = client
+        .send_replica_reply(
+            ProxyReplyKind::ReplicaOpen,
+            proxy_reply(),
+            deadline,
+            Arc::new(|| true),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput("send probe")));
+    let request = received.lock().unwrap().take().unwrap();
+    assert_eq!(request.deadline(), Some(deadline));
+    assert_eq!(request.headers().effective().actor.get(), actors::RA);
+    assert_eq!(action(request.headers()).unwrap(), "ReplicaOpenReply");
+    let identity: Identity = from_slice(
+        request
+            .headers()
+            .first_raw(HeaderId::new(IPC).unwrap())
+            .unwrap()
+            .value(),
+    )
+    .unwrap();
+    assert_eq!((identity.host.as_str(), identity.pid), ("owned-host", 17));
+    assert!(request
+        .headers()
+        .first_raw(HeaderId::new(TIMEOUT).unwrap())
+        .is_none());
+    let bytes = request
+        .body()
+        .segments()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(from_slice::<wire::ProxyReply>(&bytes).unwrap().local.id, 1);
+    assert_eq!(session.replies.available_permits(), OPERATIONS);
+    let error = client
+        .send_stateful_reply(
+            ProxyReplyKind::ReplicaOpen,
+            proxy_reply(),
+            deadline,
+            Arc::new(|| true),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::ResourceLimit("runtime report output admission")
+    ));
+    assert!(received.lock().unwrap().is_none());
+    session.check().unwrap();
+}
+
+#[tokio::test]
+async fn rap_local_encoding_and_authority_failures_do_not_submit_or_retire_the_session() {
+    let (mut client, received) = rap_client();
+    client.inner = client.inner.max_encoded_body_bytes(0).unwrap();
+    let error = client
+        .report_load(
+            wire::LoadBody {
+                legacy: fubst::serde::EmptyObjectArray,
+                reports: ObjectArray(vec![]),
+                time: 123,
+            },
+            deadline_after(Duration::from_secs(2)).unwrap(),
+            Arc::new(|| true),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::ResourceLimit(_)));
+    assert!(received.lock().unwrap().is_none());
+    assert_eq!(
+        client.inner.get_mut().session.ordinary.available_permits(),
+        OPERATIONS
+    );
+    client.inner.get_mut().session.check().unwrap();
+
+    let (mut client, received) = rap_client();
+    let error = client
+        .report_fault(
+            fault_report(),
+            deadline_after(Duration::from_secs(2)).unwrap(),
+            Arc::new(|| false),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Closed));
+    assert!(received.lock().unwrap().is_none());
+    client.inner.get_mut().session.check().unwrap();
+}
+
+#[tokio::test]
+async fn prepared_rap_payload_retries_share_original_bytes_without_native_reserialization() {
+    let (mut client, received) = rap_client();
+    let report = fault_report();
+    let pointer = report.0.segments().next().unwrap().as_ptr();
+    for report in [report.clone(), report] {
+        let error = client
+            .report_fault(
+                report,
+                deadline_after(Duration::from_secs(2)).unwrap(),
+                Arc::new(|| true),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput("send probe")));
+        let request = received.lock().unwrap().take().unwrap();
+        assert_eq!(request.body().segments().next().unwrap().as_ptr(), pointer);
+        let bytes = request
+            .body()
+            .segments()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let body = from_slice::<wire::FaultBody>(&bytes).unwrap();
+        assert_eq!(body.fault, 1);
+        assert_eq!(body.activity.id.index, 17);
+    }
 }

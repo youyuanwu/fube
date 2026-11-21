@@ -1,5 +1,5 @@
 //! Application-runtime reports, not management-client operations.
-use crate::ipc_client::{deadline_after, native_error, Check, FaultReport, IpcClient};
+use crate::ipc_client::{deadline_after, native_error, Check, FaultReport};
 use crate::{api::FaultType, lease::Authority, wire::*};
 use crate::{Error, Result};
 use fubst::serde::{EmptyObjectArray, NativeEnum, ObjectArray, Pointer};
@@ -307,10 +307,11 @@ impl Reporting {
             }]),
             time: now,
         };
+        let mut rap = self.connection.rap();
         tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return Err(Error::Closed),
-            result = self.connection.report_load(
+            result = rap.report_load(
                 body,
                 deadline_after(REPORT_TIMEOUT)?,
                 self.fence(),
@@ -495,7 +496,7 @@ impl Reporting {
             } else {
                 let first = stage.is_none();
                 let request = self.request.lock().unwrap().clone();
-                let body = IpcClient::prepare_fault_report(FaultBody {
+                let body = FaultReport::prepare(FaultBody {
                     unit: request.unit,
                     local: request.local,
                     fault: native_fault,
@@ -598,6 +599,7 @@ impl Reporting {
                     .try_acquire()
                     .map_err(|_| Error::ResourceLimit("runtime report admission"))?;
                 self.connection
+                    .rap()
                     .report_fault(body, deadline_after(REPORT_TIMEOUT)?, sent)
                     .await
             };

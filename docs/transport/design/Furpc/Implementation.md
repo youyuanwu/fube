@@ -8,7 +8,7 @@ milestones, not a record of delivered implementation or qualified support.
 
 ## Generic adapter follow-up
 
-**Status:** generic furpc APIs implemented; runtime consumer migration pending.
+**Status:** generic furpc APIs and runtime consumer migration implemented.
 The runtime's typed client/server migration exposed reusable body and one-way
 adapter gaps, not missing SF-specific transport policy.
 
@@ -17,9 +17,10 @@ whole-body implementation used by RPC codecs. The
 [typed one-way client and original-Peer service adapters](Requests.md#one-way-client-and-peer-service-adapters)
 are also implemented. PeerSendService provides the native byte service for
 OneWayClient; PeerRequestService provides request-only consumer deduplication.
-Consumer migration should keep method profiles, authority/admission checks and
-frozen retry wrappers above furpc. Switching those wrappers from Vec to shared
-Body uses existing shared storage and remains consumer work, not a replay cache.
+Runtime retains method profiles, authority/admission checks and frozen retry
+wrappers above furpc. HostingClient uses PeerRequestService; RapClient uses
+OneWayClient over runtime middleware and PeerSendService. Prepared retry wrappers
+retain shared Body rather than copied Vec bytes, not a replay cache.
 
 Focused public API checks cover custom non-Serde codecs, segmented-body consumption and
 explicit suffix skipping, zero/finite byte limits, and codec source/resource
@@ -32,10 +33,11 @@ and do not switch generations after failure.
 Cancellation cases distinguish uncommitted retraction from committed
 driver-owned output without inventing confirmed cancellation on the typed future.
 
-Future runtime migration acceptance must retain exact fault/endpoint bytes across retry attempts
-with fresh message identities, reserved stateless reply admission, ordinary
-stateful/report admission, decode-after-owned-admission ordering, and usable
-unregister IPC after late one-way commands during orderly retirement.
+Runtime migration checks retain exact fault/endpoint bytes across retry attempts
+with fresh message identities and verify shared prepared-byte storage,
+reserved stateless reply admission versus ordinary stateful/report admission,
+local encoding/authority failure isolation, decode-after-owned-admission ordering,
+and usable unregister IPC after late one-way commands during orderly retirement.
 These focused checks establish API/composition behavior, not new native
 interoperability, deployed runtime support, TLS, or FM/Federation qualification.
 
@@ -244,9 +246,18 @@ caller-selected actors/actions or reply types. Independent calls clone the stub,
 not its original-generation authority; IPC identity, remaining timeout and reply
 validation stay in the byte service. Cleanup exemptions and runtime retirement
 remain domain-owned.
-Outbound RAP methods accept typed proxy/service replies and load reports, with
-native action selection and serialization inside the client. Fault reports and
-endpoint updates use opaque typed prepared payloads to retain exact retry bytes.
+The local PeerService is retired in favor of furpc's original-Peer
+PeerRequestService. Outbound RapClient<T> retains
+OneWayClient<RapSendService<T>>; its typed proxy/service reply and load-report
+methods select native actions and use FubstCodec. RapSendService retains IPC
+identity stamping, authority checks, runtime admission and transport-error
+retirement above the native PeerSendService. Independent calls clone the typed
+stub without sharing mutable readiness across an await.
+FaultReport::prepare and ReplicaEndpointUpdate::prepare use the public
+codec::encode helper to freeze the native body once in opaque shared Body wrappers.
+A private pass-through encoder adopts those existing bytes without another native
+serialization or payload copy on retries; PeerSendService/Peer still allocate
+fresh native message identities for each authorized attempt.
 Stateless replies keep reserved admission; stateful replies and reports keep
 ordinary admission. These calls still await original-Peer local writes, not RPC
 responses or semantic acknowledgment.
@@ -264,8 +275,9 @@ typed service. RPC execution completion means encoded response-data handoff,
 not local-write completion; subsequent write failures remain serving errors.
 RAP one-way handlers accept Request<ProxyRequest> and return (). Their serving
 scope still completes at bounded enqueue, preserving late-command shutdown and
-unregister behavior. After owned dispatch admission, the public Fubst decoder
-adapts the retained body before calling the typed domain service. Using
+unregister behavior. After owned dispatch admission, public codec::decode uses
+the Fubst decoder and the retained route body limit before calling the typed
+domain service. Using
 server::Rpc::one_way at that later point would incorrectly borrow the already
 completed runner invocation. Route-selected RapAction values replace untyped
 action selection in the command handoff; native actions and schemas are unchanged.

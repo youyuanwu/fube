@@ -718,6 +718,7 @@ async fn reply(
     };
     let sent = shared
         .connection
+        .rap()
         .send_replica_reply(
             kind,
             body,
@@ -1090,6 +1091,7 @@ async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<(
     let frame_valid = valid.clone();
     let sent = shared
         .connection
+        .rap()
         .send_service_update_reply(
             response,
             deadline_after(Duration::from_secs(5))?,

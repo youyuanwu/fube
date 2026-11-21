@@ -15,8 +15,10 @@ use std::{
 
 use fube_core::protocol::actor as actors;
 use furpc::{
-    header, ActorId, Body, BoxError, Channel, Connected, Endpoint, FubstCodec, HandlerLimits,
-    HeaderId, HeaderRecord, Headers, Message, Peer, Request, Response, RpcClient, TransportIo,
+    codec, header, ActorId, Body, BoxError, Channel, ClientCodecLimits, Codec, Connected,
+    EncodeBuf, Encoder, Endpoint, FubstCodec, HandlerLimits, HeaderId, HeaderRecord, Headers,
+    OneWayClient, PeerRequestService, PeerSendService, Request, Response, RpcClient, TransportIo,
+    WriteReceipt,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
@@ -56,8 +58,8 @@ struct SessionState {
 pub(super) struct Session {
     state: Mutex<SessionState>,
     stopped: watch::Sender<Option<Error>>,
-    ordinary: Semaphore,
-    replies: Semaphore,
+    ordinary: Arc<Semaphore>,
+    replies: Arc<Semaphore>,
 }
 
 impl Session {
@@ -87,9 +89,8 @@ impl Session {
 #[derive(Clone)]
 pub(crate) struct IpcClient {
     session: Arc<Session>,
-    peer: Peer,
-    identity: HeaderRecord,
-    hosting: HostingClient<PeerService>,
+    hosting: HostingClient<PeerRequestService>,
+    rap: RapClient<PeerSendService>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -121,12 +122,25 @@ impl ProxyReplyKind {
 
 /// Encoded once so domain-owned fault retries preserve the original payload bytes.
 #[derive(Clone)]
-pub(crate) struct FaultReport(Vec<u8>);
+pub(crate) struct FaultReport(Body);
+
+impl FaultReport {
+    pub(crate) fn prepare(body: wire::FaultBody) -> Result<Self> {
+        encode(body).map(Self)
+    }
+}
 
 /// Encoded once so endpoint retries retain the original advertised description.
 #[derive(Clone)]
-pub(crate) struct ReplicaEndpointUpdate(Vec<u8>);
+pub(crate) struct ReplicaEndpointUpdate(Body);
 
+impl ReplicaEndpointUpdate {
+    pub(crate) fn prepare(body: wire::ReplicaMessage) -> Result<Self> {
+        encode(body).map(Self)
+    }
+}
+
+#[derive(Clone, Copy)]
 enum SendLane {
     Replies,
     Ordinary,
@@ -165,8 +179,8 @@ impl IpcClient {
                 error: None,
             }),
             stopped: watch::channel(None).0,
-            ordinary: Semaphore::new(OPERATIONS),
-            replies: Semaphore::new(OPERATIONS),
+            ordinary: Arc::new(Semaphore::new(OPERATIONS)),
+            replies: Arc::new(Semaphore::new(OPERATIONS)),
         });
         let router = server.router(Arc::downgrade(&session))?;
         let timeout = deadline
@@ -201,16 +215,16 @@ impl IpcClient {
             state.channel = Some(channel);
         }
         let hosting = HostingClient::new(
-            PeerService(peer.clone()),
+            PeerRequestService::new(peer.clone()),
             identity.clone(),
             session.clone(),
             serving,
         );
+        let rap = RapClient::new(PeerSendService::new(peer), identity, session.clone());
         Ok(Self {
             session,
-            peer,
-            identity,
             hosting,
+            rap,
         })
     }
 
@@ -245,12 +259,43 @@ impl IpcClient {
     }
 
     /// Clone the typed stub for independent calls on the original generation.
-    pub(crate) fn hosting(&self) -> HostingClient<PeerService> {
+    pub(crate) fn hosting(&self) -> HostingClient<PeerRequestService> {
         self.hosting.clone()
     }
 
+    pub(crate) fn rap(&self) -> RapClient<PeerSendService> {
+        self.rap.clone()
+    }
+}
+
+/// Typed RAP sends over a byte service bound to the original IPC generation.
+#[derive(Clone)]
+pub(crate) struct RapClient<T> {
+    inner: OneWayClient<RapSendService<T>>,
+}
+
+impl<T> RapClient<T> {
+    fn new(transport: T, identity: HeaderRecord, session: Arc<Session>) -> Self {
+        Self {
+            inner: OneWayClient::new(RapSendService {
+                transport,
+                identity,
+                session,
+                valid: Arc::new(|| true),
+                lane: SendLane::Ordinary,
+            }),
+        }
+    }
+}
+
+impl<T> RapClient<T>
+where
+    T: Service<Request<Body>, Response = WriteReceipt> + Send,
+    T::Future: Send + 'static,
+    T::Error: Into<BoxError>,
+{
     pub(crate) async fn send_replica_reply(
-        &self,
+        &mut self,
         kind: ProxyReplyKind,
         body: wire::ProxyReply,
         deadline: Instant,
@@ -262,9 +307,10 @@ impl IpcClient {
         ) {
             return Err(Error::InvalidInput("unauthorized runtime semantic reply"));
         }
-        self.send_encoded(
+        self.send(
             kind.action(),
-            encode(body)?,
+            body,
+            FubstCodec::<_, ()>::default(),
             deadline,
             valid,
             SendLane::Replies,
@@ -273,15 +319,16 @@ impl IpcClient {
     }
 
     pub(crate) async fn send_stateful_reply(
-        &self,
+        &mut self,
         kind: ProxyReplyKind,
         body: wire::ProxyReply,
         deadline: Instant,
         valid: Check,
     ) -> Result<()> {
-        self.send_encoded(
+        self.send(
             kind.action(),
-            encode(body)?,
+            body,
+            FubstCodec::<_, ()>::default(),
             deadline,
             valid,
             SendLane::Ordinary,
@@ -290,14 +337,15 @@ impl IpcClient {
     }
 
     pub(crate) async fn send_service_update_reply(
-        &self,
+        &mut self,
         body: wire::UpdateServiceReply,
         deadline: Instant,
         valid: Check,
     ) -> Result<()> {
-        self.send_encoded(
+        self.send(
             "ProxyUpdateServiceDescriptionReply",
-            encode(body)?,
+            body,
+            FubstCodec::<_, ()>::default(),
             deadline,
             valid,
             SendLane::Replies,
@@ -306,14 +354,15 @@ impl IpcClient {
     }
 
     pub(crate) async fn send_stateful_service_update_reply(
-        &self,
+        &mut self,
         body: wire::UpdateServiceReply,
         deadline: Instant,
         valid: Check,
     ) -> Result<()> {
-        self.send_encoded(
+        self.send(
             "ProxyUpdateServiceDescriptionReply",
-            encode(body)?,
+            body,
+            FubstCodec::<_, ()>::default(),
             deadline,
             valid,
             SendLane::Ordinary,
@@ -322,14 +371,15 @@ impl IpcClient {
     }
 
     pub(crate) async fn report_load(
-        &self,
+        &mut self,
         body: wire::LoadBody,
         deadline: Instant,
         valid: Check,
     ) -> Result<()> {
-        self.send_encoded(
+        self.send(
             "RAPReportLoad",
-            encode(body)?,
+            body,
+            FubstCodec::<_, ()>::default(),
             deadline,
             valid,
             SendLane::Ordinary,
@@ -337,19 +387,16 @@ impl IpcClient {
         .await
     }
 
-    pub(crate) fn prepare_fault_report(body: wire::FaultBody) -> Result<FaultReport> {
-        encode(body).map(FaultReport)
-    }
-
     pub(crate) async fn report_fault(
-        &self,
+        &mut self,
         report: FaultReport,
         deadline: Instant,
         valid: Check,
     ) -> Result<()> {
-        self.send_encoded(
+        self.send(
             "RAReportFault",
             report.0,
+            PreparedBodyCodec,
             deadline,
             valid,
             SendLane::Ordinary,
@@ -357,21 +404,16 @@ impl IpcClient {
         .await
     }
 
-    pub(crate) fn prepare_endpoint_update(
-        body: wire::ReplicaMessage,
-    ) -> Result<ReplicaEndpointUpdate> {
-        encode(body).map(ReplicaEndpointUpdate)
-    }
-
     pub(crate) async fn notify_replica_endpoint_updated(
-        &self,
+        &mut self,
         update: ReplicaEndpointUpdate,
         deadline: Instant,
         valid: Check,
     ) -> Result<()> {
-        self.send_encoded(
+        self.send(
             "ProxyReplicaEndpointUpdated",
             update.0,
+            PreparedBodyCodec,
             deadline,
             valid,
             SendLane::Ordinary,
@@ -379,54 +421,149 @@ impl IpcClient {
         .await
     }
 
-    async fn send_encoded(
-        &self,
+    async fn send<C>(
+        &mut self,
         action: &'static str,
-        body: Vec<u8>,
+        body: C::Encode,
+        codec: C,
         deadline: Instant,
         valid: Check,
         lane: SendLane,
-    ) -> Result<()> {
-        let (admission, exhausted) = match lane {
-            SendLane::Replies => (&self.session.replies, "runtime semantic reply admission"),
-            SendLane::Ordinary => (&self.session.ordinary, "runtime report output admission"),
-        };
-        let _slot = admission
-            .try_acquire()
-            .map_err(|_| Error::ResourceLimit(exhausted))?;
-        self.session.check()?;
-        if !valid() {
-            return Err(Error::Closed);
-        }
-        let message = Message::builder()
+    ) -> Result<()>
+    where
+        C: Codec + Send,
+        C::Encode: Send,
+        C::Encoder: Send,
+    {
+        let request = Request::new(body)
             .append_header(header::actor(actor(actors::RA)?).map_err(native_error)?)
+            .map_err(native_error)?
             .append_header(header::action(action).map_err(native_error)?)
-            .append_header(self.identity.clone())
-            .body(Body::from_bytes(body).map_err(native_error)?)
-            .build()
             .map_err(native_error)?;
-        outbound(message.headers(), false)?;
-        let result = self
-            .peer
-            .send(message, deadline)
+        let service = self.inner.get_mut();
+        service.valid = valid;
+        service.lane = lane;
+        self.inner
+            .send(request, codec, deadline)
             .await
-            .map_err(native_error);
-        if let Err(error) = &result {
-            if matches!(error.kind(), ErrorKind::ObjectClosed | ErrorKind::Transport) {
-                self.session.retire(error.clone());
-            }
-        }
-        result?;
-        self.session.check()?;
-        if !valid() {
-            return Err(Error::Closed);
-        }
+            .map_err(native_error)?;
         Ok(())
     }
 }
 
-fn encode<T: Serialize>(value: T) -> Result<Vec<u8>> {
-    fubst::serde::to_vec(&value).map_err(Into::into)
+fn encode<T: Serialize>(value: T) -> Result<Body> {
+    codec::encode(
+        &mut FubstCodec::<T, ()>::default().encoder(),
+        value,
+        ClientCodecLimits::default().max_encoded_body_bytes,
+    )
+    .map_err(|source| {
+        native_error(furpc::Error::Codec {
+            phase: "encode",
+            source,
+        })
+    })
+}
+
+// Adopt already-serialized retry bytes without serializing or copying them again.
+struct PreparedBodyCodec;
+
+impl Codec for PreparedBodyCodec {
+    type Encode = Body;
+    type Decode = ();
+    type Encoder = Self;
+    type Decoder = <FubstCodec<(), ()> as Codec>::Decoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        Self
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        FubstCodec::<(), ()>::default().decoder()
+    }
+}
+
+impl Encoder for PreparedBodyCodec {
+    type Item = Body;
+
+    fn encode(
+        &mut self,
+        body: Body,
+        dst: &mut EncodeBuf<'_>,
+    ) -> std::result::Result<(), furpc::CodecError> {
+        dst.append_body(body)
+    }
+}
+
+#[derive(Clone)]
+struct RapSendService<T> {
+    transport: T,
+    identity: HeaderRecord,
+    session: Arc<Session>,
+    valid: Check,
+    lane: SendLane,
+}
+
+impl<T> Service<Request<Body>> for RapSendService<T>
+where
+    T: Service<Request<Body>, Response = WriteReceipt> + Send,
+    T::Future: Send + 'static,
+    T::Error: Into<BoxError>,
+{
+    type Response = WriteReceipt;
+    type Error = Error;
+    type Future = BoxFuture<Result<Self::Response>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        self.transport
+            .poll_ready(cx)
+            .map_err(|error| service_error(error.into()))
+    }
+
+    fn call(&mut self, mut request: Request<Body>) -> Self::Future {
+        let prepare = (|| {
+            let (admission, exhausted) = match self.lane {
+                SendLane::Replies => (&self.session.replies, "runtime semantic reply admission"),
+                SendLane::Ordinary => (&self.session.ordinary, "runtime report output admission"),
+            };
+            let slot = admission
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| Error::ResourceLimit(exhausted))?;
+            self.session.check()?;
+            if !(self.valid)() {
+                return Err(Error::Closed);
+            }
+            request
+                .headers_mut()
+                .append(self.identity.clone())
+                .map_err(native_error)?;
+            outbound(request.headers(), false)?;
+            Ok(slot)
+        })();
+        let slot = match prepare {
+            Ok(slot) => slot,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        let future = self.transport.call(request);
+        let session = self.session.clone();
+        let valid = self.valid.clone();
+        Box::pin(async move {
+            let _slot = slot;
+            let result = future.await.map_err(|error| service_error(error.into()));
+            if let Err(error) = &result {
+                if matches!(error.kind(), ErrorKind::ObjectClosed | ErrorKind::Transport) {
+                    session.retire(error.clone());
+                }
+            }
+            let receipt = result?;
+            session.check()?;
+            if !valid() {
+                return Err(Error::Closed);
+            }
+            Ok(receipt)
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -808,26 +945,6 @@ where
             validate_reply(&response)?;
             Ok(response)
         })
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct PeerService(Peer);
-
-impl Service<Request<Body>> for PeerService {
-    type Response = Response<Body>;
-    type Error = furpc::Error;
-    type Future = furpc::Operation<Self::Response>;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<furpc::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let deadline = request
-            .deadline()
-            .expect("RpcClient sets the request deadline");
-        self.0.request(request, deadline)
     }
 }
 

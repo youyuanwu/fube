@@ -11,9 +11,8 @@ use std::{
 
 use fube_core::protocol::actor as actors;
 use furpc::{
-    header, Body, Codec, DecodeBuf, Decoder, FubstCodec, Headers, IngressLimits, IngressResponse,
-    MessageId, OneWayRouteOptions, Reply, Request, RequestPolicy, RequestRouteOptions, Router,
-    Source,
+    codec, header, Body, Codec, FubstCodec, Headers, IngressLimits, IngressResponse, MessageId,
+    OneWayRouteOptions, Reply, Request, RequestPolicy, RequestRouteOptions, Router, Source,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{sync::oneshot, time::timeout_at};
@@ -96,13 +95,15 @@ impl RuntimeServer {
             RapAction::EndpointUpdatedReply,
         ] {
             let rap = self.rap.clone();
+            let limits = IngressLimits::default();
             router = router
                 .one_way(
                     actor(actors::RA)?,
                     kind.action(),
-                    OneWayRouteOptions::new(incoming, IngressLimits::default()),
+                    OneWayRouteOptions::new(incoming, limits.clone()),
                     OneWayRoute {
                         session: session.clone(),
+                        max_body_bytes: limits.max_body_bytes,
                         handoff: Arc::new(move |call| rap(RapCall::OneWay(kind, call))),
                     },
                 )
@@ -209,6 +210,7 @@ where
 /// One-way serving completes at bounded enqueue, not at domain execution.
 pub(crate) struct OneWayCall<Q> {
     request: Request<Body>,
+    max_body_bytes: usize,
     schema: PhantomData<fn() -> Q>,
 }
 
@@ -220,19 +222,17 @@ impl<Q: DeserializeOwned> OneWayCall<Q> {
         // The runner's one-way scope has ended; do not borrow its expired
         // invocation authority via server::Rpc. Decode after domain admission.
         let (parts, body) = self.request.into_parts();
-        let mut src = DecodeBuf::new(&body);
-        let value = FubstCodec::<(), Q>::default()
-            .decoder()
-            .decode(&mut src)
-            .map_err(|source| {
-                native_error(furpc::Error::Codec {
-                    phase: "decode",
-                    source,
-                })
-            })?;
-        if !src.is_empty() {
-            return Err(Error::Protocol("unconsumed runtime IPC body"));
-        }
+        let value = codec::decode(
+            &mut FubstCodec::<(), Q>::default().decoder(),
+            &body,
+            self.max_body_bytes,
+        )
+        .map_err(|source| {
+            native_error(furpc::Error::Codec {
+                phase: "decode",
+                source,
+            })
+        })?;
         drop(body);
         poll_fn(|cx| service.poll_ready(cx)).await?;
         service.call(Request::from_parts(parts, value)).await
@@ -367,6 +367,7 @@ impl<Q: 'static, R: 'static> Service<Request<Body>> for RpcRoute<Q, R> {
 #[derive(Clone)]
 struct OneWayRoute {
     session: Weak<Session>,
+    max_body_bytes: usize,
     handoff: Arc<dyn Fn(OneWayCall<wire::ProxyRequest>) -> Result<()> + Send + Sync>,
 }
 
@@ -389,6 +390,7 @@ impl Service<Request<Body>> for OneWayRoute {
                 }
                 (self.handoff)(OneWayCall {
                     request,
+                    max_body_bytes: self.max_body_bytes,
                     schema: PhantomData,
                 })?;
                 Ok(IngressResponse::NoReply)

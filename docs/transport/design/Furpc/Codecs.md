@@ -213,10 +213,11 @@ codec-local `fubst::Limits`; default operations add no depth/work ceiling.
 by RpcClient, OneWayClient and server::Rpc, and are available to direct native
 message consumers without creating an RPC exchange or borrowing ingress authority.
 
-Runtime RAP one-way sends still serialize directly with `fubst::serde::to_vec`.
-Deferred one-way server invocations use the public Fubst decoder but repeat
-whole-body adaptation checks; migrating these consumers to the helpers remains
-a separate change.
+Runtime RapClient uses OneWayClient/FubstCodec for ordinary typed sends.
+Frozen fault/endpoint retry bodies use codec::encode once; a pass-through encoder
+adopts their shared bytes on each send without native reserialization.
+Deferred one-way server invocations use codec::decode with the Fubst decoder
+and retained route body limit after owned executor admission.
 
 ```rust,ignore
 // Public functions in furpc::codec; no new format or transport operation.

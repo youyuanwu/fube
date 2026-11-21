@@ -78,7 +78,8 @@ The [public body helpers](Codecs.md#public-body-helpers) and
 [one-way client/Peer adapters](Requests.md#one-way-client-and-peer-service-adapters)
 are implemented. The [delivery and acceptance record](Implementation.md#generic-adapter-follow-up)
 keeps SF method policy, retry payload stability, and runtime admission/lifetime
-rules in consumers; adopting these APIs in runtime remains separate work.
+rules in consumers. Runtime has adopted them without changing its original-Peer
+ownership, semantic acknowledgment, or shutdown/unregister boundaries.
 
 ## Non-goals and evidence
 

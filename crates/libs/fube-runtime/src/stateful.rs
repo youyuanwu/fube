@@ -1156,6 +1156,7 @@ impl Registry {
         let frame_valid = valid.clone();
         let sent = self
             .connection
+            .rap()
             .send_stateful_service_update_reply(
                 response,
                 deadline_after(Duration::from_secs(5))?,
@@ -1311,6 +1312,7 @@ impl Registry {
         }
         let sent = self
             .connection
+            .rap()
             .send_stateful_reply(
                 kind,
                 reply,

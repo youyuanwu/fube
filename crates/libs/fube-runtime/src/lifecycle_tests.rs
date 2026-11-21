@@ -1557,7 +1557,8 @@ async fn locally_revoked_admitted_stateless_success_preserves_siblings_and_close
         let valid = unit.state.lock().unwrap().valid.clone();
         let connection = h.engine.shared.connection.clone();
         h.peer.reads.hold_after(12);
-        let mut blocker = Box::pin(connection.report_load(
+        let mut rap = connection.rap();
+        let mut blocker = Box::pin(rap.report_load(
             large_load_report(),
             deadline_after(Duration::from_secs(5)).unwrap(),
             Arc::new(|| true),
@@ -1653,7 +1654,7 @@ async fn typed_load_report_completes_without_a_correlated_response() {
     let connection = h.engine.shared.connection.clone();
     tokio::time::timeout(
         Duration::from_secs(2),
-        connection.report_load(
+        connection.rap().report_load(
             LoadBody {
                 legacy: fubst::serde::EmptyObjectArray,
                 reports: ObjectArray(vec![]),
@@ -1692,11 +1693,12 @@ async fn prepared_fault_report_preserves_original_payload_across_retry_writes() 
             kind: 2,
         },
     };
-    let report = crate::ipc_client::IpcClient::prepare_fault_report(body.clone()).unwrap();
+    let report = crate::ipc_client::FaultReport::prepare(body.clone()).unwrap();
     body.fault = 2;
     body.activity.id.guid = Guid([8; 16]);
     let connection = h.engine.shared.connection.clone();
     connection
+        .rap()
         .report_fault(
             report.clone(),
             deadline_after(Duration::from_secs(2)).unwrap(),
@@ -1706,6 +1708,7 @@ async fn prepared_fault_report_preserves_original_payload_across_retry_writes() 
         .unwrap();
     let original = h.receive("RAReportFault").await;
     connection
+        .rap()
         .report_fault(
             report,
             deadline_after(Duration::from_secs(2)).unwrap(),
@@ -1715,6 +1718,10 @@ async fn prepared_fault_report_preserves_original_payload_across_retry_writes() 
         .unwrap();
     let retried = h.receive("RAReportFault").await;
     assert_eq!(original.body, retried.body);
+    assert_ne!(
+        original.metadata().unwrap().id,
+        retried.metadata().unwrap().id
+    );
     let received: FaultBody = from_slice(&retried.body).unwrap();
     assert_eq!(received.fault, 1);
     assert_ne!(received.fault, body.fault);
