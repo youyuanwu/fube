@@ -865,6 +865,58 @@ offline and owned Rust-process observations, not fresh native outbound RAP,
 FM/Federation, stateful-native or physical-retirement qualification. Earlier
 exact-source native receipts remain unchanged.
 
+**Fresh local Node/native RAP qualification (2026-11-21):**
+`node-rap-lifecycle` passed at clean source
+`116fa2dd5c48fc3d901a2ffa13bb0252bc721f11`, tree
+`e92f67a9c75a79e7af6ee2d95629b404b7ec5a8d`. A new version-1 bundle rebuilt the
+test host and copied the selected native SDK application and manifest example.
+The actual producer used normal local Node/Activation construction with explicit
+shared native loader inputs and the existing native-local deadline policy.
+Default Rust startup and propagated deadlines remain unchanged. The selected
+SF 11.8.121.4 Runtime/Common and cached ABI bytes were verified before/after;
+no onebox, native node service or cluster operation was used.
+
+The native SDK registered its stateless factory and created/opened/closed one
+actual singleton instance. All three callbacks matched partition
+`42b8b722-7423-4bdd-b96f-b7a86e6902f4`; the original native app PID was `1711189`.
+Open produced committed RA `Ready`, one original runtime/acquisition and one
+local-write receipt. An independent application TCP connection received
+`native-stateless-pong`. Close produced committed `Closed`, a separate local
+write receipt, applied native semantic Close command/RA operation `5`, and one
+exact release of lookup/acquisition `1`. The retained disposal lineage matched
+the original host/runtime. New endpoint connections were refused while the
+original Hosting session remained connected; service Close did not kill the host.
+
+Explicit Activation termination then forcibly retired the still-owned native
+process/group, drained upstream work, joined the RA/store owners and released
+the activation root. This is selected explicit local cleanup, not graceful
+runtime unregister or a general residency/unused-scan/deactivation guarantee.
+Independent `/proc` observation checked both live executable identities/hashes,
+the native application's actual pinned Runtime/Common mappings and subsequent
+absence of both owned identities/groups. The ordinary input package, bundle,
+bounded logs, receipts, preflight and verification remain retained at ignored
+`build/furpc-node-rap-proof/116fa2d/`, a convenience link to the physical session
+evidence directory. Packaging/execution used the physical path, not the link.
+
+| Evidence | SHA256 |
+| --- | --- |
+| Bundle manifest | `beb0ad12606670174aab3bf8c952becf9c17fc05f66ae7e298c5d71df5b71344` |
+| Native Node/RAP receipt | `7d540f0ced375a502466fa96106f0def1499c26d9a9ac431708c2cdb4b9d3e56` |
+| Independent verification | `12aff6db727f5be344033b508cd36370236574a87fe6080e7346466e2314b972` |
+| Live process observations | `b42d2ee427a25ce26e272c4b57d9a74fd3fdef522c24f82b4a79a93fb5a79e05` |
+| Test-host executable | `98a21fd7400fe394be76bd36e405162dcbb4ef3cf11bfaedec610a22c3ac01cf` |
+| Native SDK application | `9194c42a048da99ec5f5e47d4cdcc6049fb79f39bab2c1cc50697c7fdc6cd055` |
+
+The receipt stays pinned to `116fa2d`, not later documentation changes.
+This run qualifies selected stateless native Open/Close through the typed local
+Node RAP adapters and shared launcher, not stateful/native replication, other
+RAP methods, fault/revocation/retry races, FM/Federation/deployed readiness or TLS.
+It has no independent raw-frame capture or lease-poll counting and observes no
+graceful native host/runtime unregister. The original five standalone fixtures
+and earlier Hosting/native-data/runtime receipts were not rerun or relabeled.
+The 147 selected coupled Rust cases and 20 native-runner model cases passed;
+strict affected default/all-feature checks and workspace formatting passed.
+
 ## Final legacy retirement
 
 The final core, standalone test-host and CLI fixture dependencies are migrated;

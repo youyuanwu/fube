@@ -34,6 +34,9 @@ The original five standalone fixture profiles have not been freshly rerun;
 their records below remain historical. Fresh clusterless production Hosting
 lease/factory-registration qualification at `c2776ac` is recorded separately in
 the [furpc implementation evidence](../transport/design/Furpc/Implementation.md).
+Fresh normal-construction local Node/native stateless Open/Close qualification at
+`116fa2d` is also recorded there. It includes exact usage release and explicit
+forced Activation cleanup, not graceful runtime unregister or native FM readiness.
 The broader design's former `fube-transport` references are obsolete.
 
 **Standalone does not mean SDK/library-free applications, production RA
