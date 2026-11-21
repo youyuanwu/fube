@@ -1,11 +1,12 @@
 //! Byte-facing furpc ingress; Hosting alone owns admission and mutation policy.
 use super::{IO_DEADLINE, MAX_INPUT};
 use furpc::{
-    header, Accept, Accepted, ActorId, Body, Error, HandlerLimits, Headers, IngressLimits,
-    IngressOptions, IngressResponse, IngressService, IoInfo, Message, Peer, Request, RequestPolicy,
-    Result, SendKind, SendPolicy, Server, ServiceBinding, Source, TransportLimits,
+    header, Accept, Accepted, ActorId, Body, Codec, EncodeBuf, Encoder, Error, FubstCodec,
+    HandlerLimits, Headers, IngressLimits, IngressOptions, IngressResponse, IngressService, IoInfo,
+    Peer, Request, RequestPolicy, Result, SendKind, SendPolicy, Server, ServiceBinding, Source,
+    TransportLimits,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::de::DeserializeOwned;
 use std::{
     future::Future,
     pin::Pin,
@@ -19,6 +20,9 @@ use tokio::{
 };
 use tower_service::Service;
 
+#[cfg(feature = "qualification")]
+use furpc::Message;
+
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 const HANDLERS: usize = 4;
 
@@ -28,7 +32,7 @@ pub(super) struct IpcMessage {
 }
 
 pub(super) struct Incoming {
-    pub message: IpcMessage,
+    pub request: Request<Body>,
     pub received_at: Instant,
     pub deadline: tokio::time::Instant,
     pub response: oneshot::Sender<IngressResponse>,
@@ -41,6 +45,7 @@ pub(super) struct Connection {
     pub failure: watch::Receiver<Option<Error>>,
 }
 
+#[cfg(feature = "qualification")]
 pub(super) fn message(actor: i64, action: &str, body: Vec<u8>) -> Result<Message> {
     let mut builder = Message::builder().append_header(header::actor(ActorId::new(actor)?)?);
     if !action.is_empty() {
@@ -52,13 +57,6 @@ pub(super) fn message(actor: i64, action: &str, body: Vec<u8>) -> Result<Message
 pub(super) fn action(headers: &Headers) -> Result<String> {
     String::from_utf16(headers.effective().action())
         .map_err(|_| Error::Protocol("invalid Hosting action"))
-}
-
-pub(super) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    fubst::serde::to_vec(value).map_err(|source| Error::Codec {
-        phase: "encode",
-        source: source.into(),
-    })
 }
 
 pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<T> {
@@ -73,6 +71,85 @@ pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<
         phase: "decode",
         source: source.into(),
     })
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum LifecycleMethod {
+    Open,
+    Close,
+    UpdateService,
+    BuildIdleReplica,
+    RemoveIdleReplica,
+    UpdateConfiguration,
+    UpdateEpochAndGetStatus,
+    EndpointUpdatedReply,
+}
+
+impl LifecycleMethod {
+    const ALL: [Self; 8] = [
+        Self::Open,
+        Self::Close,
+        Self::UpdateService,
+        Self::BuildIdleReplica,
+        Self::RemoveIdleReplica,
+        Self::UpdateConfiguration,
+        Self::UpdateEpochAndGetStatus,
+        Self::EndpointUpdatedReply,
+    ];
+
+    pub(super) fn select(action: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|method| method.action() == action)
+    }
+
+    fn action(self) -> &'static str {
+        match self {
+            Self::Open => "ReplicaOpen",
+            Self::Close => "ReplicaClose",
+            Self::UpdateService => "ProxyUpdateServiceDescription",
+            Self::BuildIdleReplica => "ReplicatorBuildIdleReplica",
+            Self::RemoveIdleReplica => "ReplicatorRemoveIdleReplica",
+            Self::UpdateConfiguration => "UpdateConfiguration",
+            Self::UpdateEpochAndGetStatus => "ReplicatorUpdateEpochAndGetStatus",
+            Self::EndpointUpdatedReply => "ProxyReplicaEndpointUpdatedReply",
+        }
+    }
+
+    pub(super) fn request(self, body: Body) -> Result<Request<Body>> {
+        Request::new(body)
+            .append_header(header::actor(ActorId::new(12)?)?)?
+            .append_header(header::action(self.action())?)
+    }
+}
+
+pub(super) struct PreparedBodyCodec;
+
+impl Codec for PreparedBodyCodec {
+    type Encode = Body;
+    type Decode = ();
+    type Encoder = Self;
+    type Decoder = <FubstCodec<(), ()> as Codec>::Decoder;
+
+    fn encoder(&mut self) -> Self {
+        Self
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        FubstCodec::<(), ()>::default().decoder()
+    }
+}
+
+impl Encoder for PreparedBodyCodec {
+    type Item = Body;
+
+    fn encode(
+        &mut self,
+        body: Body,
+        dst: &mut EncodeBuf<'_>,
+    ) -> std::result::Result<(), furpc::CodecError> {
+        dst.append_body(body)
+    }
 }
 
 fn allow(_: &Headers, _: &Source) -> Result<()> {
@@ -95,17 +172,7 @@ fn outbound(kind: SendKind, headers: &Headers, _: &Source) -> Result<()> {
     let common = headers.effective();
     if kind != SendKind::OneWay
         || common.actor.get() != 12
-        || !matches!(
-            action(headers)?.as_str(),
-            "ReplicaOpen"
-                | "ReplicaClose"
-                | "ProxyUpdateServiceDescription"
-                | "ReplicatorBuildIdleReplica"
-                | "ReplicatorRemoveIdleReplica"
-                | "UpdateConfiguration"
-                | "ReplicatorUpdateEpochAndGetStatus"
-                | "ProxyReplicaEndpointUpdatedReply"
-        )
+        || LifecycleMethod::select(&action(headers)?).is_none()
         || common.expects_reply
         || common.relates_to != furpc::MessageId::default()
     {
@@ -250,18 +317,9 @@ impl Service<Request<Body>> for Ingress {
                     .context()
                     .ok_or(Error::Internal("Hosting ingress context"))?
                     .deadline();
-                let mut body = Vec::new();
-                body.try_reserve_exact(request.body().len())
-                    .map_err(|_| Error::ResourceLimit("Hosting ingress body"))?;
-                for segment in request.body().segments() {
-                    body.extend_from_slice(segment);
-                }
                 let (response, wait) = oneshot::channel();
                 send.try_send(Incoming {
-                    message: IpcMessage {
-                        headers: request.headers().clone(),
-                        body,
-                    },
+                    request,
                     received_at: Instant::now(),
                     deadline,
                     response,

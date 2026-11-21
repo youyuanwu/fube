@@ -965,11 +965,21 @@ async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_
     assert_eq!(received.action().unwrap(), "ReplicaOpenReply");
     assert_eq!(received.body(), &[7, 8]);
     assert!(lease.take_lifecycle_reply().is_none());
+    for action in ["RegisterFabricRuntimeRequest", "ReplicaOpenReply"] {
+        assert!(lease.send_lifecycle(action, vec![9]).is_err());
+    }
     // Only the lease had a correlated response. Lifecycle ingress emits none.
+    let mut ids = std::collections::HashSet::new();
     for action in [
+        "ReplicaOpen",
         "ReplicaClose",
+        "ProxyUpdateServiceDescription",
         "ReplicatorBuildIdleReplica",
         "ReplicatorRemoveIdleReplica",
+        "UpdateConfiguration",
+        "ReplicatorUpdateEpochAndGetStatus",
+        "ProxyReplicaEndpointUpdatedReply",
+        "ReplicaClose",
     ] {
         let send = lease.send_lifecycle(action, vec![9]).unwrap();
         let request = read_message(&mut peer.socket).await.unwrap();
@@ -978,6 +988,8 @@ async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_
         assert_eq!(p.action, action);
         assert!(!p.expects_reply);
         assert_eq!(p.relates_to, MessageId::default());
+        assert_ne!(p.id, MessageId::default());
+        assert!(ids.insert(p.id));
         assert_eq!(request.body, [9]);
         tokio::time::timeout(Duration::from_secs(1), async {
             while send.result().is_none() {

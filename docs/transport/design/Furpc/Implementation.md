@@ -365,6 +365,23 @@ Lifecycle authority checks surround submission/local completion. Hosting itself
 owns cancellation and joins its connection/send tasks on its dedicated executor,
 releasing the accepted socket before publishing disconnected state. Registration
 retirement still permits bounded original-path unregister exchanges.
+Hosting registration and lease RPCs now retain the original Request<Body>
+through domain admission and use server::Rpc for typed reply encoding and
+original-runner handoff. A private schema-selected codec retains Hosting's
+DTO allocation budget: it borrows contiguous input, copies only fragmented
+input and checks domain admission under the core lock before decoding.
+Mutation reacquires that lock and rechecks authority, cleanup-only admission,
+factory capability, deadlines and retained-result capacity. Reply DTOs stay
+inline and retain the existing pre-clone/pre-encoding allocation checks.
+Lease polls remain independent of core state locking once registration completes.
+Admitted semantic RAP replies still expose the existing owned byte API; their
+contiguous copy occurs only after domain identity/readiness/inbox admission.
+Lifecycle sends use OneWayClient<PeerSendService> on the captured original Peer,
+with shared prepared-body encoding and one method profile inventory for envelope
+construction and the outbound guard. Public action/body inputs, send admission,
+authority checks, retained local-write observations and joined shutdown remain
+Hosting policy. This refactor adds no furpc API and does not update the
+exact-source native Hosting qualification recorded below.
 The Hosting and owned-app sample direct legacy dependency edges are retired;
 RA/node control uses the separate migrated adapter below. Offline managed
 furpc-client and independent adversarial socket fixtures cover the accepted path;
