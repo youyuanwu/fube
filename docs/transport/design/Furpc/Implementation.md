@@ -428,6 +428,60 @@ This qualifies the selected accepted clear-TCP bootstrap/registration paths, not
 native deployed/stateful/reporting lifecycle, failed-write/revocation races,
 TLS/claims, or full original native node-handler parity.
 
+**Fresh typed-service qualification (2026-11-21):** both `hosting-leases` and
+`hosting-registration` passed against clean source
+`c2776ac883186b2ad2cb99f21982e9c063a82d6a`, tree
+`d396347aa151a3f112298611dd288d53b2e5502d`. A fresh version-1 standalone bundle
+contains the rebuilt test-host, native SDK application and manifest-acceptance
+executables; the two selected profiles execute the test-host and application.
+The qualified source includes typed Hosting RPC serving, the private
+HostingServer/LifecycleClient composition and shared native Actor definitions.
+These clusterless runs used the unchanged private SF 11.8.121.4 Runtime/Common
+pins and compatible cached ABI inputs; no node service was installed or used.
+
+Each profile independently observed two correlated positive lease replies,
+with TTLs 299,999,991 and 299,999,992 ticks, actual runtime unregister,
+graceful exit0, direct-child reap and absent owned process groups.
+Independent observation checked four live process identities across the runs:
+each host executable matched its bundle hash, and each actual application's
+`/proc/<pid>/exe` matched the bundled native SDK producer. Both applications
+mapped the pinned Runtime/Common libraries at their verified private paths.
+Post-run verification checked unchanged native/ABI inputs, bundle bytes/modes,
+actual wire actions and receipts, copied application bytes and process absence.
+
+Registration additionally observed the actual native stateless factory,
+same-core equal-version lookup and disabled-health bookkeeping. Registered,
+RuntimeClosed and HostClosed were completed owned local decisions with
+`IgnoredNotReady`, not FM/RA deployment acknowledgments. No native host-unregister
+frame was observed; HostClosed came from connection-loss cleanup.
+One gated package obligation remained owned, not treated as release.
+The qualification launcher reaped its native child; this is not evidence of
+production Hosting package/process residency release.
+
+Ignored evidence is retained at `build/furpc-hosting-proof/c2776ac/`, a
+convenience link to the session's physical evidence directory; the runner used
+the physical bundle path because it rejects symlink parents. It contains
+`preflight.json`, `bundle/`, `receipts/`, per-profile live-process observations,
+`verification.json`, build/console logs and retained owned run directories.
+Both native profiles and all owned process groups were stopped; the unchanged
+retained onebox remained running with all five nodes Up.
+
+| Evidence | SHA256 |
+| --- | --- |
+| Bundle manifest | `6e1eebdde73d92ac66683e2ab63faed3c008494ce153514fe92cdd9b9d61f326` |
+| Hosting leases receipt | `4799f18eb736541fecc90e9ce208a13046d457ea09030e5500ee1861a8602709` |
+| Hosting registration receipt | `7e3e5c75cdb704a923775b85aaaa195d98feb35570102566a1aaa8db240f108f` |
+| Independent verification | `d5acfeaadce8e04261543a4224e73cb8e391c5b1767fac1974eb59829d882476` |
+| Test-host executable | `9156dfae8c75ca92d40b735e6097a15611590920d1820bc46ceb702bcb45762c` |
+| Native SDK application | `9194c42a048da99ec5f5e47d4cdcc6049fb79f39bab2c1cc50697c7fdc6cd055` |
+
+This receipt remains bound to `c2776ac`, not subsequent documentation changes.
+The original five standalone fixture profiles were not rerun; their earlier
+receipts remain historical. Native outbound RAP/lifecycle, stateful/reporting
+behavior, failed-write/revocation races, TLS/claims and broader native node
+parity remain unqualified by these two selected profiles. No generic furpc
+physical-retirement/join guarantee is introduced or qualified.
+
 The public facade supports managed byte RPC by default and explicitly selected
 `ConnectionOptions::raw_only()` for caller-owned one-way IDs. Endpoint owns inert URI,
 limit and service configuration; connect returns an owning Channel. Channel

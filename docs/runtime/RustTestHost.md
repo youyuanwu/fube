@@ -30,8 +30,11 @@ immutable messages. Furpc owns handshake validation and reply correlation; the
 fixture owns a bounded inbox, domain identity/lifecycle checks and joined
 serving-thread/socket cleanup. Reply submission hands data to the runner rather
 than proving a local write. Independent observers forward original bytes.
-This changed source has no fresh native qualification; the records below remain
-historical. The broader design's former `fube-transport` references are obsolete.
+The original five standalone fixture profiles have not been freshly rerun;
+their records below remain historical. Fresh clusterless production Hosting
+lease/factory-registration qualification at `c2776ac` is recorded separately in
+the [furpc implementation evidence](../transport/design/Furpc/Implementation.md).
+The broader design's former `fube-transport` references are obsolete.
 
 **Standalone does not mean SDK/library-free applications, production RA
 equivalence, a full application deployer, or a security sandbox.** The Rust host
