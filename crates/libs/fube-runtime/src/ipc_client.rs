@@ -15,27 +15,24 @@ use std::{
 
 use fube_core::protocol::actor as actors;
 use furpc::{
-    header, ActorId, Body, BoxError, Channel, Codec, Connected, DecodeBuf, Decoder, Endpoint,
-    FubstCodec, HandlerLimits, HeaderId, HeaderRecord, Headers, IngressLimits, IngressResponse,
-    Message, MessageId, OneWayRouteOptions, Peer, Reply, Request, RequestPolicy,
-    RequestRouteOptions, Response, Router, RpcClient, Source, TransportIo,
+    header, ActorId, Body, BoxError, Channel, Connected, Endpoint, FubstCodec, HandlerLimits,
+    HeaderId, HeaderRecord, Headers, Message, Peer, Request, Response, RpcClient, TransportIo,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::{oneshot, watch, Semaphore},
+    sync::{watch, Semaphore},
     time::{timeout_at, Instant},
 };
 use tower_service::Service;
 
-use crate::{wire, Error, ErrorKind, Result};
+use crate::{ipc_server::RuntimeServer, wire, Error, ErrorKind, Result};
 
 #[cfg(test)]
 #[path = "ipc_client_tests.rs"]
 mod tests;
 
 pub(crate) type Check = Arc<dyn Fn() -> bool + Send + Sync>;
-type Handoff = Arc<dyn Fn(IpcMessage) -> Result<()> + Send + Sync>;
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 const OPERATIONS: usize = 32;
 const IPC: u16 = 0x800b;
@@ -51,100 +48,12 @@ pub(crate) fn deadline_after(timeout: Duration) -> Result<Instant> {
         .ok_or(Error::InvalidInput("runtime IPC deadline overflow"))
 }
 
-pub(crate) struct IpcMessage {
-    pub actor: i64,
-    pub action: String,
-    pub id: MessageId,
-    pub body: Vec<u8>,
-    pub received_at: std::time::Instant,
-    pub deadline: Instant,
-    pub reply: Option<IpcResponse>,
-}
-
-impl IpcMessage {
-    fn from_request(request: Request<Body>, reply: Option<IpcResponse>) -> Result<Self> {
-        let deadline = request
-            .context()
-            .ok_or(Error::Protocol("runtime ingress requires furpc context"))?
-            .deadline();
-        let properties = request.headers().effective();
-        let mut body = Vec::new();
-        body.try_reserve_exact(request.body().len())
-            .map_err(|_| Error::ResourceLimit("runtime ingress body"))?;
-        for segment in request.body().segments() {
-            body.extend_from_slice(segment);
-        }
-        Ok(Self {
-            actor: properties.actor.get(),
-            action: action(request.headers())?,
-            id: properties.message_id,
-            body,
-            received_at: std::time::Instant::now(),
-            deadline,
-            reply,
-        })
-    }
-}
-
-/// Typed response-data handoff, not proof of encoding or local writing.
-/// The original furpc runner retains native reply authority.
-pub(crate) enum IpcResponse {
-    HostControl(oneshot::Sender<wire::ErrorReply>),
-    Query(oneshot::Sender<wire::QueryReply>),
-}
-
-impl IpcResponse {
-    pub(crate) async fn reply_error(self, body: wire::ErrorReply, deadline: Instant) -> Result<()> {
-        self.reply_error_checked(body, deadline, Arc::new(|| true))
-            .await
-    }
-
-    pub(crate) async fn reply_error_checked(
-        self,
-        body: wire::ErrorReply,
-        deadline: Instant,
-        valid: Check,
-    ) -> Result<()> {
-        let Self::HostControl(response) = self else {
-            return Err(Error::InvalidInput("foreign IPC reply type"));
-        };
-        respond(response, body, deadline, valid)
-    }
-
-    pub(crate) async fn reply_query_checked(
-        self,
-        body: wire::QueryReply,
-        deadline: Instant,
-        valid: Check,
-    ) -> Result<()> {
-        let Self::Query(response) = self else {
-            return Err(Error::InvalidInput("foreign IPC reply type"));
-        };
-        respond(response, body, deadline, valid)
-    }
-}
-
-fn respond<T>(
-    response: oneshot::Sender<T>,
-    body: T,
-    deadline: Instant,
-    valid: Check,
-) -> Result<()> {
-    if Instant::now() >= deadline {
-        return Err(Error::Timeout);
-    }
-    if !valid() {
-        return Err(Error::Closed);
-    }
-    response.send(body).map_err(|_| Error::Closed)
-}
-
 struct SessionState {
     channel: Option<Channel>,
     error: Option<Error>,
 }
 
-struct Session {
+pub(super) struct Session {
     state: Mutex<SessionState>,
     stopped: watch::Sender<Option<Error>>,
     ordinary: Semaphore,
@@ -152,14 +61,14 @@ struct Session {
 }
 
 impl Session {
-    fn check(&self) -> Result<()> {
+    pub(super) fn check(&self) -> Result<()> {
         match &self.state.lock().unwrap().error {
             Some(error) => Err(error.clone()),
             None => Ok(()),
         }
     }
 
-    fn retire(&self, error: Error) {
+    pub(super) fn retire(&self, error: Error) {
         let channel = {
             let mut state = self.state.lock().unwrap();
             if state.error.is_some() {
@@ -228,7 +137,7 @@ impl IpcClient {
         address: SocketAddr,
         deadline: Instant,
         host_id: &str,
-        handoff: Handoff,
+        server: RuntimeServer,
         serving: Option<Check>,
     ) -> Result<Self> {
         if !address.ip().is_loopback() || address.port() == 0 {
@@ -259,58 +168,7 @@ impl IpcClient {
             ordinary: Semaphore::new(OPERATIONS),
             replies: Semaphore::new(OPERATIONS),
         });
-        let service = Ingress {
-            session: Arc::downgrade(&session),
-            handoff,
-            kind: IngressKind::OneWay,
-        };
-        let control = Ingress {
-            kind: IngressKind::HostControl,
-            ..service.clone()
-        };
-        let query = Ingress {
-            kind: IngressKind::Query,
-            ..service.clone()
-        };
-        let policy = RequestRouteOptions::new(
-            RequestPolicy::new(incoming, response),
-            IngressLimits::default(),
-        );
-        let mut router = Router::new();
-        for action in ["InvalidateLeaseRequest", "UpdateCodePackageContextRequest"] {
-            router = router
-                .request(
-                    actor(actors::APPLICATION_HOST)?,
-                    action,
-                    policy.clone(),
-                    control.clone(),
-                )
-                .map_err(native_error)?;
-        }
-        router = router
-            .request(actor(actors::RA)?, "RAPQuery", policy, query)
-            .map_err(native_error)?;
-        for action in [
-            "ReplicaOpen",
-            "ReplicaClose",
-            "ProxyUpdateServiceDescription",
-            "UpdateConfiguration",
-            "ReplicatorBuildIdleReplica",
-            "ReplicatorRemoveIdleReplica",
-            "ReplicatorGetStatus",
-            "ReplicatorUpdateEpochAndGetStatus",
-            "CancelCatchupReplicaSet",
-            "ProxyReplicaEndpointUpdatedReply",
-        ] {
-            router = router
-                .one_way(
-                    actor(actors::RA)?,
-                    action,
-                    OneWayRouteOptions::new(incoming, IngressLimits::default()),
-                    service.clone(),
-                )
-                .map_err(native_error)?;
-        }
+        let router = server.router(Arc::downgrade(&session))?;
         let timeout = deadline
             .checked_duration_since(Instant::now())
             .ok_or(Error::Timeout)?;
@@ -798,7 +656,7 @@ where
     }
 }
 
-fn actor(value: i64) -> Result<ActorId> {
+pub(super) fn actor(value: i64) -> Result<ActorId> {
     ActorId::new(value).map_err(native_error)
 }
 
@@ -850,35 +708,6 @@ fn outbound(headers: &Headers, request: bool) -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidInput("unauthorized runtime IPC submission"))
-    }
-}
-
-fn incoming(headers: &Headers, _: &Source) -> furpc::Result<()> {
-    let common = headers.effective();
-    if common.message_id == MessageId::default()
-        || common.uncorrelated_reply
-        || headers.first_raw(header::FAULT).is_some()
-    {
-        return Err(furpc::Error::Protocol("invalid runtime IPC ingress"));
-    }
-    Ok(())
-}
-
-fn response(headers: &Headers, _: &Source) -> furpc::Result<()> {
-    let common = headers.effective();
-    if (common.actor.get() == actors::APPLICATION_HOST && common.action().is_empty())
-        || (common.actor.get() == actors::RA
-            && common
-                .action()
-                .iter()
-                .copied()
-                .eq("RAPQueryReply".encode_utf16()))
-    {
-        Ok(())
-    } else {
-        Err(furpc::Error::InvalidInput(
-            "unauthorized runtime IPC response",
-        ))
     }
 }
 
@@ -999,173 +828,6 @@ impl Service<Request<Body>> for PeerService {
             .deadline()
             .expect("RpcClient sets the request deadline");
         self.0.request(request, deadline)
-    }
-}
-
-#[derive(Clone)]
-struct Ingress {
-    session: Weak<Session>,
-    handoff: Handoff,
-    kind: IngressKind,
-}
-
-#[derive(Clone, Copy)]
-enum IngressKind {
-    OneWay,
-    HostControl,
-    Query,
-}
-
-// Request parsing stays on the serialized domain executor; reply encoding uses Fubst.
-struct ReplyCodec<T>(FubstCodec<T, ()>);
-
-impl<T: Serialize> Codec for ReplyCodec<T> {
-    type Encode = T;
-    type Decode = Body;
-    type Encoder = <FubstCodec<T, ()> as Codec>::Encoder;
-    type Decoder = RequestBody;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        self.0.encoder()
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        RequestBody
-    }
-}
-
-struct RequestBody;
-
-impl Decoder for RequestBody {
-    type Item = Body;
-
-    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> std::result::Result<Body, furpc::CodecError> {
-        src.take(src.remaining())
-    }
-}
-
-struct ReplyHandler<T> {
-    handoff: Handoff,
-    response: fn(oneshot::Sender<T>) -> IpcResponse,
-    actor: i64,
-    action: Option<&'static str>,
-}
-
-impl<T: Send + 'static> Service<Request<Body>> for ReplyHandler<T> {
-    type Response = Reply<T>;
-    type Error = Error;
-    type Future = BoxFuture<Result<Self::Response>>;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let (send, receive) = oneshot::channel();
-        let prepared =
-            IpcMessage::from_request(request, Some((self.response)(send))).and_then(|message| {
-                let deadline = message.deadline;
-                (self.handoff)(message)?;
-                Ok(deadline)
-            });
-        let actor = self.actor;
-        let action = self.action;
-        Box::pin(async move {
-            let body = timeout_at(prepared?, receive)
-                .await
-                .map_err(|_| Error::Timeout)?
-                .map_err(|_| Error::Closed)?;
-            let mut reply = Reply::new(body)
-                .append_header(header::actor(self::actor(actor)?).map_err(native_error)?)
-                .map_err(native_error)?;
-            if let Some(action) = action {
-                reply = reply
-                    .append_header(header::action(action).map_err(native_error)?)
-                    .map_err(native_error)?;
-            }
-            Ok(reply)
-        })
-    }
-}
-
-impl Service<Request<Body>> for Ingress {
-    type Response = IngressResponse;
-    type Error = Error;
-    type Future = BoxFuture<Result<Self::Response>>;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let session = self.session.clone();
-        let handoff = self.handoff.clone();
-        let kind = self.kind;
-        Box::pin(async move {
-            let session = session.upgrade().ok_or(Error::Closed)?;
-            let mut guard = IngressCall {
-                session: session.clone(),
-                armed: true,
-            };
-            let result: Result<IngressResponse> = async {
-                session.check()?;
-                match kind {
-                    IngressKind::OneWay => {
-                        handoff(IpcMessage::from_request(request, None)?)?;
-                        Ok(IngressResponse::NoReply)
-                    }
-                    IngressKind::HostControl => {
-                        furpc::server::Rpc::new(ReplyCodec::<wire::ErrorReply>(
-                            FubstCodec::default(),
-                        ))
-                        .unary(
-                            ReplyHandler {
-                                handoff,
-                                response: IpcResponse::HostControl,
-                                actor: actors::APPLICATION_HOST,
-                                action: None,
-                            },
-                            request,
-                        )
-                        .await
-                        .map_err(native_error)
-                    }
-                    IngressKind::Query => furpc::server::Rpc::new(ReplyCodec::<wire::QueryReply>(
-                        FubstCodec::default(),
-                    ))
-                    .unary(
-                        ReplyHandler {
-                            handoff,
-                            response: IpcResponse::Query,
-                            actor: actors::RA,
-                            action: Some("RAPQueryReply"),
-                        },
-                        request,
-                    )
-                    .await
-                    .map_err(native_error),
-                }
-            }
-            .await;
-            guard.armed = false;
-            if let Err(error) = &result {
-                session.retire(error.clone());
-            }
-            result
-        })
-    }
-}
-
-struct IngressCall {
-    session: Arc<Session>,
-    armed: bool,
-}
-
-impl Drop for IngressCall {
-    fn drop(&mut self) {
-        if self.armed {
-            self.session.retire(Error::Closed);
-        }
     }
 }
 

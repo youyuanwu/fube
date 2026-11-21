@@ -102,12 +102,14 @@ mod diagnostics;
 mod error;
 mod execution;
 pub mod extensions;
+mod host_control;
 #[cfg(test)]
 mod hosting_registration_tests;
 #[cfg(test)]
 mod hosting_tests;
 mod instance_integration;
 mod ipc_client;
+mod ipc_server;
 mod lease;
 mod lifecycle;
 mod managed_participants;
@@ -139,12 +141,11 @@ use std::{
 };
 
 pub use error::{Error, ErrorKind, RejectedRegistrationInput, Result};
-use fube_core::protocol::actor as actors;
-use fubst::serde::from_slice;
 #[cfg(test)]
-use fubst::serde::to_vec;
+use fubst::serde::{from_slice, to_vec};
 use ipc_client::deadline_after;
-use ipc_client::{IpcClient, IpcMessage};
+use ipc_client::IpcClient;
+use ipc_server::{ControlCall, RapCall, RuntimeServer};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 pub(crate) use api::PartitionKind;
@@ -307,31 +308,29 @@ impl Runtime {
         let ingress_authority = authority.clone();
         let controls_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ingress_ready = controls_ready.clone();
-        let (control_tx, mut controls) =
-            mpsc::channel::<(Monotonic, IpcMessage)>(MAX_INCOMING_COMMANDS);
-        let (command_tx, incoming) = mpsc::channel::<IpcMessage>(MAX_INCOMING_COMMANDS);
-        let handler = Arc::new(move |request: IpcMessage| match request.actor {
-            actors::APPLICATION_HOST => {
-                if request.action != "UpdateCodePackageContextRequest"
-                    || !ingress_ready.load(std::sync::atomic::Ordering::Acquire)
-                {
+        let (control_tx, mut controls) = mpsc::channel::<ControlCall>(MAX_INCOMING_COMMANDS);
+        let (command_tx, incoming) = mpsc::channel::<RapCall>(MAX_INCOMING_COMMANDS);
+        let server = RuntimeServer::new(
+            Arc::new(move |call| {
+                if !call.is_update() || !ingress_ready.load(std::sync::atomic::Ordering::Acquire) {
                     ingress_authority.retire();
                 }
                 control_tx
-                    .try_send((request.received_at, request))
+                    .try_send(call)
                     .map_err(|_| Error::ResourceLimit("runtime control ingress"))
-            }
-            actors::RA => command_tx
-                .try_send(request)
-                .map_err(|_| Error::ResourceLimit("runtime ingress")),
-            _ => Err(Error::Protocol("unsupported application IPC actor")),
-        });
+            }),
+            Arc::new(move |call| {
+                command_tx
+                    .try_send(call)
+                    .map_err(|_| Error::ResourceLimit("runtime ingress"))
+            }),
+        );
         let send_authority = Arc::downgrade(&authority);
         let connection = IpcClient::connect(
             activation.address,
             deadline_after(REGISTRATION_TIMEOUT)?,
             &activation.host_id,
-            handler,
+            server,
             Some(Arc::new(move || {
                 send_authority
                     .upgrade()
@@ -449,53 +448,18 @@ impl Runtime {
         let updater = Arc::new(package_context::Updater::new(current.clone(), &deployment));
         controls_ready.store(true, std::sync::atomic::Ordering::Release);
         let control = tokio::spawn(async move {
-            while let Some((received, request)) = controls.recv().await {
-                let result: Result<()> = async {
-                    let reply = request
-                        .reply
-                        .ok_or(Error::Protocol("host control requires correlation"))?;
-                    match request.action.as_str() {
-                        "InvalidateLeaseRequest" if request.body.is_empty() => {
-                            control_authority.retire();
-                            reply
-                                .reply_error(
-                                    ErrorReply { error: 0 },
-                                    deadline_after(Duration::from_millis(250))?,
-                                )
-                                .await
-                        }
-                        "UpdateCodePackageContextRequest" => {
-                            let update: UpdateContext = from_slice(&request.body)?;
-                            if update.timeout <= 0 { return Err(Error::Timeout); }
-                            let duration = Duration::from_nanos((update.timeout.min(300_000_000) as u64)*100);
-                            let deadline = received.checked_add(duration).ok_or(Error::Timeout)?
-                                .min(request.deadline.into_std());
-                            control_authority.check()?;
-                            if Monotonic::now() >= deadline { return Err(Error::Timeout); }
-                            let call_permit = control_execution.reserve(
-                                extensions::CallLane::Native, extensions::CallOrigin::default(),
-                                deadline.saturating_duration_since(Monotonic::now()), false)?;
-                            let worker = updater.clone();
-                            let permit = worker.admit()?;
-                            let worker_authority = control_authority.clone();
-                            let mut work = call_permit.run_owned(move || {
-                                let _permit = permit;
-                                worker.apply(update,&worker_authority,deadline)
-                            });
-                            tokio::select! {
-                                result = &mut work => result?,
-                                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => return Err(Error::Timeout),
-                                _ = control_connection.closed() => return Err(Error::Closed),
-                            }
-                            let authority = control_authority.clone();
-                            reply.reply_error_checked(ErrorReply {error:0},
-                                tokio::time::Instant::from_std(deadline),
-                                Arc::new(move || authority.check().is_ok())).await
-                        }
-                        _ => Err(Error::Protocol("unsupported host control")),
-                    }
-                }
-                .await;
+            while let Some(call) = controls.recv().await {
+                let service = host_control::HostControl {
+                    authority: control_authority.clone(),
+                    connection: control_connection.clone(),
+                    execution: control_execution.clone(),
+                    updater: updater.clone(),
+                    received_at: call.received_at(),
+                };
+                let result = match call {
+                    ControlCall::InvalidateLease(call) => call.unary(service).await,
+                    ControlCall::UpdateContext(call) => call.unary(service).await,
+                };
                 if let Err(error) = result {
                     control_connection.abort();
                     control_authority.retire();

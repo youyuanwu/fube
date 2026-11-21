@@ -1,6 +1,7 @@
 //! Native stateful RAP lifecycle. Wire records are never the public API.
 use crate::extensions::EpochDomains;
 use crate::ipc_client::{deadline_after, ProxyReplyKind};
+use crate::ipc_server::RapAction;
 use crate::{
     lease::Authority, stateful_api::*, wire as w, ActivationContextHandle, Cancellation,
     PartitionKind, RuntimeMetrics,
@@ -328,41 +329,22 @@ impl Registry {
         self.units.lock().unwrap().get(&id).cloned()
     }
 
-    pub(crate) async fn dispatch(
-        &self,
-        action: &str,
-        request: w::ProxyRequest,
-        correlation: Option<crate::ipc_client::IpcResponse>,
-    ) -> Result<()> {
+    pub(crate) fn query_reply(&self, request: &w::ProxyRequest) -> Result<w::QueryReply> {
         self.authority.check()?;
-        if action == "RAPQuery" {
-            if request.runtime != self.current.snapshot().runtime.id
-                || request.flags != 0
-                || !request.remote.0.is_empty()
-                || request.local.node.id.0.len() != 16
-            {
-                return Err(Error::Protocol("invalid stateful RAPQuery context"));
-            }
-            self.metrics.queries.fetch_add(1, Ordering::Relaxed);
-            let authority = Arc::downgrade(&self.authority);
-            return correlation
-                .ok_or(Error::Protocol("RAPQuery requires correlation"))?
-                .reply_query_checked(
-                    self.query(&request)?,
-                    deadline_after(Duration::from_secs(5))?,
-                    Arc::new(move || {
-                        authority
-                            .upgrade()
-                            .is_some_and(|authority| authority.check().is_ok())
-                    }),
-                )
-                .await;
+        if request.runtime != self.current.snapshot().runtime.id
+            || request.flags != 0
+            || !request.remote.0.is_empty()
+            || request.local.node.id.0.len() != 16
+        {
+            return Err(Error::Protocol("invalid stateful RAPQuery context"));
         }
-        if correlation.is_some() {
-            return Err(Error::Protocol(
-                "stateful lifecycle uses one-way semantic replies",
-            ));
-        }
+        self.metrics.queries.fetch_add(1, Ordering::Relaxed);
+        self.query(request)
+    }
+
+    pub(crate) async fn dispatch(&self, kind: RapAction, request: w::ProxyRequest) -> Result<()> {
+        self.authority.check()?;
+        let action = kind.action();
         match action {
             "ReplicaOpen" | "ReplicaClose" | "ProxyUpdateServiceDescription" => {
                 self.validate_service(&request)?;

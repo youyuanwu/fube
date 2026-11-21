@@ -217,14 +217,25 @@ endpoint updates use opaque typed prepared payloads to retain exact retry bytes.
 Stateless replies keep reserved admission; stateful replies and reports keep
 ordinary admission. These calls still await original-Peer local writes, not RPC
 responses or semantic acknowledgment.
-Host-control and RAPQuery RPC handlers now hand off typed ErrorReply/QueryReply
-data instead of actor/action/serialized response bytes. The existing server::Rpc
-adapter uses the standard Fubst reply encoder; its request-body passthrough keeps
-parsing and validation on the serialized domain executor. Response headers are
-fixed by the admitted route, and the original runner still owns correlation and
-writing. Retained typed slots cannot publish after invocation retirement.
-Slot success means response-data handoff; later encode/write failures remain
-owned serving errors.
+RuntimeServer separately composes host-control, RAPQuery and RAP one-way routes
+in ipc_server.rs. Its bounded handoffs carry opaque, schema-typed invocations,
+not a domain-visible actor/action/Vec envelope or an optional response slot.
+The original Request<Body> stays private until the serialized executor reaches
+the existing admission boundary. Host-control services accept Request<()> or
+Request<UpdateContext> and return Reply<ErrorReply>; the query service accepts
+Request<ProxyRequest> and returns Reply<QueryReply>. The stock server::Rpc adapter
+and FubstCodec now decode requests and encode replies on that executor.
+Response headers are fixed by the admitted route, and the original runner still
+owns correlation and writing. A retired RPC invocation cannot call its retained
+typed service. RPC execution completion means encoded response-data handoff,
+not local-write completion; subsequent write failures remain serving errors.
+RAP one-way handlers accept Request<ProxyRequest> and return (). Their serving
+scope still completes at bounded enqueue, preserving late-command shutdown and
+unregister behavior. After owned dispatch admission, the public Fubst decoder
+adapts the retained body before calling the typed domain service. Using
+server::Rpc::one_way at that later point would incorrectly borrow the already
+completed runner invocation. Route-selected RapAction values replace untyped
+action selection in the command handoff; native actions and schemas are unchanged.
 Runtime IPC uses shared native subsystem actor names from
 fube_core::protocol::actor; that catalog stays above furpc and grants no routing
 authority.

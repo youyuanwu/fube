@@ -4,7 +4,7 @@ mod reporting_tests;
 #[path = "stateful_tests.rs"]
 pub(crate) mod stateful_tests;
 use fube_rap_test_support::transport::{message, ModelPeer, Received as Message};
-use fubst::serde::to_vec;
+use fubst::serde::{from_slice, to_vec};
 use furpc::MessageId;
 use tokio::{net::TcpListener, sync::Notify};
 
@@ -747,7 +747,10 @@ impl Harness {
                 address,
                 deadline_after(Duration::from_secs(2)).unwrap(),
                 &activation.host_id,
-                handler,
+                crate::ipc_server::RuntimeServer::new(
+                    Arc::new(|_| Err(Error::Protocol("unexpected model host control"))),
+                    handler,
+                ),
                 None
             ),
             async { ModelPeer::accept(listener).await.unwrap() }
@@ -1526,20 +1529,8 @@ async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
         drop(operation.acquire_owned().await.unwrap());
         // Model an operation already admitted but not yet polled by its task.
         h.engine.shared.authority.check().unwrap();
-        let admitted = crate::ipc_client::IpcMessage {
-            received_at: std::time::Instant::now(),
-            deadline: deadline_after(Duration::from_secs(30)).unwrap(),
-            actor: 12,
-            action: "ReplicaOpen".into(),
-            id: furpc::MessageId {
-                guid: [7; 16],
-                index: 99,
-            },
-            body: to_vec(&request).unwrap(),
-            reply: None,
-        };
         h.engine.shared.authority.retire();
-        let result = dispatch(h.engine.shared.clone(), admitted).await;
+        let result = dispatch(h.engine.shared.clone(), RapAction::ReplicaOpen, request).await;
         assert!(matches!(result, Err(Error::Closed)), "{result:?}");
         h.no_reply().await;
         assert_eq!(h.calls.factories.load(Ordering::SeqCst), 1);
@@ -1809,6 +1800,30 @@ async fn prove_unregister_ipc_after_drain(h: &mut Harness) {
     .unwrap();
     let reply = reply.unwrap().into_body();
     assert_eq!(reply.error, 0);
+}
+
+#[tokio::test]
+async fn typed_one_way_decoding_follows_owned_dispatch_admission() {
+    let mut h = Harness::new().await;
+    let pause = h
+        .engine
+        .shared
+        .test_hooks
+        .pause_once(DispatchPoint::BeforeDispatch);
+    h.peer
+        .send(message(12, "ReplicaOpen", vec![3, 1, 4]).unwrap())
+        .await
+        .unwrap();
+    dispatch_pause_reached(&pause).await;
+    assert!(!h.engine.shared.connection.is_closed());
+    assert_eq!(h.calls.factories.load(Ordering::SeqCst), 0);
+    pause.resume.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(2), h.engine.shared.connection.closed())
+        .await
+        .unwrap();
+    assert!(matches!(error, Error::Protocol(_) | Error::InvalidInput(_)));
+    assert_eq!(h.calls.factories.load(Ordering::SeqCst), 0);
+    h.engine.quiesce().await.unwrap();
 }
 
 #[tokio::test]
