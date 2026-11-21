@@ -839,6 +839,32 @@ native FM/RA run was executed. The earlier exact-source `154b4f1` native-data
 receipt does not qualify this changed RA/node code. TLS and broader routing stay
 unqualified.
 
+## Node local RAP typed composition
+
+Node's local RA/RAP bridge now separates private client and reply-intake adapters
+from its domain executor. RapClient prepares the eight supported RA effects using
+the existing native ProxyRequest schemas and 64 KiB body bound. Opaque prepared
+requests keep action/payload pairing inside the adapter; submission uses the
+original Hosting lease and its existing typed furpc one-way service. It adds no
+reconnection, retry, serving task or new public Hosting/furpc API.
+
+Reply intake checks exact opaque session provenance before action parsing or
+budgeted decoding, then selects typed load, service-description, endpoint and
+proxy completions. Proxy remote-count/flag checks retain the native method
+profiles; unsupported proxy methods still fail at the original state/runtime
+admission point. Node retains bounded inbox/command admission, raw held/rejected
+inputs, registration/runtime checks, RA execution, disposal lineage and ownership.
+Local frame-write completion remains separate from semantic RA completion.
+Rejected input cannot block subsequent HostClosed and exact-usage cleanup.
+
+The 45 selected Node unit/control/bridge and local-app lifecycle cases passed,
+including original-session rejection, stale/failed reply admission and command
+receipt backpressure before reply intake. Strict default-library and
+all-target/all-feature Node Clippy and workspace formatting passed. These are
+offline and owned Rust-process observations, not fresh native outbound RAP,
+FM/Federation, stateful-native or physical-retirement qualification. Earlier
+exact-source native receipts remain unchanged.
+
 ## Final legacy retirement
 
 The final core, standalone test-host and CLI fixture dependencies are migrated;

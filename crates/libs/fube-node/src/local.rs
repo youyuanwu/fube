@@ -28,6 +28,11 @@ const BODY: usize = 64 * 1024;
 const ADD_BODY: usize = BODY - 4096;
 const RETRY: Duration = Duration::from_secs(15);
 
+mod rap_client;
+mod rap_intake;
+use rap_client::RapClient;
+use rap_intake::Incoming;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Activation(h::local::LocalError),
@@ -267,7 +272,7 @@ struct Sending {
 }
 struct Route {
     runtime: String,
-    lease: ipc::HostLease,
+    client: RapClient,
 }
 
 /// Positive original-runtime instance-disposal lineage. This is a trusted-local
@@ -2995,12 +3000,7 @@ impl Node {
                 }
                 LocalDisposition::LocalResponse
             }
-            ra::Effect::UpdateConfiguration {
-                body,
-                local,
-                flags,
-                registration,
-            } => {
+            ra::Effect::UpdateConfiguration { registration, .. } => {
                 let Some(lease) = self.activation.host_lease() else {
                     return Err(Error::OwnerLost);
                 };
@@ -3011,23 +3011,13 @@ impl Node {
                 {
                     return Err(Error::Protocol);
                 }
-                let bytes = to_vec(&rap::Request {
-                    runtime: String::new(),
-                    unit: body.unit.clone(),
-                    local: (**local).clone(),
-                    remote: body.replicas.clone(),
-                    service: Service::default(),
-                    flags: *flags,
-                })
-                .map_err(|_| Error::Protocol)?;
-                if bytes.len() > BODY {
-                    return Err(Error::Capacity);
-                }
-                match lease.send_lifecycle("UpdateConfiguration", bytes) {
+                let client = RapClient::new(lease);
+                let request = RapClient::prepare(&dispatch.effect)?;
+                match client.send(request) {
                     Ok(send) => {
                         self.route = Some(Route {
                             runtime: registration.runtime.clone(),
-                            lease,
+                            client,
                         });
                         self.effects.pop_front();
                         self.sending = Some(Sending { dispatch, send });
@@ -3038,21 +3028,13 @@ impl Node {
                     Err(_) => LocalDisposition::WriteFailed,
                 }
             }
-            ra::Effect::RuntimeOpen {
-                body, registration, ..
-            }
-            | ra::Effect::Close {
-                body, registration, ..
-            }
-            | ra::Effect::UpdateServiceDescription { body, registration }
-            | ra::Effect::BuildIdle {
-                body, registration, ..
-            }
-            | ra::Effect::RemoveIdle {
-                body, registration, ..
-            }
-            | ra::Effect::QueryReplicaStatus { body, registration }
-            | ra::Effect::AcknowledgeEndpoint { body, registration } => {
+            ra::Effect::RuntimeOpen { registration, .. }
+            | ra::Effect::Close { registration, .. }
+            | ra::Effect::UpdateServiceDescription { registration, .. }
+            | ra::Effect::BuildIdle { registration, .. }
+            | ra::Effect::RemoveIdle { registration, .. }
+            | ra::Effect::QueryReplicaStatus { registration, .. }
+            | ra::Effect::AcknowledgeEndpoint { registration, .. } => {
                 let Some(lease) = self.activation.host_lease() else {
                     self.effects.pop_front();
                     self.receipts.push_back(EffectReceipt {
@@ -3065,50 +3047,13 @@ impl Node {
                 if registration.host != identity.host_id {
                     return Err(Error::Protocol);
                 }
-                let (action, flags) = match &dispatch.effect {
-                    ra::Effect::RuntimeOpen { flags, .. } => ("ReplicaOpen", *flags),
-                    ra::Effect::Close { flags, .. } => ("ReplicaClose", *flags),
-                    ra::Effect::UpdateServiceDescription { .. } => {
-                        ("ProxyUpdateServiceDescription", 0)
-                    }
-                    ra::Effect::BuildIdle { .. } => ("ReplicatorBuildIdleReplica", 0),
-                    ra::Effect::RemoveIdle { .. } => ("ReplicatorRemoveIdleReplica", 0),
-                    ra::Effect::QueryReplicaStatus { .. } => {
-                        ("ReplicatorUpdateEpochAndGetStatus", 0)
-                    }
-                    ra::Effect::AcknowledgeEndpoint { .. } => {
-                        ("ProxyReplicaEndpointUpdatedReply", 0)
-                    }
-                    _ => unreachable!(),
-                };
-                let bytes = if let ra::Effect::BuildIdle { replica, .. }
-                | ra::Effect::RemoveIdle { replica, .. } = &dispatch.effect
-                {
-                    rap::idle_request(body, replica)?
-                } else if matches!(
-                    dispatch.effect,
-                    ra::Effect::QueryReplicaStatus { .. } | ra::Effect::AcknowledgeEndpoint { .. }
-                ) {
-                    to_vec(&rap::Request {
-                        runtime: registration.runtime.clone(),
-                        unit: body.unit.clone(),
-                        local: body.replica.clone(),
-                        remote: ObjectArray(vec![]),
-                        service: Service::default(),
-                        flags: 0,
-                    })
-                    .map_err(|_| Error::Protocol)?
-                } else {
-                    rap::request(registration, body, flags)?
-                };
-                if bytes.len() > BODY {
-                    return Err(Error::Capacity);
-                }
-                match lease.send_lifecycle(action, bytes) {
+                let client = RapClient::new(lease);
+                let request = RapClient::prepare(&dispatch.effect)?;
+                match client.send(request) {
                     Ok(send) => {
                         self.route = Some(Route {
                             runtime: registration.runtime.clone(),
-                            lease,
+                            client,
                         });
                         self.effects.pop_front();
                         self.sending = Some(Sending { dispatch, send });
@@ -3236,62 +3181,20 @@ impl Node {
             return Ok(());
         };
         if self.held_reply.is_none() {
-            self.held_reply = route.lease.take_lifecycle_reply();
+            self.held_reply = route.client.take_reply();
         }
         let Some(reply) = &self.held_reply else {
             return Ok(());
         };
-        if !reply.belongs_to(&route.lease) {
-            return Err(Error::Protocol);
-        }
-        let action = reply.action().map_err(|_| Error::Protocol)?;
-        if action == "RAPReportLoad" {
-            let report: ReportLoad = decode(reply.body())?;
-            self.enqueue(Work::Load(Box::new(report)))?;
-            self.held_reply = None;
-            return Ok(());
-        }
-        if action == "ProxyUpdateServiceDescriptionReply" {
-            #[derive(Deserialize)]
-            struct Reply {
-                error: i64,
-                unit: FailoverUnit,
-                replica: Replica,
-                service: Service,
+        let proxy = match Incoming::decode(&route.client, reply)? {
+            Incoming::Command(work) => {
+                self.enqueue(work)?;
+                self.held_reply = None;
+                return Ok(());
             }
-            let body: Reply = decode(reply.body())?;
-            self.enqueue(Work::Description(Box::new(
-                ra::ServiceDescriptionCompletion {
-                    error: body.error,
-                    unit: body.unit,
-                    replica: body.replica,
-                    service: body.service,
-                },
-            )))?;
-            self.held_reply = None;
-            return Ok(());
-        }
-        if action == "ProxyReplicaEndpointUpdated" {
-            let body: AddInstance = decode(reply.body())?;
-            self.enqueue(Work::Endpoint(Arc::new(body)))?;
-            self.held_reply = None;
-            return Ok(());
-        }
-        let body: rap::Reply = decode(reply.body())?;
-        let idle = matches!(
-            action.as_str(),
-            "ReplicatorBuildIdleReplicaReply" | "ReplicatorRemoveIdleReplicaReply"
-        );
-        let configuration = action == "UpdateConfigurationReply";
-        if (idle && (body.remote.0.len() != 1 || body.flags != 0))
-            || (configuration
-                && (!(2..=ra::MAX_CONFIGURATION_REPLICAS).contains(&body.remote.0.len())
-                    || body.flags & !3 != 0))
-            || (!idle && !configuration && (!body.remote.0.is_empty() || body.flags & !12 != 0))
-        {
-            return Err(Error::Protocol);
-        }
-        let Some(state) = self.ra.snapshot(body.unit.id.guid.0).committed else {
+            Incoming::Proxy(proxy) => proxy,
+        };
+        let Some(state) = self.ra.snapshot(proxy.unit().id.guid.0).committed else {
             self.held_reply = None;
             return Ok(());
         };
@@ -3307,62 +3210,7 @@ impl Node {
         {
             return Err(Error::Protocol);
         }
-        let work = match reply.action().map_err(|_| Error::Protocol)?.as_str() {
-            "ReplicatorUpdateEpochAndGetStatusReply" => {
-                Work::ReplicaStatus(ra::ConfigurationCompletion {
-                    unit: body.unit,
-                    local: body.local,
-                    replicas: body.remote,
-                    flags: body.flags,
-                    error: body.error.error,
-                })
-            }
-            "UpdateConfigurationReply" => Work::Configured(ra::ConfigurationCompletion {
-                unit: body.unit,
-                local: body.local,
-                replicas: body.remote,
-                flags: body.flags,
-                error: body.error.error,
-            }),
-            "ReplicatorBuildIdleReplicaReply" | "ReplicatorRemoveIdleReplicaReply" => {
-                let event = ra::BuildCompletion {
-                    unit: body.unit,
-                    local: body.local,
-                    remote: body
-                        .remote
-                        .0
-                        .into_iter()
-                        .next()
-                        .expect("checked one remote"),
-                    error: body.error.error,
-                    detail: ra::ProxyErrorDetail {
-                        message: body.error.message,
-                        api: body.error.api,
-                    },
-                };
-                if action == "ReplicatorBuildIdleReplicaReply" {
-                    Work::Built(event)
-                } else {
-                    Work::Removed(event)
-                }
-            }
-            "ReplicaOpenReply" => Work::Open(ra::OpenCompletion {
-                unit: body.unit,
-                replica: body.local,
-                error: body.error.error,
-                flags: body.flags,
-                detail: ra::ProxyErrorDetail {
-                    message: body.error.message,
-                    api: body.error.api,
-                },
-            }),
-            "ReplicaCloseReply" => Work::Closed(ra::CloseCompletion {
-                unit: body.unit,
-                replica: body.local,
-                error: body.error.error,
-            }),
-            _ => return Err(Error::Unsupported),
-        };
+        let work = proxy.into_work()?;
         // The original runtime replies only after disposal/final release.
         // Failed Open and successful Close keep separate Applied lineage.
         let closed = matches!(&work, Work::Closed(event) if event.error == 0

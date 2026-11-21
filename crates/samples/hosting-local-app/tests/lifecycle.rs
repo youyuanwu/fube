@@ -2145,6 +2145,29 @@ async fn production_reply_adapter_preserves_stale_failed_and_native_nonfull_equa
             .unwrap(),
     )
     .unwrap();
+    for _ in 0..32 {
+        node.fm_work(fube_node::local::FmWork::CleanupTypeStatus)
+            .unwrap();
+    }
+    let end = std::time::Instant::now() + Duration::from_secs(2);
+    while node.pending_commands() != 0 {
+        assert!(
+            std::time::Instant::now() < end,
+            "backpressure work did not drain"
+        );
+        node.drive().unwrap();
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        node.snapshot(b.unit.id.guid.0).committed.unwrap().phase,
+        ra::Phase::Opening,
+        "retained command receipts must prevent semantic reply intake"
+    );
+    let receipts = node.take_command_receipts();
+    assert_eq!(receipts.len(), 32);
+    for receipt in receipts {
+        receipt.result.unwrap();
+    }
     until(&mut node, |n| {
         n.snapshot(b.unit.id.guid.0)
             .committed
