@@ -31,6 +31,8 @@ use tower_service::Service;
 mod listener;
 #[path = "transport/notifications.rs"]
 mod notifications;
+#[path = "transport/one_way_client.rs"]
+mod one_way_client;
 #[path = "transport/routing.rs"]
 mod routing;
 #[path = "transport/typed_server.rs"]
@@ -794,6 +796,29 @@ async fn byte_readiness_never_retargets_a_retired_generation_and_reconnects_only
         b"fresh"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+    let mut original_send = furpc::OneWayClient::new(furpc::PeerSendService::new(old.clone()));
+    assert!(original_send
+        .send(
+            Request::new(()),
+            FubstCodec::<(), ()>::default(),
+            deadline()
+        )
+        .await
+        .is_err());
+    let mut original_rpc = RpcClient::new(furpc::PeerRequestService::new(old));
+    assert!(original_rpc
+        .call(
+            Request::new(()),
+            FubstCodec::<(), ()>::default(),
+            deadline()
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "Peer adapters must not reconnect"
+    );
     drop(channel);
     bounded(second_server).await.unwrap().unwrap();
 }

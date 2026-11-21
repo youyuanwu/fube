@@ -107,7 +107,8 @@ no second admission, and dropping it unpolled releases that reservation.
 These operations do not borrow a receiver or lifecycle facade for their lifetime.
 
 `RpcClient<T>::call` instead returns an ordinary async future borrowing
-`&mut self`, following tonic. Arbitrary Tower services cannot supply a native
+`&mut self`, following tonic; OneWayClient<T>::send has the same observation and
+drop contract for typed one-way writes. Arbitrary Tower services cannot supply a native
 Attempt, so the generic client does not expose `attempt()` or claim confirmed
 retraction. Dropping its future drops the transport future; native commitment
 still determines whether output can be retracted. Callers requiring explicit

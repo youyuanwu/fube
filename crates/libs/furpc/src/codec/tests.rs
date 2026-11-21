@@ -68,13 +68,13 @@ fn fubst_preserves_native_bytes_and_decodes_fragmented_bodies_exactly() {
         body.slice(3..body.len()).unwrap(),
     ])
     .unwrap();
-    let result = decode(&mut codec.decoder(), &fragmented).unwrap();
+    let result = decode(&mut codec.decoder(), &fragmented, fragmented.len()).unwrap();
     assert_eq!(result.text, "native \u{1f980}");
     assert_eq!(result.count, 1000);
     let trailing =
         Body::from_segments(vec![fragmented, Body::from_bytes(vec![0x42]).unwrap()]).unwrap();
     assert!(matches!(
-        decode(&mut codec.decoder(), &trailing),
+        decode(&mut codec.decoder(), &trailing, trailing.len()),
         Err(CodecError::InvalidPayload { .. })
     ));
 }
@@ -100,7 +100,7 @@ fn fubst_respects_explicit_byte_and_depth_limits_without_changing_error_category
         .unwrap(),
     ] {
         assert!(matches!(
-            decode(&mut codec.decoder(), &body),
+            decode(&mut codec.decoder(), &body, body.len()),
             Err(CodecError::ResourceLimit { .. })
         ));
     }

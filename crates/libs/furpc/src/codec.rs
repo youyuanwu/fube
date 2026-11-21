@@ -161,13 +161,16 @@ impl EncodeBuf<'_> {
     }
 }
 
-pub(crate) fn encode<E: Encoder>(encoder: &mut E, item: E::Item, max_bytes: usize) -> Result<Body> {
+/// Encode one whole body under an explicit byte limit, without native submission.
+/// Zero permits empty output; limits exceeding native body capacity are invalid.
+pub fn encode<E: Encoder>(encoder: &mut E, item: E::Item, max_bytes: usize) -> Result<Body> {
+    validate_limit(max_bytes)?;
     let mut segments = Vec::new();
     let mut buf = EncodeBuf {
         segments: &mut segments,
         pending: Vec::new(),
         len: 0,
-        max_bytes: max_bytes.min(MAX_BODY_BYTES),
+        max_bytes,
     };
     encoder.encode(item, &mut buf)?;
     buf.flush()?;
@@ -267,11 +270,27 @@ impl<'a> DecodeBuf<'a> {
     }
 }
 
-pub(crate) fn decode<D: Decoder>(decoder: &mut D, body: &Body) -> Result<D::Item> {
+/// Decode one complete body, rejecting oversized input before calling the decoder.
+/// Success must consume or explicitly skip every byte. No invocation authority
+/// or native transport operation is created by this helper.
+pub fn decode<D: Decoder>(decoder: &mut D, body: &Body, max_bytes: usize) -> Result<D::Item> {
+    validate_limit(max_bytes)?;
+    if body.len() > max_bytes {
+        return Err(CodecError::resource_limit("decoded body bytes"));
+    }
     let mut buf = DecodeBuf::new(body);
     let value = decoder.decode(&mut buf)?;
     buf.finish()?;
     Ok(value)
+}
+
+fn validate_limit(max_bytes: usize) -> Result<()> {
+    if max_bytes > MAX_BODY_BYTES {
+        return Err(CodecError::invalid_payload(Error::InvalidInput(
+            "codec body limit exceeds native frame capacity",
+        )));
+    }
+    Ok(())
 }
 
 /// Native Fabric body format with the schemas/adapters supported by `fubst`.

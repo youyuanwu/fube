@@ -6,6 +6,39 @@ Maps existing gaps to owners and describes staged delivery, consumer
 migration, acceptance, and unresolved qualification work. These are proposed
 milestones, not a record of delivered implementation or qualified support.
 
+## Generic adapter follow-up
+
+**Status:** generic furpc APIs implemented; runtime consumer migration pending.
+The runtime's typed client/server migration exposed reusable body and one-way
+adapter gaps, not missing SF-specific transport policy.
+
+The [public body helpers](Codecs.md#public-body-helpers) now share the
+whole-body implementation used by RPC codecs. The
+[typed one-way client and original-Peer service adapters](Requests.md#one-way-client-and-peer-service-adapters)
+are also implemented. PeerSendService provides the native byte service for
+OneWayClient; PeerRequestService provides request-only consumer deduplication.
+Consumer migration should keep method profiles, authority/admission checks and
+frozen retry wrappers above furpc. Switching those wrappers from Vec to shared
+Body uses existing shared storage and remains consumer work, not a replay cache.
+
+Focused public API checks cover custom non-Serde codecs, segmented-body consumption and
+explicit suffix skipping, zero/finite byte limits, and codec source/resource
+classification. Typed-send cases exercise non-Clone service readiness witnesses, unused
+decode types that need not be Send, encoding failure before submission,
+request-local deadline shortening, on-time writes observed later, and no
+correlated response entry, including sends while the only RPC slot is occupied.
+Original-Peer adapters reject missing deadlines and incompatible managed headers
+and do not switch generations after failure.
+Cancellation cases distinguish uncommitted retraction from committed
+driver-owned output without inventing confirmed cancellation on the typed future.
+
+Future runtime migration acceptance must retain exact fault/endpoint bytes across retry attempts
+with fresh message identities, reserved stateless reply admission, ordinary
+stateful/report admission, decode-after-owned-admission ordering, and usable
+unregister IPC after late one-way commands during orderly retirement.
+These focused checks establish API/composition behavior, not new native
+interoperability, deployed runtime support, TLS, or FM/Federation qualification.
+
 ## Current implementation
 
 The crate now includes native frames/ordered headers, shared segmented messages,

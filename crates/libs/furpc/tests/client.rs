@@ -11,8 +11,8 @@ use std::{
 };
 
 use furpc::{
-    header, Body, ClientCodecLimits, Codec, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder,
-    Error, FubstCodec, Request, Response, RpcClient,
+    codec, header, Body, ClientCodecLimits, Codec, CodecError, DecodeBuf, Decoder, EncodeBuf,
+    Encoder, Error, FubstCodec, Request, Response, RpcClient,
 };
 use futures_util::FutureExt;
 use tokio::{
@@ -446,4 +446,74 @@ async fn decoder_errors_and_unconsumed_bytes_are_call_local_with_original_source
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(counts.decoded.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn public_body_helpers_reject_invalid_limits_and_oversized_input_before_codec_work() {
+    let counts = Arc::new(Counts::default());
+    let invalid = u32::MAX as usize - 11;
+    let mut encoder = TextEncoder(counts.clone(), Cell::new(false));
+    let error = codec::encode(&mut encoder, "".into(), invalid).unwrap_err();
+    assert!(matches!(error, CodecError::InvalidPayload { .. }));
+    assert!(std::error::Error::source(&error).unwrap().is::<Error>());
+    assert_eq!(counts.encoded.load(Ordering::SeqCst), 0);
+
+    let body = Body::from_bytes(b"x".to_vec()).unwrap();
+    let mut decoder = TextDecoder(counts.clone(), Cell::new(false));
+    assert!(matches!(
+        codec::decode(&mut decoder, &body, invalid),
+        Err(CodecError::InvalidPayload { .. })
+    ));
+    assert!(matches!(
+        codec::decode(&mut decoder, &body, 0),
+        Err(CodecError::ResourceLimit { .. })
+    ));
+    assert_eq!(counts.decoded.load(Ordering::SeqCst), 0);
+    let empty = codec::encode(&mut encoder, "".into(), 0).unwrap();
+    assert_eq!(codec::decode(&mut decoder, &empty, 0).unwrap(), "");
+}
+
+struct SharedEncoder;
+impl Encoder for SharedEncoder {
+    type Item = Body;
+
+    fn encode(&mut self, item: Body, dst: &mut EncodeBuf<'_>) -> Result<(), CodecError> {
+        dst.append_body(item)
+    }
+}
+
+struct ViewDecoder {
+    skip_tail: bool,
+}
+impl Decoder for ViewDecoder {
+    type Item = Body;
+
+    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Body, CodecError> {
+        let value = src.take(1)?;
+        if self.skip_tail {
+            src.advance(src.remaining())?;
+        }
+        Ok(value)
+    }
+}
+
+#[test]
+fn public_body_helpers_preserve_segments_and_require_explicit_suffix_consumption() {
+    let shared = Body::from_bytes(b"ab".to_vec()).unwrap();
+    let pointer = shared.segments().next().unwrap().as_ptr();
+    let body =
+        Body::from_segments(vec![shared, Body::from_bytes(b"cd".to_vec()).unwrap()]).unwrap();
+    let body = codec::encode(&mut SharedEncoder, body, 4).unwrap();
+    assert_eq!(
+        body.segments().collect::<Vec<_>>(),
+        [b"ab".as_slice(), b"cd"]
+    );
+    assert_eq!(body.segments().next().unwrap().as_ptr(), pointer);
+    assert!(matches!(
+        codec::decode(&mut ViewDecoder { skip_tail: false }, &body, 4),
+        Err(CodecError::InvalidPayload { .. })
+    ));
+    let view = codec::decode(&mut ViewDecoder { skip_tail: true }, &body, 4).unwrap();
+    assert_eq!(view.segments().next().unwrap(), b"a");
+    assert_eq!(view.segments().next().unwrap().as_ptr(), pointer);
 }

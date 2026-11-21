@@ -25,7 +25,7 @@ substitute HTTP/2 or gRPC or reproduce the entire ecosystem's abstractions.
 | Local listener | Native-style listen_address/instance builder settings on Endpoint and ServerBuilder; wire ListenInstance stays internal. Explicit listeners default to native instance zero; existing omitted behavior is preserved. Socket binding, publication, actual I/O diagnostics and authentication remain separate. |
 | Requests | http-shaped, body-first `Request<B>` is shared by outbound calls, server middleware, and decoded handlers. Requests and parts allow bounded ordered-header edits; trusted context and original admission remain protected. Message/request/reply envelopes use generic header insertion; Actor/Action helpers are not special envelope fields. Body adaptation preserves current headers and context. |
 | Responses | http-shaped `Response<T>` body access and parts reassembly preserve editable headers, read-only native provenance/settlement, and accounting. No HTTP status/version semantics. |
-| Codecs | Native header/control serialization is fixed internally using `fubst`. `RpcClient<T>` wraps a byte-facing Tower transport (default Channel), uses ordinary mutable async calls, and consumes codecs per call under explicit client codec limits. Peer request/notify operations remain byte-facing; typed notifications reuse RpcClient over an explicit notify byte-service adapter. Server method services construct `server::Rpc<C>`; routers are codec-free. |
+| Codecs | Native header/control serialization is fixed internally using `fubst`. RpcClient and OneWayClient wrap byte-facing Tower services, borrow them mutably, and consume codecs per call/send under explicit body limits. PeerRequestService/PeerSendService retain original-Peer authority; native Peer operations stay byte-facing. Typed notifications reuse RpcClient over an explicit notify adapter. Public codec helpers adapt standalone bodies; server method services construct `server::Rpc<C>`; routers are codec-free. |
 | Ingress | IngressService is canonical on Endpoint/Channel and Server: `Service<Request<Body>, Response = IngressResponse>` with shared bindings and scope-owned HandlerLimits. Ordinary and notification classes retain distinct authorization and class-local raw/Actor dispatch. Actor is optional; replication uses ReplicationActor without a synthetic Actor header or Actor-0 binding. |
 | Capabilities | IngressOptions configures one-way/request/notification authorization, not implicit general send authority. Restricted context/peer-ready Peers remain independent; replies and notification acknowledgments stay runner-owned. No native application pull API or hidden inbox: bounded application work queues compose inside services. |
 | Serving | The same raw service or optional Actor/Action Router installs on dialed and accepted owners. Separate RPC adapters provide typed handlers; the runner retains reply authority. Optional `on_peer_ready` work initiates accepted-side bootstrap after establishment. No full actor framework is introduced. |
@@ -47,8 +47,8 @@ monolithic API document.
 | [Architecture](Architecture.md) | Source baselines, scope, layering, dependencies, type ownership, and shared driver. |
 | [Connections](Connections.md) | URI Endpoint/validation, reconnecting logical Channel, native Peer, reusable URI connectors, Accept, serving/peer-ready hooks, and establishment/deadline budgets. |
 | [Messages](Messages.md) | Native header fidelity, raw `Message`/`Body`, standalone bounded construction, and raw sends. |
-| [Requests](Requests.md) | `Request<B>`/parts/context, transport-generic `RpcClient<T>`, client codec limits, `Response<T>`/parts, native IDs, and correlation/reply authority. |
-| [Codecs](Codecs.md) | Native serialization, public body-codec traits, and bounded encode/decode behavior. |
+| [Requests](Requests.md) | `Request<B>`/parts/context, transport-generic RpcClient/OneWayClient, original-Peer service adapters, client codec limits, `Response<T>`/parts, native IDs, and correlation/reply authority. |
+| [Codecs](Codecs.md) | Native serialization, public body-codec traits/helpers, and bounded encode/decode behavior. |
 | [Ingress](Actors.md) | Native classification, raw versus Actor service dispatch, ingress policies/send capabilities, generation binding, and Peer notifications with service-managed acknowledgments. |
 | [Services](Services.md) | Canonical IngressService/IngressResponse on Endpoint, Channel, and Server; native bindings, typed method adapters, private reply completion, HandlerLimits, and lifecycle. |
 | [Routing](Routing.md) | Byte-facing Actor/Action service routes, route options, exact matching, and routing limits. |
@@ -73,6 +73,12 @@ is now implemented for clear transport;
 the adapter uses the existing raw service/Peer contracts and
 explicitly changes the legacy adapter's admission and cancellation guarantees.
 The consumer migration is implemented; native replication qualification remains pending.
+
+The [public body helpers](Codecs.md#public-body-helpers) and
+[one-way client/Peer adapters](Requests.md#one-way-client-and-peer-service-adapters)
+are implemented. The [delivery and acceptance record](Implementation.md#generic-adapter-follow-up)
+keeps SF method policy, retry payload stability, and runtime admission/lifetime
+rules in consumers; adopting these APIs in runtime remains separate work.
 
 ## Non-goals and evidence
 

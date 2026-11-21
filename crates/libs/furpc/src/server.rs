@@ -70,11 +70,10 @@ impl<C: Codec> Rpc<C> {
         state
             .run(async {
                 let (parts, body) = request.into_parts();
-                let value = codec::decode(&mut self.codec.decoder(), &body).map_err(|source| {
-                    Error::Codec {
-                        phase: "decode",
-                        source,
-                    }
+                let value = codec::decode(&mut self.codec.decoder(), &body, state.max_body_bytes)
+                    .map_err(|source| Error::Codec {
+                    phase: "decode",
+                    source,
                 })?;
                 drop(body);
                 state.check()?;
@@ -121,11 +120,10 @@ impl<C: Codec> Rpc<C> {
         state
             .run(async {
                 let (parts, body) = request.into_parts();
-                let value = codec::decode(&mut self.codec.decoder(), &body).map_err(|source| {
-                    Error::Codec {
-                        phase: "decode",
-                        source,
-                    }
+                let value = codec::decode(&mut self.codec.decoder(), &body, state.max_body_bytes)
+                    .map_err(|source| Error::Codec {
+                    phase: "decode",
+                    source,
                 })?;
                 drop(body);
                 state.check()?;
