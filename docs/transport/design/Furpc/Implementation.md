@@ -286,6 +286,12 @@ fube_core::protocol::actor; that catalog stays above furpc and grants no routing
 authority.
 Runtime owns host/PID headers, real loopback I/O validation, registration, lease,
 RAP semantics and domain retirement; furpc owns ingress correlation/reply writes.
+Runtime's thin Session composes Channel establishment and captures the original
+Peer before building the typed client stubs. Its connector permits only one I/O
+acquisition and rejects retired sessions, so an attachment race cannot demand a
+replacement socket under old registration authority. Generic Channel reconnect
+behavior is unchanged; runtime retains first-cause retirement and passive I/O
+release observation without new furpc lifecycle APIs.
 The legacy channel adapter, second reader and held-completion worker are retired.
 This intentionally does not emulate its first-write predicates, ordered ingress
 barrier or physical-driver join. Domain authority checks and the independent

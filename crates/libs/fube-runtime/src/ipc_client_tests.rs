@@ -43,15 +43,7 @@ fn identity() -> HeaderRecord {
 }
 
 fn session() -> Arc<Session> {
-    Arc::new(Session {
-        state: Mutex::new(SessionState {
-            channel: None,
-            error: None,
-        }),
-        stopped: watch::channel(None).0,
-        ordinary: Arc::new(Semaphore::new(OPERATIONS)),
-        replies: Arc::new(Semaphore::new(OPERATIONS)),
-    })
+    Session::new()
 }
 
 fn service(response: Response<Body>, health: bool, valid: Check) -> (IpcService<Probe>, Captured) {
@@ -515,4 +507,53 @@ async fn prepared_rap_payload_retries_share_original_bytes_without_native_reseri
         assert_eq!(body.fault, 1);
         assert_eq!(body.activity.id.index, 17);
     }
+}
+
+#[tokio::test]
+async fn runtime_connector_never_dials_a_replacement_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let session = session();
+    let mut connector = Connector::new(address, Arc::downgrade(&session));
+    let uri = format!("tcp://{address}").parse::<http::Uri>().unwrap();
+    let connected = connector.call(uri.clone()).await.unwrap();
+    let (_accepted, _) = listener.accept().await.unwrap();
+    assert_eq!(connected.info().peer_addr, Some(address));
+    assert!(connected.info().local_addr.unwrap().ip().is_loopback());
+
+    let error = connector.call(uri).await.err().unwrap();
+    assert!(matches!(error, Error::Closed));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    session.check().unwrap();
+
+    drop(connected);
+    assert!(matches!(session.closed().await, Error::Closed));
+}
+
+#[tokio::test]
+async fn retired_runtime_session_prevents_dialing_and_preserves_its_cause() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let session = session();
+    session.retire(Error::Protocol("registration retired"));
+    let mut connector = Connector::new(address, Arc::downgrade(&session));
+    let error = connector
+        .call(format!("tcp://{address}").parse().unwrap())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::Protocol("registration retired")));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        session.closed().await,
+        Error::Protocol("registration retired")
+    ));
 }

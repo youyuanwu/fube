@@ -17,8 +17,8 @@ use fube_core::protocol::actor as actors;
 use furpc::{
     codec, header, ActorId, Body, BoxError, Channel, ClientCodecLimits, Codec, Connected,
     EncodeBuf, Encoder, Endpoint, FubstCodec, HandlerLimits, HeaderId, HeaderRecord, Headers,
-    OneWayClient, PeerRequestService, PeerSendService, Request, Response, RpcClient, TransportIo,
-    WriteReceipt,
+    OneWayClient, Peer, PeerRequestService, PeerSendService, Request, Response, RpcClient,
+    TransportIo, WriteReceipt,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
@@ -63,6 +63,56 @@ pub(super) struct Session {
 }
 
 impl Session {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(SessionState {
+                channel: None,
+                error: None,
+            }),
+            stopped: watch::channel(None).0,
+            ordinary: Arc::new(Semaphore::new(OPERATIONS)),
+            replies: Arc::new(Semaphore::new(OPERATIONS)),
+        })
+    }
+
+    async fn connect(
+        address: SocketAddr,
+        deadline: Instant,
+        server: RuntimeServer,
+    ) -> Result<(Arc<Self>, Peer)> {
+        let session = Self::new();
+        let router = server.router(Arc::downgrade(&session))?;
+        let timeout = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(Error::Timeout)?;
+        let endpoint = Endpoint::try_from(address)
+            .map_err(native_error)?
+            .connect_timeout(timeout)
+            .handler_limits(HandlerLimits {
+                max_in_flight: OPERATIONS,
+                max_readiness_waiters: OPERATIONS,
+                ..HandlerLimits::default()
+            })
+            .service(router.into_service().map_err(native_error)?)
+            .map_err(native_error)?;
+        let channel = timeout_at(
+            deadline,
+            endpoint.connect_with_connector(Connector::new(address, Arc::downgrade(&session))),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(native_error)?;
+        let peer = channel.peer(deadline).await.map_err(native_error)?;
+        {
+            let mut state = session.state.lock().unwrap();
+            if let Some(error) = &state.error {
+                return Err(error.clone());
+            }
+            state.channel = Some(channel);
+        }
+        Ok((session, peer))
+    }
+
     pub(super) fn check(&self) -> Result<()> {
         match &self.state.lock().unwrap().error {
             Some(error) => Err(error.clone()),
@@ -83,6 +133,18 @@ impl Session {
         self.replies.close();
         self.stopped.send_replace(Some(error));
         drop(channel);
+    }
+
+    async fn closed(&self) -> Error {
+        let mut stopped = self.stopped.subscribe();
+        loop {
+            if let Some(error) = stopped.borrow_and_update().clone() {
+                return error;
+            }
+            if stopped.changed().await.is_err() {
+                return Error::Closed;
+            }
+        }
     }
 }
 
@@ -173,47 +235,7 @@ impl IpcClient {
             },
         )
         .map_err(native_error)?;
-        let session = Arc::new(Session {
-            state: Mutex::new(SessionState {
-                channel: None,
-                error: None,
-            }),
-            stopped: watch::channel(None).0,
-            ordinary: Arc::new(Semaphore::new(OPERATIONS)),
-            replies: Arc::new(Semaphore::new(OPERATIONS)),
-        });
-        let router = server.router(Arc::downgrade(&session))?;
-        let timeout = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(Error::Timeout)?;
-        let endpoint = Endpoint::try_from(address)
-            .map_err(native_error)?
-            .connect_timeout(timeout)
-            .handler_limits(HandlerLimits {
-                max_in_flight: OPERATIONS,
-                max_readiness_waiters: OPERATIONS,
-                ..HandlerLimits::default()
-            })
-            .service(router.into_service().map_err(native_error)?)
-            .map_err(native_error)?;
-        let channel = timeout_at(
-            deadline,
-            endpoint.connect_with_connector(Connector {
-                address,
-                session: Arc::downgrade(&session),
-            }),
-        )
-        .await
-        .map_err(|_| Error::Timeout)?
-        .map_err(native_error)?;
-        let peer = channel.peer(deadline).await.map_err(native_error)?;
-        {
-            let mut state = session.state.lock().unwrap();
-            if let Some(error) = &state.error {
-                return Err(error.clone());
-            }
-            state.channel = Some(channel);
-        }
+        let (session, peer) = Session::connect(address, deadline, server).await?;
         let hosting = HostingClient::new(
             PeerRequestService::new(peer.clone()),
             identity.clone(),
@@ -241,15 +263,7 @@ impl IpcClient {
     }
 
     pub(crate) async fn closed(&self) -> Error {
-        let mut stopped = self.session.stopped.subscribe();
-        loop {
-            if let Some(error) = stopped.borrow_and_update().clone() {
-                return error;
-            }
-            if stopped.changed().await.is_err() {
-                return Error::Closed;
-            }
-        }
+        self.session.closed().await
     }
 
     /// Release domain ownership, not an awaitable furpc driver teardown barrier.
@@ -951,6 +965,17 @@ where
 struct Connector {
     address: SocketAddr,
     session: Weak<Session>,
+    attempted: bool,
+}
+
+impl Connector {
+    fn new(address: SocketAddr, session: Weak<Session>) -> Self {
+        Self {
+            address,
+            session,
+            attempted: false,
+        }
+    }
 }
 
 impl Service<http::Uri> for Connector {
@@ -965,7 +990,14 @@ impl Service<http::Uri> for Connector {
     fn call(&mut self, uri: http::Uri) -> Self::Future {
         let address = self.address;
         let session = self.session.clone();
+        let attempted = std::mem::replace(&mut self.attempted, true);
         Box::pin(async move {
+            let owner = session.upgrade().ok_or(Error::Closed)?;
+            owner.check()?;
+            // Replacement I/O cannot inherit this attachment's registration.
+            if attempted {
+                return Err(Error::Closed);
+            }
             if uri
                 != format!("tcp://{address}")
                     .parse::<http::Uri>()
