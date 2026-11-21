@@ -13,8 +13,8 @@ adapter bounds and [examples](Examples.md) for a custom codec.
 | --- | --- | --- |
 | Native messaging | Built-in native headers, connection controls, and transport Fault schemas using `fubst`. | Native widths and configured transport policy; no extra constructor ceilings or public native-serializer selection. |
 | Service routing | Dispatch byte-facing services without body transformation. | Native route keys and ingress policies; no body format or schema selection. |
-| Client transport services | Channel or custom Tower services exchange native byte envelopes without application decoding. Peer is a separate native capability, not a service. | Transport admission, deadlines, and native correlation where applicable; no application schema/codec. |
-| Typed RPC adapters | Public application-body `Codec`, with `FubstCodec` as the default native convenience choice. | Codec consumed per RpcClient call or constructed in the server method service; explicit client codec limits or admitted server budgets, plus codec-local work limits. |
+| Client transport services | Channel, explicit original-Peer adapters, or custom Tower services exchange native byte envelopes without application decoding. Peer itself is a separate native capability, not a service. | Transport admission, deadlines, and native correlation where applicable; no application schema/codec. |
+| Typed body adapters | Public application-body `Codec`, with `FubstCodec` as the default native convenience choice. | Codec consumed per RpcClient call/OneWayClient send or constructed in the server method service; explicit client codec limits or admitted server budgets, plus codec-local work limits. |
 
 Raw clients and servers need native serialization for headers and connection
 setup even when they never decode an application body. That implementation
@@ -102,7 +102,8 @@ Use tonic's distinct client/server ownership patterns:
 
 - Client [`Grpc<T>`][tonic-client] wraps transport and takes a codec per RPC.
   Furpc's `RpcClient<T>` likewise wraps a byte-facing Tower service; Channel is
-  the sole built-in transport, with custom middleware/services also supported.
+  the owning reconnecting transport, with explicit original-Peer adapters and
+  custom middleware/services also supported.
   Calls are ordinary async methods using `&mut self`, with no stored codec or
   schema type parameters. Typed notifications use this same RpcClient adapter
   over a byte service explicitly delegating to Peer::notify; Peer itself remains
@@ -205,6 +206,60 @@ Typed adaptation reports `Error::Codec { phase, source }`, with `phase` equal
 to `encode` or `decode`. `CodecError::InvalidPayload` and `ResourceLimit` retain
 their original error sources. `FubstCodec::with_limits` optionally selects
 codec-local `fubst::Limits`; default operations add no depth/work ceiling.
+
+## Public body helpers
+
+**Status:** implemented in furpc::codec. The same whole-body helpers are used
+by RpcClient, OneWayClient and server::Rpc, and are available to direct native
+message consumers without creating an RPC exchange or borrowing ingress authority.
+
+Runtime RapClient uses OneWayClient/FubstCodec for ordinary typed sends.
+Frozen fault/endpoint retry bodies use codec::encode once; a pass-through encoder
+adopts their shared bytes on each send without native reserialization.
+Deferred one-way server invocations use codec::decode with the Fubst decoder
+and retained route body limit after owned executor admission.
+
+```rust,ignore
+// Public functions in furpc::codec; no new format or transport operation.
+pub fn encode<E: Encoder>(
+    encoder: &mut E,
+    item: E::Item,
+    max_encoded_body_bytes: usize,
+) -> Result<Body, CodecError>;
+
+pub fn decode<D: Decoder>(
+    decoder: &mut D,
+    body: &Body,
+    max_body_bytes: usize,
+) -> Result<D::Item, CodecError>;
+```
+
+The helpers reuse the existing buffers and whole-body implementation, including fallible
+shared-segment assembly, complete-input consumption, and original codec error
+sources. Explicit byte limits are not heap quotas; zero permits only an empty
+body. Invalid limits fail before codec work, oversized decode input fails before
+calling the decoder, and successful decoding must consume or explicitly skip
+the entire body. Call/invocation adapters retain responsibility for wrapping
+failures in `Error::Codec` with their encode/decode phase.
+
+These are synchronous, cooperative body transformations, not service or native
+submission adapters. They perform no I/O, readiness polling, task creation,
+admission, deadline renewal, routing, or correlation. They neither require nor
+create RequestContext or reply authority. Generic RPC adapters reuse the
+same helpers while continuing to supply their actual client/invocation budgets.
+
+For frozen fault/endpoint retry payloads, encode once and retain the immutable
+Body in a consumer-owned typed wrapper. Clones share bytes; each authorized send
+still builds a fresh native message identity. The wrapper's native schema,
+activity/description stability, retry schedule and lifetime remain domain-owned.
+Using Body this way is already possible and is not itself a furpc API change.
+Do not add a generic replay cache or retain codecs between attempts.
+
+Runtime's deferred one-way service must continue decoding after owned executor
+admission. Its native serving scope already completed at bounded enqueue, so
+using server::Rpc::one_way at that later point would incorrectly require live
+invocation authority. Public body helpers simplify that adapter without
+changing the completion boundary or reviving its context.
 
 [tonic-codec]: https://docs.rs/tonic/latest/tonic/codec/trait.Codec.html
 [tonic-client]: https://docs.rs/tonic/latest/tonic/client/struct.Grpc.html

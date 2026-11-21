@@ -1,12 +1,13 @@
 //! Native stateful RAP lifecycle. Wire records are never the public API.
 use crate::extensions::EpochDomains;
-use crate::ipc_client::deadline_after;
+use crate::ipc_client::{deadline_after, ProxyReplyKind};
+use crate::ipc_server::RapAction;
 use crate::{
     lease::Authority, stateful_api::*, wire as w, ActivationContextHandle, Cancellation,
     PartitionKind, RuntimeMetrics,
 };
 use crate::{Error, OpenMode, Result};
-use fubst::serde::{to_vec, Guid, ObjectArray, Pointer};
+use fubst::serde::{Guid, ObjectArray, Pointer};
 use std::{
     collections::HashMap,
     future::Future,
@@ -328,43 +329,22 @@ impl Registry {
         self.units.lock().unwrap().get(&id).cloned()
     }
 
-    pub(crate) async fn dispatch(
-        &self,
-        action: &str,
-        request: w::ProxyRequest,
-        correlation: Option<crate::ipc_client::IpcResponse>,
-    ) -> Result<()> {
+    pub(crate) fn query_reply(&self, request: &w::ProxyRequest) -> Result<w::QueryReply> {
         self.authority.check()?;
-        if action == "RAPQuery" {
-            if request.runtime != self.current.snapshot().runtime.id
-                || request.flags != 0
-                || !request.remote.0.is_empty()
-                || request.local.node.id.0.len() != 16
-            {
-                return Err(Error::Protocol("invalid stateful RAPQuery context"));
-            }
-            self.metrics.queries.fetch_add(1, Ordering::Relaxed);
-            let authority = Arc::downgrade(&self.authority);
-            return correlation
-                .ok_or(Error::Protocol("RAPQuery requires correlation"))?
-                .reply_checked(
-                    12,
-                    Some("RAPQueryReply"),
-                    to_vec(&self.query(&request)?)?,
-                    deadline_after(Duration::from_secs(5))?,
-                    Arc::new(move || {
-                        authority
-                            .upgrade()
-                            .is_some_and(|authority| authority.check().is_ok())
-                    }),
-                )
-                .await;
+        if request.runtime != self.current.snapshot().runtime.id
+            || request.flags != 0
+            || !request.remote.0.is_empty()
+            || request.local.node.id.0.len() != 16
+        {
+            return Err(Error::Protocol("invalid stateful RAPQuery context"));
         }
-        if correlation.is_some() {
-            return Err(Error::Protocol(
-                "stateful lifecycle uses one-way semantic replies",
-            ));
-        }
+        self.metrics.queries.fetch_add(1, Ordering::Relaxed);
+        self.query(request)
+    }
+
+    pub(crate) async fn dispatch(&self, kind: RapAction, request: w::ProxyRequest) -> Result<()> {
+        self.authority.check()?;
+        let action = kind.action();
         match action {
             "ReplicaOpen" | "ReplicaClose" | "ProxyUpdateServiceDescription" => {
                 self.validate_service(&request)?;
@@ -607,7 +587,7 @@ impl Registry {
         };
         if let Some(result) = existing {
             return self
-                .reply(unit, "ReplicaOpenReply", request, result.err(), 1)
+                .reply(unit, ProxyReplyKind::ReplicaOpen, request, result.err(), 1)
                 .await;
         }
         #[cfg(test)]
@@ -671,7 +651,13 @@ impl Registry {
         };
         let Some((valid, cancel, generation, snapshot)) = installation else {
             return self
-                .reply(unit, "ReplicaOpenReply", request, Some(Error::Closed), 1)
+                .reply(
+                    unit,
+                    ProxyReplyKind::ReplicaOpen,
+                    request,
+                    Some(Error::Closed),
+                    1,
+                )
                 .await;
         };
         self.execution.set_current_generation(generation);
@@ -898,7 +884,7 @@ impl Registry {
         final_release(disposed, self.execution.clone()).await?;
         self.reply(
             unit,
-            "ReplicaOpenReply",
+            ProxyReplyKind::ReplicaOpen,
             request,
             outcome.err(),
             if state_changed { 0 } else { 1 },
@@ -1117,7 +1103,7 @@ impl Registry {
         if let Some(native) = &unit.state.lock().unwrap().native {
             native.retire_ledger();
         }
-        self.reply(unit, "ReplicaCloseReply", request, None, 2)
+        self.reply(unit, ProxyReplyKind::ReplicaClose, request, None, 2)
             .await
     }
 
@@ -1170,10 +1156,9 @@ impl Registry {
         let frame_valid = valid.clone();
         let sent = self
             .connection
-            .send_one_way_checked(
-                12,
-                "ProxyUpdateServiceDescriptionReply",
-                to_vec(&response)?,
+            .rap()
+            .send_stateful_service_update_reply(
+                response,
                 deadline_after(Duration::from_secs(5))?,
                 Arc::new(move || {
                     frame_valid.load(Ordering::Acquire)
@@ -1252,14 +1237,14 @@ impl Registry {
     async fn reply(
         &self,
         unit: &Unit,
-        action: &str,
+        kind: ProxyReplyKind,
         request: w::ProxyRequest,
         error: Option<Error>,
         api: i64,
     ) -> Result<()> {
         self.reply_guarded(
             unit,
-            action,
+            kind,
             request,
             error,
             ReplyControl {
@@ -1273,7 +1258,7 @@ impl Registry {
     async fn reply_guarded(
         &self,
         unit: &Unit,
-        action: &str,
+        kind: ProxyReplyKind,
         request: w::ProxyRequest,
         error: Option<Error>,
         control: ReplyControl,
@@ -1315,22 +1300,22 @@ impl Registry {
             },
         };
         let authority = Arc::downgrade(&self.authority);
-        let publish = action != "ReplicaCloseReply" && !failed;
+        let publish = kind != ProxyReplyKind::ReplicaClose && !failed;
         let frame_valid = valid.clone();
         let frame_revision = revision.clone();
         #[cfg(test)]
         if matches!(
-            action,
-            "ReplicatorBuildIdleReplicaReply" | "ReplicatorRemoveIdleReplicaReply"
+            kind,
+            ProxyReplyKind::BuildIdleReplica | ProxyReplyKind::RemoveIdleReplica
         ) {
             self.hold_remote_reply().await;
         }
         let sent = self
             .connection
-            .send_one_way_checked(
-                12,
-                action,
-                to_vec(&reply)?,
+            .rap()
+            .send_stateful_reply(
+                kind,
+                reply,
                 deadline_after(Duration::from_secs(5))?,
                 Arc::new(move || {
                     authority

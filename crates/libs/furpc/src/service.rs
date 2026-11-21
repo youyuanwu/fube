@@ -630,7 +630,7 @@ pub(crate) struct InvocationState {
     kind: InvocationKind,
     deadline: Instant,
     readiness: Arc<Semaphore>,
-    max_body_bytes: usize,
+    pub(crate) max_body_bytes: usize,
     max_receive_frame_bytes: usize,
     pub(crate) max_response_body_bytes: usize,
     target: BindingTarget,

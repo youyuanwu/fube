@@ -2,7 +2,7 @@
 
 **Status:** proposed; see the [design summary](README.md).
 
-Defines the shared `Request<B>` envelope, typed RPC, correlation, and
+Defines the shared `Request<B>` envelope, typed RPC/one-way clients, correlation, and
 reply authority. [Codecs](Codecs.md) own body representation, while
 [services](Services.md) own inbound handler completion.
 
@@ -48,8 +48,8 @@ representation, with no universal body trait or Serde bound:
 
 | Boundary | Request body |
 | --- | --- |
-| Typed outbound RPC or native notification | `Request<C::Encode>`, before body encoding. |
-| Client transport service / Channel | `Request<Body>`, after application encoding and before native request/correlation processing. |
+| Typed outbound RPC, one-way send or native notification | `Request<C::Encode>`, before body encoding. |
+| Client transport service / Channel / original-Peer adapters | `Request<Body>`, after application encoding and before native submission/correlation processing. |
 | Channel/server ingress service and router entry | `Request<Body>`, containing the admitted native message's shared, segmented bytes. |
 | Typed request or one-way handler | `Request<C::Decode>`, after its selected body codec. |
 
@@ -227,6 +227,109 @@ from `Channel::peer(deadline)`; accepted callers require an independently author
 Peer from received ingress or the
 [peer-ready hook](Connections.md#accepted-peer-readiness-hook).
 Keep the original Channel or server execution alive.
+
+## One-way client and Peer service adapters
+
+**Status:** implemented. RpcClient supports request/reply exchanges, OneWayClient
+adapts typed one-way sends, and Peer::send still accepts an already-built Message.
+Runtime's typed RapClient now uses OneWayClient over its SF policy middleware
+and PeerSendService; HostingClient uses PeerRequestService.
+
+### Typed one-way client
+
+The optional `OneWayClient<T>` is parallel to RpcClient, over an explicitly
+one-way byte-facing Tower service. This is codec composition above native sends,
+not a new connection owner or a request/reply method disguised as a send.
+
+```rust,ignore
+// Implemented API.
+impl<T> OneWayClient<T> {
+    pub fn new(transport: T) -> Self;
+    pub fn max_encoded_body_bytes(self, limit: usize) -> Result<Self>;
+    pub fn into_inner(self) -> T;
+    pub fn get_mut(&mut self) -> &mut T;
+}
+
+impl<T> OneWayClient<T>
+where
+    T: tower_service::Service<Request<Body>, Response = WriteReceipt> + Send,
+    T::Future: Send,
+    T::Error: Into<BoxError>,
+{
+    pub async fn send<C>(
+        &mut self, request: Request<C::Encode>, codec: C, deadline: Instant,
+    ) -> Result<WriteReceipt>
+    where
+        C: Codec + Send,
+        C::Encode: Send,
+        C::Encoder: Send;
+}
+```
+
+The adapter consumes a codec per send and constructs only its encoder. There
+are no bounds on unused decode types/state and no response-body limit. The
+default encoded-byte allowance is native body capacity; explicit restrictions
+validate before use. It uses the
+[public body helpers](Codecs.md#public-body-helpers), preserves
+request parts/ordered headers, and stamps the earlier of the request-local
+and explicit absolute deadlines into the byte-facing request.
+
+One unchanged deadline covers encoding, readiness and local-write observation.
+Prepare and call the same mutable byte-service instance; never clone after
+readiness or duplicate its reservation. Construction and unpolled sends are
+inert. Encoding failure occurs before submission and is call-local. No response
+decoder, pending RPC entry, ExpectsReply flag, RelatesTo, notification
+acknowledgment or semantic reply is introduced.
+
+Success returns the native WriteReceipt: complete local transmission, not peer
+receipt or domain acknowledgment. Preserve its written_at timestamp rather
+than treating delayed observation of an on-time write as a late native result.
+Middleware forwards receipts unchanged; there is no public constructor for
+fabricated native receipts.
+Like RpcClient, the ordinary async future exposes no native Attempt. Dropping
+it abandons the wrapped future, not a confirmed retraction or remote rollback;
+committed output remains driver-owned. Callers needing explicit attempt
+disposition keep using Peer::send with a body encoded separately.
+
+Frozen retry bodies can continue through the byte service directly without
+re-encoding. Do not add a replaying send method or make OneWayClient own a retry
+cache, reconnection policy, or application acknowledgment worker.
+
+### Explicit original-Peer services
+
+`PeerRequestService::new(peer)` and `PeerSendService::new(peer)` construct
+explicit adapters from an already-authorized Peer:
+
+| Adapter | Tower boundary | Native operation |
+| --- | --- | --- |
+| PeerRequestService | Service<Request<Body>, Response = Response<Body>> | Peer::request |
+| PeerSendService | Service<Request<Body>, Response = WriteReceipt> | Peer::send after native Message assembly |
+
+Both require the byte request's absolute deadline; absence fails explicitly.
+Preserve its headers and body, apply normal native managed-field/send-policy
+checks, and propagate the original operation result and error source. The send adapter rejects MessageId, RelatesTo, ExpectsReply and UncorrelatedReply
+records even in raw-only mode, rather than reinterpreting them or manufacturing
+correlation. Direct raw Peer::send retains its caller-owned-ID contract.
+
+The adapters retain the captured Peer, not an owning Channel or an Endpoint.
+They never reconnect, acquire a replacement generation, retry or replay.
+Clones copy only that same nonowning capability and configuration. They create
+no private admission semaphore, queue or background task; native operation
+admission remains where it is today. Peer itself stays byte-facing and does
+not implement Service, and Channel remains the reconnecting logical transport.
+Readiness is immediate and reserves no native operation capacity; the underlying
+Peer operation performs its existing admission when first polled.
+PeerSendService supplies the one-way client's native byte service.
+PeerRequestService replaces runtime's former request-only PeerService adapter.
+Peer::notify remains a separate
+explicit operation and is not silently selected by either adapter.
+
+SF actors/actions, IPC host/PID and timeout headers, allowed-action policy such
+as runtime's outbound(), serving-authority checks, cleanup exemptions, and
+ordinary versus reserved reply admission remain in consumer middleware.
+A dedicated runtime RapClient composes OneWayClient over that middleware;
+none of those domain rules belongs in furpc. Local-write success still does not
+mean a successful RAP semantic reply, and no first-write authority fence is added.
 
 ## Response envelope
 

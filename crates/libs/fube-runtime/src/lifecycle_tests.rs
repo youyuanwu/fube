@@ -4,6 +4,7 @@ mod reporting_tests;
 #[path = "stateful_tests.rs"]
 pub(crate) mod stateful_tests;
 use fube_rap_test_support::transport::{message, ModelPeer, Received as Message};
+use fubst::serde::{from_slice, to_vec};
 use furpc::MessageId;
 use tokio::{net::TcpListener, sync::Notify};
 
@@ -142,6 +143,21 @@ pub(crate) struct Harness {
     engine: Engine,
     peer: ModelPeer,
     calls: Arc<Calls>,
+}
+
+fn large_load_report() -> LoadBody {
+    LoadBody {
+        legacy: fubst::serde::EmptyObjectArray,
+        reports: ObjectArray(vec![LoadDescription {
+            partition: Guid([0; 16]),
+            service: "x".repeat((4 * 1024 * 1024 - 8192) / 2),
+            stateful: false,
+            primary: ObjectArray(vec![]),
+            secondary: ObjectArray(vec![]),
+            nodes: ObjectArray(vec![]),
+        }]),
+        time: 0,
+    }
 }
 
 impl Drop for Harness {
@@ -442,19 +458,24 @@ async fn health_saturation_leaves_poll_admission_and_rejects_overload() {
     let connection = h.engine.shared.connection.clone();
     let poll = tokio::spawn(async move {
         connection
-            .request::<_, ()>(
-                "",
-                15,
+            .hosting()
+            .poll_lease(
                 furpc::Request::new(()),
                 deadline_after(Duration::from_secs(1)).unwrap(),
-                None,
             )
             .await
     });
     let message = h.peer.receive().await.unwrap();
     assert_eq!(message.metadata().unwrap().actor, 15);
     message
-        .respond(fube_rap_test_support::transport::message(0, "", vec![]).unwrap())
+        .respond(
+            fube_rap_test_support::transport::message(
+                0,
+                "",
+                to_vec(&LeaseReply { ttl: 300_000_000 }).unwrap(),
+            )
+            .unwrap(),
+        )
         .unwrap();
     poll.await.unwrap().unwrap();
     for task in reports {
@@ -726,7 +747,10 @@ impl Harness {
                 address,
                 deadline_after(Duration::from_secs(2)).unwrap(),
                 &activation.host_id,
-                handler,
+                crate::ipc_server::RuntimeServer::new(
+                    Arc::new(|_| Err(Error::Protocol("unexpected model host control"))),
+                    handler,
+                ),
                 None
             ),
             async { ModelPeer::accept(listener).await.unwrap() }
@@ -1505,20 +1529,8 @@ async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
         drop(operation.acquire_owned().await.unwrap());
         // Model an operation already admitted but not yet polled by its task.
         h.engine.shared.authority.check().unwrap();
-        let admitted = crate::ipc_client::IpcMessage {
-            received_at: std::time::Instant::now(),
-            deadline: deadline_after(Duration::from_secs(30)).unwrap(),
-            actor: 12,
-            action: "ReplicaOpen".into(),
-            id: furpc::MessageId {
-                guid: [7; 16],
-                index: 99,
-            },
-            body: to_vec(&request).unwrap(),
-            reply: None,
-        };
         h.engine.shared.authority.retire();
-        let result = dispatch(h.engine.shared.clone(), admitted).await;
+        let result = dispatch(h.engine.shared.clone(), RapAction::ReplicaOpen, request).await;
         assert!(matches!(result, Err(Error::Closed)), "{result:?}");
         h.no_reply().await;
         assert_eq!(h.calls.factories.load(Ordering::SeqCst), 1);
@@ -1545,10 +1557,9 @@ async fn locally_revoked_admitted_stateless_success_preserves_siblings_and_close
         let valid = unit.state.lock().unwrap().valid.clone();
         let connection = h.engine.shared.connection.clone();
         h.peer.reads.hold_after(12);
-        let mut blocker = Box::pin(connection.send_one_way_checked(
-            12,
-            "RAPReportLoad",
-            vec![0; 4 * 1024 * 1024 - 4096],
+        let mut rap = connection.rap();
+        let mut blocker = Box::pin(rap.report_load(
+            large_load_report(),
             deadline_after(Duration::from_secs(5)).unwrap(),
             Arc::new(|| true),
         ));
@@ -1620,10 +1631,10 @@ async fn local_rpc_encoding_failure_does_not_retire_the_runtime_session() {
         .engine
         .shared
         .connection
-        .request::<_, ()>(
-            "RegisterFabricRuntimeRequest",
-            9,
+        .hosting()
+        .unary::<_, ()>(
             furpc::Request::new(1u8),
+            crate::ipc_client::HostingMethod::RegisterRuntime,
             deadline_after(Duration::from_secs(2)).unwrap(),
             None,
         )
@@ -1634,6 +1645,89 @@ async fn local_rpc_encoding_failure_does_not_retire_the_runtime_session() {
     h.no_reply().await;
     h.send("RAPQuery", &h.request(1, 1, 0)).await;
     h.receive("RAPQueryReply").await;
+    h.engine.quiesce().await.unwrap();
+}
+
+#[tokio::test]
+async fn typed_load_report_completes_without_a_correlated_response() {
+    let mut h = Harness::new().await;
+    let connection = h.engine.shared.connection.clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        connection.rap().report_load(
+            LoadBody {
+                legacy: fubst::serde::EmptyObjectArray,
+                reports: ObjectArray(vec![]),
+                time: 123,
+            },
+            deadline_after(Duration::from_secs(2)).unwrap(),
+            Arc::new(|| true),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let message = h.receive("RAPReportLoad").await;
+    let properties = message.metadata().unwrap();
+    assert!(!message.headers.effective().expects_reply);
+    assert_eq!(properties.relates_to, MessageId::default());
+    let body: LoadBody = from_slice(&message.body).unwrap();
+    assert_eq!(body.time, 123);
+    assert!(body.reports.0.is_empty());
+    h.engine.quiesce().await.unwrap();
+}
+
+#[tokio::test]
+async fn prepared_fault_report_preserves_original_payload_across_retry_writes() {
+    let mut h = Harness::new().await;
+    let request = h.request(1, 1, 0);
+    let mut body = FaultBody {
+        unit: request.unit,
+        local: request.local,
+        fault: 1,
+        activity: Activity {
+            id: ActivityId {
+                guid: Guid([7; 16]),
+                index: 17,
+            },
+            kind: 2,
+        },
+    };
+    let report = crate::ipc_client::FaultReport::prepare(body.clone()).unwrap();
+    body.fault = 2;
+    body.activity.id.guid = Guid([8; 16]);
+    let connection = h.engine.shared.connection.clone();
+    connection
+        .rap()
+        .report_fault(
+            report.clone(),
+            deadline_after(Duration::from_secs(2)).unwrap(),
+            Arc::new(|| true),
+        )
+        .await
+        .unwrap();
+    let original = h.receive("RAReportFault").await;
+    connection
+        .rap()
+        .report_fault(
+            report,
+            deadline_after(Duration::from_secs(2)).unwrap(),
+            Arc::new(|| true),
+        )
+        .await
+        .unwrap();
+    let retried = h.receive("RAReportFault").await;
+    assert_eq!(original.body, retried.body);
+    assert_ne!(
+        original.metadata().unwrap().id,
+        retried.metadata().unwrap().id
+    );
+    let received: FaultBody = from_slice(&retried.body).unwrap();
+    assert_eq!(received.fault, 1);
+    assert_ne!(received.fault, body.fault);
+    assert_eq!(received.activity.id.guid.0, [7; 16]);
+    assert_ne!(received.activity.id.guid.0, body.activity.id.guid.0);
+    assert_eq!(received.activity.id.index, 17);
     h.engine.quiesce().await.unwrap();
 }
 
@@ -1701,12 +1795,10 @@ async fn prove_unregister_ipc_after_drain(h: &mut Harness) {
         assert_eq!(properties.action, "UnregisterFabricRuntimeRequest");
         request.respond(message(0, "", body).unwrap()).unwrap();
     };
-    let send = connection.request::<_, ErrorReply>(
-        "UnregisterFabricRuntimeRequest",
-        9,
+    let mut hosting = connection.hosting();
+    let send = hosting.unregister_fabric_runtime(
         furpc::Request::new(IdRequest { id }),
         deadline_after(Duration::from_secs(2)).unwrap(),
-        None,
     );
     let (reply, ()) = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::join!(send, receive)
@@ -1715,6 +1807,30 @@ async fn prove_unregister_ipc_after_drain(h: &mut Harness) {
     .unwrap();
     let reply = reply.unwrap().into_body();
     assert_eq!(reply.error, 0);
+}
+
+#[tokio::test]
+async fn typed_one_way_decoding_follows_owned_dispatch_admission() {
+    let mut h = Harness::new().await;
+    let pause = h
+        .engine
+        .shared
+        .test_hooks
+        .pause_once(DispatchPoint::BeforeDispatch);
+    h.peer
+        .send(message(12, "ReplicaOpen", vec![3, 1, 4]).unwrap())
+        .await
+        .unwrap();
+    dispatch_pause_reached(&pause).await;
+    assert!(!h.engine.shared.connection.is_closed());
+    assert_eq!(h.calls.factories.load(Ordering::SeqCst), 0);
+    pause.resume.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(2), h.engine.shared.connection.closed())
+        .await
+        .unwrap();
+    assert!(matches!(error, Error::Protocol(_) | Error::InvalidInput(_)));
+    assert_eq!(h.calls.factories.load(Ordering::SeqCst), 0);
+    h.engine.quiesce().await.unwrap();
 }
 
 #[tokio::test]

@@ -145,7 +145,11 @@ impl Registry {
                 }
                 self.reply_guarded(
                     unit,
-                    &format!("{action}Reply"),
+                    if action == "ReplicatorGetStatus" {
+                        ProxyReplyKind::GetStatus
+                    } else {
+                        ProxyReplyKind::UpdateEpochAndGetStatus
+                    },
                     response,
                     result.err(),
                     ReplyControl {
@@ -332,7 +336,7 @@ impl Registry {
             return self
                 .reply_guarded(
                     unit,
-                    "UpdateConfigurationReply",
+                    ProxyReplyKind::UpdateConfiguration,
                     response,
                     result.err(),
                     ReplyControl {
@@ -393,7 +397,7 @@ impl Registry {
             return self
                 .reply_guarded(
                     unit,
-                    "UpdateConfigurationReply",
+                    ProxyReplyKind::UpdateConfiguration,
                     request,
                     Some(Error::Remote {
                         code: STATE_CHANGED,
@@ -429,7 +433,7 @@ impl Registry {
             return self
                 .reply_guarded(
                     unit,
-                    "UpdateConfigurationReply",
+                    ProxyReplyKind::UpdateConfiguration,
                     request,
                     result.err(),
                     ReplyControl {
@@ -578,7 +582,7 @@ impl Registry {
             matches!(&result, Err(Error::Remote { code, .. }) if *code == STATE_CHANGED);
         self.reply_guarded(
             unit,
-            "UpdateConfigurationReply",
+            ProxyReplyKind::UpdateConfiguration,
             request,
             result.err(),
             ReplyControl {
@@ -1015,7 +1019,7 @@ impl Registry {
         });
         self.reply_guarded(
             unit,
-            "CancelCatchupReplicaSetReply",
+            ProxyReplyKind::CancelCatchupReplicaSet,
             request,
             error,
             ReplyControl {
@@ -1147,7 +1151,7 @@ impl Registry {
             return self
                 .reply_guarded(
                     unit,
-                    "ReplicatorBuildIdleReplicaReply",
+                    ProxyReplyKind::BuildIdleReplica,
                     request,
                     None,
                     ReplyControl {
@@ -1214,7 +1218,7 @@ impl Registry {
         }
         self.reply_guarded(
             unit,
-            "ReplicatorBuildIdleReplicaReply",
+            ProxyReplyKind::BuildIdleReplica,
             request,
             result.err(),
             ReplyControl {
@@ -1351,7 +1355,7 @@ impl Registry {
             return self
                 .reply_guarded(
                     unit,
-                    "ReplicatorRemoveIdleReplicaReply",
+                    ProxyReplyKind::RemoveIdleReplica,
                     request,
                     None,
                     ReplyControl {
@@ -1436,7 +1440,7 @@ impl Registry {
         }
         self.reply_guarded(
             unit,
-            "ReplicatorRemoveIdleReplicaReply",
+            ProxyReplyKind::RemoveIdleReplica,
             request,
             result.err(),
             ReplyControl {
@@ -1479,7 +1483,7 @@ impl Registry {
             let mut local = request.local.clone();
             local.service_endpoint = status.service_address.clone();
             local.replication_endpoint = status.replication_address.clone();
-            let body = to_vec(&w::ReplicaMessage {
+            let body = crate::ipc_client::ReplicaEndpointUpdate::prepare(w::ReplicaMessage {
                 unit: request.unit.clone(),
                 local,
                 service: state.request.service.clone(),
@@ -1493,14 +1497,13 @@ impl Registry {
             return Err(Error::ResourceLimit("endpoint retry owners"));
         }
         let task = self.core.spawn(async move {
+            let mut rap = connection.rap();
             loop {
                 let fence_authority = Arc::downgrade(&authority);
                 let fence_valid = valid.clone();
                 let fence_cancel = cancel.clone();
-                let sent = connection
-                    .send_one_way_checked(
-                        12,
-                        "ProxyReplicaEndpointUpdated",
+                let sent = rap
+                    .notify_replica_endpoint_updated(
                         body.clone(),
                         match deadline_after(Duration::from_secs(5)) {
                             Ok(d) => d,

@@ -5,7 +5,7 @@ use tower_service::Service;
 
 use crate::{
     body::MAX_BODY_BYTES, codec, Body, BoxError, Codec, CodecError, Error, Request, Response,
-    Result,
+    Result, WriteReceipt,
 };
 
 /// Optional encoded-request and response-input restrictions, not heap quotas.
@@ -139,10 +139,126 @@ where
                 source: CodecError::resource_limit("response body bytes"),
             });
         }
-        let value = codec::decode(&mut codec.decoder(), &body).map_err(|source| Error::Codec {
+        let value = codec::decode(
+            &mut codec.decoder(),
+            &body,
+            self.limits.max_response_body_bytes,
+        )
+        .map_err(|source| Error::Codec {
             phase: "decode",
             source,
         })?;
         Ok(Response::from_parts(parts, value))
+    }
+}
+
+/// Typed one-way sends over a byte-facing Tower service.
+///
+/// Calls consume a codec and borrow the exact service mutably, without retries
+/// or reply decoding. Success means a complete local write, not a semantic ACK.
+///
+/// ```no_run
+/// use furpc::{header, FubstCodec, OneWayClient, Peer, PeerSendService, Request, WriteReceipt};
+/// use tokio::time::Instant;
+///
+/// async fn report(peer: Peer, deadline: Instant) -> furpc::Result<WriteReceipt> {
+///     OneWayClient::new(PeerSendService::new(peer))
+///         .send(
+///             Request::new(42u32).append_header(header::action("Report")?)?,
+///             FubstCodec::<u32, ()>::default(),
+///             deadline,
+///         ).await
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct OneWayClient<T> {
+    transport: T,
+    max_encoded_body_bytes: usize,
+}
+
+impl<T> OneWayClient<T> {
+    pub fn new(transport: T) -> Self {
+        Self {
+            transport,
+            max_encoded_body_bytes: MAX_BODY_BYTES,
+        }
+    }
+
+    /// Restrict encoded output, not codec allocations. Zero permits empty bodies.
+    pub fn max_encoded_body_bytes(mut self, limit: usize) -> Result<Self> {
+        if limit > MAX_BODY_BYTES {
+            return Err(Error::InvalidInput(
+                "codec body limit exceeds native frame capacity",
+            ));
+        }
+        self.max_encoded_body_bytes = limit;
+        Ok(self)
+    }
+
+    pub fn into_inner(self) -> T {
+        self.transport
+    }
+
+    /// Configure the wrapped service between sends without replacing readiness state.
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
+}
+
+impl<T> OneWayClient<T>
+where
+    T: Service<Request<Body>, Response = WriteReceipt> + Send,
+    T::Future: Send,
+    T::Error: Into<BoxError>,
+{
+    /// One absolute deadline covers encoding, readiness, submission and writing.
+    /// Native write settlement is preserved when its result is observed later.
+    /// Dropping the future does not prove retraction of committed output.
+    pub async fn send<C>(
+        &mut self,
+        request: Request<C::Encode>,
+        mut codec: C,
+        deadline: Instant,
+    ) -> Result<WriteReceipt>
+    where
+        C: Codec + Send,
+        C::Encode: Send,
+        C::Encoder: Send,
+    {
+        let deadline = request
+            .deadline()
+            .map_or(deadline, |local| local.min(deadline));
+        if Instant::now() >= deadline {
+            return Err(Error::Timeout("send"));
+        }
+        let (mut parts, item) = request.into_parts();
+        parts.deadline = Some(deadline);
+        let body = codec::encode(&mut codec.encoder(), item, self.max_encoded_body_bytes).map_err(
+            |source| Error::Codec {
+                phase: "encode",
+                source,
+            },
+        )?;
+        if Instant::now() >= deadline {
+            return Err(Error::Timeout("send"));
+        }
+        timeout_at(deadline, poll_fn(|cx| self.transport.poll_ready(cx)))
+            .await
+            .map_err(|_| Error::Timeout("send"))?
+            .map_err(|error| Error::transport("send readiness", error))?;
+        if Instant::now() >= deadline {
+            return Err(Error::Timeout("send"));
+        }
+        let receipt = timeout_at(
+            deadline,
+            self.transport.call(Request::from_parts(parts, body)),
+        )
+        .await
+        .map_err(|_| Error::Timeout("send"))?
+        .map_err(|error| Error::transport("send service", error))?;
+        if receipt.written_at() > deadline {
+            return Err(Error::Timeout("send"));
+        }
+        Ok(receipt)
     }
 }

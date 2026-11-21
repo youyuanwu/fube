@@ -6,6 +6,41 @@ Maps existing gaps to owners and describes staged delivery, consumer
 migration, acceptance, and unresolved qualification work. These are proposed
 milestones, not a record of delivered implementation or qualified support.
 
+## Generic adapter follow-up
+
+**Status:** generic furpc APIs and runtime consumer migration implemented.
+The runtime's typed client/server migration exposed reusable body and one-way
+adapter gaps, not missing SF-specific transport policy.
+
+The [public body helpers](Codecs.md#public-body-helpers) now share the
+whole-body implementation used by RPC codecs. The
+[typed one-way client and original-Peer service adapters](Requests.md#one-way-client-and-peer-service-adapters)
+are also implemented. PeerSendService provides the native byte service for
+OneWayClient; PeerRequestService provides request-only consumer deduplication.
+Runtime retains method profiles, authority/admission checks and frozen retry
+wrappers above furpc. HostingClient uses PeerRequestService; RapClient uses
+OneWayClient over runtime middleware and PeerSendService. Prepared retry wrappers
+retain shared Body rather than copied Vec bytes, not a replay cache.
+
+Focused public API checks cover custom non-Serde codecs, segmented-body consumption and
+explicit suffix skipping, zero/finite byte limits, and codec source/resource
+classification. Typed-send cases exercise non-Clone service readiness witnesses, unused
+decode types that need not be Send, encoding failure before submission,
+request-local deadline shortening, on-time writes observed later, and no
+correlated response entry, including sends while the only RPC slot is occupied.
+Original-Peer adapters reject missing deadlines and incompatible managed headers
+and do not switch generations after failure.
+Cancellation cases distinguish uncommitted retraction from committed
+driver-owned output without inventing confirmed cancellation on the typed future.
+
+Runtime migration checks retain exact fault/endpoint bytes across retry attempts
+with fresh message identities and verify shared prepared-byte storage,
+reserved stateless reply admission versus ordinary stateful/report admission,
+local encoding/authority failure isolation, decode-after-owned-admission ordering,
+and usable unregister IPC after late one-way commands during orderly retirement.
+These focused checks establish API/composition behavior, not new native
+interoperability, deployed runtime support, TLS, or FM/Federation qualification.
+
 ## Current implementation
 
 The crate now includes native frames/ordered headers, shared segmented messages,
@@ -205,8 +240,61 @@ or the rest of the gateway API. See the
 
 The initiating fube-runtime IPC client also uses a dedicated Channel and original
 Peer, with the same typed RpcClient/FubstCodec and byte-service structure.
+Its outbound HostingClient<T> retains RpcClient<IpcService<T>> and provides
+typed registration, unregister, lease-poll and health-report methods rather than
+caller-selected actors/actions or reply types. Independent calls clone the stub,
+not its original-generation authority; IPC identity, remaining timeout and reply
+validation stay in the byte service. Cleanup exemptions and runtime retirement
+remain domain-owned.
+The local PeerService is retired in favor of furpc's original-Peer
+PeerRequestService. Outbound RapClient<T> retains
+OneWayClient<RapSendService<T>>; its typed proxy/service reply and load-report
+methods select native actions and use FubstCodec. RapSendService retains IPC
+identity stamping, authority checks, runtime admission and transport-error
+retirement above the native PeerSendService. Independent calls clone the typed
+stub without sharing mutable readiness across an await.
+FaultReport::prepare and ReplicaEndpointUpdate::prepare use the public
+codec::encode helper to freeze the native body once in opaque shared Body wrappers.
+A private pass-through encoder adopts those existing bytes without another native
+serialization or payload copy on retries; PeerSendService/Peer still allocate
+fresh native message identities for each authorized attempt.
+Stateless replies keep reserved admission; stateful replies and reports keep
+ordinary admission. These calls still await original-Peer local writes, not RPC
+responses or semantic acknowledgment.
+HostingMethod and RapMethod provide the runtime-owned outbound envelopes used
+both by typed methods and the byte-service submission guard. Admission lanes
+remain selected by the typed operation, not inferred from shared native actions.
+RuntimeServer separately composes host-control, RAPQuery and RAP one-way routes
+in ipc_server.rs. Its bounded handoffs carry opaque, schema-typed invocations,
+not a domain-visible actor/action/Vec envelope or an optional response slot.
+The original Request<Body> stays private until the serialized executor reaches
+the existing admission boundary. Host-control services accept Request<()> or
+Request<UpdateContext> and return Reply<ErrorReply>; the query service accepts
+Request<ProxyRequest> and returns Reply<QueryReply>. The stock server::Rpc adapter
+and FubstCodec now decode requests and encode replies on that executor.
+Response headers are fixed by the admitted route, and the original runner still
+owns correlation and writing. A retired RPC invocation cannot call its retained
+typed service. RPC execution completion means encoded response-data handoff,
+not local-write completion; subsequent write failures remain serving errors.
+RAP one-way handlers accept Request<ProxyRequest> and return (). Their serving
+scope still completes at bounded enqueue, preserving late-command shutdown and
+unregister behavior. After owned dispatch admission, public codec::decode uses
+the Fubst decoder and the retained route body limit before calling the typed
+domain service. Using
+server::Rpc::one_way at that later point would incorrectly borrow the already
+completed runner invocation. Route-selected RapAction values replace untyped
+action selection in the command handoff; native actions and schemas are unchanged.
+Runtime IPC uses shared native subsystem actor names from
+fube_core::protocol::actor; that catalog stays above furpc and grants no routing
+authority.
 Runtime owns host/PID headers, real loopback I/O validation, registration, lease,
 RAP semantics and domain retirement; furpc owns ingress correlation/reply writes.
+Runtime's thin Session composes Channel establishment and captures the original
+Peer before building the typed client stubs. Its connector permits only one I/O
+acquisition and rejects retired sessions, so an attachment race cannot demand a
+replacement socket under old registration authority. Generic Channel reconnect
+behavior is unchanged; runtime retains first-cause retirement and passive I/O
+release observation without new furpc lifecycle APIs.
 The legacy channel adapter, second reader and held-completion worker are retired.
 This intentionally does not emulate its first-write predicates, ordered ingress
 barrier or physical-driver join. Domain authority checks and the independent
@@ -225,6 +313,43 @@ runtime executable on the retained SF11.8.121.4 onebox. Native registration,
 stateless activation and independent application RPC succeeded; owned workload
 cleanup completed and the onebox was retained. This is not a fresh full runtime
 reporting/upgrade/stateful/recovery qualification.
+
+Fresh qualification on 2026-11-21 tested clean source
+`d40b95f384401dad41332785bba5b6b5dae0a5cf`, including the typed client/server,
+one-way infrastructure adoption, Session composition and outbound profiles.
+Native run `092de2b36dc7` passed
+`PASS_FULL_EMPTY_STATEFUL_CONTROL_PLANE_AND_STATELESS_PROFILE` on the retained
+five-node SF 11.8.121.4 onebox with a verified version-3 prebuilt bundle.
+Actual native observations covered registration and finite fresh lease authority,
+49 same-process/host/runtime configuration-refresh samples, stateless load,
+move-cost, HM sequence/expiry/error behavior, transient fault replacement,
+RAP query/description updates, empty-stateful singleton and three-replica
+role/configuration/failover, isolated Close/Abort and mixed-host recovery.
+Exact application IPC loss fenced the deliberately noncooperative process in
+0.503 seconds. Receipt verification checked eight stateful snapshots and eleven
+live-process executable-hash observations against the bundle.
+
+Ignored local evidence is retained at `build/furpc-runtime-proof/d40b95f/`:
+`native-report.json`, `verification.json`, `bundle/` and `retry-model-tests.log`.
+The report redacts the allocation-owner capability. Independent observations
+confirmed absence of the minted application, both type versions, both native
+ImageStore uploads and remote/local staging; all five nodes remained Up and the
+caller-owned onebox was retained.
+
+| Evidence | SHA256 |
+| --- | --- |
+| Native report | `2cd9d4465e929de8204f6cdee3e5b9ae292c0756a4dd64f61dae469721267452` |
+| Bundle manifest | `f75498ed08615c1c05e22118d062ac2533e84fadaf4afcd80120e6d0ae4751e1` |
+| Runtime application | `0446056b14a82e19710f1568a813d367f2eb41849dc6317dac6ce22c0ba1b5cd` |
+| Independent observer | `6afd9967f59b01503f2476781e5de5d1dd460fa63bb9fa973865fee66c67d338` |
+
+Forced fault retries and endpoint semantic-ACK loss, including retry
+byte/message-ID identity, remain separate model evidence (three focused cases
+passed), not native qualification.
+Explicit InvalidateLeaseRequest and unregister wire exchanges were not
+independently traced. This empty volatile control-plane profile does not qualify
+data replication/durability, TLS, or a new physical-retirement/join guarantee.
+The receipt remains bound to the tested revision, not later changes.
 
 Hosting's production accepted IPC also uses the existing public furpc Server,
 Actor-specific ingress services and original Peer. Each connection task owns

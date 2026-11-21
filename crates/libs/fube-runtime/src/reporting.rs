@@ -1,8 +1,8 @@
 //! Application-runtime reports, not management-client operations.
-use crate::ipc_client::{deadline_after, native_error, Check};
+use crate::ipc_client::{deadline_after, native_error, Check, FaultReport};
 use crate::{api::FaultType, lease::Authority, wire::*};
 use crate::{Error, Result};
-use fubst::serde::{to_vec, EmptyObjectArray, NativeEnum, ObjectArray, Pointer};
+use fubst::serde::{EmptyObjectArray, NativeEnum, ObjectArray, Pointer};
 use furpc::{HeaderId, HeaderRecord, Request};
 use std::{
     collections::BTreeMap,
@@ -82,7 +82,7 @@ pub struct FaultDelivery {
 
 struct FaultStage {
     delivery: FaultDelivery,
-    body: Vec<u8>,
+    body: FaultReport,
     error: Option<Error>,
     current: Arc<AtomicBool>,
     complete: tokio::sync::watch::Sender<Option<Result<FaultDelivery>>>,
@@ -307,13 +307,11 @@ impl Reporting {
             }]),
             time: now,
         };
-        let body = to_vec(&body)?;
+        let mut rap = self.connection.rap();
         tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return Err(Error::Closed),
-            result = self.connection.send_one_way_checked(
-                12,
-                "RAPReportLoad",
+            result = rap.report_load(
                 body,
                 deadline_after(REPORT_TIMEOUT)?,
                 self.fence(),
@@ -443,15 +441,14 @@ impl Reporting {
                 .map_err(native_error)?,
             )
             .map_err(native_error)?;
+        let mut hosting = self.connection.hosting();
         let reply = tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return Err(Error::Closed),
-            result = self.connection.request::<_, HealthReply>(
-                "ReportHealth",
-                7,
+            result = hosting.report_health(
                 request,
                 deadline_after(REPORT_TIMEOUT)?,
-                Some(self.fence()),
+                self.fence(),
             ) => result.map_err(report_transport_error)?,
         };
         let reply = reply.into_body();
@@ -499,7 +496,7 @@ impl Reporting {
             } else {
                 let first = stage.is_none();
                 let request = self.request.lock().unwrap().clone();
-                let body = to_vec(&FaultBody {
+                let body = FaultReport::prepare(FaultBody {
                     unit: request.unit,
                     local: request.local,
                     fault: native_fault,
@@ -602,13 +599,8 @@ impl Reporting {
                     .try_acquire()
                     .map_err(|_| Error::ResourceLimit("runtime report admission"))?;
                 self.connection
-                    .send_one_way_checked(
-                        12,
-                        "RAReportFault",
-                        body,
-                        deadline_after(REPORT_TIMEOUT)?,
-                        sent,
-                    )
+                    .rap()
+                    .report_fault(body, deadline_after(REPORT_TIMEOUT)?, sent)
                     .await
             };
             let result = tokio::select! {

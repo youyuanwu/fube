@@ -2,15 +2,17 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Weak,
 };
+use std::task::{Context, Poll};
 
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
+use tower_service::Service;
 
 use crate::{
     connection::{ConnectionHandle, ConnectionObserver, ListenInstance, Phase, SendReceipt},
     rpc,
     service::Registry,
-    transport::IoInfo,
+    transport::{BoxFuture, IoInfo},
     Body, EnvelopeCheck, Error, Headers, Message, MessageId, NotificationPolicy, Operation,
     Request, Response, Result, WriteReceipt,
 };
@@ -312,6 +314,75 @@ impl Peer {
         core.handle
             .send_authorized(message, deadline, Some(authorization))
             .map_err(Error::from)
+    }
+}
+
+/// Byte RPC service over an already-authorized, nonowning original Peer.
+/// Clones never reconnect or acquire replacement generation authority.
+#[derive(Debug, Clone)]
+pub struct PeerRequestService {
+    peer: Peer,
+}
+
+impl PeerRequestService {
+    pub fn new(peer: Peer) -> Self {
+        Self { peer }
+    }
+}
+
+impl Service<Request<Body>> for PeerRequestService {
+    type Response = Response<Body>;
+    type Error = Error;
+    type Future = BoxFuture<Result<Self::Response>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let peer = self.peer.clone();
+        Box::pin(async move {
+            let deadline = request
+                .deadline()
+                .ok_or(Error::InvalidInput("byte RPC requires a deadline"))?;
+            peer.request(request, deadline).await
+        })
+    }
+}
+
+/// Byte one-way service over an already-authorized, nonowning original Peer.
+/// Native correlation fields are not accepted, even in raw-only mode.
+#[derive(Debug, Clone)]
+pub struct PeerSendService {
+    peer: Peer,
+}
+
+impl PeerSendService {
+    pub fn new(peer: Peer) -> Self {
+        Self { peer }
+    }
+}
+
+impl Service<Request<Body>> for PeerSendService {
+    type Response = WriteReceipt;
+    type Error = Error;
+    type Future = BoxFuture<Result<Self::Response>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let peer = self.peer.clone();
+        Box::pin(async move {
+            let deadline = request
+                .deadline()
+                .ok_or(Error::InvalidInput("byte send requires a deadline"))?;
+            let (parts, body) = request.into_parts();
+            rpc::check_managed(&parts.headers)?;
+            peer.send(Message::from_received(parts.headers, body), deadline)
+                .await
+        })
     }
 }
 

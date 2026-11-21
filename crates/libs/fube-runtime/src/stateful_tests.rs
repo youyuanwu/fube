@@ -732,10 +732,9 @@ async fn admitted_stateful_fault_cannot_succeed_after_authority_retirement() {
     let partition = calls.partitions.lock().unwrap()[0].clone();
     let connection = h.engine.shared.connection.clone();
     h.peer.reads.hold_after(12);
-    let blocker = connection.send_one_way_checked(
-        12,
-        "RAPReportLoad",
-        vec![0; 4 * 1024 * 1024 - 4096],
+    let mut rap = connection.rap();
+    let blocker = rap.report_load(
+        large_load_report(),
         deadline_after(Duration::from_secs(5)).unwrap(),
         Arc::new(|| true),
     );

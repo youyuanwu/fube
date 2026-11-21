@@ -3,20 +3,26 @@ use crate::{Error, Result};
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 pub(crate) mod tests;
-use crate::ipc_client::deadline_after;
-use fubst::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer};
+use crate::ipc_client::{deadline_after, ProxyReplyKind};
+use crate::ipc_server::{RapAction, RapCall};
+use fubst::serde::{Guid, ObjectArray, Pointer};
+use furpc::{Reply, Request};
 use std::{
     collections::{HashMap, HashSet},
+    future::{ready, Future, Ready},
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
+    task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{broadcast, mpsc, watch, OwnedSemaphorePermit, Semaphore},
     task::{JoinHandle, JoinSet},
 };
+use tower_service::Service as TowerService;
 
 pub const MAX_SERVICE_UNITS: usize = 32;
 pub const MAX_CALLBACKS: usize = 32;
@@ -72,8 +78,8 @@ struct Shared {
 pub(crate) struct Engine {
     shared: Arc<Shared>,
     stop: watch::Sender<bool>,
-    task: JoinHandle<Option<mpsc::Receiver<crate::ipc_client::IpcMessage>>>,
-    retired_incoming: Option<mpsc::Receiver<crate::ipc_client::IpcMessage>>,
+    task: JoinHandle<Option<mpsc::Receiver<RapCall>>>,
+    retired_incoming: Option<mpsc::Receiver<RapCall>>,
     active_at_stop: bool,
 }
 struct FactorySlot {
@@ -181,7 +187,7 @@ impl Engine {
         current: crate::ActivationContextHandle,
         authority: Arc<Authority>,
         connection: crate::ipc_client::IpcClient,
-        incoming: mpsc::Receiver<crate::ipc_client::IpcMessage>,
+        incoming: mpsc::Receiver<RapCall>,
     ) -> Self {
         let execution = crate::execution::new(authority.clone(), tokio::runtime::Handle::current());
         Self::start_with_execution(current, authority, connection, incoming, execution)
@@ -190,7 +196,7 @@ impl Engine {
         current: crate::ActivationContextHandle,
         authority: Arc<Authority>,
         connection: crate::ipc_client::IpcClient,
-        mut incoming: mpsc::Receiver<crate::ipc_client::IpcMessage>,
+        mut incoming: mpsc::Receiver<RapCall>,
         execution: crate::extensions::ExecutionRuntime,
     ) -> Self {
         let activation = (*current.snapshot()).clone();
@@ -295,7 +301,12 @@ impl Engine {
                             let _permit=permit;
                             #[cfg(test)]
                             state.test_hooks.reach(tests::DispatchPoint::BeforeDispatch).await;
-                            dispatch(state,request).await
+                            match request {
+                                RapCall::OneWay(kind, call) => call.one_way(RapService {
+                                    shared: state, kind,
+                                }).await,
+                                RapCall::Query(call) => call.unary(QueryService { shared: state }).await,
+                            }
                         });
                         dispositions.retain(|record| !record.is_finished());
                         dispositions.push(call.disposition());
@@ -480,47 +491,114 @@ fn unit(shared: &Shared, request: &ProxyRequest, create: bool) -> Result<Option<
     units.insert(request.unit.id.id.0, unit.clone());
     Ok(Some(unit))
 }
-async fn dispatch(shared: Arc<Shared>, incoming: crate::ipc_client::IpcMessage) -> Result<()> {
-    let request: ProxyRequest = from_slice(&incoming.body)?;
-    let owner = {
-        let mut owners = shared.owners.lock().unwrap();
-        let id = request.unit.id.id.0;
-        match owners.get(&id).copied() {
-            Some(stateful) => {
-                if matches!(incoming.action.as_str(), "ReplicaOpen" | "ReplicaClose")
-                    && stateful != request.service.stateful
-                {
-                    return Err(Error::Protocol(
-                        "partition changed stateless/stateful ownership",
-                    ));
-                }
-                Some(stateful)
+struct RapService {
+    shared: Arc<Shared>,
+    kind: RapAction,
+}
+
+impl TowerService<Request<ProxyRequest>> for RapService {
+    type Response = ();
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<ProxyRequest>) -> Self::Future {
+        Box::pin(dispatch(
+            self.shared.clone(),
+            self.kind,
+            request.into_body(),
+        ))
+    }
+}
+
+struct QueryService {
+    shared: Arc<Shared>,
+}
+
+impl TowerService<Request<ProxyRequest>> for QueryService {
+    type Response = Reply<QueryReply>;
+    type Error = Error;
+    type Future = Ready<Result<Self::Response>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<ProxyRequest>) -> Self::Future {
+        ready(query_request(&self.shared, request))
+    }
+}
+
+fn owner(shared: &Shared, request: &ProxyRequest, lifecycle: bool) -> Result<Option<bool>> {
+    let mut owners = shared.owners.lock().unwrap();
+    let id = request.unit.id.id.0;
+    Ok(match owners.get(&id).copied() {
+        Some(stateful) => {
+            if lifecycle && stateful != request.service.stateful {
+                return Err(Error::Protocol(
+                    "partition changed stateless/stateful ownership",
+                ));
             }
-            None if matches!(incoming.action.as_str(), "ReplicaOpen" | "ReplicaClose") => {
-                if owners.len() >= MAX_TOMBSTONES {
-                    return Err(Error::ResourceLimit("service tombstones"));
-                }
-                owners.insert(id, request.service.stateful);
-                Some(request.service.stateful)
-            }
-            None => None,
+            Some(stateful)
         }
+        None if lifecycle => {
+            if owners.len() >= MAX_TOMBSTONES {
+                return Err(Error::ResourceLimit("service tombstones"));
+            }
+            owners.insert(id, request.service.stateful);
+            Some(request.service.stateful)
+        }
+        None => None,
+    })
+}
+
+fn query_request(shared: &Shared, incoming: Request<ProxyRequest>) -> Result<Reply<QueryReply>> {
+    let deadline = incoming
+        .context()
+        .ok_or(Error::Protocol("runtime ingress requires furpc context"))?
+        .deadline();
+    let id = incoming.headers().effective().message_id;
+    let request = incoming.into_body();
+    let owner = owner(shared, &request, false)?;
+    let body = if owner == Some(true) || request.service.stateful {
+        shared.stateful.query_reply(&request)?
+    } else {
+        // Native queries intentionally carry the DEFAULT ServiceDescription.
+        if request.runtime != shared.activation.runtime.id
+            || request.local.node.id.0.len() != 16
+            || request.flags != 0
+        {
+            return Err(Error::Protocol("invalid native RAPQuery context"));
+        }
+        shared.metrics.queries.fetch_add(1, Ordering::Relaxed);
+        query(shared, &request)?
     };
+    if tokio::time::Instant::now() >= deadline {
+        return Err(Error::Timeout);
+    }
+    shared.authority.check()?;
+    let _ = shared
+        .events
+        .send(crate::RuntimeEvent::QueryReplyReady { request_id: id });
+    Ok(Reply::new(body))
+}
+
+async fn dispatch(shared: Arc<Shared>, kind: RapAction, request: ProxyRequest) -> Result<()> {
+    let action = kind.action();
+    let owner = owner(
+        &shared,
+        &request,
+        matches!(kind, RapAction::ReplicaOpen | RapAction::ReplicaClose),
+    )?;
     if owner == Some(true) || request.service.stateful {
-        let result = shared
-            .stateful
-            .dispatch(&incoming.action, request, incoming.reply)
-            .await;
-        if incoming.action == "RAPQuery" && result.is_ok() {
-            let _ = shared.events.send(crate::RuntimeEvent::QueryReplyReady {
-                request_id: incoming.id,
-            });
-        }
-        return result;
+        return shared.stateful.dispatch(kind, request).await;
     }
     if owner.is_none()
         && matches!(
-            incoming.action.as_str(),
+            action,
             "UpdateConfiguration"
                 | "ReplicatorBuildIdleReplica"
                 | "ReplicatorRemoveIdleReplica"
@@ -533,62 +611,23 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::ipc_client::IpcMessage) 
         // Native retries/delayed controls cannot create a missing replica.
         return Ok(());
     }
-    if incoming.action == "RAPQuery" {
-        // Native Query.HostQueryAsyncOperation uses a fully serialized DEFAULT
-        // ServiceDescription, not the manifest identity from ReplicaOpen.
-        // Query authority is the routed runtime + existing unit/replica, not
-        // that intentionally empty service description or partition metadata.
-        if request.runtime != shared.activation.runtime.id
-            || request.local.node.id.0.len() != 16
-            || request.flags != 0
-        {
-            return Err(Error::Protocol("invalid native RAPQuery context"));
-        }
-        shared.metrics.queries.fetch_add(1, Ordering::Relaxed);
-        let reply = incoming
-            .reply
-            .ok_or(Error::Protocol("RAPQuery requires correlation"))?;
-        let authority = Arc::downgrade(&shared.authority);
-        let result = reply
-            .reply_checked(
-                12,
-                Some("RAPQueryReply"),
-                to_vec(&query(&shared, &request)?)?,
-                deadline_after(Duration::from_secs(5))?,
-                Arc::new(move || {
-                    authority
-                        .upgrade()
-                        .is_some_and(|authority| authority.check().is_ok())
-                }),
-            )
-            .await;
-        if result.is_ok() {
-            let _ = shared.events.send(crate::RuntimeEvent::QueryReplyReady {
-                request_id: incoming.id,
-            });
-        }
-        return result;
-    }
     validate(&shared, &request)?;
-    if incoming.reply.is_some() {
-        return Err(Error::Protocol("lifecycle uses semantic one-way replies"));
-    }
     if !matches!(
-        incoming.action.as_str(),
+        action,
         "ReplicaOpen" | "ReplicaClose" | "ProxyUpdateServiceDescription"
     ) {
         return Err(Error::Protocol("unsupported stateless RAP action"));
     }
-    if incoming.action == "ReplicaOpen" {
+    if kind == RapAction::ReplicaOpen {
         shared.metrics.opens.fetch_add(1, Ordering::Relaxed);
     }
-    if incoming.action == "ReplicaClose" {
+    if kind == RapAction::ReplicaClose {
         shared.metrics.closes.fetch_add(1, Ordering::Relaxed);
         if request.flags & 4 != 0 {
             shared.metrics.aborts.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let create = matches!(incoming.action.as_str(), "ReplicaOpen" | "ReplicaClose");
+    let create = matches!(kind, RapAction::ReplicaOpen | RapAction::ReplicaClose);
     let Some(unit) = unit(&shared, &request, create)? else {
         return Ok(());
     };
@@ -606,7 +645,7 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::ipc_client::IpcMessage) 
         Err(_) => {
             // Native RA retries incompatible work. Abort/drop cancels opening;
             // never invoke a second callback while the first still owns the unit.
-            if incoming.action == "ReplicaClose" && request.flags & 12 != 0 {
+            if kind == RapAction::ReplicaClose && request.flags & 12 != 0 {
                 let state = unit.state.lock().unwrap();
                 state.valid.store(false, Ordering::Release);
                 state.cancel.cancel();
@@ -627,10 +666,10 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::ipc_client::IpcMessage) 
             }
         }
     }
-    match incoming.action.as_str() {
-        "ReplicaOpen" => open(&shared, &unit, request).await,
-        "ReplicaClose" => close(&shared, &unit, request).await,
-        "ProxyUpdateServiceDescription" => update(&shared, &unit, request).await,
+    match kind {
+        RapAction::ReplicaOpen => open(&shared, &unit, request).await,
+        RapAction::ReplicaClose => close(&shared, &unit, request).await,
+        RapAction::UpdateService => update(&shared, &unit, request).await,
         _ => unreachable!(),
     }
 }
@@ -639,7 +678,7 @@ fn native_error(error: &Error) -> i64 {
 }
 async fn reply(
     shared: &Shared,
-    action: &str,
+    kind: ProxyReplyKind,
     request: ProxyRequest,
     endpoint: String,
     error: Option<Error>,
@@ -647,10 +686,10 @@ async fn reply(
 ) -> Result<()> {
     // All successful endpoint publication, including cached duplicate Open,
     // crosses the same terminal-authority guard at the reply boundary.
-    if action == "ReplicaOpenReply" && error.is_none() {
+    if kind == ProxyReplyKind::ReplicaOpen && error.is_none() {
         shared.authority.check()?;
     }
-    let publish = action == "ReplicaOpenReply" && error.is_none();
+    let publish = kind == ProxyReplyKind::ReplicaOpen && error.is_none();
     let valid = shared
         .units
         .lock()
@@ -679,10 +718,10 @@ async fn reply(
     };
     let sent = shared
         .connection
-        .send_one_way(
-            12,
-            action,
-            to_vec(&body)?,
+        .rap()
+        .send_replica_reply(
+            kind,
+            body,
             deadline_after(Duration::from_secs(5))?,
             Arc::new(move || {
                 authority
@@ -763,11 +802,21 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
     };
     if let Some(result) = duplicate {
         return match result {
-            Ok(endpoint) => reply(shared, "ReplicaOpenReply", request, endpoint, None, 1).await,
+            Ok(endpoint) => {
+                reply(
+                    shared,
+                    ProxyReplyKind::ReplicaOpen,
+                    request,
+                    endpoint,
+                    None,
+                    1,
+                )
+                .await
+            }
             Err(error) => {
                 reply(
                     shared,
-                    "ReplicaOpenReply",
+                    ProxyReplyKind::ReplicaOpen,
                     request,
                     String::new(),
                     Some(error),
@@ -931,7 +980,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
     shared.authority.check()?;
     reply(
         shared,
-        "ReplicaOpenReply",
+        ProxyReplyKind::ReplicaOpen,
         request,
         endpoint,
         outcome.err(),
@@ -998,7 +1047,15 @@ async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()
         .wait()
         .await?;
     // Native normalizes a graceful-close error only after abort/disposal.
-    reply(shared, "ReplicaCloseReply", request, String::new(), None, 2).await
+    reply(
+        shared,
+        ProxyReplyKind::ReplicaClose,
+        request,
+        String::new(),
+        None,
+        2,
+    )
+    .await
 }
 async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()> {
     let response = {
@@ -1034,10 +1091,9 @@ async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<(
     let frame_valid = valid.clone();
     let sent = shared
         .connection
-        .send_one_way(
-            12,
-            "ProxyUpdateServiceDescriptionReply",
-            to_vec(&response)?,
+        .rap()
+        .send_service_update_reply(
+            response,
             deadline_after(Duration::from_secs(5))?,
             Arc::new(move || {
                 frame_valid.load(Ordering::Acquire)

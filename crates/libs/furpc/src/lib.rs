@@ -11,7 +11,11 @@
 //! a consumer-owned local listener advertisement; their `instance` methods select
 //! its native instance. These settings neither bind I/O nor reset live connections.
 //! [`RpcClient`] adapts that byte service with a consumed application [`Codec`]
-//! per call. [`server::Rpc`] adapts typed handlers inside byte-facing services.
+//! per call. [`OneWayClient`] uses only encoding and returns a local-write receipt.
+//! [`PeerRequestService`] and [`PeerSendService`] adapt one original nonowning Peer,
+//! without reconnection. Public [`codec::encode`] and [`codec::decode`] transform
+//! whole bodies without native submission or invocation authority.
+//! [`server::Rpc`] adapts typed handlers inside byte-facing services.
 //! [`Router`] optionally selects exact native Actor/Action services; raw ingress
 //! remains independent. TLS is not implemented.
 //!
@@ -91,13 +95,15 @@ mod service;
 mod transport;
 mod wire;
 
-pub use client::{ClientCodecLimits, RpcClient};
+pub use client::{ClientCodecLimits, OneWayClient, RpcClient};
 pub use codec::{Codec, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder, FubstCodec};
 pub use error::{BoxError, Error, ErrorSource, Result};
 pub use header::{ActorId, CommonHeaders, HeaderId, HeaderRecord, HeaderRef, Headers};
 pub use message::{Body, Message, MessageBuilder};
 pub use operation::{Attempt, AttemptDisposition, CancelOutcome, Operation, WriteReceipt};
-pub use peer::{Peer, PeerInfo, SendCheck, SendKind, SendPolicy, Source};
+pub use peer::{
+    Peer, PeerInfo, PeerRequestService, PeerSendService, SendCheck, SendKind, SendPolicy, Source,
+};
 pub use reply::Reply;
 pub use request::{Request, RequestContext, RequestParts};
 pub use response::{Response, ResponseParts};

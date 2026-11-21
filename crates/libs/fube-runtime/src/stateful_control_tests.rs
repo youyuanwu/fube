@@ -684,6 +684,10 @@ async fn promotion_endpoint_scenario(application: Option<tokio::runtime::Handle>
     tokio::time::advance(Duration::from_secs(30)).await;
     let retry = h.receive("ProxyReplicaEndpointUpdated").await;
     assert_eq!(retry.body, notification.body);
+    assert_ne!(
+        retry.metadata().unwrap().id,
+        notification.metadata().unwrap().id
+    );
     ack.local = body.local;
     h.send("ProxyReplicaEndpointUpdatedReply", &ack).await;
     tokio::time::resume();
