@@ -314,6 +314,43 @@ stateless activation and independent application RPC succeeded; owned workload
 cleanup completed and the onebox was retained. This is not a fresh full runtime
 reporting/upgrade/stateful/recovery qualification.
 
+Fresh qualification on 2026-11-21 tested clean source
+`d40b95f384401dad41332785bba5b6b5dae0a5cf`, including the typed client/server,
+one-way infrastructure adoption, Session composition and outbound profiles.
+Native run `092de2b36dc7` passed
+`PASS_FULL_EMPTY_STATEFUL_CONTROL_PLANE_AND_STATELESS_PROFILE` on the retained
+five-node SF 11.8.121.4 onebox with a verified version-3 prebuilt bundle.
+Actual native observations covered registration and finite fresh lease authority,
+49 same-process/host/runtime configuration-refresh samples, stateless load,
+move-cost, HM sequence/expiry/error behavior, transient fault replacement,
+RAP query/description updates, empty-stateful singleton and three-replica
+role/configuration/failover, isolated Close/Abort and mixed-host recovery.
+Exact application IPC loss fenced the deliberately noncooperative process in
+0.503 seconds. Receipt verification checked eight stateful snapshots and eleven
+live-process executable-hash observations against the bundle.
+
+Ignored local evidence is retained at `build/furpc-runtime-proof/d40b95f/`:
+`native-report.json`, `verification.json`, `bundle/` and `retry-model-tests.log`.
+The report redacts the allocation-owner capability. Independent observations
+confirmed absence of the minted application, both type versions, both native
+ImageStore uploads and remote/local staging; all five nodes remained Up and the
+caller-owned onebox was retained.
+
+| Evidence | SHA256 |
+| --- | --- |
+| Native report | `2cd9d4465e929de8204f6cdee3e5b9ae292c0756a4dd64f61dae469721267452` |
+| Bundle manifest | `f75498ed08615c1c05e22118d062ac2533e84fadaf4afcd80120e6d0ae4751e1` |
+| Runtime application | `0446056b14a82e19710f1568a813d367f2eb41849dc6317dac6ce22c0ba1b5cd` |
+| Independent observer | `6afd9967f59b01503f2476781e5de5d1dd460fa63bb9fa973865fee66c67d338` |
+
+Forced fault retries and endpoint semantic-ACK loss, including retry
+byte/message-ID identity, remain separate model evidence (three focused cases
+passed), not native qualification.
+Explicit InvalidateLeaseRequest and unregister wire exchanges were not
+independently traced. This empty volatile control-plane profile does not qualify
+data replication/durability, TLS, or a new physical-retirement/join guarantee.
+The receipt remains bound to the tested revision, not later changes.
+
 Hosting's production accepted IPC also uses the existing public furpc Server,
 Actor-specific ingress services and original Peer. Each connection task owns
 one inline serving future and a bounded serialized domain handoff; there is no
