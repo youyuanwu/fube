@@ -6,6 +6,161 @@ use std::sync::{
 };
 
 #[test]
+fn furpc_classification_retains_original_errors_and_codec_resource_causes() {
+    for (native, kind) in [
+        (furpc::Error::Cancelled, ErrorKind::Canceled),
+        (furpc::Error::Timeout("write"), ErrorKind::Timeout),
+        (furpc::Error::Closed, ErrorKind::ObjectClosed),
+        (furpc::Error::Unsupported("TLS"), ErrorKind::Unsupported),
+        (
+            furpc::Error::NativeHeader {
+                id: 0x8001,
+                source: fubst::Error::ResourceLimit("header budget"),
+            },
+            ErrorKind::ResourceExhausted,
+        ),
+        (
+            furpc::Error::Codec {
+                phase: "decode",
+                source: furpc::CodecError::resource_limit(fubst::Error::ResourceLimit(
+                    "body budget",
+                )),
+            },
+            ErrorKind::ResourceExhausted,
+        ),
+    ] {
+        let error = Error::from(native.clone());
+        assert_eq!(error.kind(), kind);
+        assert_eq!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<furpc::Error>(),
+            Some(&native)
+        );
+        assert_eq!(error.clone().uncertain().kind(), kind);
+    }
+}
+
+#[tokio::test]
+async fn furpc_remote_fault_preserves_native_code_and_original_body_through_wrapping() {
+    use furpc::{
+        header, Body, IngressLimits, IngressOptions, IngressResponse, IngressService, Message,
+        Request, RequestPolicy, ServiceBinding,
+    };
+    use std::{
+        future::{ready, Ready},
+        task::{Context, Poll},
+        time::Duration,
+    };
+    use tower_service::Service;
+
+    #[derive(Clone)]
+    struct Fault;
+    impl Service<Request<Body>> for Fault {
+        type Response = IngressResponse;
+        type Error = furpc::Error;
+        type Future = Ready<furpc::Result<IngressResponse>>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<furpc::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, _: Request<Body>) -> Self::Future {
+            ready(Ok(IngressResponse::Reply(
+                Message::builder()
+                    .append_header(
+                        furpc::HeaderRecord::native(
+                            header::FAULT,
+                            &furpc::Fault {
+                                code: 0x80071bcbu32 as i32 as i64,
+                                has_body: false,
+                            },
+                        )
+                        .unwrap(),
+                    )
+                    .body(Body::from_bytes(vec![9, 8, 7]).unwrap())
+                    .build()
+                    .unwrap(),
+            )))
+        }
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let allow = |_: &furpc::Headers, _: &furpc::Source| Ok(());
+    let service = IngressService::new(
+        Fault,
+        vec![ServiceBinding::raw(IngressOptions::requests(
+            RequestPolicy::new(allow, allow),
+            IngressLimits::default(),
+        ))
+        .unwrap()],
+    )
+    .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = furpc::Server::builder()
+        .service(service)
+        .unwrap()
+        .build()
+        .unwrap();
+    let owner = tokio::spawn(server.serve_with_shutdown(
+        furpc::TcpAcceptor::from_listener(listener),
+        furpc::ConnectionOptions::managed(),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    let channel = furpc::Endpoint::try_from(address)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let native = channel
+        .peer(deadline)
+        .await
+        .unwrap()
+        .request(Request::new(Body::empty()), deadline)
+        .await
+        .unwrap_err();
+    let error = Error::with_cause(ErrorKind::Provider, "callback", Error::from(native)).uncertain();
+    assert_eq!(error.native_code(), Some(0x80071bcbu32 as i32 as i64));
+    assert_eq!(error.native_result_code(), 0x80071bcbu32 as i32 as i64);
+    let Error::Uncertain(wrapped) = &error else {
+        unreachable!()
+    };
+    let Error::Classified {
+        cause: Some(converted),
+        ..
+    } = &**wrapped
+    else {
+        unreachable!()
+    };
+    let converted = converted.downcast_ref::<Error>().unwrap();
+    assert_eq!(converted.kind(), ErrorKind::ReplicationQueueFull);
+    let native = std::error::Error::source(converted)
+        .unwrap()
+        .downcast_ref::<furpc::Error>()
+        .unwrap();
+    let furpc::Error::RemoteFault(fault) = native else {
+        unreachable!()
+    };
+    assert_eq!(
+        fault
+            .body()
+            .segments()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>(),
+        [9, 8, 7]
+    );
+    drop((error, channel));
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), owner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
 fn replication_pressure_and_sizing_keep_typed_native_codes_and_causes() {
     for (kind, code) in [
         (ErrorKind::ReplicationQueueFull, 0x80071bcbu32 as i32 as i64),
@@ -27,9 +182,6 @@ fn replication_pressure_and_sizing_keep_typed_native_codes_and_causes() {
         assert_eq!(uncertain.native_result_code(), code);
         let provider = Error::with_cause(ErrorKind::Provider, "callback", error.clone());
         assert_eq!(provider.native_result_code(), code);
-        let remote: Error = error.transport_fault().into();
-        assert_eq!(remote.kind(), kind);
-        assert_eq!(remote.native_code(), Some(code));
     }
     assert_eq!(
         Error::ResourceLimit("other exhaustion").kind(),
@@ -283,6 +435,54 @@ impl Drop for Cause {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn furpc_codec_user_cause_remains_supervised_until_final_clone_is_released() {
+    let execution = ExecutionRuntime::standalone(tokio::runtime::Handle::current()).unwrap();
+    let started = Arc::new(AtomicBool::new(false));
+    let placement = Arc::new(Mutex::new(None));
+    let cause = Cause {
+        native: Error::Remote {
+            code: -903,
+            message: "codec source".into(),
+        },
+        started: started.clone(),
+        placement: placement.clone(),
+        release: Arc::new((Mutex::new(true), Condvar::new())),
+    };
+    let error = execution
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            Err::<(), _>(Error::from(furpc::Error::Codec {
+                phase: "decode",
+                source: furpc::CodecError::invalid_payload(cause),
+            }))
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    assert_eq!(error.native_code(), Some(-903));
+    let native = std::error::Error::source(&error)
+        .unwrap()
+        .downcast_ref::<furpc::Error>()
+        .unwrap();
+    let codec = std::error::Error::source(native).unwrap();
+    assert!(std::error::Error::source(codec)
+        .unwrap()
+        .downcast_ref::<Cause>()
+        .is_some());
+    let copy = error.clone();
+    drop(error);
+    assert!(!started.load(Ordering::Acquire));
+    drop(copy);
+    execution.finish_standalone().await.unwrap();
+    assert!(started.load(Ordering::Acquire));
+    assert_eq!(
+        placement.lock().unwrap().as_deref(),
+        Some("fube-owned-cleanup")
+    );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_typed_cause_and_native_code_survive_observation_then_supervised_physical_drop() {

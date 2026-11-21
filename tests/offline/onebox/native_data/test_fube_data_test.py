@@ -26,7 +26,7 @@ from tests.onebox.shared import data
 
 GRAPHS = {
     "rust-runtime-app": "rust-runtime-app\n fube-data\n fube-runtime",
-    "runtime_observer": "fube-client\n fube-transport",
+    "runtime_observer": "fube-client\n furpc",
     "native-replicator-oracle": "native-replicator-oracle\n mssf-core v0.10.0\n mssf-com v0.10.0\n fube-data",
 }
 DYNAMIC = "\nDynamic section:\n (NEEDED) Shared library: [libc.so.6]\n"

@@ -242,7 +242,7 @@ future client service integration reuses these components rather than forks
 the protocol. State extractors, macros, wildcard/fallback routing, automatic
 domain error mapping, and actor lifecycle machinery are deferred.
 
-The declaration-only `fube-transport::routing` module is not an implemented
+The removed declaration-only `fube-transport::routing` module was not an implemented
 foundation to transplant. Implement this router against native header
 semantics rather than inheriting that draft's independent restrictions.
 

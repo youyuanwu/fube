@@ -7,15 +7,27 @@ use std::{
     time::Duration,
 };
 
-use fube_transport::{
-    connection::{read_message, write_message},
-    message::{Header, ListenInstance, Message, MessageId},
-};
+#[path = "../../../libs/fube-hosting/tests/support/ipc_wire.rs"]
+#[allow(dead_code)]
+mod ipc_wire;
+use fubst::serde::Guid;
 use fubst::Encoder;
+use furpc::MessageId;
+use ipc_wire::{read_message, write_message, Header, ListenInstance, Message};
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 use uuid::Uuid;
 
 struct Package(PathBuf);
+
+#[derive(serde::Serialize)]
+struct Version(i64, i64);
+
+#[derive(serde::Serialize)]
+struct Sequence {
+    number: u64,
+    last: bool,
+    buffer_size: u64,
+}
 
 impl Package {
     fn new() -> Self {
@@ -118,16 +130,18 @@ fn acknowledgement(message: &Message, actor: i64, sequence: Option<u64>) -> Mess
         Header::actor(actor).unwrap(),
         Header::action("ClientOperationSuccess").unwrap(),
         activity(message),
-        Header::version(1, 2).unwrap(),
+        Header::native(0x8025, &Version(1, 2)).unwrap(),
     ];
     if let Some(sequence) = sequence {
         headers.push(
-            Header::object(0x803c, |encoder| {
-                encoder.u64(sequence).unwrap();
-                encoder.boolean(false).unwrap();
-                encoder.u64(4).unwrap();
-                Ok(())
-            })
+            Header::native(
+                0x803c,
+                &Sequence {
+                    number: sequence,
+                    last: false,
+                    buffer_size: 4,
+                },
+            )
             .unwrap(),
         );
     }
@@ -159,7 +173,7 @@ async fn receive_upload(
                 index: 1,
             },
             &ListenInstance {
-                nonce: [9; 16],
+                nonce: Guid([9; 16]),
                 ..ListenInstance::default()
             },
         )
@@ -175,7 +189,11 @@ async fn receive_upload(
             headers: vec![
                 Header::actor(22).unwrap(),
                 Header::action("OperationSuccessAction").unwrap(),
-                Header::relates_to(delete.properties().unwrap().id).unwrap(),
+                Header::native(
+                    furpc::header::RELATES_TO.get(),
+                    &delete.properties().unwrap().id,
+                )
+                .unwrap(),
                 activity(&delete),
             ],
             body: Vec::new(),

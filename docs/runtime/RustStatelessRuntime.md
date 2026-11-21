@@ -421,7 +421,7 @@ new reports; load/move have no automatic retry.
 | Sample retained package notifications | 32; overflow explicitly fails the fixture |
 
 Queues do not silently discard required replies. Source/model limits and resource
-tests are in [shared IPC tests](../../crates/libs/fube-transport/src/native_channel_ipc_tests.rs),
+tests are in [shared IPC tests](https://github.com/youyuanwu/fube/blob/d65bb92c2a66348b136dbd49e2fe261c73d8612b/crates/libs/fube-transport/src/native_channel_ipc_tests.rs),
 [typed IPC client tests](../../crates/libs/fube-runtime/src/ipc_client_tests.rs),
 [runtime models](../../crates/libs/fube-runtime/src/model_tests.rs) and
 [lifecycle models](../../crates/libs/fube-runtime/src/lifecycle_tests.rs).

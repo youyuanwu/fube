@@ -16,8 +16,10 @@ guide for current typed requests and absolute deadlines.
 The standalone notification client now also uses furpc ingress, typed ACK data
 and original-generation Peer RPCs. ImageStore also uses furpc Peer sends and
 authorized Actor 25/27 one-way ACK ingress, with no legacy transport fallback.
-No production fube-client dependency on fube-transport remains; the native loss
-relay and transport-model JSON tests retain it only as a development dependency.
+No fube-client dependency on legacy transport remains, including dev edges.
+The native loss relay uses independent unchanged-byte observation and public
+furpc headers. The legacy transport crate and its model-only tests are removed;
+the original crate-layout proposals below are historical.
 Shared input/version-model Error/Result aliases now refer to fubst; ImageStore
 exposes ImageStoreError/ImageStoreResult with original filesystem causes.
 Notification close

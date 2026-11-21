@@ -278,7 +278,7 @@ Install the repository toolchain on the **build** machine, build/reuse the
 uniquely owned allocation name:
 
 ```sh
-cargo test --locked -p fube-runtime -p rust-runtime-app -p fube-transport -p fube-client
+cargo test --locked -p fube-runtime -p rust-runtime-app -p furpc -p fube-client
 python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'
 cargo build --locked --workspace --bins --examples --all-features
 python3 -m tests.onebox.shared.runtime --build-bundle build/stateful-binaries

@@ -4,25 +4,64 @@ use crate::{
     complete, deployment, process, require, HostError, Options, Result, RunReport, Scenario,
 };
 use fube_hosting::{ipc, wire};
-use fube_transport::{
-    connection::{read_message, write_message},
-    message::{Message, MessageId},
-};
+use fube_rap_test_support::transport::relay::Frame;
 use fubst::serde::{from_slice, to_vec, ObjectArray, Pointer};
+use furpc::MessageId;
 use std::{
     collections::HashMap,
     path::Path,
     time::{Duration, Instant},
 };
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
     sync::mpsc,
     task::JoinSet,
 };
 
 pub(super) enum Observation {
-    Request(Message),
-    Reply(Message),
+    Request(Frame),
+    Reply(Frame),
+}
+
+pub(super) async fn observe_frames(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    observed: mpsc::Sender<Observation>,
+    observation: fn(Frame) -> Observation,
+) -> Result<()> {
+    while let Some(frame) = Frame::read(reader).await? {
+        observed
+            .try_send(observation(frame.clone()))
+            .map_err(|_| HostError("native observer frame budget".into()))?;
+        match frame.forward(writer).await {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Ok(())
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn stop_observer(tasks: &mut JoinSet<Result<()>>) -> Result<()> {
+    tasks.abort_all();
+    let mut outcome = Ok(());
+    while let Some(result) = tasks.join_next().await {
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(HostError(format!("native observer join: {error}"))),
+        };
+        outcome = complete(outcome, result);
+    }
+    outcome
 }
 
 #[derive(Default)]
@@ -38,7 +77,7 @@ impl Trace {
     pub(super) fn observe(&mut self, observation: Observation) -> Result<()> {
         match observation {
             Observation::Request(message) => {
-                let p = message.properties()?;
+                let p = message.metadata()?;
                 if p.actor == 1 {
                     return Ok(());
                 }
@@ -46,8 +85,8 @@ impl Trace {
                     "MSSF_HOST {}",
                     serde_json::json!({"event":"production_hosting_request_frame",
                     "actor":p.actor,"action":p.action,"request_index":p.id.index,
-                    "headers":message.headers.iter().map(|header| header.id).collect::<Vec<_>>(),
-                    "expects_reply":p.expects_reply,"body_bytes":message.body.len()})
+                    "headers":message.headers.records().map(|header| header.id().get()).collect::<Vec<_>>(),
+                    "expects_reply":message.headers.effective().expects_reply,"body_bytes":message.body().len()})
                 );
                 require(self.pending.len() < 32, "native pending observation budget")?;
                 require(
@@ -58,7 +97,7 @@ impl Trace {
                 )?;
                 if p.actor == 15 {
                     require(
-                        p.action.is_empty() && message.body.is_empty(),
+                        p.action.is_empty() && message.body().is_empty(),
                         "native lease request shape",
                     )?;
                 } else {
@@ -68,13 +107,13 @@ impl Trace {
                     )?;
                     self.actions.push(p.action.clone());
                     if p.action == "RegisterFabricRuntimeRequest" {
-                        let value: wire::RuntimeRequest = from_slice(&message.body)?;
+                        let value: wire::RuntimeRequest = from_slice(message.body())?;
                         self.runtime = Some(value.context.id);
                     }
                 }
             }
             Observation::Reply(message) => {
-                let p = message.properties()?;
+                let p = message.metadata()?;
                 if p.actor == 1 {
                     return Ok(());
                 }
@@ -84,7 +123,7 @@ impl Trace {
                     .ok_or_else(|| HostError("uncorrelated native application reply".into()))?;
                 require(p.action.is_empty(), "native body-only Hosting reply")?;
                 if actor == 15 {
-                    let ttl = from_slice::<wire::LeaseReply>(&message.body)?.ttl;
+                    let ttl = from_slice::<wire::LeaseReply>(message.body())?.ttl;
                     require(ttl > 0 && ttl <= 300_000_000, "native finite TTL")?;
                     self.polls += 1;
                     println!(
@@ -94,14 +133,14 @@ impl Trace {
                         "request_index":p.relates_to.index,"ttl_ticks":ttl})
                     );
                 } else if action == "StartRegisterApplicationHostRequest" {
-                    let value: wire::StartReply = from_slice(&message.body)?;
+                    let value: wire::StartReply = from_slice(message.body())?;
                     require(
                         value.error == 0 && value.lease_duration == 300_000_000,
                         "native Start result",
                     )?;
                 } else {
                     require(
-                        from_slice::<wire::ErrorReply>(&message.body)?.error == 0,
+                        from_slice::<wire::ErrorReply>(message.body())?.error == 0,
                         "native registration result",
                     )?;
                     if action == "UnregisterFabricRuntimeRequest" {
@@ -217,29 +256,8 @@ pub fn run_hosting_leases(options: Options) -> Result<RunReport> {
             let hosting = TcpStream::connect(address).await?;
             let (mut cr, mut cw) = client.into_split();
             let (mut hr, mut hw) = hosting.into_split();
-            let upstream = observed.clone();
-            let requests = async move {
-                while let Ok(message) = read_message(&mut cr).await {
-                    upstream
-                        .try_send(Observation::Request(message.clone()))
-                        .map_err(|_| HostError("native observer request overflow".into()))?;
-                    if write_message(&mut hw, &message).await.is_err() {
-                        break;
-                    }
-                }
-                Ok::<_, HostError>(())
-            };
-            let replies = async move {
-                while let Ok(message) = read_message(&mut hr).await {
-                    observed
-                        .try_send(Observation::Reply(message.clone()))
-                        .map_err(|_| HostError("native observer reply overflow".into()))?;
-                    if write_message(&mut cw, &message).await.is_err() {
-                        break;
-                    }
-                }
-                Ok::<_, HostError>(())
-            };
+            let requests = observe_frames(&mut cr, &mut hw, observed.clone(), Observation::Request);
+            let replies = observe_frames(&mut hr, &mut cw, observed, Observation::Reply);
             tokio::select! { result = requests => result, result = replies => result }
         });
         let mut trace = Trace {
@@ -307,8 +325,7 @@ pub fn run_hosting_leases(options: Options) -> Result<RunReport> {
         // Qualification observer and process cleanup cannot affect node authority:
         // revoke before joining any proxy/app cleanup and retain owned outcomes.
         lease.revoke();
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        let outcome = complete(outcome, stop_observer(&mut tasks).await);
         server
             .stop()
             .map_err(|e| HostError(format!("Hosting stop: {e:?}")))?;

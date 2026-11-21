@@ -25,6 +25,14 @@ baseline is `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`; repository baseline is
 Private protocols must be qualified against the actual app-side runtime;
 section 2 records the binary profile and measured outcomes separately from source research.
 
+**Transport retirement:** the current fixture uses public furpc Server/Peer and
+immutable messages. Furpc owns handshake validation and reply correlation; the
+fixture owns a bounded inbox, domain identity/lifecycle checks and joined
+serving-thread/socket cleanup. Reply submission hands data to the runner rather
+than proving a local write. Independent observers forward original bytes.
+This changed source has no fresh native qualification; the records below remain
+historical. The broader design's former `fube-transport` references are obsolete.
+
 **Standalone does not mean SDK/library-free applications, production RA
 equivalence, a full application deployer, or a security sandbox.** The Rust host
 should have no native SF dependency. A native-runtime app still needs its own
@@ -425,16 +433,15 @@ TestHost: scenario state, owned resources, deadlines and event journal
       +-- local report sink: load/fault/health outcomes
       +-- application probe: real RPC, separate from protocol decoding
       |
-generic Fabric IPC server over fube-transport primitives
+generic Fabric IPC server over public furpc APIs
       |
 real app process: native FabricRuntime + service implementation
 ```
 
 Keep protocol and scenario state in the library; a CLI must not be the only
-way tests observe an ordered event or own the child lifetime. Reuse serialization,
-frames, message/header primitives and bounded I/O from `fube-transport`.
-Its current connection driver is client-only and its reverse path is
-NamingGateway-notification-specific, so it is **not already the required server**.
+way tests observe an ordered event or own the child lifetime. Reuse `fubst`
+serialization and furpc messages, native headers and accepted-side serving.
+Do not expose or recreate furpc's private framing engine in the host.
 [Existing transport limitations](RustFabricRuntime.md#3-what-this-repository-can-actually-reuse).
 
 Implement the general server/IPC session without changing existing gateway

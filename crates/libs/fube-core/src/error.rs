@@ -119,8 +119,13 @@ impl Error {
             } => {
                 if let Some(error) = cause.downcast_ref::<Error>() {
                     error.needs_supervision()
-                } else if let Some(error) = cause.downcast_ref::<fube_transport::Error>() {
-                    matches!(error, fube_transport::Error::Io(error) if error.get_ref().is_some())
+                } else if let Some(error) = cause.downcast_ref::<furpc::Error>() {
+                    matches!(
+                        error,
+                        furpc::Error::Transport { .. }
+                            | furpc::Error::Handler { .. }
+                            | furpc::Error::Codec { .. }
+                    )
                 } else {
                     true
                 }
@@ -233,33 +238,6 @@ impl Error {
         };
         code as i32 as i64
     }
-    pub fn transport_fault(&self) -> fube_transport::Error {
-        match self {
-            Self::Io(error) => {
-                return fube_transport::Error::Io(match error.raw_os_error() {
-                    Some(code) => io::Error::from_raw_os_error(code),
-                    None => io::Error::new(error.kind(), error.to_string()),
-                })
-            }
-            Self::Protocol(message) => return fube_transport::Error::Protocol(message),
-            Self::InvalidInput(message) => return fube_transport::Error::InvalidInput(message),
-            Self::Timeout => return fube_transport::Error::Timeout,
-            Self::Closed => return fube_transport::Error::Closed,
-            Self::ResourceLimit(resource) => return fube_transport::Error::ResourceLimit(resource),
-            Self::Remote { code, message } => {
-                return fube_transport::Error::Remote {
-                    code: *code,
-                    message: message.clone(),
-                }
-            }
-            Self::Uncertain(cause) => return cause.transport_fault(),
-            _ => {}
-        }
-        fube_transport::Error::Remote {
-            code: self.native_result_code(),
-            message: self.to_string(),
-        }
-    }
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self::Classified {
             kind,
@@ -285,11 +263,7 @@ impl Error {
             Self::Timeout => ErrorKind::Timeout,
             Self::Closed => ErrorKind::ObjectClosed,
             Self::ResourceLimit(_) => ErrorKind::ResourceExhausted,
-            Self::Remote { code, .. } => match *code {
-                -2147017781 => ErrorKind::ReplicationQueueFull,
-                -2147017681 => ErrorKind::ReplicationOperationTooLarge,
-                _ => ErrorKind::Native,
-            },
+            Self::Remote { code, .. } => native_kind(*code),
             Self::Classified { kind, .. } => *kind,
             Self::Uncertain(cause) => cause.kind(),
             Self::RejectedRegistration(_) => ErrorKind::InvalidExecutionContext,
@@ -327,10 +301,8 @@ impl Error {
                     _ => {}
                 }
             }
-            if let Some(fube_transport::Error::Remote { code, .. }) =
-                cause.downcast_ref::<fube_transport::Error>()
-            {
-                return Some(*code);
+            if let Some(furpc::Error::RemoteFault(fault)) = cause.downcast_ref::<furpc::Error>() {
+                return Some(fault.code());
             }
             next = cause.source();
         }
@@ -391,23 +363,47 @@ impl From<io::Error> for Error {
         Self::Io(Arc::new(e))
     }
 }
-impl From<fube_transport::Error> for Error {
-    fn from(e: fube_transport::Error) -> Self {
-        use fube_transport::Error as T;
-        match e {
-            T::Io(e) => Self::Io(Arc::new(e)),
-            T::Protocol(s) => Self::Protocol(s),
-            T::InvalidInput(s) => Self::InvalidInput(s),
-            T::Timeout => Self::Timeout,
-            T::Closed => Self::Closed,
-            T::ResourceLimit(s) => Self::ResourceLimit(s),
-            T::Remote { code, message } => Self::Remote { code, message },
-        }
+fn native_kind(code: i64) -> ErrorKind {
+    match code {
+        -2147017781 => ErrorKind::ReplicationQueueFull,
+        -2147017681 => ErrorKind::ReplicationOperationTooLarge,
+        _ => ErrorKind::Native,
+    }
+}
+impl From<furpc::Error> for Error {
+    fn from(error: furpc::Error) -> Self {
+        use furpc::{CodecError, Error as T};
+        let kind = match &error {
+            T::InvalidInput(_) => ErrorKind::InvalidArgument,
+            T::Protocol(_) | T::Transport { .. } => ErrorKind::Transport,
+            T::ResourceLimit(_) => ErrorKind::ResourceExhausted,
+            T::Internal(_) => ErrorKind::InvalidState,
+            T::NativeHeader { source, .. } => match source {
+                fubst::Error::Protocol(_) => ErrorKind::Transport,
+                fubst::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
+                fubst::Error::ResourceLimit(_) => ErrorKind::ResourceExhausted,
+            },
+            T::UnsupportedSchema { .. } | T::Unsupported(_) => ErrorKind::Unsupported,
+            T::Timeout(_) => ErrorKind::Timeout,
+            T::Closed => ErrorKind::ObjectClosed,
+            T::Cancelled => ErrorKind::Canceled,
+            T::RemoteFault(fault) => native_kind(fault.code()),
+            T::Codec { source, .. } => match source {
+                CodecError::InvalidPayload { .. } => ErrorKind::InvalidArgument,
+                CodecError::ResourceLimit { .. } => ErrorKind::ResourceExhausted,
+            },
+            T::Handler { .. } => ErrorKind::Provider,
+        };
+        Self::with_cause(kind, error.to_string(), error)
     }
 }
 impl From<fubst::Error> for Error {
     fn from(error: fubst::Error) -> Self {
-        fube_transport::Error::from(error).into()
+        match error {
+            fubst::Error::Protocol(message) => Self::Protocol(message),
+            fubst::Error::InvalidInput(message) => Self::InvalidInput(message),
+            fubst::Error::ResourceLimit(resource) => Self::ResourceLimit(resource),
+        }
     }
 }
 impl fmt::Display for Error {

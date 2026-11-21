@@ -219,7 +219,7 @@ whether to retain or explicitly destroy its allocation afterward.
 ```sh
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets --all-features
-cargo test --locked -p fube-transport -p fube-client -p fube-test-host
+cargo test --locked -p furpc -p fube-client -p fube-test-host
 cargo test --locked -p fube-ra-store
 cargo test --locked -p fube-ra
 cargo test --locked -p fube-hosting
@@ -482,15 +482,16 @@ readiness or stateful cluster deployment is implied. Shared Hosting/process chan
 retain all seven separate release-native actions below on a fresh clean-source
 bundle; those are not combined production Rust RA evidence.
 
-Channel/session-boundary changes additionally reuse the transport library's
-first-positive-write, ordinary suffix/join, explicit whole-socket disposal,
-accepted IPC/adoption, late-observation and independent-budget regressions.
-Run `cargo test --locked -p fube-transport --lib -- --test-threads=1` and the
+Channel/session-boundary changes additionally reuse furpc's connection,
+deadline, drain and service regressions plus each consumer's owned-session
+cleanup tests. Legacy first-write/adoption contracts are not furpc guarantees.
+Run `cargo test --locked -p furpc -- --test-threads=1` and the
 Hosting `ipc_leases` target, keeping its real-TCP withdrawal threshold unchanged.
 For shared raw I/O, the data adapter's tests are `transport::tests::` (or its full
 library), not only the engine's separate `transport_tests::` source-grant tests.
-Accepted IPC policy lives in `native_ipc`; Hosting explicitly disposes withdrawn
-connections. No session role changes ordinary abort/close suffix ownership.
+Accepted IPC policy lives in Hosting's furpc adapter; Hosting explicitly disposes
+withdrawn connections. Consumer retirement can truncate committed output and is
+not a remote rollback or guaranteed suffix-flush barrier.
 Native-data reports retain every structured evidence field in compact JSON;
 the existing proof-input byte limit and full semantic/provenance validation
 still apply. Bounded console summaries are not substitutes for those reports.
@@ -578,7 +579,7 @@ This is separate from the native-backed `stateless-test-app` and standalone
 node-side test host. It deploys a normal ExeHost to real SF nodes:
 
 ```sh
-cargo test --locked -p fube-runtime -p rust-runtime-app -p fube-transport
+cargo test --locked -p fube-runtime -p rust-runtime-app -p furpc
 cargo clippy --locked -p fube-runtime -p rust-runtime-app --all-targets -- -D warnings
 cargo doc --locked -p fube-runtime --no-deps
 python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'

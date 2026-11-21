@@ -18,6 +18,7 @@ tokio.workspace = true
 
 [dev-dependencies]
 fubst.workspace = true
-fube-transport.workspace = true
+fube-rap-test-support.workspace = true
+serde.workspace = true
 libc = "0.2"
 uuid.workspace = true

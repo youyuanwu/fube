@@ -13,8 +13,8 @@ mod process;
 mod tests;
 mod wire;
 
-use fube_transport::message::{ListenInstance, Message};
 use fubst::serde::{from_slice, to_vec, EmptyObjectArray, Pointer};
+use furpc::{header, Body, Message};
 use serde_json::json;
 use std::{
     fmt,
@@ -58,8 +58,13 @@ impl From<std::io::Error> for HostError {
         Self(value.to_string())
     }
 }
-impl From<fube_transport::Error> for HostError {
-    fn from(value: fube_transport::Error) -> Self {
+impl From<furpc::Error> for HostError {
+    fn from(value: furpc::Error) -> Self {
+        Self(value.to_string())
+    }
+}
+impl From<furpc::BoxError> for HostError {
+    fn from(value: furpc::BoxError) -> Self {
         Self(value.to_string())
     }
 }
@@ -144,7 +149,6 @@ struct Registration {
     runtime: Option<wire::RuntimeContext>,
     registered_type: bool,
     lease_polls: usize,
-    handshake: bool,
     runtime_unregistered: bool,
 }
 
@@ -156,29 +160,45 @@ fn require(condition: bool, description: &str) -> Result<()> {
     }
 }
 
+fn decode<T: serde::de::DeserializeOwned>(message: &Message) -> Result<T> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(message.body().len())
+        .map_err(|_| HostError("test-host body decode allocation".into()))?;
+    for segment in message.body().segments() {
+        bytes.extend_from_slice(segment);
+    }
+    Ok(from_slice(&bytes)?)
+}
+
+fn action(message: &Message) -> Result<String> {
+    String::from_utf16(message.headers().effective().action())
+        .map_err(|_| HostError("IPC Action is not valid UTF-16".into()))
+}
+
 fn validate_ipc(message: &Message, host: &str, pid: u32) -> Result<()> {
     for id in [
-        fube_transport::message::ACTOR,
-        fube_transport::message::ACTION,
-        fube_transport::message::MESSAGE_ID,
-        fube_transport::message::RELATES_TO,
-        fube_transport::message::EXPECTS_REPLY,
+        header::ACTOR,
+        header::ACTION,
+        header::MESSAGE_ID,
+        header::RELATES_TO,
+        header::EXPECTS_REPLY,
     ] {
         require(
-            message.headers.iter().filter(|h| h.id == id).count() <= 1,
+            message.headers().records().filter(|h| h.id() == id).count() <= 1,
             "duplicate IPC routing header",
         )?;
     }
     let identities: Vec<_> = message
-        .headers
-        .iter()
-        .filter(|h| h.id == wire::IPC_HEADER)
+        .headers()
+        .records()
+        .filter(|h| h.id().get() == wire::IPC_HEADER)
         .collect();
     require(
         identities.len() == 1,
         "IPC message must have one identity header",
     )?;
-    let identity: wire::IpcIdentity = from_slice(&identities[0].value)?;
+    let identity: wire::IpcIdentity = from_slice(identities[0].value())?;
     require(
         identity.host == host && identity.pid == pid,
         "unowned IPC host/PID",
@@ -188,45 +208,32 @@ fn validate_ipc(message: &Message, host: &str, pid: u32) -> Result<()> {
 impl Registration {
     fn dispatch(
         &mut self,
-        message: Message,
-        session: &mut ipc::Session,
+        incoming: ipc::Incoming,
         host: &str,
         pid: u32,
         bundle: &deployment::Deployment,
     ) -> Result<()> {
-        let properties = message.properties()?;
+        let message = &incoming.message;
+        let properties = message.headers().effective();
+        let action = action(message)?;
         println!(
             "MSSF_HOST {}",
-            json!({"event":"incoming", "actor":properties.actor,
-            "action":properties.action, "body_bytes":message.body.len()})
+            json!({"event":"incoming", "actor":properties.actor.get(),
+            "action":action, "body_bytes":message.body().len()})
         );
-        if properties.actor == 1 && properties.action.is_empty() {
-            require(!self.handshake, "duplicate transport handshake")?;
-            let remote = ListenInstance::decode(&message.body)?;
-            require(
-                remote.address.is_empty() && remote.instance == 0,
-                "expected native client-only listen instance",
-            )?;
-            self.handshake = true;
-            return Ok(());
-        }
-        require(
-            self.handshake,
-            "application message before transport handshake",
-        )?;
         require(
             properties.relates_to == Default::default(),
             "unexpected correlated app reply",
         )?;
-        validate_ipc(&message, host, pid)?;
+        validate_ipc(message, host, pid)?;
         require(
             properties.expects_reply,
             "unsupported one-way application traffic",
         )?;
         let mut reply_action = None;
-        let body = match (properties.actor, properties.action.as_str()) {
+        let body = match (properties.actor.get(), action.as_str()) {
             (7, "StartRegisterApplicationHostRequest") => {
-                let request: wire::HostStart = from_slice(&message.body)?;
+                let request: wire::HostStart = decode(message)?;
                 require(
                     !self.started
                         && request.host == host
@@ -260,7 +267,7 @@ impl Registration {
                 })?
             }
             (7, "FinishRegisterApplicationHostRequest") => {
-                let request: wire::HostId = from_slice(&message.body)?;
+                let request: wire::HostId = decode(message)?;
                 require(
                     self.started && !self.finished && request.host == host,
                     "invalid host finish state",
@@ -269,7 +276,7 @@ impl Registration {
                 to_vec(&wire::ErrorReply { error: 0 })?
             }
             (9, "RegisterFabricRuntimeRequest") => {
-                let request: wire::RuntimeRegistration = from_slice(&message.body)?;
+                let request: wire::RuntimeRegistration = decode(message)?;
                 let context = &request.context;
                 require(
                     self.finished
@@ -294,7 +301,7 @@ impl Registration {
                 to_vec(&wire::ErrorReply { error: 0 })?
             }
             (9, "RegisterServiceTypeRequest") => {
-                let request: wire::TypeRegistration = from_slice(&message.body)?;
+                let request: wire::TypeRegistration = decode(message)?;
                 require(
                     self.runtime.as_ref() == Some(&request.context)
                         && !self.registered_type
@@ -308,7 +315,7 @@ impl Registration {
             }
             (15, "") => {
                 require(
-                    self.started && message.body.is_empty(),
+                    self.started && message.body().is_empty(),
                     "invalid lease request/state",
                 )?;
                 self.lease_polls += 1;
@@ -317,7 +324,7 @@ impl Registration {
                 })?
             }
             (9, "UnregisterFabricRuntimeRequest") => {
-                let request: wire::RuntimeId = from_slice(&message.body)?;
+                let request: wire::RuntimeId = decode(message)?;
                 require(
                     self.runtime
                         .as_ref()
@@ -330,7 +337,7 @@ impl Registration {
                 to_vec(&wire::ErrorReply { error: 0 })?
             }
             (7, "UnregisterApplicationHostRequest") => {
-                let request: wire::HostUnregister = from_slice(&message.body)?;
+                let request: wire::HostUnregister = decode(message)?;
                 require(
                     self.finished && request.host == host,
                     "unknown host unregister",
@@ -344,12 +351,16 @@ impl Registration {
             _ => {
                 return Err(HostError(format!(
                     "unsupported native actor/action {}/{}",
-                    properties.actor, properties.action
+                    properties.actor.get(),
+                    action
                 )))
             }
         };
-        session.reply(properties.id, reply_action, body)?;
-        Ok(())
+        let mut reply = Message::builder().body(Body::from_bytes(body)?);
+        if let Some(action) = reply_action {
+            reply = reply.append_header(header::action(action)?);
+        }
+        incoming.reply(reply.build()?)
     }
 }
 
@@ -369,26 +380,27 @@ fn pump(
     )?;
     match session.incoming.recv_timeout(Duration::from_millis(50)) {
         Ok(message) => {
-            let message = message?;
-            let properties = message.properties()?;
-            if properties.actor == 12 {
-                validate_ipc(&message, host, child.pid())?;
+            let incoming = message?;
+            let message = &incoming.message;
+            let properties = message.headers().effective();
+            if properties.actor.get() == 12 {
+                validate_ipc(message, host, child.pid())?;
                 require(
                     state.registered_type,
                     "lifecycle reply without active runtime/type",
                 )?;
                 let unit = unit.ok_or_else(|| HostError("unsolicited lifecycle traffic".into()))?;
-                unit.accept(&message)?;
+                unit.accept(message)?;
                 println!(
                     "MSSF_HOST {}",
-                    json!({"event":"semantic_reply", "action":properties.action,
+                    json!({"event":"semantic_reply", "action":action(message)?,
                     "partition":uuid::Uuid::from_bytes_le(unit.request.unit.id.id.0).to_string(),
                     "instance":unit.request.local.instance, "flags":unit.request.flags,
                     "endpoint":unit.request.local.service_endpoint})
                 );
                 Ok(())
             } else {
-                state.dispatch(message, session, host, child.pid(), bundle)
+                state.dispatch(incoming, host, child.pid(), bundle)
             }
         }
         Err(RecvTimeoutError::Timeout) => Ok(()),
@@ -470,7 +482,7 @@ fn observe(
     )
 }
 
-fn complete(outcome: Result<()>, cleanup: Result<serde_json::Value>) -> Result<serde_json::Value> {
+fn complete<T>(outcome: Result<()>, cleanup: Result<T>) -> Result<T> {
     match (outcome, cleanup) {
         (Err(error), Err(cleanup)) => Err(HostError(format!(
             "{error}; additionally cleanup failed: {cleanup}"
@@ -515,6 +527,7 @@ fn run_deployment(
     let mut runtime_id = String::new();
     let mut lifecycle_completed = false;
     let mut runtime_unregistered = false;
+    let mut session = None;
     let outcome = (|| -> Result<()> {
         let stream = loop {
             child.check_alive()?;
@@ -534,17 +547,12 @@ fn run_deployment(
                 Err(error) => return Err(error.into()),
             }
         };
-        let mut session = ipc::Session::new(stream, address)?;
+        session = Some(ipc::Session::new(stream, address)?);
+        let session = session.as_mut().expect("installed IPC owner");
         let mut state = Registration::default();
         loop {
             pump(
-                &mut state,
-                &mut session,
-                &mut child,
-                &host,
-                &bundle,
-                None,
-                deadline,
+                &mut state, session, &mut child, &host, &bundle, None, deadline,
             )?;
             if state.registered_type
                 && state.lease_polls > 0
@@ -588,11 +596,11 @@ fn run_deployment(
                 &bundle.initialization,
             );
             partition_id = Some(uuid::Uuid::from_bytes_le(unit.request.unit.id.id.0).to_string());
-            unit.open(&mut session)?;
+            unit.open(session)?;
             while unit.state != controller::UnitState::Open {
                 pump(
                     &mut state,
-                    &mut session,
+                    session,
                     &mut child,
                     &host,
                     &bundle,
@@ -617,11 +625,11 @@ fn run_deployment(
                 deadline,
             )?;
             child.check_alive()?;
-            unit.close(&mut session, scenario == Scenario::Abort)?;
+            unit.close(session, scenario == Scenario::Abort)?;
             while unit.state != controller::UnitState::Closed {
                 pump(
                     &mut state,
-                    &mut session,
+                    session,
                     &mut child,
                     &host,
                     &bundle,
@@ -659,13 +667,7 @@ fn run_deployment(
         child.command(b"shutdown\n")?;
         while state.runtime.is_some() {
             pump(
-                &mut state,
-                &mut session,
-                &mut child,
-                &host,
-                &bundle,
-                None,
-                deadline,
+                &mut state, session, &mut child, &host, &bundle, None, deadline,
             )?;
         }
         runtime_unregistered = state.runtime_unregistered;
@@ -673,6 +675,13 @@ fn run_deployment(
         child.wait_exit(deadline.min(Instant::now() + Duration::from_secs(5)))?;
         Ok(())
     })();
+    let outcome = complete(
+        outcome,
+        match session.as_mut() {
+            Some(session) => session.close(),
+            None => Ok(()),
+        },
+    );
     let cleanup = child.cleanup();
     for line in child.logs() {
         println!("MSSF_NATIVE {line}");

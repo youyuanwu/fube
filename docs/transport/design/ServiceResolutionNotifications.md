@@ -646,7 +646,8 @@ depend on adding a resolution cache or implementing the legacy long-poll API.
 `fube-client` synthetic wire/model-peer tests are retired. Keep non-wire model,
 input/version/state tests and independent report-validator negatives; use native
 owned scenarios for the protocol cases below rather than recreating fake peers.
-The furpc/fubst/fube-transport suites retain their own transport/codec coverage.
+The furpc/fubst suites retain their own transport/codec coverage; legacy-only
+transport models retired with fube-transport.
 The qualification checklist is:
 
 - Singleton, named, and signed-int64 keys; previous-result metadata; unchanged
