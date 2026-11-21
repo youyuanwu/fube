@@ -4,6 +4,7 @@ use crate::{Error, Result};
 #[path = "lifecycle_tests.rs"]
 pub(crate) mod tests;
 use crate::ipc_client::deadline_after;
+use fube_core::protocol::actor as actors;
 use fubst::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer};
 use std::{
     collections::{HashMap, HashSet},
@@ -551,7 +552,7 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::ipc_client::IpcMessage) 
         let authority = Arc::downgrade(&shared.authority);
         let result = reply
             .reply_checked(
-                12,
+                actors::RA,
                 Some("RAPQueryReply"),
                 to_vec(&query(&shared, &request)?)?,
                 deadline_after(Duration::from_secs(5))?,
@@ -680,7 +681,7 @@ async fn reply(
     let sent = shared
         .connection
         .send_one_way(
-            12,
+            actors::RA,
             action,
             to_vec(&body)?,
             deadline_after(Duration::from_secs(5))?,
@@ -1035,7 +1036,7 @@ async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<(
     let sent = shared
         .connection
         .send_one_way(
-            12,
+            actors::RA,
             "ProxyUpdateServiceDescriptionReply",
             to_vec(&response)?,
             deadline_after(Duration::from_secs(5))?,

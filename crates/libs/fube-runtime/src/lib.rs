@@ -139,6 +139,7 @@ use std::{
 };
 
 pub use error::{Error, ErrorKind, RejectedRegistrationInput, Result};
+use fube_core::protocol::actor as actors;
 use fubst::serde::{from_slice, to_vec};
 use ipc_client::deadline_after;
 use ipc_client::{IpcClient, IpcMessage};
@@ -308,7 +309,7 @@ impl Runtime {
             mpsc::channel::<(Monotonic, IpcMessage)>(MAX_INCOMING_COMMANDS);
         let (command_tx, incoming) = mpsc::channel::<IpcMessage>(MAX_INCOMING_COMMANDS);
         let handler = Arc::new(move |request: IpcMessage| match request.actor {
-            8 => {
+            actors::APPLICATION_HOST => {
                 if request.action != "UpdateCodePackageContextRequest"
                     || !ingress_ready.load(std::sync::atomic::Ordering::Acquire)
                 {
@@ -318,7 +319,7 @@ impl Runtime {
                     .try_send((request.received_at, request))
                     .map_err(|_| Error::ResourceLimit("runtime control ingress"))
             }
-            12 => command_tx
+            actors::RA => command_tx
                 .try_send(request)
                 .map_err(|_| Error::ResourceLimit("runtime ingress")),
             _ => Err(Error::Protocol("unsupported application IPC actor")),
@@ -456,7 +457,7 @@ impl Runtime {
                             control_authority.retire();
                             reply
                                 .reply(
-                                    8,
+                                    actors::APPLICATION_HOST,
                                     None,
                                     to_vec(&ErrorReply { error: 0 })?,
                                     deadline_after(Duration::from_millis(250))?,
@@ -487,7 +488,7 @@ impl Runtime {
                                 _ = control_connection.closed() => return Err(Error::Closed),
                             }
                             let authority = control_authority.clone();
-                            reply.reply_checked(8,None,to_vec(&ErrorReply {error:0})?,
+                            reply.reply_checked(actors::APPLICATION_HOST,None,to_vec(&ErrorReply {error:0})?,
                                 tokio::time::Instant::from_std(deadline),
                                 Arc::new(move || authority.check().is_ok())).await
                         }

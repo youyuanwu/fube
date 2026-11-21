@@ -6,6 +6,7 @@ use crate::{
     PartitionKind, RuntimeMetrics,
 };
 use crate::{Error, OpenMode, Result};
+use fube_core::protocol::actor as actors;
 use fubst::serde::{to_vec, Guid, ObjectArray, Pointer};
 use std::{
     collections::HashMap,
@@ -348,7 +349,7 @@ impl Registry {
             return correlation
                 .ok_or(Error::Protocol("RAPQuery requires correlation"))?
                 .reply_checked(
-                    12,
+                    actors::RA,
                     Some("RAPQueryReply"),
                     to_vec(&self.query(&request)?)?,
                     deadline_after(Duration::from_secs(5))?,
@@ -1171,7 +1172,7 @@ impl Registry {
         let sent = self
             .connection
             .send_one_way_checked(
-                12,
+                actors::RA,
                 "ProxyUpdateServiceDescriptionReply",
                 to_vec(&response)?,
                 deadline_after(Duration::from_secs(5))?,
@@ -1328,7 +1329,7 @@ impl Registry {
         let sent = self
             .connection
             .send_one_way_checked(
-                12,
+                actors::RA,
                 action,
                 to_vec(&reply)?,
                 deadline_after(Duration::from_secs(5))?,

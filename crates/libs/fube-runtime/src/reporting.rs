@@ -2,6 +2,7 @@
 use crate::ipc_client::{deadline_after, native_error, Check};
 use crate::{api::FaultType, lease::Authority, wire::*};
 use crate::{Error, Result};
+use fube_core::protocol::actor as actors;
 use fubst::serde::{to_vec, EmptyObjectArray, NativeEnum, ObjectArray, Pointer};
 use furpc::{HeaderId, HeaderRecord, Request};
 use std::{
@@ -312,7 +313,7 @@ impl Reporting {
             biased;
             _ = self.cancel.cancelled() => return Err(Error::Closed),
             result = self.connection.send_one_way_checked(
-                12,
+                actors::RA,
                 "RAPReportLoad",
                 body,
                 deadline_after(REPORT_TIMEOUT)?,
@@ -602,7 +603,7 @@ impl Reporting {
                     .map_err(|_| Error::ResourceLimit("runtime report admission"))?;
                 self.connection
                     .send_one_way_checked(
-                        12,
+                        actors::RA,
                         "RAReportFault",
                         body,
                         deadline_after(REPORT_TIMEOUT)?,

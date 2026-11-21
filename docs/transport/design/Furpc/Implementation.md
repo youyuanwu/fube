@@ -211,6 +211,9 @@ caller-selected actors/actions or reply types. Independent calls clone the stub,
 not its original-generation authority; IPC identity, remaining timeout and reply
 validation stay in the byte service. Cleanup exemptions and runtime retirement
 remain domain-owned.
+Runtime IPC uses shared native subsystem actor names from
+fube_core::protocol::actor; that catalog stays above furpc and grants no routing
+authority.
 Runtime owns host/PID headers, real loopback I/O validation, registration, lease,
 RAP semantics and domain retirement; furpc owns ingress correlation/reply writes.
 The legacy channel adapter, second reader and held-completion worker are retired.

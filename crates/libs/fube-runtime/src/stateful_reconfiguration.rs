@@ -1499,7 +1499,7 @@ impl Registry {
                 let fence_cancel = cancel.clone();
                 let sent = connection
                     .send_one_way_checked(
-                        12,
+                        actors::RA,
                         "ProxyReplicaEndpointUpdated",
                         body.clone(),
                         match deadline_after(Duration::from_secs(5)) {

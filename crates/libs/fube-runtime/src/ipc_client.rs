@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+use fube_core::protocol::actor as actors;
 use furpc::{
     header, ActorId, Body, BoxError, Channel, Connected, Endpoint, FubstCodec, HandlerLimits,
     HeaderId, HeaderRecord, Headers, IngressLimits, IngressResponse, Message, MessageId,
@@ -101,13 +102,13 @@ impl IpcResponse {
     }
 }
 
-struct Connection {
+struct SessionState {
     channel: Option<Channel>,
     error: Option<Error>,
 }
 
 struct Session {
-    connection: Mutex<Connection>,
+    state: Mutex<SessionState>,
     stopped: watch::Sender<Option<Error>>,
     ordinary: Semaphore,
     replies: Semaphore,
@@ -115,7 +116,7 @@ struct Session {
 
 impl Session {
     fn check(&self) -> Result<()> {
-        match &self.connection.lock().unwrap().error {
+        match &self.state.lock().unwrap().error {
             Some(error) => Err(error.clone()),
             None => Ok(()),
         }
@@ -123,12 +124,12 @@ impl Session {
 
     fn retire(&self, error: Error) {
         let channel = {
-            let mut connection = self.connection.lock().unwrap();
-            if connection.error.is_some() {
+            let mut state = self.state.lock().unwrap();
+            if state.error.is_some() {
                 return;
             }
-            connection.error = Some(error.clone());
-            connection.channel.take()
+            state.error = Some(error.clone());
+            state.channel.take()
         };
         self.ordinary.close();
         self.replies.close();
@@ -173,7 +174,7 @@ impl IpcClient {
         )
         .map_err(native_error)?;
         let session = Arc::new(Session {
-            connection: Mutex::new(Connection {
+            state: Mutex::new(SessionState {
                 channel: None,
                 error: None,
             }),
@@ -192,11 +193,16 @@ impl IpcClient {
         let mut router = Router::new();
         for action in ["InvalidateLeaseRequest", "UpdateCodePackageContextRequest"] {
             router = router
-                .request(actor(8)?, action, policy.clone(), service.clone())
+                .request(
+                    actor(actors::APPLICATION_HOST)?,
+                    action,
+                    policy.clone(),
+                    service.clone(),
+                )
                 .map_err(native_error)?;
         }
         router = router
-            .request(actor(12)?, "RAPQuery", policy, service.clone())
+            .request(actor(actors::RA)?, "RAPQuery", policy, service.clone())
             .map_err(native_error)?;
         for action in [
             "ReplicaOpen",
@@ -212,7 +218,7 @@ impl IpcClient {
         ] {
             router = router
                 .one_way(
-                    actor(12)?,
+                    actor(actors::RA)?,
                     action,
                     OneWayRouteOptions::new(incoming, IngressLimits::default()),
                     service.clone(),
@@ -244,11 +250,11 @@ impl IpcClient {
         .map_err(native_error)?;
         let peer = channel.peer(deadline).await.map_err(native_error)?;
         {
-            let mut connection = session.connection.lock().unwrap();
-            if let Some(error) = &connection.error {
+            let mut state = session.state.lock().unwrap();
+            if let Some(error) = &state.error {
                 return Err(error.clone());
             }
-            connection.channel = Some(channel);
+            state.channel = Some(channel);
         }
         let hosting = HostingClient::new(
             PeerService(peer.clone()),
@@ -394,14 +400,29 @@ pub(super) enum HostingMethod {
 impl HostingMethod {
     fn envelope(self) -> (i64, &'static str) {
         match self {
-            Self::StartHost => (7, "StartRegisterApplicationHostRequest"),
-            Self::FinishHost => (7, "FinishRegisterApplicationHostRequest"),
-            Self::RegisterRuntime => (9, "RegisterFabricRuntimeRequest"),
-            Self::RegisterType => (9, "RegisterServiceTypeRequest"),
-            Self::UnregisterRuntime => (9, "UnregisterFabricRuntimeRequest"),
-            Self::UnregisterHost => (7, "UnregisterApplicationHostRequest"),
-            Self::Lease => (15, ""),
-            Self::Health => (7, "ReportHealth"),
+            Self::StartHost => (
+                actors::APPLICATION_HOST_MANAGER,
+                "StartRegisterApplicationHostRequest",
+            ),
+            Self::FinishHost => (
+                actors::APPLICATION_HOST_MANAGER,
+                "FinishRegisterApplicationHostRequest",
+            ),
+            Self::RegisterRuntime => (
+                actors::FABRIC_RUNTIME_MANAGER,
+                "RegisterFabricRuntimeRequest",
+            ),
+            Self::RegisterType => (actors::FABRIC_RUNTIME_MANAGER, "RegisterServiceTypeRequest"),
+            Self::UnregisterRuntime => (
+                actors::FABRIC_RUNTIME_MANAGER,
+                "UnregisterFabricRuntimeRequest",
+            ),
+            Self::UnregisterHost => (
+                actors::APPLICATION_HOST_MANAGER,
+                "UnregisterApplicationHostRequest",
+            ),
+            Self::Lease => (actors::HOSTING, ""),
+            Self::Health => (actors::APPLICATION_HOST_MANAGER, "ReportHealth"),
         }
     }
 
@@ -617,24 +638,24 @@ fn outbound(headers: &Headers, request: bool) -> Result<()> {
     let action = action(headers)?;
     let allowed = if request {
         match actor {
-            7 => matches!(
+            actors::APPLICATION_HOST_MANAGER => matches!(
                 action.as_str(),
                 "StartRegisterApplicationHostRequest"
                     | "FinishRegisterApplicationHostRequest"
                     | "UnregisterApplicationHostRequest"
                     | "ReportHealth"
             ),
-            9 => matches!(
+            actors::FABRIC_RUNTIME_MANAGER => matches!(
                 action.as_str(),
                 "RegisterFabricRuntimeRequest"
                     | "UnregisterFabricRuntimeRequest"
                     | "RegisterServiceTypeRequest"
             ),
-            15 => action.is_empty(),
+            actors::HOSTING => action.is_empty(),
             _ => false,
         }
     } else {
-        actor == 12
+        actor == actors::RA
             && matches!(
                 action.as_str(),
                 "RAPReportLoad"
@@ -671,8 +692,8 @@ fn incoming(headers: &Headers, _: &Source) -> furpc::Result<()> {
 
 fn response(headers: &Headers, _: &Source) -> furpc::Result<()> {
     let common = headers.effective();
-    if (common.actor.get() == 8 && common.action().is_empty())
-        || (common.actor.get() == 12
+    if (common.actor.get() == actors::APPLICATION_HOST && common.action().is_empty())
+        || (common.actor.get() == actors::RA
             && common
                 .action()
                 .iter()
@@ -696,7 +717,10 @@ struct IpcService<T> {
 }
 
 fn check_hosting_reply(response: &Response<Body>) -> Result<()> {
-    if matches!(response.headers().effective().actor.get(), 25 | 27) {
+    if matches!(
+        response.headers().effective().actor.get(),
+        actors::FILE_SENDER | actors::FILE_TRANSFER_CLIENT
+    ) {
         return Err(Error::Protocol("unexpected runtime IPC reply envelope"));
     }
     Ok(())
@@ -704,7 +728,7 @@ fn check_hosting_reply(response: &Response<Body>) -> Result<()> {
 
 fn check_health_reply(response: &Response<Body>) -> Result<()> {
     let properties = response.headers().effective();
-    if properties.actor.get() != 16
+    if properties.actor.get() != actors::HM
         || !properties
             .action()
             .iter()

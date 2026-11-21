@@ -71,7 +71,7 @@ fn request(actor: i64, action: &str) -> Request<IdRequest> {
 fn client(response: Response<Body>, serving: Option<Check>) -> (HostingClient<Probe>, Captured) {
     let (service, captured) = service(response, false, Arc::new(|| true));
     let session = Arc::new(Session {
-        connection: Mutex::new(Connection {
+        state: Mutex::new(SessionState {
             channel: None,
             error: None,
         }),
