@@ -128,6 +128,7 @@ python3 -m tests.native_runtime.runner package --output build/native-runtime-bin
 python3 -m tests.native_runtime.runner bootstrap --prebuilt build/native-runtime-binaries
 python3 -m tests.native_runtime.runner close --prebuilt build/native-runtime-binaries
 python3 -m tests.native_runtime.runner abort --prebuilt build/native-runtime-binaries
+python3 -m tests.native_runtime.runner node-rap-lifecycle --prebuilt build/native-runtime-binaries
 ```
 
 Build/package once from clean source, then transfer the bundle preserving modes
@@ -145,13 +146,27 @@ to execute the host/app; no cluster/onebox is used.
 kills only its still-owned process group and reaps the direct child. That forced
 cleanup is expected and is separately reported, not described as graceful exit.
 
+`node-rap-lifecycle` is a separate clusterless profile using normal
+`fube_node::local::Node`/Hosting `Activation` construction and the same shared
+owned launcher with explicit native inputs. It drives native stateless
+Open/ping/Close, requires committed semantic completion and exact usage release,
+and checks endpoint refusal while the original host is still connected.
+Local frame-write receipts are recorded separately from semantic RA completion.
+The existing explicit Activation termination then forcibly retires its still-owned
+process/group and releases the activation root; this is not graceful runtime
+unregister, native FM/Federation readiness, or stateful-native qualification.
+The ordinary source package and diagnostics remain retained. Use a fresh
+diagnostics directory; a new receipt never replaces existing profile evidence.
+
 The final `MSSF_REPORT` JSON contains scenario, run root, native profile, host/PID,
 learned runtime/partition identity, finite poll count, actual native-library
 mappings from the app's `/proc/<pid>/maps`, endpoint, observed callback arguments
 and cleanup status. `MSSF_HOST` marks protocol/probe observations; `MSSF_NATIVE`
 contains bounded collected diagnostics. Failure is a nonzero command exit.
-Directories are retained for inspection and never recursively removed by the
-runner. Use a fresh `--root` if a failed download/extraction needs recovery.
+Original fixture directories are retained for inspection and never recursively
+removed by the runner. The local Node profile independently releases its owned
+activation root on successful explicit cleanup. Use a fresh `--root` if a failed
+download/extraction needs recovery.
 
 The minimal library API is `run(Options, Scenario) -> Result<RunReport>`, with
 `Scenario::{Bootstrap, Close, Abort}`. It executes one complete bounded scenario;

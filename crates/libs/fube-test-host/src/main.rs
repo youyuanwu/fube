@@ -32,6 +32,7 @@ enum Scenario {
     Abort,
     HostingLeases,
     HostingRegistration,
+    NodeRapLifecycle,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -118,6 +119,7 @@ fn main() {
     report(match args.scenario.expect("clap requires scenario") {
         Scenario::HostingLeases => fube_test_host::run_hosting_leases(options),
         Scenario::HostingRegistration => fube_test_host::run_hosting_registration(options),
+        Scenario::NodeRapLifecycle => fube_test_host::run_node_rap(options),
         Scenario::Bootstrap => fube_test_host::run(options, fube_test_host::Scenario::Bootstrap),
         Scenario::Close => fube_test_host::run(options, fube_test_host::Scenario::Close),
         Scenario::Abort => fube_test_host::run(options, fube_test_host::Scenario::Abort),
@@ -146,6 +148,7 @@ mod tests {
             "abort",
             "hosting-leases",
             "hosting-registration",
+            "node-rap-lifecycle",
         ] {
             let args = Arguments::try_parse_from([
                 "fube-test-host",

@@ -5,6 +5,7 @@
 //! and escaped descendants have no durable recovery guarantee.
 use crate::{ipc, wire, *};
 pub use fube_local_host::manifest::Profile;
+pub use fube_local_host::process::NativeRuntime;
 use fube_local_host::{
     deployment::Deployment,
     manifest::Package,
@@ -65,6 +66,9 @@ pub struct Options {
     /// Deployment-wide package version, independent of each physical package
     /// incarnation. None preserves the standalone generated-version profile.
     pub service_package_version_instance: Option<u64>,
+    /// Optional native SDK loader/configuration inputs for the same launcher.
+    /// None preserves Rust-only startup and propagated request deadlines.
+    pub native_runtime: Option<NativeRuntime>,
 }
 #[derive(Debug, Clone)]
 pub struct NodeContext {
@@ -85,6 +89,7 @@ impl Options {
             required: ipc::RequiredCapabilities::default(),
             node: None,
             service_package_version_instance: None,
+            native_runtime: None,
         }
     }
 }
@@ -414,6 +419,9 @@ impl Activation {
             )
             .env("Fabric_NodeIPOrFQDN", node_ip)
             .current_dir(&deployment.working_directory);
+        if let Some(native) = &self.options.native_runtime {
+            native.configure(&mut command, &deployment.root, &deployment.application)?;
+        }
         OwnedApp::start(&mut self.process, command)?;
         let pid = self.process.as_ref().expect("spawned child").pid();
         let prepared = server.admit_registration(
@@ -427,7 +435,11 @@ impl Activation {
                     activator: false,
                 },
                 code,
-                deadlines: ipc::RequestDeadlines::Propagated,
+                deadlines: if self.options.native_runtime.is_some() {
+                    ipc::RequestDeadlines::NativeClientLocal
+                } else {
+                    ipc::RequestDeadlines::Propagated
+                },
             },
             vec![package.service_type.clone()],
             self.identity.as_ref().expect("identity").host_id.as_str(),
@@ -834,6 +846,83 @@ impl Drop for Activation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_inputs_extend_the_same_owned_launch_without_changing_rust_defaults() {
+        for native in [false, true] {
+            let parent =
+                std::env::temp_dir().join(format!("hosting-launch-{}", uuid::Uuid::new_v4()));
+            let input = parent.join("input");
+            std::fs::create_dir_all(input.join("LocalService/Code")).unwrap();
+            std::fs::create_dir(parent.join("native")).unwrap();
+            std::fs::create_dir(parent.join("deps")).unwrap();
+            std::fs::write(
+                input.join("ApplicationManifest.xml"),
+                include_str!("../../../samples/hosting-local-app/pkg/ApplicationManifest.xml"),
+            )
+            .unwrap();
+            std::fs::write(
+                input.join("LocalService/ServiceManifest.xml"),
+                include_str!(
+                    "../../../samples/hosting-local-app/pkg/LocalService/ServiceManifest.xml"
+                ),
+            )
+            .unwrap();
+            std::fs::copy(
+                "/usr/bin/env",
+                input.join("LocalService/Code/hosting-local-app"),
+            )
+            .unwrap();
+            let mut options = Options::new(parent.clone());
+            if native {
+                options.native_runtime =
+                    Some(NativeRuntime::new(&parent.join("native"), &parent.join("deps")).unwrap());
+            }
+            let mut owner = Activation::new(options).unwrap();
+            owner
+                .start(
+                    &input,
+                    "fabric:/Local",
+                    &[("Arguments".into(), String::new())],
+                )
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while owner.observe_process_exit().unwrap().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "environment fixture did not exit"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let root = owner.root().unwrap().to_owned();
+            assert_eq!(root.join("FabricConfig.cfg").exists(), native);
+            assert!(owner.terminate().unwrap());
+            let logs = owner.logs();
+            assert!(logs.contains(&format!(
+                "Fabric_ApplicationHostId={}",
+                owner.identity().unwrap().host_id
+            )));
+            assert_eq!(
+                logs.iter().any(|line| line.starts_with("LD_LIBRARY_PATH=")),
+                native
+            );
+            if native {
+                assert!(logs.contains(&format!(
+                    "LD_LIBRARY_PATH={}:{}",
+                    parent.join("native").display(),
+                    parent.join("deps").display()
+                )));
+                assert!(logs.contains(&format!(
+                    "FabricCodePath={}",
+                    parent.join("native").display()
+                )));
+            }
+            assert!(owner.process_status().unwrap().reaped);
+            assert!(!root.exists());
+            std::fs::remove_dir_all(parent).unwrap();
+        }
+    }
+
     #[test]
     fn cached_registration_failure_does_not_hide_later_owned_process_exit() {
         let parent = std::env::temp_dir().join(format!(

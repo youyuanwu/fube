@@ -31,7 +31,7 @@ LIBRARY_HASHES = {
 RELATIVE_NATIVE = pathlib.Path("opt/microsoft/servicefabric/bin/Fabric/Fabric.Code")
 DIAGNOSTIC_LIMIT = 1024 * 1024
 SCENARIOS = ("bootstrap", "close", "abort", "manifest-close", "manifest-abort",
-             "hosting-leases", "hosting-registration")
+             "hosting-leases", "hosting-registration", "node-rap-lifecycle")
 BINARY_OUTPUTS = {
     "fube-test-host": "target/debug/fube-test-host",
     "stateless-test-app": "target/debug/stateless-test-app",
@@ -127,9 +127,9 @@ def save_diagnostics(directory, scenario, output):
     if scenario not in SCENARIOS:
         raise ValueError(f"unsupported diagnostic scenario: {scenario}")
     directory.mkdir(parents=True, exist_ok=True)
-    if scenario == "hosting-registration" and any(
+    if scenario in ("hosting-registration", "node-rap-lifecycle") and any(
             (directory / f"{scenario}.{suffix}").exists() for suffix in ("log", "json")):
-        raise ValueError("new registration receipts require a fresh diagnostics directory")
+        raise ValueError("new native receipts require a fresh diagnostics directory")
     (directory / f"{scenario}.log").write_bytes(output[-DIAGNOSTIC_LIMIT:])
     report = directory / f"{scenario}.json"
     report.unlink(missing_ok=True)

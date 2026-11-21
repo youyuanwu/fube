@@ -11,7 +11,6 @@ pub struct Deployment {
     pub deployment: PathBuf,
     pub work: PathBuf,
     pub code: PathBuf,
-    pub config: PathBuf,
     pub executable: PathBuf,
     pub arguments: Vec<String>,
     pub working_directory: PathBuf,
@@ -53,8 +52,6 @@ impl Deployment {
             &application.join("work"),
             &application.join("log"),
             &application.join("temp"),
-            &root.join("native-data"),
-            &root.join("native-objects"),
         ] {
             fs::create_dir_all(directory)?;
         }
@@ -84,11 +81,7 @@ impl Deployment {
         // The service binds port zero during Open and returns its actual address.
         fs::write(application.join("NativeService.Endpoints.txt"), "")?;
         fs::write(application.join("Application.Sids.txt"), "")?;
-        let config = root.join("FabricConfig.cfg");
-        fs::write(
-            &config,
-            format!("[Common]\nObjectFolder={}\n[Trace/Console]\nLevel=4\n[Trace/Etw]\nLevel=0\n[Trace/File]\nLevel=0\n", root.join("native-objects").display()),
-        )?;
+        fube_local_host::process::NativeRuntime::prepare_layout(&root)?;
         Ok(Self {
             executable: code.join("stateless-test-app"),
             arguments: Vec::new(),
@@ -102,21 +95,16 @@ impl Deployment {
             deployment,
             work,
             code,
-            config,
         })
     }
 
     pub fn from_manifest(parent: &Path, package: &Package) -> Result<Self> {
         let layout = fube_local_host::deployment::Deployment::from_manifest(parent, package)?;
-        let config = layout.root.join("FabricConfig.cfg");
         rollback_layout(
             &layout,
-            (|| {
-                fs::create_dir_all(layout.root.join("native-data"))?;
-                fs::create_dir_all(layout.root.join("native-objects"))?;
-                fs::write(&config, format!("[Common]\nObjectFolder={}\n[Trace/Console]\nLevel=4\n[Trace/Etw]\nLevel=0\n[Trace/File]\nLevel=0\n", layout.root.join("native-objects").display()))?;
-                Ok(())
-            })(),
+            fube_local_host::process::NativeRuntime::prepare_layout(&layout.root)
+                .map(|_| ())
+                .map_err(Into::into),
         )?;
         Ok(Self {
             executable: layout.executable,
@@ -135,7 +123,6 @@ impl Deployment {
             deployment: layout.deployment,
             work: layout.work,
             code: layout.code,
-            config,
             application: layout.application,
         })
     }
@@ -251,7 +238,7 @@ mod tests {
         ] {
             assert!(application.join(file).is_file());
         }
-        assert!(fs::read_to_string(&first.config)
+        assert!(fs::read_to_string(first.root.join("FabricConfig.cfg"))
             .unwrap()
             .contains("[Trace/Console]"));
         fs::remove_dir_all(first.root).unwrap();
