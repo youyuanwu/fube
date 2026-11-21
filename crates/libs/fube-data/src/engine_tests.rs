@@ -845,37 +845,37 @@ async fn all_sixty_four_copy_callbacks_allow_callback_free_terminal_retirement_a
     let template = descriptor(&p);
     let mut builds = JoinSet::new();
     let mut replicas = Vec::new();
-    for id in 2..=65 {
-        let destination = endpoint(&network, partition, id);
-        let mut replica = template.clone();
-        replica.replica_id = id;
-        replica.address = destination.to_string();
-        let owner = p.clone();
-        let cancellation = cancel();
-        let owned_cancellation = cancellation.clone();
-        let owned_replica = replica.clone();
-        builds.spawn(async move { owner.build_replica(owned_replica, owned_cancellation).await });
-        replicas.push((replica, destination));
-    }
     timeout(std::time::Duration::from_secs(5), async {
-        while stream.active.load(Ordering::Acquire) < 64 {
-            tokio::select! {
-                Some(packet) = incoming.recv_control() => {
-                    if let Body::StartCopy { target, .. } = packet.body {
-                        let destination = &replicas[(target - 2) as usize].1;
-                        let written = network.send_observed(Packet {
-                            from: destination.clone(),
-                            to: p.endpoint.actor,
-                            body: Body::Ack {
-                                received: 0, applied: 0, copy_received: 0, copy_applied: 0, error: 0,
-                            },
-                        }).unwrap();
-                        // Saturate provider callbacks, not the fixture's ACK queue.
-                        // This is local writing only; callback admission remains observed below.
-                        drop(timeout(std::time::Duration::from_secs(2), written).await.unwrap().unwrap());
-                    }
-                },
-                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+        for id in 2..=65 {
+            let destination = endpoint(&network, partition, id);
+            let mut replica = template.clone();
+            replica.replica_id = id;
+            replica.address = destination.to_string();
+            let owner = p.clone();
+            let cancellation = cancel();
+            let owned_cancellation = cancellation.clone();
+            let owned_replica = replica.clone();
+            builds.spawn(async move { owner.build_replica(owned_replica, owned_cancellation).await });
+            replicas.push((replica, destination));
+            // Pace setup handshakes without completing any pending provider callback.
+            while stream.active.load(Ordering::Acquire) < replicas.len() {
+                tokio::select! {
+                    Some(packet) = incoming.recv_control() => {
+                        if let Body::StartCopy { target, .. } = packet.body {
+                            let destination = &replicas[(target - 2) as usize].1;
+                            let written = network.send_observed(Packet {
+                                from: destination.clone(),
+                                to: p.endpoint.actor,
+                                body: Body::Ack {
+                                    received: 0, applied: 0, copy_received: 0, copy_applied: 0, error: 0,
+                                },
+                            }).unwrap();
+                            // Local writing is not evidence of provider callback admission.
+                            drop(timeout(std::time::Duration::from_secs(2), written).await.unwrap().unwrap());
+                        }
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                }
             }
         }
     })
