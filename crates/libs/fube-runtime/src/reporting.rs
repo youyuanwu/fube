@@ -1,9 +1,8 @@
 //! Application-runtime reports, not management-client operations.
-use crate::ipc_client::{deadline_after, native_error, Check};
+use crate::ipc_client::{deadline_after, native_error, Check, FaultReport, IpcClient};
 use crate::{api::FaultType, lease::Authority, wire::*};
 use crate::{Error, Result};
-use fube_core::protocol::actor as actors;
-use fubst::serde::{to_vec, EmptyObjectArray, NativeEnum, ObjectArray, Pointer};
+use fubst::serde::{EmptyObjectArray, NativeEnum, ObjectArray, Pointer};
 use furpc::{HeaderId, HeaderRecord, Request};
 use std::{
     collections::BTreeMap,
@@ -83,7 +82,7 @@ pub struct FaultDelivery {
 
 struct FaultStage {
     delivery: FaultDelivery,
-    body: Vec<u8>,
+    body: FaultReport,
     error: Option<Error>,
     current: Arc<AtomicBool>,
     complete: tokio::sync::watch::Sender<Option<Result<FaultDelivery>>>,
@@ -308,13 +307,10 @@ impl Reporting {
             }]),
             time: now,
         };
-        let body = to_vec(&body)?;
         tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return Err(Error::Closed),
-            result = self.connection.send_one_way_checked(
-                actors::RA,
-                "RAPReportLoad",
+            result = self.connection.report_load(
                 body,
                 deadline_after(REPORT_TIMEOUT)?,
                 self.fence(),
@@ -499,7 +495,7 @@ impl Reporting {
             } else {
                 let first = stage.is_none();
                 let request = self.request.lock().unwrap().clone();
-                let body = to_vec(&FaultBody {
+                let body = IpcClient::prepare_fault_report(FaultBody {
                     unit: request.unit,
                     local: request.local,
                     fault: native_fault,
@@ -602,13 +598,7 @@ impl Reporting {
                     .try_acquire()
                     .map_err(|_| Error::ResourceLimit("runtime report admission"))?;
                 self.connection
-                    .send_one_way_checked(
-                        actors::RA,
-                        "RAReportFault",
-                        body,
-                        deadline_after(REPORT_TIMEOUT)?,
-                        sent,
-                    )
+                    .report_fault(body, deadline_after(REPORT_TIMEOUT)?, sent)
                     .await
             };
             let result = tokio::select! {

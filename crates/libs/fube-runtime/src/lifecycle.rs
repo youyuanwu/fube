@@ -3,7 +3,7 @@ use crate::{Error, Result};
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 pub(crate) mod tests;
-use crate::ipc_client::deadline_after;
+use crate::ipc_client::{deadline_after, ProxyReplyKind};
 use fube_core::protocol::actor as actors;
 use fubst::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer};
 use std::{
@@ -640,7 +640,7 @@ fn native_error(error: &Error) -> i64 {
 }
 async fn reply(
     shared: &Shared,
-    action: &str,
+    kind: ProxyReplyKind,
     request: ProxyRequest,
     endpoint: String,
     error: Option<Error>,
@@ -648,10 +648,10 @@ async fn reply(
 ) -> Result<()> {
     // All successful endpoint publication, including cached duplicate Open,
     // crosses the same terminal-authority guard at the reply boundary.
-    if action == "ReplicaOpenReply" && error.is_none() {
+    if kind == ProxyReplyKind::ReplicaOpen && error.is_none() {
         shared.authority.check()?;
     }
-    let publish = action == "ReplicaOpenReply" && error.is_none();
+    let publish = kind == ProxyReplyKind::ReplicaOpen && error.is_none();
     let valid = shared
         .units
         .lock()
@@ -680,10 +680,9 @@ async fn reply(
     };
     let sent = shared
         .connection
-        .send_one_way(
-            actors::RA,
-            action,
-            to_vec(&body)?,
+        .send_replica_reply(
+            kind,
+            body,
             deadline_after(Duration::from_secs(5))?,
             Arc::new(move || {
                 authority
@@ -764,11 +763,21 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
     };
     if let Some(result) = duplicate {
         return match result {
-            Ok(endpoint) => reply(shared, "ReplicaOpenReply", request, endpoint, None, 1).await,
+            Ok(endpoint) => {
+                reply(
+                    shared,
+                    ProxyReplyKind::ReplicaOpen,
+                    request,
+                    endpoint,
+                    None,
+                    1,
+                )
+                .await
+            }
             Err(error) => {
                 reply(
                     shared,
-                    "ReplicaOpenReply",
+                    ProxyReplyKind::ReplicaOpen,
                     request,
                     String::new(),
                     Some(error),
@@ -932,7 +941,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
     shared.authority.check()?;
     reply(
         shared,
-        "ReplicaOpenReply",
+        ProxyReplyKind::ReplicaOpen,
         request,
         endpoint,
         outcome.err(),
@@ -999,7 +1008,15 @@ async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()
         .wait()
         .await?;
     // Native normalizes a graceful-close error only after abort/disposal.
-    reply(shared, "ReplicaCloseReply", request, String::new(), None, 2).await
+    reply(
+        shared,
+        ProxyReplyKind::ReplicaClose,
+        request,
+        String::new(),
+        None,
+        2,
+    )
+    .await
 }
 async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()> {
     let response = {
@@ -1035,10 +1052,8 @@ async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<(
     let frame_valid = valid.clone();
     let sent = shared
         .connection
-        .send_one_way(
-            actors::RA,
-            "ProxyUpdateServiceDescriptionReply",
-            to_vec(&response)?,
+        .send_service_update_reply(
+            response,
             deadline_after(Duration::from_secs(5))?,
             Arc::new(move || {
                 frame_valid.load(Ordering::Acquire)

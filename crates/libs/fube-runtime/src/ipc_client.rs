@@ -146,6 +146,46 @@ pub(crate) struct IpcClient {
     hosting: HostingClient<PeerService>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyReplyKind {
+    ReplicaOpen,
+    ReplicaClose,
+    UpdateConfiguration,
+    BuildIdleReplica,
+    RemoveIdleReplica,
+    GetStatus,
+    UpdateEpochAndGetStatus,
+    CancelCatchupReplicaSet,
+}
+
+impl ProxyReplyKind {
+    fn action(self) -> &'static str {
+        match self {
+            Self::ReplicaOpen => "ReplicaOpenReply",
+            Self::ReplicaClose => "ReplicaCloseReply",
+            Self::UpdateConfiguration => "UpdateConfigurationReply",
+            Self::BuildIdleReplica => "ReplicatorBuildIdleReplicaReply",
+            Self::RemoveIdleReplica => "ReplicatorRemoveIdleReplicaReply",
+            Self::GetStatus => "ReplicatorGetStatusReply",
+            Self::UpdateEpochAndGetStatus => "ReplicatorUpdateEpochAndGetStatusReply",
+            Self::CancelCatchupReplicaSet => "CancelCatchupReplicaSetReply",
+        }
+    }
+}
+
+/// Encoded once so domain-owned fault retries preserve the original payload bytes.
+#[derive(Clone)]
+pub(crate) struct FaultReport(Vec<u8>);
+
+/// Encoded once so endpoint retries retain the original advertised description.
+#[derive(Clone)]
+pub(crate) struct ReplicaEndpointUpdate(Vec<u8>);
+
+enum SendLane {
+    Replies,
+    Ordinary,
+}
+
 impl IpcClient {
     pub(crate) async fn connect(
         address: SocketAddr,
@@ -305,67 +345,163 @@ impl IpcClient {
         self.hosting.clone()
     }
 
-    pub(crate) async fn send_one_way(
+    pub(crate) async fn send_replica_reply(
         &self,
-        actor: i64,
-        action: &str,
-        body: Vec<u8>,
+        kind: ProxyReplyKind,
+        body: wire::ProxyReply,
         deadline: Instant,
         valid: Check,
     ) -> Result<()> {
         if !matches!(
-            action,
-            "ReplicaOpenReply" | "ReplicaCloseReply" | "ProxyUpdateServiceDescriptionReply"
+            kind,
+            ProxyReplyKind::ReplicaOpen | ProxyReplyKind::ReplicaClose
         ) {
             return Err(Error::InvalidInput("unauthorized runtime semantic reply"));
         }
-        let _slot = self
-            .session
-            .replies
-            .try_acquire()
-            .map_err(|_| Error::ResourceLimit("runtime semantic reply admission"))?;
-        self.send(actor, action, body, deadline, valid).await
+        self.send_encoded(
+            kind.action(),
+            encode(body)?,
+            deadline,
+            valid,
+            SendLane::Replies,
+        )
+        .await
     }
 
-    pub(crate) async fn send_one_way_checked(
+    pub(crate) async fn send_stateful_reply(
         &self,
-        actor: i64,
-        action: &str,
-        body: Vec<u8>,
+        kind: ProxyReplyKind,
+        body: wire::ProxyReply,
         deadline: Instant,
         valid: Check,
     ) -> Result<()> {
-        let _slot = self
-            .session
-            .ordinary
-            .try_acquire()
-            .map_err(|_| Error::ResourceLimit("runtime report output admission"))?;
-        self.send(actor, action, body, deadline, valid).await
+        self.send_encoded(
+            kind.action(),
+            encode(body)?,
+            deadline,
+            valid,
+            SendLane::Ordinary,
+        )
+        .await
     }
 
-    async fn send(
+    pub(crate) async fn send_service_update_reply(
         &self,
-        actor: i64,
-        action: &str,
-        body: Vec<u8>,
+        body: wire::UpdateServiceReply,
         deadline: Instant,
         valid: Check,
     ) -> Result<()> {
+        self.send_encoded(
+            "ProxyUpdateServiceDescriptionReply",
+            encode(body)?,
+            deadline,
+            valid,
+            SendLane::Replies,
+        )
+        .await
+    }
+
+    pub(crate) async fn send_stateful_service_update_reply(
+        &self,
+        body: wire::UpdateServiceReply,
+        deadline: Instant,
+        valid: Check,
+    ) -> Result<()> {
+        self.send_encoded(
+            "ProxyUpdateServiceDescriptionReply",
+            encode(body)?,
+            deadline,
+            valid,
+            SendLane::Ordinary,
+        )
+        .await
+    }
+
+    pub(crate) async fn report_load(
+        &self,
+        body: wire::LoadBody,
+        deadline: Instant,
+        valid: Check,
+    ) -> Result<()> {
+        self.send_encoded(
+            "RAPReportLoad",
+            encode(body)?,
+            deadline,
+            valid,
+            SendLane::Ordinary,
+        )
+        .await
+    }
+
+    pub(crate) fn prepare_fault_report(body: wire::FaultBody) -> Result<FaultReport> {
+        encode(body).map(FaultReport)
+    }
+
+    pub(crate) async fn report_fault(
+        &self,
+        report: FaultReport,
+        deadline: Instant,
+        valid: Check,
+    ) -> Result<()> {
+        self.send_encoded(
+            "RAReportFault",
+            report.0,
+            deadline,
+            valid,
+            SendLane::Ordinary,
+        )
+        .await
+    }
+
+    pub(crate) fn prepare_endpoint_update(
+        body: wire::ReplicaMessage,
+    ) -> Result<ReplicaEndpointUpdate> {
+        encode(body).map(ReplicaEndpointUpdate)
+    }
+
+    pub(crate) async fn notify_replica_endpoint_updated(
+        &self,
+        update: ReplicaEndpointUpdate,
+        deadline: Instant,
+        valid: Check,
+    ) -> Result<()> {
+        self.send_encoded(
+            "ProxyReplicaEndpointUpdated",
+            update.0,
+            deadline,
+            valid,
+            SendLane::Ordinary,
+        )
+        .await
+    }
+
+    async fn send_encoded(
+        &self,
+        action: &'static str,
+        body: Vec<u8>,
+        deadline: Instant,
+        valid: Check,
+        lane: SendLane,
+    ) -> Result<()> {
+        let (admission, exhausted) = match lane {
+            SendLane::Replies => (&self.session.replies, "runtime semantic reply admission"),
+            SendLane::Ordinary => (&self.session.ordinary, "runtime report output admission"),
+        };
+        let _slot = admission
+            .try_acquire()
+            .map_err(|_| Error::ResourceLimit(exhausted))?;
         self.session.check()?;
         if !valid() {
             return Err(Error::Closed);
         }
-        let mut message = envelope(actor, Some(action), body)?;
-        outbound(message.headers(), false)?;
-        let mut builder = Message::builder();
-        for header in message.headers().records() {
-            builder = builder.append_header(header.to_owned());
-        }
-        message = builder
+        let message = Message::builder()
+            .append_header(header::actor(actor(actors::RA)?).map_err(native_error)?)
+            .append_header(header::action(action).map_err(native_error)?)
             .append_header(self.identity.clone())
-            .body(message.into_body())
+            .body(Body::from_bytes(body).map_err(native_error)?)
             .build()
             .map_err(native_error)?;
+        outbound(message.headers(), false)?;
         let result = self
             .peer
             .send(message, deadline)
@@ -383,6 +519,10 @@ impl IpcClient {
         }
         Ok(())
     }
+}
+
+fn encode<T: Serialize>(value: T) -> Result<Vec<u8>> {
+    fubst::serde::to_vec(&value).map_err(Into::into)
 }
 
 #[derive(Clone, Copy)]

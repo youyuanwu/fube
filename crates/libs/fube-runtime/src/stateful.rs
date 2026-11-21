@@ -1,6 +1,6 @@
 //! Native stateful RAP lifecycle. Wire records are never the public API.
 use crate::extensions::EpochDomains;
-use crate::ipc_client::deadline_after;
+use crate::ipc_client::{deadline_after, ProxyReplyKind};
 use crate::{
     lease::Authority, stateful_api::*, wire as w, ActivationContextHandle, Cancellation,
     PartitionKind, RuntimeMetrics,
@@ -608,7 +608,7 @@ impl Registry {
         };
         if let Some(result) = existing {
             return self
-                .reply(unit, "ReplicaOpenReply", request, result.err(), 1)
+                .reply(unit, ProxyReplyKind::ReplicaOpen, request, result.err(), 1)
                 .await;
         }
         #[cfg(test)]
@@ -672,7 +672,13 @@ impl Registry {
         };
         let Some((valid, cancel, generation, snapshot)) = installation else {
             return self
-                .reply(unit, "ReplicaOpenReply", request, Some(Error::Closed), 1)
+                .reply(
+                    unit,
+                    ProxyReplyKind::ReplicaOpen,
+                    request,
+                    Some(Error::Closed),
+                    1,
+                )
                 .await;
         };
         self.execution.set_current_generation(generation);
@@ -899,7 +905,7 @@ impl Registry {
         final_release(disposed, self.execution.clone()).await?;
         self.reply(
             unit,
-            "ReplicaOpenReply",
+            ProxyReplyKind::ReplicaOpen,
             request,
             outcome.err(),
             if state_changed { 0 } else { 1 },
@@ -1118,7 +1124,7 @@ impl Registry {
         if let Some(native) = &unit.state.lock().unwrap().native {
             native.retire_ledger();
         }
-        self.reply(unit, "ReplicaCloseReply", request, None, 2)
+        self.reply(unit, ProxyReplyKind::ReplicaClose, request, None, 2)
             .await
     }
 
@@ -1171,10 +1177,8 @@ impl Registry {
         let frame_valid = valid.clone();
         let sent = self
             .connection
-            .send_one_way_checked(
-                actors::RA,
-                "ProxyUpdateServiceDescriptionReply",
-                to_vec(&response)?,
+            .send_stateful_service_update_reply(
+                response,
                 deadline_after(Duration::from_secs(5))?,
                 Arc::new(move || {
                     frame_valid.load(Ordering::Acquire)
@@ -1253,14 +1257,14 @@ impl Registry {
     async fn reply(
         &self,
         unit: &Unit,
-        action: &str,
+        kind: ProxyReplyKind,
         request: w::ProxyRequest,
         error: Option<Error>,
         api: i64,
     ) -> Result<()> {
         self.reply_guarded(
             unit,
-            action,
+            kind,
             request,
             error,
             ReplyControl {
@@ -1274,7 +1278,7 @@ impl Registry {
     async fn reply_guarded(
         &self,
         unit: &Unit,
-        action: &str,
+        kind: ProxyReplyKind,
         request: w::ProxyRequest,
         error: Option<Error>,
         control: ReplyControl,
@@ -1316,22 +1320,21 @@ impl Registry {
             },
         };
         let authority = Arc::downgrade(&self.authority);
-        let publish = action != "ReplicaCloseReply" && !failed;
+        let publish = kind != ProxyReplyKind::ReplicaClose && !failed;
         let frame_valid = valid.clone();
         let frame_revision = revision.clone();
         #[cfg(test)]
         if matches!(
-            action,
-            "ReplicatorBuildIdleReplicaReply" | "ReplicatorRemoveIdleReplicaReply"
+            kind,
+            ProxyReplyKind::BuildIdleReplica | ProxyReplyKind::RemoveIdleReplica
         ) {
             self.hold_remote_reply().await;
         }
         let sent = self
             .connection
-            .send_one_way_checked(
-                actors::RA,
-                action,
-                to_vec(&reply)?,
+            .send_stateful_reply(
+                kind,
+                reply,
                 deadline_after(Duration::from_secs(5))?,
                 Arc::new(move || {
                     authority

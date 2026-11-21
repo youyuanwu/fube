@@ -211,6 +211,12 @@ caller-selected actors/actions or reply types. Independent calls clone the stub,
 not its original-generation authority; IPC identity, remaining timeout and reply
 validation stay in the byte service. Cleanup exemptions and runtime retirement
 remain domain-owned.
+Outbound RAP methods accept typed proxy/service replies and load reports, with
+native action selection and serialization inside the client. Fault reports and
+endpoint updates use opaque typed prepared payloads to retain exact retry bytes.
+Stateless replies keep reserved admission; stateful replies and reports keep
+ordinary admission. These calls still await original-Peer local writes, not RPC
+responses or semantic acknowledgment.
 Runtime IPC uses shared native subsystem actor names from
 fube_core::protocol::actor; that catalog stays above furpc and grants no routing
 authority.
