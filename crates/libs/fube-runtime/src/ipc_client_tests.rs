@@ -233,22 +233,33 @@ async fn typed_health_method_retains_its_per_report_admission_fence() {
 
 #[tokio::test]
 async fn retired_or_foreign_requests_are_rejected_before_byte_submission() {
-    for (actor, valid) in [(9, false), (5, true)] {
+    for (actor, action, valid) in [
+        (9, "RegisterFabricRuntimeRequest", false),
+        (5, "RegisterFabricRuntimeRequest", true),
+        (7, "RegisterFabricRuntimeRequest", true),
+        (12, "RAPReportLoad", true),
+        (15, "RAPReportLoad", true),
+    ] {
         let response =
             Response::new(Body::from_bytes(to_vec(&ErrorReply { error: 0 }).unwrap()).unwrap());
         let (service, received) = service(response, false, Arc::new(move || valid));
         let error = RpcClient::new(service)
             .call(
-                request(actor, "RegisterFabricRuntimeRequest"),
+                request(actor, action),
                 FubstCodec::<IdRequest, ErrorReply>::default(),
                 deadline_after(Duration::from_secs(2)).unwrap(),
             )
             .await
             .unwrap_err();
-        assert!(matches!(
-            native_error(error),
-            Error::Closed | Error::InvalidInput(_)
-        ));
+        let error = native_error(error);
+        if valid {
+            assert!(matches!(
+                error,
+                Error::InvalidInput("unauthorized runtime IPC submission")
+            ));
+        } else {
+            assert!(matches!(error, Error::Closed));
+        }
         assert!(received.lock().unwrap().is_none());
     }
 }
@@ -298,6 +309,35 @@ fn rap_client() -> (RapClient<SendProbe>, Captured) {
         ),
         received,
     )
+}
+
+#[tokio::test]
+async fn rap_guard_rejects_foreign_profiles_without_submitting_or_retiring() {
+    for (actor, action) in [
+        (actors::FABRIC_RUNTIME_MANAGER, "RAPReportLoad"),
+        (actors::RA, "RegisterFabricRuntimeRequest"),
+        (actors::RA, "ReplicaOpen"),
+        (actors::RA, ""),
+    ] {
+        let (mut client, received) = rap_client();
+        let service = client.inner.get_mut();
+        let mut request = Request::new(Body::empty())
+            .append_header(header::actor(self::actor(actor).unwrap()).unwrap())
+            .unwrap()
+            .append_header(header::action(action).unwrap())
+            .unwrap();
+        request.set_deadline(deadline_after(Duration::from_secs(2)).unwrap());
+        std::future::poll_fn(|cx| service.poll_ready(cx))
+            .await
+            .unwrap();
+        let error = service.call(request).await.unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidInput("unauthorized runtime IPC submission")
+        ));
+        assert!(received.lock().unwrap().is_none());
+        service.session.check().unwrap();
+    }
 }
 
 fn proxy_reply() -> wire::ProxyReply {

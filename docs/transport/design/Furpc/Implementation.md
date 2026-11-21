@@ -261,6 +261,9 @@ fresh native message identities for each authorized attempt.
 Stateless replies keep reserved admission; stateful replies and reports keep
 ordinary admission. These calls still await original-Peer local writes, not RPC
 responses or semantic acknowledgment.
+HostingMethod and RapMethod provide the runtime-owned outbound envelopes used
+both by typed methods and the byte-service submission guard. Admission lanes
+remain selected by the typed operation, not inferred from shared native actions.
 RuntimeServer separately composes host-control, RAPQuery and RAP one-way routes
 in ipc_server.rs. Its bounded handoffs carry opaque, schema-typed invocations,
 not a domain-visible actor/action/Vec envelope or an optional response slot.

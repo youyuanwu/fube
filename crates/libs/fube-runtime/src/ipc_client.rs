@@ -182,6 +182,43 @@ impl ProxyReplyKind {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RapMethod {
+    ReplicaReply(ProxyReplyKind),
+    ServiceUpdateReply,
+    Load,
+    Fault,
+    EndpointUpdated,
+}
+
+impl RapMethod {
+    const ALL: [Self; 12] = [
+        Self::ReplicaReply(ProxyReplyKind::ReplicaOpen),
+        Self::ReplicaReply(ProxyReplyKind::ReplicaClose),
+        Self::ReplicaReply(ProxyReplyKind::UpdateConfiguration),
+        Self::ReplicaReply(ProxyReplyKind::BuildIdleReplica),
+        Self::ReplicaReply(ProxyReplyKind::RemoveIdleReplica),
+        Self::ReplicaReply(ProxyReplyKind::GetStatus),
+        Self::ReplicaReply(ProxyReplyKind::UpdateEpochAndGetStatus),
+        Self::ReplicaReply(ProxyReplyKind::CancelCatchupReplicaSet),
+        Self::ServiceUpdateReply,
+        Self::Load,
+        Self::Fault,
+        Self::EndpointUpdated,
+    ];
+
+    fn envelope(self) -> (i64, &'static str) {
+        let action = match self {
+            Self::ReplicaReply(kind) => kind.action(),
+            Self::ServiceUpdateReply => "ProxyUpdateServiceDescriptionReply",
+            Self::Load => "RAPReportLoad",
+            Self::Fault => "RAReportFault",
+            Self::EndpointUpdated => "ProxyReplicaEndpointUpdated",
+        };
+        (actors::RA, action)
+    }
+}
+
 /// Encoded once so domain-owned fault retries preserve the original payload bytes.
 #[derive(Clone)]
 pub(crate) struct FaultReport(Body);
@@ -322,7 +359,7 @@ where
             return Err(Error::InvalidInput("unauthorized runtime semantic reply"));
         }
         self.send(
-            kind.action(),
+            RapMethod::ReplicaReply(kind),
             body,
             FubstCodec::<_, ()>::default(),
             deadline,
@@ -340,7 +377,7 @@ where
         valid: Check,
     ) -> Result<()> {
         self.send(
-            kind.action(),
+            RapMethod::ReplicaReply(kind),
             body,
             FubstCodec::<_, ()>::default(),
             deadline,
@@ -357,7 +394,7 @@ where
         valid: Check,
     ) -> Result<()> {
         self.send(
-            "ProxyUpdateServiceDescriptionReply",
+            RapMethod::ServiceUpdateReply,
             body,
             FubstCodec::<_, ()>::default(),
             deadline,
@@ -374,7 +411,7 @@ where
         valid: Check,
     ) -> Result<()> {
         self.send(
-            "ProxyUpdateServiceDescriptionReply",
+            RapMethod::ServiceUpdateReply,
             body,
             FubstCodec::<_, ()>::default(),
             deadline,
@@ -391,7 +428,7 @@ where
         valid: Check,
     ) -> Result<()> {
         self.send(
-            "RAPReportLoad",
+            RapMethod::Load,
             body,
             FubstCodec::<_, ()>::default(),
             deadline,
@@ -408,7 +445,7 @@ where
         valid: Check,
     ) -> Result<()> {
         self.send(
-            "RAReportFault",
+            RapMethod::Fault,
             report.0,
             PreparedBodyCodec,
             deadline,
@@ -425,7 +462,7 @@ where
         valid: Check,
     ) -> Result<()> {
         self.send(
-            "ProxyReplicaEndpointUpdated",
+            RapMethod::EndpointUpdated,
             update.0,
             PreparedBodyCodec,
             deadline,
@@ -437,7 +474,7 @@ where
 
     async fn send<C>(
         &mut self,
-        action: &'static str,
+        method: RapMethod,
         body: C::Encode,
         codec: C,
         deadline: Instant,
@@ -449,8 +486,9 @@ where
         C::Encode: Send,
         C::Encoder: Send,
     {
+        let (actor, action) = method.envelope();
         let request = Request::new(body)
-            .append_header(header::actor(actor(actors::RA)?).map_err(native_error)?)
+            .append_header(header::actor(self::actor(actor)?).map_err(native_error)?)
             .map_err(native_error)?
             .append_header(header::action(action).map_err(native_error)?)
             .map_err(native_error)?;
@@ -593,6 +631,17 @@ pub(super) enum HostingMethod {
 }
 
 impl HostingMethod {
+    const ALL: [Self; 8] = [
+        Self::StartHost,
+        Self::FinishHost,
+        Self::RegisterRuntime,
+        Self::RegisterType,
+        Self::UnregisterRuntime,
+        Self::UnregisterHost,
+        Self::Lease,
+        Self::Health,
+    ];
+
     fn envelope(self) -> (i64, &'static str) {
         match self {
             Self::StartHost => (
@@ -820,40 +869,13 @@ fn outbound(headers: &Headers, request: bool) -> Result<()> {
     let actor = headers.effective().actor.get();
     let action = action(headers)?;
     let allowed = if request {
-        match actor {
-            actors::APPLICATION_HOST_MANAGER => matches!(
-                action.as_str(),
-                "StartRegisterApplicationHostRequest"
-                    | "FinishRegisterApplicationHostRequest"
-                    | "UnregisterApplicationHostRequest"
-                    | "ReportHealth"
-            ),
-            actors::FABRIC_RUNTIME_MANAGER => matches!(
-                action.as_str(),
-                "RegisterFabricRuntimeRequest"
-                    | "UnregisterFabricRuntimeRequest"
-                    | "RegisterServiceTypeRequest"
-            ),
-            actors::HOSTING => action.is_empty(),
-            _ => false,
-        }
+        HostingMethod::ALL
+            .iter()
+            .any(|method| method.envelope() == (actor, action.as_str()))
     } else {
-        actor == actors::RA
-            && matches!(
-                action.as_str(),
-                "RAPReportLoad"
-                    | "RAReportFault"
-                    | "ProxyReplicaEndpointUpdated"
-                    | "ReplicaOpenReply"
-                    | "ReplicaCloseReply"
-                    | "ProxyUpdateServiceDescriptionReply"
-                    | "UpdateConfigurationReply"
-                    | "ReplicatorBuildIdleReplicaReply"
-                    | "ReplicatorRemoveIdleReplicaReply"
-                    | "ReplicatorGetStatusReply"
-                    | "ReplicatorUpdateEpochAndGetStatusReply"
-                    | "CancelCatchupReplicaSetReply"
-            )
+        RapMethod::ALL
+            .iter()
+            .any(|method| method.envelope() == (actor, action.as_str()))
     };
     if allowed {
         Ok(())
