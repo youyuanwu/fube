@@ -4,8 +4,7 @@ use crate::{Error, Result};
 #[path = "lifecycle_tests.rs"]
 pub(crate) mod tests;
 use crate::ipc_client::{deadline_after, ProxyReplyKind};
-use fube_core::protocol::actor as actors;
-use fubst::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer};
+use fubst::serde::{from_slice, Guid, ObjectArray, Pointer};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -551,10 +550,8 @@ async fn dispatch(shared: Arc<Shared>, incoming: crate::ipc_client::IpcMessage) 
             .ok_or(Error::Protocol("RAPQuery requires correlation"))?;
         let authority = Arc::downgrade(&shared.authority);
         let result = reply
-            .reply_checked(
-                actors::RA,
-                Some("RAPQueryReply"),
-                to_vec(&query(&shared, &request)?)?,
+            .reply_query_checked(
+                query(&shared, &request)?,
                 deadline_after(Duration::from_secs(5))?,
                 Arc::new(move || {
                     authority

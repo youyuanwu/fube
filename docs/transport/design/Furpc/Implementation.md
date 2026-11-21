@@ -217,6 +217,14 @@ endpoint updates use opaque typed prepared payloads to retain exact retry bytes.
 Stateless replies keep reserved admission; stateful replies and reports keep
 ordinary admission. These calls still await original-Peer local writes, not RPC
 responses or semantic acknowledgment.
+Host-control and RAPQuery RPC handlers now hand off typed ErrorReply/QueryReply
+data instead of actor/action/serialized response bytes. The existing server::Rpc
+adapter uses the standard Fubst reply encoder; its request-body passthrough keeps
+parsing and validation on the serialized domain executor. Response headers are
+fixed by the admitted route, and the original runner still owns correlation and
+writing. Retained typed slots cannot publish after invocation retirement.
+Slot success means response-data handoff; later encode/write failures remain
+owned serving errors.
 Runtime IPC uses shared native subsystem actor names from
 fube_core::protocol::actor; that catalog stays above furpc and grants no routing
 authority.

@@ -140,7 +140,9 @@ use std::{
 
 pub use error::{Error, ErrorKind, RejectedRegistrationInput, Result};
 use fube_core::protocol::actor as actors;
-use fubst::serde::{from_slice, to_vec};
+use fubst::serde::from_slice;
+#[cfg(test)]
+use fubst::serde::to_vec;
 use ipc_client::deadline_after;
 use ipc_client::{IpcClient, IpcMessage};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -456,10 +458,8 @@ impl Runtime {
                         "InvalidateLeaseRequest" if request.body.is_empty() => {
                             control_authority.retire();
                             reply
-                                .reply(
-                                    actors::APPLICATION_HOST,
-                                    None,
-                                    to_vec(&ErrorReply { error: 0 })?,
+                                .reply_error(
+                                    ErrorReply { error: 0 },
                                     deadline_after(Duration::from_millis(250))?,
                                 )
                                 .await
@@ -488,7 +488,7 @@ impl Runtime {
                                 _ = control_connection.closed() => return Err(Error::Closed),
                             }
                             let authority = control_authority.clone();
-                            reply.reply_checked(actors::APPLICATION_HOST,None,to_vec(&ErrorReply {error:0})?,
+                            reply.reply_error_checked(ErrorReply {error:0},
                                 tokio::time::Instant::from_std(deadline),
                                 Arc::new(move || authority.check().is_ok())).await
                         }

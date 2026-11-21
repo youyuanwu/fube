@@ -6,8 +6,7 @@ use crate::{
     PartitionKind, RuntimeMetrics,
 };
 use crate::{Error, OpenMode, Result};
-use fube_core::protocol::actor as actors;
-use fubst::serde::{to_vec, Guid, ObjectArray, Pointer};
+use fubst::serde::{Guid, ObjectArray, Pointer};
 use std::{
     collections::HashMap,
     future::Future,
@@ -348,10 +347,8 @@ impl Registry {
             let authority = Arc::downgrade(&self.authority);
             return correlation
                 .ok_or(Error::Protocol("RAPQuery requires correlation"))?
-                .reply_checked(
-                    actors::RA,
-                    Some("RAPQueryReply"),
-                    to_vec(&self.query(&request)?)?,
+                .reply_query_checked(
+                    self.query(&request)?,
                     deadline_after(Duration::from_secs(5))?,
                     Arc::new(move || {
                         authority

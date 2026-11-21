@@ -15,10 +15,10 @@ use std::{
 
 use fube_core::protocol::actor as actors;
 use furpc::{
-    header, ActorId, Body, BoxError, Channel, Connected, Endpoint, FubstCodec, HandlerLimits,
-    HeaderId, HeaderRecord, Headers, IngressLimits, IngressResponse, Message, MessageId,
-    OneWayRouteOptions, Peer, Request, RequestPolicy, RequestRouteOptions, Response, Router,
-    RpcClient, Source, TransportIo,
+    header, ActorId, Body, BoxError, Channel, Codec, Connected, DecodeBuf, Decoder, Endpoint,
+    FubstCodec, HandlerLimits, HeaderId, HeaderRecord, Headers, IngressLimits, IngressResponse,
+    Message, MessageId, OneWayRouteOptions, Peer, Reply, Request, RequestPolicy,
+    RequestRouteOptions, Response, Router, RpcClient, Source, TransportIo,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
@@ -61,45 +61,82 @@ pub(crate) struct IpcMessage {
     pub reply: Option<IpcResponse>,
 }
 
-/// Domain reply data for the waiting ingress handler, never native reply authority.
-pub(crate) struct IpcResponse {
-    actor: i64,
-    response: oneshot::Sender<Message>,
+impl IpcMessage {
+    fn from_request(request: Request<Body>, reply: Option<IpcResponse>) -> Result<Self> {
+        let deadline = request
+            .context()
+            .ok_or(Error::Protocol("runtime ingress requires furpc context"))?
+            .deadline();
+        let properties = request.headers().effective();
+        let mut body = Vec::new();
+        body.try_reserve_exact(request.body().len())
+            .map_err(|_| Error::ResourceLimit("runtime ingress body"))?;
+        for segment in request.body().segments() {
+            body.extend_from_slice(segment);
+        }
+        Ok(Self {
+            actor: properties.actor.get(),
+            action: action(request.headers())?,
+            id: properties.message_id,
+            body,
+            received_at: std::time::Instant::now(),
+            deadline,
+            reply,
+        })
+    }
+}
+
+/// Typed response-data handoff, not proof of encoding or local writing.
+/// The original furpc runner retains native reply authority.
+pub(crate) enum IpcResponse {
+    HostControl(oneshot::Sender<wire::ErrorReply>),
+    Query(oneshot::Sender<wire::QueryReply>),
 }
 
 impl IpcResponse {
-    pub(crate) async fn reply(
-        self,
-        actor: i64,
-        action: Option<&str>,
-        body: Vec<u8>,
-        deadline: Instant,
-    ) -> Result<()> {
-        self.reply_checked(actor, action, body, deadline, Arc::new(|| true))
+    pub(crate) async fn reply_error(self, body: wire::ErrorReply, deadline: Instant) -> Result<()> {
+        self.reply_error_checked(body, deadline, Arc::new(|| true))
             .await
     }
 
-    pub(crate) async fn reply_checked(
+    pub(crate) async fn reply_error_checked(
         self,
-        actor: i64,
-        action: Option<&str>,
-        body: Vec<u8>,
+        body: wire::ErrorReply,
         deadline: Instant,
         valid: Check,
     ) -> Result<()> {
-        if self.actor != actor {
-            return Err(Error::InvalidInput("foreign IPC reply actor"));
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::Timeout);
-        }
-        if !valid() {
-            return Err(Error::Closed);
-        }
-        self.response
-            .send(envelope(actor, action, body)?)
-            .map_err(|_| Error::Closed)
+        let Self::HostControl(response) = self else {
+            return Err(Error::InvalidInput("foreign IPC reply type"));
+        };
+        respond(response, body, deadline, valid)
     }
+
+    pub(crate) async fn reply_query_checked(
+        self,
+        body: wire::QueryReply,
+        deadline: Instant,
+        valid: Check,
+    ) -> Result<()> {
+        let Self::Query(response) = self else {
+            return Err(Error::InvalidInput("foreign IPC reply type"));
+        };
+        respond(response, body, deadline, valid)
+    }
+}
+
+fn respond<T>(
+    response: oneshot::Sender<T>,
+    body: T,
+    deadline: Instant,
+    valid: Check,
+) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(Error::Timeout);
+    }
+    if !valid() {
+        return Err(Error::Closed);
+    }
+    response.send(body).map_err(|_| Error::Closed)
 }
 
 struct SessionState {
@@ -225,6 +262,15 @@ impl IpcClient {
         let service = Ingress {
             session: Arc::downgrade(&session),
             handoff,
+            kind: IngressKind::OneWay,
+        };
+        let control = Ingress {
+            kind: IngressKind::HostControl,
+            ..service.clone()
+        };
+        let query = Ingress {
+            kind: IngressKind::Query,
+            ..service.clone()
         };
         let policy = RequestRouteOptions::new(
             RequestPolicy::new(incoming, response),
@@ -237,12 +283,12 @@ impl IpcClient {
                     actor(actors::APPLICATION_HOST)?,
                     action,
                     policy.clone(),
-                    service.clone(),
+                    control.clone(),
                 )
                 .map_err(native_error)?;
         }
         router = router
-            .request(actor(actors::RA)?, "RAPQuery", policy, service.clone())
+            .request(actor(actors::RA)?, "RAPQuery", policy, query)
             .map_err(native_error)?;
         for action in [
             "ReplicaOpen",
@@ -756,18 +802,6 @@ fn actor(value: i64) -> Result<ActorId> {
     ActorId::new(value).map_err(native_error)
 }
 
-fn envelope(actor: i64, action: Option<&str>, body: Vec<u8>) -> Result<Message> {
-    let mut builder =
-        Message::builder().append_header(header::actor(self::actor(actor)?).map_err(native_error)?);
-    if let Some(action) = action.filter(|action| !action.is_empty()) {
-        builder = builder.append_header(header::action(action).map_err(native_error)?);
-    }
-    builder
-        .body(Body::from_bytes(body).map_err(native_error)?)
-        .build()
-        .map_err(native_error)
-}
-
 fn action(headers: &Headers) -> Result<String> {
     String::from_utf16(headers.effective().action())
         .map_err(|_| Error::Protocol("invalid runtime IPC action"))
@@ -972,6 +1006,86 @@ impl Service<Request<Body>> for PeerService {
 struct Ingress {
     session: Weak<Session>,
     handoff: Handoff,
+    kind: IngressKind,
+}
+
+#[derive(Clone, Copy)]
+enum IngressKind {
+    OneWay,
+    HostControl,
+    Query,
+}
+
+// Request parsing stays on the serialized domain executor; reply encoding uses Fubst.
+struct ReplyCodec<T>(FubstCodec<T, ()>);
+
+impl<T: Serialize> Codec for ReplyCodec<T> {
+    type Encode = T;
+    type Decode = Body;
+    type Encoder = <FubstCodec<T, ()> as Codec>::Encoder;
+    type Decoder = RequestBody;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        self.0.encoder()
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        RequestBody
+    }
+}
+
+struct RequestBody;
+
+impl Decoder for RequestBody {
+    type Item = Body;
+
+    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> std::result::Result<Body, furpc::CodecError> {
+        src.take(src.remaining())
+    }
+}
+
+struct ReplyHandler<T> {
+    handoff: Handoff,
+    response: fn(oneshot::Sender<T>) -> IpcResponse,
+    actor: i64,
+    action: Option<&'static str>,
+}
+
+impl<T: Send + 'static> Service<Request<Body>> for ReplyHandler<T> {
+    type Response = Reply<T>;
+    type Error = Error;
+    type Future = BoxFuture<Result<Self::Response>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let (send, receive) = oneshot::channel();
+        let prepared =
+            IpcMessage::from_request(request, Some((self.response)(send))).and_then(|message| {
+                let deadline = message.deadline;
+                (self.handoff)(message)?;
+                Ok(deadline)
+            });
+        let actor = self.actor;
+        let action = self.action;
+        Box::pin(async move {
+            let body = timeout_at(prepared?, receive)
+                .await
+                .map_err(|_| Error::Timeout)?
+                .map_err(|_| Error::Closed)?;
+            let mut reply = Reply::new(body)
+                .append_header(header::actor(self::actor(actor)?).map_err(native_error)?)
+                .map_err(native_error)?;
+            if let Some(action) = action {
+                reply = reply
+                    .append_header(header::action(action).map_err(native_error)?)
+                    .map_err(native_error)?;
+            }
+            Ok(reply)
+        })
+    }
 }
 
 impl Service<Request<Body>> for Ingress {
@@ -986,6 +1100,7 @@ impl Service<Request<Body>> for Ingress {
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         let session = self.session.clone();
         let handoff = self.handoff.clone();
+        let kind = self.kind;
         Box::pin(async move {
             let session = session.upgrade().ok_or(Error::Closed)?;
             let mut guard = IngressCall {
@@ -994,39 +1109,41 @@ impl Service<Request<Body>> for Ingress {
             };
             let result: Result<IngressResponse> = async {
                 session.check()?;
-                let context = request
-                    .context()
-                    .ok_or(Error::Protocol("runtime ingress requires furpc context"))?;
-                let deadline = context.deadline();
-                let properties = request.headers().effective();
-                let (send, receive) = oneshot::channel();
-                let expects_reply = properties.expects_reply;
-                let mut body = Vec::new();
-                body.try_reserve_exact(request.body().len())
-                    .map_err(|_| Error::ResourceLimit("runtime ingress body"))?;
-                for segment in request.body().segments() {
-                    body.extend_from_slice(segment);
-                }
-                handoff(IpcMessage {
-                    actor: properties.actor.get(),
-                    action: action(request.headers())?,
-                    id: properties.message_id,
-                    body,
-                    received_at: std::time::Instant::now(),
-                    deadline,
-                    reply: expects_reply.then_some(IpcResponse {
-                        actor: properties.actor.get(),
-                        response: send,
-                    }),
-                })?;
-                if expects_reply {
-                    let message = timeout_at(deadline, receive)
+                match kind {
+                    IngressKind::OneWay => {
+                        handoff(IpcMessage::from_request(request, None)?)?;
+                        Ok(IngressResponse::NoReply)
+                    }
+                    IngressKind::HostControl => {
+                        furpc::server::Rpc::new(ReplyCodec::<wire::ErrorReply>(
+                            FubstCodec::default(),
+                        ))
+                        .unary(
+                            ReplyHandler {
+                                handoff,
+                                response: IpcResponse::HostControl,
+                                actor: actors::APPLICATION_HOST,
+                                action: None,
+                            },
+                            request,
+                        )
                         .await
-                        .map_err(|_| Error::Timeout)?
-                        .map_err(|_| Error::Closed)?;
-                    Ok(IngressResponse::Reply(message))
-                } else {
-                    Ok(IngressResponse::NoReply)
+                        .map_err(native_error)
+                    }
+                    IngressKind::Query => furpc::server::Rpc::new(ReplyCodec::<wire::QueryReply>(
+                        FubstCodec::default(),
+                    ))
+                    .unary(
+                        ReplyHandler {
+                            handoff,
+                            response: IpcResponse::Query,
+                            actor: actors::RA,
+                            action: Some("RAPQueryReply"),
+                        },
+                        request,
+                    )
+                    .await
+                    .map_err(native_error),
                 }
             }
             .await;
@@ -1175,9 +1292,14 @@ pub(crate) fn native_error(error: furpc::Error) -> Error {
             {
                 return Error::from(*error);
             }
-            Error::with_cause(ErrorKind::Transport, format!("runtime IPC {phase}"), source)
+            let kind = if matches!(&source, furpc::CodecError::ResourceLimit { .. }) {
+                ErrorKind::ResourceExhausted
+            } else {
+                ErrorKind::Transport
+            };
+            Error::with_cause(kind, format!("runtime IPC {phase}"), source)
         }
-        error @ furpc::Error::Transport { .. } => {
+        error @ (furpc::Error::Transport { .. } | furpc::Error::Handler { .. }) => {
             if let Some(original) =
                 std::error::Error::source(&error).and_then(|source| source.downcast_ref::<Error>())
             {

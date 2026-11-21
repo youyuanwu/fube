@@ -4,6 +4,7 @@ mod reporting_tests;
 #[path = "stateful_tests.rs"]
 pub(crate) mod stateful_tests;
 use fube_rap_test_support::transport::{message, ModelPeer, Received as Message};
+use fubst::serde::to_vec;
 use furpc::MessageId;
 use tokio::{net::TcpListener, sync::Notify};
 
