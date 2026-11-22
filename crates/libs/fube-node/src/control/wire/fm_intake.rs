@@ -2,10 +2,24 @@
 use super::{action, bounded, err, peer_intake::Payload, predecode, Result};
 use fube_ra::protocol::{
     AddInstance, AddInstanceReply, AddPrimary, AddReplica, DeleteReplica, DoReconfiguration,
-    NodeActivateRequest, NodeDeactivateRequest, NodeUpdateServiceRequest, RemoveInstance,
-    ReplicaUp, ServiceTypeNotificationReply, ServiceTypeUpdateReply,
+    GenerationHeader, GenerationUpdate, NodeActivateRequest, NodeDeactivateRequest,
+    NodeUpdateServiceRequest, RemoveInstance, ReplicaUp, ServiceTypeNotificationReply,
+    ServiceTypeUpdateReply,
 };
-use furpc::Message;
+use furpc::{Error, Message};
+
+pub(in crate::control) fn decode_generation_update(
+    message: &Message,
+) -> Result<(GenerationUpdate, GenerationHeader)> {
+    bounded(message).map_err(err)?;
+    let (body, generation) = Payload::decode(message, "GenerationUpdate")?.into_parts()?;
+    if generation.for_fm_replica {
+        return Err(err(Error::Protocol(
+            "FMM generation control is not supported",
+        )));
+    }
+    Ok((body, generation))
+}
 
 pub(in crate::control) enum Incoming<'a> {
     ServiceTypeStatusReply {
@@ -364,5 +378,143 @@ mod tests {
             Incoming::decode(&unknown).err().unwrap(),
             super::super::predecode(&unknown).unwrap_err()
         );
+    }
+
+    #[test]
+    fn contiguous_and_segmented_generation_updates_match_native_factory_decoder() {
+        let original = generation_update_message(
+            &GenerationUpdate {
+                fm_service_epoch: Epoch {
+                    data_loss: 41,
+                    configuration: 52,
+                },
+            },
+            &generation(),
+        )
+        .unwrap();
+        let expected = fube_ra::protocol::decode_generation_update(&original).unwrap();
+        let bytes: Vec<_> = original.body().segments().flatten().copied().collect();
+        for split in [0, bytes.len() / 2] {
+            let body = Body::from_segments(vec![
+                Body::from_bytes(bytes[..split].to_vec()).unwrap(),
+                Body::from_bytes(bytes[split..].to_vec()).unwrap(),
+            ])
+            .unwrap();
+            let message = rebuild(&original, body, |_| true);
+            assert_eq!(super::decode_generation_update(&message).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn generation_update_intake_preserves_body_header_and_ordinary_fm_failure_order() {
+        fn previous_decode(message: &Message) -> Result<(GenerationUpdate, GenerationHeader)> {
+            super::super::predecode(message)?;
+            fube_ra::protocol::decode_generation_update(message).map_err(err)
+        }
+
+        let original =
+            generation_update_message(&GenerationUpdate::default(), &generation()).unwrap();
+        let generation_id = HeaderId::new(GENERATION_HEADER).unwrap();
+        let mut invalid = vec![];
+        for id in [
+            header::ACTOR,
+            header::ACTION,
+            header::HIGH_PRIORITY,
+            generation_id,
+        ] {
+            if id != header::ACTION {
+                invalid.push(rebuild(&original, original.body().clone(), |header| {
+                    header != id
+                }));
+            }
+            let mut builder = Message::builder().body(original.body().clone());
+            for header in original.headers().records() {
+                builder = builder.append_header(header.to_owned());
+            }
+            invalid.push(
+                builder
+                    .append_header(
+                        original
+                            .headers()
+                            .records()
+                            .find(|header| header.id() == id)
+                            .unwrap()
+                            .to_owned(),
+                    )
+                    .build()
+                    .unwrap(),
+            );
+        }
+        let mut fmm = generation();
+        fmm.for_fm_replica = true;
+        let mut builder = Message::builder().body(original.body().clone());
+        for header in original
+            .headers()
+            .records()
+            .filter(|header| header.id() != generation_id)
+        {
+            builder = builder.append_header(header.to_owned());
+        }
+        let fmm = builder
+            .append_header(fmm.header().unwrap())
+            .build()
+            .unwrap();
+        assert!(super::decode_generation_update(&fmm)
+            .unwrap_err()
+            .contains("FMM generation control is not supported"));
+        invalid.push(fmm);
+        for message in invalid {
+            assert_eq!(
+                super::decode_generation_update(&message).unwrap_err(),
+                previous_decode(&message).unwrap_err()
+            );
+            let malformed = rebuild(&message, Body::from_bytes(vec![0xff]).unwrap(), |_| true);
+            assert_eq!(
+                super::decode_generation_update(&malformed).unwrap_err(),
+                previous_decode(&malformed).unwrap_err()
+            );
+        }
+        let oversized = rebuild(
+            &original,
+            Body::from_bytes(vec![0xff; LIMIT + 1]).unwrap(),
+            |_| true,
+        );
+        let expected = previous_decode(&oversized).unwrap_err();
+        assert!(expected.contains("ResourceLimit"));
+        assert_eq!(
+            super::decode_generation_update(&oversized).unwrap_err(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_generation_updates_keep_original_link_generation_independent_delivery() {
+        let (node, fm) = super::super::tests::links(false).await;
+        let old = node.generation();
+        let mut current = old.clone();
+        current.number.generation += 3;
+        node.advance_generation(&current);
+        let mut future = current.clone();
+        future.number.generation += 4;
+        let body = GenerationUpdate::default();
+        for generation in [old, future] {
+            fm.send(generation_update_message(&body, &generation).unwrap())
+                .await
+                .unwrap();
+            let incoming = node
+                .receive_checked(super::super::deadline())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(incoming.reply.is_none());
+            assert_eq!(
+                super::decode_generation_update(&incoming.message).unwrap(),
+                (body.clone(), generation)
+            );
+            assert_eq!(node.generation(), current);
+            assert!(node.is_live());
+        }
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
     }
 }

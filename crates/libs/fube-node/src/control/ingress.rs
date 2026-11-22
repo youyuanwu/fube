@@ -493,8 +493,7 @@ impl Ingress {
                     .await?;
             }
             "GenerationUpdate" => {
-                wire::predecode(message)?;
-                let (body, header) = decode_generation_update(message).map_err(err)?;
+                let (body, header) = wire::decode_generation_update(message)?;
                 let outcome = match node.process_generation_update(&self.fm, &body, &header) {
                     Ok(outcome) => outcome,
                     Err(Error::Ra(ra::Failure::Capacity)) => {
@@ -506,8 +505,8 @@ impl Ingress {
                 };
                 match outcome {
                     ra::GenerationUpdateOutcome::Rejected(proposed) => {
-                        link.send(generation_update_reject_message(&proposed).map_err(err)?)
-                            .await?;
+                        let mut client = wire::FmClient::new(link)?;
+                        client.generation_update_reject(&proposed).await?;
                     }
                     ra::GenerationUpdateOutcome::UploadRequired => link.advance_generation(&header),
                     _ => {}

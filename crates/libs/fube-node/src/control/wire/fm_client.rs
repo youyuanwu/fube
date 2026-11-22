@@ -5,12 +5,12 @@ use fube_ra::{
     protocol::{
         add_instance_reply_message, add_primary_reply_message, add_replica_reply_message,
         change_configuration_message, delete_replica_reply_message,
-        do_reconfiguration_reply_message, node_activate_reply_message,
-        node_deactivate_reply_message, node_update_service_reply_message,
-        remove_instance_reply_message, remove_replica_reply_message,
-        replica_endpoint_updated_message, replica_up_message, report_load_message,
-        service_type_disabled_message, service_type_enabled_message,
-        service_type_notification_message, Owner,
+        do_reconfiguration_reply_message, generation_update_reject_message,
+        node_activate_reply_message, node_deactivate_reply_message,
+        node_update_service_reply_message, remove_instance_reply_message,
+        remove_replica_reply_message, replica_endpoint_updated_message, replica_up_message,
+        report_load_message, service_type_disabled_message, service_type_enabled_message,
+        service_type_notification_message, GenerationNumber, Owner,
     },
 };
 use furpc::{Error, Message, OneWayClient, PeerSendService, Request};
@@ -69,7 +69,19 @@ impl FmClient {
     }
 
     pub(in crate::control) async fn send(&mut self, effect: &Effect) -> Result<()> {
-        let message = self.link.seal(Self::prepare(effect)?)?;
+        self.send_message(Self::prepare(effect)?).await
+    }
+
+    pub(in crate::control) async fn generation_update_reject(
+        &mut self,
+        proposed: &GenerationNumber,
+    ) -> Result<()> {
+        self.send_message(generation_update_reject_message(proposed).map_err(err)?)
+            .await
+    }
+
+    async fn send_message(&mut self, message: Message) -> Result<()> {
+        let message = self.link.seal(message)?;
         if !self.link.is_live() {
             return Err(err(Error::Closed));
         }
@@ -363,6 +375,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_update_reject_keeps_native_one_way_body_and_original_link_authority() {
+        let (sender, receiver) = links(false).await;
+        let mut client = FmClient::new(&sender).unwrap();
+        let generation = sender.generation();
+        let proposed = GenerationNumber {
+            owner: [4; 16],
+            generation: generation.number.generation + 10,
+        };
+        client.generation_update_reject(&proposed).await.unwrap();
+        let incoming = receiver.receive_checked(deadline()).await.unwrap().unwrap();
+        let common = incoming.message.headers().effective();
+        assert_eq!(common.actor.get(), 11);
+        assert!(common
+            .action()
+            .iter()
+            .copied()
+            .eq("GenerationUpdateReject".encode_utf16()));
+        assert!(common.high_priority);
+        assert!(!common.expects_reply);
+        assert!(!common.uncorrelated_reply);
+        assert_eq!(common.relates_to, furpc::MessageId::default());
+        assert!(incoming.reply.is_none());
+        assert!(!incoming
+            .message
+            .headers()
+            .records()
+            .any(|header| header.id().get() == GENERATION_HEADER));
+        assert_eq!(
+            decode_generation_update_reject(&incoming.message).unwrap(),
+            proposed
+        );
+        assert_eq!(
+            incoming
+                .message
+                .body()
+                .segments()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            to_vec(&proposed).unwrap()
+        );
+        assert_eq!(sender.generation(), generation);
+        assert_eq!(receiver.generation(), generation);
+        sender.retire();
+        assert!(client
+            .generation_update_reject(&proposed)
+            .await
+            .unwrap_err()
+            .contains("Closed"));
+        sender.close().await.unwrap();
+        receiver.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn fm_client_does_not_bypass_original_relationship_role_policy() {
         for peer in [false, true] {
             let (node, remote) = links(peer).await;
@@ -370,6 +436,10 @@ mod tests {
             let mut client = FmClient::new(&sender).unwrap();
             assert!(client
                 .send(&Effect::NodeActivateReply(NodeActivateReply::default()))
+                .await
+                .is_err());
+            assert!(client
+                .generation_update_reject(&sender.generation().number)
                 .await
                 .is_err());
             assert!(sender.is_live());

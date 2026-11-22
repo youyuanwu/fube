@@ -906,6 +906,17 @@ Foreign/unknown actions retain their prior failure points. Cluster and standalon
 callers keep the original raw Incoming on blocked admission, and original-Link
 authority is unchanged. This adds no protocol or native qualification claim.
 
+Node-side GenerationUpdate intake now shares the same budgeted payload decoder
+and native header checks, decoding its body once before ordinary-FM validation.
+GenerationUpdateReject uses a typed FM-client method on the original Link, sharing
+the prepared-body send path. It remains an uncorrelated one-way FM action with
+the caller-selected proposal in its body and no GenerationHeader. Generation
+negotiation still bypasses ordinary receive-generation matching in Link;
+Ingress/Node retain proposal/readiness/staleness policy, Capacity-to-Retained
+admission, LFUM inventory/retry ownership and the original generation-advancement
+points. Local writing is not remote execution or generation/LFUM completion.
+No FM-side migration, reconnect, generic furpc API or native qualification is added.
+
 ## Node local RAP typed composition
 
 Node's local RA/RAP bridge now separates private client and reply-intake adapters

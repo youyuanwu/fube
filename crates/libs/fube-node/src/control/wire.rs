@@ -20,7 +20,7 @@ mod peer_intake;
 mod session;
 pub use bootstrap::LfumUploadRequest;
 pub(super) use fm_client::FmClient;
-pub(super) use fm_intake::Incoming as FmIncoming;
+pub(super) use fm_intake::{decode_generation_update, Incoming as FmIncoming};
 pub(super) use peer_client::PeerClient;
 pub(super) use peer_intake::Incoming as PeerIncoming;
 pub use session::{Failure, Incoming, Session};
