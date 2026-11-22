@@ -8,6 +8,7 @@ mod hosting_registration;
 mod ipc;
 mod lifecycle_wire;
 mod manifest;
+mod node_rap;
 mod process;
 #[cfg(test)]
 mod tests;
@@ -28,6 +29,7 @@ use std::{
 pub type Result<T> = std::result::Result<T, HostError>;
 pub use hosting_leases::run_hosting_leases;
 pub use hosting_registration::run_hosting_registration;
+pub use node_rap::run_node_rap;
 
 /// Validate the supported manifest subset without native libraries or app launch.
 pub fn validate_manifest(

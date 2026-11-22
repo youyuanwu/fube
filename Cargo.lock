@@ -391,6 +391,7 @@ dependencies = [
 name = "fube-hosting"
 version = "0.1.0"
 dependencies = [
+ "fube-core",
  "fube-local-host",
  "fube-ra",
  "fube-ra-store",

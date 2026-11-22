@@ -57,6 +57,24 @@ The existing run parent must resolve outside the source Code directory.
 Canonical path checks reject equal or nested paths, including symlink aliases,
 before reserving a root, and recheck separation before materialization.
 
+### Unified Rust and native startup
+
+The same `Activation::start` and owned-process supervisor launch either runtime.
+Rust startup remains the default. Native SDK applications explicitly supply
+`Options::native_runtime = Some(NativeRuntime::new(native_directory,
+dependency_directory)?)`; the paths are canonicalized, never discovered from
+inherited loader/cluster configuration. The shared native setup used by the
+standalone test host supplies loader paths and private native data/object/log
+configuration inside the owned run layout. It does not load SF libraries into
+Hosting or enable another placement/security/lifecycle profile.
+
+Native SDK requests use the existing `NativeClientLocal` deadline policy because
+they omit propagated per-request deadlines. Rust defaults remain `Propagated`;
+host/PID/package/session admission, finite authority, bounded decoding and task
+ownership remain identical. Native library/version/ABI compatibility is the
+caller's responsibility; the [native runner](../runtime/RustTestHost.md) checks
+the selected SF 11.8.121.4 pins before launching its fixture.
+
 ### Opt-in volatile stateful registration
 
 Set `Options::profile` to

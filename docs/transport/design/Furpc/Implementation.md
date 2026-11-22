@@ -365,6 +365,42 @@ Lifecycle authority checks surround submission/local completion. Hosting itself
 owns cancellation and joins its connection/send tasks on its dedicated executor,
 releasing the accepted socket before publishing disconnected state. Registration
 retirement still permits bounded original-path unregister exchanges.
+Hosting registration and lease RPCs now retain the original Request<Body>
+through domain admission and use server::Rpc for typed reply encoding and
+original-runner handoff. A private schema-selected codec retains Hosting's
+DTO allocation budget: it borrows contiguous input, copies only fragmented
+input and checks domain admission under the core lock before decoding.
+Mutation reacquires that lock and rechecks authority, cleanup-only admission,
+factory capability, deadlines and retained-result capacity. Reply DTOs stay
+inline and retain the existing pre-clone/pre-encoding allocation checks.
+Lease polls remain independent of core state locking once registration completes.
+Admitted semantic RAP replies still expose the existing owned byte API; their
+contiguous copy occurs only after domain identity/readiness/inbox admission.
+Lifecycle sends use OneWayClient<PeerSendService> on the captured original Peer,
+with shared prepared-body encoding and one method profile inventory for envelope
+construction and the outbound guard. Public action/body inputs, send admission,
+authority checks, retained local-write observations and joined shutdown remain
+Hosting policy. This refactor adds no furpc API and does not update the
+exact-source native Hosting qualification recorded below.
+Private HostingServer and LifecycleClient facades now separate protocol
+composition from the connection/domain executor. HostingServer owns actor-wide
+ingress bindings, method dispatch and opaque deferred RPC/semantic invocations;
+the executor inspects immutable headers for identity/replay admission before
+routing. Header-action errors retain their original validation point, while
+unsupported methods are rejected only after source attachment admission, so
+they retire that exact owner instead of being silently discarded or leaving a
+reusable admission. RPC invocations retain the original request/context and
+response handoff and reject a mismatched typed handler before decoding.
+Semantic completion remains bounded enqueue, not execution or an ACK.
+LifecycleClient owns outbound profiles, opaque prepared requests and byte
+submission on the original Peer. Node retains RA payload/effect interpretation;
+Hosting retains send admission, authority checks and joined task ownership.
+The transport adapter owns only accepted socket validation, ready observation
+and inline furpc serving. No new generic layer, public Hosting API, retry/reconnection
+policy or native qualification is introduced.
+Hosting's wire Actor identifiers, including Empty replies, reuse the pinned
+fube-core::protocol::actor definitions through a direct core dependency.
+The numeric wire values are unchanged; SF identifiers remain outside furpc.
 The Hosting and owned-app sample direct legacy dependency edges are retired;
 RA/node control uses the separate migrated adapter below. Offline managed
 furpc-client and independent adversarial socket fixtures cover the accepted path;
@@ -391,6 +427,60 @@ Ignored evidence is under `build/furpc-hosting-proof/`: `binaries-0191bcc/`,
 This qualifies the selected accepted clear-TCP bootstrap/registration paths, not
 native deployed/stateful/reporting lifecycle, failed-write/revocation races,
 TLS/claims, or full original native node-handler parity.
+
+**Fresh typed-service qualification (2026-11-21):** both `hosting-leases` and
+`hosting-registration` passed against clean source
+`c2776ac883186b2ad2cb99f21982e9c063a82d6a`, tree
+`d396347aa151a3f112298611dd288d53b2e5502d`. A fresh version-1 standalone bundle
+contains the rebuilt test-host, native SDK application and manifest-acceptance
+executables; the two selected profiles execute the test-host and application.
+The qualified source includes typed Hosting RPC serving, the private
+HostingServer/LifecycleClient composition and shared native Actor definitions.
+These clusterless runs used the unchanged private SF 11.8.121.4 Runtime/Common
+pins and compatible cached ABI inputs; no node service was installed or used.
+
+Each profile independently observed two correlated positive lease replies,
+with TTLs 299,999,991 and 299,999,992 ticks, actual runtime unregister,
+graceful exit0, direct-child reap and absent owned process groups.
+Independent observation checked four live process identities across the runs:
+each host executable matched its bundle hash, and each actual application's
+`/proc/<pid>/exe` matched the bundled native SDK producer. Both applications
+mapped the pinned Runtime/Common libraries at their verified private paths.
+Post-run verification checked unchanged native/ABI inputs, bundle bytes/modes,
+actual wire actions and receipts, copied application bytes and process absence.
+
+Registration additionally observed the actual native stateless factory,
+same-core equal-version lookup and disabled-health bookkeeping. Registered,
+RuntimeClosed and HostClosed were completed owned local decisions with
+`IgnoredNotReady`, not FM/RA deployment acknowledgments. No native host-unregister
+frame was observed; HostClosed came from connection-loss cleanup.
+One gated package obligation remained owned, not treated as release.
+The qualification launcher reaped its native child; this is not evidence of
+production Hosting package/process residency release.
+
+Ignored evidence is retained at `build/furpc-hosting-proof/c2776ac/`, a
+convenience link to the session's physical evidence directory; the runner used
+the physical bundle path because it rejects symlink parents. It contains
+`preflight.json`, `bundle/`, `receipts/`, per-profile live-process observations,
+`verification.json`, build/console logs and retained owned run directories.
+Both native profiles and all owned process groups were stopped; the unchanged
+retained onebox remained running with all five nodes Up.
+
+| Evidence | SHA256 |
+| --- | --- |
+| Bundle manifest | `6e1eebdde73d92ac66683e2ab63faed3c008494ce153514fe92cdd9b9d61f326` |
+| Hosting leases receipt | `4799f18eb736541fecc90e9ce208a13046d457ea09030e5500ee1861a8602709` |
+| Hosting registration receipt | `7e3e5c75cdb704a923775b85aaaa195d98feb35570102566a1aaa8db240f108f` |
+| Independent verification | `d5acfeaadce8e04261543a4224e73cb8e391c5b1767fac1974eb59829d882476` |
+| Test-host executable | `9156dfae8c75ca92d40b735e6097a15611590920d1820bc46ceb702bcb45762c` |
+| Native SDK application | `9194c42a048da99ec5f5e47d4cdcc6049fb79f39bab2c1cc50697c7fdc6cd055` |
+
+This receipt remains bound to `c2776ac`, not subsequent documentation changes.
+The original five standalone fixture profiles were not rerun; their earlier
+receipts remain historical. Native outbound RAP/lifecycle, stateful/reporting
+behavior, failed-write/revocation races, TLS/claims and broader native node
+parity remain unqualified by these two selected profiles. No generic furpc
+physical-retirement/join guarantee is introduced or qualified.
 
 The public facade supports managed byte RPC by default and explicitly selected
 `ConnectionOptions::raw_only()` for caller-owned one-way IDs. Endpoint owns inert URI,
@@ -748,6 +838,84 @@ Federation interoperability. No fresh native-stream producer/consumer bundle or
 native FM/RA run was executed. The earlier exact-source `154b4f1` native-data
 receipt does not qualify this changed RA/node code. TLS and broader routing stay
 unqualified.
+
+## Node local RAP typed composition
+
+Node's local RA/RAP bridge now separates private client and reply-intake adapters
+from its domain executor. RapClient prepares the eight supported RA effects using
+the existing native ProxyRequest schemas and 64 KiB body bound. Opaque prepared
+requests keep action/payload pairing inside the adapter; submission uses the
+original Hosting lease and its existing typed furpc one-way service. It adds no
+reconnection, retry, serving task or new public Hosting/furpc API.
+
+Reply intake checks exact opaque session provenance before action parsing or
+budgeted decoding, then selects typed load, service-description, endpoint and
+proxy completions. Proxy remote-count/flag checks retain the native method
+profiles; unsupported proxy methods still fail at the original state/runtime
+admission point. Node retains bounded inbox/command admission, raw held/rejected
+inputs, registration/runtime checks, RA execution, disposal lineage and ownership.
+Local frame-write completion remains separate from semantic RA completion.
+Rejected input cannot block subsequent HostClosed and exact-usage cleanup.
+
+The 45 selected Node unit/control/bridge and local-app lifecycle cases passed,
+including original-session rejection, stale/failed reply admission and command
+receipt backpressure before reply intake. Strict default-library and
+all-target/all-feature Node Clippy and workspace formatting passed. These are
+offline and owned Rust-process observations, not fresh native outbound RAP,
+FM/Federation, stateful-native or physical-retirement qualification. Earlier
+exact-source native receipts remain unchanged.
+
+**Fresh local Node/native RAP qualification (2026-11-21):**
+`node-rap-lifecycle` passed at clean source
+`116fa2dd5c48fc3d901a2ffa13bb0252bc721f11`, tree
+`e92f67a9c75a79e7af6ee2d95629b404b7ec5a8d`. A new version-1 bundle rebuilt the
+test host and copied the selected native SDK application and manifest example.
+The actual producer used normal local Node/Activation construction with explicit
+shared native loader inputs and the existing native-local deadline policy.
+Default Rust startup and propagated deadlines remain unchanged. The selected
+SF 11.8.121.4 Runtime/Common and cached ABI bytes were verified before/after;
+no onebox, native node service or cluster operation was used.
+
+The native SDK registered its stateless factory and created/opened/closed one
+actual singleton instance. All three callbacks matched partition
+`42b8b722-7423-4bdd-b96f-b7a86e6902f4`; the original native app PID was `1711189`.
+Open produced committed RA `Ready`, one original runtime/acquisition and one
+local-write receipt. An independent application TCP connection received
+`native-stateless-pong`. Close produced committed `Closed`, a separate local
+write receipt, applied native semantic Close command/RA operation `5`, and one
+exact release of lookup/acquisition `1`. The retained disposal lineage matched
+the original host/runtime. New endpoint connections were refused while the
+original Hosting session remained connected; service Close did not kill the host.
+
+Explicit Activation termination then forcibly retired the still-owned native
+process/group, drained upstream work, joined the RA/store owners and released
+the activation root. This is selected explicit local cleanup, not graceful
+runtime unregister or a general residency/unused-scan/deactivation guarantee.
+Independent `/proc` observation checked both live executable identities/hashes,
+the native application's actual pinned Runtime/Common mappings and subsequent
+absence of both owned identities/groups. The ordinary input package, bundle,
+bounded logs, receipts, preflight and verification remain retained at ignored
+`build/furpc-node-rap-proof/116fa2d/`, a convenience link to the physical session
+evidence directory. Packaging/execution used the physical path, not the link.
+
+| Evidence | SHA256 |
+| --- | --- |
+| Bundle manifest | `beb0ad12606670174aab3bf8c952becf9c17fc05f66ae7e298c5d71df5b71344` |
+| Native Node/RAP receipt | `7d540f0ced375a502466fa96106f0def1499c26d9a9ac431708c2cdb4b9d3e56` |
+| Independent verification | `12aff6db727f5be344033b508cd36370236574a87fe6080e7346466e2314b972` |
+| Live process observations | `b42d2ee427a25ce26e272c4b57d9a74fd3fdef522c24f82b4a79a93fb5a79e05` |
+| Test-host executable | `98a21fd7400fe394be76bd36e405162dcbb4ef3cf11bfaedec610a22c3ac01cf` |
+| Native SDK application | `9194c42a048da99ec5f5e47d4cdcc6049fb79f39bab2c1cc50697c7fdc6cd055` |
+
+The receipt stays pinned to `116fa2d`, not later documentation changes.
+This run qualifies selected stateless native Open/Close through the typed local
+Node RAP adapters and shared launcher, not stateful/native replication, other
+RAP methods, fault/revocation/retry races, FM/Federation/deployed readiness or TLS.
+It has no independent raw-frame capture or lease-poll counting and observes no
+graceful native host/runtime unregister. The original five standalone fixtures
+and earlier Hosting/native-data/runtime receipts were not rerun or relabeled.
+The 147 selected coupled Rust cases and 20 native-runner model cases passed;
+strict affected default/all-feature checks and workspace formatting passed.
 
 ## Final legacy retirement
 

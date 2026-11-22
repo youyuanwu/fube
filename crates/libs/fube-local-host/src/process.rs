@@ -16,6 +16,9 @@ use std::{
 
 use crate::{HostError, Result};
 
+mod native;
+pub use native::NativeRuntime;
+
 const LOG_LIMIT: usize = 1024 * 1024;
 
 fn proc_stat_result(result: std::io::Result<Vec<u8>>) -> std::io::Result<Option<Vec<u8>>> {

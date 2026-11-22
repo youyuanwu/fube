@@ -965,11 +965,21 @@ async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_
     assert_eq!(received.action().unwrap(), "ReplicaOpenReply");
     assert_eq!(received.body(), &[7, 8]);
     assert!(lease.take_lifecycle_reply().is_none());
+    for action in ["RegisterFabricRuntimeRequest", "ReplicaOpenReply"] {
+        assert!(lease.send_lifecycle(action, vec![9]).is_err());
+    }
     // Only the lease had a correlated response. Lifecycle ingress emits none.
+    let mut ids = std::collections::HashSet::new();
     for action in [
+        "ReplicaOpen",
         "ReplicaClose",
+        "ProxyUpdateServiceDescription",
         "ReplicatorBuildIdleReplica",
         "ReplicatorRemoveIdleReplica",
+        "UpdateConfiguration",
+        "ReplicatorUpdateEpochAndGetStatus",
+        "ProxyReplicaEndpointUpdatedReply",
+        "ReplicaClose",
     ] {
         let send = lease.send_lifecycle(action, vec![9]).unwrap();
         let request = read_message(&mut peer.socket).await.unwrap();
@@ -978,6 +988,8 @@ async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_
         assert_eq!(p.action, action);
         assert!(!p.expects_reply);
         assert_eq!(p.relates_to, MessageId::default());
+        assert_ne!(p.id, MessageId::default());
+        assert!(ids.insert(p.id));
         assert_eq!(request.body, [9]);
         tokio::time::timeout(Duration::from_secs(1), async {
             while send.result().is_none() {
@@ -1226,20 +1238,26 @@ async fn foreign_id_only_mutation_and_duplicate_cannot_steal_runtime() {
 
 #[tokio::test]
 async fn malformed_actor15_and_unsupported_profiles_fail_closed() {
-    for (actor, action, body) in [
-        (15, "", vec![1]),
-        (15, "bogus", vec![]),
-        (9, "RegisterServiceTypeRequest", vec![]),
-        (7, "ReportHealth", vec![]),
-        (12, "RAPReportLoad", vec![]),
+    for (actor, action, body, expects_reply) in [
+        (15, "", vec![1], true),
+        (15, "bogus", vec![], true),
+        (9, "RegisterServiceTypeRequest", vec![], true),
+        (7, "ReportHealth", vec![], true),
+        (7, "RegisterFabricRuntimeRequest", vec![], true),
+        (12, "RAPReportLoad", vec![], true),
+        (12, "UnknownRapMethod", vec![], false),
     ] {
         let server = server(LOCAL_LEASE_DURATION);
         let a = admission();
         let lease = server.admit(a.clone()).unwrap();
         let mut peer = Peer::connect(&server, a).await;
         peer.bootstrap().await;
-        assert!(peer.raw(peer.frame(actor, action, body)).await.is_err());
-        if actor == 12 {
+        let mut request = peer.frame(actor, action, body);
+        if !expects_reply {
+            request.headers.retain(|h| h.id != EXPECTS_REPLY);
+        }
+        assert!(peer.raw(request).await.is_err());
+        if actor == 12 && expects_reply {
             assert!(lease.take_lifecycle_reply().is_none());
             assert!(
                 peer.poll().await.unwrap() > 0,
@@ -1249,8 +1267,37 @@ async fn malformed_actor15_and_unsupported_profiles_fail_closed() {
             continue;
         }
         disconnected(&server, &lease).await;
+        assert_eq!(server.status(&lease).unwrap().loss, Some(Loss::Protocol));
         assert!(!server.status(&lease).unwrap().registered_host);
         assert!(server.status(&lease).unwrap().runtimes.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn unknown_first_hosting_method_consumes_the_original_session_admission() {
+    for (actor, action) in [(7, "UnknownHostingMethod"), (12, "UnknownRapMethod")] {
+        let server = server(LOCAL_LEASE_DURATION);
+        let a = admission();
+        let lease = server.admit(a.clone()).unwrap();
+        let mut peer = Peer::connect(&server, a.clone()).await;
+        let mut request = peer.frame(actor, action, vec![]);
+        if actor == 12 {
+            request.headers.retain(|h| h.id != EXPECTS_REPLY);
+        }
+        assert!(peer.raw(request).await.is_err());
+        disconnected(&server, &lease).await;
+        let status = server.status(&lease).unwrap();
+        assert_eq!(status.loss, Some(Loss::Protocol));
+        assert!(!status.registered_host);
+        assert!(server.take_outputs().unwrap().operations.is_empty());
+
+        let mut replacement = Peer::connect(&server, a).await;
+        let request = replacement.frame(15, "", vec![]);
+        assert!(
+            replacement.raw(request).await.is_err(),
+            "unsupported method cannot leave a reusable attachment admission"
+        );
+        assert!(!server.status(&lease).unwrap().connected);
     }
 }
 

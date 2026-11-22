@@ -1,18 +1,15 @@
-use crate::{deployment::Deployment, HostError, Result};
+use crate::{deployment::Deployment, Result};
 use std::{path::Path, process::Command, time::Instant};
 
 pub(crate) fn absolute_directories(
     native: &Path,
     dependencies: &Path,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    let native = native.canonicalize()?;
-    let dependencies = dependencies.canonicalize()?;
-    if !native.is_dir() || !dependencies.is_dir() {
-        return Err(HostError(
-            "native/dependency inputs must be directories".into(),
-        ));
-    }
-    Ok((native, dependencies))
+    let inputs = fube_local_host::process::NativeRuntime::new(native, dependencies)?;
+    Ok((
+        inputs.directory().to_owned(),
+        inputs.dependencies().to_owned(),
+    ))
 }
 
 pub struct OwnedApp(fube_local_host::process::OwnedApp);
@@ -24,7 +21,7 @@ impl OwnedApp {
         host: &str,
         address: &str,
     ) -> Result<Self> {
-        let (native, dependencies) = absolute_directories(native, dependencies)?;
+        let inputs = fube_local_host::process::NativeRuntime::new(native, dependencies)?;
         let identity = &bundle.identity;
         let package = &identity.code.package.package;
         let mut command = Command::new(&bundle.executable);
@@ -33,14 +30,6 @@ impl OwnedApp {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &bundle.root)
-            .env(
-                "LD_LIBRARY_PATH",
-                std::env::join_paths([&native, &dependencies])?,
-            )
-            .env("FabricConfigFileName", &bundle.config)
-            .env("FabricDataRoot", bundle.root.join("native-data"))
-            .env("FabricLogRoot", bundle.application.join("log"))
-            .env("FabricCodePath", &native)
             .env("Fabric_ApplicationHostId", host)
             .env("Fabric_ApplicationHostType", "Activated_SingleCodePackage")
             .env("Fabric_IsContainerHost", "false")
@@ -62,6 +51,7 @@ impl OwnedApp {
             .env("Fabric_ServicePackageVersionInstance", "1.0:1.0:1")
             .env("Fabric_ServicePackageActivationId", "")
             .current_dir(&bundle.working_directory);
+        inputs.configure(&mut command, &bundle.root, &bundle.application)?;
         let mut owned = None;
         fube_local_host::process::OwnedApp::start(&mut owned, command)?;
         Ok(Self(owned.expect("spawned child")))
@@ -98,6 +88,7 @@ impl OwnedApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::HostError;
     use std::time::Duration;
     #[test]
     fn relative_loader_paths_are_absolute_in_the_changed_child_directory() {

@@ -5,8 +5,11 @@
 //! an owned consumer boundary; reports, deployed RA/RAP and distributed Federation
 //! capability are not implied. Node composition owns actual event consumers.
 use crate::{lease::Authority, wire, Hosting};
+use fube_core::protocol::actor as actors;
 use fubst::serde::to_vec;
-use furpc::{header, Error as TransportError, Headers, MessageId, Peer, Result as TransportResult};
+#[cfg(test)]
+use furpc::Body;
+use furpc::{header, Error as TransportError, Headers, MessageId, Result as TransportResult};
 use serde::Deserialize;
 use std::{
     collections::{HashSet, VecDeque},
@@ -24,8 +27,13 @@ use tokio::{
     task::JoinSet,
 };
 
+mod client;
+mod rpc;
+mod server;
 mod transport;
-use transport::{decode, encode, message, IpcMessage};
+use client::{LifecycleClient, Method as LifecycleMethod};
+use rpc::{decode, Call as RpcCall, Method as RpcMethod, Response as RpcResponse};
+use server::{Call as IngressCall, IpcMessage};
 
 const IO_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_INPUT: usize = 64 * 1024;
@@ -108,7 +116,7 @@ struct Entry {
 }
 #[derive(Clone)]
 struct Session {
-    peer: Peer,
+    lifecycle: LifecycleClient,
     executor: tokio::runtime::Handle,
     tasks: Arc<Mutex<Option<JoinSet<()>>>>,
 }
@@ -146,7 +154,7 @@ pub struct LifecycleReply {
 }
 impl LifecycleReply {
     pub fn action(&self) -> TransportResult<String> {
-        transport::action(&self.message.headers)
+        action(&self.message.headers)
     }
     pub fn body(&self) -> &[u8] {
         &self.message.body
@@ -238,15 +246,9 @@ impl HostLease {
         action: &str,
         body: Vec<u8>,
     ) -> TransportResult<LifecycleReply> {
-        if !matches!(action, "ReplicaOpenReply" | "ReplicaCloseReply") || body.len() > MAX_INPUT {
-            return Err(protocol("invalid qualification reply"));
-        }
         Ok(LifecycleReply {
             entry: self.entry.clone(),
-            message: IpcMessage {
-                headers: message(12, action, vec![])?.headers().clone(),
-                body,
-            },
+            message: IpcMessage::qualification(action, body)?,
         })
     }
     pub fn stop_renewal(&self) {
@@ -262,18 +264,9 @@ impl HostLease {
         if !self.lifecycle_enabled {
             return Err(protocol("registration-only Hosting profile"));
         }
-        if !matches!(
-            action,
-            "ReplicaOpen"
-                | "ReplicaClose"
-                | "ProxyUpdateServiceDescription"
-                | "ReplicatorBuildIdleReplica"
-                | "ReplicatorRemoveIdleReplica"
-                | "UpdateConfiguration"
-                | "ReplicatorUpdateEpochAndGetStatus"
-                | "ProxyReplicaEndpointUpdatedReply"
-        ) || body.len() > MAX_INPUT
-        {
+        let method = LifecycleMethod::select(action)
+            .ok_or(protocol("unsupported local lifecycle action/body"))?;
+        if body.len() > MAX_INPUT {
             return Err(protocol("unsupported local lifecycle action/body"));
         }
         if !session_live(&self.entry) || !self.entry.ready.load(Ordering::SeqCst) {
@@ -299,8 +292,8 @@ impl HostLease {
             _permit: permit.clone(),
         };
         let entry = self.entry.clone();
-        let message = message(12, action, body)?;
-        let peer = session.peer.clone();
+        let request = method.prepare(body)?;
+        let mut lifecycle = session.lifecycle.clone();
         let mut guard = session.tasks.lock().unwrap();
         let tasks = guard.as_mut().ok_or(TransportError::Closed)?;
         while let Some(result) = tasks.try_join_next() {
@@ -312,7 +305,8 @@ impl HostLease {
                     if !session_live(&entry) {
                         return Err(TransportError::Closed);
                     }
-                    peer.send(message, tokio::time::Instant::now() + IO_DEADLINE)
+                    lifecycle
+                        .send(request, tokio::time::Instant::now() + IO_DEADLINE)
                         .await?;
                     if !session_live(&entry) {
                         return Err(TransportError::Closed);
@@ -1194,18 +1188,20 @@ fn unique_headers(headers: &Headers) -> TransportResult<()> {
 const IPC: u16 = 0x800b;
 const TIMEOUT: u16 = 0x8023;
 
-fn envelope(
-    message: &IpcMessage,
-    decode_limit: usize,
-) -> TransportResult<(String, u32, Option<i64>)> {
-    unique_headers(&message.headers)?;
-    let p = message.headers.effective();
+fn action(headers: &Headers) -> TransportResult<String> {
+    String::from_utf16(headers.effective().action())
+        .map_err(|_| TransportError::Protocol("invalid Hosting action"))
+}
+
+fn envelope(headers: &Headers, decode_limit: usize) -> TransportResult<(String, u32, Option<i64>)> {
+    unique_headers(headers)?;
+    let p = headers.effective();
     if p.message_id == MessageId::default()
         || p.relates_to != MessageId::default()
-        || (p.actor.get() == 12) == p.expects_reply
-        || message.headers.first_raw(header::FAULT).is_some()
+        || (p.actor.get() == actors::RA) == p.expects_reply
+        || headers.first_raw(header::FAULT).is_some()
         || p.uncorrelated_reply
-        || message.headers.first_raw(header::ACTOR).is_none()
+        || headers.first_raw(header::ACTOR).is_none()
     {
         return Err(protocol("invalid Hosting request envelope"));
     }
@@ -1213,16 +1209,14 @@ fn envelope(
     struct Timeout {
         ticks: i64,
     }
-    let timeout = message
-        .headers
+    let timeout = headers
         .first_raw(furpc::HeaderId::new(TIMEOUT)?)
         .map(|h| decode::<Timeout>(h.value(), decode_limit).map(|value| value.ticks))
         .transpose()?;
     if timeout.is_some_and(|value| value <= 0) {
         return Err(protocol("expired Hosting request"));
     }
-    let header = message
-        .headers
+    let header = headers
         .first_raw(furpc::HeaderId::new(IPC)?)
         .ok_or(protocol("missing Hosting identity"))?;
     #[derive(Deserialize)]
@@ -1293,17 +1287,16 @@ async fn run_connection(
                 _ = tokio::time::sleep(Duration::from_secs(30)) => return Err(TransportError::Timeout("Hosting first request")),
             }
         };
-        if tokio::time::Instant::now() >= incoming.deadline {
+        if tokio::time::Instant::now() >= incoming.deadline() {
             return Err(TransportError::Timeout("Hosting ingress"));
         }
-        let arrived = incoming.received_at;
-        let request = incoming.message;
-        let (host, pid, timeout) = envelope(&request, shared.config.decode_bytes)?;
+        let arrived = incoming.received_at();
+        let ingress_deadline = incoming.deadline();
+        let (host, pid, timeout) = envelope(incoming.headers(), shared.config.decode_bytes)?;
         let has_timeout = timeout.is_some();
-        let p = request.headers.effective();
+        let p = incoming.headers().effective();
         let id = p.message_id;
-        let actor = p.actor.get();
-        let action = transport::action(&request.headers)?;
+        incoming.validate_action()?;
         if id.guid == [0; 16]
             || guid.is_some_and(|guid| id.guid != guid)
             || seen.len() == 4096
@@ -1333,79 +1326,51 @@ async fn run_connection(
             r.claimed = true;
             r.entry.connected.store(true, Ordering::SeqCst);
             *r.entry.session.lock().unwrap() = Some(Session {
-                peer: peer.clone(),
+                lifecycle: LifecycleClient::new(peer.clone())?,
                 executor: tokio::runtime::Handle::current(),
                 tasks: Arc::new(Mutex::new(Some(JoinSet::new()))),
             });
             *claimed = Some(r.entry.clone());
         }
         let entry = claimed.as_ref().expect("claimed session");
-        if !has_timeout && actor != 12 && entry.admission.deadlines == RequestDeadlines::Propagated
+        if !has_timeout
+            && !incoming.is_semantic()
+            && entry.admission.deadlines == RequestDeadlines::Propagated
         {
             return Err(protocol("missing propagated Hosting timeout"));
         }
         if entry.admission.host.id != host || entry.admission.host.pid != pid {
             return Err(protocol("Hosting identity changed"));
         }
-        if actor == 12 {
-            if !entry.ready.load(Ordering::SeqCst)
-                || !matches!(
-                    action.as_str(),
-                    "ReplicaOpenReply"
-                        | "ReplicaCloseReply"
-                        | "ProxyUpdateServiceDescriptionReply"
-                        | "ReplicatorBuildIdleReplicaReply"
-                        | "ReplicatorRemoveIdleReplicaReply"
-                        | "UpdateConfigurationReply"
-                        | "ReplicatorUpdateEpochAndGetStatusReply"
-                        | "ProxyReplicaEndpointUpdated"
-                        | "RAPReportLoad"
-                )
-            {
-                return Err(protocol("unsupported semantic RAP input"));
+        match incoming.route()? {
+            IngressCall::Semantic(call) => {
+                if !entry.ready.load(Ordering::SeqCst) {
+                    return Err(protocol("unsupported semantic RAP input"));
+                }
+                let mut queue = entry.semantic.lock().unwrap();
+                if queue.len() == 4 {
+                    return Err(TransportError::ResourceLimit("Hosting semantic inbox"));
+                }
+                call.enqueue(&mut queue)?;
             }
-            let mut queue = entry.semantic.lock().unwrap();
-            if queue.len() == 4 {
-                return Err(TransportError::ResourceLimit("Hosting semantic inbox"));
+            IngressCall::Rpc(call) => {
+                let method = call.method();
+                let type_deadline = (method == RpcMethod::RegisterType).then(|| {
+                    (arrived
+                        + Duration::from_nanos(
+                            timeout.unwrap_or(300_000_000).min(300_000_000) as u64 * 100,
+                        ))
+                    .min(ingress_deadline.into_std())
+                });
+                call.unary(rpc::HostingRpc::new(
+                    shared.clone(),
+                    entry.clone(),
+                    method,
+                    type_deadline,
+                ))
+                .await?;
             }
-            queue.push_back(request);
-            incoming
-                .response
-                .send(furpc::IngressResponse::NoReply)
-                .map_err(|_| TransportError::Closed)?;
-            continue;
         }
-        let lease_reply = actor == 15;
-        let body = if lease_reply {
-            if !action.is_empty() || !request.body.is_empty() {
-                return Err(protocol("invalid actor-15 request"));
-            }
-            // No core lock or callback is involved in ongoing lease service.
-            if !entry.ready.load(Ordering::SeqCst) {
-                return Err(protocol("lease before completed registration"));
-            }
-            let ttl = entry.authority.poll().ok_or(TransportError::Closed)?;
-            reply_budget(shared, 32)?;
-            encode(&wire::LeaseReply { ttl })?
-        } else {
-            let type_deadline = (actor == 9 && action == "RegisterServiceTypeRequest").then(|| {
-                (arrived
-                    + Duration::from_nanos(
-                        timeout.unwrap_or(300_000_000).min(300_000_000) as u64 * 100,
-                    ))
-                .min(incoming.deadline.into_std())
-            });
-            dispatch(shared, entry, actor, &action, &request.body, type_deadline)?
-        };
-        // This is data handoff, not a first-write fence or write-order barrier.
-        // Cleanup replies remain possible after serving authority retires.
-        if lease_reply && !entry.authority.live() {
-            return Err(TransportError::Closed);
-        }
-        incoming
-            .response
-            .send(furpc::IngressResponse::Reply(message(0, "", body)?))
-            .map_err(|_| TransportError::Closed)?;
     }
 }
 
@@ -1493,20 +1458,18 @@ fn native_error(error: &crate::Error) -> TransportResult<i64> {
     };
     Ok(bits as i32 as i64)
 }
-fn dispatch(
-    shared: &Shared,
+fn admit_dispatch<'a>(
+    shared: &'a Shared,
     entry: &Arc<Entry>,
-    actor: i64,
-    action: &str,
-    body: &[u8],
+    method: RpcMethod,
     type_deadline: Option<Instant>,
-) -> TransportResult<Vec<u8>> {
+) -> TransportResult<(MutexGuard<'a, State>, usize)> {
     // Before mutation as well as in the independent wait supervisor.
     deadline(shared, entry)?;
     if entry.cleanup_deadline.load(Ordering::SeqCst) != 0
         && !matches!(
-            (actor, action),
-            (7, "UnregisterApplicationHostRequest") | (9, "UnregisterFabricRuntimeRequest")
+            method,
+            RpcMethod::UnregisterHost | RpcMethod::UnregisterRuntime
         )
     {
         return Err(protocol("retired session accepts cleanup only"));
@@ -1520,23 +1483,49 @@ fn dispatch(
     // The core lock may have been stalled by an independent consumer/control
     // operation. Recheck this exact incarnation at the mutation boundary.
     deadline_locked(shared, entry, &mut state)?;
+    if entry.cleanup_deadline.load(Ordering::SeqCst) != 0
+        && !matches!(
+            method,
+            RpcMethod::UnregisterHost | RpcMethod::UnregisterRuntime
+        )
+    {
+        return Err(protocol("retired session accepts cleanup only"));
+    }
     if type_deadline.is_some_and(|due| Instant::now() >= due) {
         return Err(protocol("type request deadline before admission"));
     }
     if state.records[i].results.len() == MAX_RESULTS {
         return Err(protocol("Hosting retained result capacity"));
     }
+    if method == RpcMethod::RegisterType {
+        let consumer = state.records[i]
+            .registration_consumer
+            .as_ref()
+            .ok_or(protocol("factory capability not admitted"))?;
+        if !consumer.active() {
+            return Err(protocol("factory consumer withdrawn"));
+        }
+    }
+    Ok((state, i))
+}
+
+fn dispatch(
+    shared: &Shared,
+    entry: &Arc<Entry>,
+    call: RpcCall,
+    type_deadline: Option<Instant>,
+) -> TransportResult<RpcResponse> {
+    let (mut state, i) = admit_dispatch(shared, entry, call.method(), type_deadline)?;
     let host_matches = |id: &str| crate::compare_names(id, &entry.admission.host.id).is_eq();
     let mut result = OperationResult {
-        action: "",
+        action: call.method().envelope().1,
         primary: Ok(()),
         state_method: None,
         cleanup: None,
     };
-    let mut start_reply = false;
-    match (actor, action) {
-        (7, "StartRegisterApplicationHostRequest") => {
-            let value: wire::StartRequest = decode(body, shared.config.decode_bytes)?;
+    let start_reply = matches!(call, RpcCall::Start(_));
+    match call {
+        RpcCall::Start(value) => {
             if !host_matches(&value.id)
                 || value.pid != entry.admission.host.pid
                 || value.kind != 1
@@ -1546,7 +1535,6 @@ fn dispatch(
             {
                 return Err(protocol("Start outside admitted profile"));
             }
-            result.action = "StartRegisterApplicationHostRequest";
             result.primary = state.core.add_host(value.id.clone());
             if result.primary.is_ok() {
                 match state.core.start_host(
@@ -1563,14 +1551,11 @@ fn dispatch(
                     Err(error) => result.primary = Err(error),
                 }
             }
-            start_reply = true;
         }
-        (7, "FinishRegisterApplicationHostRequest") => {
-            let value: wire::IdRequest = decode(body, shared.config.decode_bytes)?;
+        RpcCall::Finish(value) => {
             if !host_matches(&value.id) {
                 return Err(protocol("foreign Finish target"));
             }
-            result.action = "FinishRegisterApplicationHostRequest";
             match state.core.finish_host(&value.id, false) {
                 Ok(finish) => {
                     result.primary = finish.reply;
@@ -1588,8 +1573,7 @@ fn dispatch(
                 entry.registration_deadline.store(0, Ordering::SeqCst);
             }
         }
-        (9, "RegisterFabricRuntimeRequest") => {
-            let value: wire::RuntimeRequest = decode(body, shared.config.decode_bytes)?;
+        RpcCall::RegisterRuntime(value) => {
             let context = &value.context;
             let mut expected_host = entry.admission.host.clone();
             expected_host.id = context.host.id.clone();
@@ -1600,7 +1584,6 @@ fn dispatch(
             {
                 return Err(protocol("runtime context outside admitted profile"));
             }
-            result.action = "RegisterFabricRuntimeRequest";
             if state.records[i]
                 .runtime
                 .as_ref()
@@ -1620,7 +1603,7 @@ fn dispatch(
                 entry.ready.store(true, Ordering::SeqCst);
             }
         }
-        (9, "RegisterServiceTypeRequest") => {
+        RpcCall::RegisterType(value) => {
             let consumer = state.records[i]
                 .registration_consumer
                 .as_ref()
@@ -1629,7 +1612,6 @@ fn dispatch(
             if !consumer.active() {
                 return Err(protocol("factory consumer withdrawn"));
             }
-            let value: wire::TypeRequest = decode(body, shared.config.decode_bytes)?;
             let context = &value.context;
             let mut expected_host = entry.admission.host.clone();
             expected_host.id = context.host.id.clone();
@@ -1672,7 +1654,6 @@ fn dispatch(
             if !consumer.active() {
                 return Err(protocol("factory consumer withdrawn before mutation"));
             }
-            result.action = "RegisterServiceTypeRequest";
             let registration = state.core.register_type(&id, &context.project());
             result.primary = registration.result;
             result.cleanup = registration.cleanup;
@@ -1680,8 +1661,7 @@ fn dispatch(
                 state.health = health;
             }
         }
-        (9, "UnregisterFabricRuntimeRequest") => {
-            let value: wire::IdRequest = decode(body, shared.config.decode_bytes)?;
+        RpcCall::UnregisterRuntime(value) => {
             if !state.records[i]
                 .runtime
                 .as_ref()
@@ -1689,7 +1669,6 @@ fn dispatch(
             {
                 return Err(protocol("foreign runtime unregister target"));
             }
-            result.action = "UnregisterFabricRuntimeRequest";
             entry.ready.store(false, Ordering::SeqCst);
             let _ = entry.cleanup_deadline.compare_exchange(
                 0,
@@ -1703,12 +1682,10 @@ fn dispatch(
                 state.records[i].runtime = None;
             }
         }
-        (7, "UnregisterApplicationHostRequest") => {
-            let value: wire::UnregisterHost = decode(body, shared.config.decode_bytes)?;
+        RpcCall::UnregisterHost(value) => {
             if !host_matches(&value.id) {
                 return Err(protocol("foreign host unregister target"));
             }
-            result.action = "UnregisterApplicationHostRequest";
             entry.ready.store(false, Ordering::SeqCst);
             let _ = entry.cleanup_deadline.compare_exchange(
                 0,
@@ -1736,7 +1713,7 @@ fn dispatch(
                 state.records[i].timer = None;
             }
         }
-        _ => return Err(protocol("unsupported Hosting capability")),
+        RpcCall::Lease => return Err(TransportError::Internal("Hosting lease dispatch")),
     }
     // Accepted operation outcomes remain owned even when serialization, local
     // mapping or the subsequent socket write fails.
@@ -1752,10 +1729,10 @@ fn dispatch(
         node.lease_duration = (shared.config.lease_duration.as_nanos() / 100) as i64;
         node.initial_ttl = node.lease_duration;
         node.error = error;
-        encode(&node)?
+        RpcResponse::Start(node)
     } else {
         reply_budget(shared, 32)?;
-        encode(&wire::ErrorReply { error })?
+        RpcResponse::Error(wire::ErrorReply { error })
     };
     Ok(response)
 }
@@ -1795,6 +1772,19 @@ fn cleanup(state: &mut State, i: usize, loss: Loss) {
 #[cfg(test)]
 mod fence_tests {
     use super::*;
+
+    fn dispatch_wire(
+        shared: &Arc<Shared>,
+        entry: &Arc<Entry>,
+        method: RpcMethod,
+        bytes: &[u8],
+        type_deadline: Option<Instant>,
+    ) -> TransportResult<RpcResponse> {
+        let body = Body::from_bytes(bytes.to_vec())?;
+        let call = rpc::HostingRpc::new(shared.clone(), entry.clone(), method, type_deadline)
+            .decode(&mut furpc::DecodeBuf::new(&body))?;
+        dispatch(shared, entry, call, type_deadline)
+    }
 
     fn fixture(duration: Duration) -> (Server, Admission) {
         let node = NodeContext {
@@ -1942,21 +1932,18 @@ mod fence_tests {
                     },
                 })
                 .unwrap();
-                let response = dispatch(
+                let response = dispatch_wire(
                     &shared,
                     &entry,
-                    9,
-                    "RegisterServiceTypeRequest",
+                    RpcMethod::RegisterType,
                     &body,
                     Some(Instant::now() + Duration::from_secs(1)),
                 )
                 .unwrap();
-                assert_eq!(
-                    fubst::serde::from_slice::<wire::ErrorReply>(&response)
-                        .unwrap()
-                        .error,
-                    0
-                );
+                assert!(matches!(
+                    response,
+                    RpcResponse::Error(wire::ErrorReply { error: 0 })
+                ));
                 owner.as_ref().unwrap().take_outputs().unwrap();
             }
             let mut state = shared.state().unwrap();
@@ -1997,14 +1984,13 @@ mod fence_tests {
             };
             let type_due = (mode == 2).then(|| Instant::now() + Duration::from_millis(200));
             let worker = std::thread::spawn(move || {
-                let result = dispatch(
+                let result = dispatch_wire(
                     &owned,
                     &entry,
-                    if mode == 2 { 9 } else { 7 },
                     if mode == 2 {
-                        "RegisterServiceTypeRequest"
+                        RpcMethod::RegisterType
                     } else {
-                        "FinishRegisterApplicationHostRequest"
+                        RpcMethod::Finish
                     },
                     &body,
                     type_due,
@@ -2061,6 +2047,78 @@ mod fence_tests {
         }
     }
 
+    #[test]
+    fn typed_rpc_rejects_before_decoding_when_domain_admission_is_unavailable() {
+        let (mut server, admission) = fixture(LOCAL_LEASE_DURATION);
+        let lease = server.admit(admission).unwrap();
+        let body = Body::from_bytes(vec![0xff]).unwrap();
+        let rpc =
+            |method| rpc::HostingRpc::new(server.shared.clone(), lease.entry.clone(), method, None);
+        assert!(matches!(
+            rpc(RpcMethod::RegisterType).decode(&mut furpc::DecodeBuf::new(&body)),
+            Err(TransportError::Protocol("factory capability not admitted"))
+        ));
+        {
+            let mut state = server.shared.state().unwrap();
+            let i = record_index(&state, &lease.entry).unwrap();
+            state.records[i].results.resize(
+                MAX_RESULTS,
+                OperationResult {
+                    action: "",
+                    primary: Ok(()),
+                    state_method: None,
+                    cleanup: None,
+                },
+            );
+        }
+        assert!(matches!(
+            rpc(RpcMethod::Finish).decode(&mut furpc::DecodeBuf::new(&body)),
+            Err(TransportError::Protocol("Hosting retained result capacity"))
+        ));
+        lease.revoke();
+        assert!(matches!(
+            rpc(RpcMethod::Finish).decode(&mut furpc::DecodeBuf::new(&body)),
+            Err(TransportError::Closed)
+        ));
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn typed_rpc_rechecks_authority_between_decode_and_mutation() {
+        let (mut server, admission) = fixture(LOCAL_LEASE_DURATION);
+        let lease = server.admit(admission.clone()).unwrap();
+        let body = Body::from_bytes(
+            to_vec(&wire::StartRequest {
+                id: admission.host.id.clone(),
+                kind: 1,
+                pid: admission.host.pid,
+                timeout: 10_000_000,
+                container: false,
+                activator: false,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let call = rpc::HostingRpc::new(
+            server.shared.clone(),
+            lease.entry.clone(),
+            RpcMethod::Start,
+            None,
+        )
+        .decode(&mut furpc::DecodeBuf::new(&body))
+        .unwrap();
+        lease.revoke();
+        assert!(matches!(
+            dispatch(&server.shared, &lease.entry, call, None),
+            Err(TransportError::Closed)
+        ));
+        let state = server.shared.state().unwrap();
+        assert!(state.core.find_host(&admission.host.id).is_err());
+        let i = record_index(&state, &lease.entry).unwrap();
+        assert!(state.records[i].results.is_empty());
+        drop(state);
+        server.stop().unwrap();
+    }
     #[test]
     fn health_removal_capacity_preserves_source_core_membership_and_entity_history() {
         let (mut server, admission) = fixture(LOCAL_LEASE_DURATION);

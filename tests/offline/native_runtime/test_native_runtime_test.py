@@ -46,7 +46,7 @@ class DiagnosticTests(unittest.TestCase):
     def test_registration_receipts_are_additive_and_never_overwrite_prior_evidence(self):
         self.assertEqual(profile.SCENARIOS[:6], ("bootstrap", "close", "abort",
                          "manifest-close", "manifest-abort", "hosting-leases"))
-        self.assertEqual(profile.SCENARIOS[6:], ("hosting-registration",))
+        self.assertEqual(profile.SCENARIOS[6:], ("hosting-registration", "node-rap-lifecycle"))
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             output = b'MSSF_REPORT {"profile":"registration"}\n'
@@ -54,6 +54,16 @@ class DiagnosticTests(unittest.TestCase):
             before = {p.name: p.read_bytes() for p in root.iterdir()}
             with self.assertRaisesRegex(ValueError, "fresh diagnostics"):
                 profile.save_diagnostics(root, "hosting-registration", b"replacement")
+            self.assertEqual({p.name: p.read_bytes() for p in root.iterdir()}, before)
+
+    def test_node_rap_receipts_never_replace_previous_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            output = b'MSSF_REPORT {"profile":"local-node-native-stateless"}\n'
+            profile.save_diagnostics(root, "node-rap-lifecycle", output)
+            before = {p.name: p.read_bytes() for p in root.iterdir()}
+            with self.assertRaisesRegex(ValueError, "fresh diagnostics"):
+                profile.save_diagnostics(root, "node-rap-lifecycle", b"replacement")
             self.assertEqual({p.name: p.read_bytes() for p in root.iterdir()}, before)
 
     def test_every_scenario_writes_bounded_diagnostics(self):
