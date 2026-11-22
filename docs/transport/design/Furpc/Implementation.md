@@ -863,6 +863,17 @@ handler. NodeUp final-upload progression and LFUM generation advancement still
 follow successful handoff. Low-level raw reply construction remains available
 for independent wire fixtures and malformed-response checks.
 
+**Typed peer-control client:** the nine RA/RA CreateReplica, Activate, Deactivate,
+GetLSN and DoReconfiguration effect profiles now use a private OneWayClient over
+the original PeerSendService. Existing native factories retain action/body
+pairings, derived scopes, flags and the Adapter-selected generation; the prepared
+Body is adopted without another serialization. Original-Link source sealing,
+relationship policy, finite envelope bounds and terminal-session checks precede
+submission. Adapter still owns target matching, phase fences, queue removal,
+retry/retirement policy and semantic completion. Successful submission observes
+and drops the actual local-write receipt, not a remote execution or semantic ACK.
+No reconnect, generic furpc API or peer ingress migration is introduced.
+
 ## Node local RAP typed composition
 
 Node's local RA/RAP bridge now separates private client and reply-intake adapters

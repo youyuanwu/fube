@@ -12,7 +12,7 @@ use crate::local::{FmWork, LocalDisposition, Node};
 use fube_ra::{entity as ra, protocol::*};
 use std::{collections::VecDeque, future::Future, pin::Pin, task::Poll, time::Duration};
 use tokio::time::Instant;
-use wire::{LfumUploadRequest, Link};
+use wire::{LfumUploadRequest, Link, PeerClient};
 
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub type Result<T> = std::result::Result<T, String>;
@@ -626,38 +626,11 @@ impl Adapter {
                 }
             }
             let sent = async {
-                let message = match &reply.effect {
-                    ra::Effect::PeerCreateReplica { target, body } if target == peer => {
-                        create_replica_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerCreateReplicaReply { target, body } if target == peer => {
-                        create_replica_reply_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerActivate { target, body } if target == peer => {
-                        activate_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerActivateReply { target, body } if target == peer => {
-                        activate_reply_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerDeactivate { target, body } if target == peer => {
-                        deactivate_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerDeactivateReply { target, body } if target == peer => {
-                        deactivate_reply_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerContinueSwap { target, body } if target == peer => {
-                        do_reconfiguration_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerGetLsn { target, body } if target == peer => {
-                        get_lsn_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerGetLsnReply { target, body } if target == peer => {
-                        get_lsn_reply_message(body, &link.generation())
-                    }
-                    _ => return Err("peer receipt does not match the original bound peer".into()),
+                if peer_target(&reply.effect) != Some(peer) {
+                    return Err("peer receipt does not match the original bound peer".into());
                 }
-                .map_err(err)?;
-                link.send(message).await
+                let mut client = PeerClient::new(link)?;
+                client.send(&reply.effect, &link.generation()).await
             }
             .await;
             match sent {

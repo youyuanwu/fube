@@ -13,8 +13,10 @@ use std::{
 use tokio::time::Instant;
 
 mod bootstrap;
+mod peer_client;
 mod session;
 pub use bootstrap::LfumUploadRequest;
+pub(super) use peer_client::PeerClient;
 pub use session::{Failure, Incoming, Session};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -652,7 +654,7 @@ mod tests {
     use super::*;
     use fube_ra::protocol::*;
 
-    async fn links(peer: bool) -> (Link, Link) {
+    pub(super) async fn links(peer: bool) -> (Link, Link) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sender = connect(
             listener.local_addr().unwrap(),

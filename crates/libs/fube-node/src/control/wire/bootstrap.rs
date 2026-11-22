@@ -158,7 +158,7 @@ struct BootstrapCodec<R> {
     admitted: Arc<OnceLock<ValidatedReply>>,
     marker: PhantomData<fn() -> R>,
 }
-struct PreparedEncoder;
+pub(super) struct PreparedEncoder;
 
 impl<R: DeserializeOwned> Codec for BootstrapCodec<R> {
     type Encode = Body;
