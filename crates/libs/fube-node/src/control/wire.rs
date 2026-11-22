@@ -774,10 +774,10 @@ mod tests {
                     .reply
                     .take()
                     .unwrap()
-                    .reply(
-                        fm.seal(lfum_upload_reply_message(&old).unwrap()).unwrap(),
-                        deadline(),
-                    )
+                    .lfum_upload(&fm, |decoded| {
+                        assert_eq!(decoded, body);
+                        Ok(old.clone())
+                    })
                     .await
                     .unwrap();
             }
@@ -809,11 +809,10 @@ mod tests {
                 .reply
                 .take()
                 .unwrap()
-                .reply(
-                    fm.seal(node_up_ack_message(&ack, &generation).unwrap())
-                        .unwrap(),
-                    deadline(),
-                )
+                .node_up(&fm, |decoded| {
+                    assert_eq!(decoded, up);
+                    Ok((ack.clone(), generation.clone()))
+                })
                 .await
                 .unwrap();
         });
@@ -834,15 +833,103 @@ mod tests {
                 .reply
                 .take()
                 .unwrap()
-                .reply(
-                    node.seal(generation_proposal_reply_message(&proposal).unwrap())
-                        .unwrap(),
-                    deadline(),
-                )
+                .generation_proposal(&node, |decoded| {
+                    assert_eq!(decoded, generation);
+                    Ok(proposal.clone())
+                })
                 .await
                 .unwrap();
         });
         assert_eq!(reply.unwrap(), proposal);
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_server_keeps_original_request_despite_mutated_message_view() {
+        let (node, fm) = links(false).await;
+        let body = LfumUpload {
+            generation: node.generation().number,
+            ..LfumUpload::default()
+        };
+        let generation = fm.generation();
+        let mut calls = 0;
+        let (client, server) = tokio::join!(
+            node.lfum_upload(LfumUploadRequest::new(&body).unwrap()),
+            async {
+                let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
+                incoming.message = Message::builder()
+                    .body(Body::from_bytes(vec![0xff]).unwrap())
+                    .build()
+                    .unwrap();
+                incoming
+                    .reply
+                    .take()
+                    .unwrap()
+                    .lfum_upload(&fm, |decoded| {
+                        calls += 1;
+                        assert_eq!(decoded, body);
+                        Ok(generation.clone())
+                    })
+                    .await
+            }
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(client.unwrap(), Some(generation.clone()));
+        assert_eq!(server.unwrap(), generation);
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_server_rejects_method_source_and_schema_before_domain_handler() {
+        let (node, fm) = links(false).await;
+        for invalid in ["method", "source", "schema"] {
+            let original = lfum_upload_message(&LfumUpload::default()).unwrap();
+            let mut builder = Message::builder().body(Body::from_bytes(vec![0xff]).unwrap());
+            for header in original.headers().records() {
+                builder = builder.append_header(header.to_owned());
+            }
+            let message = node.seal(builder.build().unwrap()).unwrap();
+            let mut request = furpc::Request::new(message.body().clone());
+            *request.headers_mut() = message.headers().clone();
+            let peer = node.session.peer.clone();
+            let client = tokio::spawn(async move { peer.request(request, deadline()).await });
+            let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
+            let slot = incoming.reply.take().unwrap();
+            let error = match invalid {
+                "method" => slot
+                    .node_up(&fm, |_| panic!("mismatched method reached handler"))
+                    .await
+                    .unwrap_err(),
+                "source" => {
+                    let foreign = Link {
+                        remote: NodeInstance {
+                            instance: node.local.instance + 1,
+                            ..node.local.clone()
+                        },
+                        ..fm.clone()
+                    };
+                    slot.lfum_upload(&foreign, |_| panic!("foreign source reached handler"))
+                        .await
+                        .unwrap_err()
+                }
+                _ => slot
+                    .lfum_upload(&fm, |_| panic!("malformed schema reached handler"))
+                    .await
+                    .unwrap_err(),
+            };
+            assert!(error.contains(match invalid {
+                "method" => "unsupported bootstrap invocation",
+                "source" => "foreign/stale native sender or recipient incarnation",
+                _ => "decode",
+            }));
+            client.abort();
+            match client.await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(result) => assert!(result.is_err()),
+            }
+        }
         node.close().await.unwrap();
         fm.close().await.unwrap();
     }
@@ -960,9 +1047,23 @@ mod tests {
         assert!(proposal.unwrap().is_none());
         assert!(node.is_live());
         assert!(fm.is_live());
+        let (mut lfum, mut proposal) = retained;
+        assert!(lfum
+            .reply
+            .take()
+            .unwrap()
+            .lfum_upload(&fm, |_| panic!("expired LFUM handler executed"))
+            .await
+            .is_err());
+        assert!(proposal
+            .reply
+            .take()
+            .unwrap()
+            .generation_proposal(&node, |_| panic!("expired proposal handler executed"))
+            .await
+            .is_err());
         node.close().await.unwrap();
         fm.close().await.unwrap();
-        drop(retained);
     }
 
     #[tokio::test]
@@ -986,11 +1087,7 @@ mod tests {
             .reply
             .take()
             .unwrap()
-            .reply(
-                fm.seal(lfum_upload_reply_message(&fm.generation()).unwrap())
-                    .unwrap(),
-                deadline(),
-            )
+            .lfum_upload(&fm, |_| panic!("retired LFUM handler executed"))
             .await
             .is_err());
         assert!(node

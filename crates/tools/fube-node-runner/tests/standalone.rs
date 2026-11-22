@@ -565,9 +565,12 @@ impl FmFixture {
             let Some(mut incoming) = incoming else {
                 continue;
             };
-            wire::predecode(&incoming.message).unwrap();
+            let action = wire::action(&incoming.message).unwrap();
+            if action != "NodeUp" {
+                wire::predecode(&incoming.message).unwrap();
+            }
             let generation = self.configurations[index].generation().unwrap();
-            match wire::action(&incoming.message).unwrap().as_str() {
+            match action.as_str() {
                 "NodeDeactivateReply" => {
                     let (reply, owner) = decode_node_deactivate_reply(&incoming.message).unwrap();
                     assert_eq!(owner, Owner::Fm);
@@ -955,30 +958,28 @@ impl FmFixture {
                         .reply
                         .take()
                         .unwrap()
-                        .reply(
-                            link.seal(lfum_upload_reply_message(&generation).unwrap())
-                                .unwrap(),
-                            wire::deadline(),
-                        )
+                        .lfum_upload(link, |decoded| {
+                            assert_eq!(decoded, body);
+                            Ok(generation)
+                        })
                         .await
                         .unwrap();
                     self.uploaded[index] = Some(body);
                 }
                 "NodeUp" => {
-                    let body = decode_node_up(&incoming.message).unwrap();
-                    body.validate_fresh_stateless().unwrap();
-                    let ack =
-                        NodeUpAck::fresh_activated(FabricVersionInstance::native_default(), 0)
-                            .unwrap();
                     incoming
                         .reply
                         .take()
                         .unwrap()
-                        .reply(
-                            link.seal(node_up_ack_message(&ack, &generation).unwrap())
-                                .unwrap(),
-                            wire::deadline(),
-                        )
+                        .node_up(link, |body| {
+                            body.validate_fresh_stateless().unwrap();
+                            let ack = NodeUpAck::fresh_activated(
+                                FabricVersionInstance::native_default(),
+                                0,
+                            )
+                            .unwrap();
+                            Ok((ack, generation))
+                        })
                         .await
                         .unwrap();
                 }

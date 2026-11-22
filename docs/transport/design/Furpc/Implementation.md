@@ -852,6 +852,17 @@ retire a healthy original session. Domain inboxes, response-slot ownership,
 semantic/store commit gates and physical cleanup are unchanged. This is consumer
 composition, not new generic furpc APIs or native FM/Federation qualification.
 
+The matching bootstrap server adapters retain the original Request and invocation
+context inside each consuming response slot. After original-Link admission,
+server::Rpc decodes once, co-polls a typed handoff with the caller's borrowed
+domain handler, and encodes the prepared reply on that same invocation. No
+per-message task or second inbox is introduced. Domain handlers keep Node/cluster
+mutation and semantic gates; completion remains encoded response-data handoff,
+not local-write completion. Expired/retired invocations cannot execute a late
+handler. NodeUp final-upload progression and LFUM generation advancement still
+follow successful handoff. Low-level raw reply construction remains available
+for independent wire fixtures and malformed-response checks.
+
 ## Node local RAP typed composition
 
 Node's local RA/RAP bridge now separates private client and reply-intake adapters

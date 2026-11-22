@@ -133,7 +133,11 @@ pub struct Incoming {
     pub source: Source,
 }
 
-pub struct ResponseSlot(oneshot::Sender<Message>, Role);
+pub struct ResponseSlot {
+    pub(super) request: Request<Body>,
+    pub(super) response: oneshot::Sender<furpc::Result<IngressResponse>>,
+    role: Role,
+}
 impl ResponseSlot {
     /// Hand response data to the original furpc runner, not a local-write receipt.
     pub async fn reply(self, message: Message, deadline: Instant) -> furpc::Result<()> {
@@ -142,12 +146,14 @@ impl ResponseSlot {
         }
         bounded(&message)?;
         let props = super::Properties::new(&message)?;
-        match self.1 {
+        match self.role {
             Role::Fm => super::ack(&message, &props)?,
             Role::Node => super::proposal_ack(&message, &props)?,
             Role::Peer => return Err(Error::Unsupported("peer RPC")),
         }
-        self.0.send(message).map_err(|_| Error::Closed)
+        self.response
+            .send(Ok(IngressResponse::Reply(message)))
+            .map_err(|_| Error::Closed)
     }
 }
 
@@ -171,16 +177,22 @@ impl Service<Request<Body>> for Ingress {
             .source()
             .clone();
         let expects_reply = request.headers().effective().expects_reply;
-        let (parts, body) = request.into_parts();
-        let mut builder = Message::builder().body(body);
-        for header in parts.headers.records() {
+        let mut builder = Message::builder().body(request.body().clone());
+        for header in request.headers().records() {
             builder = builder.append_header(header.to_owned());
         }
         let result = builder.build().and_then(|message| {
             inbound(self.role, &message)?;
             let (response, receive) = if expects_reply {
                 let (tx, rx) = oneshot::channel();
-                (Some(ResponseSlot(tx, self.role)), Some(rx))
+                (
+                    Some(ResponseSlot {
+                        request,
+                        response: tx,
+                        role: self.role,
+                    }),
+                    Some(rx),
+                )
             } else {
                 (None, None)
             };
@@ -198,9 +210,7 @@ impl Service<Request<Body>> for Ingress {
         }
         Box::pin(async move {
             match result? {
-                Some(response) => Ok(IngressResponse::Reply(
-                    response.await.map_err(|_| Error::Closed)?,
-                )),
+                Some(response) => response.await.map_err(|_| Error::Closed)?,
                 None => Ok(IngressResponse::NoReply),
             }
         })

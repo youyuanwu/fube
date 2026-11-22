@@ -2894,12 +2894,8 @@ pub(crate) mod report_tests {
                     .reply
                     .take()
                     .ok_or("second LFUM upload missing reply authority")?
-                    .reply(
-                        fm.seal(lfum_upload_reply_message(&generation).map_err(err)?)?,
-                        wire::deadline(),
-                    )
-                    .await
-                    .map_err(err)?;
+                    .lfum_upload(&fm, |_| Ok(generation.clone()))
+                    .await?;
                 let completed = upload.receive().await;
                 let second_upload = completed.0;
                 upload.complete(&node, &launch.fm, completed, Instant::now())?;
@@ -2924,12 +2920,8 @@ pub(crate) mod report_tests {
                     .reply
                     .take()
                     .ok_or("resumed LFUM upload missing reply authority")?
-                    .reply(
-                        fm.seal(lfum_upload_reply_message(&generation).map_err(err)?)?,
-                        wire::deadline(),
-                    )
-                    .await
-                    .map_err(err)?;
+                    .lfum_upload(&fm, |_| Ok(generation.clone()))
+                    .await?;
                 let completed = upload.receive().await;
                 upload.complete(&node, &launch.fm, completed, Instant::now())?;
                 drop(first);
@@ -2969,12 +2961,8 @@ pub(crate) mod report_tests {
                     .reply
                     .take()
                     .ok_or("LFUM retry missing reply authority")?
-                    .reply(
-                        fm.seal(lfum_upload_reply_message(&generation).map_err(err)?)?,
-                        wire::deadline(),
-                    )
-                    .await
-                    .map_err(err)?;
+                    .lfum_upload(&fm, |_| Ok(generation.clone()))
+                    .await?;
                 let reply = upload.receive().await;
                 upload.complete(&node, &launch.fm, reply, Instant::now())?;
                 if node.generation_state().upload_pending

@@ -19,6 +19,8 @@ use std::{
 };
 use tower_service::Service;
 
+mod server;
+
 /// Opaque LFUM action/body pairing prepared from the caller's frozen inventory.
 pub struct LfumUploadRequest(Message);
 
@@ -196,20 +198,26 @@ impl<R: DeserializeOwned> Decoder for BootstrapCodec<R> {
         let metadata = self.admitted.get().ok_or_else(|| {
             CodecError::invalid_payload(Error::Internal("unadmitted bootstrap reply"))
         })?;
-        let mut budget = metadata.budget;
-        let mut decode = |bytes: &[u8]| {
-            fubst::serde::from_slice_with_budget(bytes, &mut |bytes| reserve(&mut budget, bytes))
-                .map_err(CodecError::from)
-        };
-        let len = src.remaining();
-        let value = if src.chunk().len() == len {
-            let value = decode(src.chunk())?;
-            src.advance(len)?;
-            value
-        } else {
-            decode(&src.copy_remaining()?)?
-        };
+        let value = decode_body(src, metadata.budget)?;
         Ok((value, metadata.generation.clone()))
+    }
+}
+
+fn decode_body<R: DeserializeOwned>(
+    src: &mut DecodeBuf<'_>,
+    mut budget: usize,
+) -> std::result::Result<R, CodecError> {
+    let mut decode = |bytes: &[u8]| {
+        fubst::serde::from_slice_with_budget(bytes, &mut |bytes| reserve(&mut budget, bytes))
+            .map_err(CodecError::from)
+    };
+    let len = src.remaining();
+    if src.chunk().len() == len {
+        let value = decode(src.chunk())?;
+        src.advance(len)?;
+        Ok(value)
+    } else {
+        decode(&src.copy_remaining()?)
     }
 }
 

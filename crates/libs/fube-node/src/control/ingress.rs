@@ -489,19 +489,15 @@ impl Ingress {
         let message = &incoming.message;
         match wire::action(message)?.as_str() {
             "GenerationProposal" => {
-                wire::predecode(message)?;
-                let header = decode_generation_proposal(message).map_err(err)?;
-                let body = node
-                    .process_generation_proposal(&self.fm, &header)
-                    .map_err(err)?;
-                let reply = generation_proposal_reply_message(&body).map_err(err)?;
                 incoming
                     .reply
                     .take()
                     .ok_or("GenerationProposal missing consuming request context")?
-                    .reply(link.seal(reply)?, wire::deadline())
-                    .await
-                    .map_err(err)?;
+                    .generation_proposal(link, |header| {
+                        node.process_generation_proposal(&self.fm, &header)
+                            .map_err(err)
+                    })
+                    .await?;
             }
             "GenerationUpdate" => {
                 wire::predecode(message)?;
