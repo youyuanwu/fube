@@ -8044,9 +8044,8 @@ async fn real_generation_upload_uses_correlated_replies_and_resumes_new_generati
         let proposed = decode_generation_update_reject(&rejected.message).map_err(err)?;
         assert_eq!(proposed, initial.number);
         let reply = link
-            .request(generation_proposal_message(&high).map_err(err)?)
+            .generation_proposal(&high)
             .await?;
-        let reply = decode_generation_proposal_reply(&reply).map_err(err)?;
         assert_eq!(reply.proposed, high.number);
         assert_eq!(reply.current, high.number);
         assert_eq!(reply.error, 0);

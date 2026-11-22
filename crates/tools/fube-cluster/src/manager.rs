@@ -45,7 +45,7 @@ impl Manager {
                 continue;
             };
             let generation = link.generation();
-            let request = link.request(generation_proposal_message(&generation).map_err(err)?);
+            let request = link.generation_proposal(&generation);
             tokio::pin!(request);
             let reply = loop {
                 tokio::select! {
@@ -59,8 +59,6 @@ impl Manager {
                     }
                 }
             };
-            wire::predecode(&reply)?;
-            let reply = decode_generation_proposal_reply(&reply).map_err(err)?;
             if reply.proposed != generation.number || reply.error != 0 {
                 return Err(
                     "FM shutdown ingress fence was not processed by the original Node".into(),
@@ -818,12 +816,7 @@ impl Manager {
             .ok_or("original generation link absent")?;
         match work {
             fm::GenerationWork::Propose(header) => {
-                if let Some(message) = link
-                    .request_optional(generation_proposal_message(&header).map_err(err)?)
-                    .await?
-                {
-                    wire::predecode(&message)?;
-                    let body = decode_generation_proposal_reply(&message).map_err(err)?;
+                if let Some(body) = link.generation_proposal_optional(&header).await? {
                     self.ledger
                         .generation
                         .as_mut()

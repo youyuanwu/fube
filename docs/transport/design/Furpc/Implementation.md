@@ -839,6 +839,19 @@ native FM/RA run was executed. The earlier exact-source `154b4f1` native-data
 receipt does not qualify this changed RA/node code. TLS and broader routing stay
 unqualified.
 
+**Typed bootstrap follow-up:** NodeUp, LFUMUpload and GenerationProposal now use
+private RpcClient codecs over the original PeerRequestService. Method-specific
+reply envelopes, unique native headers and PToP/generation authority are checked
+before the bounded body decoder runs. NodeUpAck retains its shared header/body
+allocation budget; fragmented bodies alone require a contiguous copy. Existing
+RA request factories supply opaque prepared bytes without reserialization.
+Node/cluster/standalone callers consume typed acknowledgments instead of raw
+Messages and repeated full-schema decoding. LFUM still freezes its inventory
+and owns independent retries; optional request timeouts do not grant success or
+retire a healthy original session. Domain inboxes, response-slot ownership,
+semantic/store commit gates and physical cleanup are unchanged. This is consumer
+composition, not new generic furpc APIs or native FM/Federation qualification.
+
 ## Node local RAP typed composition
 
 Node's local RA/RAP bridge now separates private client and reply-intake adapters

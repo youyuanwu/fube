@@ -315,21 +315,6 @@ impl Session {
         outbound(self.role, &message, false)?;
         self.peer.send(message, deadline).await.map(|_| ())
     }
-    pub async fn request(&self, message: Message, deadline: Instant) -> furpc::Result<Message> {
-        if self.terminal_error().is_some() {
-            return Err(Error::Closed);
-        }
-        outbound(self.role, &message, true)?;
-        let mut request = Request::new(message.body().clone());
-        *request.headers_mut() = message.headers().clone();
-        let response = self.peer.request(request, deadline).await?;
-        let mut builder = Message::builder().body(response.body().clone());
-        for header in response.headers().records() {
-            builder = builder.append_header(header.to_owned());
-        }
-        builder.build()
-    }
-
     #[cfg(test)]
     pub(super) fn queued(&self) -> usize {
         self.incoming.try_lock().expect("unpolled test inbox").len()

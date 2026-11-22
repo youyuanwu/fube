@@ -12,7 +12,7 @@ use crate::local::{FmWork, LocalDisposition, Node};
 use fube_ra::{entity as ra, protocol::*};
 use std::{collections::VecDeque, future::Future, pin::Pin, task::Poll, time::Duration};
 use tokio::time::Instant;
-use wire::Link;
+use wire::{LfumUploadRequest, Link};
 
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub type Result<T> = std::result::Result<T, String>;
@@ -53,7 +53,7 @@ pub enum SemanticAck {
     Notification(ServiceTypeNotification),
     Report(ReplicaUp),
 }
-type UploadRequest = Pin<Box<dyn Future<Output = Result<Option<furpc::Message>>> + Send>>;
+type UploadRequest = Pin<Box<dyn Future<Output = Result<Option<GenerationHeader>>> + Send>>;
 
 struct LfumRequest {
     upload: u64,
@@ -87,7 +87,7 @@ impl LfumUploadState {
     }
 
     /// Poll original requests independently, or wait while none is in flight.
-    pub async fn receive(&mut self) -> (u64, Result<Option<furpc::Message>>) {
+    pub async fn receive(&mut self) -> (u64, Result<Option<GenerationHeader>>) {
         std::future::poll_fn(|context| {
             for upload in &mut self.uploads {
                 if let Some(request) = &mut upload.request {
@@ -105,7 +105,7 @@ impl LfumUploadState {
         &mut self,
         node: &Node,
         source: &NodeInstance,
-        completed: (u64, Result<Option<furpc::Message>>),
+        completed: (u64, Result<Option<GenerationHeader>>),
         now: Instant,
     ) -> Result<()> {
         let (upload, reply) = completed;
@@ -122,9 +122,7 @@ impl LfumUploadState {
                     .node(ra::NodeProperty::LfumUploadRetryIntervalTicks)
                     .max(1),
             );
-        if let Some(message) = reply? {
-            wire::predecode(&message)?;
-            let generation = decode_lfum_upload_reply(&message).map_err(err)?;
+        if let Some(generation) = reply? {
             node.complete_lfum_upload(upload, source, &generation)
                 .map_err(err)?;
             self.uploads.remove(index);
@@ -157,11 +155,9 @@ impl LfumUploadState {
             if upload.request.is_some() || now < upload.retry_at {
                 continue;
             }
-            let request = lfum_upload_message(&upload.body).map_err(err)?;
+            let request = LfumUploadRequest::new(&upload.body)?;
             let link = link.clone();
-            upload.request = Some(Box::pin(
-                async move { link.request_optional(request).await },
-            ));
+            upload.request = Some(Box::pin(async move { link.lfum_upload(request).await }));
         }
         Ok(())
     }

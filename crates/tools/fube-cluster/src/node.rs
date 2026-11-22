@@ -142,8 +142,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         fabric.clone(),
     )
     .map_err(err)?;
-    let reply = link.request(node_up_message(&up).map_err(err)?).await?;
-    let (ack, generation) = decode_node_up_ack(&reply).map_err(err)?;
+    let (ack, generation) = link.node_up(&up).await?;
     ack.validate_fresh_activated(&fabric).map_err(err)?;
     if generation != launch.generation {
         return Err("foreign/stale NodeUpAck generation".into());

@@ -402,12 +402,9 @@ impl Owner {
             version.clone(),
         )
         .map_err(err)?;
-        let reply =
-            tokio::time::timeout_at(deadline, link.request(node_up_message(&up).map_err(err)?))
-                .await
-                .map_err(err)??;
-        wire::predecode(&reply)?;
-        let (ack, generation) = decode_node_up_ack(&reply).map_err(err)?;
+        let (ack, generation) = tokio::time::timeout_at(deadline, link.node_up(&up))
+            .await
+            .map_err(err)??;
         ack.validate_fresh_activated(&version).map_err(err)?;
         if generation != self.config.generation()? {
             return Err("foreign NodeUpAck generation".into());

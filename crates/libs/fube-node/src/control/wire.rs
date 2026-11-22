@@ -4,7 +4,7 @@ use fube_ra::protocol::{
     GenerationHeader, NodeInstance, FM_ACTOR, GENERATION_HEADER, RA_ACTOR, RS_ACTOR,
 };
 use fubst::serde::from_slice_with_budget;
-use furpc::{HeaderId, HeaderRecord, Message};
+use furpc::{Body, HeaderId, HeaderRecord, Headers, Message};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     sync::{Arc, Mutex},
@@ -12,7 +12,9 @@ use std::{
 };
 use tokio::time::Instant;
 
+mod bootstrap;
 mod session;
+pub use bootstrap::LfumUploadRequest;
 pub use session::{Failure, Incoming, Session};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,7 +33,10 @@ struct Properties {
 }
 impl Properties {
     fn new(message: &Message) -> furpc::Result<Self> {
-        let common = message.headers().effective();
+        Self::from_headers(message.headers())
+    }
+    fn from_headers(headers: &Headers) -> furpc::Result<Self> {
+        let common = headers.effective();
         Ok(Self {
             actor: common.actor.get(),
             action: String::from_utf16(common.action())
@@ -78,10 +83,12 @@ struct PToP {
 const PTOP: u16 = 0x8013;
 
 fn bounded(message: &Message) -> furpc::Result<()> {
-    if message.body().len() > LIMIT
-        || message.headers().records().count() > 16
-        || message
-            .headers()
+    bounded_parts(message.headers(), message.body())
+}
+fn bounded_parts(headers: &Headers, body: &Body) -> furpc::Result<()> {
+    if body.len() > LIMIT
+        || headers.records().count() > 16
+        || headers
             .records()
             .map(|header| header.value().len())
             .sum::<usize>()
@@ -504,18 +511,23 @@ impl Link {
         Ok(())
     }
     fn is_current(&self, message: &Message) -> Result<bool> {
-        validate_source(message, &self.local, &self.remote)?;
-        let mut headers = message
-            .headers()
+        self.is_current_parts(message.headers(), message.body())
+    }
+    fn is_current_parts(&self, headers: &Headers, body: &Body) -> Result<bool> {
+        validate_source(headers, body, &self.local, &self.remote)?;
+        let mut generations = headers
             .records()
             .filter(|header| header.id().get() == GENERATION_HEADER);
-        if let Some(header) = headers.next() {
+        if let Some(header) = generations.next() {
             let generation: GenerationHeader = decode(header.value())?;
             let generation_independent = matches!(
-                action(message)?.as_str(),
+                Properties::from_headers(headers)
+                    .map_err(err)?
+                    .action
+                    .as_str(),
                 "GenerationProposal" | "GenerationUpdate" | "LFUMUploadReply"
             );
-            if headers.next().is_some() || generation.for_fm_replica {
+            if generations.next().is_some() || generation.for_fm_replica {
                 return Err("foreign/stale/duplicate native FM generation".into());
             }
             if !generation_independent && generation.number.older_than(&self.generation().number) {
@@ -529,27 +541,6 @@ impl Link {
             .send(self.seal(message)?, deadline())
             .await
             .map_err(err)
-    }
-    pub async fn request(&self, message: Message) -> Result<Message> {
-        self.request_optional(message)
-            .await?
-            .ok_or("native request reply timeout".into())
-    }
-    pub async fn request_optional(&self, message: Message) -> Result<Option<Message>> {
-        let reply = match self.session.request(self.seal(message)?, deadline()).await {
-            Ok(reply) => reply,
-            Err(furpc::Error::Timeout(_)) => return Ok(None),
-            Err(error) => return Err(err(error)),
-        };
-        let props = Properties::new(&reply).map_err(err)?;
-        match self.session.role() {
-            Role::Node => ack(&reply, &props),
-            Role::Fm => proposal_ack(&reply, &props),
-            Role::Peer => return Err("peer RPC is unsupported".into()),
-        }
-        .map_err(err)?;
-        self.validate(&reply)?;
-        Ok(Some(reply))
     }
     pub async fn receive(&self, until: Instant) -> Result<Option<Incoming>> {
         self.receive_checked(until)
@@ -621,12 +612,14 @@ impl std::fmt::Display for ReceiveError {
         }
     }
 }
-fn validate_source(message: &Message, local: &NodeInstance, remote: &NodeInstance) -> Result<()> {
-    bounded(message).map_err(err)?;
-    let mut headers = message
-        .headers()
-        .records()
-        .filter(|header| header.id().get() == PTOP);
+fn validate_source(
+    headers: &Headers,
+    body: &Body,
+    local: &NodeInstance,
+    remote: &NodeInstance,
+) -> Result<()> {
+    bounded_parts(headers, body).map_err(err)?;
+    let mut headers = headers.records().filter(|header| header.id().get() == PTOP);
     let header = headers.next().ok_or("missing native source identity")?;
     if headers.next().is_some() {
         return Err("duplicate native source identity".into());
@@ -772,24 +765,204 @@ mod tests {
             generation: old.number.clone(),
             ..LfumUpload::default()
         };
-        let (reply, ()) = tokio::join!(node.request(lfum_upload_message(&body).unwrap()), async {
+        let (reply, ()) = tokio::join!(
+            node.lfum_upload(LfumUploadRequest::new(&body).unwrap()),
+            async {
+                let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
+                assert_eq!(decode_lfum_upload(&incoming.message).unwrap(), body);
+                incoming
+                    .reply
+                    .take()
+                    .unwrap()
+                    .reply(
+                        fm.seal(lfum_upload_reply_message(&old).unwrap()).unwrap(),
+                        deadline(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        );
+        assert_eq!(reply.unwrap().unwrap(), old);
+        assert_eq!(fm.generation(), current);
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_bootstrap_preserves_native_profiles_and_correlated_results() {
+        let (node, fm) = links(false).await;
+        let version = FabricVersionInstance::native_default();
+        let up = NodeUp::fresh_stateless(
+            "node".into(),
+            "typed-bootstrap".into(),
+            "127.0.0.1:12345".parse().unwrap(),
+            version.clone(),
+        )
+        .unwrap();
+        let ack = NodeUpAck::fresh_activated(version, 42).unwrap();
+        let generation = node.generation();
+        let (reply, ()) = tokio::join!(node.node_up(&up), async {
             let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
-            assert_eq!(decode_lfum_upload(&incoming.message).unwrap(), body);
+            assert_eq!(incoming.message.headers().effective().actor.get(), 11);
+            assert_eq!(decode_node_up(&incoming.message).unwrap(), up);
             incoming
                 .reply
                 .take()
                 .unwrap()
                 .reply(
-                    fm.seal(lfum_upload_reply_message(&old).unwrap()).unwrap(),
+                    fm.seal(node_up_ack_message(&ack, &generation).unwrap())
+                        .unwrap(),
                     deadline(),
                 )
                 .await
                 .unwrap();
         });
-        assert_eq!(decode_lfum_upload_reply(&reply.unwrap()).unwrap(), old);
-        assert_eq!(fm.generation(), current);
+        assert_eq!(reply.unwrap(), (ack, generation.clone()));
+        let proposal = GenerationProposalReply {
+            proposed: generation.number.clone(),
+            current: generation.number.clone(),
+            error: 0,
+        };
+        let (reply, ()) = tokio::join!(fm.generation_proposal(&generation), async {
+            let mut incoming = node.receive_checked(deadline()).await.unwrap().unwrap();
+            assert_eq!(incoming.message.headers().effective().actor.get(), 12);
+            assert_eq!(
+                decode_generation_proposal(&incoming.message).unwrap(),
+                generation
+            );
+            incoming
+                .reply
+                .take()
+                .unwrap()
+                .reply(
+                    node.seal(generation_proposal_reply_message(&proposal).unwrap())
+                        .unwrap(),
+                    deadline(),
+                )
+                .await
+                .unwrap();
+        });
+        assert_eq!(reply.unwrap(), proposal);
         node.close().await.unwrap();
         fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_lfum_rejects_wrong_method_and_nonempty_success_body() {
+        let (node, fm) = links(false).await;
+        let generation = fm.generation();
+        let nonempty = lfum_upload_reply_message(&generation).unwrap();
+        let mut builder = Message::builder().body(Body::from_bytes(vec![0xff]).unwrap());
+        for header in nonempty.headers().records() {
+            builder = builder.append_header(header.to_owned());
+        }
+        for (reply, expected) in [
+            (
+                node_up_ack_message(&NodeUpAck::default(), &generation).unwrap(),
+                "unsupported bootstrap reply",
+            ),
+            (builder.build().unwrap(), "LFUMUploadReply must be bodyless"),
+        ] {
+            let request = LfumUploadRequest::new(&LfumUpload::default()).unwrap();
+            let (result, ()) = tokio::join!(node.lfum_upload(request), async {
+                let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
+                incoming
+                    .reply
+                    .take()
+                    .unwrap()
+                    .reply(fm.seal(reply).unwrap(), deadline())
+                    .await
+                    .unwrap();
+            });
+            assert!(result.unwrap_err().contains(expected));
+            assert!(node.is_live());
+        }
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_bootstrap_rejects_source_and_generation_before_malformed_body_decode() {
+        let (node, fm) = links(false).await;
+        let up = NodeUp::fresh_stateless(
+            "node".into(),
+            "typed-bootstrap".into(),
+            "127.0.0.1:12345".parse().unwrap(),
+            FabricVersionInstance::native_default(),
+        )
+        .unwrap();
+        for (invalid, expected) in [
+            (
+                "source",
+                "foreign/stale native sender or recipient incarnation",
+            ),
+            ("stale", "foreign/stale/duplicate native FM generation"),
+            ("missing", "missing reliability header"),
+            ("duplicate", "foreign/stale/duplicate native FM generation"),
+        ] {
+            let (result, ()) = tokio::join!(node.node_up(&up), async {
+                let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
+                let source = if invalid == "source" {
+                    Link {
+                        remote: NodeInstance {
+                            instance: node.local.instance + 1,
+                            ..node.local.clone()
+                        },
+                        ..fm.clone()
+                    }
+                } else {
+                    fm.clone()
+                };
+                let mut generation = fm.generation();
+                if invalid == "stale" {
+                    generation.number.generation -= 1;
+                }
+                let original = node_up_ack_message(&NodeUpAck::default(), &generation).unwrap();
+                let mut builder = Message::builder().body(Body::from_bytes(vec![0xff]).unwrap());
+                for header in original.headers().records() {
+                    if invalid != "missing" || header.id().get() != GENERATION_HEADER {
+                        builder = builder.append_header(header.to_owned());
+                    }
+                }
+                if invalid == "duplicate" {
+                    builder = builder.append_header(generation.header().unwrap());
+                }
+                incoming
+                    .reply
+                    .take()
+                    .unwrap()
+                    .reply(source.seal(builder.build().unwrap()).unwrap(), deadline())
+                    .await
+                    .unwrap();
+            });
+            assert!(result.unwrap_err().contains(expected));
+            assert!(node.is_live());
+        }
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_optional_bootstrap_timeouts_preserve_original_session() {
+        let (node, fm) = links(false).await;
+        let request = LfumUploadRequest::new(&LfumUpload::default()).unwrap();
+        let generation = fm.generation();
+        let (lfum, proposal, retained) = tokio::join!(
+            node.lfum_upload(request),
+            fm.generation_proposal_optional(&generation),
+            async {
+                let lfum = fm.receive_checked(deadline()).await.unwrap().unwrap();
+                let proposal = node.receive_checked(deadline()).await.unwrap().unwrap();
+                (lfum, proposal)
+            }
+        );
+        assert!(lfum.unwrap().is_none());
+        assert!(proposal.unwrap().is_none());
+        assert!(node.is_live());
+        assert!(fm.is_live());
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+        drop(retained);
     }
 
     #[tokio::test]
@@ -798,7 +971,7 @@ mod tests {
         let request_owner = node.clone();
         let request = tokio::spawn(async move {
             request_owner
-                .request(lfum_upload_message(&LfumUpload::default()).unwrap())
+                .lfum_upload(LfumUploadRequest::new(&LfumUpload::default()).unwrap())
                 .await
         });
         let mut incoming = fm.receive(deadline()).await.unwrap().unwrap();
@@ -979,24 +1152,26 @@ mod tests {
                 .build()
                 .unwrap()
         };
-        validate_source(&message(&identity), &local, &remote).unwrap();
+        let validate =
+            |message: Message| validate_source(message.headers(), message.body(), &local, &remote);
+        validate(message(&identity)).unwrap();
         let mut stale = identity.clone();
         stale.from.instance -= 1;
-        assert!(validate_source(&message(&stale), &local, &remote).is_err());
+        assert!(validate(message(&stale)).is_err());
         stale = identity.clone();
         stale.to.instance -= 1;
-        assert!(validate_source(&message(&stale), &local, &remote).is_err());
+        assert!(validate(message(&stale)).is_err());
         stale = identity.clone();
         stale.from.id = [3; 16];
-        assert!(validate_source(&message(&stale), &local, &remote).is_err());
+        assert!(validate(message(&stale)).is_err());
         stale = identity.clone();
         stale.exact_instance = false;
-        assert!(validate_source(&message(&stale), &local, &remote).is_err());
+        assert!(validate(message(&stale)).is_err());
         let duplicate = Message::builder()
             .append_header(HeaderRecord::native(HeaderId::new(PTOP).unwrap(), &identity).unwrap())
             .append_header(HeaderRecord::native(HeaderId::new(PTOP).unwrap(), &identity).unwrap())
             .build()
             .unwrap();
-        assert!(validate_source(&duplicate, &local, &remote).is_err());
+        assert!(validate(duplicate).is_err());
     }
 }
