@@ -12,7 +12,7 @@ use crate::local::{FmWork, LocalDisposition, Node};
 use fube_ra::{entity as ra, protocol::*};
 use std::{collections::VecDeque, future::Future, pin::Pin, task::Poll, time::Duration};
 use tokio::time::Instant;
-use wire::{LfumUploadRequest, Link, PeerClient};
+use wire::{FmClient, LfumUploadRequest, Link, PeerClient};
 
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub type Result<T> = std::result::Result<T, String>;
@@ -763,39 +763,8 @@ impl Adapter {
                         return Ok(());
                     }
                 }
-                let message = match &reply.effect {
-                    ra::Effect::NodeActivateReply(body) => {
-                        node_activate_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::NodeDeactivateReply(body) => {
-                        node_deactivate_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::NodeUpdateServiceReply(body) => {
-                        node_update_service_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::Reply(body) => add_instance_reply_message(body, Owner::Fm),
-                    ra::Effect::DoReconfigurationReply(body) => {
-                        do_reconfiguration_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::ChangeConfiguration(body) => {
-                        change_configuration_message(body, Owner::Fm)
-                    }
-                    ra::Effect::ReplicaEndpointUpdated(body) => {
-                        replica_endpoint_updated_message(body, Owner::Fm)
-                    }
-                    ra::Effect::PrimaryReply(body) => add_primary_reply_message(body, Owner::Fm),
-                    ra::Effect::AddReplicaReply(body) => add_replica_reply_message(body, Owner::Fm),
-                    ra::Effect::RemoveReplicaReply(body) => {
-                        remove_replica_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::RemoveReply(body) => remove_instance_reply_message(body, Owner::Fm),
-                    ra::Effect::DeleteReplicaReply(body) => {
-                        delete_replica_reply_message(body, Owner::Fm)
-                    }
-                    _ => return Err("unimplemented semantic reply retained".into()),
-                }
-                .map_err(err)?;
-                link.send(message).await?;
+                let mut client = FmClient::new(link)?;
+                client.send(&reply.effect).await?;
                 self.replies.pop_front();
             }
         }
@@ -833,17 +802,12 @@ impl Adapter {
                     self.escrow.remove(index);
                     return Ok(());
                 }
-                ra::Effect::ServiceTypeStatus { enabled, body } => {
+                ra::Effect::ServiceTypeStatus { .. } => {
                     let Some(link) = link else {
                         continue;
                     };
-                    let message = if *enabled {
-                        service_type_enabled_message(body)
-                    } else {
-                        service_type_disabled_message(body)
-                    }
-                    .map_err(err)?;
-                    link.send(message).await?;
+                    let mut client = FmClient::new(link)?;
+                    client.send(&effect).await?;
                     self.status_due = Some(
                         Instant::now()
                             + ticks(
@@ -855,11 +819,12 @@ impl Adapter {
                     self.escrow.remove(index);
                     return Ok(());
                 }
-                ra::Effect::ReportLoad(body) => {
+                ra::Effect::ReportLoad(_) => {
                     let Some(link) = link else {
                         continue;
                     };
-                    link.send(report_load_message(body).map_err(err)?).await?;
+                    let mut client = FmClient::new(link)?;
+                    client.send(&effect).await?;
                     self.escrow.remove(index);
                     return Ok(());
                 }
@@ -897,8 +862,8 @@ impl Adapter {
                                 return Err("unsupported replaced notification remains semantically pending".into());
                             }
                             self.notification_pending = Some((**body).clone());
-                            link.send(service_type_notification_message(body).map_err(err)?)
-                                .await?;
+                            let mut client = FmClient::new(link)?;
+                            client.send(&effect).await?;
                         }
                         self.escrow[index].sent = true;
                     }
@@ -929,8 +894,8 @@ impl Adapter {
                         continue;
                     };
                     self.report_pending = Some((**body).clone());
-                    link.send(replica_up_message(body, Owner::Fm).map_err(err)?)
-                        .await?;
+                    let mut client = FmClient::new(link)?;
+                    client.send(&effect).await?;
                     self.escrow.remove(index);
                     self.finish_report_pass(entity, report_retry(node, entity));
                     return Ok(());

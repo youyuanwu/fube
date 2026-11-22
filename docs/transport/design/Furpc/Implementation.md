@@ -883,6 +883,18 @@ Capacity/Busy decisions. Original-Link authority and older-generation handling
 remain in Link, and caller-owned raw input is unchanged when admission blocks.
 This is typed consumer composition, not new peer protocol or native qualification.
 
+**Typed FM-control client:** lifecycle replies, configuration/endpoint effects,
+ReplicaUp, service-type notifications/status and ReportLoad now use a private
+OneWayClient on the captured original PeerSendService. Existing native factories
+retain ordinary-FM actor/action/body pairings, priorities and the absence of an
+outgoing GenerationHeader; source sealing and relationship/envelope/terminal
+checks remain on the original Link. FM and peer clients share the prepared-body
+codec without reserialization. Adapter retains snapshot/generation fences, retry
+scheduling, captured-work completion, pending semantic ACKs and pop-on-success
+queues. A successful send observes only the actual local-write receipt, including
+reply-named actions; it does not complete remote FM execution or semantic ACKs.
+No reconnect, new generic furpc API or native FM/Federation qualification is added.
+
 ## Node local RAP typed composition
 
 Node's local RA/RAP bridge now separates private client and reply-intake adapters

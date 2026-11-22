@@ -1,5 +1,5 @@
 //! Native peer effect profiles; target, phase and retry policy stay in Adapter.
-use super::{bootstrap::PreparedEncoder, deadline, err, outbound, Link, Result, LIMIT};
+use super::{bootstrap::PreparedBodyCodec, deadline, err, outbound, Link, Result, LIMIT};
 use fube_ra::{
     entity::Effect,
     protocol::{
@@ -8,7 +8,7 @@ use fube_ra::{
         do_reconfiguration_message, get_lsn_message, get_lsn_reply_message, GenerationHeader,
     },
 };
-use furpc::{Body, Codec, Error, FubstCodec, Message, OneWayClient, PeerSendService, Request};
+use furpc::{Error, Message, OneWayClient, PeerSendService, Request};
 
 pub(in crate::control) struct PeerClient {
     link: Link,
@@ -60,23 +60,6 @@ impl PeerClient {
             .await
             .map(|_| ())
             .map_err(err)
-    }
-}
-
-struct PreparedBodyCodec;
-
-impl Codec for PreparedBodyCodec {
-    type Encode = Body;
-    type Decode = ();
-    type Encoder = PreparedEncoder;
-    type Decoder = <FubstCodec<(), ()> as Codec>::Decoder;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        PreparedEncoder
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        FubstCodec::<(), ()>::default().decoder()
     }
 }
 

@@ -7,7 +7,8 @@ use fube_ra::protocol::{
 };
 use furpc::{
     header, Body, ClientCodecLimits, Codec, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder,
-    Error, HeaderId, HeaderRef, Headers, Message, PeerRequestService, Request, Response, RpcClient,
+    Error, FubstCodec, HeaderId, HeaderRef, Headers, Message, PeerRequestService, Request,
+    Response, RpcClient,
 };
 use serde::de::DeserializeOwned;
 use std::{
@@ -159,6 +160,22 @@ struct BootstrapCodec<R> {
     marker: PhantomData<fn() -> R>,
 }
 pub(super) struct PreparedEncoder;
+pub(super) struct PreparedBodyCodec;
+
+impl Codec for PreparedBodyCodec {
+    type Encode = Body;
+    type Decode = ();
+    type Encoder = PreparedEncoder;
+    type Decoder = <FubstCodec<(), ()> as Codec>::Decoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        PreparedEncoder
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        FubstCodec::<(), ()>::default().decoder()
+    }
+}
 
 impl<R: DeserializeOwned> Codec for BootstrapCodec<R> {
     type Encode = Body;
