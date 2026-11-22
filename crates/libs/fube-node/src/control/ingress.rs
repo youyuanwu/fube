@@ -402,13 +402,12 @@ impl Ingress {
         message: &Message,
         stopping: bool,
     ) -> Result<Option<u64>> {
-        wire::predecode(message)?;
+        let (action, incoming) = wire::PeerIncoming::decode(message)?;
         let peer = self
             .peers
             .iter()
             .find(|peer| &peer.node == source)
             .ok_or("unbound peer ingress")?;
-        let action = wire::action(message)?;
         if stopping
             && !matches!(
                 action.as_str(),
@@ -417,42 +416,48 @@ impl Ingress {
         {
             return Err("new peer lifecycle intent is not admitted during shutdown".into());
         }
-        let result = match action.as_str() {
-            "DoReconfiguration" if self.profile.peer_replicas() => {
-                let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
+        let result = match incoming {
+            wire::PeerIncoming::DoReconfiguration(payload) if self.profile.peer_replicas() => {
+                let (body, generation) = payload.into_parts()?;
                 self.description(&body.configuration.unit, &body.configuration.service)?;
                 node.continue_swap_from_peer(body, source, &generation)
             }
-            "GetLSN" => {
-                let (body, generation) = decode_get_lsn(message).map_err(err)?;
+            wire::PeerIncoming::GetLsn(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 node.get_lsn_from_peer(body, source, &generation)
             }
-            "GetLSNReply" => {
-                let (body, generation) = decode_get_lsn_reply(message).map_err(err)?;
+            wire::PeerIncoming::GetLsnReply(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 node.get_lsn_reply_from_peer(body, source, &generation)
             }
-            "Deactivate" if !self.coordinating || self.profile.mesh_peers() => {
-                let (body, generation) = decode_deactivate(message).map_err(err)?;
+            wire::PeerIncoming::Deactivate(payload)
+                if !self.coordinating || self.profile.mesh_peers() =>
+            {
+                let (body, generation) = payload.into_parts()?;
                 self.description(&body.configuration.unit, &body.configuration.service)?;
                 node.deactivate_replica_from_peer(body, source, &generation)
             }
-            "DeactivateReply" if self.coordinating || self.profile.mesh_peers() => {
-                let (body, generation) = decode_deactivate_reply(message).map_err(err)?;
+            wire::PeerIncoming::DeactivateReply(payload)
+                if self.coordinating || self.profile.mesh_peers() =>
+            {
+                let (body, generation) = payload.into_parts()?;
                 self.idle_target(&body.unit.id, &body.replica, peer)?;
                 node.deactivate_reply_from_peer(body, source, &generation)
             }
-            "Activate" => {
-                let (body, generation) = decode_activate(message).map_err(err)?;
+            wire::PeerIncoming::Activate(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 self.description(&body.configuration.unit, &body.configuration.service)?;
                 node.activate_replica_from_peer(body, source, &generation)
             }
-            "ActivateReply" => {
-                let (body, generation) = decode_activate_reply(message).map_err(err)?;
+            wire::PeerIncoming::ActivateReply(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 self.idle_target(&body.unit.id, &body.replica, peer)?;
                 node.activate_reply_from_peer(body, source, &generation)
             }
-            "CreateReplica" if !self.coordinating || self.profile.mesh_peers() => {
-                let (body, generation) = decode_create_replica(message).map_err(err)?;
+            wire::PeerIncoming::CreateReplica(payload)
+                if !self.coordinating || self.profile.mesh_peers() =>
+            {
+                let (body, generation) = payload.into_parts()?;
                 self.description(&body.replica.0.unit, &body.replica.0.service)?;
                 self.idle_target(
                     &body.replica.0.unit.id,
@@ -461,8 +466,10 @@ impl Ingress {
                 )?;
                 node.create_replica_from_peer(body, source, &generation)
             }
-            "CreateReplicaReply" if self.coordinating || self.profile.mesh_peers() => {
-                let (body, generation) = decode_create_replica_reply(message).map_err(err)?;
+            wire::PeerIncoming::CreateReplicaReply(payload)
+                if self.coordinating || self.profile.mesh_peers() =>
+            {
+                let (body, generation) = payload.into_parts()?;
                 self.idle_target(&body.unit.id, &body.replica, peer)?;
                 node.create_replica_reply_from_peer(body, source, &generation)
             }

@@ -95,7 +95,7 @@ impl Method {
     }
 }
 
-fn unique(headers: &Headers, id: HeaderId) -> furpc::Result<HeaderRef<'_>> {
+pub(super) fn unique(headers: &Headers, id: HeaderId) -> furpc::Result<HeaderRef<'_>> {
     let mut matching = headers.records().filter(|header| header.id() == id);
     let header = matching
         .next()

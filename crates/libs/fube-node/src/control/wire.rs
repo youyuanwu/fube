@@ -14,9 +14,11 @@ use tokio::time::Instant;
 
 mod bootstrap;
 mod peer_client;
+mod peer_intake;
 mod session;
 pub use bootstrap::LfumUploadRequest;
 pub(super) use peer_client::PeerClient;
+pub(super) use peer_intake::Incoming as PeerIncoming;
 pub use session::{Failure, Incoming, Session};
 
 #[derive(Clone, Copy, PartialEq, Eq)]

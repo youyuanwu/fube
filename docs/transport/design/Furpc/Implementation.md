@@ -872,7 +872,16 @@ relationship policy, finite envelope bounds and terminal-session checks precede
 submission. Adapter still owns target matching, phase fences, queue removal,
 retry/retirement policy and semantic completion. Successful submission observes
 and drops the actual local-write receipt, not a remote execution or semantic ACK.
-No reconnect, generic furpc API or peer ingress migration is introduced.
+The client introduces no reconnect or generic furpc API.
+
+The matching private peer intake decodes each of the nine native bodies once
+under the existing allocation budget, borrowing contiguous input and copying
+only fragmented bodies. Factory/header adaptation remains deferred until the
+original shutdown and placement gates; foreign/unknown actions keep their prior
+failure points. Ingress retains service/replica checks, RA mutation and
+Capacity/Busy decisions. Original-Link authority and older-generation handling
+remain in Link, and caller-owned raw input is unchanged when admission blocks.
+This is typed consumer composition, not new peer protocol or native qualification.
 
 ## Node local RAP typed composition
 
