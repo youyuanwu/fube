@@ -895,6 +895,17 @@ queues. A successful send observes only the actual local-write receipt, includin
 reply-named actions; it does not complete remote FM execution or semantic ACKs.
 No reconnect, new generic furpc API or native FM/Federation qualification is added.
 
+The matching private FM intake shares the peer payload decoder and deferred
+native header adaptation. Each supported FM control body is decoded once under
+the existing allocation budget; contiguous input is borrowed and only fragmented
+bodies are copied. Malformed bodies still fail before FM generation admission,
+while factory/header failures remain after the original shutdown/profile gates.
+Ingress retains exact receive-generation checks, placement/service/replica
+admission, RA mutation, semantic ACK handoff and Capacity-to-Retained decisions.
+Foreign/unknown actions retain their prior failure points. Cluster and standalone
+callers keep the original raw Incoming on blocked admission, and original-Link
+authority is unchanged. This adds no protocol or native qualification claim.
+
 ## Node local RAP typed composition
 
 Node's local RA/RAP bridge now separates private client and reply-intake adapters

@@ -64,7 +64,7 @@ struct Scalar<T> {
 }
 
 impl<'a, T: DeserializeOwned> Payload<'a, T> {
-    fn decode(message: &'a Message, action: &'static str) -> Result<Self> {
+    pub(super) fn decode(message: &'a Message, action: &'static str) -> Result<Self> {
         let mut src = DecodeBuf::new(message.body());
         let body = if src.chunk().len() == src.remaining() {
             decode(src.chunk())?

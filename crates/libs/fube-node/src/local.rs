@@ -3430,6 +3430,9 @@ mod ingress_tests {
 
     #[tokio::test]
     async fn fm_capacity_retains_semantic_ack_and_rejects_unadmitted_generation_before_mutation() {
+        use crate::control::{err, wire};
+        use furpc::{header, Body, HeaderId, Message};
+
         let local = Placement {
             node: NodeInstance {
                 id: [1; 16],
@@ -3474,6 +3477,53 @@ mod ingress_tests {
             vec![],
         )
         .unwrap();
+        let without = |message: &Message, id: HeaderId| {
+            let mut builder = Message::builder().body(message.body().clone());
+            for header in message
+                .headers()
+                .records()
+                .filter(|header| header.id() != id)
+            {
+                builder = builder.append_header(header.to_owned());
+            }
+            builder.build().unwrap()
+        };
+        let activation =
+            node_activate_request_message(&NodeActivateRequest::default(), &generation).unwrap();
+        let missing_actor = without(&activation, header::ACTOR);
+        assert_eq!(
+            ingress.fm(&mut node, &missing_actor, true).err().unwrap(),
+            "new lifecycle intent is not admitted during shutdown"
+        );
+        assert_eq!(
+            ingress.fm(&mut node, &missing_actor, false).err().unwrap(),
+            err(decode_node_activate_request(&missing_actor).unwrap_err())
+        );
+        let missing_generation = without(&missing_actor, HeaderId::new(GENERATION_HEADER).unwrap());
+        assert_eq!(
+            ingress
+                .fm(&mut node, &missing_generation, true)
+                .err()
+                .unwrap(),
+            "missing FM generation"
+        );
+        let mut builder = Message::builder().body(Body::from_bytes(vec![0xff]).unwrap());
+        for header in missing_generation.headers().records() {
+            builder = builder.append_header(header.to_owned());
+        }
+        let malformed = builder.build().unwrap();
+        assert_eq!(
+            ingress.fm(&mut node, &malformed, true).err().unwrap(),
+            wire::predecode(&malformed).unwrap_err()
+        );
+        let reconfiguration =
+            do_reconfiguration_message(&DoReconfiguration::default(), &generation).unwrap();
+        let missing_actor = without(&reconfiguration, header::ACTOR);
+        assert_eq!(
+            ingress.fm(&mut node, &missing_actor, false).err().unwrap(),
+            "DoReconfiguration requires a replicated stateful profile"
+        );
+        assert_eq!(node.pending_commands(), 0);
         let mut foreign = AddInstance::default();
         foreign.unit.id.guid.0[0] = 1;
         let message = add_instance_message(&foreign, &generation).unwrap();

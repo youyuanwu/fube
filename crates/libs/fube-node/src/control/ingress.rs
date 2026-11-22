@@ -230,7 +230,7 @@ impl Ingress {
     }
 
     pub fn fm(&self, node: &mut Node, message: &Message, stopping: bool) -> Result<Admission> {
-        wire::predecode(message)?;
+        let (action, incoming) = wire::FmIncoming::decode(message)?;
         let mut headers = message
             .headers()
             .records()
@@ -243,7 +243,6 @@ impl Ingress {
         {
             return Err("FM generation must match the Node's admitted receive generation".into());
         }
-        let action = wire::action(message)?;
         if stopping
             && !matches!(
                 action.as_str(),
@@ -259,15 +258,9 @@ impl Ingress {
             return Err("new lifecycle intent is not admitted during shutdown".into());
         }
         let mut acknowledgement = None;
-        let result = match action.as_str() {
-            "ServiceTypeEnabledReply" | "ServiceTypeDisabledReply" => {
-                let enabled = action == "ServiceTypeEnabledReply";
-                let (body, generation) = if enabled {
-                    decode_service_type_enabled_reply(message)
-                } else {
-                    decode_service_type_disabled_reply(message)
-                }
-                .map_err(err)?;
+        let result = match incoming {
+            wire::FmIncoming::ServiceTypeStatusReply { enabled, payload } => {
+                let (body, generation) = payload.into_parts()?;
                 node.fm_work(FmWork::TypeStatusReply(
                     enabled,
                     body,
@@ -275,54 +268,46 @@ impl Ingress {
                     generation,
                 ))
             }
-            "NodeActivateRequest" => {
-                let (body, generation) = decode_node_activate_request(message).map_err(err)?;
+            wire::FmIncoming::NodeActivate(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 node.fm_work(FmWork::NodeActivate(body, self.fm.clone(), generation))
             }
-            "NodeDeactivateRequest" => {
-                let (body, generation) = decode_node_deactivate_request(message).map_err(err)?;
+            wire::FmIncoming::NodeDeactivate(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 node.fm_work(FmWork::NodeDeactivate(body, self.fm.clone(), generation))
             }
-            "NodeUpdateServiceRequest" => {
-                let (body, generation) =
-                    decode_node_update_service_request(message).map_err(err)?;
+            wire::FmIncoming::NodeUpdateService(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 node.fm_work(FmWork::NodeUpdateService(
                     Box::new(body),
                     self.fm.clone(),
                     generation,
                 ))
             }
-            "AddInstance" => {
-                let (body, generation) = decode_add_instance(message).map_err(err)?;
+            wire::FmIncoming::AddInstance(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 self.initial_target(node, &body, false)?;
                 node.add_from_fm(body, &self.fm, &generation)
             }
-            "AddPrimary" => {
-                let (body, generation) = decode_add_primary(message).map_err(err)?;
+            wire::FmIncoming::AddPrimary(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 self.initial_target(node, &body, false)?;
                 node.add_primary_from_fm(body, &self.fm, &generation)
             }
-            "DoReconfiguration" => {
+            wire::FmIncoming::DoReconfiguration(payload) => {
                 if !self.profile.peer_replicas() {
                     return Err("DoReconfiguration requires a replicated stateful profile".into());
                 }
-                let (body, generation) = decode_do_reconfiguration(message).map_err(err)?;
+                let (body, generation) = payload.into_parts()?;
                 self.description(&body.configuration.unit, &body.configuration.service)?;
                 node.reconfigure_from_fm(body, &self.fm, &generation)
             }
-            "ReplicaEndpointUpdatedReply" => {
-                let (body, generation) =
-                    decode_replica_endpoint_updated_reply(message).map_err(err)?;
+            wire::FmIncoming::ReplicaEndpointUpdatedReply(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 node.endpoint_reply_from_fm(body, &self.fm, &generation)
             }
-            "AddReplica" | "RemoveReplica" => {
-                let removing = action == "RemoveReplica";
-                let (body, generation) = if removing {
-                    decode_remove_replica(message)
-                } else {
-                    decode_add_replica(message)
-                }
-                .map_err(err)?;
+            wire::FmIncoming::ReplicaControl { removing, payload } => {
+                let (body, generation) = payload.into_parts()?;
                 self.description(&body.unit, &body.service)?;
                 let peer = self
                     .peers
@@ -337,13 +322,13 @@ impl Ingress {
                     node.add_replica_from_fm(body, &self.fm, &generation)
                 }
             }
-            "RemoveInstance" => {
-                let (body, generation) = decode_remove_instance(message).map_err(err)?;
+            wire::FmIncoming::RemoveInstance(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 self.description(&body.replica.0.unit, &body.replica.0.service)?;
                 node.fm_work(FmWork::Remove(Box::new(body), self.fm.clone(), generation))
             }
-            "DeleteReplica" => {
-                let (body, generation) = decode_delete_replica(message).map_err(err)?;
+            wire::FmIncoming::DeleteReplica(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 self.initial_target(node, &body.replica.0, true)?;
                 if self.profile == Profile::StatefulPeerIdle && !self.coordinating {
                     let incoming = &body.replica.0;
@@ -375,18 +360,19 @@ impl Ingress {
                     generation,
                 ))
             }
-            "ReplicaUpReply" => {
-                let (body, generation) = decode_replica_up_reply(message).map_err(err)?;
+            wire::FmIncoming::ReplicaUpReply(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 acknowledgement = Some(SemanticAck::Report(body.clone()));
                 node.fm_work(FmWork::ReplicaUpReply(body, self.fm.clone(), generation))
             }
-            "ServiceTypeNotificationReply" => {
-                let (body, generation) =
-                    decode_service_type_notification_reply(message).map_err(err)?;
+            wire::FmIncoming::ServiceTypeNotificationReply(payload) => {
+                let (body, generation) = payload.into_parts()?;
                 acknowledgement = Some(SemanticAck::Notification(body.clone()));
                 node.fm_work(FmWork::ServiceTypeReply(body, self.fm.clone(), generation))
             }
-            _ => return Err(format!("unsupported FM command: {action}")),
+            wire::FmIncoming::Unsupported => {
+                return Err(format!("unsupported FM command: {action}"))
+            }
         };
         match result {
             Ok(id) => Ok(Admission::Submitted(acknowledgement.map(|ack| (id, ack)))),
