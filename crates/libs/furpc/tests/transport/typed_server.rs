@@ -564,42 +564,36 @@ impl Service<Request<Body>> for PendingTyped {
 }
 
 #[tokio::test]
-async fn typed_readiness_shares_scope_waiter_capacity_and_releases_it_on_cancellation() {
+async fn typed_readiness_has_no_implicit_waiter_cap_and_preserves_cancellation() {
     fn send<T: Send>(value: T) -> T {
         value
     }
 
-    for waiters in [0, 1] {
+    {
         let counts = Arc::new(CodecCounts::default());
         let mut queued = QueuedIngress::start(
             IngressOptions::one_way(allow, IngressLimits::default()),
-            HandlerLimits {
-                max_readiness_waiters: waiters,
-                ..Default::default()
-            },
+            HandlerLimits::default(),
         )
         .await;
         let peer = queued.channel.peer(deadline()).await.unwrap();
-        peer.send(packet("first", b""), deadline()).await.unwrap();
-        let (request, complete_first) = bounded(queued.work.recv()).await.unwrap();
-        let mut first_rpc = server::Rpc::new(DecodeOnly(counts.clone(), Cell::new(())));
-        let mut first = Box::pin(first_rpc.one_way(PendingTyped, request));
-        if waiters == 0 {
-            let error = first.await.unwrap_err();
-            assert_eq!(error, Error::ResourceLimit("service readiness waiters"));
-            complete_first.send(Err(error)).unwrap();
-        } else {
-            assert!(first.as_mut().now_or_never().is_none());
-            peer.send(packet("second", b""), deadline()).await.unwrap();
-            let (request, complete_second) = bounded(queued.work.recv()).await.unwrap();
-            let error = server::Rpc::new(DecodeOnly(counts.clone(), Cell::new(())))
-                .one_way(PendingTyped, request)
-                .await
-                .unwrap_err();
-            assert_eq!(error, Error::ResourceLimit("service readiness waiters"));
-            complete_second.send(Err(error)).unwrap();
-            complete_first.send(Err(Error::Cancelled)).unwrap();
-            assert_eq!(bounded(first).await.unwrap_err(), Error::Closed);
+        let mut pending = vec![];
+        for _ in 0..12 {
+            peer.send(packet("pending", b""), deadline()).await.unwrap();
+            let (request, complete) = bounded(queued.work.recv()).await.unwrap();
+            let counts = counts.clone();
+            let mut call = Box::pin(async move {
+                server::Rpc::new(DecodeOnly(counts, Cell::new(())))
+                    .one_way(PendingTyped, request)
+                    .await
+            });
+            assert!(call.as_mut().now_or_never().is_none());
+            pending.push((call, complete));
+        }
+        assert_eq!(counts.decoded.load(Ordering::SeqCst), 12);
+        for (call, complete) in pending {
+            complete.send(Err(Error::Cancelled)).unwrap();
+            assert_eq!(bounded(call).await.unwrap_err(), Error::Closed);
         }
         peer.send(packet("ready", b""), deadline()).await.unwrap();
         let (request, completed) = bounded(queued.work.recv()).await.unwrap();

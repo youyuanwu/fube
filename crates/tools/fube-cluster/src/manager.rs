@@ -45,7 +45,7 @@ impl Manager {
                 continue;
             };
             let generation = link.generation();
-            let request = link.request(generation_proposal_message(&generation).map_err(err)?);
+            let request = link.generation_proposal(&generation);
             tokio::pin!(request);
             let reply = loop {
                 tokio::select! {
@@ -59,8 +59,6 @@ impl Manager {
                     }
                 }
             };
-            wire::predecode(&reply)?;
-            let reply = decode_generation_proposal_reply(&reply).map_err(err)?;
             if reply.proposed != generation.number || reply.error != 0 {
                 return Err(
                     "FM shutdown ingress fence was not processed by the original Node".into(),
@@ -279,21 +277,19 @@ impl Manager {
             .link
             .as_ref()
             .ok_or("original node link absent")?;
-        wire::predecode(&incoming.message)?;
         let action = wire::action(&incoming.message)?;
+        if !matches!(action.as_str(), "NodeUp" | "LFUMUpload") {
+            wire::predecode(&incoming.message)?;
+        }
         let generation = self.children[index].generation();
         match action.as_str() {
             "LFUMUpload" => {
-                let body = decode_lfum_upload(&incoming.message).map_err(err)?;
-                let header = self.ledger.lfum_upload(index, body)?;
-                let response = lfum_upload_reply_message(&header).map_err(err)?;
-                incoming
+                let header = incoming
                     .reply
                     .take()
                     .ok_or("LFUMUpload missing consuming reply authority")?
-                    .reply(link.seal(response)?, wire::deadline())
-                    .await
-                    .map_err(err)?;
+                    .lfum_upload(link, |body| self.ledger.lfum_upload(index, body))
+                    .await?;
                 if self.ledger.generation.as_ref().is_some_and(|round| {
                     round.number == header.number && round.uploads[index].is_some()
                 }) {
@@ -392,38 +388,38 @@ impl Manager {
                 .ledger
                 .load(index, decode_report_load(&incoming.message).map_err(err)?)?,
             "NodeUp" => {
-                let body = decode_node_up(&incoming.message).map_err(err)?;
-                body.validate_fresh_stateless().map_err(err)?;
                 let placement = &mut self.ledger.placements[index];
                 let metadata = self.children[index]
                     .metadata
                     .as_ref()
                     .ok_or("missing original listener")?;
-                let expected = NodeUp::fresh_stateless(
-                    placement.launch.name(),
-                    "fube-cluster-local".into(),
-                    metadata.address,
-                    FabricVersionInstance::native_default(),
-                )
-                .map_err(err)?;
-                if placement.bootstrap != Bootstrap::NodeUp || body != expected {
-                    return Err(
-                        "unexpected/stale native NodeUp identity or recovery contents".into(),
-                    );
-                }
-                placement.node_description = Some(body.node.clone());
-                let ack = NodeUpAck::fresh_activated(body.node.version, 1).map_err(err)?;
-                placement.activation_sequence = ack.activation_sequence;
-                placement.activated = ack.activated;
-                let response = node_up_ack_message(&ack, &generation).map_err(err)?;
                 let context = incoming
                     .reply
                     .take()
                     .ok_or("NodeUp missing consuming reply authority")?;
                 context
-                    .reply(link.seal(response)?, wire::deadline())
-                    .await
-                    .map_err(err)?;
+                    .node_up(link, |body| {
+                        body.validate_fresh_stateless().map_err(err)?;
+                        let expected = NodeUp::fresh_stateless(
+                            placement.launch.name(),
+                            "fube-cluster-local".into(),
+                            metadata.address,
+                            FabricVersionInstance::native_default(),
+                        )
+                        .map_err(err)?;
+                        if placement.bootstrap != Bootstrap::NodeUp || body != expected {
+                            return Err(
+                                "unexpected/stale native NodeUp identity or recovery contents"
+                                    .into(),
+                            );
+                        }
+                        placement.node_description = Some(body.node.clone());
+                        let ack = NodeUpAck::fresh_activated(body.node.version, 1).map_err(err)?;
+                        placement.activation_sequence = ack.activation_sequence;
+                        placement.activated = ack.activated;
+                        Ok((ack, generation))
+                    })
+                    .await?;
                 placement.bootstrap = Bootstrap::FinalUpload;
             }
             "ReplicaUp" => {
@@ -818,12 +814,7 @@ impl Manager {
             .ok_or("original generation link absent")?;
         match work {
             fm::GenerationWork::Propose(header) => {
-                if let Some(message) = link
-                    .request_optional(generation_proposal_message(&header).map_err(err)?)
-                    .await?
-                {
-                    wire::predecode(&message)?;
-                    let body = decode_generation_proposal_reply(&message).map_err(err)?;
+                if let Some(body) = link.generation_proposal_optional(&header).await? {
                     self.ledger
                         .generation
                         .as_mut()

@@ -4,7 +4,7 @@ use fube_ra::protocol::{
     GenerationHeader, NodeInstance, FM_ACTOR, GENERATION_HEADER, RA_ACTOR, RS_ACTOR,
 };
 use fubst::serde::from_slice_with_budget;
-use furpc::{HeaderId, HeaderRecord, Message};
+use furpc::{Body, HeaderId, HeaderRecord, Headers, Message};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     sync::{Arc, Mutex},
@@ -12,7 +12,19 @@ use std::{
 };
 use tokio::time::Instant;
 
+mod bootstrap;
+mod fm_client;
+mod fm_intake;
+mod one_way;
+mod peer_client;
+mod peer_intake;
 mod session;
+pub use bootstrap::LfumUploadRequest;
+pub(super) use fm_client::FmClient;
+pub(super) use fm_intake::{generation_parts, Incoming as FmIncoming};
+pub(super) use one_way::Call as OneWayCall;
+pub(super) use peer_client::PeerClient;
+pub(super) use peer_intake::Incoming as PeerIncoming;
 pub use session::{Failure, Incoming, Session};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,7 +43,10 @@ struct Properties {
 }
 impl Properties {
     fn new(message: &Message) -> furpc::Result<Self> {
-        let common = message.headers().effective();
+        Self::from_headers(message.headers())
+    }
+    fn from_headers(headers: &Headers) -> furpc::Result<Self> {
+        let common = headers.effective();
         Ok(Self {
             actor: common.actor.get(),
             action: String::from_utf16(common.action())
@@ -78,10 +93,12 @@ struct PToP {
 const PTOP: u16 = 0x8013;
 
 fn bounded(message: &Message) -> furpc::Result<()> {
-    if message.body().len() > LIMIT
-        || message.headers().records().count() > 16
-        || message
-            .headers()
+    bounded_parts(message.headers(), message.body())
+}
+fn bounded_parts(headers: &Headers, body: &Body) -> furpc::Result<()> {
+    if body.len() > LIMIT
+        || headers.records().count() > 16
+        || headers
             .records()
             .map(|header| header.value().len())
             .sum::<usize>()
@@ -285,137 +302,22 @@ pub fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(3)
 }
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    let mut budget = 4 * LIMIT;
-    from_slice_with_budget(bytes, &mut |count| {
-        budget = budget
-            .checked_sub(count)
-            .ok_or(fubst::Error::ResourceLimit("cluster native decode"))?;
-        Ok(())
-    })
-    .map_err(err)
+    let body = Body::from_bytes(bytes.to_vec()).map_err(err)?;
+    furpc::codec::decode(&mut one_way::Budgeted::<T>::default(), &body, LIMIT)
+        .map_err(one_way::decode_error)
 }
 
-// Bound allocations before the existing action/header/body factory decoders
-// run. Their second decode is then bounded by this validated full schema.
+// Compatibility validation for byte-facing FM consumers and independent fixtures.
 pub fn predecode(message: &Message) -> Result<()> {
-    bounded(message).map_err(err)?;
-    let body: Vec<_> = message.body().segments().flatten().copied().collect();
-    use fube_ra::protocol::*;
-    match action(message)?.as_str() {
-        "GetLSN" => {
-            decode::<GetLsn>(&body)?;
-        }
-        "GetLSNReply" => {
-            decode::<GetLsnReply>(&body)?;
-        }
-        "ReplicaEndpointUpdated" => {
-            decode::<AddInstance>(&body)?;
-        }
-        "ReplicaEndpointUpdatedReply" => {
-            decode::<AddInstanceReply>(&body)?;
-        }
-        "DoReconfiguration" => {
-            decode::<DoReconfiguration>(&body)?;
-        }
-        "DoReconfigurationReply" => {
-            decode::<ConfigurationReply>(&body)?;
-        }
-        "ChangeConfiguration" => {
-            decode::<Configuration>(&body)?;
-        }
-        "ChangeConfigurationReply" => {
-            decode::<FailoverUnitReply>(&body)?;
-        }
-        "Activate" => {
-            decode::<Activate>(&body)?;
-        }
-        "ActivateReply" => {
-            decode::<ActivateReply>(&body)?;
-        }
-        "Deactivate" => {
-            decode::<Deactivate>(&body)?;
-        }
-        "DeactivateReply" => {
-            decode::<DeactivateReply>(&body)?;
-        }
-        "GenerationProposal" => {
-            if !message.body().is_empty() {
-                return Err("GenerationProposal must be bodyless".into());
-            }
-        }
-        "LFUMUpload" => {
-            decode::<LfumUpload>(&body)?;
-        }
-        "LFUMUploadReply" => {
-            if !message.body().is_empty() {
-                return Err("LFUMUploadReply must be bodyless".into());
-            }
-        }
-        "GenerationProposalReply" => {
-            decode::<fube_ra::protocol::GenerationProposalReply>(&body)?;
-        }
-        "GenerationUpdate" => {
-            decode::<GenerationUpdate>(&body)?;
-        }
-        "GenerationUpdateReject" => {
-            decode::<GenerationNumber>(&body)?;
-        }
-        "NodeUp" => {
-            decode::<NodeUp>(&body)?;
-        }
-        "NodeUpAck" => {
-            decode::<NodeUpAck>(&body)?;
-        }
-        "AddInstance" | "AddPrimary" | "AddReplica" | "RemoveReplica" => {
-            decode::<AddInstance>(&body)?;
-        }
-        "CreateReplica" => {
-            decode::<CreateReplica>(&body)?;
-        }
-        "CreateReplicaReply" => {
-            decode::<CreateReplicaReply>(&body)?;
-        }
-        "RemoveInstance" | "DeleteReplica" => {
-            decode::<RemoveInstance>(&body)?;
-        }
-        "AddInstanceReply"
-        | "AddPrimaryReply"
-        | "AddReplicaReply"
-        | "RemoveReplicaReply"
-        | "RemoveInstanceReply"
-        | "DeleteReplicaReply" => {
-            decode::<AddInstanceReply>(&body)?;
-        }
-        "ReplicaUp" | "ReplicaUpReply" => {
-            decode::<ReplicaUp>(&body)?;
-        }
-        "ServiceTypeNotification" | "ServiceTypeNotificationReply" => {
-            decode::<ServiceTypeNotification>(&body)?;
-        }
-        "NodeActivateRequest" | "NodeDeactivateRequest" => {
-            decode::<NodeActivationRequest>(&body)?;
-        }
-        "NodeActivateReply" | "NodeDeactivateReply" => {
-            decode::<NodeActivationReply>(&body)?;
-        }
-        "NodeUpdateServiceRequest" => {
-            decode::<NodeUpdateServiceRequest>(&body)?;
-        }
-        "NodeUpdateServiceReply" => {
-            decode::<NodeUpdateServiceReply>(&body)?;
-        }
-        "ServiceTypeEnabled" | "ServiceTypeDisabled" => {
-            decode::<ServiceTypeUpdate>(&body)?;
-        }
-        "ServiceTypeEnabledReply" | "ServiceTypeDisabledReply" => {
-            decode::<ServiceTypeUpdateReply>(&body)?;
-        }
-        "ReportLoad" => {
-            decode::<ReportLoad>(&body)?;
-        }
-        _ => return Err("unsupported native action retained at boundary".into()),
-    }
-    Ok(())
+    one_way::decode_message(message, one_way::discard)
+}
+
+pub(super) fn fm_generation(headers: &Headers) -> Result<(GenerationHeader, bool)> {
+    let mut records = headers
+        .records()
+        .filter(|header| header.id().get() == GENERATION_HEADER);
+    let generation = decode(records.next().ok_or("missing FM generation")?.value())?;
+    Ok((generation, records.next().is_some()))
 }
 
 #[derive(Clone)]
@@ -504,18 +406,23 @@ impl Link {
         Ok(())
     }
     fn is_current(&self, message: &Message) -> Result<bool> {
-        validate_source(message, &self.local, &self.remote)?;
-        let mut headers = message
-            .headers()
+        self.is_current_parts(message.headers(), message.body())
+    }
+    fn is_current_parts(&self, headers: &Headers, body: &Body) -> Result<bool> {
+        validate_source(headers, body, &self.local, &self.remote)?;
+        let mut generations = headers
             .records()
             .filter(|header| header.id().get() == GENERATION_HEADER);
-        if let Some(header) = headers.next() {
+        if let Some(header) = generations.next() {
             let generation: GenerationHeader = decode(header.value())?;
             let generation_independent = matches!(
-                action(message)?.as_str(),
+                Properties::from_headers(headers)
+                    .map_err(err)?
+                    .action
+                    .as_str(),
                 "GenerationProposal" | "GenerationUpdate" | "LFUMUploadReply"
             );
-            if headers.next().is_some() || generation.for_fm_replica {
+            if generations.next().is_some() || generation.for_fm_replica {
                 return Err("foreign/stale/duplicate native FM generation".into());
             }
             if !generation_independent && generation.number.older_than(&self.generation().number) {
@@ -530,27 +437,6 @@ impl Link {
             .await
             .map_err(err)
     }
-    pub async fn request(&self, message: Message) -> Result<Message> {
-        self.request_optional(message)
-            .await?
-            .ok_or("native request reply timeout".into())
-    }
-    pub async fn request_optional(&self, message: Message) -> Result<Option<Message>> {
-        let reply = match self.session.request(self.seal(message)?, deadline()).await {
-            Ok(reply) => reply,
-            Err(furpc::Error::Timeout(_)) => return Ok(None),
-            Err(error) => return Err(err(error)),
-        };
-        let props = Properties::new(&reply).map_err(err)?;
-        match self.session.role() {
-            Role::Node => ack(&reply, &props),
-            Role::Fm => proposal_ack(&reply, &props),
-            Role::Peer => return Err("peer RPC is unsupported".into()),
-        }
-        .map_err(err)?;
-        self.validate(&reply)?;
-        Ok(Some(reply))
-    }
     pub async fn receive(&self, until: Instant) -> Result<Option<Incoming>> {
         self.receive_checked(until)
             .await
@@ -562,7 +448,7 @@ impl Link {
         until: Instant,
     ) -> std::result::Result<Option<Incoming>, ReceiveError> {
         match self.session.receive(until).await {
-            Ok(Some(incoming)) => {
+            Ok(Some(mut incoming)) => {
                 if incoming.source.generation() != self.session.peer.info().generation {
                     self.retire();
                     return Err(ReceiveError::Invalid(
@@ -578,12 +464,31 @@ impl Link {
                                 "foreign/stale/duplicate native FM generation".into(),
                             ));
                         }
+                        if let Some(slot) = incoming.one_way.take() {
+                            if slot
+                                .response
+                                .send(Ok(furpc::IngressResponse::NoReply))
+                                .is_err()
+                            {
+                                self.retire();
+                                return Err(ReceiveError::Invalid(err(furpc::Error::Closed)));
+                            }
+                        }
                         eprintln!("ignored native message from older FM generation");
                         return Ok(None);
                     }
                     Err(error) => {
                         self.retire();
                         return Err(ReceiveError::Invalid(error));
+                    }
+                }
+                if let Some(slot) = incoming.one_way.take() {
+                    match slot.prepare(self).await {
+                        Ok(prepared) => incoming.prepared = Some(prepared),
+                        Err(error) => {
+                            self.retire();
+                            return Err(ReceiveError::Invalid(error));
+                        }
                     }
                 }
                 Ok(Some(incoming))
@@ -621,12 +526,14 @@ impl std::fmt::Display for ReceiveError {
         }
     }
 }
-fn validate_source(message: &Message, local: &NodeInstance, remote: &NodeInstance) -> Result<()> {
-    bounded(message).map_err(err)?;
-    let mut headers = message
-        .headers()
-        .records()
-        .filter(|header| header.id().get() == PTOP);
+fn validate_source(
+    headers: &Headers,
+    body: &Body,
+    local: &NodeInstance,
+    remote: &NodeInstance,
+) -> Result<()> {
+    bounded_parts(headers, body).map_err(err)?;
+    let mut headers = headers.records().filter(|header| header.id().get() == PTOP);
     let header = headers.next().ok_or("missing native source identity")?;
     if headers.next().is_some() {
         return Err("duplicate native source identity".into());
@@ -659,7 +566,7 @@ mod tests {
     use super::*;
     use fube_ra::protocol::*;
 
-    async fn links(peer: bool) -> (Link, Link) {
+    pub(super) async fn links(peer: bool) -> (Link, Link) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sender = connect(
             listener.local_addr().unwrap(),
@@ -772,22 +679,303 @@ mod tests {
             generation: old.number.clone(),
             ..LfumUpload::default()
         };
-        let (reply, ()) = tokio::join!(node.request(lfum_upload_message(&body).unwrap()), async {
+        let (reply, ()) = tokio::join!(
+            node.lfum_upload(LfumUploadRequest::new(&body).unwrap()),
+            async {
+                let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
+                assert_eq!(decode_lfum_upload(&incoming.message).unwrap(), body);
+                incoming
+                    .reply
+                    .take()
+                    .unwrap()
+                    .lfum_upload(&fm, |decoded| {
+                        assert_eq!(decoded, body);
+                        Ok(old.clone())
+                    })
+                    .await
+                    .unwrap();
+            }
+        );
+        assert_eq!(reply.unwrap().unwrap(), old);
+        assert_eq!(fm.generation(), current);
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_bootstrap_preserves_native_profiles_and_correlated_results() {
+        let (node, fm) = links(false).await;
+        let version = FabricVersionInstance::native_default();
+        let up = NodeUp::fresh_stateless(
+            "node".into(),
+            "typed-bootstrap".into(),
+            "127.0.0.1:12345".parse().unwrap(),
+            version.clone(),
+        )
+        .unwrap();
+        let ack = NodeUpAck::fresh_activated(version, 42).unwrap();
+        let generation = node.generation();
+        let (reply, ()) = tokio::join!(node.node_up(&up), async {
             let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
-            assert_eq!(decode_lfum_upload(&incoming.message).unwrap(), body);
+            assert_eq!(incoming.message.headers().effective().actor.get(), 11);
+            assert_eq!(decode_node_up(&incoming.message).unwrap(), up);
             incoming
                 .reply
                 .take()
                 .unwrap()
-                .reply(
-                    fm.seal(lfum_upload_reply_message(&old).unwrap()).unwrap(),
-                    deadline(),
-                )
+                .node_up(&fm, |decoded| {
+                    assert_eq!(decoded, up);
+                    Ok((ack.clone(), generation.clone()))
+                })
                 .await
                 .unwrap();
         });
-        assert_eq!(decode_lfum_upload_reply(&reply.unwrap()).unwrap(), old);
-        assert_eq!(fm.generation(), current);
+        assert_eq!(reply.unwrap(), (ack, generation.clone()));
+        let proposal = GenerationProposalReply {
+            proposed: generation.number.clone(),
+            current: generation.number.clone(),
+            error: 0,
+        };
+        let (reply, ()) = tokio::join!(fm.generation_proposal(&generation), async {
+            let mut incoming = node.receive_checked(deadline()).await.unwrap().unwrap();
+            assert_eq!(incoming.message.headers().effective().actor.get(), 12);
+            assert_eq!(
+                decode_generation_proposal(&incoming.message).unwrap(),
+                generation
+            );
+            incoming
+                .reply
+                .take()
+                .unwrap()
+                .generation_proposal(&node, |decoded| {
+                    assert_eq!(decoded, generation);
+                    Ok(proposal.clone())
+                })
+                .await
+                .unwrap();
+        });
+        assert_eq!(reply.unwrap(), proposal);
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_server_keeps_original_request_despite_mutated_message_view() {
+        let (node, fm) = links(false).await;
+        let body = LfumUpload {
+            generation: node.generation().number,
+            ..LfumUpload::default()
+        };
+        let generation = fm.generation();
+        let mut calls = 0;
+        let (client, server) = tokio::join!(
+            node.lfum_upload(LfumUploadRequest::new(&body).unwrap()),
+            async {
+                let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
+                incoming.message = Message::builder()
+                    .body(Body::from_bytes(vec![0xff]).unwrap())
+                    .build()
+                    .unwrap();
+                incoming
+                    .reply
+                    .take()
+                    .unwrap()
+                    .lfum_upload(&fm, |decoded| {
+                        calls += 1;
+                        assert_eq!(decoded, body);
+                        Ok(generation.clone())
+                    })
+                    .await
+            }
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(client.unwrap(), Some(generation.clone()));
+        assert_eq!(server.unwrap(), generation);
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_server_rejects_method_source_and_schema_before_domain_handler() {
+        let (node, fm) = links(false).await;
+        for invalid in ["method", "source", "schema"] {
+            let original = lfum_upload_message(&LfumUpload::default()).unwrap();
+            let mut builder = Message::builder().body(Body::from_bytes(vec![0xff]).unwrap());
+            for header in original.headers().records() {
+                builder = builder.append_header(header.to_owned());
+            }
+            let message = node.seal(builder.build().unwrap()).unwrap();
+            let mut request = furpc::Request::new(message.body().clone());
+            *request.headers_mut() = message.headers().clone();
+            let peer = node.session.peer.clone();
+            let client = tokio::spawn(async move { peer.request(request, deadline()).await });
+            let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
+            let slot = incoming.reply.take().unwrap();
+            let error = match invalid {
+                "method" => slot
+                    .node_up(&fm, |_| panic!("mismatched method reached handler"))
+                    .await
+                    .unwrap_err(),
+                "source" => {
+                    let foreign = Link {
+                        remote: NodeInstance {
+                            instance: node.local.instance + 1,
+                            ..node.local.clone()
+                        },
+                        ..fm.clone()
+                    };
+                    slot.lfum_upload(&foreign, |_| panic!("foreign source reached handler"))
+                        .await
+                        .unwrap_err()
+                }
+                _ => slot
+                    .lfum_upload(&fm, |_| panic!("malformed schema reached handler"))
+                    .await
+                    .unwrap_err(),
+            };
+            assert!(error.contains(match invalid {
+                "method" => "unsupported bootstrap invocation",
+                "source" => "foreign/stale native sender or recipient incarnation",
+                _ => "decode",
+            }));
+            client.abort();
+            match client.await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(result) => assert!(result.is_err()),
+            }
+        }
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_lfum_rejects_wrong_method_and_nonempty_success_body() {
+        let (node, fm) = links(false).await;
+        let generation = fm.generation();
+        let nonempty = lfum_upload_reply_message(&generation).unwrap();
+        let mut builder = Message::builder().body(Body::from_bytes(vec![0xff]).unwrap());
+        for header in nonempty.headers().records() {
+            builder = builder.append_header(header.to_owned());
+        }
+        for (reply, expected) in [
+            (
+                node_up_ack_message(&NodeUpAck::default(), &generation).unwrap(),
+                "unsupported bootstrap reply",
+            ),
+            (builder.build().unwrap(), "LFUMUploadReply must be bodyless"),
+        ] {
+            let request = LfumUploadRequest::new(&LfumUpload::default()).unwrap();
+            let (result, ()) = tokio::join!(node.lfum_upload(request), async {
+                let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
+                incoming
+                    .reply
+                    .take()
+                    .unwrap()
+                    .reply(fm.seal(reply).unwrap(), deadline())
+                    .await
+                    .unwrap();
+            });
+            assert!(result.unwrap_err().contains(expected));
+            assert!(node.is_live());
+        }
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_bootstrap_rejects_source_and_generation_before_malformed_body_decode() {
+        let (node, fm) = links(false).await;
+        let up = NodeUp::fresh_stateless(
+            "node".into(),
+            "typed-bootstrap".into(),
+            "127.0.0.1:12345".parse().unwrap(),
+            FabricVersionInstance::native_default(),
+        )
+        .unwrap();
+        for (invalid, expected) in [
+            (
+                "source",
+                "foreign/stale native sender or recipient incarnation",
+            ),
+            ("stale", "foreign/stale/duplicate native FM generation"),
+            ("missing", "missing reliability header"),
+            ("duplicate", "foreign/stale/duplicate native FM generation"),
+        ] {
+            let (result, ()) = tokio::join!(node.node_up(&up), async {
+                let mut incoming = fm.receive_checked(deadline()).await.unwrap().unwrap();
+                let source = if invalid == "source" {
+                    Link {
+                        remote: NodeInstance {
+                            instance: node.local.instance + 1,
+                            ..node.local.clone()
+                        },
+                        ..fm.clone()
+                    }
+                } else {
+                    fm.clone()
+                };
+                let mut generation = fm.generation();
+                if invalid == "stale" {
+                    generation.number.generation -= 1;
+                }
+                let original = node_up_ack_message(&NodeUpAck::default(), &generation).unwrap();
+                let mut builder = Message::builder().body(Body::from_bytes(vec![0xff]).unwrap());
+                for header in original.headers().records() {
+                    if invalid != "missing" || header.id().get() != GENERATION_HEADER {
+                        builder = builder.append_header(header.to_owned());
+                    }
+                }
+                if invalid == "duplicate" {
+                    builder = builder.append_header(generation.header().unwrap());
+                }
+                incoming
+                    .reply
+                    .take()
+                    .unwrap()
+                    .reply(source.seal(builder.build().unwrap()).unwrap(), deadline())
+                    .await
+                    .unwrap();
+            });
+            assert!(result.unwrap_err().contains(expected));
+            assert!(node.is_live());
+        }
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_optional_bootstrap_timeouts_preserve_original_session() {
+        let (node, fm) = links(false).await;
+        let request = LfumUploadRequest::new(&LfumUpload::default()).unwrap();
+        let generation = fm.generation();
+        let (lfum, proposal, retained) = tokio::join!(
+            node.lfum_upload(request),
+            fm.generation_proposal_optional(&generation),
+            async {
+                let lfum = fm.receive_checked(deadline()).await.unwrap().unwrap();
+                let proposal = node.receive_checked(deadline()).await.unwrap().unwrap();
+                (lfum, proposal)
+            }
+        );
+        assert!(lfum.unwrap().is_none());
+        assert!(proposal.unwrap().is_none());
+        assert!(node.is_live());
+        assert!(fm.is_live());
+        let (mut lfum, mut proposal) = retained;
+        assert!(lfum
+            .reply
+            .take()
+            .unwrap()
+            .lfum_upload(&fm, |_| panic!("expired LFUM handler executed"))
+            .await
+            .is_err());
+        assert!(proposal
+            .reply
+            .take()
+            .unwrap()
+            .generation_proposal(&node, |_| panic!("expired proposal handler executed"))
+            .await
+            .is_err());
         node.close().await.unwrap();
         fm.close().await.unwrap();
     }
@@ -798,7 +986,7 @@ mod tests {
         let request_owner = node.clone();
         let request = tokio::spawn(async move {
             request_owner
-                .request(lfum_upload_message(&LfumUpload::default()).unwrap())
+                .lfum_upload(LfumUploadRequest::new(&LfumUpload::default()).unwrap())
                 .await
         });
         let mut incoming = fm.receive(deadline()).await.unwrap().unwrap();
@@ -813,11 +1001,7 @@ mod tests {
             .reply
             .take()
             .unwrap()
-            .reply(
-                fm.seal(lfum_upload_reply_message(&fm.generation()).unwrap())
-                    .unwrap(),
-                deadline(),
-            )
+            .lfum_upload(&fm, |_| panic!("retired LFUM handler executed"))
             .await
             .is_err());
         assert!(node
@@ -979,24 +1163,26 @@ mod tests {
                 .build()
                 .unwrap()
         };
-        validate_source(&message(&identity), &local, &remote).unwrap();
+        let validate =
+            |message: Message| validate_source(message.headers(), message.body(), &local, &remote);
+        validate(message(&identity)).unwrap();
         let mut stale = identity.clone();
         stale.from.instance -= 1;
-        assert!(validate_source(&message(&stale), &local, &remote).is_err());
+        assert!(validate(message(&stale)).is_err());
         stale = identity.clone();
         stale.to.instance -= 1;
-        assert!(validate_source(&message(&stale), &local, &remote).is_err());
+        assert!(validate(message(&stale)).is_err());
         stale = identity.clone();
         stale.from.id = [3; 16];
-        assert!(validate_source(&message(&stale), &local, &remote).is_err());
+        assert!(validate(message(&stale)).is_err());
         stale = identity.clone();
         stale.exact_instance = false;
-        assert!(validate_source(&message(&stale), &local, &remote).is_err());
+        assert!(validate(message(&stale)).is_err());
         let duplicate = Message::builder()
             .append_header(HeaderRecord::native(HeaderId::new(PTOP).unwrap(), &identity).unwrap())
             .append_header(HeaderRecord::native(HeaderId::new(PTOP).unwrap(), &identity).unwrap())
             .build()
             .unwrap();
-        assert!(validate_source(&duplicate, &local, &remote).is_err());
+        assert!(validate(duplicate).is_err());
     }
 }

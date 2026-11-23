@@ -16,9 +16,8 @@ use std::{
 use fube_core::protocol::actor as actors;
 use furpc::{
     codec, header, ActorId, Body, BoxError, Channel, ClientCodecLimits, Codec, Connected,
-    EncodeBuf, Encoder, Endpoint, FubstCodec, HandlerLimits, HeaderId, HeaderRecord, Headers,
-    OneWayClient, Peer, PeerRequestService, PeerSendService, Request, Response, RpcClient,
-    TransportIo, WriteReceipt,
+    EncodeBuf, Encoder, Endpoint, FubstCodec, HeaderId, HeaderRecord, Headers, OneWayClient, Peer,
+    PeerRequestService, PeerSendService, Request, Response, RpcClient, TransportIo, WriteReceipt,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
@@ -88,11 +87,6 @@ impl Session {
         let endpoint = Endpoint::try_from(address)
             .map_err(native_error)?
             .connect_timeout(timeout)
-            .handler_limits(HandlerLimits {
-                max_in_flight: OPERATIONS,
-                max_readiness_waiters: OPERATIONS,
-                ..HandlerLimits::default()
-            })
             .service(router.into_service().map_err(native_error)?)
             .map_err(native_error)?;
         let channel = timeout_at(

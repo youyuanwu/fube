@@ -594,9 +594,9 @@ There is at most one admitted hook execution per accepted connection, including
 its readiness wait. Its service clone, future, timer, and completion metadata
 are owned by that accepted connection. No separate allocation budget,
 unbounded ready-event queue or detached worker is added.
-Hook executions do not consume request-service `HandlerLimits` slots or readiness
-permits: holding those while waiting for a service-handled bootstrap response
-could exhaust the very handlers needed for progress. Outbound operations and
+Furpc imposes no request-service concurrency or readiness-waiter quota.
+Consumers must not hold their own execution permits while waiting for a
+service-handled bootstrap response if that would prevent bootstrap progress. Outbound operations and
 incoming responses still require their normal independent admission.
 
 `peer_ready_timeout` has a 30-second default, an explicit Rust policy rather

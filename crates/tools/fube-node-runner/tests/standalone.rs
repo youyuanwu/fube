@@ -565,9 +565,12 @@ impl FmFixture {
             let Some(mut incoming) = incoming else {
                 continue;
             };
-            wire::predecode(&incoming.message).unwrap();
+            let action = wire::action(&incoming.message).unwrap();
+            if action != "NodeUp" {
+                wire::predecode(&incoming.message).unwrap();
+            }
             let generation = self.configurations[index].generation().unwrap();
-            match wire::action(&incoming.message).unwrap().as_str() {
+            match action.as_str() {
                 "NodeDeactivateReply" => {
                     let (reply, owner) = decode_node_deactivate_reply(&incoming.message).unwrap();
                     assert_eq!(owner, Owner::Fm);
@@ -955,30 +958,28 @@ impl FmFixture {
                         .reply
                         .take()
                         .unwrap()
-                        .reply(
-                            link.seal(lfum_upload_reply_message(&generation).unwrap())
-                                .unwrap(),
-                            wire::deadline(),
-                        )
+                        .lfum_upload(link, |decoded| {
+                            assert_eq!(decoded, body);
+                            Ok(generation)
+                        })
                         .await
                         .unwrap();
                     self.uploaded[index] = Some(body);
                 }
                 "NodeUp" => {
-                    let body = decode_node_up(&incoming.message).unwrap();
-                    body.validate_fresh_stateless().unwrap();
-                    let ack =
-                        NodeUpAck::fresh_activated(FabricVersionInstance::native_default(), 0)
-                            .unwrap();
                     incoming
                         .reply
                         .take()
                         .unwrap()
-                        .reply(
-                            link.seal(node_up_ack_message(&ack, &generation).unwrap())
-                                .unwrap(),
-                            wire::deadline(),
-                        )
+                        .node_up(link, |body| {
+                            body.validate_fresh_stateless().unwrap();
+                            let ack = NodeUpAck::fresh_activated(
+                                FabricVersionInstance::native_default(),
+                                0,
+                            )
+                            .unwrap();
+                            Ok((ack, generation))
+                        })
                         .await
                         .unwrap();
                 }
@@ -1178,7 +1179,8 @@ impl FmFixture {
                     .check_alive()
                     .unwrap_or_else(|error| panic!("{error}: {:?}", child.logs()));
             }
-            self.step().await;
+            // Keep the large FM dispatch future off nested scenario stacks.
+            Box::pin(self.step()).await;
         }
     }
 
@@ -2135,7 +2137,7 @@ async fn standalone_lfum_during_removal_supersession_preserves_pc_uploads_quorum
         // Fence the late one-way replay's ingress, not reconfiguration completion.
         let generation = fm.configurations[0].generation().unwrap();
         let link = fm.links[0].as_ref().unwrap().clone();
-        let proposal = link.request(generation_proposal_message(&generation).unwrap());
+        let proposal = link.generation_proposal(&generation);
         tokio::pin!(proposal);
         let reply = loop {
             tokio::select! {
@@ -2145,7 +2147,6 @@ async fn standalone_lfum_during_removal_supersession_preserves_pc_uploads_quorum
             }
             fm.step().await;
         };
-        let reply = decode_generation_proposal_reply(&reply).unwrap();
         assert_eq!(reply.error, 0);
         assert_eq!(reply.proposed, generation.number);
         assert_eq!(reply.current, generation.number);
@@ -3845,11 +3846,7 @@ async fn start_rollover_on(fm: &mut FmFixture, index: usize) {
     let mut generation = fm.configurations[index].generation().unwrap();
     generation.number.generation += 1;
     let link = fm.links[index].as_ref().unwrap();
-    let reply = link
-        .request(generation_proposal_message(&generation).unwrap())
-        .await
-        .unwrap();
-    let reply = decode_generation_proposal_reply(&reply).unwrap();
+    let reply = link.generation_proposal(&generation).await.unwrap();
     assert_eq!(reply.error, 0);
     assert_eq!(reply.proposed, generation.number);
     assert_eq!(reply.current, generation.number);

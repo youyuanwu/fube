@@ -131,9 +131,36 @@ pub struct Incoming {
     pub message: Message,
     pub reply: Option<ResponseSlot>,
     pub source: Source,
+    pub(super) one_way: Option<OneWaySlot>,
+    pub(super) prepared: Option<super::one_way::Prepared>,
 }
 
-pub struct ResponseSlot(oneshot::Sender<Message>, Role);
+impl Incoming {
+    pub fn action(&self) -> super::Result<String> {
+        match &self.prepared {
+            Some(prepared) => Ok(prepared.action.clone()),
+            None => super::action(&self.message),
+        }
+    }
+
+    pub(in crate::control) fn prepared(&self) -> super::Result<&super::one_way::Prepared> {
+        self.prepared
+            .as_ref()
+            .ok_or_else(|| "one-way intake has no original typed handoff".into())
+    }
+}
+
+pub(super) struct OneWaySlot {
+    pub(super) request: Request<Body>,
+    pub(super) response: oneshot::Sender<furpc::Result<IngressResponse>>,
+    pub(super) role: Role,
+}
+
+pub struct ResponseSlot {
+    pub(super) request: Request<Body>,
+    pub(super) response: oneshot::Sender<furpc::Result<IngressResponse>>,
+    role: Role,
+}
 impl ResponseSlot {
     /// Hand response data to the original furpc runner, not a local-write receipt.
     pub async fn reply(self, message: Message, deadline: Instant) -> furpc::Result<()> {
@@ -142,12 +169,14 @@ impl ResponseSlot {
         }
         bounded(&message)?;
         let props = super::Properties::new(&message)?;
-        match self.1 {
+        match self.role {
             Role::Fm => super::ack(&message, &props)?,
             Role::Node => super::proposal_ack(&message, &props)?,
             Role::Peer => return Err(Error::Unsupported("peer RPC")),
         }
-        self.0.send(message).map_err(|_| Error::Closed)
+        self.response
+            .send(Ok(IngressResponse::Reply(message)))
+            .map_err(|_| Error::Closed)
     }
 }
 
@@ -171,24 +200,44 @@ impl Service<Request<Body>> for Ingress {
             .source()
             .clone();
         let expects_reply = request.headers().effective().expects_reply;
-        let (parts, body) = request.into_parts();
-        let mut builder = Message::builder().body(body);
-        for header in parts.headers.records() {
+        let mut builder = Message::builder().body(request.body().clone());
+        for header in request.headers().records() {
             builder = builder.append_header(header.to_owned());
         }
         let result = builder.build().and_then(|message| {
             inbound(self.role, &message)?;
-            let (response, receive) = if expects_reply {
+            let (response, one_way, receive) = if expects_reply {
                 let (tx, rx) = oneshot::channel();
-                (Some(ResponseSlot(tx, self.role)), Some(rx))
+                (
+                    Some(ResponseSlot {
+                        request,
+                        response: tx,
+                        role: self.role,
+                    }),
+                    None,
+                    Some(rx),
+                )
+            } else if self.role != Role::Fm {
+                let (tx, rx) = oneshot::channel();
+                (
+                    None,
+                    Some(OneWaySlot {
+                        request,
+                        response: tx,
+                        role: self.role,
+                    }),
+                    Some(rx),
+                )
             } else {
-                (None, None)
+                (None, None, None)
             };
             self.tx
                 .try_send(Incoming {
                     message,
                     source,
                     reply: response,
+                    one_way,
+                    prepared: None,
                 })
                 .map_err(|_| Error::ResourceLimit("Node control inbox"))?;
             Ok(receive)
@@ -198,9 +247,7 @@ impl Service<Request<Body>> for Ingress {
         }
         Box::pin(async move {
             match result? {
-                Some(response) => Ok(IngressResponse::Reply(
-                    response.await.map_err(|_| Error::Closed)?,
-                )),
+                Some(response) => response.await.map_err(|_| Error::Closed)?,
                 None => Ok(IngressResponse::NoReply),
             }
         })
@@ -315,21 +362,6 @@ impl Session {
         outbound(self.role, &message, false)?;
         self.peer.send(message, deadline).await.map(|_| ())
     }
-    pub async fn request(&self, message: Message, deadline: Instant) -> furpc::Result<Message> {
-        if self.terminal_error().is_some() {
-            return Err(Error::Closed);
-        }
-        outbound(self.role, &message, true)?;
-        let mut request = Request::new(message.body().clone());
-        *request.headers_mut() = message.headers().clone();
-        let response = self.peer.request(request, deadline).await?;
-        let mut builder = Message::builder().body(response.body().clone());
-        for header in response.headers().records() {
-            builder = builder.append_header(header.to_owned());
-        }
-        builder.build()
-    }
-
     #[cfg(test)]
     pub(super) fn queued(&self) -> usize {
         self.incoming.try_lock().expect("unpolled test inbox").len()
@@ -478,8 +510,6 @@ pub(super) async fn establish(
     }
     let service = router.into_service().map_err(super::err)?;
     let handlers = HandlerLimits {
-        max_in_flight: 8,
-        max_readiness_waiters: 8,
         max_encoded_body_bytes_per_response: super::LIMIT,
         timeout: Duration::from_secs(3),
     };

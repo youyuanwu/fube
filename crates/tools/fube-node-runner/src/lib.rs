@@ -402,12 +402,9 @@ impl Owner {
             version.clone(),
         )
         .map_err(err)?;
-        let reply =
-            tokio::time::timeout_at(deadline, link.request(node_up_message(&up).map_err(err)?))
-                .await
-                .map_err(err)??;
-        wire::predecode(&reply)?;
-        let (ack, generation) = decode_node_up_ack(&reply).map_err(err)?;
+        let (ack, generation) = tokio::time::timeout_at(deadline, link.node_up(&up))
+            .await
+            .map_err(err)??;
         ack.validate_fresh_activated(&version).map_err(err)?;
         if generation != self.config.generation()? {
             return Err("foreign NodeUpAck generation".into());
@@ -568,10 +565,10 @@ impl Owner {
                 }
             }
             if let Some(incoming) = peer.incoming.take() {
-                match self.ingress.peer(
+                match self.ingress.peer_incoming(
                     node,
                     &peer.placement.identity.native()?,
-                    &incoming.message,
+                    &incoming,
                     stopping,
                 )? {
                     Some(id) => {
@@ -610,10 +607,10 @@ impl Owner {
                         return Ok(());
                     }
                 }
-                if self.adapter.reject_deprecated(node, &incoming.message)? {
+                if self.adapter.reject_deprecated(node, &incoming)? {
                     return Ok(());
                 }
-                match self.ingress.fm(node, &incoming.message, stopping)? {
+                match self.ingress.fm_incoming(node, &incoming, stopping)? {
                     Admission::Retained => self.fm_incoming = Some(incoming),
                     Admission::Submitted(acknowledgement) => {
                         if let Some(acknowledgement) = acknowledgement {

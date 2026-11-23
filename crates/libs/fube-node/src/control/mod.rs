@@ -12,7 +12,7 @@ use crate::local::{FmWork, LocalDisposition, Node};
 use fube_ra::{entity as ra, protocol::*};
 use std::{collections::VecDeque, future::Future, pin::Pin, task::Poll, time::Duration};
 use tokio::time::Instant;
-use wire::Link;
+use wire::{FmClient, LfumUploadRequest, Link, PeerClient};
 
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub type Result<T> = std::result::Result<T, String>;
@@ -53,7 +53,7 @@ pub enum SemanticAck {
     Notification(ServiceTypeNotification),
     Report(ReplicaUp),
 }
-type UploadRequest = Pin<Box<dyn Future<Output = Result<Option<furpc::Message>>> + Send>>;
+type UploadRequest = Pin<Box<dyn Future<Output = Result<Option<GenerationHeader>>> + Send>>;
 
 struct LfumRequest {
     upload: u64,
@@ -87,7 +87,7 @@ impl LfumUploadState {
     }
 
     /// Poll original requests independently, or wait while none is in flight.
-    pub async fn receive(&mut self) -> (u64, Result<Option<furpc::Message>>) {
+    pub async fn receive(&mut self) -> (u64, Result<Option<GenerationHeader>>) {
         std::future::poll_fn(|context| {
             for upload in &mut self.uploads {
                 if let Some(request) = &mut upload.request {
@@ -105,7 +105,7 @@ impl LfumUploadState {
         &mut self,
         node: &Node,
         source: &NodeInstance,
-        completed: (u64, Result<Option<furpc::Message>>),
+        completed: (u64, Result<Option<GenerationHeader>>),
         now: Instant,
     ) -> Result<()> {
         let (upload, reply) = completed;
@@ -122,9 +122,7 @@ impl LfumUploadState {
                     .node(ra::NodeProperty::LfumUploadRetryIntervalTicks)
                     .max(1),
             );
-        if let Some(message) = reply? {
-            wire::predecode(&message)?;
-            let generation = decode_lfum_upload_reply(&message).map_err(err)?;
+        if let Some(generation) = reply? {
             node.complete_lfum_upload(upload, source, &generation)
                 .map_err(err)?;
             self.uploads.remove(index);
@@ -157,11 +155,9 @@ impl LfumUploadState {
             if upload.request.is_some() || now < upload.retry_at {
                 continue;
             }
-            let request = lfum_upload_message(&upload.body).map_err(err)?;
+            let request = LfumUploadRequest::new(&upload.body)?;
             let link = link.clone();
-            upload.request = Some(Box::pin(
-                async move { link.request_optional(request).await },
-            ));
+            upload.request = Some(Box::pin(async move { link.lfum_upload(request).await }));
         }
         Ok(())
     }
@@ -333,12 +329,14 @@ impl Adapter {
         self.peer_replies.pop_front()
     }
 
-    pub fn reject_deprecated(&mut self, node: &Node, message: &furpc::Message) -> Result<bool> {
-        if wire::action(message)? != "ChangeConfigurationReply" {
+    pub fn reject_deprecated(&mut self, node: &Node, incoming: &wire::Incoming) -> Result<bool> {
+        if incoming.action()? != "ChangeConfigurationReply" {
             return Ok(false);
         }
-        wire::predecode(message)?;
-        let (body, generation) = decode_change_configuration_reply(message).map_err(err)?;
+        let wire::OneWayCall::Deprecated(payload) = &incoming.prepared()?.call else {
+            return Err("original typed invocation is not deprecated reply".into());
+        };
+        let (body, generation) = payload.clone().into_parts()?;
         if generation.for_fm_replica || generation.number != node.generation_state().receive {
             return Err("deprecated reply has a foreign FM generation".into());
         }
@@ -630,38 +628,11 @@ impl Adapter {
                 }
             }
             let sent = async {
-                let message = match &reply.effect {
-                    ra::Effect::PeerCreateReplica { target, body } if target == peer => {
-                        create_replica_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerCreateReplicaReply { target, body } if target == peer => {
-                        create_replica_reply_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerActivate { target, body } if target == peer => {
-                        activate_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerActivateReply { target, body } if target == peer => {
-                        activate_reply_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerDeactivate { target, body } if target == peer => {
-                        deactivate_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerDeactivateReply { target, body } if target == peer => {
-                        deactivate_reply_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerContinueSwap { target, body } if target == peer => {
-                        do_reconfiguration_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerGetLsn { target, body } if target == peer => {
-                        get_lsn_message(body, &link.generation())
-                    }
-                    ra::Effect::PeerGetLsnReply { target, body } if target == peer => {
-                        get_lsn_reply_message(body, &link.generation())
-                    }
-                    _ => return Err("peer receipt does not match the original bound peer".into()),
+                if peer_target(&reply.effect) != Some(peer) {
+                    return Err("peer receipt does not match the original bound peer".into());
                 }
-                .map_err(err)?;
-                link.send(message).await
+                let mut client = PeerClient::new(link)?;
+                client.send(&reply.effect, &link.generation()).await
             }
             .await;
             match sent {
@@ -794,39 +765,8 @@ impl Adapter {
                         return Ok(());
                     }
                 }
-                let message = match &reply.effect {
-                    ra::Effect::NodeActivateReply(body) => {
-                        node_activate_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::NodeDeactivateReply(body) => {
-                        node_deactivate_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::NodeUpdateServiceReply(body) => {
-                        node_update_service_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::Reply(body) => add_instance_reply_message(body, Owner::Fm),
-                    ra::Effect::DoReconfigurationReply(body) => {
-                        do_reconfiguration_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::ChangeConfiguration(body) => {
-                        change_configuration_message(body, Owner::Fm)
-                    }
-                    ra::Effect::ReplicaEndpointUpdated(body) => {
-                        replica_endpoint_updated_message(body, Owner::Fm)
-                    }
-                    ra::Effect::PrimaryReply(body) => add_primary_reply_message(body, Owner::Fm),
-                    ra::Effect::AddReplicaReply(body) => add_replica_reply_message(body, Owner::Fm),
-                    ra::Effect::RemoveReplicaReply(body) => {
-                        remove_replica_reply_message(body, Owner::Fm)
-                    }
-                    ra::Effect::RemoveReply(body) => remove_instance_reply_message(body, Owner::Fm),
-                    ra::Effect::DeleteReplicaReply(body) => {
-                        delete_replica_reply_message(body, Owner::Fm)
-                    }
-                    _ => return Err("unimplemented semantic reply retained".into()),
-                }
-                .map_err(err)?;
-                link.send(message).await?;
+                let mut client = FmClient::new(link)?;
+                client.send(&reply.effect).await?;
                 self.replies.pop_front();
             }
         }
@@ -864,17 +804,12 @@ impl Adapter {
                     self.escrow.remove(index);
                     return Ok(());
                 }
-                ra::Effect::ServiceTypeStatus { enabled, body } => {
+                ra::Effect::ServiceTypeStatus { .. } => {
                     let Some(link) = link else {
                         continue;
                     };
-                    let message = if *enabled {
-                        service_type_enabled_message(body)
-                    } else {
-                        service_type_disabled_message(body)
-                    }
-                    .map_err(err)?;
-                    link.send(message).await?;
+                    let mut client = FmClient::new(link)?;
+                    client.send(&effect).await?;
                     self.status_due = Some(
                         Instant::now()
                             + ticks(
@@ -886,11 +821,12 @@ impl Adapter {
                     self.escrow.remove(index);
                     return Ok(());
                 }
-                ra::Effect::ReportLoad(body) => {
+                ra::Effect::ReportLoad(_) => {
                     let Some(link) = link else {
                         continue;
                     };
-                    link.send(report_load_message(body).map_err(err)?).await?;
+                    let mut client = FmClient::new(link)?;
+                    client.send(&effect).await?;
                     self.escrow.remove(index);
                     return Ok(());
                 }
@@ -928,8 +864,8 @@ impl Adapter {
                                 return Err("unsupported replaced notification remains semantically pending".into());
                             }
                             self.notification_pending = Some((**body).clone());
-                            link.send(service_type_notification_message(body).map_err(err)?)
-                                .await?;
+                            let mut client = FmClient::new(link)?;
+                            client.send(&effect).await?;
                         }
                         self.escrow[index].sent = true;
                     }
@@ -960,8 +896,8 @@ impl Adapter {
                         continue;
                     };
                     self.report_pending = Some((**body).clone());
-                    link.send(replica_up_message(body, Owner::Fm).map_err(err)?)
-                        .await?;
+                    let mut client = FmClient::new(link)?;
+                    client.send(&effect).await?;
                     self.escrow.remove(index);
                     self.finish_report_pass(entity, report_retry(node, entity));
                     return Ok(());

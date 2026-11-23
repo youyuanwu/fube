@@ -108,7 +108,6 @@ impl Generation {
         id: MessageId,
         check: EnvelopeCheck,
         deadline: Instant,
-        slot: OwnedSemaphorePermit,
     ) -> Result<SendReceipt> {
         let message = rpc::envelope(
             message.headers().clone(),
@@ -124,7 +123,6 @@ impl Generation {
             kind: SendKind::OneWay,
             notification: None,
             reply: Some(check),
-            _reply_slot: Some(slot),
         };
         self.handle
             .send_authorized(message, deadline, Some(authorization))
@@ -268,7 +266,6 @@ impl Peer {
             },
             notification: notification.map(|policy| policy.notification),
             reply: None,
-            _reply_slot: None,
         };
         let receipt = core
             .handle
@@ -309,7 +306,6 @@ impl Peer {
             kind: SendKind::OneWay,
             notification: None,
             reply: None,
-            _reply_slot: None,
         };
         core.handle
             .send_authorized(message, deadline, Some(authorization))
@@ -394,7 +390,6 @@ pub(crate) struct SendAuthorization {
     kind: SendKind,
     notification: Option<EnvelopeCheck>,
     reply: Option<EnvelopeCheck>,
-    _reply_slot: Option<OwnedSemaphorePermit>,
 }
 impl SendAuthorization {
     pub(crate) fn is_reply(&self) -> bool {

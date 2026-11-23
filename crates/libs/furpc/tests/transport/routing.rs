@@ -706,7 +706,7 @@ impl Service<Request<u32>> for PendingMethod {
 }
 
 #[tokio::test(start_paused = true)]
-async fn routed_readiness_reuses_method_waiters_and_keeps_same_instance_and_error_sources() {
+async fn routed_readiness_keeps_independent_waiters_same_instances_and_error_sources() {
     async fn result(
         results: &mut mpsc::Receiver<(String, furpc::Result<()>)>,
         expected: &str,
@@ -716,14 +716,14 @@ async fn routed_readiness_reuses_method_waiters_and_keeps_same_instance_and_erro
             if name == expected {
                 return result;
             }
-            assert_eq!(name, "typed");
+            assert!(matches!(name.as_str(), "typed" | "pending"));
             assert!(matches!(
                 result,
                 Err(Error::Closed | Error::Timeout("handler"))
             ));
         }
     }
-    for waiters in [0, 1] {
+    {
         let entered = Arc::new(Notify::new());
         let (observed, mut results) = mpsc::channel(16);
         let mut router = Router::new()
@@ -783,7 +783,6 @@ async fn routed_readiness_reuses_method_waiters_and_keeps_same_instance_and_erro
         let running = Running::start(
             service,
             HandlerLimits {
-                max_readiness_waiters: waiters,
                 timeout: Duration::from_secs(1),
                 ..Default::default()
             },
@@ -797,20 +796,9 @@ async fn routed_readiness_reuses_method_waiters_and_keeps_same_instance_and_erro
         .await
         .unwrap();
         bounded(entered.notified()).await;
-        if waiters == 0 {
-            assert_eq!(
-                result(&mut results, "typed").await.unwrap_err(),
-                Error::ResourceLimit("service readiness waiters")
-            );
-        } else {
-            peer.send(routed(actor(7), "pending", b""), deadline())
-                .await
-                .unwrap();
-            assert_eq!(
-                result(&mut results, "pending").await.unwrap_err(),
-                Error::ResourceLimit("service readiness waiters")
-            );
-        }
+        peer.send(routed(actor(7), "pending", b""), deadline())
+            .await
+            .unwrap();
         peer.send(routed(actor(7), "ready", b""), deadline())
             .await
             .unwrap();
@@ -837,15 +825,7 @@ async fn routed_readiness_reuses_method_waiters_and_keeps_same_instance_and_erro
         peer.send(routed(actor(7), "once", b""), deadline())
             .await
             .unwrap();
-        let ready = result(&mut results, "once").await;
-        if waiters == 0 {
-            assert_eq!(
-                ready.unwrap_err(),
-                Error::ResourceLimit("service readiness waiters")
-            );
-        } else {
-            ready.unwrap();
-        }
+        result(&mut results, "once").await.unwrap();
         running.finish().await;
     }
 }

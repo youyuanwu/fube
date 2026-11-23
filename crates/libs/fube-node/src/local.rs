@@ -3430,6 +3430,9 @@ mod ingress_tests {
 
     #[tokio::test]
     async fn fm_capacity_retains_semantic_ack_and_rejects_unadmitted_generation_before_mutation() {
+        use crate::control::{err, wire};
+        use furpc::{header, Body, HeaderId, Message};
+
         let local = Placement {
             node: NodeInstance {
                 id: [1; 16],
@@ -3469,11 +3472,58 @@ mod ingress_tests {
             Profile::Stateless,
             true,
             PartitionId::default(),
-            fm,
-            local,
+            fm.clone(),
+            local.clone(),
             vec![],
         )
         .unwrap();
+        let without = |message: &Message, id: HeaderId| {
+            let mut builder = Message::builder().body(message.body().clone());
+            for header in message
+                .headers()
+                .records()
+                .filter(|header| header.id() != id)
+            {
+                builder = builder.append_header(header.to_owned());
+            }
+            builder.build().unwrap()
+        };
+        let activation =
+            node_activate_request_message(&NodeActivateRequest::default(), &generation).unwrap();
+        let missing_actor = without(&activation, header::ACTOR);
+        assert_eq!(
+            ingress.fm(&mut node, &missing_actor, true).err().unwrap(),
+            "new lifecycle intent is not admitted during shutdown"
+        );
+        assert_eq!(
+            ingress.fm(&mut node, &missing_actor, false).err().unwrap(),
+            err(decode_node_activate_request(&missing_actor).unwrap_err())
+        );
+        let missing_generation = without(&missing_actor, HeaderId::new(GENERATION_HEADER).unwrap());
+        assert_eq!(
+            ingress
+                .fm(&mut node, &missing_generation, true)
+                .err()
+                .unwrap(),
+            "missing FM generation"
+        );
+        let mut builder = Message::builder().body(Body::from_bytes(vec![0xff]).unwrap());
+        for header in missing_generation.headers().records() {
+            builder = builder.append_header(header.to_owned());
+        }
+        let malformed = builder.build().unwrap();
+        assert_eq!(
+            ingress.fm(&mut node, &malformed, true).err().unwrap(),
+            wire::predecode(&malformed).unwrap_err()
+        );
+        let reconfiguration =
+            do_reconfiguration_message(&DoReconfiguration::default(), &generation).unwrap();
+        let missing_actor = without(&reconfiguration, header::ACTOR);
+        assert_eq!(
+            ingress.fm(&mut node, &missing_actor, false).err().unwrap(),
+            "DoReconfiguration requires a replicated stateful profile"
+        );
+        assert_eq!(node.pending_commands(), 0);
         let mut foreign = AddInstance::default();
         foreign.unit.id.guid.0[0] = 1;
         let message = add_instance_message(&foreign, &generation).unwrap();
@@ -3505,8 +3555,46 @@ mod ingress_tests {
         }
         let body = ServiceTypeNotification::default();
         let acknowledgement = service_type_notification_reply_message(&body, &generation).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sender = wire::connect(
+            listener.local_addr().unwrap(),
+            wire::Role::Fm,
+            wire::deadline(),
+        );
+        let (sender, receiver) = tokio::join!(sender, async {
+            let (stream, _) = listener.accept().await.unwrap();
+            wire::accept(stream, wire::Role::Node, wire::deadline()).await
+        });
+        let sender = wire::Link::new(
+            sender.unwrap(),
+            fm.clone(),
+            local.node.clone(),
+            generation.clone(),
+        )
+        .unwrap();
+        let receiver = wire::Link::new(
+            receiver.unwrap(),
+            local.node.clone(),
+            fm.clone(),
+            generation.clone(),
+        )
+        .unwrap();
+        sender.send(acknowledgement.clone()).await.unwrap();
+        let mut incoming = receiver
+            .receive_checked(wire::deadline())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(
-            ingress.fm(&mut node, &acknowledgement, false).unwrap(),
+            ingress.fm_incoming(&mut node, &incoming, false).unwrap(),
+            Admission::Retained
+        ));
+        incoming.message = Message::builder()
+            .body(Body::from_bytes(vec![0xff]).unwrap())
+            .build()
+            .unwrap();
+        assert!(matches!(
+            ingress.fm_incoming(&mut node, &incoming, false).unwrap(),
             Admission::Retained
         ));
         assert_eq!(node.pending_commands(), 32);
@@ -3522,13 +3610,15 @@ mod ingress_tests {
         }
         assert_eq!(node.pending_commands(), 32);
         drain_control(&mut node).await;
-        match ingress.fm(&mut node, &acknowledgement, false).unwrap() {
+        match ingress.fm_incoming(&mut node, &incoming, false).unwrap() {
             Admission::Submitted(Some((_, SemanticAck::Notification(actual)))) => {
                 assert_eq!(actual, body)
             }
             _ => panic!("retry must admit the original semantic acknowledgement"),
         }
         drain_control(&mut node).await;
+        receiver.close().await.unwrap();
+        sender.close().await.unwrap();
         assert!(node.terminate().unwrap());
         node.close_executor(Duration::from_secs(3)).await.unwrap();
         assert!(store.close().await.unwrap().is_clean());
