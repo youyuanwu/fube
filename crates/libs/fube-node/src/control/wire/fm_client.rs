@@ -1,5 +1,5 @@
 //! Native FM effect profiles; fences, retries and semantic ACKs stay in Adapter.
-use super::{bootstrap::PreparedBodyCodec, deadline, err, outbound, Link, Result, LIMIT};
+use super::{err, one_way, Link, Result, LIMIT};
 use fube_ra::{
     entity::Effect,
     protocol::{
@@ -13,7 +13,7 @@ use fube_ra::{
         service_type_notification_message, GenerationNumber, Owner,
     },
 };
-use furpc::{Error, Message, OneWayClient, PeerSendService, Request};
+use furpc::{Message, OneWayClient, PeerSendService};
 
 pub(in crate::control) struct FmClient {
     link: Link,
@@ -81,24 +81,13 @@ impl FmClient {
     }
 
     async fn send_message(&mut self, message: Message) -> Result<()> {
-        let message = self.link.seal(message)?;
-        if !self.link.is_live() {
-            return Err(err(Error::Closed));
-        }
-        outbound(self.link.session.role(), &message, false).map_err(err)?;
-        let mut request = Request::new(message.body().clone());
-        *request.headers_mut() = message.headers().clone();
-        self.client
-            .send(request, PreparedBodyCodec, deadline())
-            .await
-            .map(|_| ())
-            .map_err(err)
+        one_way::send_prepared(&self.link, &mut self.client, message).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{decode, tests::links, PToP, GENERATION_HEADER, PTOP};
+    use super::super::{deadline, decode, tests::links, PToP, GENERATION_HEADER, PTOP};
     use super::*;
     use fube_ra::protocol::*;
     use fubst::serde::{to_vec, ObjectArray};

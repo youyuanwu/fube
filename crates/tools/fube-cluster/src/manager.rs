@@ -7,7 +7,7 @@ use fube_ra::protocol::*;
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 use tokio::time::Instant;
-use wire::{FmReport, Link};
+use wire::{FmReport, Link, NodeClient, NodeRequest};
 
 pub(crate) struct Connection {
     pub(crate) launch: Launch,
@@ -339,9 +339,8 @@ impl Manager {
                     return Err("FMM endpoint publication is gated".into());
                 }
                 if let Some(reply) = self.ledger.endpoint_updated(index, body)? {
-                    let message =
-                        replica_endpoint_updated_reply_message(&reply, &generation).map_err(err)?;
-                    link.send(message).await?;
+                    let request = NodeRequest::replica_endpoint_updated_reply(&reply, &generation)?;
+                    NodeClient::new(link)?.send(request).await?;
                 }
             }
             FmReport::DoReconfigurationReply(payload) => {
@@ -360,10 +359,8 @@ impl Manager {
                     self.ledger
                         .change_configuration(index, body, Instant::now())?
                 {
-                    link.send(
-                        change_configuration_reply_message(&reply, &generation).map_err(err)?,
-                    )
-                    .await?;
+                    let request = NodeRequest::change_configuration_reply(&reply, &generation)?;
+                    NodeClient::new(link)?.send(request).await?;
                     if self.finished.is_none() {
                         let next = &self
                             .ledger
@@ -384,13 +381,12 @@ impl Manager {
             FmReport::ServiceTypeStatus { enabled, payload } => {
                 let (body, _) = payload.into_parts()?;
                 let reply = self.ledger.type_status(index, enabled, &body)?;
-                let message = if enabled {
-                    service_type_enabled_reply_message(&reply, &generation)
+                let request = if enabled {
+                    NodeRequest::service_type_enabled_reply(&reply, &generation)
                 } else {
-                    service_type_disabled_reply_message(&reply, &generation)
-                }
-                .map_err(err)?;
-                link.send(message).await?;
+                    NodeRequest::service_type_disabled_reply(&reply, &generation)
+                }?;
+                NodeClient::new(link)?.send(request).await?;
             }
             FmReport::NodeActivationReply { activate, payload } => {
                 let (body, owner) = payload.into_parts()?;
@@ -426,8 +422,8 @@ impl Manager {
                 {
                     self.ledger.down(index);
                 }
-                link.send(replica_up_reply_message(&response, &generation).map_err(err)?)
-                    .await?;
+                let request = NodeRequest::replica_up_reply(&response, &generation)?;
+                NodeClient::new(link)?.send(request).await?;
                 if self.ledger.placements[index].bootstrap == Bootstrap::FinalUpload {
                     self.ledger.placements[index].bootstrap = Bootstrap::Metadata;
                 }
@@ -438,10 +434,8 @@ impl Manager {
                 if !admitted.infos.0.is_empty() {
                     self.ledger.placements[index].catalog_notified = true;
                 }
-                link.send(
-                    service_type_notification_reply_message(&admitted, &generation).map_err(err)?,
-                )
-                .await?;
+                let request = NodeRequest::service_type_notification_reply(&admitted, &generation)?;
+                NodeClient::new(link)?.send(request).await?;
             }
             FmReport::AddReplicaReply(payload) => {
                 let (body, owner) = payload.into_parts()?;
@@ -635,11 +629,12 @@ impl Manager {
         body: &DeleteReplica,
     ) -> Result<()> {
         let child = &self.children[destination];
-        child
+        let link = child
             .link
             .as_ref()
-            .ok_or("original repair destination link absent")?
-            .send(delete_replica_message(body, &child.generation()).map_err(err)?)
+            .ok_or("original repair destination link absent")?;
+        NodeClient::new(link)?
+            .send(NodeRequest::delete_replica(body, &child.generation())?)
             .await
     }
 
@@ -790,16 +785,14 @@ impl Manager {
                 }
             }
             fm::GenerationWork::Update(header) => {
-                link.send(
-                    generation_update_message(
+                NodeClient::new(link)?
+                    .send(NodeRequest::generation_update(
                         &GenerationUpdate {
                             fm_service_epoch: Epoch::default(),
                         },
                         &header,
-                    )
-                    .map_err(err)?,
-                )
-                .await?;
+                    )?)
+                    .await?;
                 link.advance_generation(&header);
             }
         }
@@ -815,19 +808,20 @@ impl Manager {
         let child = &self.children[index];
         let link = child.link.as_ref().ok_or("original node link absent")?;
         if let Some((activate, body)) = control {
-            let message = if activate {
-                node_activate_request_message(&body, &child.generation())
+            let request = if activate {
+                NodeRequest::node_activate(&body, &child.generation())
             } else {
-                node_deactivate_request_message(&body, &child.generation())
-            }
-            .map_err(err)?;
-            link.send(message).await?;
+                NodeRequest::node_deactivate(&body, &child.generation())
+            }?;
+            NodeClient::new(link)?.send(request).await?;
         }
         if let Some(body) = service {
-            link.send(
-                node_update_service_request_message(&body, &child.generation()).map_err(err)?,
-            )
-            .await?;
+            NodeClient::new(link)?
+                .send(NodeRequest::node_update_service(
+                    &body,
+                    &child.generation(),
+                )?)
+                .await?;
         }
         Ok(())
     }
@@ -836,13 +830,9 @@ impl Manager {
             return Ok(());
         };
         let child = &self.children[index];
-        let message = add_primary_message(&body, &child.generation()).map_err(err)?;
-        child
-            .link
-            .as_ref()
-            .ok_or("original Primary link absent")?
-            .send(message)
-            .await
+        let request = NodeRequest::add_primary(&body, &child.generation())?;
+        let link = child.link.as_ref().ok_or("original Primary link absent")?;
+        NodeClient::new(link)?.send(request).await
     }
     pub(crate) async fn retry_idle(&mut self, index: usize) -> Result<()> {
         let Some(body) = self.ledger.idle_retry(index, Instant::now()) else {
@@ -855,11 +845,9 @@ impl Manager {
             .children
             .get(self.ledger.primary_index())
             .ok_or("missing original Primary owner")?;
-        child
-            .link
-            .as_ref()
-            .ok_or("original Primary link absent")?
-            .send(add_replica_message(body, &child.generation()).map_err(err)?)
+        let link = child.link.as_ref().ok_or("original Primary link absent")?;
+        NodeClient::new(link)?
+            .send(NodeRequest::add_replica(body, &child.generation())?)
             .await
     }
     pub(crate) async fn retry_idle_removal(&mut self, index: usize) -> Result<()> {
@@ -873,11 +861,9 @@ impl Manager {
             .children
             .get(self.ledger.primary_index())
             .ok_or("missing original Primary owner")?;
-        child
-            .link
-            .as_ref()
-            .ok_or("original Primary link absent")?
-            .send(remove_replica_message(body, &child.generation()).map_err(err)?)
+        let link = child.link.as_ref().ok_or("original Primary link absent")?;
+        NodeClient::new(link)?
+            .send(NodeRequest::remove_replica(body, &child.generation())?)
             .await
     }
     pub(crate) async fn retry_deletion(&mut self, index: usize) -> Result<()> {
@@ -888,13 +874,9 @@ impl Manager {
             return Ok(());
         };
         let child = &self.children[index];
-        let message = delete_replica_message(&body, &child.generation()).map_err(err)?;
-        child
-            .link
-            .as_ref()
-            .ok_or("original deletion link absent")?
-            .send(message)
-            .await
+        let request = NodeRequest::delete_replica(&body, &child.generation())?;
+        let link = child.link.as_ref().ok_or("original deletion link absent")?;
+        NodeClient::new(link)?.send(request).await
     }
     pub(crate) async fn retry_idle_deletion(&mut self, index: usize) -> Result<()> {
         if let Some(body) = self.ledger.repair_deletion_retry(index, Instant::now()) {
@@ -910,11 +892,12 @@ impl Manager {
             .children
             .get(1)
             .ok_or("missing original destination owner")?;
-        child
+        let link = child
             .link
             .as_ref()
-            .ok_or("original destination link absent")?
-            .send(delete_replica_message(body, &child.generation()).map_err(err)?)
+            .ok_or("original destination link absent")?;
+        NodeClient::new(link)?
+            .send(NodeRequest::delete_replica(body, &child.generation())?)
             .await
     }
     pub(crate) fn read_retirement(&mut self, index: usize) -> Result<()> {
@@ -1158,11 +1141,9 @@ impl Manager {
             .children
             .get(self.ledger.configuration_target_index())
             .ok_or("missing original Primary owner")?;
-        child
-            .link
-            .as_ref()
-            .ok_or("missing original Primary link")?
-            .send(do_reconfiguration_message(body, &child.generation()).map_err(err)?)
+        let link = child.link.as_ref().ok_or("missing original Primary link")?;
+        NodeClient::new(link)?
+            .send(NodeRequest::do_reconfiguration(body, &child.generation())?)
             .await
     }
     /// FM retires original creation or removes the opened/lost Idle's replication session.
@@ -1277,18 +1258,16 @@ impl Manager {
         match self.ledger.accept(command)? {
             Accepted::NodeControl(index, activate, body) => {
                 let generation = &self.children[index].generation();
-                let message = if activate {
-                    node_activate_request_message(&body, generation)
+                let request = if activate {
+                    NodeRequest::node_activate(&body, generation)
                 } else {
-                    node_deactivate_request_message(&body, generation)
-                }
-                .map_err(err)?;
-                let result = self.children[index]
+                    NodeRequest::node_deactivate(&body, generation)
+                }?;
+                let link = self.children[index]
                     .link
                     .as_ref()
-                    .ok_or("original link absent")?
-                    .send(message)
-                    .await;
+                    .ok_or("original link absent")?;
+                let result = NodeClient::new(link)?.send(request).await;
                 if let Err(error) = result {
                     self.ledger.lost(index, error);
                 }
@@ -1296,34 +1275,32 @@ impl Manager {
             Accepted::Duplicate(outcome) => return Ok(outcome),
             Accepted::Create(index, body) => {
                 let factory = if self.children[index].launch.profile.stateful() {
-                    add_primary_message
+                    NodeRequest::add_primary
                 } else {
-                    add_instance_message
+                    NodeRequest::add_instance
                 };
-                let message = factory(&body, &self.children[index].generation()).map_err(err)?;
-                let result = self.children[index]
+                let request = factory(&body, &self.children[index].generation())?;
+                let link = self.children[index]
                     .link
                     .as_ref()
-                    .ok_or("original link absent")?
-                    .send(message)
-                    .await;
+                    .ok_or("original link absent")?;
+                let result = NodeClient::new(link)?.send(request).await;
                 if let Err(error) = result {
                     self.ledger.lost(index, error);
                 }
             }
             Accepted::Delete(index, body) => {
                 let factory = if self.children[index].launch.profile.stateful() {
-                    delete_replica_message
+                    NodeRequest::delete_replica
                 } else {
-                    remove_instance_message
+                    NodeRequest::remove_instance
                 };
-                let message = factory(&body, &self.children[index].generation()).map_err(err)?;
-                let result = self.children[index]
+                let request = factory(&body, &self.children[index].generation())?;
+                let link = self.children[index]
                     .link
                     .as_ref()
-                    .ok_or("original link absent")?
-                    .send(message)
-                    .await;
+                    .ok_or("original link absent")?;
+                let result = NodeClient::new(link)?.send(request).await;
                 if let Err(error) = result {
                     self.ledger.lost(index, error);
                 }
@@ -1377,19 +1354,17 @@ impl Manager {
         {
             return Err("service update is outside admitted fixed profile/version".into());
         }
-        let message = node_update_service_request_message(
+        let request = NodeRequest::node_update_service(
             &NodeUpdateServiceRequest {
                 service: service.clone(),
             },
             &self.children[index].generation(),
-        )
-        .map_err(err)?;
-        self.children[index]
+        )?;
+        let link = self.children[index]
             .link
             .as_ref()
-            .ok_or("original link absent")?
-            .send(message)
-            .await?;
+            .ok_or("original link absent")?;
+        NodeClient::new(link)?.send(request).await?;
         placement.service_update = Some(service);
         placement.service_retry_at = Some(Instant::now() + Duration::from_secs(5));
         Ok(())

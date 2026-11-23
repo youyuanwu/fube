@@ -958,9 +958,29 @@ mutation, generation-rebuild ACK suppression, bootstrap progression and reply
 policy. NodeUp/LFUMUpload RPC serving is unchanged. Typed handoff/NoReply means
 decoded input delivery, not ledger execution, semantic acknowledgment or local
 writing. No new worker queue, per-message task, generic furpc API or handler cap
-is introduced. FM outbound commands/ACKs remain a separate typed-client
-follow-up. This is source/schema and owned Rust-process composition, not fresh
-native FM/Federation, TLS or deployed-readiness qualification.
+is introduced. This is source/schema and owned Rust-process composition, not
+fresh native FM/Federation, TLS or deployed-readiness qualification.
+
+**Typed FM-to-Node client:** the FM manager's seventeen one-way command/ACK
+profiles now use `NodeClient` on the captured original `PeerSendService`.
+Opaque `NodeRequest` constructors retain the native factory action/body,
+priority and caller-selected GenerationHeader. Preparation stays separate from
+submission, preserving local factory-error handling and frozen generations;
+the shared prepared-body codec adopts the bytes without another serialization.
+Node, peer and FM one-way clients share the original-Link sealing, live-session
+and role/envelope checks and await the actual local-write receipt.
+
+The manager still selects the destination and lifecycle profile, captures
+generations, schedules retries, gates mutations and retains semantic outcomes.
+GenerationUpdate advances only its original Link after successful writing;
+creation/deletion, service updates and semantic ACKs keep their existing
+completion and retry points. A retained client cannot reacquire a successor
+session. GenerationProposal and NodeUp/LFUMUpload remain on their existing typed
+RPC paths. Deprecated ChangeConfigurationReply retains its native send profile
+and explicit Node-side rejection, not new support. No reconnect, replay,
+generic furpc API or handler policy is added. These checks are consumer
+composition evidence, not fresh native FM/Federation, TLS or deployed-readiness
+qualification.
 
 ## Node local RAP typed composition
 

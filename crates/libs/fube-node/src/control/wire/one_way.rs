@@ -1,14 +1,16 @@
-//! Original-invocation decoding and typed handoff, not domain completion.
+//! Original-Link sends and original-invocation typed handoffs, not domain completion.
 use super::{
-    bootstrap::{decode_body, PreparedEncoder},
-    bounded, err, fm_intake,
+    bootstrap::{decode_body, PreparedBodyCodec, PreparedEncoder},
+    bounded, deadline, err, fm_intake,
     fm_server::FmReport,
-    peer_intake,
+    outbound, peer_intake,
     session::OneWaySlot,
     Headers, Link, Message, Properties, Result, Role, LIMIT,
 };
 use fube_ra::protocol::{FailoverUnitReply, GenerationUpdate};
-use furpc::{Body, Codec, CodecError, DecodeBuf, Decoder, Error, Request};
+use furpc::{
+    Body, Codec, CodecError, DecodeBuf, Decoder, Error, OneWayClient, PeerSendService, Request,
+};
 use serde::de::DeserializeOwned;
 use std::{
     future::{ready, Ready},
@@ -17,6 +19,25 @@ use std::{
 };
 use tokio::sync::oneshot;
 use tower_service::Service;
+
+pub(super) async fn send_prepared(
+    link: &Link,
+    client: &mut OneWayClient<PeerSendService>,
+    message: Message,
+) -> Result<()> {
+    let message = link.seal(message)?;
+    if !link.is_live() {
+        return Err(err(Error::Closed));
+    }
+    outbound(link.session.role(), &message, false).map_err(err)?;
+    let mut request = Request::new(message.body().clone());
+    *request.headers_mut() = message.headers().clone();
+    client
+        .send(request, PreparedBodyCodec, deadline())
+        .await
+        .map(|_| ())
+        .map_err(err)
+}
 
 pub(super) struct Budgeted<T>(PhantomData<fn() -> T>);
 

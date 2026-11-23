@@ -912,7 +912,11 @@ async fn typed_fm_manager() -> (Manager, Vec<wire::Link>) {
 #[tokio::test]
 async fn typed_fm_intake_keeps_cached_lifecycle_data_child_authority_and_profile_error_order() {
     let (mut manager, nodes) = typed_fm_manager().await;
-    manager.ledger.accept(command("typed-create", "create", Some(1))).unwrap();
+    let pending = manager.execute(command("typed-create", "create", Some(1))).await.unwrap();
+    assert_eq!(pending["state"], "pending");
+    let command_input = nodes[0].receive(Instant::now() + Duration::from_secs(3)).await.unwrap().unwrap();
+    assert_eq!(decode_add_instance(&command_input.message).unwrap().0, manager.ledger.placements[0].body().unwrap());
+    assert!(nodes[1].receive(Instant::now() + Duration::from_millis(5)).await.unwrap().is_none());
     let reply = ready_reply(&manager.ledger.placements[0]);
     let link = manager.children[0].link.clone().unwrap();
     nodes[0].send(add_instance_reply_message(&reply, Owner::Fm).unwrap()).await.unwrap();
@@ -923,6 +927,8 @@ async fn typed_fm_intake_keeps_cached_lifecycle_data_child_authority_and_profile
         .build().unwrap();
     manager.receive_message(0, incoming).await.unwrap();
     assert_eq!(manager.ledger.result("typed-create")["state"], "complete");
+    assert_eq!(manager.execute(command("typed-create", "create", Some(1))).await.unwrap(), manager.ledger.result("typed-create"));
+    assert!(nodes[0].receive(Instant::now() + Duration::from_millis(5)).await.unwrap().is_none());
     let before = manager.ledger.status();
 
     nodes[0].send(add_instance_reply_message(&reply, Owner::Fm).unwrap()).await.unwrap();
@@ -976,6 +982,45 @@ async fn typed_fm_intake_withholds_report_acks_during_rebuild_but_validates_head
     let incoming = link.receive(Instant::now() + Duration::from_secs(3)).await.unwrap().unwrap();
     manager.receive_message(0, incoming).await.unwrap();
     assert_eq!(manager.ledger.generation.as_ref().unwrap().number.generation, proposal.generation + 1);
+    for node in nodes { node.close().await.unwrap(); }
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn typed_fm_client_advances_only_the_original_generation_after_a_successful_local_write() {
+    let (mut manager, nodes) = typed_fm_manager().await;
+    let old = manager.children[0].generation();
+    manager.ledger.begin_generation().unwrap();
+    let round = manager.ledger.generation.as_mut().unwrap();
+    let proposal = round.number.clone();
+    for index in 0..nodes.len() {
+        round.proposal_reply(index, &GenerationProposalReply { proposed: proposal.clone(), current: proposal.clone(), error: 0 }).unwrap();
+    }
+    manager.retry_generation(0).await.unwrap();
+    let current = GenerationHeader { number: proposal, for_fm_replica: false };
+    assert_eq!(manager.children[0].generation(), current);
+    assert_eq!(manager.children[1].generation(), old);
+    let incoming = nodes[0].receive(Instant::now() + Duration::from_secs(3)).await.unwrap().unwrap();
+    assert_eq!(decode_generation_update(&incoming.message).unwrap(), (GenerationUpdate::default(), current));
+    assert_eq!(nodes[0].generation(), old);
+    manager.children[1].link.as_ref().unwrap().retire();
+    assert!(manager.retry_generation(1).await.unwrap_err().contains("Closed"));
+    assert_eq!(manager.children[1].generation(), old);
+    for node in nodes { node.close().await.unwrap(); }
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn typed_fm_client_local_encoding_failure_does_not_install_pending_service_work_or_lose_the_link() {
+    let (mut manager, nodes) = typed_fm_manager().await;
+    let before = manager.ledger.status();
+    let mut service = manager.ledger.placements[0].body().unwrap().service;
+    service.constraints = "x".repeat(64 * 1024);
+    assert!(manager.update_service(0, service).await.unwrap_err().contains("ResourceLimit"));
+    assert_eq!(manager.ledger.status(), before);
+    assert!(manager.ledger.placements[0].service_update.is_none());
+    assert!(manager.children[0].link.as_ref().unwrap().is_live());
+    assert!(nodes[0].receive(Instant::now() + Duration::from_millis(5)).await.unwrap().is_none());
     for node in nodes { node.close().await.unwrap(); }
     manager.close().await.unwrap();
 }
