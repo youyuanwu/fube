@@ -1179,7 +1179,8 @@ impl FmFixture {
                     .check_alive()
                     .unwrap_or_else(|error| panic!("{error}: {:?}", child.logs()));
             }
-            self.step().await;
+            // Keep the large FM dispatch future off nested scenario stacks.
+            Box::pin(self.step()).await;
         }
     }
 

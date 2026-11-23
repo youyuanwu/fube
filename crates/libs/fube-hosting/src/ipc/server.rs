@@ -201,6 +201,17 @@ impl Service<Request<Body>> for HostingServer {
         let send = self.send.clone();
         let failure = self.failure.clone();
         Box::pin(async move {
+            let permit = match send.try_reserve_owned() {
+                Ok(permit) => permit,
+                // Overload rejects this call, not the admitted Hosting session.
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    return Err(Error::ResourceLimit("Hosting ingress handoff"));
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    failure.send_replace(Some(Error::Closed));
+                    return Err(Error::Closed);
+                }
+            };
             let mut guard = CallGuard {
                 failure,
                 completed: false,
@@ -214,19 +225,13 @@ impl Service<Request<Body>> for HostingServer {
                 // Surface header errors at the executor's original validation point.
                 let action = action(request.headers());
                 let (response, wait) = oneshot::channel();
-                send.try_send(Incoming {
+                permit.send(Incoming {
                     request,
                     action,
                     received_at,
                     deadline,
                     response,
-                })
-                .map_err(|error| match error {
-                    mpsc::error::TrySendError::Full(_) => {
-                        Error::ResourceLimit("Hosting ingress handoff")
-                    }
-                    mpsc::error::TrySendError::Closed(_) => Error::Closed,
-                })?;
+                });
                 wait.await.map_err(|_| Error::Closed)
             }
             .await;
