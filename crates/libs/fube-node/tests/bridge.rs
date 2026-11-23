@@ -883,7 +883,6 @@ async fn terminal_ra_loss_fences_existing_factory_and_new_admission_without_anot
     })
     .await
     .unwrap();
-    assert!(!ra.consumer_lifetime().is_accepting());
     peer.index += 1;
     let id = MessageId {
         guid: peer.guid,
@@ -935,6 +934,15 @@ async fn terminal_ra_loss_fences_existing_factory_and_new_admission_without_anot
         }),
         Err(fube_node::Error::Closed)
     ));
+    // Node fences on ticket loss before the RA scope necessarily publishes its lifetime.
+    tokio::time::timeout(WAIT, async {
+        while ra.consumer_lifetime().is_accepting() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!ra.consumer_lifetime().is_accepting());
     node.stop().unwrap();
     let residual = handle.take_shutdown().unwrap();
     assert!(residual.pending.iter().any(|p| p
