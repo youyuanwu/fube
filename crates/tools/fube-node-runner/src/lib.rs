@@ -413,14 +413,12 @@ impl Owner {
             last: true,
             ..ReplicaUp::default()
         };
-        link.send(replica_up_message(&upload, fube_ra::protocol::Owner::Fm).map_err(err)?)
-            .await?;
+        link.replica_up(&upload).await?;
         let incoming = link
             .receive(deadline)
             .await?
             .ok_or("final inventory reply timeout")?;
-        wire::predecode(&incoming.message)?;
-        let (body, generation) = decode_replica_up_reply(&incoming.message).map_err(err)?;
+        let (body, generation) = incoming.replica_up_reply(link)?;
         if body != upload || generation != self.config.generation()? {
             return Err("fresh bootstrap requires the matching final empty inventory reply".into());
         }

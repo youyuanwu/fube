@@ -982,6 +982,18 @@ generic furpc API or handler policy is added. These checks are consumer
 composition evidence, not fresh native FM/Federation, TLS or deployed-readiness
 qualification.
 
+**Typed startup final inventory:** both cluster-owned and standalone Node startup
+send their initial empty, final `ReplicaUp` through `Link::replica_up`, backed by
+the existing typed FM one-way client. Completion remains the actual local-write
+receipt, not an RPC result or semantic ACK. Startup reads `ReplicaUpReply` from
+the original typed handoff through `Incoming::replica_up_reply`; it no longer
+predecodes or reparses the public raw Message view. The accessor retains native
+factory/generation-header checks and binds the cached reply to its original
+Link, independent of mutable message/source observations. Each caller retains
+its existing receive deadline, exact inventory/generation comparison and gate
+before constructing RA/Hosting/process authority. This adds no protocol support,
+retry, reconnect or fresh native qualification.
+
 ## Node local RAP typed composition
 
 Node's local RA/RAP bridge now separates private client and reply-intake adapters
