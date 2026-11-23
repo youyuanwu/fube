@@ -872,6 +872,114 @@ fn ledger() -> Ledger {
     }
     ledger
 }
+
+async fn typed_fm_manager() -> (Manager, Vec<wire::Link>) {
+    let launches = launches();
+    let mut manager = Manager::new(launches.to_vec()).unwrap();
+    manager.ledger = ledger();
+    let mut nodes = Vec::new();
+    for launch in launches {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        let (fm, node) = tokio::join!(
+            wire::connect(listener.local_addr().unwrap(), wire::Role::Fm, until),
+            async {
+                let (stream, _) = listener.accept().await.unwrap();
+                wire::accept(stream, wire::Role::Node, until).await
+            }
+        );
+        nodes.push(wire::Link::new(
+            node.unwrap(),
+            launch.node.clone(),
+            launch.fm.clone(),
+            launch.generation.clone(),
+        ).unwrap());
+        manager.children.push(crate::manager::Connection {
+            link: Some(wire::Link::new(
+                fm.unwrap(),
+                launch.fm.clone(),
+                launch.node.clone(),
+                launch.generation.clone(),
+            ).unwrap()),
+            launch,
+            node_pid: 555,
+            metadata: None,
+        });
+    }
+    (manager, nodes)
+}
+
+#[tokio::test]
+async fn typed_fm_intake_keeps_cached_lifecycle_data_child_authority_and_profile_error_order() {
+    let (mut manager, nodes) = typed_fm_manager().await;
+    manager.ledger.accept(command("typed-create", "create", Some(1))).unwrap();
+    let reply = ready_reply(&manager.ledger.placements[0]);
+    let link = manager.children[0].link.clone().unwrap();
+    nodes[0].send(add_instance_reply_message(&reply, Owner::Fm).unwrap()).await.unwrap();
+    let mut incoming = link.receive(Instant::now() + Duration::from_secs(3)).await.unwrap().unwrap();
+    incoming.message = furpc::Message::builder()
+        .append_header(furpc::header::action("NodeUp").unwrap())
+        .body(furpc::Body::from_bytes(vec![0xff]).unwrap())
+        .build().unwrap();
+    manager.receive_message(0, incoming).await.unwrap();
+    assert_eq!(manager.ledger.result("typed-create")["state"], "complete");
+    let before = manager.ledger.status();
+
+    nodes[0].send(add_instance_reply_message(&reply, Owner::Fm).unwrap()).await.unwrap();
+    let incoming = link.receive(Instant::now() + Duration::from_secs(3)).await.unwrap().unwrap();
+    assert!(manager.receive_message(1, incoming).await.unwrap_err().contains("foreign Channel"));
+    assert_eq!(manager.ledger.status(), before);
+
+    let original = add_primary_reply_message(&reply, Owner::Fm).unwrap();
+    let mut builder = furpc::Message::builder().body(original.body().clone());
+    for header in original.headers().records() {
+        builder = builder.append_header(header.to_owned());
+    }
+    let invalid = builder.append_header(
+        original.headers().records().find(|h| h.id() == furpc::header::HIGH_PRIORITY).unwrap().to_owned()
+    ).build().unwrap();
+    nodes[0].send(invalid).await.unwrap();
+    let incoming = link.receive(Instant::now() + Duration::from_secs(3)).await.unwrap().unwrap();
+    assert_eq!(manager.receive_message(0, incoming).await.unwrap_err(), "reply action does not match admitted lifecycle profile");
+    assert_eq!(manager.ledger.status(), before);
+    for node in nodes { node.close().await.unwrap(); }
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn typed_fm_intake_withholds_report_acks_during_rebuild_but_validates_headers_and_rejects() {
+    let (mut manager, nodes) = typed_fm_manager().await;
+    manager.ledger.begin_generation().unwrap();
+    let link = manager.children[0].link.clone().unwrap();
+    let before = manager.ledger.status();
+    let original = replica_up_message(&ReplicaUp { last: true, ..Default::default() }, Owner::Fm).unwrap();
+    nodes[0].send(original.clone()).await.unwrap();
+    let incoming = link.receive(Instant::now() + Duration::from_secs(3)).await.unwrap().unwrap();
+    manager.receive_message(0, incoming).await.unwrap();
+    assert_eq!(manager.ledger.status(), before);
+    assert!(nodes[0].receive(Instant::now() + Duration::from_millis(20)).await.unwrap().is_none());
+
+    let mut builder = furpc::Message::builder().body(original.body().clone());
+    for header in original.headers().records() {
+        builder = builder.append_header(header.to_owned());
+    }
+    let invalid = builder.append_header(
+        original.headers().records().find(|h| h.id() == furpc::header::HIGH_PRIORITY).unwrap().to_owned()
+    ).build().unwrap();
+    nodes[0].send(invalid).await.unwrap();
+    let incoming = link.receive(Instant::now() + Duration::from_secs(3)).await.unwrap().unwrap();
+    assert!(manager.receive_message(0, incoming).await.unwrap_err().contains("duplicate reliability header"));
+    assert_eq!(manager.ledger.status(), before);
+
+    let proposal = manager.ledger.generation.as_ref().unwrap().number.clone();
+    nodes[0].send(generation_update_reject_message(&proposal).unwrap()).await.unwrap();
+    let incoming = link.receive(Instant::now() + Duration::from_secs(3)).await.unwrap().unwrap();
+    manager.receive_message(0, incoming).await.unwrap();
+    assert_eq!(manager.ledger.generation.as_ref().unwrap().number.generation, proposal.generation + 1);
+    for node in nodes { node.close().await.unwrap(); }
+    manager.close().await.unwrap();
+}
+
 fn stateful_ledger() -> Ledger {
     let mut launches = launches();
     for launch in &mut launches {

@@ -148,6 +148,18 @@ impl Incoming {
             .as_ref()
             .ok_or_else(|| "one-way intake has no original typed handoff".into())
     }
+
+    /// Read the cached typed report admitted on this original FM Link.
+    pub fn fm_report(&self, link: &super::Link) -> super::Result<super::FmReport> {
+        let prepared = self.prepared()?;
+        if prepared.source_generation != link.session.peer.info().generation {
+            return Err("foreign Channel source capability".into());
+        }
+        match &prepared.call {
+            super::one_way::Call::Report(report) => Ok(report.clone()),
+            _ => Err("expected original typed FM report".into()),
+        }
+    }
 }
 
 pub(super) struct OneWaySlot {
@@ -217,7 +229,7 @@ impl Service<Request<Body>> for Ingress {
                     None,
                     Some(rx),
                 )
-            } else if self.role != Role::Fm {
+            } else {
                 let (tx, rx) = oneshot::channel();
                 (
                     None,
@@ -228,8 +240,6 @@ impl Service<Request<Body>> for Ingress {
                     }),
                     Some(rx),
                 )
-            } else {
-                (None, None, None)
             };
             self.tx
                 .try_send(Incoming {

@@ -7,7 +7,7 @@ use fube_ra::protocol::*;
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 use tokio::time::Instant;
-use wire::Link;
+use wire::{FmReport, Link};
 
 pub(crate) struct Connection {
     pub(crate) launch: Launch,
@@ -277,10 +277,7 @@ impl Manager {
             .link
             .as_ref()
             .ok_or("original node link absent")?;
-        let action = wire::action(&incoming.message)?;
-        if !matches!(action.as_str(), "NodeUp" | "LFUMUpload") {
-            wire::predecode(&incoming.message)?;
-        }
+        let action = incoming.action()?;
         let generation = self.children[index].generation();
         match action.as_str() {
             "LFUMUpload" => {
@@ -295,98 +292,8 @@ impl Manager {
                 }) {
                     link.advance_generation(&header);
                 }
+                return Ok(());
             }
-            "ReplicaEndpointUpdated" => {
-                let (body, owner) =
-                    decode_replica_endpoint_updated(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm {
-                    return Err("FMM endpoint publication is gated".into());
-                }
-                if let Some(reply) = self.ledger.endpoint_updated(index, body)? {
-                    let message =
-                        replica_endpoint_updated_reply_message(&reply, &generation).map_err(err)?;
-                    link.send(message).await?;
-                }
-            }
-            "DoReconfigurationReply" => {
-                let (body, owner) =
-                    decode_do_reconfiguration_reply(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm {
-                    return Err("FMM configuration reply is gated".into());
-                }
-                self.ledger.configuration_reply(index, body)?;
-            }
-            "ChangeConfiguration" => {
-                let (body, owner) = decode_change_configuration(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm {
-                    return Err("FMM candidate redirection is gated".into());
-                }
-                if let Some(reply) =
-                    self.ledger
-                        .change_configuration(index, body, Instant::now())?
-                {
-                    link.send(
-                        change_configuration_reply_message(&reply, &generation).map_err(err)?,
-                    )
-                    .await?;
-                    if self.finished.is_none() {
-                        let next = &self
-                            .ledger
-                            .swap
-                            .as_ref()
-                            .ok_or("missing redirected failover")?
-                            .body;
-                        self.send_configuration(next).await?;
-                    }
-                }
-            }
-            "GenerationUpdateReject" => {
-                let current = decode_generation_update_reject(&incoming.message).map_err(err)?;
-                if let Some(round) = &mut self.ledger.generation {
-                    round.reject(&current)?;
-                }
-            }
-            "ServiceTypeEnabled" | "ServiceTypeDisabled" => {
-                let enabled = action == "ServiceTypeEnabled";
-                let body = if enabled {
-                    decode_service_type_enabled(&incoming.message)
-                } else {
-                    decode_service_type_disabled(&incoming.message)
-                }
-                .map_err(err)?;
-                let reply = self.ledger.type_status(index, enabled, &body)?;
-                let message = if enabled {
-                    service_type_enabled_reply_message(&reply, &generation)
-                } else {
-                    service_type_disabled_reply_message(&reply, &generation)
-                }
-                .map_err(err)?;
-                link.send(message).await?;
-            }
-            "NodeActivateReply" | "NodeDeactivateReply" => {
-                let activate = action == "NodeActivateReply";
-                let (body, owner) = if activate {
-                    decode_node_activate_reply(&incoming.message)
-                } else {
-                    decode_node_deactivate_reply(&incoming.message)
-                }
-                .map_err(err)?;
-                if owner != Owner::Fm {
-                    return Err("FMM activation unsupported".into());
-                }
-                self.ledger.node_control_reply(index, activate, body)?;
-            }
-            "NodeUpdateServiceReply" => {
-                let (body, owner) =
-                    decode_node_update_service_reply(&incoming.message).map_err(err)?;
-                if owner != Owner::Fm {
-                    return Err("FMM service update unsupported".into());
-                }
-                self.ledger.service_reply(index, body)?;
-            }
-            "ReportLoad" => self
-                .ledger
-                .load(index, decode_report_load(&incoming.message).map_err(err)?)?,
             "NodeUp" => {
                 let placement = &mut self.ledger.placements[index];
                 let metadata = self.children[index]
@@ -421,9 +328,89 @@ impl Manager {
                     })
                     .await?;
                 placement.bootstrap = Bootstrap::FinalUpload;
+                return Ok(());
             }
-            "ReplicaUp" => {
-                let (body, owner) = decode_replica_up(&incoming.message).map_err(err)?;
+            _ => {}
+        }
+        match incoming.fm_report(link)? {
+            FmReport::ReplicaEndpointUpdated(payload) => {
+                let (body, owner) = payload.into_parts()?;
+                if owner != Owner::Fm {
+                    return Err("FMM endpoint publication is gated".into());
+                }
+                if let Some(reply) = self.ledger.endpoint_updated(index, body)? {
+                    let message =
+                        replica_endpoint_updated_reply_message(&reply, &generation).map_err(err)?;
+                    link.send(message).await?;
+                }
+            }
+            FmReport::DoReconfigurationReply(payload) => {
+                let (body, owner) = payload.into_parts()?;
+                if owner != Owner::Fm {
+                    return Err("FMM configuration reply is gated".into());
+                }
+                self.ledger.configuration_reply(index, body)?;
+            }
+            FmReport::ChangeConfiguration(payload) => {
+                let (body, owner) = payload.into_parts()?;
+                if owner != Owner::Fm {
+                    return Err("FMM candidate redirection is gated".into());
+                }
+                if let Some(reply) =
+                    self.ledger
+                        .change_configuration(index, body, Instant::now())?
+                {
+                    link.send(
+                        change_configuration_reply_message(&reply, &generation).map_err(err)?,
+                    )
+                    .await?;
+                    if self.finished.is_none() {
+                        let next = &self
+                            .ledger
+                            .swap
+                            .as_ref()
+                            .ok_or("missing redirected failover")?
+                            .body;
+                        self.send_configuration(next).await?;
+                    }
+                }
+            }
+            FmReport::GenerationUpdateReject(payload) => {
+                let (current, _) = payload.into_parts()?;
+                if let Some(round) = &mut self.ledger.generation {
+                    round.reject(&current)?;
+                }
+            }
+            FmReport::ServiceTypeStatus { enabled, payload } => {
+                let (body, _) = payload.into_parts()?;
+                let reply = self.ledger.type_status(index, enabled, &body)?;
+                let message = if enabled {
+                    service_type_enabled_reply_message(&reply, &generation)
+                } else {
+                    service_type_disabled_reply_message(&reply, &generation)
+                }
+                .map_err(err)?;
+                link.send(message).await?;
+            }
+            FmReport::NodeActivationReply { activate, payload } => {
+                let (body, owner) = payload.into_parts()?;
+                if owner != Owner::Fm {
+                    return Err("FMM activation unsupported".into());
+                }
+                self.ledger.node_control_reply(index, activate, body)?;
+            }
+            FmReport::NodeUpdateServiceReply(payload) => {
+                let (body, owner) = payload.into_parts()?;
+                if owner != Owner::Fm {
+                    return Err("FMM service update unsupported".into());
+                }
+                self.ledger.service_reply(index, body)?;
+            }
+            FmReport::ReportLoad(payload) => {
+                self.ledger.load(index, payload.into_parts()?.0)?;
+            }
+            FmReport::ReplicaUp(payload) => {
+                let (body, owner) = payload.into_parts()?;
                 if owner != Owner::Fm {
                     return Err("FMM report unsupported".into());
                 }
@@ -445,8 +432,8 @@ impl Manager {
                     self.ledger.placements[index].bootstrap = Bootstrap::Metadata;
                 }
             }
-            "ServiceTypeNotification" => {
-                let body = decode_service_type_notification(&incoming.message).map_err(err)?;
+            FmReport::ServiceTypeNotification(payload) => {
+                let (body, _) = payload.into_parts()?;
                 let admitted = self.ledger.placements[index].notification(&body)?;
                 if !admitted.infos.0.is_empty() {
                     self.ledger.placements[index].catalog_notified = true;
@@ -456,16 +443,16 @@ impl Manager {
                 )
                 .await?;
             }
-            "AddReplicaReply" => {
-                let (body, owner) = decode_add_replica_reply(&incoming.message).map_err(err)?;
+            FmReport::AddReplicaReply(payload) => {
+                let (body, owner) = payload.into_parts()?;
                 if owner != Owner::Fm || !self.profile.peer_replicas() {
                     return Err("AddReplicaReply requires the original peer-idle FM profile".into());
                 }
                 self.read_repair_host()?;
                 self.ledger.idle_reply(index, body)?;
             }
-            "RemoveReplicaReply" => {
-                let (body, owner) = decode_remove_replica_reply(&incoming.message).map_err(err)?;
+            FmReport::RemoveReplicaReply(payload) => {
+                let (body, owner) = payload.into_parts()?;
                 if owner != Owner::Fm || !self.profile.peer_replicas() {
                     return Err(
                         "RemoveReplicaReply requires the original peer-idle FM profile".into(),
@@ -473,40 +460,20 @@ impl Manager {
                 }
                 self.ledger.idle_removal_reply(index, body)?;
             }
-            "AddInstanceReply"
-            | "AddPrimaryReply"
-            | "RemoveInstanceReply"
-            | "DeleteReplicaReply" => {
-                let removing = matches!(
-                    action.as_str(),
-                    "RemoveInstanceReply" | "DeleteReplicaReply"
-                );
-                let primary = self.children[index].launch.profile.stateful();
-                let expected_action = match (primary, removing) {
-                    (true, true) => "DeleteReplicaReply",
-                    (true, false) => "AddPrimaryReply",
-                    (false, true) => "RemoveInstanceReply",
-                    (false, false) => "AddInstanceReply",
-                };
-                if action != expected_action {
+            FmReport::LifecycleReply {
+                primary,
+                removing,
+                payload,
+            } => {
+                if primary != self.children[index].launch.profile.stateful() {
                     return Err("reply action does not match admitted lifecycle profile".into());
                 }
-                let (body, owner) = if primary && removing {
-                    decode_delete_replica_reply(&incoming.message)
-                } else if removing {
-                    decode_remove_instance_reply(&incoming.message)
-                } else if primary {
-                    decode_add_primary_reply(&incoming.message)
-                } else {
-                    decode_add_instance_reply(&incoming.message)
-                }
-                .map_err(err)?;
+                let (body, owner) = payload.into_parts()?;
                 if owner != Owner::Fm {
                     return Err("FMM semantic reply unsupported".into());
                 }
                 self.ledger.reply(index, body, removing)?;
             }
-            _ => return Err("unsupported native ingress; no successful ACK".into()),
         }
         Ok(())
     }

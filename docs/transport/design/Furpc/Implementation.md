@@ -941,6 +941,27 @@ The bounded source/schema fixture entry points use `furpc::codec::decode`; no
 Node production body parser bypasses the furpc codec layer. These changes are
 not fresh native FM/Federation, TLS or deployment qualification.
 
+**Typed FM-side one-way intake:** the cluster FM manager now consumes a cached
+`FmReport` for all eighteen supported Node report/reply actions, including
+GenerationUpdateReject. FM-role one-way ingress retains the original Request
+until `server::Rpc::one_way` decodes it under the existing body/allocation budget
+and hands off immutable headers and DTOs. Original-Link source/incarnation and
+generation checks still precede application decoding. The handoff records the
+original source generation, so a report cannot be admitted under another child
+Link or retargeted by editing the public raw Message view.
+
+The manager no longer predecodes and then invokes a second native body decoder.
+Shared consumer codecs still defer unique factory-header/owner validation until
+the original admission point; lifecycle-profile mismatches retain precedence
+over deferred header failures. The manager keeps ordinary-FM/FMM gates, ledger
+mutation, generation-rebuild ACK suppression, bootstrap progression and reply
+policy. NodeUp/LFUMUpload RPC serving is unchanged. Typed handoff/NoReply means
+decoded input delivery, not ledger execution, semantic acknowledgment or local
+writing. No new worker queue, per-message task, generic furpc API or handler cap
+is introduced. FM outbound commands/ACKs remain a separate typed-client
+follow-up. This is source/schema and owned Rust-process composition, not fresh
+native FM/Federation, TLS or deployed-readiness qualification.
+
 ## Node local RAP typed composition
 
 Node's local RA/RAP bridge now separates private client and reply-intake adapters
