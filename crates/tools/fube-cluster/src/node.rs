@@ -151,14 +151,12 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         last: true,
         ..ReplicaUp::default()
     };
-    link.send(replica_up_message(&final_upload, Owner::Fm).map_err(err)?)
-        .await?;
+    link.replica_up(&final_upload).await?;
     let incoming = link
         .receive(wire::deadline())
         .await?
         .ok_or("final upload reply timeout")?;
-    wire::predecode(&incoming.message)?;
-    let (uploaded, generation) = decode_replica_up_reply(&incoming.message).map_err(err)?;
+    let (uploaded, generation) = incoming.replica_up_reply(&link)?;
     if uploaded != final_upload || generation != launch.generation {
         link.retire();
         return Err("foreign/stale/nonfinal bootstrap upload reply".into());

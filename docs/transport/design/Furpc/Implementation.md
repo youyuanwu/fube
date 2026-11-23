@@ -941,6 +941,59 @@ The bounded source/schema fixture entry points use `furpc::codec::decode`; no
 Node production body parser bypasses the furpc codec layer. These changes are
 not fresh native FM/Federation, TLS or deployment qualification.
 
+**Typed FM-side one-way intake:** the cluster FM manager now consumes a cached
+`FmReport` for all eighteen supported Node report/reply actions, including
+GenerationUpdateReject. FM-role one-way ingress retains the original Request
+until `server::Rpc::one_way` decodes it under the existing body/allocation budget
+and hands off immutable headers and DTOs. Original-Link source/incarnation and
+generation checks still precede application decoding. The handoff records the
+original source generation, so a report cannot be admitted under another child
+Link or retargeted by editing the public raw Message view.
+
+The manager no longer predecodes and then invokes a second native body decoder.
+Shared consumer codecs still defer unique factory-header/owner validation until
+the original admission point; lifecycle-profile mismatches retain precedence
+over deferred header failures. The manager keeps ordinary-FM/FMM gates, ledger
+mutation, generation-rebuild ACK suppression, bootstrap progression and reply
+policy. NodeUp/LFUMUpload RPC serving is unchanged. Typed handoff/NoReply means
+decoded input delivery, not ledger execution, semantic acknowledgment or local
+writing. No new worker queue, per-message task, generic furpc API or handler cap
+is introduced. This is source/schema and owned Rust-process composition, not
+fresh native FM/Federation, TLS or deployed-readiness qualification.
+
+**Typed FM-to-Node client:** the FM manager's seventeen one-way command/ACK
+profiles now use `NodeClient` on the captured original `PeerSendService`.
+Opaque `NodeRequest` constructors retain the native factory action/body,
+priority and caller-selected GenerationHeader. Preparation stays separate from
+submission, preserving local factory-error handling and frozen generations;
+the shared prepared-body codec adopts the bytes without another serialization.
+Node, peer and FM one-way clients share the original-Link sealing, live-session
+and role/envelope checks and await the actual local-write receipt.
+
+The manager still selects the destination and lifecycle profile, captures
+generations, schedules retries, gates mutations and retains semantic outcomes.
+GenerationUpdate advances only its original Link after successful writing;
+creation/deletion, service updates and semantic ACKs keep their existing
+completion and retry points. A retained client cannot reacquire a successor
+session. GenerationProposal and NodeUp/LFUMUpload remain on their existing typed
+RPC paths. Deprecated ChangeConfigurationReply retains its native send profile
+and explicit Node-side rejection, not new support. No reconnect, replay,
+generic furpc API or handler policy is added. These checks are consumer
+composition evidence, not fresh native FM/Federation, TLS or deployed-readiness
+qualification.
+
+**Typed startup final inventory:** both cluster-owned and standalone Node startup
+send their initial empty, final `ReplicaUp` through `Link::replica_up`, backed by
+the existing typed FM one-way client. Completion remains the actual local-write
+receipt, not an RPC result or semantic ACK. Startup reads `ReplicaUpReply` from
+the original typed handoff through `Incoming::replica_up_reply`; it no longer
+predecodes or reparses the public raw Message view. The accessor retains native
+factory/generation-header checks and binds the cached reply to its original
+Link, independent of mutable message/source observations. Each caller retains
+its existing receive deadline, exact inventory/generation comparison and gate
+before constructing RA/Hosting/process authority. This adds no protocol support,
+retry, reconnect or fresh native qualification.
+
 ## Node local RAP typed composition
 
 Node's local RA/RAP bridge now separates private client and reply-intake adapters

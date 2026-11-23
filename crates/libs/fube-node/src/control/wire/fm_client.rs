@@ -1,5 +1,5 @@
 //! Native FM effect profiles; fences, retries and semantic ACKs stay in Adapter.
-use super::{bootstrap::PreparedBodyCodec, deadline, err, outbound, Link, Result, LIMIT};
+use super::{err, one_way, Link, Result, LIMIT};
 use fube_ra::{
     entity::Effect,
     protocol::{
@@ -10,10 +10,10 @@ use fube_ra::{
         node_update_service_reply_message, remove_instance_reply_message,
         remove_replica_reply_message, replica_endpoint_updated_message, replica_up_message,
         report_load_message, service_type_disabled_message, service_type_enabled_message,
-        service_type_notification_message, GenerationNumber, Owner,
+        service_type_notification_message, GenerationNumber, Owner, ReplicaUp,
     },
 };
-use furpc::{Error, Message, OneWayClient, PeerSendService, Request};
+use furpc::{Message, OneWayClient, PeerSendService};
 
 pub(in crate::control) struct FmClient {
     link: Link,
@@ -81,27 +81,29 @@ impl FmClient {
     }
 
     async fn send_message(&mut self, message: Message) -> Result<()> {
-        let message = self.link.seal(message)?;
-        if !self.link.is_live() {
-            return Err(err(Error::Closed));
-        }
-        outbound(self.link.session.role(), &message, false).map_err(err)?;
-        let mut request = Request::new(message.body().clone());
-        *request.headers_mut() = message.headers().clone();
-        self.client
-            .send(request, PreparedBodyCodec, deadline())
+        one_way::send_prepared(&self.link, &mut self.client, message).await
+    }
+}
+
+impl Link {
+    /// Send a one-way inventory report; completion means local writing, not an FM ACK.
+    pub async fn replica_up(&self, body: &ReplicaUp) -> Result<()> {
+        FmClient::new(self)?
+            .send_message(replica_up_message(body, Owner::Fm).map_err(err)?)
             .await
-            .map(|_| ())
-            .map_err(err)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{decode, tests::links, PToP, GENERATION_HEADER, PTOP};
+    use super::super::{
+        deadline, decode, tests::links, FmReport, NodeClient, NodeRequest, PToP, GENERATION_HEADER,
+        PTOP,
+    };
     use super::*;
     use fube_ra::protocol::*;
     use fubst::serde::{to_vec, ObjectArray};
+    use furpc::{header, Body};
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -331,6 +333,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_bootstrap_replica_up_keeps_one_way_completion_and_original_cached_reply() {
+        let (node, fm) = links(false).await;
+        let body = ReplicaUp {
+            last: true,
+            ..ReplicaUp::default()
+        };
+        node.replica_up(&body).await.unwrap();
+        let report = fm.receive(deadline()).await.unwrap().unwrap();
+        assert!(report.reply.is_none());
+        assert!(!report.message.headers().effective().expects_reply);
+        assert_eq!(
+            decode_replica_up(&report.message).unwrap(),
+            (body.clone(), Owner::Fm)
+        );
+        let FmReport::ReplicaUp(payload) = report.fm_report(&fm).unwrap() else {
+            panic!("inventory report")
+        };
+        assert_eq!(payload.into_parts().unwrap(), (body.clone(), Owner::Fm));
+
+        let generation = fm.generation();
+        NodeClient::new(&fm)
+            .unwrap()
+            .send(NodeRequest::replica_up_reply(&body, &generation).unwrap())
+            .await
+            .unwrap();
+        let mut incoming = node.receive(deadline()).await.unwrap().unwrap();
+        assert!(incoming.reply.is_none());
+        assert!(!incoming.message.headers().effective().expects_reply);
+        assert_eq!(
+            decode_replica_up_reply(&incoming.message).unwrap(),
+            (body.clone(), generation.clone())
+        );
+        incoming.message = Message::builder()
+            .append_header(header::action("NodeUp").unwrap())
+            .body(Body::from_bytes(vec![0xff]).unwrap())
+            .build()
+            .unwrap();
+        incoming.source = report.source;
+        assert!(incoming
+            .replica_up_reply(&fm)
+            .unwrap_err()
+            .contains("foreign Channel"));
+        for _ in 0..2 {
+            assert_eq!(incoming.action().unwrap(), "ReplicaUpReply");
+            assert_eq!(
+                incoming.replica_up_reply(&node).unwrap(),
+                (body.clone(), generation.clone())
+            );
+        }
+        node.retire();
+        assert!(node.replica_up(&body).await.unwrap_err().contains("Closed"));
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_bootstrap_replica_up_reply_rejects_wrong_profile_and_missing_generation() {
+        let (node, fm) = links(false).await;
+        let generation = fm.generation();
+        NodeClient::new(&fm)
+            .unwrap()
+            .send(
+                NodeRequest::service_type_enabled_reply(
+                    &ServiceTypeUpdateReply::default(),
+                    &generation,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let incoming = node.receive(deadline()).await.unwrap().unwrap();
+        assert_eq!(
+            incoming.replica_up_reply(&node).unwrap_err(),
+            "expected original typed ReplicaUpReply"
+        );
+
+        let original = replica_up_reply_message(&ReplicaUp::default(), &generation).unwrap();
+        let mut builder = Message::builder().body(original.body().clone());
+        for header in original
+            .headers()
+            .records()
+            .filter(|header| header.id().get() != GENERATION_HEADER)
+        {
+            builder = builder.append_header(header.to_owned());
+        }
+        let invalid = builder.build().unwrap();
+        let expected = err(decode_replica_up_reply(&invalid).unwrap_err());
+        fm.send(invalid).await.unwrap();
+        let incoming = node.receive(deadline()).await.unwrap().unwrap();
+        assert_eq!(incoming.replica_up_reply(&node).unwrap_err(), expected);
+        assert!(node.is_live());
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn preparation_failure_is_isolated_and_retirement_revokes_retained_client() {
         let (sender, receiver) = links(false).await;
         let mut client = FmClient::new(&sender).unwrap();
@@ -442,6 +540,7 @@ mod tests {
                 .generation_update_reject(&sender.generation().number)
                 .await
                 .is_err());
+            assert!(sender.replica_up(&ReplicaUp::default()).await.is_err());
             assert!(sender.is_live());
             assert!(receiver
                 .receive_checked(Instant::now() + Duration::from_millis(5))

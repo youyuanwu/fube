@@ -1,4 +1,5 @@
 use super::{bounded, inbound, outbound, Role};
+use fube_ra::protocol::{GenerationHeader, ReplicaUp};
 use furpc::{
     Accept, Accepted, ActorId, Body, Connected, ConnectionOptions, Error, HandlerLimits,
     IngressLimits, IngressResponse, IoInfo, Message, OneWayRouteOptions, Peer, Request,
@@ -148,6 +149,35 @@ impl Incoming {
             .as_ref()
             .ok_or_else(|| "one-way intake has no original typed handoff".into())
     }
+
+    fn prepared_on(&self, link: &super::Link) -> super::Result<&super::one_way::Prepared> {
+        let prepared = self.prepared()?;
+        if prepared.source_generation != link.session.peer.info().generation {
+            return Err("foreign Channel source capability".into());
+        }
+        Ok(prepared)
+    }
+
+    /// Read the cached typed report admitted on this original FM Link.
+    pub fn fm_report(&self, link: &super::Link) -> super::Result<super::FmReport> {
+        match &self.prepared_on(link)?.call {
+            super::one_way::Call::Report(report) => Ok(report.clone()),
+            _ => Err("expected original typed FM report".into()),
+        }
+    }
+
+    /// Read the cached inventory ACK without reparsing the public Message view.
+    pub fn replica_up_reply(
+        &self,
+        link: &super::Link,
+    ) -> super::Result<(ReplicaUp, GenerationHeader)> {
+        match &self.prepared_on(link)?.call {
+            super::one_way::Call::Fm(super::fm_intake::Incoming::ReplicaUpReply(payload)) => {
+                payload.clone().into_parts()
+            }
+            _ => Err("expected original typed ReplicaUpReply".into()),
+        }
+    }
 }
 
 pub(super) struct OneWaySlot {
@@ -217,7 +247,7 @@ impl Service<Request<Body>> for Ingress {
                     None,
                     Some(rx),
                 )
-            } else if self.role != Role::Fm {
+            } else {
                 let (tx, rx) = oneshot::channel();
                 (
                     None,
@@ -228,8 +258,6 @@ impl Service<Request<Body>> for Ingress {
                     }),
                     Some(rx),
                 )
-            } else {
-                (None, None, None)
             };
             self.tx
                 .try_send(Incoming {

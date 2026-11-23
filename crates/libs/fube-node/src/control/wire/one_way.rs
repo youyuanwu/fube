@@ -1,12 +1,16 @@
-//! Original-invocation decoding and typed handoff, not domain completion.
+//! Original-Link sends and original-invocation typed handoffs, not domain completion.
 use super::{
-    bootstrap::{decode_body, PreparedEncoder},
-    bounded, err, fm_intake, peer_intake,
+    bootstrap::{decode_body, PreparedBodyCodec, PreparedEncoder},
+    bounded, deadline, err, fm_intake,
+    fm_server::FmReport,
+    outbound, peer_intake,
     session::OneWaySlot,
     Headers, Link, Message, Properties, Result, Role, LIMIT,
 };
 use fube_ra::protocol::{FailoverUnitReply, GenerationUpdate};
-use furpc::{Body, Codec, CodecError, DecodeBuf, Decoder, Error, Request};
+use furpc::{
+    Body, Codec, CodecError, DecodeBuf, Decoder, Error, OneWayClient, PeerSendService, Request,
+};
 use serde::de::DeserializeOwned;
 use std::{
     future::{ready, Ready},
@@ -15,6 +19,25 @@ use std::{
 };
 use tokio::sync::oneshot;
 use tower_service::Service;
+
+pub(super) async fn send_prepared(
+    link: &Link,
+    client: &mut OneWayClient<PeerSendService>,
+    message: Message,
+) -> Result<()> {
+    let message = link.seal(message)?;
+    if !link.is_live() {
+        return Err(err(Error::Closed));
+    }
+    outbound(link.session.role(), &message, false).map_err(err)?;
+    let mut request = Request::new(message.body().clone());
+    *request.headers_mut() = message.headers().clone();
+    client
+        .send(request, PreparedBodyCodec, deadline())
+        .await
+        .map(|_| ())
+        .map_err(err)
+}
 
 pub(super) struct Budgeted<T>(PhantomData<fn() -> T>);
 
@@ -94,6 +117,7 @@ pub(super) fn decode_message<T>(message: &Message, decode: Decode<T>) -> Result<
 #[derive(Clone)]
 pub(in crate::control) enum Call {
     Fm(fm_intake::Incoming),
+    Report(FmReport),
     Peer(peer_intake::Incoming),
     GenerationUpdate(peer_intake::Payload<GenerationUpdate>),
     Deprecated(peer_intake::Payload<FailoverUnitReply>),
@@ -103,6 +127,7 @@ pub(in crate::control) struct Prepared {
     pub headers: Headers,
     pub action: String,
     pub call: Call,
+    pub source_generation: u64,
 }
 
 fn node(headers: &Headers, src: &mut DecodeBuf<'_>) -> std::result::Result<Call, CodecError> {
@@ -124,6 +149,10 @@ fn peer(headers: &Headers, src: &mut DecodeBuf<'_>) -> std::result::Result<Call,
     peer_intake::Incoming::decode_parts(headers, src).map(|(_, call)| Call::Peer(call))
 }
 
+fn fm(headers: &Headers, src: &mut DecodeBuf<'_>) -> std::result::Result<Call, CodecError> {
+    FmReport::decode_parts(headers, src).map(Call::Report)
+}
+
 struct Capture(Option<oneshot::Sender<Prepared>>);
 
 impl Service<Request<Call>> for Capture {
@@ -136,9 +165,14 @@ impl Service<Request<Call>> for Capture {
     }
 
     fn call(&mut self, request: Request<Call>) -> Self::Future {
+        let context = request
+            .context()
+            .map(|context| context.source().generation())
+            .ok_or(Error::Internal("one-way handoff missing received context"));
         let action = Properties::from_headers(request.headers()).map(|props| props.action);
         let (parts, call) = request.into_parts();
         ready(action.and_then(|action| {
+            let source_generation = context?;
             self.0
                 .take()
                 .ok_or(Error::Internal("one-way handoff already called"))?
@@ -146,6 +180,7 @@ impl Service<Request<Call>> for Capture {
                     headers: parts.headers,
                     action,
                     call,
+                    source_generation,
                 })
                 .map_err(|_| Error::Closed)
         }))
@@ -174,7 +209,7 @@ impl OneWaySlot {
             let decode = match self.role {
                 Role::Node => node,
                 Role::Peer => peer,
-                Role::Fm => return Err(Error::Unsupported("Node one-way intake on FM")),
+                Role::Fm => fm,
             };
             let codec = IntakeCodec {
                 headers: self.request.headers().clone(),
@@ -288,33 +323,44 @@ mod tests {
 
     #[tokio::test]
     async fn original_one_way_context_rejects_retired_and_expired_decode_handoffs() {
-        for expired in [false, true] {
-            let (node, fm) = links(false).await;
-            let original = service_type_enabled_reply_message(
-                &ServiceTypeUpdateReply { sequence: 41 },
-                &node.generation(),
-            )
-            .unwrap();
-            let mut builder = Message::builder().body(Body::from_bytes(vec![0xff]).unwrap());
-            for header in original.headers().records() {
-                builder = builder.append_header(header.to_owned());
-            }
-            fm.send(builder.build().unwrap()).await.unwrap();
-            let mut incoming = node.session.receive(deadline()).await.unwrap().unwrap();
-            let slot = incoming.one_way.take().unwrap();
-            if expired {
-                sleep_until(slot.request.context().unwrap().deadline() + Duration::from_millis(20))
+        for receiving_fm in [false, true] {
+            for expired in [false, true] {
+                let (node, fm) = links(false).await;
+                let original = if receiving_fm {
+                    fube_ra::protocol::service_type_enabled_message(
+                        &fube_ra::protocol::ServiceTypeUpdate::default(),
+                    )
+                } else {
+                    service_type_enabled_reply_message(
+                        &ServiceTypeUpdateReply { sequence: 41 },
+                        &node.generation(),
+                    )
+                }
+                .unwrap();
+                let (receiver, sender) = if receiving_fm { (fm, node) } else { (node, fm) };
+                let mut builder = Message::builder().body(Body::from_bytes(vec![0xff]).unwrap());
+                for header in original.headers().records() {
+                    builder = builder.append_header(header.to_owned());
+                }
+                sender.send(builder.build().unwrap()).await.unwrap();
+                let mut incoming = receiver.session.receive(deadline()).await.unwrap().unwrap();
+                let slot = incoming.one_way.take().unwrap();
+                if expired {
+                    sleep_until(
+                        slot.request.context().unwrap().deadline() + Duration::from_millis(20),
+                    )
                     .await;
-            } else {
-                node.retire();
+                } else {
+                    receiver.retire();
+                }
+                let error = slot.prepare(&receiver).await.err().unwrap();
+                assert!(
+                    error.contains("Closed") || error.contains("Timeout"),
+                    "{error}"
+                );
+                receiver.close().await.unwrap();
+                sender.close().await.unwrap();
             }
-            let error = slot.prepare(&node).await.err().unwrap();
-            assert!(
-                error.contains("Closed") || error.contains("Timeout"),
-                "{error}"
-            );
-            node.close().await.unwrap();
-            fm.close().await.unwrap();
         }
     }
 

@@ -1,5 +1,5 @@
 //! Native peer effect profiles; target, phase and retry policy stay in Adapter.
-use super::{bootstrap::PreparedBodyCodec, deadline, err, outbound, Link, Result, LIMIT};
+use super::{err, one_way, Link, Result, LIMIT};
 use fube_ra::{
     entity::Effect,
     protocol::{
@@ -8,7 +8,7 @@ use fube_ra::{
         do_reconfiguration_message, get_lsn_message, get_lsn_reply_message, GenerationHeader,
     },
 };
-use furpc::{Error, Message, OneWayClient, PeerSendService, Request};
+use furpc::{Message, OneWayClient, PeerSendService};
 
 pub(in crate::control) struct PeerClient {
     link: Link,
@@ -48,24 +48,18 @@ impl PeerClient {
         effect: &Effect,
         generation: &GenerationHeader,
     ) -> Result<()> {
-        let message = self.link.seal(Self::prepare(effect, generation)?)?;
-        if !self.link.is_live() {
-            return Err(err(Error::Closed));
-        }
-        outbound(self.link.session.role(), &message, false).map_err(err)?;
-        let mut request = Request::new(message.body().clone());
-        *request.headers_mut() = message.headers().clone();
-        self.client
-            .send(request, PreparedBodyCodec, deadline())
-            .await
-            .map(|_| ())
-            .map_err(err)
+        one_way::send_prepared(
+            &self.link,
+            &mut self.client,
+            Self::prepare(effect, generation)?,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{decode, tests::links, GENERATION_HEADER};
+    use super::super::{deadline, decode, tests::links, GENERATION_HEADER};
     use super::*;
     use fube_ra::protocol::*;
     use fubst::serde::{to_vec, ObjectArray};

@@ -94,11 +94,14 @@ impl<T: DeserializeOwned> Payload<T> {
 }
 
 impl<T> Payload<T> {
-    // Header failures remain deferred until the original shutdown/placement gates.
-    pub(in crate::control) fn into_parts(self) -> Result<(T, GenerationHeader)> {
+    pub(super) fn action(&self) -> &'static str {
+        self.action
+    }
+
+    pub(super) fn factory_parts(self, actors: &[i64]) -> Result<(T, Headers, i64)> {
         let headers = &self.headers;
         let actor: Scalar<i64> = decode(unique(headers, header::ACTOR).map_err(err)?.value())?;
-        if actor.value != RA_ACTOR
+        if !actors.contains(&actor.value)
             || decode::<Scalar<String>>(unique(headers, header::ACTION).map_err(err)?.value())?
                 .value
                 != self.action
@@ -106,12 +109,18 @@ impl<T> Payload<T> {
             return Err(err(Error::Protocol("wrong reliability actor/action")));
         }
         decode::<Scalar<bool>>(unique(headers, header::HIGH_PRIORITY).map_err(err)?.value())?;
+        Ok((self.body, self.headers, actor.value))
+    }
+
+    // Header failures remain deferred until the original shutdown/placement gates.
+    pub(in crate::control) fn into_parts(self) -> Result<(T, GenerationHeader)> {
+        let (body, headers, _) = self.factory_parts(&[RA_ACTOR])?;
         let generation = decode(
-            unique(headers, HeaderId::new(GENERATION_HEADER).map_err(err)?)
+            unique(&headers, HeaderId::new(GENERATION_HEADER).map_err(err)?)
                 .map_err(err)?
                 .value(),
         )?;
-        Ok((self.body, generation))
+        Ok((body, generation))
     }
 }
 
