@@ -544,10 +544,20 @@ for the legacy transport still used by other workspace consumers.
 
 `ImageStoreClient` is a noncloneable owner of a dedicated furpc Channel and one
 captured Peer, with authorized Actor 25/27 ordinary one-way ingress services.
-Transfer messages use `Peer::send`; the routed root Delete uses `Peer::request`.
+Transfer messages use a private typed `OneWayClient<PeerSendService>` stub;
+the routed root Delete uses `RpcClient` over the original `PeerRequestService`.
+Prepared body encoding adopts file chunks unchanged, without another payload
+copy or serialization. Delete's typed reply codec preserves the FileNotFound
+result and native protocol/domain/decode failures.
+Semantic ACK serving uses `server::Rpc::one_way` on the original received
+request, after source-generation admission, then enqueues the decoded DTO in
+the existing bounded queue. Cancelling an admitted handoff fences the owner.
+The owner still applies Activity/sequence, chunk negotiation and stage policy.
 Semantic ACKs are not ordinary RPC completions or furpc native notifications.
 It does not borrow a `FabricClient` or
 notification session.
+This typed-adapter refactor has Rust/loopback coverage; the source-pinned native
+upload evidence below was not rerun or relabeled.
 Production upload uses no native SDK, COM library, HTTP gateway or subprocess.
 Only native `fabric:ImageStore`, canonical protocol **1.2**, and explicitly
 unsecured **numeric, nonzero-port** development gateways are supported;
@@ -679,6 +689,7 @@ not a physical-driver join barrier. An idle physical disconnect has no separate
 closure observer; waiting for a semantic ACK remains bounded by the copy deadline.
 
 Implementation: [public API and copy lifecycle](../../crates/libs/fube-client/src/image_store.rs),
+[typed original-Peer clients and codecs](../../crates/libs/fube-client/src/image_store/transport.rs),
 [native codecs](../../crates/libs/fube-client/src/image_store_protocol.rs),
 [complete root-marker preflight](../../crates/libs/fube-client/src/image_store_protocol.rs),
 [strict client semantic ACK decoding](../../crates/libs/fube-client/src/image_store_protocol.rs)

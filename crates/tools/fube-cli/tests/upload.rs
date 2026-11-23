@@ -154,6 +154,7 @@ fn acknowledgement(message: &Message, actor: i64, sequence: Option<u64>) -> Mess
 async fn receive_upload(
     listener: TcpListener,
     mut reject_root_commit: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    missing_root: bool,
 ) -> Vec<Vec<u8>> {
     let (mut stream, _) = listener.accept().await.unwrap();
     assert_eq!(
@@ -183,24 +184,32 @@ async fn receive_upload(
     .unwrap();
     let delete = read_message(&mut stream).await.unwrap();
     assert_eq!(delete.properties().unwrap().action, "ForwardMessage");
-    write_message(
-        &mut stream,
-        &Message {
-            headers: vec![
-                Header::actor(22).unwrap(),
-                Header::action("OperationSuccessAction").unwrap(),
-                Header::native(
-                    furpc::header::RELATES_TO.get(),
-                    &delete.properties().unwrap().id,
-                )
-                .unwrap(),
-                activity(&delete),
-            ],
-            body: Vec::new(),
-        },
-    )
-    .await
-    .unwrap();
+    let mut deleted = Message {
+        headers: vec![
+            Header::actor(22).unwrap(),
+            Header::action("OperationSuccessAction").unwrap(),
+            Header::native(
+                furpc::header::RELATES_TO.get(),
+                &delete.properties().unwrap().id,
+            )
+            .unwrap(),
+            activity(&delete),
+        ],
+        body: Vec::new(),
+    };
+    if missing_root {
+        deleted.headers[0] = Header::actor(5).unwrap();
+        deleted.headers[1] = Header::action("ClientOperationFailure").unwrap();
+        let mut encoder = Encoder::new();
+        encoder
+            .object(|encoder| {
+                encoder.i64(-2147017728)?;
+                encoder.string("root does not exist")
+            })
+            .unwrap();
+        deleted.body = encoder.finish();
+    }
+    write_message(&mut stream, &deleted).await.unwrap();
     let mut files = Vec::new();
     for expected in [b"package".as_slice(), b"".as_slice()] {
         let create = read_message(&mut stream).await.unwrap();
@@ -282,30 +291,32 @@ fn upload_command(package: &Package, endpoint: SocketAddr) -> tokio::process::Co
 
 #[tokio::test]
 async fn command_uses_native_upload_and_waits_for_package_completion() {
-    let package = Package::new();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = listener.local_addr().unwrap();
-    let peer = tokio::spawn(receive_upload(listener, None));
-    let output = timeout(
-        Duration::from_secs(10),
-        upload_command(&package, endpoint).output(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!output.stdout.is_empty());
-    assert_eq!(
-        timeout(Duration::from_secs(5), peer)
-            .await
-            .unwrap()
-            .unwrap(),
-        [b"package".to_vec(), Vec::new()]
-    );
+    for missing_root in [false, true] {
+        let package = Package::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let peer = tokio::spawn(receive_upload(listener, None, missing_root));
+        let output = timeout(
+            Duration::from_secs(10),
+            upload_command(&package, endpoint).output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.is_empty());
+        assert_eq!(
+            timeout(Duration::from_secs(5), peer)
+                .await
+                .unwrap()
+                .unwrap(),
+            [b"package".to_vec(), Vec::new()]
+        );
+    }
 }
 
 #[tokio::test]
@@ -315,7 +326,7 @@ async fn rejected_final_commit_never_prints_success() {
     let endpoint = listener.local_addr().unwrap();
     let (ready, pending) = oneshot::channel();
     let (release, reply) = oneshot::channel();
-    let peer = tokio::spawn(receive_upload(listener, Some((ready, reply))));
+    let peer = tokio::spawn(receive_upload(listener, Some((ready, reply)), false));
     let mut child = upload_command(&package, endpoint)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -69,3 +69,29 @@ async fn ingress_failure_survives_secondary_closure_and_ends_the_ack_wait() {
         ));
     }
 }
+
+#[test]
+fn cancelling_an_unpolled_typed_ack_handoff_retires_its_upload_owner() {
+    let state = Arc::new(UploadState {
+        connection: Mutex::new(Connection {
+            channel: None,
+            error: None,
+        }),
+        failed: Notify::new(),
+    });
+    let (replies, _receiver) = mpsc::channel(MAX_REPLIES);
+    let mut ingress = UploadIngress {
+        state: Arc::downgrade(&state),
+        generation: 1,
+        replies,
+    };
+    let pending = ingress.call(Request::new(Body::empty()));
+    assert!(state.check().is_ok());
+    drop(pending);
+    assert!(matches!(
+        state.check(),
+        Err(ImageStoreError::Common(FurpcClientError::Native(
+            furpc::Error::Cancelled
+        )))
+    ));
+}

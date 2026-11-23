@@ -209,8 +209,17 @@ The default-Docker onebox was left running.
 ImageStoreClient now also owns an independent furpc Channel and captured Peer.
 Async construction installs authorized Actor 25/27 ordinary one-way ingress;
 semantic ACKs are not native notifications or ordinary RPC responses.
-FileCreate/content/commit/commit-ACK use Peer::send, while the initial routed
-root Delete uses Peer::request. Shared native Serde schemas preserve protocol
+Its private typed UploadClient uses OneWayClient/PeerSendService for
+FileCreate/content/commit/commit-ACK and failed-session cleanup, while the initial
+routed root Delete uses RpcClient/PeerRequestService. Prepared codecs adopt
+shared body storage without serializing file chunks or encoding Delete twice.
+Delete's reply codec receives original response headers after upload-state
+admission and preserves FileNotFound, domain and decode error classifications.
+Authorized ACK ingress uses server::Rpc::one_way on the original Request to
+decode and hand off FileTransferReply to the same bounded consumer queue.
+Original-generation checks precede decoding; failure or cancellation fences
+the upload owner. Typed handoff means enqueue, not stage success, while typed
+sends await local writing, not semantic ACKs. Shared native Serde schemas preserve protocol
 1.2, Activity/sequence checks, negotiated chunks, postorder markers and bounded
 stale-reply handling. There is no reconnect or replay, legacy Channel
 composition, retained-allocation ledger or standalone 4 MiB frame ceiling.
@@ -229,7 +238,9 @@ zero-byte directory markers. Provision/create and independent native application
 contact succeeded; all three deployed Data file SHA256 hashes matched source.
 Owned application/type/upload/temp cleanup completed and the onebox remained
 ready/running. The actual optional report retains inventories, hashes, executable
-identities and confirmed cleanup. This does not qualify upload cancellation
+identities and confirmed cleanup. The later typed-adapter refactor is covered by Rust codec
+and independent loopback CLI fixtures, not a fresh native upload run; the
+earlier native evidence is unchanged. This does not qualify upload cancellation
 over a real failed connection or repeated native SDK copy reliability.
 Together with the earlier runs, this is initiating clear-TCP evidence for the
 thirteen migrated reads, two naming writes, MovePrimary, notification receiving/ACKs
