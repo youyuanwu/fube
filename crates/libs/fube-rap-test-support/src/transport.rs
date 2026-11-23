@@ -1,9 +1,9 @@
 //! Public furpc-backed model peers and test-only TCP observation.
 //! These are offline test adapters, not native interoperability evidence.
 use furpc::{
-    header, Accept, Accepted, ActorId, Body, Error, HandlerLimits, Headers, IngressLimits,
-    IngressOptions, IngressResponse, IngressService, IoInfo, Message, MessageId, Peer, Request,
-    RequestPolicy, Result, SendPolicy, Server, ServiceBinding,
+    header, Accept, Accepted, ActorId, Body, Error, Headers, IngressLimits, IngressOptions,
+    IngressResponse, IngressService, IoInfo, Message, MessageId, Peer, Request, RequestPolicy,
+    Result, SendPolicy, Server, ServiceBinding,
 };
 use std::{
     future::Future,
@@ -176,10 +176,6 @@ impl ModelPeer {
         let ready = Arc::new(Mutex::new(Some(ready)));
         let ready_reads = reads.clone();
         let server = Server::builder()
-            .handler_limits(HandlerLimits {
-                max_in_flight: 64,
-                ..Default::default()
-            })
             .service(ingress)?
             .on_peer_ready(
                 SendPolicy::new(|_, _, _| Ok(())),

@@ -42,8 +42,6 @@ fn limits(settings: &Settings) -> TransportLimits {
 
 fn handlers(settings: &Settings) -> HandlerLimits {
     HandlerLimits {
-        max_in_flight: 4,
-        max_readiness_waiters: 4,
         max_encoded_body_bytes_per_response: MAX_FRAME_SIZE,
         timeout: settings.callback_timeout,
     }

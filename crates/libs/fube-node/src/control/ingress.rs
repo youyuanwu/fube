@@ -229,15 +229,35 @@ impl Ingress {
         self.fixed_target(partition, replica, placement, expected)
     }
 
+    /// Codec-backed message fixtures/composition; live sessions use `fm_incoming`.
     pub fn fm(&self, node: &mut Node, message: &Message, stopping: bool) -> Result<Admission> {
         let (action, incoming) = wire::FmIncoming::decode(message)?;
-        let mut headers = message
-            .headers()
-            .records()
-            .filter(|header| header.id().get() == GENERATION_HEADER);
-        let generation: GenerationHeader =
-            wire::decode(headers.next().ok_or("missing FM generation")?.value())?;
-        if headers.next().is_some()
+        self.fm_typed(node, message.headers(), &action, &incoming, stopping)
+    }
+
+    pub fn fm_incoming(
+        &self,
+        node: &mut Node,
+        incoming: &wire::Incoming,
+        stopping: bool,
+    ) -> Result<Admission> {
+        let prepared = incoming.prepared()?;
+        let wire::OneWayCall::Fm(call) = &prepared.call else {
+            return Err("original typed invocation is not FM control".into());
+        };
+        self.fm_typed(node, &prepared.headers, &prepared.action, call, stopping)
+    }
+
+    fn fm_typed(
+        &self,
+        node: &mut Node,
+        headers: &furpc::Headers,
+        action: &str,
+        incoming: &wire::FmIncoming,
+        stopping: bool,
+    ) -> Result<Admission> {
+        let (generation, duplicate) = wire::fm_generation(headers)?;
+        if duplicate
             || generation.for_fm_replica
             || generation.number != node.generation_state().receive
         {
@@ -245,7 +265,7 @@ impl Ingress {
         }
         if stopping
             && !matches!(
-                action.as_str(),
+                action,
                 "DeleteReplica"
                     | "RemoveInstance"
                     | "ReplicaUpReply"
@@ -258,7 +278,7 @@ impl Ingress {
             return Err("new lifecycle intent is not admitted during shutdown".into());
         }
         let mut acknowledgement = None;
-        let result = match incoming {
+        let result = match incoming.clone() {
             wire::FmIncoming::ServiceTypeStatusReply { enabled, payload } => {
                 let (body, generation) = payload.into_parts()?;
                 node.fm_work(FmWork::TypeStatusReply(
@@ -381,6 +401,7 @@ impl Ingress {
         }
     }
 
+    /// Codec-backed message fixtures/composition; live sessions use `peer_incoming`.
     pub fn peer(
         &self,
         node: &mut Node,
@@ -389,6 +410,31 @@ impl Ingress {
         stopping: bool,
     ) -> Result<Option<u64>> {
         let (action, incoming) = wire::PeerIncoming::decode(message)?;
+        self.peer_typed(node, source, &action, &incoming, stopping)
+    }
+
+    pub fn peer_incoming(
+        &self,
+        node: &mut Node,
+        source: &NodeInstance,
+        incoming: &wire::Incoming,
+        stopping: bool,
+    ) -> Result<Option<u64>> {
+        let prepared = incoming.prepared()?;
+        let wire::OneWayCall::Peer(call) = &prepared.call else {
+            return Err("original typed invocation is not peer control".into());
+        };
+        self.peer_typed(node, source, &prepared.action, call, stopping)
+    }
+
+    fn peer_typed(
+        &self,
+        node: &mut Node,
+        source: &NodeInstance,
+        action: &str,
+        incoming: &wire::PeerIncoming,
+        stopping: bool,
+    ) -> Result<Option<u64>> {
         let peer = self
             .peers
             .iter()
@@ -396,13 +442,13 @@ impl Ingress {
             .ok_or("unbound peer ingress")?;
         if stopping
             && !matches!(
-                action.as_str(),
+                action,
                 "CreateReplicaReply" | "GetLSNReply" | "DeactivateReply" | "ActivateReply"
             )
         {
             return Err("new peer lifecycle intent is not admitted during shutdown".into());
         }
-        let result = match incoming {
+        let result = match incoming.clone() {
             wire::PeerIncoming::DoReconfiguration(payload) if self.profile.peer_replicas() => {
                 let (body, generation) = payload.into_parts()?;
                 self.description(&body.configuration.unit, &body.configuration.service)?;
@@ -479,8 +525,7 @@ impl Ingress {
         link: &wire::Link,
         incoming: &mut wire::Incoming,
     ) -> Result<Option<Admission>> {
-        let message = &incoming.message;
-        match wire::action(message)?.as_str() {
+        match incoming.action()?.as_str() {
             "GenerationProposal" => {
                 incoming
                     .reply
@@ -493,7 +538,10 @@ impl Ingress {
                     .await?;
             }
             "GenerationUpdate" => {
-                let (body, header) = wire::decode_generation_update(message)?;
+                let wire::OneWayCall::GenerationUpdate(payload) = &incoming.prepared()?.call else {
+                    return Err("original typed invocation is not GenerationUpdate".into());
+                };
+                let (body, header) = wire::generation_parts(payload.clone())?;
                 let outcome = match node.process_generation_update(&self.fm, &body, &header) {
                     Ok(outcome) => outcome,
                     Err(Error::Ra(ra::Failure::Capacity)) => {

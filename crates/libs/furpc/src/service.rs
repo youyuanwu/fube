@@ -4,12 +4,11 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, Weak,
     },
-    task::Poll,
     time::Duration,
 };
 
 use tokio::{
-    sync::{Notify, OwnedSemaphorePermit, Semaphore},
+    sync::{Notify, Semaphore},
     time::{timeout_at, Instant},
 };
 use tower_service::Service;
@@ -294,18 +293,15 @@ pub enum IngressResponse {
     NoReply,
 }
 
+/// Invocation timeout and encoded response policy; services own concurrency.
 #[derive(Debug, Clone)]
 pub struct HandlerLimits {
-    pub max_in_flight: usize,
-    pub max_readiness_waiters: usize,
     pub max_encoded_body_bytes_per_response: usize,
     pub timeout: Duration,
 }
 impl Default for HandlerLimits {
     fn default() -> Self {
         Self {
-            max_in_flight: 8,
-            max_readiness_waiters: 4,
             max_encoded_body_bytes_per_response: u32::MAX as usize - 12,
             timeout: Duration::from_secs(30),
         }
@@ -313,47 +309,24 @@ impl Default for HandlerLimits {
 }
 impl HandlerLimits {
     pub fn validate(&self) -> Result<()> {
-        if self.max_in_flight == 0
-            || self.max_in_flight > Semaphore::MAX_PERMITS
-            || self.max_readiness_waiters > Semaphore::MAX_PERMITS
-        {
-            return Err(Error::InvalidInput("invalid handler execution counts"));
-        }
         validate_timeout(self.timeout)
     }
 }
 
-async fn ready<S, Q>(service: &mut S, readiness: Arc<Semaphore>, phase: &'static str) -> Result<()>
+async fn ready<S, Q>(service: &mut S, phase: &'static str) -> Result<()>
 where
     S: Service<Q>,
     S::Error: Into<BoxError>,
 {
-    let mut waiting = None;
-    poll_fn(|cx| match service.poll_ready(cx) {
-        Poll::Ready(result) => {
-            waiting.take();
-            Poll::Ready(result.map_err(|error| Error::handler(phase, error)))
-        }
-        Poll::Pending => {
-            if waiting.is_none() {
-                match readiness.clone().try_acquire_owned() {
-                    Ok(permit) => waiting = Some(permit),
-                    Err(_) => {
-                        return Poll::Ready(Err(Error::ResourceLimit("service readiness waiters")))
-                    }
-                }
-            }
-            Poll::Pending
-        }
-    })
-    .await
+    poll_fn(|cx| service.poll_ready(cx))
+        .await
+        .map_err(|error| Error::handler(phase, error))
 }
 
 trait Factory: Send {
     fn make(
         &mut self,
         request: Request<Body>,
-        readiness: Arc<Semaphore>,
         readiness_phase: &'static str,
         handler_phase: &'static str,
     ) -> BoxFuture<Result<IngressResponse>>;
@@ -368,14 +341,13 @@ where
     fn make(
         &mut self,
         request: Request<Body>,
-        readiness: Arc<Semaphore>,
         readiness_phase: &'static str,
         handler_phase: &'static str,
     ) -> BoxFuture<Result<IngressResponse>> {
         let mut service = self.0.clone();
         Box::pin(async move {
             let state = InvocationState::live_context(&request)?;
-            ready(&mut service, readiness, readiness_phase).await?;
+            ready(&mut service, readiness_phase).await?;
             state.check()?;
             service
                 .call(request)
@@ -399,14 +371,13 @@ impl ServiceFactory {
     pub(crate) fn invoke(
         &self,
         request: Request<Body>,
-        readiness: Arc<Semaphore>,
         readiness_phase: &'static str,
         handler_phase: &'static str,
     ) -> BoxFuture<Result<IngressResponse>> {
         self.0
             .lock()
             .unwrap()
-            .make(request, readiness, readiness_phase, handler_phase)
+            .make(request, readiness_phase, handler_phase)
     }
 }
 
@@ -418,14 +389,11 @@ pub(crate) struct StoredService {
 pub(crate) struct Registry {
     service: Mutex<Option<Arc<StoredService>>>,
     limits: HandlerLimits,
-    active: Arc<Semaphore>,
-    readiness: Arc<Semaphore>,
     stopping: AtomicBool,
     generations: Mutex<Vec<Weak<Generation>>>,
     diagnostics: AtomicU64,
     pub(crate) managed: bool,
     pub(crate) rpc_slots: Arc<Semaphore>,
-    reply_slots: Arc<Semaphore>,
     max_receive_frame_bytes: usize,
 }
 impl Registry {
@@ -436,20 +404,14 @@ impl Registry {
         transport: &crate::TransportLimits,
     ) -> Result<Arc<Self>> {
         limits.validate()?;
-        let reply_count = limits.max_in_flight;
         Ok(Arc::new(Self {
             service: Mutex::new(service),
-            active: Arc::new(Semaphore::new(limits.max_in_flight)),
-            readiness: Arc::new(Semaphore::new(
-                limits.max_readiness_waiters.min(limits.max_in_flight),
-            )),
             limits,
             stopping: AtomicBool::new(false),
             generations: Mutex::new(Vec::new()),
             diagnostics: AtomicU64::new(0),
             managed: options.is_managed(),
             rpc_slots: Arc::new(Semaphore::new(transport.max_pending_requests)),
-            reply_slots: Arc::new(Semaphore::new(reply_count)),
             max_receive_frame_bytes: transport.max_receive_frame_bytes,
         }))
     }
@@ -552,29 +514,13 @@ impl Registry {
             self.diagnose("ingress authorization", &error);
             return Err(DropReason::PolicyRejected);
         }
-        let permit = self
-            .active
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| DropReason::Capacity)?;
-        let reply = options
-            .response
-            .map(|policy| {
-                let slot = self
-                    .reply_slots
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| DropReason::Capacity)?;
-                Ok((common.message_id, policy, slot))
-            })
-            .transpose()?;
+        let reply = options.response.map(|policy| (common.message_id, policy));
         let deadline = Instant::now() + self.limits.timeout;
         let state = Arc::new(InvocationState {
             live: AtomicBool::new(true),
             stopped: Notify::new(),
             kind: options.kind,
             deadline,
-            readiness: self.readiness.clone(),
             max_body_bytes: options.limits.max_body_bytes,
             max_receive_frame_bytes: self.max_receive_frame_bytes,
             max_response_body_bytes: self.limits.max_encoded_body_bytes_per_response,
@@ -583,10 +529,7 @@ impl Registry {
         let sends = options.sends;
         Ok(Dispatch {
             service,
-            guard: Invocation {
-                state,
-                _permit: permit,
-            },
+            guard: Invocation { state },
             reply,
             sends,
         })
@@ -629,7 +572,6 @@ pub(crate) struct InvocationState {
     stopped: Notify,
     kind: InvocationKind,
     deadline: Instant,
-    readiness: Arc<Semaphore>,
     pub(crate) max_body_bytes: usize,
     max_receive_frame_bytes: usize,
     pub(crate) max_response_body_bytes: usize,
@@ -696,12 +638,7 @@ impl InvocationState {
         factory: &ServiceFactory,
         request: Request<Body>,
     ) -> BoxFuture<Result<IngressResponse>> {
-        factory.invoke(
-            request,
-            self.readiness.clone(),
-            "route readiness",
-            "route handler",
-        )
+        factory.invoke(request, "route readiness", "route handler")
     }
 
     pub(crate) fn is_live(&self) -> bool {
@@ -723,7 +660,7 @@ impl InvocationState {
         S: Service<Q>,
         S::Error: Into<BoxError>,
     {
-        ready(service, self.readiness.clone(), "typed service readiness").await?;
+        ready(service, "typed service readiness").await?;
         self.check()
     }
 
@@ -745,7 +682,6 @@ impl InvocationState {
 
 struct Invocation {
     state: Arc<InvocationState>,
-    _permit: OwnedSemaphorePermit,
 }
 impl Drop for Invocation {
     fn drop(&mut self) {
@@ -757,7 +693,7 @@ impl Drop for Invocation {
 pub(crate) struct Dispatch {
     service: Arc<StoredService>,
     guard: Invocation,
-    reply: Option<(crate::MessageId, EnvelopeCheck, OwnedSemaphorePermit)>,
+    reply: Option<(crate::MessageId, EnvelopeCheck)>,
     sends: Option<SendPolicy>,
 }
 impl Dispatch {
@@ -774,7 +710,6 @@ impl Dispatch {
             deadline: self.deadline(),
             invocation: Arc::downgrade(&self.guard.state),
         });
-        let readiness = core.registry.readiness.clone();
         let target = Arc::downgrade(core);
         Box::pin(async move {
             let deadline = self.deadline();
@@ -786,10 +721,10 @@ impl Dispatch {
             if !request.context().is_some_and(RequestContext::is_live) {
                 return Err(Error::Closed);
             }
-            let future =
-                self.service
-                    .factory
-                    .invoke(request, readiness, "service readiness", "handler");
+            let future = self
+                .service
+                .factory
+                .invoke(request, "service readiness", "handler");
             match timeout_at(deadline, future)
                 .await
                 .map_err(|_| Error::Timeout("handler"))??
@@ -799,11 +734,11 @@ impl Dispatch {
                     if message.body().len() > max_response {
                         return Err(Error::ResourceLimit("encoded handler response body"));
                     }
-                    let (id, policy, slot) = self.reply.expect("authorized reply");
+                    let (id, policy) = self.reply.expect("authorized reply");
                     let receipt = target
                         .upgrade()
                         .ok_or(Error::Closed)?
-                        .reply(message, id, policy, deadline, slot)?;
+                        .reply(message, id, policy, deadline)?;
                     timeout_at(deadline, receipt)
                         .await
                         .map_err(|_| Error::Timeout("reply write"))?

@@ -557,7 +557,7 @@ graceful drain without a general-purpose Peer.
 
 TCP/custom connectors, Accept, TCP/stream acceptors and
 `Server::serve_with_shutdown` use the same physical engine. Canonical
-IngressService bindings admit bounded work at the header gate, before body
+IngressService bindings admit authorized work at the header gate, before body
 storage, and run readiness/handlers outside the driver. Header authorization
 and HandlerLimits are shared by all connections in a server or generations in
 one Channel. Handler deadlines begin at that admission, including partial-body
@@ -573,7 +573,7 @@ without a ticket are diagnosed handler failures and generate no automatic Fault.
 
 Ordinary ingress now selects one explicit raw binding or multiple disjoint
 whole-Actor/exact-action bindings. Header-stage matching uses sorted native
-Actor/UTF-16 Action keys before body retention, policy checks, handler permits
+Actor/UTF-16 Action keys before body retention, policy checks
 or reply tickets. Unknown actors/actions are diagnosed and discarded with full
 frame integrity rather than becoming connection-fatal errors or falling back
 to raw delivery. Correlation/control classification remains earlier and separate
@@ -585,19 +585,20 @@ private binding and route identity: edited keys and independently configured
 router tables cannot borrow another route's permissions. Whole-Actor services
 may rewrite Action within their original Actor; explicit raw services remain
 actor-less when appropriate. Routed and typed services share the existing
-readiness allowance, original deadline and runner-owned reply completion.
+original deadline and runner-owned reply completion. Concurrency and readiness
+waiter policy belong to consumer services, not furpc.
 Configuration rejects reserved control actors, duplicate/overlapping bindings
 and raw/Actor mixtures without adding route-count or action-storage quotas.
 Router clones share configuration, not prepared services; selected services
 are cloned before readiness and called on that same instance.
 
 The optional accepted-peer hook runs once after establishment, with its own
-timeout and no handler-slot dependency. Shutdown drops acceptance, rejects
+timeout and no consumer handler-slot dependency. Shutdown drops acceptance, rejects
 new sends/dispatch and waits for admitted handlers, hook work, pending RPC and
 output under one drain deadline. Native shutdown is held until original-path
-replies finish; general Peers have no drain exemption. Reply count credit is
-reserved from handler capacity and follows the driver's queued frame after
-commitment, independently of a timed-out handler or dropped observer. Native
+replies finish; general Peers have no drain exemption. Original reply authority
+follows the driver's queued frame after commitment independently of a
+timed-out handler or dropped observer. Native
 queue-byte accounting still applies. Finite accept-source exhaustion is not a
 shutdown signal. Dropping initial connect or the last Channel owner cancels
 owned work; retaining Endpoint configuration or a Peer does not keep it alive.
@@ -612,7 +613,8 @@ scope, 128 server connections, 16 simultaneous
 handshakes, 128 peer waiters, 64 KiB/32-step cooperative turns, 30-second frame
 and committed-write watchdogs, and a 5-second discard watchdog. Connect, server
 handshake, peer-ready and server drain default to 30 seconds; HandlerLimits
-retain their documented 8 in-flight/4 readiness-waiter/30-second defaults.
+retain a 30-second invocation timeout and native-capacity response-size default,
+but no handler concurrency or readiness-waiter ceiling.
 These are not native constants or performance qualification.
 
 Native notifications are implemented through byte-facing Peer::notify,
@@ -628,8 +630,8 @@ still take precedence. Matched ACK policies run at header admission before
 retention. A rejected ACK is diagnosed/discarded with full integrity and leaves
 the pending operation awaiting an authorized response or expiry.
 
-The existing service runner reserves notification handler/reply capacity and
-owns the original acknowledgment ticket. IngressResponse::Reply(Message) or
+The existing service runner owns the original notification acknowledgment
+ticket without imposing handler concurrency/readiness quotas. IngressResponse::Reply(Message) or
 typed unary Reply<T> supplies application-defined ACK data; only the ticket
 supplies native RelatesTo and ordinary reply flags. Edited flags cannot change
 the original route class or turn notification context into one-way authority.
@@ -916,6 +918,28 @@ Ingress/Node retain proposal/readiness/staleness policy, Capacity-to-Retained
 admission, LFUM inventory/retry ownership and the original generation-advancement
 points. Local writing is not remote execution or generation/LFUM completion.
 No FM-side migration, reconnect, generic furpc API or native qualification is added.
+
+**Consumer-owned handler policy and completed Node one-way serving:** furpc no
+longer imposes handler concurrency/readiness-waiter caps or derives a reply-slot
+quota from handler concurrency. `HandlerLimits` retains only invocation timeout
+and encoded-response policy; transport/correlation, frame and codec guards stay
+unchanged. Consumers retain their existing domain queues/admission state and can
+add Tower-style limiting middleware. Node's eight-entry inbox still reports
+terminal overflow; it is no longer masked by eight generic handler permits.
+
+FM/peer/generation/deprecated Node intake now decodes through
+`server::Rpc::one_way` on each original live Request, after original-Link source
+and generation admission. The typed service hands data to the existing caller,
+not a new worker queue. Headers and DTOs are cached independently of the mutable
+Message view; capacity retries do not reconstruct a context or decode again.
+Raw input remains caller-owned. Factory/header/domain gates remain deferred to
+their original admission points. Explicit retired/expired invocations cannot
+execute a late decoder. Older peer generations are settled as deliberate
+NoReply drops without parsing or retiring a healthy Link. Deprecated
+ChangeConfigurationReply also uses typed intake but stays explicitly rejected.
+The bounded source/schema fixture entry points use `furpc::codec::decode`; no
+Node production body parser bypasses the furpc codec layer. These changes are
+not fresh native FM/Federation, TLS or deployment qualification.
 
 ## Node local RAP typed composition
 
@@ -1207,7 +1231,8 @@ Acceptance evidence has distinct levels:
   without adding a client drain API or post-drop join promise.
   Application work-queue composition preserves Request context, absolute
   deadlines, and shared storage while the runner retains reply authority.
-  Enqueue/worker/oneshot waits stay inside existing bounded handler capacity;
+  Enqueue/worker/oneshot waits retain the original invocation deadline;
+  consumers own queue/concurrency/readiness bounds.
   no second transport queue or waiting pool is created. Closed queue/worker
   channels surface as service errors. Timeout, disconnect, and shutdown races
   invalidate the original ticket; late output cannot resurrect it, forge a

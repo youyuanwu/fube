@@ -347,8 +347,8 @@ notification-receiver lifecycle. Duplicate/conflicting bindings reject within
 their traffic class before serving.
 
 At header admission, the core validates the original native notification kind
-and required ID, selects only an authorized notification binding, and reserves
-the existing handler and reply-completion capacity before body retention.
+and required ID, selects only an authorized notification binding, and captures
+the original invocation/acknowledgment authority before body retention.
 Ordinary one-way/request flags or mutable Actor/Action values cannot mint this
 admission. After integrity verification the service receives Request<Body> with
 the same private original-source, kind, route, policy and deadline context.
@@ -365,6 +365,8 @@ Failures, cancellation and dropped work send no implicit acknowledgment or Fault
 
 On ingress, notification readiness, codec work, handlers, queue waits and
 acknowledgment writes use the original invocation deadline and shared HandlerLimits.
+Handler concurrency and readiness admission are consumer middleware/queue
+policy, not an implicit furpc quota.
 Application-owned bounded queues compose inside services while the runner
 retains its ticket. They receive no send authority, and late worker output
 cannot revive a cancelled invocation. The optional SendPolicy alone decides

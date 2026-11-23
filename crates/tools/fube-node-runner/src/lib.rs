@@ -565,10 +565,10 @@ impl Owner {
                 }
             }
             if let Some(incoming) = peer.incoming.take() {
-                match self.ingress.peer(
+                match self.ingress.peer_incoming(
                     node,
                     &peer.placement.identity.native()?,
-                    &incoming.message,
+                    &incoming,
                     stopping,
                 )? {
                     Some(id) => {
@@ -607,10 +607,10 @@ impl Owner {
                         return Ok(());
                     }
                 }
-                if self.adapter.reject_deprecated(node, &incoming.message)? {
+                if self.adapter.reject_deprecated(node, &incoming)? {
                     return Ok(());
                 }
-                match self.ingress.fm(node, &incoming.message, stopping)? {
+                match self.ingress.fm_incoming(node, &incoming, stopping)? {
                     Admission::Retained => self.fm_incoming = Some(incoming),
                     Admission::Submitted(acknowledgement) => {
                         if let Some(acknowledgement) = acknowledgement {

@@ -1,18 +1,30 @@
 //! Budgeted FM bodies; generation and domain admission stay in Ingress.
-use super::{action, bounded, err, peer_intake::Payload, predecode, Result};
+use super::{err, one_way, peer_intake::Payload, Headers, Properties, Result};
 use fube_ra::protocol::{
     AddInstance, AddInstanceReply, AddPrimary, AddReplica, DeleteReplica, DoReconfiguration,
     GenerationHeader, GenerationUpdate, NodeActivateRequest, NodeDeactivateRequest,
     NodeUpdateServiceRequest, RemoveInstance, ReplicaUp, ServiceTypeNotificationReply,
     ServiceTypeUpdateReply,
 };
-use furpc::{Error, Message};
+use furpc::{CodecError, DecodeBuf, Error, Message};
 
+#[cfg(test)]
 pub(in crate::control) fn decode_generation_update(
     message: &Message,
 ) -> Result<(GenerationUpdate, GenerationHeader)> {
-    bounded(message).map_err(err)?;
-    let (body, generation) = Payload::decode(message, "GenerationUpdate")?.into_parts()?;
+    fn parse(
+        headers: &Headers,
+        src: &mut DecodeBuf<'_>,
+    ) -> std::result::Result<Payload<GenerationUpdate>, CodecError> {
+        Payload::decode_parts(headers, src, "GenerationUpdate")
+    }
+    generation_parts(one_way::decode_message(message, parse)?)
+}
+
+pub(in crate::control) fn generation_parts(
+    payload: Payload<GenerationUpdate>,
+) -> Result<(GenerationUpdate, GenerationHeader)> {
+    let (body, generation) = payload.into_parts()?;
     if generation.for_fm_replica {
         return Err(err(Error::Protocol(
             "FMM generation control is not supported",
@@ -21,78 +33,95 @@ pub(in crate::control) fn decode_generation_update(
     Ok((body, generation))
 }
 
-pub(in crate::control) enum Incoming<'a> {
+#[derive(Clone)]
+pub(in crate::control) enum Incoming {
     ServiceTypeStatusReply {
         enabled: bool,
-        payload: Payload<'a, ServiceTypeUpdateReply>,
+        payload: Payload<ServiceTypeUpdateReply>,
     },
-    NodeActivate(Payload<'a, NodeActivateRequest>),
-    NodeDeactivate(Payload<'a, NodeDeactivateRequest>),
-    NodeUpdateService(Payload<'a, NodeUpdateServiceRequest>),
-    AddInstance(Payload<'a, AddInstance>),
-    AddPrimary(Payload<'a, AddPrimary>),
-    DoReconfiguration(Payload<'a, DoReconfiguration>),
-    ReplicaEndpointUpdatedReply(Payload<'a, AddInstanceReply>),
+    NodeActivate(Payload<NodeActivateRequest>),
+    NodeDeactivate(Payload<NodeDeactivateRequest>),
+    NodeUpdateService(Payload<NodeUpdateServiceRequest>),
+    AddInstance(Payload<AddInstance>),
+    AddPrimary(Payload<AddPrimary>),
+    DoReconfiguration(Payload<DoReconfiguration>),
+    ReplicaEndpointUpdatedReply(Payload<AddInstanceReply>),
     ReplicaControl {
         removing: bool,
-        payload: Payload<'a, AddReplica>,
+        payload: Payload<AddReplica>,
     },
-    RemoveInstance(Payload<'a, RemoveInstance>),
-    DeleteReplica(Payload<'a, DeleteReplica>),
-    ReplicaUpReply(Payload<'a, ReplicaUp>),
-    ServiceTypeNotificationReply(Payload<'a, ServiceTypeNotificationReply>),
+    RemoveInstance(Payload<RemoveInstance>),
+    DeleteReplica(Payload<DeleteReplica>),
+    ReplicaUpReply(Payload<ReplicaUp>),
+    ServiceTypeNotificationReply(Payload<ServiceTypeNotificationReply>),
     Unsupported,
 }
 
-impl<'a> Incoming<'a> {
-    pub(in crate::control) fn decode(message: &'a Message) -> Result<(String, Self)> {
-        bounded(message).map_err(err)?;
-        let action = action(message)?;
+impl Incoming {
+    pub(in crate::control) fn decode(message: &Message) -> Result<(String, Self)> {
+        one_way::decode_message(message, Self::decode_parts)
+    }
+
+    pub(super) fn decode_parts(
+        headers: &Headers,
+        src: &mut DecodeBuf<'_>,
+    ) -> std::result::Result<(String, Self), CodecError> {
+        let action = Properties::from_headers(headers)
+            .map_err(CodecError::invalid_payload)?
+            .action;
         let incoming = match action.as_str() {
             "ServiceTypeEnabledReply" => Self::ServiceTypeStatusReply {
                 enabled: true,
-                payload: Payload::decode(message, "ServiceTypeEnabledReply")?,
+                payload: Payload::decode_parts(headers, src, "ServiceTypeEnabledReply")?,
             },
             "ServiceTypeDisabledReply" => Self::ServiceTypeStatusReply {
                 enabled: false,
-                payload: Payload::decode(message, "ServiceTypeDisabledReply")?,
+                payload: Payload::decode_parts(headers, src, "ServiceTypeDisabledReply")?,
             },
             "NodeActivateRequest" => {
-                Self::NodeActivate(Payload::decode(message, "NodeActivateRequest")?)
+                Self::NodeActivate(Payload::decode_parts(headers, src, "NodeActivateRequest")?)
             }
-            "NodeDeactivateRequest" => {
-                Self::NodeDeactivate(Payload::decode(message, "NodeDeactivateRequest")?)
-            }
-            "NodeUpdateServiceRequest" => {
-                Self::NodeUpdateService(Payload::decode(message, "NodeUpdateServiceRequest")?)
-            }
-            "AddInstance" => Self::AddInstance(Payload::decode(message, "AddInstance")?),
-            "AddPrimary" => Self::AddPrimary(Payload::decode(message, "AddPrimary")?),
-            "DoReconfiguration" => {
-                Self::DoReconfiguration(Payload::decode(message, "DoReconfiguration")?)
-            }
-            "ReplicaEndpointUpdatedReply" => Self::ReplicaEndpointUpdatedReply(Payload::decode(
-                message,
-                "ReplicaEndpointUpdatedReply",
+            "NodeDeactivateRequest" => Self::NodeDeactivate(Payload::decode_parts(
+                headers,
+                src,
+                "NodeDeactivateRequest",
             )?),
+            "NodeUpdateServiceRequest" => Self::NodeUpdateService(Payload::decode_parts(
+                headers,
+                src,
+                "NodeUpdateServiceRequest",
+            )?),
+            "AddInstance" => Self::AddInstance(Payload::decode_parts(headers, src, "AddInstance")?),
+            "AddPrimary" => Self::AddPrimary(Payload::decode_parts(headers, src, "AddPrimary")?),
+            "DoReconfiguration" => {
+                Self::DoReconfiguration(Payload::decode_parts(headers, src, "DoReconfiguration")?)
+            }
+            "ReplicaEndpointUpdatedReply" => Self::ReplicaEndpointUpdatedReply(
+                Payload::decode_parts(headers, src, "ReplicaEndpointUpdatedReply")?,
+            ),
             "AddReplica" => Self::ReplicaControl {
                 removing: false,
-                payload: Payload::decode(message, "AddReplica")?,
+                payload: Payload::decode_parts(headers, src, "AddReplica")?,
             },
             "RemoveReplica" => Self::ReplicaControl {
                 removing: true,
-                payload: Payload::decode(message, "RemoveReplica")?,
+                payload: Payload::decode_parts(headers, src, "RemoveReplica")?,
             },
-            "RemoveInstance" => Self::RemoveInstance(Payload::decode(message, "RemoveInstance")?),
-            "DeleteReplica" => Self::DeleteReplica(Payload::decode(message, "DeleteReplica")?),
-            "ReplicaUpReply" => Self::ReplicaUpReply(Payload::decode(message, "ReplicaUpReply")?),
-            "ServiceTypeNotificationReply" => Self::ServiceTypeNotificationReply(Payload::decode(
-                message,
-                "ServiceTypeNotificationReply",
-            )?),
+            "RemoveInstance" => {
+                Self::RemoveInstance(Payload::decode_parts(headers, src, "RemoveInstance")?)
+            }
+            "DeleteReplica" => {
+                Self::DeleteReplica(Payload::decode_parts(headers, src, "DeleteReplica")?)
+            }
+            "ReplicaUpReply" => {
+                Self::ReplicaUpReply(Payload::decode_parts(headers, src, "ReplicaUpReply")?)
+            }
+            "ServiceTypeNotificationReply" => Self::ServiceTypeNotificationReply(
+                Payload::decode_parts(headers, src, "ServiceTypeNotificationReply")?,
+            ),
             _ => {
                 // Keep foreign/unknown action failures at their original admission points.
-                predecode(message)?;
+                one_way::discard(headers, src)?;
                 Self::Unsupported
             }
         };

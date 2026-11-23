@@ -298,10 +298,6 @@ where
     let server = Server::builder()
         .handshake_timeout(Duration::from_secs(10))
         .drain_timeout(Duration::from_secs(5))
-        .handler_limits(HandlerLimits {
-            max_in_flight: 4,
-            ..HandlerLimits::default()
-        })
         .service(router.into_service()?)?
         .build()?;
     let acceptor = TcpAcceptor::bind(address).await?;

@@ -191,8 +191,6 @@ async fn serve(
             ..Default::default()
         })
         .handler_limits(HandlerLimits {
-            max_in_flight: INBOX_LIMIT,
-            max_readiness_waiters: INBOX_LIMIT,
             max_encoded_body_bytes_per_response: FRAME_LIMIT,
             timeout: Duration::from_secs(120),
         })

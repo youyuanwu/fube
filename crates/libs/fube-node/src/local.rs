@@ -3472,8 +3472,8 @@ mod ingress_tests {
             Profile::Stateless,
             true,
             PartitionId::default(),
-            fm,
-            local,
+            fm.clone(),
+            local.clone(),
             vec![],
         )
         .unwrap();
@@ -3555,8 +3555,46 @@ mod ingress_tests {
         }
         let body = ServiceTypeNotification::default();
         let acknowledgement = service_type_notification_reply_message(&body, &generation).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sender = wire::connect(
+            listener.local_addr().unwrap(),
+            wire::Role::Fm,
+            wire::deadline(),
+        );
+        let (sender, receiver) = tokio::join!(sender, async {
+            let (stream, _) = listener.accept().await.unwrap();
+            wire::accept(stream, wire::Role::Node, wire::deadline()).await
+        });
+        let sender = wire::Link::new(
+            sender.unwrap(),
+            fm.clone(),
+            local.node.clone(),
+            generation.clone(),
+        )
+        .unwrap();
+        let receiver = wire::Link::new(
+            receiver.unwrap(),
+            local.node.clone(),
+            fm.clone(),
+            generation.clone(),
+        )
+        .unwrap();
+        sender.send(acknowledgement.clone()).await.unwrap();
+        let mut incoming = receiver
+            .receive_checked(wire::deadline())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(
-            ingress.fm(&mut node, &acknowledgement, false).unwrap(),
+            ingress.fm_incoming(&mut node, &incoming, false).unwrap(),
+            Admission::Retained
+        ));
+        incoming.message = Message::builder()
+            .body(Body::from_bytes(vec![0xff]).unwrap())
+            .build()
+            .unwrap();
+        assert!(matches!(
+            ingress.fm_incoming(&mut node, &incoming, false).unwrap(),
             Admission::Retained
         ));
         assert_eq!(node.pending_commands(), 32);
@@ -3572,13 +3610,15 @@ mod ingress_tests {
         }
         assert_eq!(node.pending_commands(), 32);
         drain_control(&mut node).await;
-        match ingress.fm(&mut node, &acknowledgement, false).unwrap() {
+        match ingress.fm_incoming(&mut node, &incoming, false).unwrap() {
             Admission::Submitted(Some((_, SemanticAck::Notification(actual)))) => {
                 assert_eq!(actual, body)
             }
             _ => panic!("retry must admit the original semantic acknowledgement"),
         }
         drain_control(&mut node).await;
+        receiver.close().await.unwrap();
+        sender.close().await.unwrap();
         assert!(node.terminate().unwrap());
         node.close_executor(Duration::from_secs(3)).await.unwrap();
         assert!(store.close().await.unwrap().is_clean());

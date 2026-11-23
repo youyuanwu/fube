@@ -174,7 +174,7 @@ impl<I: TransportIo> Session<I> {
                         Some(ConnectionEvent::Discarded(reason)) => {
                             provisional = None;
                             let error = match reason {
-                                DropReason::Capacity => Error::ResourceLimit("handler capacity"),
+                                DropReason::Capacity => Error::ResourceLimit("ingress admission"),
                                 DropReason::Draining => Error::Closed,
                                 DropReason::NoDestination => Error::Protocol("no ingress destination"),
                                 DropReason::UnknownActor => Error::InvalidInput("unknown ingress Actor"),

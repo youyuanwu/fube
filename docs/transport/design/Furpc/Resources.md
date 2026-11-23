@@ -72,8 +72,9 @@ they cannot retarget a replacement connection or replay a failed request.
 Reconnection coalesces demand into one attempt and keeps existing operation
 deadlines. Current and retiring work remain owned until completion/cancellation,
 but no allocation ledger follows old results into application ownership.
-Ingress HandlerLimits apply to one logical Channel/server runner across its
-bindings and generations. Application-owned queues have their own policy.
+Ingress timeout/response-size policy applies to one logical Channel/server
+runner across its bindings and generations. Handler concurrency and readiness
+waiter limits belong exclusively to consumers, including their bounded queues.
 
 Retain staged receive:
 
@@ -149,11 +150,11 @@ the actual native message checks.
 
 Fail-fast admission and any explicit waiting path preserve one absolute
 deadline. Bound waiter registrations separately when waiting is supported.
-Native RPC/notification operations and service readiness use their appropriate operation/count
-admission; none creates a general allocation-budget capability.
-Notification handlers share HandlerLimits and protected reply-completion counts
-with ordinary handlers, not a separate transport-owned notification queue or
-per-class allowance.
+Native RPC/notification operations retain their transport operation/count
+admission; none creates a general allocation-budget capability. Furpc imposes
+no service-readiness or handler concurrency quota. Notification handlers share
+invocation-time/response-size policy with ordinary handlers, not a separate
+transport-owned notification queue or per-class allowance.
 
 [sf-repl-dispatch]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/Replicator.cpp#L618-L746
 [sf-repl-operation-admission]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/SecondaryReplicationReceiver.cpp#L396-L426

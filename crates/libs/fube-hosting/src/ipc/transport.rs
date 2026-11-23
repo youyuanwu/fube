@@ -48,8 +48,6 @@ pub(super) fn accepted(socket: TcpStream) -> Result<Connection> {
             ..TransportLimits::default()
         })
         .handler_limits(HandlerLimits {
-            max_in_flight: HANDLERS,
-            max_readiness_waiters: HANDLERS,
             max_encoded_body_bytes_per_response: MAX_INPUT,
             timeout: Duration::from_secs(30),
         })

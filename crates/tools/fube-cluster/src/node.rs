@@ -443,7 +443,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         }
                     }
                     if let Some(incoming) = &mut connection.incoming {
-                        match ingress.peer(&mut node, &peer.node, &incoming.message, false) {
+                        match ingress.peer_incoming(&mut node, &peer.node, incoming, false) {
                             Ok(Some(id)) => {
                                 adapter.track_peer_command(id)?;
                                 connection.incoming = None;
@@ -482,9 +482,9 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 if let Some(mut incoming) = fm_incoming.take() {
                     let received = match ingress.generation(&node, current, &mut incoming).await {
                         Ok(Some(admission)) => Ok(admission),
-                        Ok(None) => match adapter.reject_deprecated(&node, &incoming.message) {
+                        Ok(None) => match adapter.reject_deprecated(&node, &incoming) {
                             Ok(true) => Ok(Admission::Submitted(None)),
-                            Ok(false) => ingress.fm(&mut node, &incoming.message, false),
+                            Ok(false) => ingress.fm_incoming(&mut node, &incoming, false),
                             Err(error) => Err(error),
                         },
                         Err(error) => Err(error),
@@ -830,11 +830,29 @@ fn create_idle(launch: &Launch, node: &mut Node) -> Result<u64> {
 }
 
 #[cfg(test)]
-fn receive_peer(launch: &Launch, node: &mut Node, message: &furpc::Message) -> Result<Option<u64>> {
+fn receive_peer_message(
+    launch: &Launch,
+    node: &mut Node,
+    message: &furpc::Message,
+) -> Result<Option<u64>> {
     launch.ingress()?.peer(
         node,
         &launch.peers.first().ok_or("unbound peer ingress")?.node,
         message,
+        false,
+    )
+}
+
+#[cfg(test)]
+fn receive_peer(
+    launch: &Launch,
+    node: &mut Node,
+    incoming: &wire::Incoming,
+) -> Result<Option<u64>> {
+    launch.ingress()?.peer_incoming(
+        node,
+        &launch.peers.first().ok_or("unbound peer ingress")?.node,
+        incoming,
         false,
     )
 }
@@ -1084,12 +1102,24 @@ fn publish_failed_open(
 }
 
 #[cfg(test)]
-fn receive_command(
+fn receive_command_message(
     launch: &Launch,
     node: &mut Node,
     message: &furpc::Message,
 ) -> Result<Option<(u64, SemanticAck)>> {
     match launch.ingress()?.fm(node, message, false)? {
+        Admission::Submitted(acknowledgement) => Ok(acknowledgement),
+        Admission::Retained => Err("Capacity".into()),
+    }
+}
+
+#[cfg(test)]
+fn receive_command(
+    launch: &Launch,
+    node: &mut Node,
+    incoming: &wire::Incoming,
+) -> Result<Option<(u64, SemanticAck)>> {
+    match launch.ingress()?.fm_incoming(node, incoming, false)? {
         Admission::Submitted(acknowledgement) => Ok(acknowledgement),
         Admission::Retained => Err("Capacity".into()),
     }
@@ -1290,7 +1320,7 @@ pub(crate) mod report_tests {
             .receive(Instant::now() + Duration::from_millis(1))
             .await?
         {
-            if let Some(ack) = receive_command(launch, node, &incoming.message)? {
+            if let Some(ack) = receive_command(launch, node, &incoming)? {
                 adapter.track_acknowledgement(ack)?;
             }
         }
@@ -1691,7 +1721,7 @@ pub(crate) mod report_tests {
         }
         let mut stale_generation = launch.generation.clone();
         stale_generation.number.generation -= 1;
-        if receive_command(
+        if receive_command_message(
             launch,
             node,
             &replica_up_reply_message(&first, &stale_generation).map_err(err)?,
@@ -3202,7 +3232,7 @@ pub(crate) mod report_tests {
             .receive(Instant::now() + Duration::from_millis(1))
             .await?
         {
-            let id = receive_peer(launch, node, &incoming.message)
+            let id = receive_peer(launch, node, &incoming)
                 .map_err(|error| format!("node{} peer ingress: {error}", launch.placement))?
                 .ok_or("unexpected peer command capacity in bounded test")?;
             adapter.track_peer_command(id)?;
@@ -3253,8 +3283,8 @@ pub(crate) mod report_tests {
                 &launches[1].generation,
             )
             .map_err(err)?;
-            if receive_peer(&launches[1], target, &request).is_ok()
-                || receive_peer(&launches[0], source, &reply).is_ok()
+            if receive_peer_message(&launches[1], target, &request).is_ok()
+                || receive_peer_message(&launches[0], source, &reply).is_ok()
             {
                 return Err("unbound peer topology reached first-FT admission".into());
             }
@@ -3531,7 +3561,7 @@ pub(crate) mod report_tests {
             if deleting {
                 let mut foreign = request.clone();
                 foreign.replica.instance += 1;
-                if receive_command(&launches[1], &mut target,
+                if receive_command_message(&launches[1], &mut target,
                     &delete_replica_message(&DeleteReplica::new(foreign, false), &launches[1].generation).map_err(err)?).is_ok()
                 {
                     return Err("peer Delete admitted an unrelated destination incarnation".into());
@@ -3579,7 +3609,7 @@ pub(crate) mod report_tests {
                     source_link.send(create_replica_message(&create, &launches[0].generation).map_err(err)?).await?;
                     let incoming = target_link.receive(Instant::now() + Duration::from_secs(2)).await?
                         .ok_or("missing original Create before lookup")?;
-                    let id = receive_peer(&launches[1], &mut target, &incoming.message)?.ok_or("original Create capacity")?;
+                    let id = receive_peer(&launches[1], &mut target, &incoming)?.ok_or("original Create capacity")?;
                     target_adapter.track_peer_command(id)?;
                     target.drive().map_err(err)?;
                     while target.snapshot(entity).committed.is_none() {
@@ -4350,7 +4380,7 @@ pub(crate) mod report_tests {
                         if reply.error != 0 || reply.replica.replication_endpoint.is_empty() {
                             return Err("destination did not actually Open".into());
                         }
-                        let command = receive_peer(&launches[0], &mut source, &incoming.message)?
+                        let command = receive_peer(&launches[0], &mut source, &incoming)?
                             .ok_or("late peer reply capacity")?;
                         source_adapter.track_peer_command(command)?;
                         break;
@@ -4427,7 +4457,7 @@ pub(crate) mod report_tests {
                         let deleting = ledger.request_idle_deletion(Instant::now(), crate::fm::IdleDeleteTarget::Runtime)?;
                         let mut foreign_force = DeleteReplica::new(deleting.replica.0.clone(), true);
                         foreign_force.replica.0.replica.id += 1;
-                        if receive_command(&launches[1], &mut target,
+                        if receive_command_message(&launches[1], &mut target,
                             &delete_replica_message(&foreign_force,
                                 &launches[1].generation).map_err(err)?).is_ok()
                         {
@@ -4588,13 +4618,13 @@ pub(crate) mod report_tests {
                             fresh.replica.0.replica.id = id;
                             fresh.replica.0.replica.instance = instance;
                             let message = create_replica_message(&fresh, &launches[0].generation).map_err(err)?;
-                            receive_command(&launches[1], &mut target,
+                            receive_command_message(&launches[1], &mut target,
                                 &delete_replica_message(&deleting, &launches[1].generation).map_err(err)?)?;
                             let pending = target.pending_commands();
                             let before = target.snapshot(entity).committed.ok_or("missing closed owner before busy Create")?;
                             // Queued old-owner work must backpressure a fresh Create, not close the peer.
                             for _ in 0..2 {
-                                if receive_peer(&launches[1], &mut target, &message)?.is_some()
+                                if receive_peer_message(&launches[1], &mut target, &message)?.is_some()
                                     || target.pending_commands() != pending
                                     || target.snapshot(entity).committed.is_none_or(|state|
                                         state.body != before.body || !state.local_deleted)

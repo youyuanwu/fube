@@ -15,12 +15,14 @@ use tokio::time::Instant;
 mod bootstrap;
 mod fm_client;
 mod fm_intake;
+mod one_way;
 mod peer_client;
 mod peer_intake;
 mod session;
 pub use bootstrap::LfumUploadRequest;
 pub(super) use fm_client::FmClient;
-pub(super) use fm_intake::{decode_generation_update, Incoming as FmIncoming};
+pub(super) use fm_intake::{generation_parts, Incoming as FmIncoming};
+pub(super) use one_way::Call as OneWayCall;
 pub(super) use peer_client::PeerClient;
 pub(super) use peer_intake::Incoming as PeerIncoming;
 pub use session::{Failure, Incoming, Session};
@@ -300,137 +302,22 @@ pub fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(3)
 }
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    let mut budget = 4 * LIMIT;
-    from_slice_with_budget(bytes, &mut |count| {
-        budget = budget
-            .checked_sub(count)
-            .ok_or(fubst::Error::ResourceLimit("cluster native decode"))?;
-        Ok(())
-    })
-    .map_err(err)
+    let body = Body::from_bytes(bytes.to_vec()).map_err(err)?;
+    furpc::codec::decode(&mut one_way::Budgeted::<T>::default(), &body, LIMIT)
+        .map_err(one_way::decode_error)
 }
 
-// Bound allocations before the existing action/header/body factory decoders
-// run. Their second decode is then bounded by this validated full schema.
+// Compatibility validation for byte-facing FM consumers and independent fixtures.
 pub fn predecode(message: &Message) -> Result<()> {
-    bounded(message).map_err(err)?;
-    let body: Vec<_> = message.body().segments().flatten().copied().collect();
-    use fube_ra::protocol::*;
-    match action(message)?.as_str() {
-        "GetLSN" => {
-            decode::<GetLsn>(&body)?;
-        }
-        "GetLSNReply" => {
-            decode::<GetLsnReply>(&body)?;
-        }
-        "ReplicaEndpointUpdated" => {
-            decode::<AddInstance>(&body)?;
-        }
-        "ReplicaEndpointUpdatedReply" => {
-            decode::<AddInstanceReply>(&body)?;
-        }
-        "DoReconfiguration" => {
-            decode::<DoReconfiguration>(&body)?;
-        }
-        "DoReconfigurationReply" => {
-            decode::<ConfigurationReply>(&body)?;
-        }
-        "ChangeConfiguration" => {
-            decode::<Configuration>(&body)?;
-        }
-        "ChangeConfigurationReply" => {
-            decode::<FailoverUnitReply>(&body)?;
-        }
-        "Activate" => {
-            decode::<Activate>(&body)?;
-        }
-        "ActivateReply" => {
-            decode::<ActivateReply>(&body)?;
-        }
-        "Deactivate" => {
-            decode::<Deactivate>(&body)?;
-        }
-        "DeactivateReply" => {
-            decode::<DeactivateReply>(&body)?;
-        }
-        "GenerationProposal" => {
-            if !message.body().is_empty() {
-                return Err("GenerationProposal must be bodyless".into());
-            }
-        }
-        "LFUMUpload" => {
-            decode::<LfumUpload>(&body)?;
-        }
-        "LFUMUploadReply" => {
-            if !message.body().is_empty() {
-                return Err("LFUMUploadReply must be bodyless".into());
-            }
-        }
-        "GenerationProposalReply" => {
-            decode::<fube_ra::protocol::GenerationProposalReply>(&body)?;
-        }
-        "GenerationUpdate" => {
-            decode::<GenerationUpdate>(&body)?;
-        }
-        "GenerationUpdateReject" => {
-            decode::<GenerationNumber>(&body)?;
-        }
-        "NodeUp" => {
-            decode::<NodeUp>(&body)?;
-        }
-        "NodeUpAck" => {
-            decode::<NodeUpAck>(&body)?;
-        }
-        "AddInstance" | "AddPrimary" | "AddReplica" | "RemoveReplica" => {
-            decode::<AddInstance>(&body)?;
-        }
-        "CreateReplica" => {
-            decode::<CreateReplica>(&body)?;
-        }
-        "CreateReplicaReply" => {
-            decode::<CreateReplicaReply>(&body)?;
-        }
-        "RemoveInstance" | "DeleteReplica" => {
-            decode::<RemoveInstance>(&body)?;
-        }
-        "AddInstanceReply"
-        | "AddPrimaryReply"
-        | "AddReplicaReply"
-        | "RemoveReplicaReply"
-        | "RemoveInstanceReply"
-        | "DeleteReplicaReply" => {
-            decode::<AddInstanceReply>(&body)?;
-        }
-        "ReplicaUp" | "ReplicaUpReply" => {
-            decode::<ReplicaUp>(&body)?;
-        }
-        "ServiceTypeNotification" | "ServiceTypeNotificationReply" => {
-            decode::<ServiceTypeNotification>(&body)?;
-        }
-        "NodeActivateRequest" | "NodeDeactivateRequest" => {
-            decode::<NodeActivationRequest>(&body)?;
-        }
-        "NodeActivateReply" | "NodeDeactivateReply" => {
-            decode::<NodeActivationReply>(&body)?;
-        }
-        "NodeUpdateServiceRequest" => {
-            decode::<NodeUpdateServiceRequest>(&body)?;
-        }
-        "NodeUpdateServiceReply" => {
-            decode::<NodeUpdateServiceReply>(&body)?;
-        }
-        "ServiceTypeEnabled" | "ServiceTypeDisabled" => {
-            decode::<ServiceTypeUpdate>(&body)?;
-        }
-        "ServiceTypeEnabledReply" | "ServiceTypeDisabledReply" => {
-            decode::<ServiceTypeUpdateReply>(&body)?;
-        }
-        "ReportLoad" => {
-            decode::<ReportLoad>(&body)?;
-        }
-        _ => return Err("unsupported native action retained at boundary".into()),
-    }
-    Ok(())
+    one_way::decode_message(message, one_way::discard)
+}
+
+pub(super) fn fm_generation(headers: &Headers) -> Result<(GenerationHeader, bool)> {
+    let mut records = headers
+        .records()
+        .filter(|header| header.id().get() == GENERATION_HEADER);
+    let generation = decode(records.next().ok_or("missing FM generation")?.value())?;
+    Ok((generation, records.next().is_some()))
 }
 
 #[derive(Clone)]
@@ -561,7 +448,7 @@ impl Link {
         until: Instant,
     ) -> std::result::Result<Option<Incoming>, ReceiveError> {
         match self.session.receive(until).await {
-            Ok(Some(incoming)) => {
+            Ok(Some(mut incoming)) => {
                 if incoming.source.generation() != self.session.peer.info().generation {
                     self.retire();
                     return Err(ReceiveError::Invalid(
@@ -577,12 +464,31 @@ impl Link {
                                 "foreign/stale/duplicate native FM generation".into(),
                             ));
                         }
+                        if let Some(slot) = incoming.one_way.take() {
+                            if slot
+                                .response
+                                .send(Ok(furpc::IngressResponse::NoReply))
+                                .is_err()
+                            {
+                                self.retire();
+                                return Err(ReceiveError::Invalid(err(furpc::Error::Closed)));
+                            }
+                        }
                         eprintln!("ignored native message from older FM generation");
                         return Ok(None);
                     }
                     Err(error) => {
                         self.retire();
                         return Err(ReceiveError::Invalid(error));
+                    }
+                }
+                if let Some(slot) = incoming.one_way.take() {
+                    match slot.prepare(self).await {
+                        Ok(prepared) => incoming.prepared = Some(prepared),
+                        Err(error) => {
+                            self.retire();
+                            return Err(ReceiveError::Invalid(error));
+                        }
                     }
                 }
                 Ok(Some(incoming))

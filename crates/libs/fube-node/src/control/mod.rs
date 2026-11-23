@@ -329,12 +329,14 @@ impl Adapter {
         self.peer_replies.pop_front()
     }
 
-    pub fn reject_deprecated(&mut self, node: &Node, message: &furpc::Message) -> Result<bool> {
-        if wire::action(message)? != "ChangeConfigurationReply" {
+    pub fn reject_deprecated(&mut self, node: &Node, incoming: &wire::Incoming) -> Result<bool> {
+        if incoming.action()? != "ChangeConfigurationReply" {
             return Ok(false);
         }
-        wire::predecode(message)?;
-        let (body, generation) = decode_change_configuration_reply(message).map_err(err)?;
+        let wire::OneWayCall::Deprecated(payload) = &incoming.prepared()?.call else {
+            return Err("original typed invocation is not deprecated reply".into());
+        };
+        let (body, generation) = payload.clone().into_parts()?;
         if generation.for_fm_replica || generation.number != node.generation_state().receive {
             return Err("deprecated reply has a foreign FM generation".into());
         }

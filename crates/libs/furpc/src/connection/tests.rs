@@ -976,7 +976,7 @@ async fn routing_misses_classify_before_body_input_and_verify_discard_integrity(
 }
 
 #[tokio::test(start_paused = true)]
-async fn notification_admission_requires_original_id_and_shares_ordinary_handler_capacity() {
+async fn notification_admission_requires_original_id_without_a_handler_concurrency_cap() {
     use crate::{
         peer::Generation, service::Registry, ConnectionOptions, HandlerLimits, IngressLimits,
         IngressOptions, IngressService, NotificationPolicy, Request, ServiceBinding,
@@ -1014,10 +1014,7 @@ async fn notification_admission_requires_original_id_and_shares_ordinary_handler
     .erase();
     let registry = Registry::new(
         Some(service),
-        HandlerLimits {
-            max_in_flight: 1,
-            ..Default::default()
-        },
+        HandlerLimits::default(),
         ConnectionOptions::managed(),
         &TransportLimits::default(),
     )
@@ -1072,18 +1069,12 @@ async fn notification_admission_requires_original_id_and_shares_ordinary_handler
         )
         .unwrap();
     let ordinary = registry.admit(&core, message(b"").headers(), 0).unwrap();
-    assert!(matches!(
-        registry.admit(&core, &headers, 0),
-        Err(DropReason::Capacity)
-    ));
-    drop(ordinary);
     // Native special classification does not depend on ExpectsReply or RelatesTo.
     let notification = registry.admit(&core, &headers, 0).unwrap();
-    assert!(matches!(
-        registry.admit(&core, message(b"").headers(), 0),
-        Err(DropReason::Capacity)
-    ));
-    drop(notification);
+    let more: Vec<_> = (0..16)
+        .map(|_| registry.admit(&core, message(b"").headers(), 0).unwrap())
+        .collect();
+    drop((ordinary, notification, more));
     assert!(registry.admit(&core, message(b"").headers(), 0).is_ok());
 }
 

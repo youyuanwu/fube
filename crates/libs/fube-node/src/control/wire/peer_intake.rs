@@ -1,56 +1,71 @@
 //! Budgeted peer bodies; placement admission still precedes factory adaptation.
 use super::{
-    action, bootstrap::unique, bounded, decode, err, predecode, Result, GENERATION_HEADER, RA_ACTOR,
+    bootstrap::unique, decode, err, one_way, Headers, Properties, Result, GENERATION_HEADER,
+    RA_ACTOR,
 };
 use fube_ra::protocol::{
     Activate, ActivateReply, CreateReplica, CreateReplicaReply, Deactivate, DeactivateReply,
     DoReconfiguration, GenerationHeader, GetLsn, GetLsnReply,
 };
-use furpc::{header, DecodeBuf, Error, HeaderId, Message};
+use furpc::{header, CodecError, DecodeBuf, Decoder, Error, HeaderId, Message};
 use serde::{de::DeserializeOwned, Deserialize};
 
-pub(in crate::control) enum Incoming<'a> {
-    DoReconfiguration(Payload<'a, DoReconfiguration>),
-    GetLsn(Payload<'a, GetLsn>),
-    GetLsnReply(Payload<'a, GetLsnReply>),
-    Deactivate(Payload<'a, Deactivate>),
-    DeactivateReply(Payload<'a, DeactivateReply>),
-    Activate(Payload<'a, Activate>),
-    ActivateReply(Payload<'a, ActivateReply>),
-    CreateReplica(Payload<'a, CreateReplica>),
-    CreateReplicaReply(Payload<'a, CreateReplicaReply>),
+#[derive(Clone)]
+pub(in crate::control) enum Incoming {
+    DoReconfiguration(Payload<DoReconfiguration>),
+    GetLsn(Payload<GetLsn>),
+    GetLsnReply(Payload<GetLsnReply>),
+    Deactivate(Payload<Deactivate>),
+    DeactivateReply(Payload<DeactivateReply>),
+    Activate(Payload<Activate>),
+    ActivateReply(Payload<ActivateReply>),
+    CreateReplica(Payload<CreateReplica>),
+    CreateReplicaReply(Payload<CreateReplicaReply>),
     Unsupported,
 }
 
-pub(in crate::control) struct Payload<'a, T> {
-    message: &'a Message,
+#[derive(Clone)]
+pub(in crate::control) struct Payload<T> {
+    headers: Headers,
     action: &'static str,
     body: T,
 }
 
-impl<'a> Incoming<'a> {
-    pub(in crate::control) fn decode(message: &'a Message) -> Result<(String, Self)> {
-        bounded(message).map_err(err)?;
-        let action = action(message)?;
+impl Incoming {
+    pub(in crate::control) fn decode(message: &Message) -> Result<(String, Self)> {
+        one_way::decode_message(message, Self::decode_parts)
+    }
+
+    pub(super) fn decode_parts(
+        headers: &Headers,
+        src: &mut DecodeBuf<'_>,
+    ) -> std::result::Result<(String, Self), CodecError> {
+        let action = Properties::from_headers(headers)
+            .map_err(CodecError::invalid_payload)?
+            .action;
         let incoming = match action.as_str() {
             "DoReconfiguration" => {
-                Self::DoReconfiguration(Payload::decode(message, "DoReconfiguration")?)
+                Self::DoReconfiguration(Payload::decode_parts(headers, src, "DoReconfiguration")?)
             }
-            "GetLSN" => Self::GetLsn(Payload::decode(message, "GetLSN")?),
-            "GetLSNReply" => Self::GetLsnReply(Payload::decode(message, "GetLSNReply")?),
-            "Deactivate" => Self::Deactivate(Payload::decode(message, "Deactivate")?),
+            "GetLSN" => Self::GetLsn(Payload::decode_parts(headers, src, "GetLSN")?),
+            "GetLSNReply" => Self::GetLsnReply(Payload::decode_parts(headers, src, "GetLSNReply")?),
+            "Deactivate" => Self::Deactivate(Payload::decode_parts(headers, src, "Deactivate")?),
             "DeactivateReply" => {
-                Self::DeactivateReply(Payload::decode(message, "DeactivateReply")?)
+                Self::DeactivateReply(Payload::decode_parts(headers, src, "DeactivateReply")?)
             }
-            "Activate" => Self::Activate(Payload::decode(message, "Activate")?),
-            "ActivateReply" => Self::ActivateReply(Payload::decode(message, "ActivateReply")?),
-            "CreateReplica" => Self::CreateReplica(Payload::decode(message, "CreateReplica")?),
+            "Activate" => Self::Activate(Payload::decode_parts(headers, src, "Activate")?),
+            "ActivateReply" => {
+                Self::ActivateReply(Payload::decode_parts(headers, src, "ActivateReply")?)
+            }
+            "CreateReplica" => {
+                Self::CreateReplica(Payload::decode_parts(headers, src, "CreateReplica")?)
+            }
             "CreateReplicaReply" => {
-                Self::CreateReplicaReply(Payload::decode(message, "CreateReplicaReply")?)
+                Self::CreateReplicaReply(Payload::decode_parts(headers, src, "CreateReplicaReply")?)
             }
             _ => {
                 // Preserve foreign/unknown action failures at their original admission points.
-                predecode(message)?;
+                one_way::discard(headers, src)?;
                 Self::Unsupported
             }
         };
@@ -63,26 +78,25 @@ struct Scalar<T> {
     value: T,
 }
 
-impl<'a, T: DeserializeOwned> Payload<'a, T> {
-    pub(super) fn decode(message: &'a Message, action: &'static str) -> Result<Self> {
-        let mut src = DecodeBuf::new(message.body());
-        let body = if src.chunk().len() == src.remaining() {
-            decode(src.chunk())?
-        } else {
-            decode(&src.copy_remaining().map_err(err)?)?
-        };
+impl<T: DeserializeOwned> Payload<T> {
+    pub(super) fn decode_parts(
+        headers: &Headers,
+        src: &mut DecodeBuf<'_>,
+        action: &'static str,
+    ) -> std::result::Result<Self, CodecError> {
+        let body = one_way::Budgeted::<T>::default().decode(src)?;
         Ok(Self {
-            message,
+            headers: headers.clone(),
             action,
             body,
         })
     }
 }
 
-impl<T> Payload<'_, T> {
+impl<T> Payload<T> {
     // Header failures remain deferred until the original shutdown/placement gates.
     pub(in crate::control) fn into_parts(self) -> Result<(T, GenerationHeader)> {
-        let headers = self.message.headers();
+        let headers = &self.headers;
         let actor: Scalar<i64> = decode(unique(headers, header::ACTOR).map_err(err)?.value())?;
         if actor.value != RA_ACTOR
             || decode::<Scalar<String>>(unique(headers, header::ACTION).map_err(err)?.value())?

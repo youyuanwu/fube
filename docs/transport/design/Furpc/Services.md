@@ -385,10 +385,10 @@ authority to transmit a native reply itself. The service future returns that
 result, and only the original runner completes correlation and output.
 There is no core ticket transfer/disarm path for either traffic class.
 
-The original HandlerLimits slot, absolute invocation deadline, context, and
+The original absolute invocation deadline, response-size policy, context, and
 shared storage ownership remain in force across enqueue, worker processing,
-response waiting, and reply completion. Queue-capacity waits are inside that
-already bounded invocation, not an unbounded waiter pool. Queueing preserves
+response waiting, and reply completion. The application owns queue capacity
+and any readiness/concurrency admission policy. Queueing preserves
 Request parts/context; it does not reconstruct a request or renew admission.
 Application queues/workers may keep byte storage alive after timeout or
 cancellation; this does not keep transport queue credit occupied.
@@ -408,15 +408,13 @@ admission may itself be the complete handler outcome NoReply; it is not proof
 of application completion. That separately owned processing and its actual
 ACK policy follow the [replication boundary](#replication-service-admission).
 
-## Bounded execution and deadlines
+## Consumer execution policy and invocation deadlines
 
 ### Handler limits
 
 ```rust,ignore
 #[derive(Clone, Debug)]
 pub struct HandlerLimits {
-    pub max_in_flight: usize,
-    pub max_readiness_waiters: usize,
     pub max_encoded_body_bytes_per_response: usize,
     pub timeout: Duration,
 }
@@ -431,7 +429,7 @@ defaults, not native SF constants, hard wire limits, eager allocations, or
 performance qualification. [Route configuration](Routing.md#routing-limits)
 validates keys/conflicts without another construction-only quota.
 
-These limits configure all installed user-service ingress in one logical
+These timeout/output limits configure all installed user-service ingress in one logical
 Channel or server scope as a whole, not independent per-clone, per-route, or
 per-generation pools. Endpoint configures them for dialed ingress; ServerBuilder
 configures them for accepted ingress. Route options supply native ingress/send
@@ -439,16 +437,20 @@ policies, not additional handler timeout or allocation limits.
 
 | Handler field | Default | Meaning |
 | --- | --- | --- |
-| `max_in_flight` | 8 | Admitted service invocations, including body/readiness wait, decoding, execution, encoding, and response completion. |
-| `max_readiness_waiters` | 4 | Subset of in-flight invocations waiting for service readiness. Zero selects fail-fast readiness; the effective ceiling is also bounded by `max_in_flight`. |
 | `max_encoded_body_bytes_per_response` | Native frame body capacity | Optional caller-selected encoded-output restriction, not backing capacity or a heap quota. The full frame must still fit after headers. |
 | `timeout` | 30 seconds | One total service-invocation budget, not a timeout restarted for each phase. |
 
-MiB means a power-of-1024 unit. Count/byte arithmetic is checked, including
-derived per-invocation/count ceilings; overflow is InvalidInput. Server build
-and Endpoint connect validate limits before starting ingress: in-flight
-capacity must be positive, and timeout must be positive and fit the monotonic clock range. Readiness
-waiters are a subset, not additional requests. A zero encoded-body cap permits
+Furpc imposes no handler concurrency or service-readiness waiter cap. Consumers
+can wrap their service with Tower concurrency/load-shedding middleware or use
+their own bounded queues and admission state. Shared limits require shared
+consumer middleware state; furpc does not manufacture a quota per route,
+connection or clone. Pending readiness retains the same prepared service and
+remains subject to the original invocation deadline and cancellation.
+
+MiB means a power-of-1024 unit. Byte arithmetic is checked; overflow is
+InvalidInput. Server build and Endpoint connect validate timeout/output policy
+before starting ingress: timeout must be positive and fit the monotonic clock
+range. A zero encoded-body cap permits
 empty output. Decoded Rust allocations are not tracked.
 
 Explicit per-invocation output limits cannot widen native frame or send-queue
@@ -469,15 +471,13 @@ A protocol-specific timeout header may narrow this budget through explicit
 domain policy. It does not silently select infinity or control every raw
 protocol. Partial-frame and committed-write watchdogs remain separate.
 
-Check ingress/handler capacity before accepting work.
-The native driver hands off once into bounded service work;
-do not introduce an unbounded router inbox, task-per-message admission bypass,
-or a second copy of the message. Ordinary ownership follows readiness, decoding,
+Consumers must check their own ingress/handler capacity before accepting work.
+Furpc adds no router inbox or consumer worker queue. Ordinary ownership follows readiness, decoding,
 handler state, and completed-but-unsent responses, without allocation charges.
 
 Service readiness and body/handler code run outside the socket driver.
-Pending service capacity must not stop unrelated native control/reply
-processing or consume all reserved reply capacity. This does not eliminate
+Pending service readiness must not stop unrelated native control/reply
+processing. Transport send/correlation guards remain independent. This does not eliminate
 TCP head-of-line blocking behind a frame already arriving.
 
 Body codecs use the existing bounded buffers. User handlers and custom
@@ -504,7 +504,7 @@ messages before their Action can be examined.
 
 For replication data, validate and try to admit the operation into a bounded,
 replication-owned queue, then promptly return IngressResponse::NoReply.
-Do not occupy HandlerLimits while waiting for later state-provider processing,
+Do not retain a live handler invocation while waiting for later state-provider processing,
 application acknowledgment, or quorum completion. The domain owns that work,
 ACK timers, and retry. It may retain shared storage and an independently
 authorized original-generation Peer for later semantic sends, but not a live
@@ -518,7 +518,7 @@ not the operation or an ACK. ACK/RequestAck can still report truthful progress
 for earlier admitted operations. This is a declared overload outcome, not a
 catch-all conversion of malformed input or arbitrary service errors to success.
 
-Generic frame, byte, send-queue, and HandlerLimits ceilings still apply. The framework
+Generic frame, byte, send-queue, invocation-time and response-size guards still apply. The framework
 must quiesce its deferred processing and required ACKs before owner shutdown.
 
 ## Errors and shutdown

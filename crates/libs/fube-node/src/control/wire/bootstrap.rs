@@ -220,7 +220,7 @@ impl<R: DeserializeOwned> Decoder for BootstrapCodec<R> {
     }
 }
 
-fn decode_body<R: DeserializeOwned>(
+pub(super) fn decode_body<R: DeserializeOwned>(
     src: &mut DecodeBuf<'_>,
     mut budget: usize,
 ) -> std::result::Result<R, CodecError> {

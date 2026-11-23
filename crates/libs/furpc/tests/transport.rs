@@ -915,10 +915,6 @@ async fn reply_contract_and_response_policy_failures_send_nothing_and_release_th
         Server::builder()
             .service(service)
             .unwrap()
-            .handler_limits(HandlerLimits {
-                max_in_flight: 1,
-                ..Default::default()
-            })
             .build()
             .unwrap()
             .serve_with_shutdown(one(accepted), ConnectionOptions::managed(), async {
@@ -1722,7 +1718,7 @@ async fn public_attempt_drop_after_commit_preserves_the_full_frame_before_later_
 }
 
 #[tokio::test]
-async fn shared_handler_capacity_is_checked_before_body_and_released_after_completion() {
+async fn concurrent_handlers_across_connections_have_no_implicit_execution_cap() {
     let (one_client, one_accepted) = tokio::io::duplex(1);
     let (two_client, two_accepted) = tokio::io::duplex(1);
     let started = Arc::new(Notify::new());
@@ -1763,10 +1759,6 @@ async fn shared_handler_capacity_is_checked_before_body_and_released_after_compl
         Server::builder()
             .service(handler)
             .unwrap()
-            .handler_limits(HandlerLimits {
-                max_in_flight: 1,
-                ..Default::default()
-            })
             .build()
             .unwrap()
             .serve_with_shutdown(acceptor, ConnectionOptions::raw_only(), async {
@@ -1781,28 +1773,27 @@ async fn shared_handler_capacity_is_checked_before_body_and_released_after_compl
         bounded(raw("memory://second").connect_with_connector(Connector::new(vec![two_client])))
             .await
             .unwrap();
-    first
-        .peer(deadline())
-        .await
-        .unwrap()
-        .send(packet("hold", &[1; 10]), deadline())
-        .await
-        .unwrap();
-    bounded(started.notified()).await;
+    let first_peer = first.peer(deadline()).await.unwrap();
     let second_peer = second.peer(deadline()).await.unwrap();
-    second_peer
-        .send(packet("capacity rejected", &[2; 100]), deadline())
-        .await
-        .unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    release.notify_one();
-    tokio::task::yield_now().await;
+    for count in 1..=16 {
+        let peer = if count % 2 == 0 {
+            &first_peer
+        } else {
+            &second_peer
+        };
+        peer.send(packet("hold", &[2; 100]), deadline())
+            .await
+            .unwrap();
+        bounded(started.notified()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), count);
+    }
+    release.notify_waiters();
     second_peer
         .send(packet("marker", &[3; 10]), deadline())
         .await
         .unwrap();
     bounded(marker.notified()).await;
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 17);
     stop.send(()).unwrap();
     bounded(serving).await.unwrap().unwrap();
     drop((first, second));
@@ -1953,6 +1944,7 @@ struct Readiness {
     enabled: Arc<std::sync::atomic::AtomicBool>,
     polled: Arc<Notify>,
     called: Arc<Notify>,
+    waiting: Arc<Mutex<Option<std::task::Waker>>>,
     ready: Cell<bool>,
 }
 impl Clone for Readiness {
@@ -1961,6 +1953,7 @@ impl Clone for Readiness {
             enabled: self.enabled.clone(),
             polled: self.polled.clone(),
             called: self.called.clone(),
+            waiting: self.waiting.clone(),
             ready: Cell::new(false),
         }
     }
@@ -1969,12 +1962,13 @@ impl Service<Request<Body>> for Readiness {
     type Response = IngressResponse;
     type Error = Error;
     type Future = std::future::Ready<furpc::Result<IngressResponse>>;
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<furpc::Result<()>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<furpc::Result<()>> {
         self.polled.notify_one();
         if self.enabled.load(Ordering::SeqCst) {
             self.ready.set(true);
             Poll::Ready(Ok(()))
         } else {
+            *self.waiting.lock().unwrap() = Some(cx.waker().clone());
             Poll::Pending
         }
     }
@@ -1989,12 +1983,13 @@ impl Service<Request<Body>> for Readiness {
 }
 
 #[tokio::test]
-async fn fail_fast_readiness_does_not_stall_the_driver_or_clone_ready_services() {
+async fn pending_readiness_does_not_stall_the_driver_or_clone_ready_services() {
     let (client, accepted) = tokio::io::duplex(1);
     let service = Readiness {
         enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         polled: Arc::new(Notify::new()),
         called: Arc::new(Notify::new()),
+        waiting: Arc::new(Mutex::new(None)),
         ready: Cell::new(false),
     };
     let state = service.clone();
@@ -2003,10 +1998,6 @@ async fn fail_fast_readiness_does_not_stall_the_driver_or_clone_ready_services()
         Server::builder()
             .service(ingress(service, false))
             .unwrap()
-            .handler_limits(HandlerLimits {
-                max_readiness_waiters: 0,
-                ..Default::default()
-            })
             .build()
             .unwrap()
             .serve_with_shutdown(one(accepted), ConnectionOptions::raw_only(), async {
@@ -2023,6 +2014,8 @@ async fn fail_fast_readiness_does_not_stall_the_driver_or_clone_ready_services()
         .unwrap();
     bounded(state.polled.notified()).await;
     state.enabled.store(true, Ordering::SeqCst);
+    state.waiting.lock().unwrap().take().unwrap().wake();
+    bounded(state.called.notified()).await;
     peer.send(packet("ready", &[2; 10]), deadline())
         .await
         .unwrap();
@@ -2068,10 +2061,6 @@ async fn peer_ready_work_has_independent_handler_capacity_and_a_finite_timeout()
         Server::builder()
             .service(handler)
             .unwrap()
-            .handler_limits(HandlerLimits {
-                max_in_flight: 1,
-                ..Default::default()
-            })
             .on_peer_ready(SendPolicy::new(control_sends), hook)
             .unwrap()
             .build()

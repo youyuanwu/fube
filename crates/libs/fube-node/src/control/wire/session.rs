@@ -131,6 +131,29 @@ pub struct Incoming {
     pub message: Message,
     pub reply: Option<ResponseSlot>,
     pub source: Source,
+    pub(super) one_way: Option<OneWaySlot>,
+    pub(super) prepared: Option<super::one_way::Prepared>,
+}
+
+impl Incoming {
+    pub fn action(&self) -> super::Result<String> {
+        match &self.prepared {
+            Some(prepared) => Ok(prepared.action.clone()),
+            None => super::action(&self.message),
+        }
+    }
+
+    pub(in crate::control) fn prepared(&self) -> super::Result<&super::one_way::Prepared> {
+        self.prepared
+            .as_ref()
+            .ok_or_else(|| "one-way intake has no original typed handoff".into())
+    }
+}
+
+pub(super) struct OneWaySlot {
+    pub(super) request: Request<Body>,
+    pub(super) response: oneshot::Sender<furpc::Result<IngressResponse>>,
+    pub(super) role: Role,
 }
 
 pub struct ResponseSlot {
@@ -183,7 +206,7 @@ impl Service<Request<Body>> for Ingress {
         }
         let result = builder.build().and_then(|message| {
             inbound(self.role, &message)?;
-            let (response, receive) = if expects_reply {
+            let (response, one_way, receive) = if expects_reply {
                 let (tx, rx) = oneshot::channel();
                 (
                     Some(ResponseSlot {
@@ -191,16 +214,30 @@ impl Service<Request<Body>> for Ingress {
                         response: tx,
                         role: self.role,
                     }),
+                    None,
+                    Some(rx),
+                )
+            } else if self.role != Role::Fm {
+                let (tx, rx) = oneshot::channel();
+                (
+                    None,
+                    Some(OneWaySlot {
+                        request,
+                        response: tx,
+                        role: self.role,
+                    }),
                     Some(rx),
                 )
             } else {
-                (None, None)
+                (None, None, None)
             };
             self.tx
                 .try_send(Incoming {
                     message,
                     source,
                     reply: response,
+                    one_way,
+                    prepared: None,
                 })
                 .map_err(|_| Error::ResourceLimit("Node control inbox"))?;
             Ok(receive)
@@ -473,8 +510,6 @@ pub(super) async fn establish(
     }
     let service = router.into_service().map_err(super::err)?;
     let handlers = HandlerLimits {
-        max_in_flight: 8,
-        max_readiness_waiters: 8,
         max_encoded_body_bytes_per_response: super::LIMIT,
         timeout: Duration::from_secs(3),
     };
