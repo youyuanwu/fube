@@ -12,9 +12,9 @@ use std::{
 
 use fubst::serde::{CountedValues, ObjectArray, Pointer};
 use furpc::{
-    header, ActorId, Attempt, AttemptDisposition, Body, Channel, FubstCodec, HeaderRecord, Headers,
-    IngressLimits, IngressOptions, IngressResponse, IngressService, NotificationPolicy, Operation,
-    Peer, Reply, Request, Response, ServiceBinding, Source,
+    header, ActorId, Attempt, AttemptDisposition, Body, Channel, FubstDecoder, FubstEncoder,
+    HeaderRecord, Headers, IngressLimits, IngressOptions, IngressResponse, IngressService,
+    NotificationPolicy, Operation, Peer, Reply, Request, Response, ServiceBinding, Source,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
@@ -692,7 +692,8 @@ where
     })
     .unary(
         Request::new(body).append_header(priority()?)?,
-        FubstCodec::<I, O>::default(),
+        FubstEncoder::<I>::default(),
+        FubstDecoder::<O>::default(),
         action,
         validate,
         deadline,
@@ -788,9 +789,13 @@ impl Service<Request<Body>> for NotificationIngress {
                         "notification session generation changed",
                     ));
                 }
-                furpc::server::Rpc::new(FubstCodec::<wire::Status, wire::PageBody>::default())
-                    .unary(PageHandler(session.clone()), request)
-                    .await
+                furpc::server::unary(
+                    PageHandler(session.clone()),
+                    request,
+                    FubstDecoder::<wire::PageBody>::default(),
+                    FubstEncoder::<wire::Status>::default(),
+                )
+                .await
             }
             .await;
             guard.armed = false;

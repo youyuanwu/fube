@@ -2022,7 +2022,8 @@ async fn managed_bootstrap(peer: &furpc::Peer, a: &Admission) {
     let reply = client
         .call(
             start,
-            furpc::FubstCodec::<_, wire::StartReply>::default(),
+            furpc::FubstEncoder::<_>::default(),
+            furpc::FubstDecoder::<wire::StartReply>::default(),
             tokio::time::Instant::now() + Duration::from_secs(5),
         )
         .await
@@ -2041,7 +2042,8 @@ async fn managed_bootstrap(peer: &furpc::Peer, a: &Admission) {
         client
             .call(
                 finish,
-                furpc::FubstCodec::<_, wire::ErrorReply>::default(),
+                furpc::FubstEncoder::<_>::default(),
+                furpc::FubstDecoder::<wire::ErrorReply>::default(),
                 tokio::time::Instant::now() + Duration::from_secs(5)
             )
             .await
@@ -2066,7 +2068,8 @@ async fn managed_bootstrap(peer: &furpc::Peer, a: &Admission) {
         client
             .call(
                 register,
-                furpc::FubstCodec::<_, wire::ErrorReply>::default(),
+                furpc::FubstEncoder::<_>::default(),
+                furpc::FubstDecoder::<wire::ErrorReply>::default(),
                 tokio::time::Instant::now() + Duration::from_secs(5)
             )
             .await

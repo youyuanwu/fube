@@ -275,14 +275,13 @@ where
 {
     let actor = ActorId::new(70000)?;
     let echo_service = tower::service_fn(|request: Request<Body>| async move {
-        let mut rpc = server::Rpc::new(
-            FubstCodec::<EchoReply, EchoRequest>::default(),
-        );
-        rpc.unary(tower::service_fn(echo), request).await
+        server::unary(tower::service_fn(echo), request,
+            FubstDecoder::<EchoRequest>::default(),
+            FubstEncoder::<EchoReply>::default()).await
     });
     let text_service = tower::service_fn(|request: Request<Body>| async move {
-        let mut rpc = server::Rpc::new(Utf8Codec);
-        rpc.unary(tower::service_fn(echo_text), request).await
+        server::unary(tower::service_fn(echo_text), request,
+            Utf8Decoder, Utf8Encoder).await
     });
     let router = Router::new()
         .request(
@@ -310,11 +309,11 @@ where
 ```
 
 The router only selects a byte-facing service. Each service creates its
-tonic-style `server::Rpc` method adapter, which owns decoding, typed-service
+server::unary function, which owns decoding, typed-service
 invocation, and response encoding. The two method services select distinct
 agreed body codecs; there is no sniffing or router-level default.
 Serving owns admission, handler lifetime, and original reply completion.
-`Utf8Codec` is defined below.
+Utf8Encoder and Utf8Decoder are defined below.
 
 The outer services are cloneable shared configuration, but their per-call
 codec and typed-service values need neither Clone nor Sync. Full Tower is
@@ -335,8 +334,8 @@ the acknowledgment policy. The runner supplies native correlation and flags.
 
 ```rust,ignore
 let notification_service = tower::service_fn(|request: Request<Body>| async move {
-    server::Rpc::new(FubstCodec::<Ack, Notification>::default())
-        .unary(tower::service_fn(acknowledge), request).await
+    server::unary(tower::service_fn(acknowledge), request,
+        FubstDecoder::<Notification>::default(), FubstEncoder::<Ack>::default()).await
 });
 let policy = NotificationPolicy::new(check_notification, check_acknowledgment);
 let ingress = Router::new()
@@ -373,7 +372,8 @@ let transport = tower::service_fn(move |request: Request<Body>| {
 });
 let mut client = RpcClient::new(transport);
 let acknowledgment = client.call(
-    typed_request, FubstCodec::<Notification, Ack>::default(), deadline,
+    typed_request, FubstEncoder::<Notification>::default(),
+    FubstDecoder::<Ack>::default(), deadline,
 ).await?;
 ```
 
@@ -391,19 +391,8 @@ separate; there is no fallback between them.
 ### Default fubst and an external non-Serde codec
 
 ```rust,ignore
-struct Utf8Codec;
 struct Utf8Encoder;
 struct Utf8Decoder;
-
-impl Codec for Utf8Codec {
-    type Encode = String;
-    type Decode = String;
-    type Encoder = Utf8Encoder;
-    type Decoder = Utf8Decoder;
-
-    fn encoder(&mut self) -> Self::Encoder { Utf8Encoder }
-    fn decoder(&mut self) -> Self::Decoder { Utf8Decoder }
-}
 
 impl Encoder for Utf8Encoder {
     type Item = String;
@@ -436,14 +425,15 @@ async fn typed_client(destination: String) -> Result<()> {
         .append_header(header::actor(actor)?)?
         .append_header(header::action("Echo")?)?;
     let response = rpc.call(
-        request, FubstCodec::<EchoRequest, EchoReply>::default(), deadline,
+        request, FubstEncoder::<EchoRequest>::default(),
+        FubstDecoder::<EchoReply>::default(), deadline,
     ).await?;
     println!("{}", response.body().text);
 
     let request = Request::new(String::from("hello"))
         .append_header(header::actor(actor)?)?
         .append_header(header::action("EchoText")?)?;
-    let response = rpc.call(request, Utf8Codec, deadline).await?;
+    let response = rpc.call(request, Utf8Encoder, Utf8Decoder, deadline).await?;
     println!("{}", response.body());
 
     Ok(())
@@ -457,9 +447,8 @@ It uses `&mut self` for standard service readiness; clone the client before
 readiness to issue concurrent calls. Channel clones share its dialed owner,
 native admission, and driver without another public owner.
 The matching server method services select fubst for Echo and UTF-8 for EchoText.
-`FubstCodec` is explicitly supplied for the native-format call; custom-only
-protocols do not instantiate it. `Utf8Codec` needs no Clone implementation on
-either side: server method services construct a fresh instance per invocation.
+Native FubstEncoder/FubstDecoder values are explicitly supplied for the native-format call.
+Custom-only protocols do not instantiate them. Neither UTF-8 direction needs Clone: server method services construct a fresh instance per invocation.
 The final owning client/channel drops after the required responses; the
 application controls server shutdown independently. Real native operations still require their specified
 schemas; the UTF-8 codec is not a

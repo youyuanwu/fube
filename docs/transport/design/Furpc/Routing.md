@@ -103,7 +103,7 @@ impl tower_service::Service<Request<Body>> for Router {
 Every registered service accepts `Request<Body>` and returns `IngressResponse`.
 The router has no application-body type parameters, serialization bounds,
 body-format defaults, or format-selecting registration methods. A method
-service may use `server::Rpc`, custom byte processing, or compatible middleware;
+service may use server::unary/one_way, custom byte processing, or compatible middleware;
 that choice is opaque to routing.
 
 Request routes accept only `RequestRouteOptions`; one-way routes accept only

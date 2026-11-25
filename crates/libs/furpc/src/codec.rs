@@ -7,9 +7,10 @@ use std::{fmt, marker::PhantomData};
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{body::MAX_BODY_BYTES, Body, BoxError, Error, ErrorSource};
+use crate::{body::MAX_BODY_BYTES, Body, BoxError, Error, ErrorSource, Headers};
 
 type Result<T> = std::result::Result<T, CodecError>;
+static EMPTY_HEADERS: Headers = Headers::new();
 
 /// A call-local body failure. The enclosing [`Error::Codec`] records its phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,17 +72,6 @@ impl From<fubst::Error> for CodecError {
     }
 }
 
-/// Locally sent and received types may differ. No Serde bounds are required.
-pub trait Codec {
-    type Encode;
-    type Decode;
-    type Encoder: Encoder<Item = Self::Encode>;
-    type Decoder: Decoder<Item = Self::Decode>;
-
-    fn encoder(&mut self) -> Self::Encoder;
-    fn decoder(&mut self) -> Self::Decoder;
-}
-
 pub trait Encoder {
     type Item;
 
@@ -95,15 +85,32 @@ pub trait Decoder {
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Self::Item>;
 }
 
+impl<F, T> Decoder for F
+where
+    F: FnMut(&mut DecodeBuf<'_>) -> Result<T>,
+{
+    type Item = T;
+
+    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<T> {
+        self(src)
+    }
+}
+
 /// Fallible byte writes and shared-body composition for one encoded value.
 pub struct EncodeBuf<'a> {
+    headers: &'a Headers,
     segments: &'a mut Vec<Body>,
     pending: Vec<u8>,
     len: usize,
     max_bytes: usize,
 }
 
-impl EncodeBuf<'_> {
+impl<'a> EncodeBuf<'a> {
+    /// Current read-only envelope headers, empty for standalone body encoding.
+    pub fn headers(&self) -> &'a Headers {
+        self.headers
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -164,9 +171,19 @@ impl EncodeBuf<'_> {
 /// Encode one whole body under an explicit byte limit, without native submission.
 /// Zero permits empty output; limits exceeding native body capacity are invalid.
 pub fn encode<E: Encoder>(encoder: &mut E, item: E::Item, max_bytes: usize) -> Result<Body> {
+    encode_with_headers(encoder, item, &EMPTY_HEADERS, max_bytes)
+}
+
+pub(crate) fn encode_with_headers<E: Encoder>(
+    encoder: &mut E,
+    item: E::Item,
+    headers: &Headers,
+    max_bytes: usize,
+) -> Result<Body> {
     validate_limit(max_bytes)?;
     let mut segments = Vec::new();
     let mut buf = EncodeBuf {
+        headers,
         segments: &mut segments,
         pending: Vec::new(),
         len: 0,
@@ -180,12 +197,31 @@ pub fn encode<E: Encoder>(encoder: &mut E, item: E::Item, max_bytes: usize) -> R
 /// A cursor over exactly one complete body, with zero-copy shared views.
 pub struct DecodeBuf<'a> {
     body: &'a Body,
+    headers: &'a Headers,
     position: usize,
 }
 
 impl<'a> DecodeBuf<'a> {
     pub fn new(body: &'a Body) -> Self {
-        Self { body, position: 0 }
+        Self {
+            body,
+            headers: &EMPTY_HEADERS,
+            position: 0,
+        }
+    }
+
+    /// Read-only envelope metadata, not invocation or reply authority.
+    pub fn with_headers(body: &'a Body, headers: &'a Headers) -> Self {
+        Self {
+            body,
+            headers,
+            position: 0,
+        }
+    }
+
+    /// Current read-only envelope headers, empty for standalone body decoding.
+    pub fn headers(&self) -> &'a Headers {
+        self.headers
     }
 
     pub fn remaining(&self) -> usize {
@@ -274,12 +310,21 @@ impl<'a> DecodeBuf<'a> {
 /// Success must consume or explicitly skip every byte. No invocation authority
 /// or native transport operation is created by this helper.
 pub fn decode<D: Decoder>(decoder: &mut D, body: &Body, max_bytes: usize) -> Result<D::Item> {
+    decode_with(body, &EMPTY_HEADERS, max_bytes, |buf| decoder.decode(buf))
+}
+
+pub(crate) fn decode_with<T>(
+    body: &Body,
+    headers: &Headers,
+    max_bytes: usize,
+    decode: impl FnOnce(&mut DecodeBuf<'_>) -> Result<T>,
+) -> Result<T> {
     validate_limit(max_bytes)?;
     if body.len() > max_bytes {
         return Err(CodecError::resource_limit("decoded body bytes"));
     }
-    let mut buf = DecodeBuf::new(body);
-    let value = decoder.decode(&mut buf)?;
+    let mut buf = DecodeBuf::with_headers(body, headers);
+    let value = decode(&mut buf)?;
     buf.finish()?;
     Ok(value)
 }
@@ -293,16 +338,13 @@ fn validate_limit(max_bytes: usize) -> Result<()> {
     Ok(())
 }
 
-/// Native Fabric body format with the schemas/adapters supported by `fubst`.
-///
-/// Defaults add no depth or work ceiling. Optional codec-local limits do not
-/// affect native headers, connection controls, or transport Fault decoding.
-pub struct FubstCodec<Out, In> {
+/// Native Fabric body encoding. Limits do not affect native envelope schemas.
+pub struct FubstEncoder<T> {
     limits: fubst::Limits,
-    marker: PhantomData<fn(Out) -> In>,
+    marker: PhantomData<fn(T)>,
 }
 
-impl<Out, In> FubstCodec<Out, In> {
+impl<T> FubstEncoder<T> {
     pub fn with_limits(limits: fubst::Limits) -> Self {
         Self {
             limits,
@@ -311,40 +353,30 @@ impl<Out, In> FubstCodec<Out, In> {
     }
 }
 
-impl<Out, In> Default for FubstCodec<Out, In> {
+impl<T> Default for FubstEncoder<T> {
     fn default() -> Self {
         Self::with_limits(fubst::Limits::default())
     }
 }
 
-pub struct FubstEncoder<T> {
-    limits: fubst::Limits,
-    marker: PhantomData<fn(T)>,
-}
-
+/// Native Fabric body decoding. Defaults add no depth or work ceiling.
 pub struct FubstDecoder<T> {
     limits: fubst::Limits,
     marker: PhantomData<fn() -> T>,
 }
 
-impl<Out: Serialize, In: DeserializeOwned> Codec for FubstCodec<Out, In> {
-    type Encode = Out;
-    type Decode = In;
-    type Encoder = FubstEncoder<Out>;
-    type Decoder = FubstDecoder<In>;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        FubstEncoder {
-            limits: self.limits,
+impl<T> FubstDecoder<T> {
+    pub fn with_limits(limits: fubst::Limits) -> Self {
+        Self {
+            limits,
             marker: PhantomData,
         }
     }
+}
 
-    fn decoder(&mut self) -> Self::Decoder {
-        FubstDecoder {
-            limits: self.limits,
-            marker: PhantomData,
-        }
+impl<T> Default for FubstDecoder<T> {
+    fn default() -> Self {
+        Self::with_limits(fubst::Limits::default())
     }
 }
 

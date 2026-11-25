@@ -2,8 +2,8 @@
 use super::{action, MAX_INPUT};
 use fube_core::protocol::actor as actors;
 use furpc::{
-    header, ActorId, Body, Codec, EncodeBuf, Encoder, Error, FubstCodec, Headers, OneWayClient,
-    Peer, PeerSendService, Request, Result, SendKind, SendPolicy, Source, WriteReceipt,
+    header, ActorId, Body, EncodeBuf, Encoder, Error, Headers, OneWayClient, Peer, PeerSendService,
+    Request, Result, SendKind, SendPolicy, Source, WriteReceipt,
 };
 use tokio::time::Instant;
 
@@ -30,7 +30,7 @@ impl LifecycleClient {
         deadline: Instant,
     ) -> Result<WriteReceipt> {
         self.client
-            .send(request.0, PreparedBodyCodec, deadline)
+            .send(request.0, PreparedBodyEncoder, deadline)
             .await
     }
 }
@@ -102,24 +102,9 @@ fn outbound(kind: SendKind, headers: &Headers, _: &Source) -> Result<()> {
     Ok(())
 }
 
-struct PreparedBodyCodec;
+struct PreparedBodyEncoder;
 
-impl Codec for PreparedBodyCodec {
-    type Encode = Body;
-    type Decode = ();
-    type Encoder = Self;
-    type Decoder = <FubstCodec<(), ()> as Codec>::Decoder;
-
-    fn encoder(&mut self) -> Self {
-        Self
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        FubstCodec::<(), ()>::default().decoder()
-    }
-}
-
-impl Encoder for PreparedBodyCodec {
+impl Encoder for PreparedBodyEncoder {
     type Item = Body;
 
     fn encode(

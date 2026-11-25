@@ -177,15 +177,15 @@ where
     T::Future: Send,
     T::Error: Into<BoxError>,
 {
-    pub async fn call<C>(
-        &mut self, request: Request<C::Encode>, codec: C, deadline: Instant,
-    ) -> Result<Response<C::Decode>>
+    pub async fn call<E, D>(
+        &mut self, request: Request<E::Item>, encoder: E, decoder: D, deadline: Instant,
+    ) -> Result<Response<D::Item>>
     where
-        C: Codec + Send,
-        C::Encode: Send,
-        C::Decode: Send,
-        C::Encoder: Send,
-        C::Decoder: Send;
+        E: Encoder + Send,
+        E::Item: Send,
+        D: Decoder + Send,
+        D::Item: Send;
+
 }
 
 pub struct ClientCodecLimits {
@@ -256,17 +256,16 @@ where
     T::Future: Send,
     T::Error: Into<BoxError>,
 {
-    pub async fn send<C>(
-        &mut self, request: Request<C::Encode>, codec: C, deadline: Instant,
+    pub async fn send<E>(
+        &mut self, request: Request<E::Item>, encoder: E, deadline: Instant,
     ) -> Result<WriteReceipt>
     where
-        C: Codec + Send,
-        C::Encode: Send,
-        C::Encoder: Send;
+        E: Encoder + Send,
+        E::Item: Send;
 }
 ```
 
-The adapter consumes a codec per send and constructs only its encoder. There
+The adapter consumes an encoder value per send and uses only that direction. There
 are no bounds on unused decode types/state and no response-body limit. The
 default encoded-byte allowance is native body capacity; explicit restrictions
 validate before use. It uses the
@@ -388,7 +387,7 @@ A generic transport needs neither Clone nor Sync nor a static lifetime. `call` b
 the client mutably, like tonic; clone a cloneable client before starting
 concurrent calls. Do not silently clone T inside `call`.
 
-Each `call` consumes its own codec and returns an ordinary async future, not
+Each `call` consumes its own encoder and decoder and returns an ordinary async future, not
 `Operation<T>`. One client supports unrelated body types and formats. The codec
 and its encode/decode state need Send, not Clone or Sync, and stay in the
 caller's future. First poll checks the effective deadline and encodes into a
@@ -422,8 +421,8 @@ can acquire/initialize a Peer and submit through `Peer::request` on that exact
 generation. Merely initializing a Peer before a separate Channel call would
 race Channel reconnection; see [domain recovery](Connections.md#identity-and-domain-recovery).
 
-The generic RPC adapter always takes an explicit codec. Native domain or
-convenience methods supply `FubstCodec<Q, R>::default()` when appropriate;
+The generic RPC adapter takes explicit encoder/decoder values. Native domain or
+convenience methods supply FubstEncoder<Q> and FubstDecoder<R> when appropriate;
 supported fubst schemas are required only for those calls. There is no
 codec-bound client type, codec-selecting connection constructor, or codec
 replacement method. T parameterizes transport, not serialization. Codec choice
@@ -528,7 +527,7 @@ changes a Channel request into a notification; the supplied byte service
 explicitly selects that native operation and policy.
 
 Notification handlers use the same Request<Body>/IngressResponse service
-boundary as ordinary handlers. `server::Rpc::unary` accepts either original
+boundary as ordinary handlers. `server::unary` accepts either original
 replying kind; `one_way` accepts neither. IngressOptions/route options explicitly
 select notification authorization before body retention. Their private ticket
 captures the original notification MessageId, generation, acknowledgment policy,

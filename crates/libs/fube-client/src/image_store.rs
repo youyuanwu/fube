@@ -76,6 +76,12 @@ impl From<furpc::Error> for ImageStoreError {
         if let Some(error) = source.and_then(|source| source.downcast_ref::<Self>()) {
             return error.clone();
         }
+        // Preserve the existing serializer-error category for typed encoding too.
+        if matches!(error, furpc::Error::Codec { .. }) {
+            if let Some(error) = source.and_then(|source| source.downcast_ref::<fubst::Error>()) {
+                return (*error).into();
+            }
+        }
         FurpcClientError::from_rpc(error).into()
     }
 }
@@ -456,9 +462,11 @@ impl ImageStoreClient {
         session: &mut Option<[u8; 16]>,
     ) -> Result<()> {
         let activity = uuid::Uuid::new_v4().to_bytes_le();
-        let create = UploadRequest::create(path, size)?;
+        let create =
+            self.client
+                .prepare(UploadRequest::Create { path, size }, activity, deadline)?;
         *session = Some(activity);
-        self.client.send(create, activity, deadline).await?;
+        self.client.send_request(create, deadline).await?;
         let created = self.receive(activity, Stage::Create, deadline).await?;
         created.result.map_err(FurpcClientError::Domain)?;
         let chunk_size = negotiated_size(created.sequence.unwrap().buffer_size)?;
@@ -674,17 +682,16 @@ impl Service<Request<Body>> for UploadIngress {
                         FurpcClientError::Protocol("upload connection generation changed").into(),
                     );
                 }
-                let codec = transport::AckCodec(request.headers().clone());
-                furpc::server::Rpc::new(codec)
-                    .one_way(
-                        AckHandoff {
-                            state: state.clone(),
-                            replies,
-                        },
-                        request,
-                    )
-                    .await
-                    .map_err(ImageStoreError::from)
+                furpc::server::one_way(
+                    AckHandoff {
+                        state: state.clone(),
+                        replies,
+                    },
+                    request,
+                    transport::decode_ack,
+                )
+                .await
+                .map_err(ImageStoreError::from)
             }
             .await;
             if let Err(error) = &result {

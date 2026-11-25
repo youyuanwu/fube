@@ -13,10 +13,10 @@ use std::{
 
 use furpc::{
     header, Accept, Accepted, Body, BoxError, CancelOutcome, Connected, ConnectionOptions,
-    Endpoint, Error, FubstCodec, HandlerLimits, Headers, IngressLimits, IngressOptions,
-    IngressResponse, IngressService, IoInfo, Message, Peer, Request, RequestPolicy, Response,
-    RpcClient, SendKind, SendPolicy, Server, ServiceBinding, Source, StreamAcceptor, TcpAcceptor,
-    TransportIo, TransportLimits,
+    Endpoint, Error, FubstDecoder, FubstEncoder, HandlerLimits, Headers, IngressLimits,
+    IngressOptions, IngressResponse, IngressService, IoInfo, Message, Peer, Request, RequestPolicy,
+    Response, RpcClient, SendKind, SendPolicy, Server, ServiceBinding, Source, StreamAcceptor,
+    TcpAcceptor, TransportIo, TransportLimits,
 };
 use futures_util::{future::join_all, stream, FutureExt};
 use http::Uri;
@@ -339,7 +339,8 @@ async fn managed_rpc_uses_opaque_bodies_pending_only_ids_and_original_reply_auth
     let response = rpc
         .call(
             Request::new(73u32),
-            FubstCodec::<u32, u32>::default(),
+            FubstEncoder::<u32>::default(),
+            FubstDecoder::<u32>::default(),
             deadline(),
         )
         .await
@@ -800,7 +801,7 @@ async fn byte_readiness_never_retargets_a_retired_generation_and_reconnects_only
     assert!(original_send
         .send(
             Request::new(()),
-            FubstCodec::<(), ()>::default(),
+            furpc::FubstEncoder::<()>::default(),
             deadline()
         )
         .await
@@ -809,7 +810,8 @@ async fn byte_readiness_never_retargets_a_retired_generation_and_reconnects_only
     assert!(original_rpc
         .call(
             Request::new(()),
-            FubstCodec::<(), ()>::default(),
+            FubstEncoder::<()>::default(),
+            FubstDecoder::<()>::default(),
             deadline()
         )
         .await
@@ -1033,7 +1035,8 @@ async fn on_time_rpc_response_survives_late_observation_and_generation_retiremen
     let mut rpc = RpcClient::new(channel.clone());
     let mut typed = Box::pin(rpc.call(
         Request::new(73u32),
-        FubstCodec::<u32, u32>::default(),
+        FubstEncoder::<u32>::default(),
+        FubstDecoder::<u32>::default(),
         Instant::now() + Duration::from_secs(1),
     ));
     assert!(operation.as_mut().now_or_never().is_none());

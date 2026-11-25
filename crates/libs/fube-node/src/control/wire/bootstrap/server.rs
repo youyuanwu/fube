@@ -1,6 +1,6 @@
 //! Deferred typed handlers; the caller keeps domain state and commit policy.
 use super::{
-    bounded_parts, decode_body, err, unique, Body, Codec, CodecError, DecodeBuf, Decoder, Error,
+    bounded_parts, decode_body, err, unique, Body, CodecError, DecodeBuf, Decoder, Error,
     GenerationHeader, GenerationProposalReply, LfumUpload, Link, Message, Method, NodeUp,
     NodeUpAck, PreparedEncoder, Properties, Request, Result, FM_ACTOR, GENERATION_HEADER, LIMIT,
     RA_ACTOR,
@@ -24,13 +24,13 @@ enum Call {
     GenerationProposal(GenerationHeader),
 }
 
-struct ServerCodec {
+struct ServerDecoder {
     method: Method,
     budget: usize,
     generation: Option<GenerationHeader>,
 }
 
-impl ServerCodec {
+impl ServerDecoder {
     fn admitted(method: Method, link: &Link, request: &Request<Body>) -> Result<Self> {
         let context = request
             .context()
@@ -95,26 +95,7 @@ impl ServerCodec {
     }
 }
 
-impl Codec for ServerCodec {
-    type Encode = Body;
-    type Decode = Call;
-    type Encoder = PreparedEncoder;
-    type Decoder = Self;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        PreparedEncoder
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        Self {
-            method: self.method,
-            budget: self.budget,
-            generation: self.generation.clone(),
-        }
-    }
-}
-
-impl Decoder for ServerCodec {
+impl Decoder for ServerDecoder {
     type Item = Call;
 
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> std::result::Result<Call, CodecError> {
@@ -226,8 +207,8 @@ impl ResponseSlot {
         handler: impl FnOnce(Call) -> Result<R> + Send,
         prepare: impl FnOnce(&R) -> Result<Message> + Send,
     ) -> Result<R> {
-        let codec = match ServerCodec::admitted(method, link, &self.request) {
-            Ok(codec) => codec,
+        let decoder = match ServerDecoder::admitted(method, link, &self.request) {
+            Ok(decoder) => decoder,
             Err(source) => {
                 let error = Error::Codec {
                     phase: "bootstrap admission",
@@ -244,26 +225,28 @@ impl ResponseSlot {
             call: Some(send),
             reply: Some(response),
         };
-        let mut rpc = furpc::server::Rpc::new(codec);
         // Co-poll the typed service and borrowed domain handler, never spawn a task.
-        let (encoded, handled) = tokio::join!(rpc.unary(service, self.request), async {
-            let call = receive.await.map_err(|_| err(Error::Closed))?;
-            let result = handler(call);
-            let prepared = result
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(prepare)
-                .and_then(|message| link.seal(message))
-                .and_then(|message| {
-                    let mut reply = Reply::new(message.body().clone());
-                    for header in message.headers().records() {
-                        reply = reply.append_header(header.to_owned()).map_err(err)?;
-                    }
-                    Ok(reply)
-                });
-            reply.send(prepared).map_err(|_| err(Error::Closed))?;
-            result
-        });
+        let (encoded, handled) = tokio::join!(
+            furpc::server::unary(service, self.request, decoder, PreparedEncoder),
+            async {
+                let call = receive.await.map_err(|_| err(Error::Closed))?;
+                let result = handler(call);
+                let prepared = result
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(prepare)
+                    .and_then(|message| link.seal(message))
+                    .and_then(|message| {
+                        let mut reply = Reply::new(message.body().clone());
+                        for header in message.headers().records() {
+                            reply = reply.append_header(header.to_owned()).map_err(err)?;
+                        }
+                        Ok(reply)
+                    });
+                reply.send(prepared).map_err(|_| err(Error::Closed))?;
+                result
+            }
+        );
         let error = encoded.as_ref().err().map(err);
         let sent = self.response.send(encoded).map_err(|_| err(Error::Closed));
         if let Some(error) = error {

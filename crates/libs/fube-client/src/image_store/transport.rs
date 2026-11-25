@@ -1,53 +1,49 @@
 //! Typed original-Peer methods; upload stages and semantic completion stay in the owner.
 use super::{wire, FurpcClientError, ImageStoreError, Result, UploadState};
 use furpc::{
-    header, ActorId, Body, Codec, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder, FubstCodec,
-    HeaderRecord, Headers, OneWayClient, Peer, PeerRequestService, PeerSendService, Request,
-    Response, RpcClient,
+    header, ActorId, Body, CodecError, DecodeBuf, EncodeBuf, Encoder, FubstEncoder, OneWayClient,
+    Peer, PeerRequestService, PeerSendService, Request, Response, RpcClient,
 };
 use std::{
     future::Future,
+    marker::PhantomData,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     task::{Context, Poll},
 };
 use tokio::time::Instant;
 use tower_service::Service;
 
-pub(super) enum UploadRequest {
-    Create(HeaderRecord),
+pub(super) enum UploadRequest<'a> {
+    Create { path: &'a str, size: u64 },
     Content { number: u64, bytes: Vec<u8> },
     Commit,
     CommitAck,
     DeleteSession,
 }
 
-impl UploadRequest {
-    pub(super) fn create(path: &str, size: u64) -> Result<Self> {
-        wire::create(path, size).map(Self::Create)
-    }
-
-    fn prepare(self, activity: [u8; 16], deadline: Instant) -> Result<Request<Body>> {
+impl UploadRequest<'_> {
+    fn prepare(self, activity: [u8; 16], deadline: Instant) -> Result<Request<Self>> {
         let mut headers = wire::headers(activity)?;
-        let (action, body) = match self {
-            Self::Create(create) => {
-                headers.push(create);
-                ("FileCreate", Body::empty())
+        let action = match &self {
+            Self::Create { path, size } => {
+                headers.push(wire::create(path, *size)?);
+                "FileCreate"
             }
             Self::Content { number, bytes } => {
-                headers.push(wire::sequence(number, bytes.len() as u64)?);
-                ("FileContent", Body::from_bytes(bytes)?)
+                headers.push(wire::sequence(*number, bytes.len() as u64)?);
+                "FileContent"
             }
-            Self::Commit => ("FileUploadCommit", Body::empty()),
-            Self::CommitAck => ("FileUploadCommitAck", Body::empty()),
-            Self::DeleteSession => ("FileUploadDeleteSession", Body::empty()),
+            Self::Commit => "FileUploadCommit",
+            Self::CommitAck => "FileUploadCommitAck",
+            Self::DeleteSession => "FileUploadDeleteSession",
         };
         headers.extend([
             header::actor(ActorId::new(26)?)?,
             header::action(action)?,
             wire::timeout(deadline)?,
         ]);
-        let mut request = Request::new(body);
+        let mut request = Request::new(self);
         for header in headers {
             request = request.append_header(header)?;
         }
@@ -55,8 +51,33 @@ impl UploadRequest {
     }
 }
 
+struct UploadEncoder<'a>(PhantomData<&'a str>);
+
+impl<'a> Encoder for UploadEncoder<'a> {
+    type Item = UploadRequest<'a>;
+
+    fn encode(
+        &mut self,
+        request: Self::Item,
+        dst: &mut EncodeBuf<'_>,
+    ) -> std::result::Result<(), CodecError> {
+        match request {
+            UploadRequest::Content { bytes, .. } => {
+                dst.append_body(Body::from_bytes(bytes).map_err(|error| match error {
+                    furpc::Error::ResourceLimit(_) => CodecError::resource_limit(error),
+                    _ => CodecError::invalid_payload(error),
+                })?)
+            }
+            UploadRequest::Create { .. }
+            | UploadRequest::Commit
+            | UploadRequest::CommitAck
+            | UploadRequest::DeleteSession => Ok(()),
+        }
+    }
+}
+
 pub(super) struct UploadClient {
-    peer: Peer,
+    requests: RpcClient<DeleteService>,
     sends: OneWayClient<PeerSendService>,
     state: Arc<UploadState>,
 }
@@ -64,8 +85,11 @@ pub(super) struct UploadClient {
 impl UploadClient {
     pub(super) fn new(peer: Peer, state: Arc<UploadState>) -> Self {
         Self {
-            sends: OneWayClient::new(PeerSendService::new(peer.clone())),
-            peer,
+            requests: RpcClient::new(DeleteService {
+                transport: PeerRequestService::new(peer.clone()),
+                state: state.clone(),
+            }),
+            sends: OneWayClient::new(PeerSendService::new(peer)),
             state,
         }
     }
@@ -87,14 +111,14 @@ impl UploadClient {
         for header in headers {
             request = request.append_header(header)?;
         }
-        let received = Arc::new(OnceLock::new());
-        let mut client = RpcClient::new(DeleteService {
-            transport: PeerRequestService::new(self.peer.clone()),
-            state: self.state.clone(),
-            received: received.clone(),
-        });
-        let response = client
-            .call(request, DeleteCodec(received), deadline)
+        let response = self
+            .requests
+            .call(
+                request,
+                FubstEncoder::<wire::Delete<'_>>::default(),
+                decode_delete,
+                deadline,
+            )
             .await
             .map_err(ImageStoreError::from)?;
         Ok(response.into_body())
@@ -102,27 +126,51 @@ impl UploadClient {
 
     pub(super) async fn send(
         &mut self,
-        request: UploadRequest,
+        request: UploadRequest<'_>,
         activity: [u8; 16],
+        deadline: Instant,
+    ) -> Result<()> {
+        let request = self.prepare(request, activity, deadline)?;
+        self.send_request(request, deadline).await
+    }
+
+    pub(super) fn prepare<'a>(
+        &self,
+        request: UploadRequest<'a>,
+        activity: [u8; 16],
+        deadline: Instant,
+    ) -> Result<Request<UploadRequest<'a>>> {
+        self.state.check()?;
+        request.prepare(activity, deadline)
+    }
+
+    pub(super) async fn send_request(
+        &mut self,
+        request: Request<UploadRequest<'_>>,
         deadline: Instant,
     ) -> Result<()> {
         self.state.check()?;
         self.sends
-            .send(
-                request.prepare(activity, deadline)?,
-                PreparedBodyCodec,
-                deadline,
-            )
+            .send(request, UploadEncoder(PhantomData), deadline)
             .await
             .map(|_| ())
             .map_err(ImageStoreError::from)
     }
 }
 
+fn decode_delete(src: &mut DecodeBuf<'_>) -> std::result::Result<Option<[u8; 16]>, CodecError> {
+    wire::decode_delete(src.headers(), src).map_err(codec_error)
+}
+
+pub(super) fn decode_ack(
+    src: &mut DecodeBuf<'_>,
+) -> std::result::Result<wire::FileTransferReply, CodecError> {
+    wire::decode_reply(src.headers(), src).map_err(codec_error)
+}
+
 struct DeleteService {
     transport: PeerRequestService,
     state: Arc<UploadState>,
-    received: Arc<OnceLock<Headers>>,
 }
 
 impl Service<Request<Body>> for DeleteService {
@@ -140,102 +188,15 @@ impl Service<Request<Body>> for DeleteService {
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         let future = self.transport.call(request);
         let state = self.state.clone();
-        let received = self.received.clone();
         Box::pin(async move {
             let response = future.await?;
             state.check()?;
-            received
-                .set(response.headers().clone())
-                .map_err(|_| furpc::Error::Internal("Delete reply already admitted"))?;
             Ok(response)
         })
     }
 }
 
-pub(super) struct PreparedEncoder;
-struct PreparedBodyCodec;
-
-impl Encoder for PreparedEncoder {
-    type Item = Body;
-
-    fn encode(
-        &mut self,
-        body: Body,
-        dst: &mut EncodeBuf<'_>,
-    ) -> std::result::Result<(), CodecError> {
-        dst.append_body(body)
-    }
-}
-
-impl Codec for PreparedBodyCodec {
-    type Encode = Body;
-    type Decode = ();
-    type Encoder = PreparedEncoder;
-    type Decoder = <FubstCodec<(), ()> as Codec>::Decoder;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        PreparedEncoder
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        FubstCodec::<(), ()>::default().decoder()
-    }
-}
-
-struct DeleteCodec(Arc<OnceLock<Headers>>);
-
-impl Codec for DeleteCodec {
-    type Encode = Body;
-    type Decode = Option<[u8; 16]>;
-    type Encoder = PreparedEncoder;
-    type Decoder = Self;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        PreparedEncoder
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        Self(self.0.clone())
-    }
-}
-
-impl Decoder for DeleteCodec {
-    type Item = Option<[u8; 16]>;
-
-    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> std::result::Result<Self::Item, CodecError> {
-        let headers = self.0.get().ok_or_else(|| {
-            CodecError::invalid_payload(furpc::Error::Internal("unadmitted Delete reply"))
-        })?;
-        wire::decode_delete(headers, src).map_err(codec_error)
-    }
-}
-
-pub(super) struct AckCodec(pub(super) Headers);
-
-impl Codec for AckCodec {
-    type Encode = Body;
-    type Decode = wire::FileTransferReply;
-    type Encoder = PreparedEncoder;
-    type Decoder = Self;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        PreparedEncoder
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        Self(self.0.clone())
-    }
-}
-
-impl Decoder for AckCodec {
-    type Item = wire::FileTransferReply;
-
-    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> std::result::Result<Self::Item, CodecError> {
-        wire::decode_reply(&self.0, src).map_err(codec_error)
-    }
-}
-
-fn codec_error(error: ImageStoreError) -> CodecError {
+pub(super) fn codec_error(error: ImageStoreError) -> CodecError {
     match &error {
         ImageStoreError::Common(
             FurpcClientError::Decode(fubst::Error::ResourceLimit(_))
@@ -249,6 +210,7 @@ fn codec_error(error: ImageStoreError) -> CodecError {
 mod tests {
     use super::*;
     use fubst::serde::to_vec;
+    use furpc::{DecodeBuf, Headers};
     use serde::Serialize;
     use std::time::Duration;
 
@@ -258,6 +220,36 @@ mod tests {
             source: error,
         }
         .into()
+    }
+
+    #[test]
+    fn typed_delete_encoding_preserves_native_bytes_and_local_error_classification() {
+        #[derive(Serialize)]
+        struct Expected<'a> {
+            path: &'a str,
+        }
+        let path = "Package/nested";
+        let expected = to_vec(&Expected { path }).unwrap();
+        let (_, payload) = wire::delete(path, [3; 16]).unwrap();
+        let body = furpc::codec::encode(
+            &mut FubstEncoder::<wire::Delete<'_>>::default(),
+            payload,
+            expected.len(),
+        )
+        .unwrap();
+        assert_eq!(body.segments().next().unwrap(), expected);
+        let (_, payload) = wire::delete(path, [3; 16]).unwrap();
+        let source =
+            furpc::codec::encode(&mut FubstEncoder::<wire::Delete<'_>>::default(), payload, 1)
+                .unwrap_err();
+        let error = ImageStoreError::from(furpc::Error::Codec {
+            phase: "encode",
+            source,
+        });
+        assert!(matches!(
+            error,
+            ImageStoreError::Common(FurpcClientError::Decode(fubst::Error::ResourceLimit(_)))
+        ));
     }
 
     #[test]
@@ -285,15 +277,14 @@ mod tests {
             (sequence.number, sequence.last, sequence.buffer_size),
             (7, false, 1024)
         );
-        let body =
-            furpc::codec::encode(&mut PreparedBodyCodec.encoder(), request.into_body(), 1024)
-                .unwrap();
+        let body = furpc::codec::encode(&mut UploadEncoder(PhantomData), request.into_body(), 1024)
+            .unwrap();
         assert_eq!(body.len(), 1024);
         assert_eq!(body.segments().next().unwrap().as_ptr(), storage);
     }
 
     #[test]
-    fn typed_delete_and_ack_codecs_preserve_fragmented_native_failures_and_error_classes() {
+    fn delete_and_ack_profiles_preserve_fragmented_native_failures_and_error_classes() {
         #[derive(Serialize)]
         struct Failure<'a> {
             code: i64,
@@ -318,8 +309,7 @@ mod tests {
                 headers
                     .append(header::action("ClientOperationFailure").unwrap())
                     .unwrap();
-                let received = Arc::new(OnceLock::from(headers));
-                let deleted = furpc::codec::decode(&mut DeleteCodec(received), &body, body.len())
+                let deleted = decode_delete(&mut DecodeBuf::with_headers(&body, &headers))
                     .map_err(decode_error);
                 match code {
                     wire::FILE_NOT_FOUND => assert_eq!(deleted.unwrap(), None),
@@ -345,8 +335,7 @@ mod tests {
                     .append(header::action("ClientOperationFailure").unwrap())
                     .unwrap();
                 let acknowledged =
-                    furpc::codec::decode(&mut AckCodec(headers.clone()), &body, body.len())
-                        .map_err(decode_error);
+                    decode_ack(&mut DecodeBuf::with_headers(&body, &headers)).map_err(decode_error);
                 if code == 0 {
                     assert!(matches!(
                         acknowledged,
@@ -363,11 +352,24 @@ mod tests {
                 }
                 let malformed = Body::from_bytes(vec![0xff]).unwrap();
                 assert!(matches!(
-                    furpc::codec::decode(&mut AckCodec(headers), &malformed, 1)
+                    decode_ack(&mut DecodeBuf::with_headers(&malformed, &headers))
                         .map_err(decode_error),
                     Err(ImageStoreError::Common(FurpcClientError::Decode(_)))
                 ));
             }
         }
+    }
+
+    #[test]
+    fn header_dependent_decoder_rejects_empty_standalone_headers() {
+        let error = furpc::codec::decode(&mut decode_ack, &Body::empty(), 0)
+            .map_err(decode_error)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ImageStoreError::Common(FurpcClientError::Protocol(
+                "invalid native file-transfer envelope"
+            ))
+        ));
     }
 }

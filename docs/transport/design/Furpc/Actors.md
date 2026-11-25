@@ -330,7 +330,7 @@ table or driver. It does not make Peer implement Service or introduce another
 built-in transport. RpcClient never infers native notification kind from edited
 flags or changes the ordinary Channel service's request semantics.
 
-Typed notification calls therefore use the existing per-call Codec and
+Typed notification calls therefore use per-call encoder/decoder values and
 ClientCodecLimits contract, encoding before byte-service/native admission and
 decoding outside the driver. They return ordinary RpcClient futures without an
 Attempt; callers needing native disposition use the byte notify operation.
@@ -354,7 +354,7 @@ admission. After integrity verification the service receives Request<Body> with
 the same private original-source, kind, route, policy and deadline context.
 
 The service returns IngressResponse::Reply as acknowledgment data.
-`server::Rpc::unary` adapts its typed Request<Q> -> Reply<R> inside that same
+`server::unary` adapts its typed Request<Q> -> Reply<R> inside that same
 invocation; it accepts either an originally authorized ordinary request or
 notification. The runner alone canonicalizes the acknowledgment's native
 flags/RelatesTo using the notification's original MessageId and generation.

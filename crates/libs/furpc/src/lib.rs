@@ -10,12 +10,17 @@
 //! [`Endpoint::listen_address`] and [`ServerBuilder::listen_address`] configure
 //! a consumer-owned local listener advertisement; their `instance` methods select
 //! its native instance. These settings neither bind I/O nor reset live connections.
-//! [`RpcClient`] adapts that byte service with a consumed application [`Codec`]
-//! per call. [`OneWayClient`] uses only encoding and returns a local-write receipt.
+//! [`RpcClient`] consumes an [`Encoder`] and [`Decoder`] per call.
+//! [`OneWayClient`] consumes only an encoder and returns a local-write receipt.
 //! [`PeerRequestService`] and [`PeerSendService`] adapt one original nonowning Peer,
 //! without reconnection. Public [`codec::encode`] and [`codec::decode`] transform
 //! whole bodies without native submission or invocation authority.
-//! [`server::Rpc`] adapts typed handlers inside byte-facing services.
+//! [`EncodeBuf::headers`] and [`DecodeBuf::headers`] always supply immutable
+//! metadata, using empty headers for standalone body operations.
+//! One-way adapters use only their needed direction.
+//! [`FubstEncoder`] and [`FubstDecoder`] can be constructed
+//! independently without changing native serialization.
+//! [`server::unary`] and [`server::one_way`] adapt typed handlers inside byte services.
 //! [`Router`] optionally selects exact native Actor/Action services; raw ingress
 //! remains independent. TLS is not implemented.
 //!
@@ -35,10 +40,10 @@
 //! # }
 //! ```
 //!
-//! Typed clients select a body codec for each call:
+//! Typed clients supply actual direction states for each call:
 //!
 //! ```no_run
-//! use furpc::{Endpoint, FubstCodec, Request, RpcClient};
+//! use furpc::{Endpoint, FubstEncoder, FubstDecoder, Request, RpcClient};
 //! use serde::{Deserialize, Serialize};
 //! use tokio::time::{Duration, Instant};
 //!
@@ -50,7 +55,7 @@
 //! let mut rpc = RpcClient::new(channel);
 //! let response = rpc.call(
 //!     Request::new(Echo { text: "hello".into() }),
-//!     FubstCodec::<Echo, Echo>::default(),
+//!     FubstEncoder::<Echo>::default(), FubstDecoder::<Echo>::default(),
 //!     Instant::now() + Duration::from_secs(5),
 //! ).await?;
 //! assert_eq!(response.body().text, "hello");
@@ -96,7 +101,7 @@ mod transport;
 mod wire;
 
 pub use client::{ClientCodecLimits, OneWayClient, RpcClient};
-pub use codec::{Codec, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder, FubstCodec};
+pub use codec::{CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder, FubstDecoder, FubstEncoder};
 pub use error::{BoxError, Error, ErrorSource, Result};
 pub use header::{ActorId, CommonHeaders, HeaderId, HeaderRecord, HeaderRef, Headers};
 pub use message::{Body, Message, MessageBuilder};

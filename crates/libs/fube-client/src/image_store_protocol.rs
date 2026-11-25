@@ -1,7 +1,7 @@
-use fubst::serde::{from_slice, to_vec, Derived, Guid, Inline};
+use fubst::serde::{from_slice, Derived, Guid, Inline};
 use furpc::{
-    header, ActorId, Body, Codec, DecodeBuf, Decoder, FubstCodec, HeaderId, HeaderRecord, Headers,
-    Message, MessageId,
+    header, ActorId, DecodeBuf, Decoder, FubstDecoder, HeaderId, HeaderRecord, Headers, Message,
+    MessageId,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::time::Instant;
@@ -78,8 +78,7 @@ fn read_header<T: DeserializeOwned>(headers: &Headers, id: u16) -> Result<T> {
 }
 
 fn failure(src: &mut DecodeBuf<'_>) -> Result<DomainFailure> {
-    let failure = FubstCodec::<(), Failure>::default()
-        .decoder()
+    let failure = FubstDecoder::<Failure>::default()
         .decode(src)
         .map_err(|source| {
             ImageStoreError::from(furpc::Error::Codec {
@@ -280,11 +279,11 @@ struct Route<'a> {
     derived: Derived<TypeScope<'a>>,
 }
 #[derive(Serialize)]
-struct Delete<'a> {
+pub(crate) struct Delete<'a> {
     path: &'a str,
 }
 
-pub(crate) fn delete(path: &str, activity: [u8; 16]) -> Result<(Vec<HeaderRecord>, Body)> {
+pub(crate) fn delete(path: &str, activity: [u8; 16]) -> Result<(Vec<HeaderRecord>, Delete<'_>)> {
     #[derive(Serialize)]
     struct Partition {
         id: Guid,
@@ -327,7 +326,7 @@ pub(crate) fn delete(path: &str, activity: [u8; 16]) -> Result<(Vec<HeaderRecord
             },
         )?,
     ]);
-    Ok((headers, Body::from_bytes(to_vec(&Delete { path })?)?))
+    Ok((headers, Delete { path }))
 }
 
 pub(crate) fn decode_delete(

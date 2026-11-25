@@ -1,6 +1,6 @@
 use super::*;
-use furpc::{server, Codec, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder, Reply};
-use std::{marker::PhantomData, rc::Rc};
+use furpc::{server, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder, Reply};
+use furpc::{FubstDecoder, FubstEncoder};
 
 #[derive(Default)]
 struct CodecCounts {
@@ -8,33 +8,9 @@ struct CodecCounts {
     decoded: AtomicUsize,
 }
 
-struct BytesCodec {
-    counts: Arc<CodecCounts>,
-    _not_sync: Cell<()>,
-}
-impl BytesCodec {
-    fn new(counts: &Arc<CodecCounts>) -> Self {
-        Self {
-            counts: counts.clone(),
-            _not_sync: Cell::new(()),
-        }
-    }
-}
 struct BytesEncoder(Arc<CodecCounts>, Cell<()>);
 struct BytesDecoder(Arc<CodecCounts>, Cell<()>);
-impl Codec for BytesCodec {
-    type Encode = Body;
-    type Decode = Body;
-    type Encoder = BytesEncoder;
-    type Decoder = BytesDecoder;
 
-    fn encoder(&mut self) -> Self::Encoder {
-        BytesEncoder(self.counts.clone(), Cell::new(()))
-    }
-    fn decoder(&mut self) -> Self::Decoder {
-        BytesDecoder(self.counts.clone(), Cell::new(()))
-    }
-}
 impl Encoder for BytesEncoder {
     type Item = Body;
 
@@ -54,30 +30,8 @@ impl Decoder for BytesDecoder {
     }
 }
 
-struct DecodeOnly(Arc<CodecCounts>, Cell<()>);
-struct UnusedEncoder {
-    _not_send: PhantomData<Rc<()>>,
-}
-impl Encoder for UnusedEncoder {
-    type Item = Rc<()>;
-
-    fn encode(&mut self, _: Rc<()>, _: &mut EncodeBuf<'_>) -> Result<(), CodecError> {
-        panic!("one-way adaptation must not encode")
-    }
-}
-impl Codec for DecodeOnly {
-    type Encode = Rc<()>;
-    type Decode = Body;
-    type Encoder = UnusedEncoder;
-    type Decoder = BytesDecoder;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        panic!("one-way adaptation must not construct an encoder")
-    }
-    fn decoder(&mut self) -> Self::Decoder {
-        self.1.set(());
-        BytesDecoder(self.0.clone(), Cell::new(()))
-    }
+fn decode_only(counts: &Arc<CodecCounts>) -> BytesDecoder {
+    BytesDecoder(counts.clone(), Cell::new(()))
 }
 
 struct Prepared<F> {
@@ -201,6 +155,153 @@ struct EchoReply {
 }
 
 #[tokio::test]
+async fn header_aware_methods_keep_original_context_and_runner_owned_completion() {
+    struct ReplyEncoder;
+    impl Encoder for ReplyEncoder {
+        type Item = String;
+
+        fn encode(&mut self, value: String, dst: &mut EncodeBuf<'_>) -> Result<(), CodecError> {
+            assert_eq!(action(dst.headers()), "ReplyText");
+            FubstEncoder::<String>::default().encode(value, dst)
+        }
+    }
+
+    for requests in [false, true] {
+        let options = if requests {
+            IngressOptions::requests(RequestPolicy::new(allow, allow), IngressLimits::default())
+        } else {
+            IngressOptions::one_way(allow, IngressLimits::default())
+        };
+        let mut queued = QueuedIngress::start(options, HandlerLimits::default()).await;
+        let peer = queued.channel.peer(deadline()).await.unwrap();
+        let bytes = fubst::serde::to_vec("body").unwrap();
+        let mut operation = if requests {
+            let mut operation = Box::pin(peer.request(rpc_request(&bytes), deadline()));
+            assert!(operation.as_mut().now_or_never().is_none());
+            Some(operation)
+        } else {
+            peer.send(packet("one-way", &bytes), deadline())
+                .await
+                .unwrap();
+            None
+        };
+        let (mut request, completed) = bounded(queued.work.recv()).await.unwrap();
+        let source = request.context().unwrap().source().generation();
+        request.headers_mut().remove_all(header::ACTION).unwrap();
+        request
+            .headers_mut()
+            .append(header::action("Selected").unwrap())
+            .unwrap();
+        let decode = |src: &mut DecodeBuf<'_>| {
+            assert_eq!(action(src.headers()), "Selected");
+            FubstDecoder::<String>::default().decode(src)
+        };
+        let response = if requests {
+            server::unary(
+                Prepared::new(move |request: Request<String>| async move {
+                    assert_eq!(request.context().unwrap().source().generation(), source);
+                    assert_eq!(action(request.headers()), "Selected");
+                    Reply::new(request.into_body()).append_header(header::action("ReplyText")?)
+                }),
+                request,
+                decode,
+                ReplyEncoder,
+            )
+            .await
+            .unwrap()
+        } else {
+            let result = server::one_way(
+                Prepared::new(move |request: Request<String>| async move {
+                    assert_eq!(request.context().unwrap().source().generation(), source);
+                    assert_eq!(request.body(), "body");
+                    Ok::<_, Error>(())
+                }),
+                request,
+                decode,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, IngressResponse::NoReply));
+            result
+        };
+        completed.send(Ok(response)).unwrap();
+        if let Some(operation) = operation.take() {
+            let response = operation.await.unwrap();
+            assert_eq!(
+                fubst::serde::from_slice::<String>(response.body().segments().next().unwrap())
+                    .unwrap(),
+                "body"
+            );
+            assert_eq!(
+                response.source().unwrap().generation(),
+                peer.info().generation
+            );
+        }
+        queued.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn header_aware_decoding_cannot_run_without_original_live_invocation_authority() {
+    let reject = |_: &mut DecodeBuf<'_>| -> Result<String, CodecError> {
+        panic!("fabricated request decoded")
+    };
+    let error = server::unary(
+        Function(|_: Request<String>| async { Ok::<_, Error>(Reply::new(String::new())) }),
+        Request::new(Body::empty()),
+        reject,
+        FubstEncoder::<String>::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput(_)));
+
+    for requests in [false, true] {
+        let options = if requests {
+            IngressOptions::requests(RequestPolicy::new(allow, allow), IngressLimits::default())
+        } else {
+            IngressOptions::one_way(allow, IngressLimits::default())
+        };
+        let mut queued = QueuedIngress::start(options, HandlerLimits::default()).await;
+        let peer = queued.channel.peer(deadline()).await.unwrap();
+        let mut operation = if requests {
+            let mut operation = Box::pin(peer.request(rpc_request(b""), deadline()));
+            assert!(operation.as_mut().now_or_never().is_none());
+            Some(operation)
+        } else {
+            peer.send(packet("stale", b""), deadline()).await.unwrap();
+            None
+        };
+        let (request, completed) = bounded(queued.work.recv()).await.unwrap();
+        completed.send(Err(Error::Cancelled)).unwrap();
+        operation.take();
+        queued.finish().await;
+        let decode = |_: &mut DecodeBuf<'_>| -> Result<String, CodecError> {
+            panic!("retired invocation decoded")
+        };
+        let error = if requests {
+            server::unary(
+                Function(|_: Request<String>| async { Ok::<_, Error>(Reply::new(String::new())) }),
+                request,
+                decode,
+                FubstEncoder::<String>::default(),
+            )
+            .await
+            .unwrap_err()
+        } else {
+            server::one_way(
+                Function(|_: Request<String>| async { Ok::<_, Error>(()) }),
+                request,
+                decode,
+            )
+            .await
+            .unwrap_err()
+        };
+        assert_eq!(error, Error::Closed);
+    }
+}
+
+#[tokio::test]
 async fn typed_codecs_round_trip_without_a_router_and_preserve_original_reply_affinity() {
     fn response_policy(headers: &Headers, _: &Source) -> furpc::Result<()> {
         if action(headers) == "TypedReply" {
@@ -230,42 +331,44 @@ async fn typed_codecs_round_trip_without_a_router_and_preserve_original_reply_af
                         },
                     )?)?;
                     if native {
-                        server::Rpc::new(FubstCodec::<EchoReply, Echo>::default())
-                            .unary(
-                                Prepared::new(move |request: Request<Echo>| async move {
-                                    assert_eq!(
-                                        request.context().unwrap().source().generation(),
-                                        source
-                                    );
-                                    assert_eq!(
-                                        request.context().unwrap().deadline(),
-                                        original_deadline
-                                    );
-                                    assert!(request.context().unwrap().peer().is_none());
-                                    assert!(!request.headers().effective().expects_reply);
-                                    Reply::new(EchoReply {
-                                        text: request.into_body().text,
-                                        count: 1,
-                                    })
-                                    .append_header(header::action("TypedReply")?)
-                                }),
-                                request,
-                            )
-                            .await
+                        server::unary(
+                            Prepared::new(move |request: Request<Echo>| async move {
+                                assert_eq!(
+                                    request.context().unwrap().source().generation(),
+                                    source
+                                );
+                                assert_eq!(
+                                    request.context().unwrap().deadline(),
+                                    original_deadline
+                                );
+                                assert!(request.context().unwrap().peer().is_none());
+                                assert!(!request.headers().effective().expects_reply);
+                                Reply::new(EchoReply {
+                                    text: request.into_body().text,
+                                    count: 1,
+                                })
+                                .append_header(header::action("TypedReply")?)
+                            }),
+                            request,
+                            FubstDecoder::<Echo>::default(),
+                            FubstEncoder::<EchoReply>::default(),
+                        )
+                        .await
                     } else {
-                        server::Rpc::new(BytesCodec::new(&counts))
-                            .unary(
-                                Prepared::new(move |request: Request<Body>| async move {
-                                    assert_eq!(
-                                        request.context().unwrap().source().generation(),
-                                        source
-                                    );
-                                    Reply::new(request.into_body())
-                                        .append_header(header::action("TypedReply")?)
-                                }),
-                                request,
-                            )
-                            .await
+                        server::unary(
+                            Prepared::new(move |request: Request<Body>| async move {
+                                assert_eq!(
+                                    request.context().unwrap().source().generation(),
+                                    source
+                                );
+                                Reply::new(request.into_body())
+                                    .append_header(header::action("TypedReply")?)
+                            }),
+                            request,
+                            BytesDecoder(counts.clone(), Cell::new(())),
+                            BytesEncoder(counts.clone(), Cell::new(())),
+                        )
+                        .await
                     }
                 }
             }
@@ -304,7 +407,8 @@ async fn typed_codecs_round_trip_without_a_router_and_preserve_original_reply_af
             })
             .append_header(header::action("native").unwrap())
             .unwrap(),
-            FubstCodec::<Echo, EchoReply>::default(),
+            FubstEncoder::<Echo>::default(),
+            FubstDecoder::<EchoReply>::default(),
             deadline(),
         )
         .await
@@ -316,7 +420,12 @@ async fn typed_codecs_round_trip_without_a_router_and_preserve_original_reply_af
     assert_ne!(response.headers().effective().relates_to.guid, [9; 16]);
     let body = Body::from_bytes(b"custom bytes".to_vec()).unwrap();
     let response = rpc
-        .call(Request::new(body), BytesCodec::new(&counts), deadline())
+        .call(
+            Request::new(body),
+            BytesEncoder(counts.clone(), Cell::new(())),
+            BytesDecoder(counts.clone(), Cell::new(())),
+            deadline(),
+        )
         .await
         .unwrap();
     assert_eq!(response.body().segments().next().unwrap(), b"custom bytes");
@@ -331,13 +440,14 @@ async fn typed_codecs_round_trip_without_a_router_and_preserve_original_reply_af
 #[tokio::test]
 async fn typed_methods_reject_missing_wrong_kind_and_stale_context_before_decode() {
     let counts = Arc::new(CodecCounts::default());
-    let error = server::Rpc::new(BytesCodec::new(&counts))
-        .unary(
-            Function(|_: Request<Body>| async { Ok::<_, Error>(Reply::new(Body::empty())) }),
-            Request::new(Body::empty()),
-        )
-        .await
-        .unwrap_err();
+    let error = server::unary(
+        Function(|_: Request<Body>| async { Ok::<_, Error>(Reply::new(Body::empty())) }),
+        Request::new(Body::empty()),
+        BytesDecoder(counts.clone(), Cell::new(())),
+        BytesEncoder(counts.clone(), Cell::new(())),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(error, Error::InvalidInput(_)));
     for requests in [false, true] {
         let options = if requests {
@@ -375,23 +485,22 @@ async fn typed_methods_reject_missing_wrong_kind_and_stale_context_before_decode
                 .unwrap();
         }
         let error = if requests {
-            server::Rpc::new(DecodeOnly(counts.clone(), Cell::new(())))
-                .one_way(
-                    Function(|_: Request<Body>| async { Ok::<_, Error>(()) }),
-                    request,
-                )
-                .await
-                .unwrap_err()
+            server::one_way(
+                Function(|_: Request<Body>| async { Ok::<_, Error>(()) }),
+                request,
+                decode_only(&counts),
+            )
+            .await
+            .unwrap_err()
         } else {
-            server::Rpc::new(BytesCodec::new(&counts))
-                .unary(
-                    Function(|_: Request<Body>| async {
-                        Ok::<_, Error>(Reply::new(Body::empty()))
-                    }),
-                    request,
-                )
-                .await
-                .unwrap_err()
+            server::unary(
+                Function(|_: Request<Body>| async { Ok::<_, Error>(Reply::new(Body::empty())) }),
+                request,
+                BytesDecoder(counts.clone(), Cell::new(())),
+                BytesEncoder(counts.clone(), Cell::new(())),
+            )
+            .await
+            .unwrap_err()
         };
         assert!(matches!(error, Error::InvalidInput(_)));
         completed.send(Err(error)).unwrap();
@@ -409,23 +518,22 @@ async fn typed_methods_reject_missing_wrong_kind_and_stale_context_before_decode
         stale_operation.take();
         queued.finish().await;
         let error = if requests {
-            server::Rpc::new(BytesCodec::new(&counts))
-                .unary(
-                    Function(|_: Request<Body>| async {
-                        Ok::<_, Error>(Reply::new(Body::empty()))
-                    }),
-                    request,
-                )
-                .await
-                .unwrap_err()
+            server::unary(
+                Function(|_: Request<Body>| async { Ok::<_, Error>(Reply::new(Body::empty())) }),
+                request,
+                BytesDecoder(counts.clone(), Cell::new(())),
+                BytesEncoder(counts.clone(), Cell::new(())),
+            )
+            .await
+            .unwrap_err()
         } else {
-            server::Rpc::new(DecodeOnly(counts.clone(), Cell::new(())))
-                .one_way(
-                    Function(|_: Request<Body>| async { Ok::<_, Error>(()) }),
-                    request,
-                )
-                .await
-                .unwrap_err()
+            server::one_way(
+                Function(|_: Request<Body>| async { Ok::<_, Error>(()) }),
+                request,
+                decode_only(&counts),
+            )
+            .await
+            .unwrap_err()
         };
         assert_eq!(error, Error::Closed);
     }
@@ -436,7 +544,7 @@ async fn typed_methods_reject_missing_wrong_kind_and_stale_context_before_decode
 #[tokio::test]
 async fn typed_adaptation_uses_admitted_input_frame_and_output_limits_and_error_sources() {
     let counts = Arc::new(CodecCounts::default());
-    let mut rpc = server::Rpc::new(BytesCodec::new(&counts));
+
     let mut queued = QueuedIngress::start(
         IngressOptions::requests(
             RequestPolicy::new(allow, allow),
@@ -462,22 +570,30 @@ async fn typed_adaptation_uses_admitted_input_frame_and_output_limits_and_error_
                 .unwrap();
         }
         let error = if case == 4 {
-            server::Rpc::new(FubstCodec::<EchoReply, Echo>::default())
-                .unary(
-                    Function(|_: Request<Echo>| async {
-                        Ok::<_, Error>(Reply::new(EchoReply {
-                            text: String::new(),
-                            count: 0,
-                        }))
-                    }),
-                    request,
-                )
-                .await
-                .unwrap_err()
+            server::unary(
+                Function(|_: Request<Echo>| async {
+                    Ok::<_, Error>(Reply::new(EchoReply {
+                        text: String::new(),
+                        count: 0,
+                    }))
+                }),
+                request,
+                FubstDecoder::<Echo>::default(),
+                FubstEncoder::<EchoReply>::default(),
+            )
+            .await
+            .unwrap_err()
         } else if case == 5 {
-            rpc.unary(FailingReadiness, request).await.unwrap_err()
+            server::unary(
+                FailingReadiness,
+                request,
+                BytesDecoder(counts.clone(), Cell::new(())),
+                BytesEncoder(counts.clone(), Cell::new(())),
+            )
+            .await
+            .unwrap_err()
         } else {
-            rpc.unary(
+            server::unary(
                 Function(move |_: Request<Body>| async move {
                     if case == 3 {
                         return Err(std::io::Error::other("typed handler detail"));
@@ -485,6 +601,8 @@ async fn typed_adaptation_uses_admitted_input_frame_and_output_limits_and_error_
                     Ok(Reply::new(Body::from_bytes(vec![0; 3]).unwrap()))
                 }),
                 request,
+                BytesDecoder(counts.clone(), Cell::new(())),
+                BytesEncoder(counts.clone(), Cell::new(())),
             )
             .await
             .unwrap_err()
@@ -583,9 +701,7 @@ async fn typed_readiness_has_no_implicit_waiter_cap_and_preserves_cancellation()
             let (request, complete) = bounded(queued.work.recv()).await.unwrap();
             let counts = counts.clone();
             let mut call = Box::pin(async move {
-                server::Rpc::new(DecodeOnly(counts, Cell::new(())))
-                    .one_way(PendingTyped, request)
-                    .await
+                server::one_way(PendingTyped, request, decode_only(&counts)).await
             });
             assert!(call.as_mut().now_or_never().is_none());
             pending.push((call, complete));
@@ -597,10 +713,11 @@ async fn typed_readiness_has_no_implicit_waiter_cap_and_preserves_cancellation()
         }
         peer.send(packet("ready", b""), deadline()).await.unwrap();
         let (request, completed) = bounded(queued.work.recv()).await.unwrap();
-        let mut rpc = server::Rpc::new(DecodeOnly(counts.clone(), Cell::new(())));
-        let result = send(rpc.one_way(
+
+        let result = send(server::one_way(
             Function(|_: Request<Body>| async { Ok::<_, Error>(()) }),
             request,
+            BytesDecoder(counts.clone(), Cell::new(())),
         ))
         .await
         .unwrap();
@@ -645,8 +762,8 @@ async fn queued_typed_work_observes_original_deadlines_and_runner_cancellation()
             .unwrap();
         let (mut request, completed) = bounded(queued.work.recv()).await.unwrap();
         request.set_deadline(Instant::now() + Duration::from_secs(3600));
-        let mut rpc = server::Rpc::new(DecodeOnly(counts.clone(), Cell::new(())));
-        let mut method = Box::pin(rpc.one_way(
+
+        let mut method = Box::pin(server::one_way(
             Function({
                 let dropped = dropped.clone();
                 move |_: Request<Body>| {
@@ -658,6 +775,7 @@ async fn queued_typed_work_observes_original_deadlines_and_runner_cancellation()
                 }
             }),
             request,
+            BytesDecoder(counts.clone(), Cell::new(())),
         ));
         assert!(method.as_mut().now_or_never().is_none());
         if !expire {
@@ -684,7 +802,8 @@ async fn typed_reply_finishes_during_graceful_drain_without_a_general_peer() {
         Request::new(Echo {
             text: "drain".into(),
         }),
-        FubstCodec::<Echo, Echo>::default(),
+        FubstEncoder::<Echo>::default(),
+        FubstDecoder::<Echo>::default(),
         deadline(),
     ));
     assert!(call.as_mut().now_or_never().is_none());
@@ -693,15 +812,16 @@ async fn typed_reply_finishes_during_graceful_drain_without_a_general_peer() {
     queued.stop.send(()).unwrap();
     bounded(queued.shutting_down.notified()).await;
     assert!(!queued.serving.is_finished());
-    let result = server::Rpc::new(FubstCodec::<Echo, Echo>::default())
-        .unary(
-            Prepared::new(|request: Request<Echo>| async move {
-                Ok::<_, Error>(Reply::new(request.into_body()))
-            }),
-            request,
-        )
-        .await
-        .unwrap();
+    let result = server::unary(
+        Prepared::new(|request: Request<Echo>| async move {
+            Ok::<_, Error>(Reply::new(request.into_body()))
+        }),
+        request,
+        FubstDecoder::<Echo>::default(),
+        FubstEncoder::<Echo>::default(),
+    )
+    .await
+    .unwrap();
     completed.send(Ok(result)).unwrap();
     assert_eq!(bounded(call).await.unwrap().body().text, "drain");
     bounded(queued.serving).await.unwrap().unwrap();

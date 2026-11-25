@@ -6,9 +6,8 @@ use fube_ra::protocol::{
     RS_ACTOR,
 };
 use furpc::{
-    header, Body, ClientCodecLimits, Codec, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder,
-    Error, FubstCodec, HeaderId, HeaderRef, Headers, Message, PeerRequestService, Request,
-    Response, RpcClient,
+    header, Body, ClientCodecLimits, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder, Error,
+    HeaderId, HeaderRef, Headers, Message, PeerRequestService, Request, Response, RpcClient,
 };
 use serde::de::DeserializeOwned;
 use std::{
@@ -155,45 +154,11 @@ impl Service<Request<Body>> for BootstrapService {
     }
 }
 
-struct BootstrapCodec<R> {
+struct BootstrapDecoder<R> {
     admitted: Arc<OnceLock<ValidatedReply>>,
     marker: PhantomData<fn() -> R>,
 }
 pub(super) struct PreparedEncoder;
-pub(super) struct PreparedBodyCodec;
-
-impl Codec for PreparedBodyCodec {
-    type Encode = Body;
-    type Decode = ();
-    type Encoder = PreparedEncoder;
-    type Decoder = <FubstCodec<(), ()> as Codec>::Decoder;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        PreparedEncoder
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        FubstCodec::<(), ()>::default().decoder()
-    }
-}
-
-impl<R: DeserializeOwned> Codec for BootstrapCodec<R> {
-    type Encode = Body;
-    type Decode = (R, Option<GenerationHeader>);
-    type Encoder = PreparedEncoder;
-    type Decoder = Self;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        PreparedEncoder
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        Self {
-            admitted: self.admitted.clone(),
-            marker: PhantomData,
-        }
-    }
-}
 
 impl Encoder for PreparedEncoder {
     type Item = Body;
@@ -207,7 +172,7 @@ impl Encoder for PreparedEncoder {
     }
 }
 
-impl<R: DeserializeOwned> Decoder for BootstrapCodec<R> {
+impl<R: DeserializeOwned> Decoder for BootstrapDecoder<R> {
     type Item = (R, Option<GenerationHeader>);
 
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> std::result::Result<Self::Item, CodecError> {
@@ -307,11 +272,14 @@ impl Link {
             max_response_body_bytes: LIMIT,
         })
         .map_err(err)?;
-        let codec = BootstrapCodec::<R> {
+        let decoder = BootstrapDecoder::<R> {
             admitted,
             marker: PhantomData,
         };
-        match client.call(request, codec, deadline()).await {
+        match client
+            .call(request, PreparedEncoder, decoder, deadline())
+            .await
+        {
             Ok(response) => Ok(Some(response.into_body())),
             Err(Error::Timeout(_)) => Ok(None),
             Err(error) => Err(err(error)),
@@ -341,11 +309,11 @@ mod tests {
                         generation: None
                     })
                     .is_ok());
-                let mut codec = BootstrapCodec::<String> {
+                let mut decoder = BootstrapDecoder::<String> {
                     admitted,
                     marker: PhantomData,
                 };
-                let result = furpc::codec::decode(&mut codec, &body, LIMIT);
+                let result = furpc::codec::decode(&mut decoder, &body, LIMIT);
                 if budget == 1 {
                     assert!(matches!(result, Err(CodecError::ResourceLimit { .. })));
                 } else {

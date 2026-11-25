@@ -60,21 +60,34 @@ fn fubst_preserves_native_bytes_and_decodes_fragmented_bodies_exactly() {
         count: 1000,
     };
     let expected = fubst::serde::to_vec(&value).unwrap();
-    let mut codec = FubstCodec::<Payload, Payload>::default();
-    let body = encode(&mut codec.encoder(), value, expected.len()).unwrap();
+    let body = encode(
+        &mut FubstEncoder::<Payload>::default(),
+        value,
+        expected.len(),
+    )
+    .unwrap();
     assert_eq!(body.segments().next().unwrap(), expected);
     let fragmented = Body::from_segments(vec![
         body.slice(0..3).unwrap(),
         body.slice(3..body.len()).unwrap(),
     ])
     .unwrap();
-    let result = decode(&mut codec.decoder(), &fragmented, fragmented.len()).unwrap();
+    let result = decode(
+        &mut FubstDecoder::<Payload>::default(),
+        &fragmented,
+        fragmented.len(),
+    )
+    .unwrap();
     assert_eq!(result.text, "native \u{1f980}");
     assert_eq!(result.count, 1000);
     let trailing =
         Body::from_segments(vec![fragmented, Body::from_bytes(vec![0x42]).unwrap()]).unwrap();
     assert!(matches!(
-        decode(&mut codec.decoder(), &trailing, trailing.len()),
+        decode(
+            &mut FubstDecoder::<Payload>::default(),
+            &trailing,
+            trailing.len()
+        ),
         Err(CodecError::InvalidPayload { .. })
     ));
 }
@@ -82,12 +95,15 @@ fn fubst_preserves_native_bytes_and_decodes_fragmented_bodies_exactly() {
 #[test]
 fn fubst_respects_explicit_byte_and_depth_limits_without_changing_error_category() {
     let body = Body::from_bytes(fubst::serde::to_vec("hello").unwrap()).unwrap();
-    let mut codec = FubstCodec::<String, String>::default();
     assert!(matches!(
-        encode(&mut codec.encoder(), "hello".into(), body.len() - 1),
+        encode(
+            &mut FubstEncoder::<String>::default(),
+            "hello".into(),
+            body.len() - 1
+        ),
         Err(CodecError::ResourceLimit { .. })
     ));
-    let mut codec = FubstCodec::<String, String>::with_limits(fubst::Limits {
+    let mut decoder = FubstDecoder::<String>::with_limits(fubst::Limits {
         max_bytes: body.len() - 1,
         ..Default::default()
     });
@@ -100,17 +116,17 @@ fn fubst_respects_explicit_byte_and_depth_limits_without_changing_error_category
         .unwrap(),
     ] {
         assert!(matches!(
-            decode(&mut codec.decoder(), &body, body.len()),
+            decode(&mut decoder, &body, body.len()),
             Err(CodecError::ResourceLimit { .. })
         ));
     }
-    let mut codec = FubstCodec::<Payload, Payload>::with_limits(fubst::Limits {
+    let mut encoder = FubstEncoder::<Payload>::with_limits(fubst::Limits {
         max_depth: 0,
         ..Default::default()
     });
     assert!(matches!(
         encode(
-            &mut codec.encoder(),
+            &mut encoder,
             Payload {
                 text: String::new(),
                 count: 0

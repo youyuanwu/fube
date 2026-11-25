@@ -41,6 +41,21 @@ and usable unregister IPC after late one-way commands during orderly retirement.
 These focused checks establish API/composition behavior, not new native
 interoperability, deployed runtime support, TLS, or FM/Federation qualification.
 
+**Canonical typed composition:** call/send/unary/one_way now provide one
+adaptation path, not parallel `_with_*` entrypoints. The Codec trait and
+factory wrappers are removed: call takes encoder/decoder values, send only
+an encoder, unary decoder/encoder values, and one_way only a decoder. EncodeBuf and DecodeBuf always expose read-only current
+headers, with an empty set for standalone bodies. Decoding receives metadata
+after settlement/admission and body-bound checks; reply encoding sees the
+typed service's reply headers, not new reply authority.
+Fubst directions can be constructed independently; ImageStore passes its actual
+Delete DTO and upload command types to these adapters, not pre-serialized Body.
+Only its genuinely byte-oriented file-content encoder emits raw chunk bytes.
+The prepared/Delete/ACK codec wrappers and shared header-capture cell are gone.
+Its byte middleware still gates upload state. Other workspace callsites receive
+only the required factory/signature updates; their protocol/admission/retry
+behavior is unchanged. This is not native qualification or a fubst change.
+
 ## Current implementation
 
 The crate now includes native frames/ordered headers, shared segmented messages,
@@ -133,7 +148,7 @@ remaining legacy operations keep their own transport. Current proof gates use
 canonical furpc results and independent HTTP/source-derived expectations, not
 retained legacy implementations as comparison oracles.
 CreateName/DeleteName now use the same stub with `Request<NamingUri>` and
-`Response<()>`. The standard FubstCodec requires an empty success body after
+`Response<()>`. The native unit decoder requires an empty success body after
 NamingGateway/NameOperationReply validation, and deletion alone adds native
 explicit-delete header `0x8033`. Both preserve native failures, absolute deadlines,
 source/settlement metadata and no-replay/unknown-write-outcome semantics.
@@ -165,7 +180,7 @@ on N0040, with unchanged replica identities independently observed through
 native reads and HTTP. The mutation and subsequent cloned mixed reads retained
 generation 1. Actual list/topology/deployment/movement receipts passed the
 independent validators and owned cleanup completed; the onebox was left running.
-Resolution now uses its own native FubstCodec rather than the query envelope,
+Resolution now uses its own native encoder/decoder schemas rather than the query envelope,
 with checked `ResolutionRequest` selection and private previous-result metadata.
 Service/partition/version binding, signed/named keys and endpoint roles remain
 validated without a local endpoint cache, hidden description query or replay.
@@ -188,7 +203,7 @@ passed. Actual resolution/retry receipts and owned cleanup were independently
 validated; the default-Docker onebox was left running.
 ServiceNotificationClient now owns an independent furpc Channel and captures its
 original Peer. Startup installs an authorized notification IngressService before
-the native session exchange. Typed server::Rpc/FubstCodec handlers commit page
+the native session exchange. Typed server::unary handlers with native direction states commit page
 updates/version state atomically and return ACK data; furpc alone supplies native
 ACK correlation, flags, capacity and original-generation submission. Session and
 filter RPCs reuse the gateway adapter over a Peer-backed byte service, with no
@@ -211,11 +226,13 @@ Async construction installs authorized Actor 25/27 ordinary one-way ingress;
 semantic ACKs are not native notifications or ordinary RPC responses.
 Its private typed UploadClient uses OneWayClient/PeerSendService for
 FileCreate/content/commit/commit-ACK and failed-session cleanup, while the initial
-routed root Delete uses RpcClient/PeerRequestService. Prepared codecs adopt
-shared body storage without serializing file chunks or encoding Delete twice.
-Delete's reply codec receives original response headers after upload-state
+routed root Delete uses RpcClient/PeerRequestService. Its actual Delete DTO is
+serialized by FubstEncoder at the RPC boundary. One-way sends pass typed upload
+commands to their encoder; file-content bytes are emitted unchanged there,
+without an intermediate pre-encoded message body.
+Delete's normal decoder receives original response headers through DecodeBuf after upload-state
 admission and preserves FileNotFound, domain and decode error classifications.
-Authorized ACK ingress uses server::Rpc::one_way on the original Request to
+Authorized ACK ingress uses server::one_way with a decoder value on the original Request to
 decode and hand off FileTransferReply to the same bounded consumer queue.
 Original-generation checks precede decoding; failure or cancellation fences
 the upload owner. Typed handoff means enqueue, not stage success, while typed
@@ -250,7 +267,7 @@ or the rest of the gateway API. See the
 [client slice](../../RustFabricClient.md#separate-furpc-backed-client).
 
 The initiating fube-runtime IPC client also uses a dedicated Channel and original
-Peer, with the same typed RpcClient/FubstCodec and byte-service structure.
+Peer, with the same typed RpcClient encoder/decoder and byte-service structure.
 Its outbound HostingClient<T> retains RpcClient<IpcService<T>> and provides
 typed registration, unregister, lease-poll and health-report methods rather than
 caller-selected actors/actions or reply types. Independent calls clone the stub,
@@ -260,7 +277,7 @@ remain domain-owned.
 The local PeerService is retired in favor of furpc's original-Peer
 PeerRequestService. Outbound RapClient<T> retains
 OneWayClient<RapSendService<T>>; its typed proxy/service reply and load-report
-methods select native actions and use FubstCodec. RapSendService retains IPC
+methods select native actions and use native encoder values. RapSendService retains IPC
 identity stamping, authority checks, runtime admission and transport-error
 retirement above the native PeerSendService. Independent calls clone the typed
 stub without sharing mutable readiness across an await.
@@ -281,8 +298,8 @@ not a domain-visible actor/action/Vec envelope or an optional response slot.
 The original Request<Body> stays private until the serialized executor reaches
 the existing admission boundary. Host-control services accept Request<()> or
 Request<UpdateContext> and return Reply<ErrorReply>; the query service accepts
-Request<ProxyRequest> and returns Reply<QueryReply>. The stock server::Rpc adapter
-and FubstCodec now decode requests and encode replies on that executor.
+Request<ProxyRequest> and returns Reply<QueryReply>. The stock server::unary function
+and native encoder/decoder values now decode requests and encode replies on that executor.
 Response headers are fixed by the admitted route, and the original runner still
 owns correlation and writing. A retired RPC invocation cannot call its retained
 typed service. RPC execution completion means encoded response-data handoff,
@@ -292,7 +309,7 @@ scope still completes at bounded enqueue, preserving late-command shutdown and
 unregister behavior. After owned dispatch admission, public codec::decode uses
 the Fubst decoder and the retained route body limit before calling the typed
 domain service. Using
-server::Rpc::one_way at that later point would incorrectly borrow the already
+server::one_way at that later point would incorrectly borrow the already
 completed runner invocation. Route-selected RapAction values replace untyped
 action selection in the command handoff; native actions and schemas are unchanged.
 Runtime IPC uses shared native subsystem actor names from
@@ -377,7 +394,7 @@ owns cancellation and joins its connection/send tasks on its dedicated executor,
 releasing the accepted socket before publishing disconnected state. Registration
 retirement still permits bounded original-path unregister exchanges.
 Hosting registration and lease RPCs now retain the original Request<Body>
-through domain admission and use server::Rpc for typed reply encoding and
+through domain admission and use server::unary for typed reply encoding and
 original-runner handoff. A private schema-selected codec retains Hosting's
 DTO allocation budget: it borrows contiguous input, copies only fragmented
 input and checks domain admission under the core lock before decoding.
@@ -529,10 +546,10 @@ than creating a successful empty response. Application bodies are never decoded
 by this layer.
 
 Application-body adaptation is now available above the byte service through
-public Codec/Encoder/Decoder traits, fallible segmented EncodeBuf/DecodeBuf
-buffers, and FubstCodec. Custom codecs need no Serde, Clone or Sync bounds.
+public Encoder/Decoder traits, fallible segmented EncodeBuf/DecodeBuf
+buffers, and native FubstEncoder/FubstDecoder implementations. Custom codecs need no Serde, Clone or Sync bounds.
 Encoding can adopt shared body segments without copying; decoding must consume
-the whole body. FubstCodec uses the shared native Serde implementation, borrows
+the whole body. The native directions use the shared native Serde implementation, borrows
 contiguous input directly and copies fragmented input only when needed by that
 implementation. Its optional byte/depth settings are independent of native
 header/control/Fault decoding and add no default depth/work ceiling.
@@ -548,7 +565,7 @@ zero for empty bodies. Codec errors retain encode/decode phase, original source,
 and resource-limit classification without becoming connection-protocol failures.
 No decoded-allocation ledger or transport-budget handoff is introduced.
 
-Typed ingress methods now use `server::Rpc<C>::unary` or `one_way` inside the
+Typed ingress methods now use server::unary or decoder-only server::one_way inside the
 same byte-facing services. `Reply<T>` supplies response data and ordered headers;
 only the existing runner owns reply tickets, correlation and original-generation
 submission. Adapters validate live core-created context, original exchange kind,
@@ -867,7 +884,7 @@ composition, not new generic furpc APIs or native FM/Federation qualification.
 
 The matching bootstrap server adapters retain the original Request and invocation
 context inside each consuming response slot. After original-Link admission,
-server::Rpc decodes once, co-polls a typed handoff with the caller's borrowed
+server::unary decodes once, co-polls a typed handoff with the caller's borrowed
 domain handler, and encodes the prepared reply on that same invocation. No
 per-message task or second inbox is introduced. Domain handlers keep Node/cluster
 mutation and semantic gates; completion remains encoded response-data handoff,
@@ -939,7 +956,7 @@ add Tower-style limiting middleware. Node's eight-entry inbox still reports
 terminal overflow; it is no longer masked by eight generic handler permits.
 
 FM/peer/generation/deprecated Node intake now decodes through
-`server::Rpc::one_way` on each original live Request, after original-Link source
+`server::one_way` on each original live Request, after original-Link source
 and generation admission. The typed service hands data to the existing caller,
 not a new worker queue. Headers and DTOs are cached independently of the mutable
 Message view; capacity retries do not reconstruct a context or decode again.
@@ -955,7 +972,7 @@ not fresh native FM/Federation, TLS or deployment qualification.
 **Typed FM-side one-way intake:** the cluster FM manager now consumes a cached
 `FmReport` for all eighteen supported Node report/reply actions, including
 GenerationUpdateReject. FM-role one-way ingress retains the original Request
-until `server::Rpc::one_way` decodes it under the existing body/allocation budget
+until `server::one_way` decodes it under the existing body/allocation budget
 and hands off immutable headers and DTOs. Original-Link source/incarnation and
 generation checks still precede application decoding. The handoff records the
 original source generation, so a report cannot be admitted under another child
@@ -1139,7 +1156,7 @@ Deliver the initial clear-TCP implementation in this order:
    `TransportLimits`; no higher layer compensates for broken shared decoding.
    Add standalone message/header constructors with native width/schema checks;
    send/reply admission must still validate the actual scope policy.
-   Add the public body-codec contract and default `FubstCodec` with separate
+   Add the public body-codec contract and    native FubstEncoder/FubstDecoder implementations with separate
    body-specific operation budgets, not inherited native decode settings.
 3. Implement a clear physical connection for both initiating and accepted
    sockets, with staged admission, receipts, segmented output, drain, and abort.
@@ -1177,11 +1194,11 @@ Deliver the initial clear-TCP implementation in this order:
    and native admission at transport handoff. Peer notifications retain
    byte-facing native operations; typed notifications reuse RpcClient over an
    explicit notify byte-service adapter. Each typed call consumes its codec; domain convenience
-   methods supply `FubstCodec`. Preserve domain/capability boundaries.
+   methods supply native direction states. Preserve domain/capability boundaries.
    Keep application dispatcher selection independent of managed/raw-only
    correlation mode. Qualify actor-less replication in initiating and accepted
    roles without synthesizing ordinary Actor headers or installing Actor 0.
-6. Add the optional codec-free service router and separate `server::Rpc<C>`
+6. Add the optional codec-free service router and separate server::unary/one_way
    ordinary request/one-way and notification method adaptation inside byte-facing
    services. Qualify shared
    bounded readiness, handler lifetime/response completion, and graceful
@@ -1469,7 +1486,7 @@ Acceptance evidence has distinct levels:
   transports support concurrent calls through independent client clones;
   codec state must not be shared.
   Server method services must likewise support non-Clone/non-Sync codecs and
-  per-invocation typed services through `server::Rpc`; shared route-service
+  per-invocation typed services   through server::unary/one_way; shared route-service
   bounds cannot leak onto values created inside its future. Exercise unary and
   decoder-only one-way adaptation with both fubst and external formats.
   Unpolled calls must not execute codecs or acquire new transport admission.

@@ -8,8 +8,8 @@ use std::{
 };
 
 use furpc::{
-    header, ActorId, Body, BoxError, Channel, Codec, CodecError, EncodeBuf, Encoder, Endpoint,
-    FubstCodec, HeaderId, HeaderRecord, Request, Response, RpcClient,
+    header, ActorId, Body, BoxError, Channel, CodecError, EncodeBuf, Encoder, Endpoint,
+    FubstDecoder, FubstEncoder, HeaderId, HeaderRecord, Request, Response, RpcClient,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::time::Instant;
@@ -190,7 +190,8 @@ where
         let response = self
             .unary(
                 request,
-                FubstCodec::<(), protocol::PingReplyBody>::default(),
+                FubstEncoder::<()>::default(),
+                FubstDecoder::<protocol::PingReplyBody>::default(),
                 "PingRequest",
                 check_ping_reply,
                 deadline,
@@ -210,7 +211,8 @@ where
         let response = self
             .unary(
                 request,
-                FubstCodec::<NamingUri, protocol::NameExistsReplyBody>::default(),
+                FubstEncoder::<NamingUri>::default(),
+                FubstDecoder::<protocol::NameExistsReplyBody>::default(),
                 "NameExistsRequest",
                 check_name_reply,
                 deadline,
@@ -231,7 +233,8 @@ where
     ) -> Result<Response<()>> {
         self.unary(
             request,
-            FubstCodec::<NamingUri, ()>::default(),
+            FubstEncoder::<NamingUri>::default(),
+            FubstDecoder::<()>::default(),
             "CreateNameRequest",
             check_name_reply,
             deadline,
@@ -255,7 +258,8 @@ where
         )?)?;
         self.unary(
             request,
-            FubstCodec::<NamingUri, ()>::default(),
+            FubstEncoder::<NamingUri>::default(),
+            FubstDecoder::<()>::default(),
             "DeleteNameRequest",
             check_name_reply,
             deadline,
@@ -293,7 +297,8 @@ where
         let response = self
             .unary(
                 request,
-                ResolutionCodec::default(),
+                FubstEncoder::<ResolutionRequest>::default(),
+                FubstDecoder::<resolution_protocol::ResolveReply>::default(),
                 "ResolveServiceRequest",
                 check_resolution_reply,
                 deadline,
@@ -431,7 +436,8 @@ where
         let response = self
             .unary(
                 request,
-                QueryCodec::<Q>::new(),
+                QueryEncoder::<Q>::new(),
+                FubstDecoder::<QueryBody<Q>>::default(),
                 "QueryRequest",
                 check_query_reply::<Q>,
                 deadline,
@@ -443,20 +449,20 @@ where
         Ok(Response::from_parts(parts, output))
     }
 
-    pub(crate) async fn unary<C>(
+    pub(crate) async fn unary<E, D>(
         &mut self,
-        request: Request<C::Encode>,
-        codec: C,
+        request: Request<E::Item>,
+        encoder: E,
+        decoder: D,
         action: &'static str,
         validate_reply: fn(&Response<Body>) -> Result<()>,
         deadline: Instant,
-    ) -> Result<Response<C::Decode>>
+    ) -> Result<Response<D::Item>>
     where
-        C: Codec + Send,
-        C::Encode: Send,
-        C::Decode: Send,
-        C::Encoder: Send,
-        C::Decoder: Send,
+        E: Encoder + Send,
+        E::Item: Send,
+        D: furpc::Decoder + Send,
+        D::Item: Send,
     {
         let deadline = request
             .deadline()
@@ -477,7 +483,7 @@ where
             )?)?;
         self.inner.get_mut().validate_reply = validate_reply;
         self.inner
-            .call(request, codec, deadline)
+            .call(request, encoder, decoder, deadline)
             .await
             .map_err(FurpcClientError::from_rpc)
     }
@@ -567,31 +573,15 @@ fn stamp_timeout(request: Request<Body>) -> furpc::Result<Request<Body>> {
 }
 
 type QueryBody<Q> = <<<Q as QueryRequest>::Parameters as Query>::Reply as Reply>::Body;
-type ResolutionCodec = FubstCodec<ResolutionRequest, resolution_protocol::ResolveReply>;
+struct QueryEncoder<Q>(PhantomData<fn(Q)>);
 
-struct QueryCodec<Q>(PhantomData<fn(Q)>);
-
-impl<Q> QueryCodec<Q> {
+impl<Q> QueryEncoder<Q> {
     fn new() -> Self {
         Self(PhantomData)
     }
 }
 
-impl<Q: QueryRequest> Codec for QueryCodec<Q> {
-    type Encode = Q;
-    type Decode = QueryBody<Q>;
-    type Encoder = Self;
-    type Decoder = <FubstCodec<(), QueryBody<Q>> as Codec>::Decoder;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        Self::new()
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        FubstCodec::<(), QueryBody<Q>>::default().decoder()
-    }
-}
-impl<Q: QueryRequest> Encoder for QueryCodec<Q> {
+impl<Q: QueryRequest> Encoder for QueryEncoder<Q> {
     type Item = Q;
 
     fn encode(

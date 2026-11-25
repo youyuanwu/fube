@@ -18,7 +18,7 @@ implementations have been removed. There is no compatibility wrapper or fallback
 `ClientOptions`/`ClientLimits` and typed retained-allocation accounting are retired.
 ServiceNotificationClient owns its **own furpc Channel/native session**; it
 does not adopt an ordinary client's channel or lifecycle. Authorized furpc
-ingress and `server::Rpc::unary` decode notifications and return typed ACK data;
+ingress and `server::unary` decode notifications and return typed ACK data;
 the runner owns native correlation and original-generation ACK writes.
 Session/filter RPCs reuse the gateway adapter on the original furpc Peer.
 The legacy notification adapters, receiver/reply-context plumbing and allocation
@@ -109,13 +109,13 @@ The method selects its validator through `RpcClient::get_mut` before invoking
 the RPC; validators are neither inferred from an edited reply nor shared between
 clones. The adapter validates the reply envelope or decodes
 ClientOperationFailure before the success body codec. Ping uses the standard
-`FubstCodec<(), PingReplyBody>`: fubst's root unit maps to zero body bytes, while
+`FubstEncoder<()>` / `FubstDecoder<PingReplyBody>`: fubst's root unit maps to zero body bytes, while
 the reply uses its native object schema. Nested unit values remain unsupported
 and empty structs retain native object framing.
 Gateway Actor, activity and protocol 1.1 remain method-owned native headers.
 NameExists sends the structured native NamingUri and requires NamingGateway's
 NameOperationReply. CreateName/DeleteName reuse the same checked URI and reply
-envelope, but `FubstCodec<NamingUri, ()>` requires zero success-body bytes.
+envelope, but `FubstEncoder<NamingUri>` / `FubstDecoder<()>` requires zero success-body bytes.
 DeleteName adds native explicit-delete header `0x8033` with `true`; creation
 does not add that header. These writes use the same deadline, source/settlement
 metadata and error path as the reads, without retry or replay.
@@ -481,7 +481,7 @@ Public edits to service/partition/version identity cannot rebind that metadata.
 Named keys reject empty/NUL values; native body byte/string widths, rather than
 the retired standalone 32768-unit construction ceiling, bound serialization.
 
-Resolution uses a dedicated native `FubstCodec<ResolutionRequest, ResolveReply>`,
+Resolution uses a dedicated native `FubstEncoder<ResolutionRequest>` and `FubstDecoder<ResolveReply>`,
 not the query envelope. NamingGateway actor 5 and `ResolveServiceRequest` reply
 action are checked before body decode. Identity/version, partition details and
 the requested service/key are checked before returning `Response<ResolvedServicePartition>`.
@@ -546,12 +546,16 @@ for the legacy transport still used by other workspace consumers.
 captured Peer, with authorized Actor 25/27 ordinary one-way ingress services.
 Transfer messages use a private typed `OneWayClient<PeerSendService>` stub;
 the routed root Delete uses `RpcClient` over the original `PeerRequestService`.
-Prepared body encoding adopts file chunks unchanged, without another payload
-copy or serialization. Delete's typed reply codec preserves the FileNotFound
+Delete passes its actual DTO to FubstEncoder at the RPC boundary, and upload
+commands stay typed until their encoder emits each protocol body. File-content
+encoding adopts the command's chunk bytes without copying or serializing them.
+There is no ordinary pre-encoded Body pass-through. Delete's decoder preserves the FileNotFound
 result and native protocol/domain/decode failures.
-Semantic ACK serving uses `server::Rpc::one_way` on the original received
+Semantic ACK serving uses `server::one_way` with only a decoder value on the original received
 request, after source-generation admission, then enqueues the decoded DTO in
 the existing bounded queue. Cancelling an admitted handoff fences the owner.
+Normal decoders read current headers directly from DecodeBuf; no custom pass-through codec or
+shared header-capture cell is needed.
 The owner still applies Activity/sequence, chunk negotiation and stage policy.
 Semantic ACKs are not ordinary RPC completions or furpc native notifications.
 It does not borrow a `FabricClient` or
@@ -689,7 +693,7 @@ not a physical-driver join barrier. An idle physical disconnect has no separate
 closure observer; waiting for a semantic ACK remains bounded by the copy deadline.
 
 Implementation: [public API and copy lifecycle](../../crates/libs/fube-client/src/image_store.rs),
-[typed original-Peer clients and codecs](../../crates/libs/fube-client/src/image_store/transport.rs),
+[typed original-Peer client adapters](../../crates/libs/fube-client/src/image_store/transport.rs),
 [native codecs](../../crates/libs/fube-client/src/image_store_protocol.rs),
 [complete root-marker preflight](../../crates/libs/fube-client/src/image_store_protocol.rs),
 [strict client semantic ACK decoding](../../crates/libs/fube-client/src/image_store_protocol.rs)

@@ -1,6 +1,6 @@
 //! Original-Link sends and original-invocation typed handoffs, not domain completion.
 use super::{
-    bootstrap::{decode_body, PreparedBodyCodec, PreparedEncoder},
+    bootstrap::{decode_body, PreparedEncoder},
     bounded, deadline, err, fm_intake,
     fm_server::FmReport,
     outbound, peer_intake,
@@ -8,9 +8,7 @@ use super::{
     Headers, Link, Message, Properties, Result, Role, LIMIT,
 };
 use fube_ra::protocol::{FailoverUnitReply, GenerationUpdate};
-use furpc::{
-    Body, Codec, CodecError, DecodeBuf, Decoder, Error, OneWayClient, PeerSendService, Request,
-};
+use furpc::{CodecError, DecodeBuf, Decoder, Error, OneWayClient, PeerSendService, Request};
 use serde::de::DeserializeOwned;
 use std::{
     future::{ready, Ready},
@@ -33,7 +31,7 @@ pub(super) async fn send_prepared(
     let mut request = Request::new(message.body().clone());
     *request.headers_mut() = message.headers().clone();
     client
-        .send(request, PreparedBodyCodec, deadline())
+        .send(request, PreparedEncoder, deadline())
         .await
         .map(|_| ())
         .map_err(err)
@@ -70,30 +68,12 @@ pub(super) fn decode_error(error: CodecError) -> String {
 
 type Decode<T> = fn(&Headers, &mut DecodeBuf<'_>) -> std::result::Result<T, CodecError>;
 
-struct IntakeCodec<T> {
+struct IntakeDecoder<T> {
     headers: Headers,
     decode: Decode<T>,
 }
 
-impl<T> Codec for IntakeCodec<T> {
-    type Encode = Body;
-    type Decode = T;
-    type Encoder = PreparedEncoder;
-    type Decoder = Self;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        PreparedEncoder
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        Self {
-            headers: self.headers.clone(),
-            decode: self.decode,
-        }
-    }
-}
-
-impl<T> Decoder for IntakeCodec<T> {
+impl<T> Decoder for IntakeDecoder<T> {
     type Item = T;
 
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> std::result::Result<T, CodecError> {
@@ -104,7 +84,7 @@ impl<T> Decoder for IntakeCodec<T> {
 pub(super) fn decode_message<T>(message: &Message, decode: Decode<T>) -> Result<T> {
     bounded(message).map_err(err)?;
     furpc::codec::decode(
-        &mut IntakeCodec {
+        &mut IntakeDecoder {
             headers: message.headers().clone(),
             decode,
         },
@@ -211,14 +191,13 @@ impl OneWaySlot {
                 Role::Peer => peer,
                 Role::Fm => fm,
             };
-            let codec = IntakeCodec {
+            let decoder = IntakeDecoder {
                 headers: self.request.headers().clone(),
                 decode,
             };
             let (send, receive) = oneshot::channel();
-            let response = furpc::server::Rpc::new(codec)
-                .one_way(Capture(Some(send)), self.request)
-                .await?;
+            let response =
+                furpc::server::one_way(Capture(Some(send)), self.request, decoder).await?;
             let prepared = receive.await.map_err(|_| Error::Closed)?;
             Ok((response, prepared))
         }
@@ -319,6 +298,7 @@ mod tests {
         change_configuration_reply_message, decode_change_configuration_reply,
         service_type_enabled_reply_message, ServiceTypeUpdateReply,
     };
+    use furpc::Body;
     use tokio::time::{sleep_until, Duration};
 
     #[tokio::test]

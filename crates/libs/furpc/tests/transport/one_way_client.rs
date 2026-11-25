@@ -1,10 +1,9 @@
 use super::*;
 use furpc::{
-    ActorId, AttemptDisposition, Codec, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder,
-    HeaderId, HeaderRecord, OneWayClient, OneWayRouteOptions, PeerRequestService, PeerSendService,
-    Router, WriteReceipt,
+    ActorId, AttemptDisposition, CodecError, EncodeBuf, Encoder, FubstEncoder, HeaderId,
+    HeaderRecord, OneWayClient, OneWayRouteOptions, PeerRequestService, PeerSendService, Router,
+    WriteReceipt,
 };
-use std::{marker::PhantomData, rc::Rc};
 use tokio::time::{advance, sleep, Sleep};
 
 const ACTOR: i64 = 70000;
@@ -140,6 +139,50 @@ fn report<T>(body: T) -> Request<T> {
         .unwrap()
 }
 
+#[tokio::test]
+async fn directional_send_encodes_the_actual_payload_without_a_codec() {
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    struct Report {
+        sequence: u32,
+        text: String,
+    }
+    struct ReportEncoder;
+    impl Encoder for ReportEncoder {
+        type Item = Report;
+
+        fn encode(&mut self, value: Report, dst: &mut EncodeBuf<'_>) -> Result<(), CodecError> {
+            assert_eq!(action(dst.headers()), "Report");
+            FubstEncoder::<Report>::default().encode(value, dst)
+        }
+    }
+    let mut pair = Pair::start(true).await;
+    let mut client = OneWayClient::new(PeerSendService::new(pair.peer.clone()));
+    let receipt = client
+        .send(
+            report(Report {
+                sequence: 17,
+                text: "typed".into(),
+            }),
+            ReportEncoder,
+            deadline(),
+        )
+        .await
+        .unwrap();
+    assert!(receipt.written_at() <= Instant::now());
+    let request = pair.receive().await;
+    assert!(!request.headers().effective().expects_reply);
+    let received: Report =
+        fubst::serde::from_slice(request.body().segments().next().unwrap()).unwrap();
+    assert_eq!(
+        received,
+        Report {
+            sequence: 17,
+            text: "typed".into()
+        }
+    );
+    pair.finish().await;
+}
+
 // Neither the service nor its borrowed state is Clone/Sync/'static.
 struct PreparedSend<'a> {
     inner: PeerSendService,
@@ -171,28 +214,7 @@ impl Service<Request<Body>> for PreparedSend<'_> {
     }
 }
 
-struct EncodeOnly {
-    encoded: Arc<AtomicUsize>,
-    state: Cell<bool>,
-}
 struct CountEncoder(Arc<AtomicUsize>, Cell<bool>);
-struct UnusedDecoder(PhantomData<Rc<()>>);
-
-impl Codec for EncodeOnly {
-    type Encode = u32;
-    type Decode = Rc<()>;
-    type Encoder = CountEncoder;
-    type Decoder = UnusedDecoder;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        assert!(!self.state.replace(true));
-        CountEncoder(self.encoded.clone(), Cell::new(false))
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        panic!("typed sends must not construct a decoder")
-    }
-}
 
 impl Encoder for CountEncoder {
     type Item = u32;
@@ -204,19 +226,8 @@ impl Encoder for CountEncoder {
     }
 }
 
-impl Decoder for UnusedDecoder {
-    type Item = Rc<()>;
-
-    fn decode(&mut self, _: &mut DecodeBuf<'_>) -> Result<Rc<()>, CodecError> {
-        panic!("typed sends must not decode")
-    }
-}
-
-fn encode_only(encoded: &Arc<AtomicUsize>) -> EncodeOnly {
-    EncodeOnly {
-        encoded: encoded.clone(),
-        state: Cell::new(false),
-    }
+fn encode_only(encoded: &Arc<AtomicUsize>) -> CountEncoder {
+    CountEncoder(encoded.clone(), Cell::new(false))
 }
 
 #[tokio::test]
@@ -269,7 +280,7 @@ async fn typed_send_is_inert_encodes_only_and_preserves_borrowed_service_readine
 
     let mut client = client.max_encoded_body_bytes(0).unwrap();
     client
-        .send(report(()), FubstCodec::<(), ()>::default(), expiry)
+        .send(report(()), FubstEncoder::<()>::default(), expiry)
         .await
         .unwrap();
     assert!(pair.receive().await.body().is_empty());
@@ -293,7 +304,12 @@ async fn typed_send_needs_no_rpc_slot_or_correlated_response() {
     let mut requests = RpcClient::new(PeerRequestService::new(pair.peer.clone()));
     assert_eq!(
         requests
-            .call(report(()), FubstCodec::<(), ()>::default(), deadline())
+            .call(
+                report(()),
+                FubstEncoder::<()>::default(),
+                FubstDecoder::<()>::default(),
+                deadline()
+            )
             .await
             .unwrap_err(),
         Error::ResourceLimit("pending RPC/results"),
@@ -301,7 +317,7 @@ async fn typed_send_needs_no_rpc_slot_or_correlated_response() {
     let mut client = OneWayClient::new(PeerSendService::new(pair.peer.clone()));
     for value in [1u32, 2] {
         client
-            .send(report(value), FubstCodec::<u32, ()>::default(), deadline())
+            .send(report(value), FubstEncoder::<u32>::default(), deadline())
             .await
             .unwrap();
         let received = pair.receive().await;
@@ -415,7 +431,7 @@ async fn peer_services_require_deadlines_and_reject_correlation_fields_even_in_r
             );
         }
         OneWayClient::new(sends)
-            .send(report(()), FubstCodec::<(), ()>::default(), deadline())
+            .send(report(()), FubstEncoder::<()>::default(), deadline())
             .await
             .unwrap();
         assert!(pair.receive().await.body().is_empty());
@@ -427,7 +443,8 @@ async fn peer_services_require_deadlines_and_reject_correlation_fields_even_in_r
                         .unwrap()
                         .append_header(header::action("Echo").unwrap())
                         .unwrap(),
-                    FubstCodec::<u32, u32>::default(),
+                    FubstEncoder::<u32>::default(),
+                    FubstDecoder::<u32>::default(),
                     deadline(),
                 )
                 .await
@@ -449,13 +466,13 @@ async fn dropping_typed_sends_retracts_only_uncommitted_frames_without_replay() 
         let mut client = OneWayClient::new(PeerSendService::new(pair.peer.clone()));
         pair.gate.limit(Some(usize::from(committed)));
         let mut sending =
-            Box::pin(client.send(report(1u32), FubstCodec::<u32, ()>::default(), deadline()));
+            Box::pin(client.send(report(1u32), FubstEncoder::<u32>::default(), deadline()));
         assert!(sending.as_mut().now_or_never().is_none());
         bounded(pair.gate.blocked.notified()).await;
         drop(sending);
         pair.gate.limit(None);
         client
-            .send(report(2u32), FubstCodec::<u32, ()>::default(), deadline())
+            .send(report(2u32), FubstEncoder::<u32>::default(), deadline())
             .await
             .unwrap();
         for value in if committed { vec![1u32, 2] } else { vec![2] } {
@@ -492,8 +509,7 @@ async fn typed_native_write_settlement_survives_late_observation_and_retirement(
     });
     let expiry = Instant::now() + Duration::from_secs(1);
     let mut client = OneWayClient::new(transport);
-    let mut sending =
-        Box::pin(client.send(report(42u32), FubstCodec::<u32, ()>::default(), expiry));
+    let mut sending = Box::pin(client.send(report(42u32), FubstEncoder::<u32>::default(), expiry));
     assert!(sending.as_mut().now_or_never().is_none());
     bounded(async {
         loop {

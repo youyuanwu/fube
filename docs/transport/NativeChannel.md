@@ -241,7 +241,7 @@ implementations for those roles.
 
 **Current migration:** the initiating fube-runtime client now uses
 [`ipc_client.rs`](../../crates/libs/fube-runtime/src/ipc_client.rs) over furpc,
-with typed RpcClient/FubstCodec requests, authorized ingress and one captured Peer.
+with typed RpcClient encoder/decoder requests, authorized ingress and one captured Peer.
 Host/PID and actual loopback checks remain consumer policy. Domain workers
 return reply data; furpc alone correlates and writes it. Retirement releases
 Channel ownership rather than joining the physical driver. Legacy ordered

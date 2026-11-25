@@ -246,7 +246,8 @@ async fn retired_or_foreign_requests_are_rejected_before_byte_submission() {
         let error = RpcClient::new(service)
             .call(
                 request(actor, action),
-                FubstCodec::<IdRequest, ErrorReply>::default(),
+                FubstEncoder::<IdRequest>::default(),
+                FubstDecoder::<ErrorReply>::default(),
                 deadline_after(Duration::from_secs(2)).unwrap(),
             )
             .await

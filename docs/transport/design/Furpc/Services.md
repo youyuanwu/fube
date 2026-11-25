@@ -21,7 +21,7 @@ native connection driver
                         -> scope-owned service readiness and handler work
                             -> optional Router: native class + Actor + Action
                                 -> selected Service<Request<Body>>
-                                    -> optional server::Rpc<C> method adapter
+                                    -> optional server::unary/one_way adaptation
                                         -> decode -> typed service -> encode
                         -> private original-connection reply/ack completion
 ```
@@ -120,7 +120,7 @@ impl ServerBuilder {
 
 `IngressService<S>` and `IngressResponse` replace the server-specific service
 and response names: the same inbound handler role applies to dialed reverse
-traffic and accepted connections. `server::Rpc` can adapt typed methods in
+traffic and accepted connections. server::unary/one_way adapt typed methods in
 either role; it does not require an accepted Server owner.
 
 `IngressService` is configuration, not another task owner or queue. Its bindings
@@ -199,7 +199,7 @@ capacity or block its dispatch.
 
 ## Typed RPC adapters
 
-`server::Rpc<C>`, `unary`, `one_way`, and `Reply<T>` are implemented. They work
+`server::unary`, `server::one_way`, and `Reply<T>` are implemented. They work
 inside raw, whole-Actor, or routed ingress services on either connection role.
 The optional codec-free Router is implemented independently of these adapters.
 Unary accepts authorized native notifications as well as ordinary requests;
@@ -208,52 +208,45 @@ acknowledgment tickets.
 
 Keep typed body adaptation outside `Router`, following
 [tonic's method-level `server::Grpc<C>`][tonic-server-rpc]. A byte-facing method
-service constructs `server::Rpc<C>` with its codec for that invocation.
-Ordinary Tower service composition supplies the factory; the router has no
+service supplies actual encoder/decoder state values for that invocation.
+Ordinary Tower composition owns their construction; the router has no
 codec/factory parameter or default body format. The same method adapter can
 also run inside a custom raw or whole-actor service without any router.
 
 ```rust,ignore
-impl<C: Codec> server::Rpc<C> {
-    pub fn new(codec: C) -> Self;
-
-    pub async fn unary<S>(
-        &mut self, service: S, request: Request<Body>,
+pub async fn unary<S, D, E>(
+        service: S, request: Request<Body>, decoder: D, encoder: E,
     ) -> Result<IngressResponse>
     where
-        C: Send + 'static,
-        C::Encode: Send + 'static,
-        C::Decode: Send + 'static,
-        C::Encoder: Send + 'static,
-        C::Decoder: Send + 'static,
+        E: Encoder + Send,
+        E::Item: Send + 'static,
+        D: Decoder + Send,
+        D::Item: Send + 'static,
         S: tower_service::Service<
-            Request<C::Decode>, Response = Reply<C::Encode>,
+            Request<D::Item>, Response = Reply<E::Item>,
         > + Send + 'static,
         S::Future: Send + 'static,
         S::Error: Into<BoxError>;
 
-    pub async fn one_way<S>(
-        &mut self, service: S, request: Request<Body>,
+pub async fn one_way<S, D>(
+        service: S, request: Request<Body>, decoder: D,
     ) -> Result<IngressResponse>
     where
-        C: Send + 'static,
-        C::Decode: Send + 'static,
-        C::Decoder: Send + 'static,
-        S: tower_service::Service<Request<C::Decode>, Response = ()>
+        D: Decoder + Send,
+        D::Item: Send + 'static,
+        S: tower_service::Service<Request<D::Item>, Response = ()>
             + Send + 'static,
         S::Future: Send + 'static,
         S::Error: Into<BoxError>;
-}
-
 impl<T> Reply<T> {
     pub fn new(body: T) -> Self;
     pub fn append_header(self, header: HeaderRecord) -> Result<Self>;
 }
 ```
 
-`server::Rpc` owns a codec, not a socket, admission pool, reply grant, or
-execution scope. `new` performs no decoding or I/O. Invoke it inside the
-byte-facing service future, using a fresh codec or independent encoder/decoder
+These functions own no socket, admission pool, reply grant, or
+execution scope. Invoke them inside the
+byte-facing service future, supplying independent encoder/decoder
 state per invocation. Neither that codec nor the consumed typed service needs
 Clone or Sync; sharing requirements apply only to stored outer service
 configuration. Constructing a method adapter cannot create live invocation
@@ -266,11 +259,11 @@ authorization recorded by the runner, and validate the current header collection
 under its original scope. Do not infer authorization from editable flags or
 IDs. Use that invocation's actual body budgets and original deadline,
 not defaults captured when the service was constructed. Decode into
-`Request<C::Decode>` while preserving parts, then invoke the typed service and
-encode its `Reply<C::Encode>` into `IngressResponse::Reply(Message)`.
+`Request<D::Item>` while preserving parts, then invoke the typed service and
+encode its `Reply<E::Item>` into `IngressResponse::Reply(Message)`.
 The runner's private ticket, not the codec or typed service, chooses ordinary
 reply versus native notification acknowledgment canonicalization.
-Native convenience method code supplies `FubstCodec<R, Q>::default()` for a
+Native convenience method code supplies `FubstDecoder<Q>` and `FubstEncoder<R>` for a
 `Request<Q>` / `Reply<R>` handler; custom protocols supply their own codec.
 Supported fubst serialization/deserialization schemas are required only by
 that concrete codec, not by routing or custom method codecs.
@@ -288,6 +281,15 @@ decodes once, calls a typed service returning `()`,
 and produces `IngressResponse::NoReply`. It does not construct an encoder or
 impose bounds on unused encode types. Successful handler completion is not a
 semantic ACK; domain processing and an authorized send remain explicit.
+
+Header-aware decoding uses these same unary/one_way methods. Normal decoders
+read current headers through DecodeBuf::headers(), only after original
+invocation admission and input-byte limits. They pass the actual typed body to
+the service without header capture/cloning. Unary can compose its two real
+directions as actual values; one-way uses only a decoder.
+Metadata cannot alter original routing permissions or create authority.
+The reply encoder also sees the typed reply's current headers through EncodeBuf.
+See [header-aware adaptation](Codecs.md#header-aware-method-adaptation).
 
 The methods return response data only. They never call `Peer::send`,
 mint a grant, or insert reply correlation. The runner retains the original

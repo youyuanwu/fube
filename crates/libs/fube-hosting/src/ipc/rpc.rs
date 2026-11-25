@@ -2,8 +2,8 @@
 use super::{admit_dispatch, deadline, dispatch, protocol, reply_budget, wire, Entry, Shared};
 use fube_core::protocol::actor as actors;
 use furpc::{
-    header, ActorId, Body, Codec, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder, Error,
-    FubstCodec, IngressResponse, Reply, Request, Result,
+    header, ActorId, Body, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder, Error, FubstEncoder,
+    IngressResponse, Reply, Request, Result,
 };
 use serde::de::DeserializeOwned;
 use std::{
@@ -127,30 +127,28 @@ impl HostingRpc {
         }
     }
 
-    fn codec(&self) -> HostingCodec {
-        HostingCodec(self.clone())
-    }
-
     pub(super) fn method(&self) -> Method {
         self.method
     }
 
     pub(super) async fn unary(self, request: Request<Body>) -> Result<IngressResponse> {
-        let mut rpc = furpc::server::Rpc::new(self.codec());
+        let decoder = RequestDecoder(self.clone());
         let lease = self.method == Method::Lease;
         let entry = self.entry.clone();
-        let result = rpc.unary(self, request).await.map_err(|error| {
-            // Admission errors pass through the decoder, but remain domain causes.
-            if let Error::Codec { source, .. } = &error {
-                if let Some(original) = source
-                    .source()
-                    .and_then(|source| source.downcast_ref::<Error>())
-                {
-                    return original.clone();
+        let result = furpc::server::unary(self, request, decoder, ResponseEncoder)
+            .await
+            .map_err(|error| {
+                // Admission errors pass through the decoder, but remain domain causes.
+                if let Error::Codec { source, .. } = &error {
+                    if let Some(original) = source
+                        .source()
+                        .and_then(|source| source.downcast_ref::<Error>())
+                    {
+                        return original.clone();
+                    }
                 }
-            }
-            error
-        })?;
+                error
+            })?;
         // Cleanup replies retain their original runner even after lease retirement.
         if lease && !entry.authority.live() {
             return Err(Error::Closed);
@@ -215,24 +213,8 @@ impl Service<Request<Call>> for HostingRpc {
     }
 }
 
-struct HostingCodec(HostingRpc);
 struct RequestDecoder(HostingRpc);
 struct ResponseEncoder;
-
-impl Codec for HostingCodec {
-    type Encode = Response;
-    type Decode = Call;
-    type Encoder = ResponseEncoder;
-    type Decoder = RequestDecoder;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        ResponseEncoder
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        RequestDecoder(self.0.clone())
-    }
-}
 
 impl Decoder for RequestDecoder {
     type Item = Call;
@@ -254,15 +236,15 @@ impl Encoder for ResponseEncoder {
         dst: &mut EncodeBuf<'_>,
     ) -> std::result::Result<(), CodecError> {
         match item {
-            Response::Start(value) => FubstCodec::<wire::StartReply, ()>::default()
-                .encoder()
-                .encode(value, dst),
-            Response::Error(value) => FubstCodec::<wire::ErrorReply, ()>::default()
-                .encoder()
-                .encode(value, dst),
-            Response::Lease(value) => FubstCodec::<wire::LeaseReply, ()>::default()
-                .encoder()
-                .encode(value, dst),
+            Response::Start(value) => {
+                FubstEncoder::<wire::StartReply>::default().encode(value, dst)
+            }
+            Response::Error(value) => {
+                FubstEncoder::<wire::ErrorReply>::default().encode(value, dst)
+            }
+            Response::Lease(value) => {
+                FubstEncoder::<wire::LeaseReply>::default().encode(value, dst)
+            }
         }
     }
 }

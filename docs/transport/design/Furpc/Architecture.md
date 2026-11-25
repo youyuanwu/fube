@@ -153,7 +153,7 @@ crates/libs/furpc/src/
         headers.rs        records, public header namespace, typed native views
         message.rs        standalone builder, immutable headers/segmented body
     codec/
-        mod.rs            public Codec, Encoder, Decoder, bounded buffers
+        mod.rs            public Encoder, Decoder, bounded buffers
         fubst.rs          default typed-body codec using fubst
     connection/
         driver.rs         sole I/O and protocol-progress owner
@@ -210,7 +210,7 @@ do not add a trait, boxed future, task, or queue for each conceptual boundary.
 | `Headers` | Ordered collection with fallible atomic edits under native widths; encoded records stay immutable and shared. | Owns header data, not provenance or admission; raw messages expose read-only access. |
 | `MessageBuilder` / `HeaderRecord` constructors | Standalone construction under native representation limits only. | Caller-owned data, not transport admission; submission applies the actual scope policy. |
 | `Router` / `IngressService<S>` | Cloneable byte-facing configuration/bindings; IngressService needs Clone + Send, not Sync; Router retains its immutable route-sharing bounds. Raw or Actor dispatch within ordinary and notification classes. | Canonically installed on Endpoint, Channel, or ServerBuilder; owner tracks all execution/replies/acknowledgments under shared HandlerLimits. No public owner or mandatory inbox. |
-| `server::Rpc<C>` | Per-invocation codec adapter; methods take `&mut self`. No Clone/Sync requirement on its codec. | Decodes/calls/encodes within the supplied service future; no socket, admission pool, or reply grant. |
+| `server::unary` / `one_way` | Consume actual direction states per invocation, without a Codec or factory wrapper. | Decode/call/encode within the supplied service future; no socket, admission pool, or reply grant. |
 | `RequestRouteOptions` / `OneWayRouteOptions` / `NotificationRouteOptions` | Distinct immutable route-kind configuration with existing authorization and ingress/send limits. | Options cannot be interchanged to gain another kind's reply/acknowledgment authority. |
 | `Request<B>` / `RequestParts` | http-shaped body-first envelope with editable headers and optional local deadline. No initial `Clone` implementation; context stays private and read-only. | Body adaptation preserves metadata, storage ownership, and received context. Metadata edits cannot change original admission, correlation, policies, or server deadline; no reply grant or lifecycle ownership. |
 | `RequestContext` | Read-only received context with private constructors; accessed through the request or its parts. | Original source/deadline and optional restricted Peer; not a message-construction dependency, reply authority, or a separate handler argument. |
