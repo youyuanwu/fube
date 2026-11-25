@@ -1528,7 +1528,9 @@ async fn captured_unpolled_build_is_revoked_never_retargets_replacement_native_n
             _ = until(|| proof.validate().is_err()) => {},
         }
         assert!(proof.validate().is_err());
-        release.send(()).unwrap();
+        // Closing the barrier also releases a live pause; revocation may have
+        // already dropped its receiver.
+        drop(release);
         epoch.await.unwrap();
         first.abort();
         let _ = first.await;
