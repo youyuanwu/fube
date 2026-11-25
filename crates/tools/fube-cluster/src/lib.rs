@@ -3,6 +3,7 @@ mod interlock;
 mod management;
 mod manager;
 mod node;
+mod process_control;
 mod profile;
 mod restart;
 pub(crate) use fube_node::control::wire;
@@ -18,6 +19,7 @@ use fm::Bootstrap;
 use fm::{Accepted, Ledger};
 use fube_local_host::process::OwnedApp;
 use fube_ra::protocol::*;
+use process_control::NodeControl;
 use profile::*;
 use serde_json::{json, Value};
 use std::{
@@ -424,17 +426,16 @@ impl Cluster {
                         .position(|p| &p.node == target)
                         .ok_or("missing original mesh peer")?;
                     let child = &self.manager.children[source];
-                    self.processes[source]
-                        .as_mut()
-                        .ok_or("missing original Primary owner")?
-                        .command(
-                            format!(
-                                "peer {} {} {} {address}\n",
-                                child.launch.session, child.launch.capability, peer_index
-                            )
-                            .as_bytes(),
-                        )
-                        .map_err(err)?;
+                    process_control::send(
+                        self.processes[source]
+                            .as_mut()
+                            .ok_or("missing original Primary owner")?,
+                        &child.launch,
+                        NodeControl::DialPeer {
+                            slot: peer_index,
+                            address,
+                        },
+                    )?;
                 }
             }
         }
@@ -539,11 +540,11 @@ impl Cluster {
                 {
                     return Err("listener metadata is not the original owned Node".into());
                 }
-                self.processes[index]
-                    .as_mut()
-                    .unwrap()
-                    .command(format!("admit {} {}\n", launch.session, launch.capability).as_bytes())
-                    .map_err(err)?;
+                process_control::send(
+                    self.processes[index].as_mut().unwrap(),
+                    &launch,
+                    NodeControl::Admit {},
+                )?;
                 if let Some(remote) = &mut self.remote {
                     let attached = remote
                         .request(management::Operation::Attach { index, metadata })
@@ -595,17 +596,13 @@ impl Cluster {
             return Ok(current);
         }
         let child = &self.manager.children[0];
-        self.processes[0]
-            .as_mut()
-            .ok_or("missing original Primary owner")?
-            .command(
-                format!(
-                    "create-idle {} {}\n",
-                    child.launch.session, child.launch.capability
-                )
-                .as_bytes(),
-            )
-            .map_err(err)?;
+        process_control::send(
+            self.processes[0]
+                .as_mut()
+                .ok_or("missing original Primary owner")?,
+            &child.launch,
+            NodeControl::CreateIdle {},
+        )?;
         self.manager.peer_idle_requested = true;
         Ok(json!({"state":"pending","kind":"peer_idle_open","built":false,"serving":false}))
     }
@@ -637,17 +634,13 @@ impl Cluster {
             return Ok(current);
         }
         let child = &self.manager.children[0];
-        self.processes[0]
-            .as_mut()
-            .ok_or("missing original Primary owner")?
-            .command(
-                format!(
-                    "build-idle {} {}\n",
-                    child.launch.session, child.launch.capability
-                )
-                .as_bytes(),
-            )
-            .map_err(err)?;
+        process_control::send(
+            self.processes[0]
+                .as_mut()
+                .ok_or("missing original Primary owner")?,
+            &child.launch,
+            NodeControl::BuildIdle {},
+        )?;
         Ok(json!({"state":"pending","kind":"peer_idle_build","built":false,"serving":false}))
     }
     /// Remove the original Idle from the Primary's replicator, not its remote
@@ -680,17 +673,13 @@ impl Cluster {
             return Err("peer removal requires the original opened Idle".into());
         }
         let child = &self.manager.children[0];
-        self.processes[0]
-            .as_mut()
-            .ok_or("missing original Primary owner")?
-            .command(
-                format!(
-                    "remove-idle {} {}\n",
-                    child.launch.session, child.launch.capability
-                )
-                .as_bytes(),
-            )
-            .map_err(err)?;
+        process_control::send(
+            self.processes[0]
+                .as_mut()
+                .ok_or("missing original Primary owner")?,
+            &child.launch,
+            NodeControl::RemoveIdle {},
+        )?;
         if let Some(idle) = self.manager.ledger.idles.first_mut() {
             idle.cancelled = true;
         }
@@ -737,10 +726,9 @@ impl Cluster {
         // before waiting for any sibling's independently owned cleanup.
         for (child, process) in self.manager.children.iter().zip(&mut self.processes) {
             if let Some(process) = process.as_mut() {
-                let stop =
-                    process.command(format!("stop {}\n", child.launch.capability).as_bytes());
+                let stop = process_control::send(process, &child.launch, NodeControl::Stop {});
                 if let Err(error) = stop {
-                    receipts.push(json!({"node":child.launch.placement,"stop_error":err(error)}));
+                    receipts.push(json!({"node":child.launch.placement,"stop_error":error}));
                 }
             }
         }

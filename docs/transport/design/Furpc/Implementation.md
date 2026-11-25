@@ -106,6 +106,8 @@ can provide physical fencing evidence, drive FM reconfiguration, and admit a
 fresh incarnation. The standalone runner retains its original-session loss
 gate. Shared target replacement itself does not provide failure detection,
 automatic restart, process adoption, Federation membership, or durable RA recovery.
+Cluster [parent controls](../../../../crates/tools/fube-cluster/src/process_control.rs)
+are typed private process messages, separate from native FM/RA transport.
 
 LFUM inventory is a domain-owned frozen DTO snapshot. Each call encodes under
 its current operation deadline; serialization failure occurs before native

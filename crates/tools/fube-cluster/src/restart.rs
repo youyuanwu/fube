@@ -2,6 +2,7 @@ use crate::{
     fm::Desired,
     management::Operation,
     manager::{Connection, Manager},
+    process_control::{self, NodeControl},
     profile::*,
     wire::{self, Target},
     Cluster, Command,
@@ -311,17 +312,16 @@ impl Cluster {
             let ready = local.directory.join(format!("{name}-ready.json"));
             if !ready.try_exists().map_err(err)? {
                 write_json(&local.directory.join(format!("{name}.json")), proof)?;
-                self.processes[survivor]
-                    .as_mut()
-                    .ok_or("missing surviving Node owner")?
-                    .command(
-                        format!(
-                            "peer-down {} {} {slot} {}\n",
-                            local.session, local.capability, proof.node.instance
-                        )
-                        .as_bytes(),
-                    )
-                    .map_err(err)?;
+                process_control::send(
+                    self.processes[survivor]
+                        .as_mut()
+                        .ok_or("missing surviving Node owner")?,
+                    &local,
+                    NodeControl::PeerDown {
+                        slot,
+                        instance: proof.node.instance,
+                    },
+                )?;
                 let until = Instant::now() + Duration::from_secs(10);
                 while !ready.try_exists().map_err(err)? {
                     self.drive().await;
@@ -378,10 +378,11 @@ impl Cluster {
             .as_mut()
             .ok_or("missing original Node owner")?;
         if process.observed_exit().map_err(err)?.is_none() {
-            let capability = &self.manager.children[index].launch.capability;
-            process
-                .command(format!("stop {capability}\n").as_bytes())
-                .map_err(err)?;
+            process_control::send(
+                process,
+                &self.manager.children[index].launch,
+                NodeControl::Stop {},
+            )?;
             if let Err(error) =
                 process.wait_exit(std::time::Instant::now() + Duration::from_secs(20))
             {
@@ -489,17 +490,16 @@ impl Cluster {
             };
             let name = format!("peer-update-{slot}-{}", replacement.node.instance);
             write_json(&local.directory.join(format!("{name}.json")), &update)?;
-            self.processes[survivor]
-                .as_mut()
-                .ok_or("missing surviving Node owner")?
-                .command(
-                    format!(
-                        "peer-update {} {} {slot} {}\n",
-                        local.session, local.capability, replacement.node.instance
-                    )
-                    .as_bytes(),
-                )
-                .map_err(err)?;
+            process_control::send(
+                self.processes[survivor]
+                    .as_mut()
+                    .ok_or("missing surviving Node owner")?,
+                &local,
+                NodeControl::PeerUpdate {
+                    slot,
+                    instance: replacement.node.instance,
+                },
+            )?;
             let until = Instant::now() + Duration::from_secs(10);
             let path = local.directory.join(format!("{name}-ready.json"));
             while !path.try_exists().map_err(err)? {
@@ -528,17 +528,16 @@ impl Cluster {
                 .iter()
                 .position(|peer| peer.node == local.node)
                 .ok_or("restarted Node is missing the current survivor binding")?;
-            self.processes[index]
-                .as_mut()
-                .ok_or("missing restarted Node owner")?
-                .command(
-                    format!(
-                        "peer {} {} {outgoing} {}\n",
-                        replacement.session, replacement.capability, receipt.address
-                    )
-                    .as_bytes(),
-                )
-                .map_err(err)?;
+            process_control::send(
+                self.processes[index]
+                    .as_mut()
+                    .ok_or("missing restarted Node owner")?,
+                &replacement,
+                NodeControl::DialPeer {
+                    slot: outgoing,
+                    address: receipt.address,
+                },
+            )?;
         }
         Ok(())
     }

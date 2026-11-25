@@ -33,7 +33,7 @@ message dispatch, retries and explicit membership intent. It drives native work
 even while the controller is not polling. Reliability execution remains in
 shared Node/RA/Hosting.
 
-The private process interface uses newline-delimited JSON, bounded to 64 KiB
+The supervisor-to-FM process interface uses newline-delimited JSON, bounded to 64 KiB
 including the newline, with strictly increasing request IDs and matching reply
 IDs. For example, `{"id":1,"operation":{"action":"status"}}` requests a snapshot;
 `{"id":2,"operation":{"action":"command","command":{"op":"create","action":"create","node":1}}}`
@@ -43,6 +43,17 @@ semantic replies are unchanged: this IPC is not a new SF message or serving
 authority. Protocol stdout is separate from diagnostic stderr. Malformed,
 oversized, truncated or miscorrelated traffic fails explicitly; uncertain
 exchanges are not retried on a new FM.
+
+Supervisor-to-Node commands use the shared typed
+[`NodeControl` protocol](src/process_control.rs), serialized in an envelope with
+the exact launch session and capability. Admission, stop, peer dialing,
+host replacement and peer fencing/rebinding are enum variants, not positional
+text arguments. Node frames are bounded to 256 bytes including the newline;
+FM and Node interfaces share cancellation-safe framing that retains partial
+input across polls. Complete Node frames are decoded once and checked against
+the owning launch before [typed dispatch](src/node.rs). Profile, replica-owner
+and [fencing checks](src/node/peers.rs) remain domain validation. These private
+process messages are not native SF reliability traffic.
 
 The first executable profile is same-host, fresh-start and statically configured.
 `fube-fm --config <deployment/fm.json>` consumes the supervisor's versioned list
