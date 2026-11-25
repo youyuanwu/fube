@@ -1,15 +1,15 @@
 //! Original-Link sends and original-invocation typed handoffs, not domain completion.
 use super::{
-    bootstrap::{decode_body, PreparedEncoder},
-    bounded, deadline, err, fm_intake,
-    fm_server::FmReport,
-    outbound, peer_intake,
-    session::OneWaySlot,
-    Headers, Link, Message, Properties, Result, Role, LIMIT,
+    bootstrap::decode_body, bounded, deadline, err, fm_intake, fm_server::FmReport,
+    outbound_headers, peer_intake, session::OneWaySlot, Headers, Link, Message, Properties, Result,
+    Role, LIMIT,
 };
-use fube_ra::protocol::{FailoverUnitReply, GenerationUpdate};
-use furpc::{CodecError, DecodeBuf, Decoder, Error, OneWayClient, PeerSendService, Request};
-use serde::de::DeserializeOwned;
+use fube_ra::protocol::{FailoverUnitReply, GenerationHeader, GenerationUpdate};
+use furpc::{
+    header, ActorId, CodecError, DecodeBuf, Decoder, Error, FubstEncoder, HeaderRecord,
+    OneWayClient, PeerSendService, Request,
+};
+use serde::{de::DeserializeOwned, Serialize};
 use std::{
     future::{ready, Ready},
     marker::PhantomData,
@@ -18,20 +18,52 @@ use std::{
 use tokio::sync::oneshot;
 use tower_service::Service;
 
-pub(super) async fn send_prepared(
+pub(super) fn request<T>(
+    body: T,
+    action: &str,
+    actor: i64,
+    high_priority: bool,
+    generation: Option<&GenerationHeader>,
+) -> Result<Request<T>> {
+    #[derive(Serialize)]
+    struct Priority {
+        value: bool,
+    }
+    let mut request = Request::new(body)
+        .append_header(header::actor(ActorId::new(actor).map_err(err)?).map_err(err)?)
+        .map_err(err)?
+        .append_header(header::action(action).map_err(err)?)
+        .map_err(err)?
+        .append_header(
+            HeaderRecord::native(
+                header::HIGH_PRIORITY,
+                &Priority {
+                    value: high_priority,
+                },
+            )
+            .map_err(err)?,
+        )
+        .map_err(err)?;
+    if let Some(generation) = generation {
+        request = request
+            .append_header(generation.header().map_err(err)?)
+            .map_err(err)?;
+    }
+    Ok(request)
+}
+
+pub(super) async fn send<T: Serialize + Send>(
     link: &Link,
     client: &mut OneWayClient<PeerSendService>,
-    message: Message,
+    mut request: Request<T>,
 ) -> Result<()> {
-    let message = link.seal(message)?;
+    link.seal_headers(request.headers_mut())?;
     if !link.is_live() {
         return Err(err(Error::Closed));
     }
-    outbound(link.session.role(), &message, false).map_err(err)?;
-    let mut request = Request::new(message.body().clone());
-    *request.headers_mut() = message.headers().clone();
+    outbound_headers(link.session.role(), request.headers(), false).map_err(err)?;
     client
-        .send(request, PreparedEncoder, deadline())
+        .send(request, FubstEncoder::<T>::default(), deadline())
         .await
         .map(|_| ())
         .map_err(err)
@@ -299,7 +331,123 @@ mod tests {
         service_type_enabled_reply_message, ServiceTypeUpdateReply,
     };
     use furpc::Body;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use tokio::time::{sleep_until, Duration};
+
+    struct Counted {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl Serialize for Counted {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(serde::ser::Error::custom(
+                    "injected outbound encode failure",
+                ));
+            }
+            fube_ra::protocol::NodeDeactivateReply { sequence: 42 }.serialize(serializer)
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_send_encodes_only_when_polled_with_an_unexpired_deadline() {
+        use fube_ra::protocol::{decode_node_deactivate_reply, Owner, FM_ACTOR};
+
+        let (sender, receiver) = links(false).await;
+        let mut client = OneWayClient::new(PeerSendService::new(sender.session.peer.clone()))
+            .max_encoded_body_bytes(LIMIT)
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let body = Counted {
+            calls: calls.clone(),
+            fail: false,
+        };
+        let make_request = || request(&body, "NodeDeactivateReply", FM_ACTOR, false, None).unwrap();
+        let prepared = make_request();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(send(&sender, &mut client, prepared));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let mut expired = make_request();
+        expired.set_deadline(tokio::time::Instant::now() - Duration::from_secs(1));
+        assert!(send(&sender, &mut client, expired)
+            .await
+            .unwrap_err()
+            .contains("Timeout"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(receiver
+            .receive(tokio::time::Instant::now() + Duration::from_millis(5))
+            .await
+            .unwrap()
+            .is_none());
+
+        send(&sender, &mut client, make_request()).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let incoming = receiver.receive_checked(deadline()).await.unwrap().unwrap();
+        assert_eq!(
+            decode_node_deactivate_reply(&incoming.message).unwrap(),
+            (
+                fube_ra::protocol::NodeDeactivateReply { sequence: 42 },
+                Owner::Fm,
+            )
+        );
+        sender.close().await.unwrap();
+        receiver.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_send_guards_encoding_and_never_submits_failed_serialization() {
+        use fube_ra::protocol::{FM_ACTOR, RA_ACTOR};
+
+        let (sender, receiver) = links(false).await;
+        let mut client = OneWayClient::new(PeerSendService::new(sender.session.peer.clone()))
+            .max_encoded_body_bytes(LIMIT)
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut body = Counted {
+            calls: calls.clone(),
+            fail: false,
+        };
+        let invalid = request(&body, "GetLSN", RA_ACTOR, true, Some(&sender.generation())).unwrap();
+        assert!(send(&sender, &mut client, invalid).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        body.fail = true;
+        let invalid = request(&body, "NodeDeactivateReply", FM_ACTOR, false, None).unwrap();
+        let error = send(&sender, &mut client, invalid).await.unwrap_err();
+        assert!(error.contains("phase: \"encode\""), "{error}");
+        assert!(error.contains("InvalidPayload"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(sender.is_live());
+        assert!(receiver
+            .receive(tokio::time::Instant::now() + Duration::from_millis(5))
+            .await
+            .unwrap()
+            .is_none());
+
+        body.fail = false;
+        let valid = request(&body, "NodeDeactivateReply", FM_ACTOR, false, None).unwrap();
+        send(&sender, &mut client, valid).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        receiver.receive_checked(deadline()).await.unwrap().unwrap();
+
+        sender.retire();
+        let retired = request(&body, "NodeDeactivateReply", FM_ACTOR, false, None).unwrap();
+        assert!(send(&sender, &mut client, retired)
+            .await
+            .unwrap_err()
+            .contains("Closed"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        sender.close().await.unwrap();
+        receiver.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn original_one_way_context_rejects_retired_and_expired_decode_handoffs() {

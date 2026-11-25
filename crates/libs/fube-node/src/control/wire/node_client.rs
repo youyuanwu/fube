@@ -1,138 +1,152 @@
 //! FM-to-Node profiles; selection, generation advancement and retries stay in FM.
 use super::{err, one_way, Link, Result, Role, LIMIT};
 use fube_ra::protocol::*;
-use furpc::{Message, OneWayClient, PeerSendService};
+use furpc::{OneWayClient, PeerSendService, Request};
+use serde::Serialize;
 
-/// Opaque one-way action/body pairing prepared with the FM-selected generation.
-pub struct NodeRequest(Message);
+/// Typed one-way snapshot with its action and FM-selected generation.
+pub struct NodeRequest<T>(Request<T>);
 
-impl NodeRequest {
+impl<T: Clone> NodeRequest<T> {
+    fn new(
+        body: &T,
+        action: &str,
+        high_priority: bool,
+        generation: &GenerationHeader,
+    ) -> Result<Self> {
+        one_way::request(
+            body.clone(),
+            action,
+            RA_ACTOR,
+            high_priority,
+            Some(generation),
+        )
+        .map(Self)
+    }
+}
+
+impl NodeRequest<AddInstance> {
     pub fn add_instance(body: &AddInstance, generation: &GenerationHeader) -> Result<Self> {
-        add_instance_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "AddInstance", true, generation)
     }
 
     pub fn add_primary(body: &AddPrimary, generation: &GenerationHeader) -> Result<Self> {
-        add_primary_message(body, generation).map(Self).map_err(err)
+        Self::new(body, "AddPrimary", true, generation)
     }
 
     pub fn add_replica(body: &AddReplica, generation: &GenerationHeader) -> Result<Self> {
-        add_replica_message(body, generation).map(Self).map_err(err)
+        Self::new(body, "AddReplica", true, generation)
     }
 
     pub fn remove_replica(body: &RemoveReplica, generation: &GenerationHeader) -> Result<Self> {
-        remove_replica_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "RemoveReplica", true, generation)
     }
+}
 
+impl NodeRequest<RemoveInstance> {
     pub fn remove_instance(body: &RemoveInstance, generation: &GenerationHeader) -> Result<Self> {
-        remove_instance_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "RemoveInstance", true, generation)
     }
 
     pub fn delete_replica(body: &DeleteReplica, generation: &GenerationHeader) -> Result<Self> {
-        delete_replica_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "DeleteReplica", true, generation)
     }
+}
 
+impl NodeRequest<DoReconfiguration> {
     pub fn do_reconfiguration(
         body: &DoReconfiguration,
         generation: &GenerationHeader,
     ) -> Result<Self> {
-        do_reconfiguration_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "DoReconfiguration", true, generation)
     }
+}
 
+impl NodeRequest<FailoverUnitReply> {
     pub fn change_configuration_reply(
         body: &FailoverUnitReply,
         generation: &GenerationHeader,
     ) -> Result<Self> {
-        change_configuration_reply_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "ChangeConfigurationReply", true, generation)
     }
+}
 
+impl NodeRequest<AddInstanceReply> {
     pub fn replica_endpoint_updated_reply(
         body: &AddInstanceReply,
         generation: &GenerationHeader,
     ) -> Result<Self> {
-        replica_endpoint_updated_reply_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "ReplicaEndpointUpdatedReply", false, generation)
     }
+}
 
+impl NodeRequest<ReplicaUp> {
     pub fn replica_up_reply(body: &ReplicaUp, generation: &GenerationHeader) -> Result<Self> {
-        replica_up_reply_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "ReplicaUpReply", true, generation)
     }
+}
 
+impl NodeRequest<ServiceTypeNotificationReply> {
     pub fn service_type_notification_reply(
         body: &ServiceTypeNotificationReply,
         generation: &GenerationHeader,
     ) -> Result<Self> {
-        service_type_notification_reply_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "ServiceTypeNotificationReply", false, generation)
     }
+}
 
+impl NodeRequest<ServiceTypeUpdateReply> {
     pub fn service_type_enabled_reply(
         body: &ServiceTypeUpdateReply,
         generation: &GenerationHeader,
     ) -> Result<Self> {
-        service_type_enabled_reply_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "ServiceTypeEnabledReply", false, generation)
     }
 
     pub fn service_type_disabled_reply(
         body: &ServiceTypeUpdateReply,
         generation: &GenerationHeader,
     ) -> Result<Self> {
-        service_type_disabled_reply_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "ServiceTypeDisabledReply", false, generation)
     }
+}
 
+impl NodeRequest<NodeActivationRequest> {
     pub fn node_activate(
         body: &NodeActivateRequest,
         generation: &GenerationHeader,
     ) -> Result<Self> {
-        node_activate_request_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "NodeActivateRequest", false, generation)
     }
 
     pub fn node_deactivate(
         body: &NodeDeactivateRequest,
         generation: &GenerationHeader,
     ) -> Result<Self> {
-        node_deactivate_request_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "NodeDeactivateRequest", false, generation)
     }
+}
 
+impl NodeRequest<NodeUpdateServiceRequest> {
     pub fn node_update_service(
         body: &NodeUpdateServiceRequest,
         generation: &GenerationHeader,
     ) -> Result<Self> {
-        node_update_service_request_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        Self::new(body, "NodeUpdateServiceRequest", false, generation)
     }
+}
 
+impl NodeRequest<GenerationUpdate> {
     pub fn generation_update(
         body: &GenerationUpdate,
         generation: &GenerationHeader,
     ) -> Result<Self> {
-        generation_update_message(body, generation)
-            .map(Self)
-            .map_err(err)
+        if generation.for_fm_replica {
+            return Err(err(furpc::Error::Protocol(
+                "FMM generation control is not supported",
+            )));
+        }
+        Self::new(body, "GenerationUpdate", true, generation)
     }
 }
 
@@ -156,8 +170,8 @@ impl NodeClient {
     }
 
     /// Await the actual local-write receipt, not remote execution or a semantic ACK.
-    pub async fn send(&mut self, request: NodeRequest) -> Result<()> {
-        one_way::send_prepared(&self.link, &mut self.client, request.0).await
+    pub async fn send<T: Serialize + Send>(&mut self, request: NodeRequest<T>) -> Result<()> {
+        one_way::send(&self.link, &mut self.client, request.0).await
     }
 }
 
@@ -166,10 +180,15 @@ mod tests {
     use super::super::{deadline, decode, tests::links, PToP, PTOP};
     use super::*;
     use fubst::serde::ObjectArray;
-    use furpc::{header, MessageId};
+    use furpc::{header, Message, MessageId};
     use tokio::time::{Duration, Instant};
 
-    fn profiles(generation: &GenerationHeader) -> Vec<(NodeRequest, Message)> {
+    async fn profiles(
+        generation: &GenerationHeader,
+        client: &mut NodeClient,
+        node: &Link,
+        fm: &Link,
+    ) {
         let mut base = AddInstance::default();
         base.unit.id.guid.0 = [3; 16];
         base.replica.id = 41;
@@ -218,145 +237,157 @@ mod tests {
                 configuration: 107,
             },
         };
-        vec![
+        macro_rules! profiles {
+            ($(($request:expr, $expected:expr)),* $(,)?) => {
+                $(profile(client, node, fm, $request, $expected).await;)*
+            };
+        }
+        profiles![
             (
                 NodeRequest::add_instance(&base, generation).unwrap(),
-                add_instance_message(&base, generation).unwrap(),
+                add_instance_message(&base, generation).unwrap()
             ),
             (
                 NodeRequest::add_primary(&base, generation).unwrap(),
-                add_primary_message(&base, generation).unwrap(),
+                add_primary_message(&base, generation).unwrap()
             ),
             (
                 NodeRequest::add_replica(&base, generation).unwrap(),
-                add_replica_message(&base, generation).unwrap(),
+                add_replica_message(&base, generation).unwrap()
             ),
             (
                 NodeRequest::remove_replica(&base, generation).unwrap(),
-                remove_replica_message(&base, generation).unwrap(),
+                remove_replica_message(&base, generation).unwrap()
             ),
             (
                 NodeRequest::remove_instance(&removed, generation).unwrap(),
-                remove_instance_message(&removed, generation).unwrap(),
+                remove_instance_message(&removed, generation).unwrap()
             ),
             (
                 NodeRequest::delete_replica(&deleted, generation).unwrap(),
-                delete_replica_message(&deleted, generation).unwrap(),
+                delete_replica_message(&deleted, generation).unwrap()
             ),
             (
                 NodeRequest::do_reconfiguration(&configured, generation).unwrap(),
-                do_reconfiguration_message(&configured, generation).unwrap(),
+                do_reconfiguration_message(&configured, generation).unwrap()
             ),
             (
                 NodeRequest::change_configuration_reply(&changed, generation).unwrap(),
-                change_configuration_reply_message(&changed, generation).unwrap(),
+                change_configuration_reply_message(&changed, generation).unwrap()
             ),
             (
                 NodeRequest::replica_endpoint_updated_reply(&reply, generation).unwrap(),
-                replica_endpoint_updated_reply_message(&reply, generation).unwrap(),
+                replica_endpoint_updated_reply_message(&reply, generation).unwrap()
             ),
             (
                 NodeRequest::replica_up_reply(&report, generation).unwrap(),
-                replica_up_reply_message(&report, generation).unwrap(),
+                replica_up_reply_message(&report, generation).unwrap()
             ),
             (
                 NodeRequest::service_type_notification_reply(&notified, generation).unwrap(),
-                service_type_notification_reply_message(&notified, generation).unwrap(),
+                service_type_notification_reply_message(&notified, generation).unwrap()
             ),
             (
                 NodeRequest::service_type_enabled_reply(&status, generation).unwrap(),
-                service_type_enabled_reply_message(&status, generation).unwrap(),
+                service_type_enabled_reply_message(&status, generation).unwrap()
             ),
             (
                 NodeRequest::service_type_disabled_reply(&status, generation).unwrap(),
-                service_type_disabled_reply_message(&status, generation).unwrap(),
+                service_type_disabled_reply_message(&status, generation).unwrap()
             ),
             (
                 NodeRequest::node_activate(&activate, generation).unwrap(),
-                node_activate_request_message(&activate, generation).unwrap(),
+                node_activate_request_message(&activate, generation).unwrap()
             ),
             (
                 NodeRequest::node_deactivate(&activate, generation).unwrap(),
-                node_deactivate_request_message(&activate, generation).unwrap(),
+                node_deactivate_request_message(&activate, generation).unwrap()
             ),
             (
                 NodeRequest::node_update_service(&service, generation).unwrap(),
-                node_update_service_request_message(&service, generation).unwrap(),
+                node_update_service_request_message(&service, generation).unwrap()
             ),
             (
                 NodeRequest::generation_update(&update, generation).unwrap(),
-                generation_update_message(&update, generation).unwrap(),
+                generation_update_message(&update, generation).unwrap()
             ),
-        ]
+        ];
     }
 
     #[tokio::test]
     async fn fm_to_node_profiles_keep_native_bytes_headers_and_frozen_generation_on_local_write() {
         let (node, fm) = links(false).await;
         let original = fm.generation();
-        let requests = profiles(&original);
         let mut current = original.clone();
         current.number.generation += 3;
         fm.advance_generation(&current);
         let mut client = NodeClient::new(&fm).unwrap();
-        for (request, expected) in requests {
-            client.send(request).await.unwrap();
-            let incoming = node.receive_checked(deadline()).await.unwrap().unwrap();
-            let headers = incoming.message.headers();
-            let common = headers.effective();
-            assert!(!common.expects_reply);
-            assert!(!common.uncorrelated_reply);
-            assert_eq!(common.relates_to, MessageId::default());
-            assert_ne!(common.message_id, MessageId::default());
-            assert!(incoming.reply.is_none());
-            for header in expected.headers().records() {
-                assert_eq!(
-                    headers
-                        .records()
-                        .filter(|actual| actual.id() == header.id())
-                        .count(),
-                    1
-                );
-                assert_eq!(
-                    headers.first_raw(header.id()).unwrap().value(),
-                    header.value()
-                );
-            }
-            assert_eq!(
-                incoming
-                    .message
-                    .body()
-                    .segments()
-                    .flatten()
-                    .copied()
-                    .collect::<Vec<_>>(),
-                expected
-                    .body()
-                    .segments()
-                    .flatten()
-                    .copied()
-                    .collect::<Vec<_>>()
-            );
-            let source: PToP = decode(
-                headers
-                    .first_raw(furpc::HeaderId::new(PTOP).unwrap())
-                    .unwrap()
-                    .value(),
-            )
-            .unwrap();
-            assert_eq!(source.from, fm.local);
-            assert_eq!(source.to, node.local);
-            assert!(source.exact_instance);
-            assert!(headers.first_raw(header::EXPECTS_REPLY).is_none());
-        }
+        profiles(&original, &mut client, &node, &fm).await;
         assert_eq!(fm.generation(), current);
         assert_eq!(node.generation(), original);
         node.close().await.unwrap();
         fm.close().await.unwrap();
     }
 
+    async fn profile<T: Serialize + Send>(
+        client: &mut NodeClient,
+        node: &Link,
+        fm: &Link,
+        request: NodeRequest<T>,
+        expected: Message,
+    ) {
+        client.send(request).await.unwrap();
+        let incoming = node.receive_checked(deadline()).await.unwrap().unwrap();
+        let headers = incoming.message.headers();
+        let common = headers.effective();
+        assert!(!common.expects_reply);
+        assert!(!common.uncorrelated_reply);
+        assert_eq!(common.relates_to, MessageId::default());
+        assert_ne!(common.message_id, MessageId::default());
+        assert!(incoming.reply.is_none());
+        for header in expected.headers().records() {
+            assert_eq!(
+                headers
+                    .records()
+                    .filter(|actual| actual.id() == header.id())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                headers.first_raw(header.id()).unwrap().value(),
+                header.value()
+            );
+        }
+        assert_eq!(
+            incoming
+                .message
+                .body()
+                .segments()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            expected
+                .body()
+                .segments()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+        );
+        let source: PToP = decode(
+            headers
+                .first_raw(furpc::HeaderId::new(PTOP).unwrap())
+                .unwrap()
+                .value(),
+        )
+        .unwrap();
+        assert_eq!(source.from, fm.local);
+        assert_eq!(source.to, node.local);
+        assert!(source.exact_instance);
+        assert!(headers.first_raw(header::EXPECTS_REPLY).is_none());
+    }
+
     #[tokio::test]
-    async fn preparation_errors_do_not_submit_or_retire_and_old_clients_never_switch_links() {
+    async fn encoding_errors_do_not_submit_or_retire_and_old_clients_never_switch_links() {
         let (node, fm) = links(false).await;
         let generation = fm.generation();
         let mut client = NodeClient::new(&fm).unwrap();
@@ -421,6 +452,25 @@ mod tests {
         node.close().await.unwrap();
         successor_node.close().await.unwrap();
         successor_fm.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_keeps_its_typed_body_and_generation_snapshot_until_encoding() {
+        let (node, fm) = links(false).await;
+        let mut generation = fm.generation();
+        let mut body = AddInstance::default();
+        body.service.name = "fabric:/original".into();
+        let expected = (body.clone(), generation.clone());
+        let request = NodeRequest::add_instance(&body, &generation).unwrap();
+        body.service.name = "fabric:/changed".into();
+        generation.number.generation += 1;
+        fm.advance_generation(&generation);
+        assert_eq!(request.0.body(), &expected.0);
+        NodeClient::new(&fm).unwrap().send(request).await.unwrap();
+        let incoming = node.receive_checked(deadline()).await.unwrap().unwrap();
+        assert_eq!(decode_add_instance(&incoming.message).unwrap(), expected);
+        node.close().await.unwrap();
+        fm.close().await.unwrap();
     }
 
     #[tokio::test]

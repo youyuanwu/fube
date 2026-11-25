@@ -895,12 +895,13 @@ for independent wire fixtures and malformed-response checks.
 
 **Typed peer-control client:** the nine RA/RA CreateReplica, Activate, Deactivate,
 GetLSN and DoReconfiguration effect profiles now use a private OneWayClient over
-the original PeerSendService. Existing native factories retain action/body
-pairings, derived scopes, flags and the Adapter-selected generation; the prepared
-Body is adopted without another serialization. Original-Link source sealing,
-relationship policy, finite envelope bounds and terminal-session checks precede
-submission. Adapter still owns target matching, phase fences, queue removal,
-retry/retirement policy and semantic completion. Successful submission observes
+the original PeerSendService. Requests retain actual protocol DTOs until
+`FubstEncoder<T>` runs inside send, preserving native action/body pairings,
+derived scopes, flags and the Adapter-selected generation. Original-Link source
+sealing, relationship policy and terminal-session checks precede encoding;
+encoded-output bounds apply before submission. Adapter still owns target matching,
+phase fences, queue removal, retry/retirement policy and semantic completion.
+Successful submission observes
 and drops the actual local-write receipt, not a remote execution or semantic ACK.
 The client introduces no reconnect or generic furpc API.
 
@@ -915,12 +916,12 @@ This is typed consumer composition, not new peer protocol or native qualificatio
 
 **Typed FM-control client:** lifecycle replies, configuration/endpoint effects,
 ReplicaUp, service-type notifications/status and ReportLoad now use a private
-OneWayClient on the captured original PeerSendService. Existing native factories
-retain ordinary-FM actor/action/body pairings, priorities and the absence of an
-outgoing GenerationHeader; source sealing and relationship/envelope/terminal
-checks remain on the original Link. FM and peer clients share the prepared-body
-codec without reserialization. Adapter retains snapshot/generation fences, retry
-scheduling, captured-work completion, pending semantic ACKs and pop-on-success
+OneWayClient on the captured original PeerSendService. Typed requests retain
+ordinary-FM actor/action/body pairings, priorities and the absence of an outgoing
+GenerationHeader; source sealing and relationship/header/terminal checks remain
+on the original Link. FM and peer clients share direct bounded `FubstEncoder<T>`
+composition, without pre-encoding their bodies. Adapter retains snapshot/generation
+fences, retry scheduling, captured-work completion, pending semantic ACKs and pop-on-success
 queues. A successful send observes only the actual local-write receipt, including
 reply-named actions; it does not complete remote FM execution or semantic ACKs.
 No reconnect, new generic furpc API or native FM/Federation qualification is added.
@@ -939,7 +940,7 @@ authority is unchanged. This adds no protocol or native qualification claim.
 Node-side GenerationUpdate intake now shares the same budgeted payload decoder
 and native header checks, decoding its body once before ordinary-FM validation.
 GenerationUpdateReject uses a typed FM-client method on the original Link, sharing
-the prepared-body send path. It remains an uncorrelated one-way FM action with
+the direct typed send path. It remains an uncorrelated one-way FM action with
 the caller-selected proposal in its body and no GenerationHeader. Generation
 negotiation still bypasses ordinary receive-generation matching in Link;
 Ingress/Node retain proposal/readiness/staleness policy, Capacity-to-Retained
@@ -991,12 +992,17 @@ fresh native FM/Federation, TLS or deployed-readiness qualification.
 
 **Typed FM-to-Node client:** the FM manager's seventeen one-way command/ACK
 profiles now use `NodeClient` on the captured original `PeerSendService`.
-Opaque `NodeRequest` constructors retain the native factory action/body,
-priority and caller-selected GenerationHeader. Preparation stays separate from
-submission, preserving local factory-error handling and frozen generations;
-the shared prepared-body codec adopts the bytes without another serialization.
-Node, peer and FM one-way clients share the original-Link sealing, live-session
-and role/envelope checks and await the actual local-write receipt.
+`NodeRequest<T>` constructors retain an owned protocol DTO snapshot, the native
+action/priority and the caller-selected GenerationHeader, without encoding the
+body. FM reports and peer effects borrow their actual protocol DTOs until sending.
+All three paths pass those types directly to `FubstEncoder<T>` inside
+`OneWayClient::send`; ordinary outbound traffic no longer builds a pre-encoded
+Message or uses a prepared-body pass-through. Header/profile preparation stays
+separate from submission; body serialization errors are reported by send before
+transport submission, under its deadline and encoded-output limit.
+Node, peer and FM one-way clients share original-Link header sealing, live-session
+and role/header checks and await the actual local-write receipt. Byte-facing
+paths retain the same envelope policy, including their encoded-body bound.
 
 The manager still selects the destination and lifecycle profile, captures
 generations, schedules retries, gates mutations and retains semantic outcomes.

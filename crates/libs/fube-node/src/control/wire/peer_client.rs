@@ -2,13 +2,10 @@
 use super::{err, one_way, Link, Result, LIMIT};
 use fube_ra::{
     entity::Effect,
-    protocol::{
-        activate_message, activate_reply_message, create_replica_message,
-        create_replica_reply_message, deactivate_message, deactivate_reply_message,
-        do_reconfiguration_message, get_lsn_message, get_lsn_reply_message, GenerationHeader,
-    },
+    protocol::{GenerationHeader, RA_ACTOR},
 };
-use furpc::{Message, OneWayClient, PeerSendService};
+use furpc::{OneWayClient, PeerSendService};
+use serde::Serialize;
 
 pub(in crate::control) struct PeerClient {
     link: Link,
@@ -25,35 +22,47 @@ impl PeerClient {
         })
     }
 
-    fn prepare(effect: &Effect, generation: &GenerationHeader) -> Result<Message> {
-        match effect {
-            Effect::PeerCreateReplica { body, .. } => create_replica_message(body, generation),
-            Effect::PeerCreateReplicaReply { body, .. } => {
-                create_replica_reply_message(body, generation)
-            }
-            Effect::PeerActivate { body, .. } => activate_message(body, generation),
-            Effect::PeerActivateReply { body, .. } => activate_reply_message(body, generation),
-            Effect::PeerDeactivate { body, .. } => deactivate_message(body, generation),
-            Effect::PeerDeactivateReply { body, .. } => deactivate_reply_message(body, generation),
-            Effect::PeerContinueSwap { body, .. } => do_reconfiguration_message(body, generation),
-            Effect::PeerGetLsn { body, .. } => get_lsn_message(body, generation),
-            Effect::PeerGetLsnReply { body, .. } => get_lsn_reply_message(body, generation),
-            _ => return Err("unsupported peer control effect".into()),
-        }
-        .map_err(err)
-    }
-
     pub(in crate::control) async fn send(
         &mut self,
         effect: &Effect,
         generation: &GenerationHeader,
     ) -> Result<()> {
-        one_way::send_prepared(
-            &self.link,
-            &mut self.client,
-            Self::prepare(effect, generation)?,
-        )
-        .await
+        match effect {
+            Effect::PeerCreateReplica { body, .. } => {
+                self.send_body(body, "CreateReplica", generation).await
+            }
+            Effect::PeerCreateReplicaReply { body, .. } => {
+                self.send_body(body, "CreateReplicaReply", generation).await
+            }
+            Effect::PeerActivate { body, .. } => self.send_body(body, "Activate", generation).await,
+            Effect::PeerActivateReply { body, .. } => {
+                self.send_body(body, "ActivateReply", generation).await
+            }
+            Effect::PeerDeactivate { body, .. } => {
+                self.send_body(body, "Deactivate", generation).await
+            }
+            Effect::PeerDeactivateReply { body, .. } => {
+                self.send_body(body, "DeactivateReply", generation).await
+            }
+            Effect::PeerContinueSwap { body, .. } => {
+                self.send_body(body, "DoReconfiguration", generation).await
+            }
+            Effect::PeerGetLsn { body, .. } => self.send_body(body, "GetLSN", generation).await,
+            Effect::PeerGetLsnReply { body, .. } => {
+                self.send_body(body, "GetLSNReply", generation).await
+            }
+            _ => Err("unsupported peer control effect".into()),
+        }
+    }
+
+    async fn send_body<T: Serialize + Sync>(
+        &mut self,
+        body: &T,
+        action: &str,
+        generation: &GenerationHeader,
+    ) -> Result<()> {
+        let request = one_way::request(body, action, RA_ACTOR, true, Some(generation))?;
+        one_way::send(&self.link, &mut self.client, request).await
     }
 }
 
