@@ -1,4 +1,9 @@
-use crate::{manager::Manager, profile::*, Command};
+use crate::{
+    manager::Manager,
+    process_control::{frame, Lines},
+    profile::*,
+    Command,
+};
 use fube_local_host::process::OwnedApp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -8,7 +13,7 @@ use std::{
     process::Command as ProcessCommand,
     time::Duration,
 };
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 
 /// Private same-host deployment manifest, not an SF reliability message.
 #[derive(Serialize, Deserialize)]
@@ -31,6 +36,19 @@ pub(crate) enum Operation {
     Attach {
         index: usize,
         metadata: Metadata,
+    },
+    NodeOwner {
+        index: usize,
+    },
+    NodeDown {
+        index: usize,
+        receipt: NodeDownReceipt,
+    },
+    PrepareNodeRestart {
+        index: usize,
+    },
+    FinishNodeRestart {
+        index: usize,
     },
     Command {
         command: Command,
@@ -83,56 +101,24 @@ pub(crate) struct ShutdownState {
     pub hosts: Vec<HostCleanupOwner>,
 }
 
-struct Lines<R> {
-    input: R,
-    bytes: Vec<u8>,
-}
-impl<R: AsyncBufRead + Unpin> Lines<R> {
-    fn new(input: R) -> Self {
-        Self {
-            input,
-            bytes: Vec::new(),
-        }
-    }
-
-    async fn next(&mut self) -> Result<Option<Vec<u8>>> {
-        loop {
-            let chunk = self.input.fill_buf().await.map_err(err)?;
-            if chunk.is_empty() {
-                return if self.bytes.is_empty() {
-                    Ok(None)
-                } else {
-                    Err("truncated FM management frame".into())
-                };
-            }
-            let newline = chunk.iter().position(|byte| *byte == b'\n');
-            let count = newline.map_or(chunk.len(), |index| index + 1);
-            if self.bytes.len() + count > LIMIT {
-                return Err("FM management frame exceeds 64 KiB".into());
-            }
-            self.bytes.extend_from_slice(&chunk[..count]);
-            self.input.consume(count);
-            if newline.is_some() {
-                return Ok(Some(std::mem::take(&mut self.bytes)));
-            }
-        }
-    }
-}
-
-fn frame(value: &impl Serialize) -> Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec(value).map_err(err)?;
-    if bytes.len() >= LIMIT {
-        return Err("FM management frame exceeds 64 KiB".into());
-    }
-    bytes.push(b'\n');
-    Ok(bytes)
-}
-
 async fn operate(manager: &mut Manager, operation: Operation) -> Result<Value> {
     match operation {
         Operation::Attach { index, metadata } => {
             serde_json::to_value(manager.attach(index, metadata).await?).map_err(err)
         }
+        Operation::NodeOwner { index } => serde_json::to_value(
+            manager
+                .children
+                .get(index)
+                .and_then(|child| child.metadata.clone())
+                .ok_or("Node metadata is not admitted")?,
+        )
+        .map_err(err),
+        Operation::NodeDown { index, receipt } => manager.node_down(index, receipt).await,
+        Operation::PrepareNodeRestart { index } => {
+            serde_json::to_value(manager.prepare_node_restart(index).await?).map_err(err)
+        }
+        Operation::FinishNodeRestart { index } => manager.finish_node_restart(index).await,
         Operation::Command { command } => manager.execute(command).await,
         Operation::Status => Ok(Value::Null),
         Operation::Generation => manager.begin_generation_handshake(),
@@ -182,7 +168,7 @@ pub async fn run(path: &Path) -> Result<()> {
         .map(|path| read_json(path))
         .collect::<Result<Vec<Launch>>>()?;
     let mut manager = Manager::new(launches)?;
-    let mut lines = Lines::new(BufReader::new(tokio::io::stdin()));
+    let mut lines = Lines::new(BufReader::new(tokio::io::stdin()), LIMIT);
     let mut expected = 1u64;
     let serving = async {
         loop {
@@ -214,7 +200,7 @@ pub async fn run(path: &Path) -> Result<()> {
                 result,
                 status,
             };
-            let bytes = frame(&response)?;
+            let bytes = frame(&response, LIMIT)?;
             let stdout = std::io::stdout();
             let mut writer = stdout.lock();
             writer
@@ -261,9 +247,10 @@ impl Client {
         let (input, output) =
             OwnedApp::start_with_pipes(&mut self.process, command).map_err(err)?;
         self.input = Some(tokio::process::ChildStdin::from_std(input).map_err(err)?);
-        self.output = Some(Lines::new(BufReader::new(
-            tokio::process::ChildStdout::from_std(output).map_err(err)?,
-        )));
+        self.output = Some(Lines::new(
+            BufReader::new(tokio::process::ChildStdout::from_std(output).map_err(err)?),
+            LIMIT,
+        ));
         self.request(Operation::Status).await?;
         Ok(())
     }
@@ -339,7 +326,7 @@ impl Client {
             .ok_or("FM management sequence exhausted")?;
         let input = self.input.as_mut().ok_or("FM protocol stdin absent")?;
         input
-            .write_all(&frame(&Request { id, operation })?)
+            .write_all(&frame(&Request { id, operation }, LIMIT)?)
             .await
             .map_err(err)?;
         input.flush().await.map_err(err)?;
@@ -402,7 +389,7 @@ mod tests {
     async fn management_frames_retain_partial_input_and_reject_truncation_or_overflow() {
         use tokio::io::AsyncWriteExt;
         let (mut writer, reader) = tokio::io::duplex(128);
-        let mut lines = Lines::new(BufReader::new(reader));
+        let mut lines = Lines::new(BufReader::new(reader), LIMIT);
         writer.write_all(b"{\"id\":").await.unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(1), lines.next())
             .await
@@ -413,7 +400,7 @@ mod tests {
         drop(writer);
         assert!(lines.next().await.unwrap_err().contains("truncated"));
         let bytes = vec![b'x'; LIMIT + 1];
-        let mut lines = Lines::new(BufReader::new(bytes.as_slice()));
-        assert!(lines.next().await.unwrap_err().contains("64 KiB"));
+        let mut lines = Lines::new(BufReader::new(bytes.as_slice()), LIMIT);
+        assert!(lines.next().await.unwrap_err().contains("65536 bytes"));
     }
 }

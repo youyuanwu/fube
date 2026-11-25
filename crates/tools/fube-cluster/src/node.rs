@@ -1,6 +1,7 @@
 use crate::{
+    process_control::{NodeControl, NodeReader, NODE_CONTROL_LIMIT},
     profile::*,
-    wire::{self, Link},
+    wire::{self, Link, Target, Targets},
 };
 use fube_hosting::local::{Activation, NodeContext, Options};
 #[cfg(test)]
@@ -16,11 +17,7 @@ use fube_node::{
 use fube_ra::{entity as ra, protocol::*};
 use fube_ra_store::{MemoryBackend, Settings, Store};
 use std::{fs, path::Path, sync::Arc, time::Duration};
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    net::TcpListener,
-    time::Instant,
-};
+use tokio::{io::BufReader, net::TcpListener, time::Instant};
 
 struct PeerConnection {
     link: Option<Link>,
@@ -28,36 +25,12 @@ struct PeerConnection {
     dialed: bool,
 }
 
-async fn control_line(input: &mut BufReader<tokio::io::Stdin>) -> Result<Option<Vec<u8>>> {
-    let mut line = Vec::new();
-    loop {
-        let buffer = input.fill_buf().await.map_err(err)?;
-        if buffer.is_empty() {
-            return if line.is_empty() {
-                Ok(None)
-            } else {
-                Err("truncated owner control".into())
-            };
-        }
-        let count = buffer
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(buffer.len(), |i| i + 1);
-        if line.len() + count > 256 {
-            return Err("owner control capacity".into());
-        }
-        line.extend_from_slice(&buffer[..count]);
-        input.consume(count);
-        if line.last() == Some(&b'\n') {
-            return Ok(Some(line));
-        }
-    }
-}
+mod peers;
 
 pub async fn run(config: &Path) -> Result<()> {
-    let launch: Launch = read_json(config)?;
+    let mut launch: Launch = read_json(config)?;
     launch.validate()?;
-    let result = run_owned(&launch).await;
+    let result = run_owned(&mut launch).await;
     if result.is_err()
         && !launch.directory.join("activation-acquired.json").exists()
         && unsafe { libc::getppid() } as u32 == launch.parent_pid
@@ -86,11 +59,26 @@ pub async fn run(config: &Path) -> Result<()> {
     }
     result
 }
-async fn run_owned(launch: &Launch) -> Result<()> {
+async fn run_owned(launch: &mut Launch) -> Result<()> {
     if unsafe { libc::getppid() } as u32 != launch.parent_pid {
         return Err("internal node requires original launcher parent".into());
     }
-    let ingress = launch.ingress()?;
+    let mut ingress = launch.ingress()?;
+    let mut routes = vec![Target::new(
+        launch.fm.clone(),
+        wire::Role::Node,
+        None,
+        launch.generation.clone(),
+    )?];
+    for peer in &launch.peers {
+        routes.push(Target::new(
+            peer.node.clone(),
+            wire::Role::Peer,
+            None,
+            launch.generation.clone(),
+        )?);
+    }
+    let mut targets = Targets::new(launch.node.clone(), routes)?;
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
     let address = listener.local_addr().map_err(err)?;
     let mut peer_listeners = vec![];
@@ -112,55 +100,29 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         profile: None,
     };
     write_json(&launch.directory.join("listener.json"), &metadata)?;
-    let mut control = BufReader::with_capacity(256, tokio::io::stdin());
-    let admission = tokio::time::timeout(Duration::from_secs(20), control_line(&mut control))
+    let mut control = NodeReader::new(BufReader::with_capacity(
+        NODE_CONTROL_LIMIT,
+        tokio::io::stdin(),
+    ));
+    let admission = tokio::time::timeout(Duration::from_secs(20), control.next(launch))
         .await
         .map_err(err)??
         .ok_or("owner vanished before admission")?;
-    if admission != format!("admit {} {}\n", launch.session, launch.capability).as_bytes() {
-        return Err("wrong one-use local launch capability".into());
+    if !matches!(admission, NodeControl::Admit {}) {
+        return Err("Node startup requires one-use launch admission".into());
     }
     let (stream, _) = tokio::time::timeout(Duration::from_secs(20), listener.accept())
         .await
         .map_err(err)?
         .map_err(err)?;
     drop(listener); // Exactly one original session; no reconnect listener.
-    let channel = wire::accept(stream, wire::Role::Node, wire::deadline())
-        .await
-        .map_err(err)?;
-    let link = Link::new(
-        channel,
-        launch.node.clone(),
-        launch.fm.clone(),
-        launch.generation.clone(),
-    )?;
+    let link = targets.accept(&launch.fm, stream, wire::deadline()).await?;
     let fabric = FabricVersionInstance::native_default();
-    let up = NodeUp::fresh_stateless(
-        launch.name(),
-        "fube-cluster-local".into(),
-        address,
-        fabric.clone(),
-    )
-    .map_err(err)?;
-    let (ack, generation) = link.node_up(&up).await?;
-    ack.validate_fresh_activated(&fabric).map_err(err)?;
-    if generation != launch.generation {
-        return Err("foreign/stale NodeUpAck generation".into());
-    }
-    let final_upload = ReplicaUp {
-        last: true,
-        ..ReplicaUp::default()
-    };
-    link.replica_up(&final_upload).await?;
-    let incoming = link
-        .receive(wire::deadline())
-        .await?
-        .ok_or("final upload reply timeout")?;
-    let (uploaded, generation) = incoming.replica_up_reply(&link)?;
-    if uploaded != final_upload || generation != launch.generation {
-        link.retire();
-        return Err("foreign/stale/nonfinal bootstrap upload reply".into());
-    }
+    let up = NodeUp::fresh_stateless(launch.name(), "fube-cluster-local".into(), address, fabric)
+        .map_err(err)?;
+    let (ack, generation) = targets
+        .bootstrap_fresh(&launch.fm, &up, Instant::now() + Duration::from_secs(20))
+        .await?;
     // No RA/Hosting/process authority exists until BOTH native semantic
     // bootstrap exchanges completed for this original session.
     private_dir(&launch.directory.join("hosting"))?;
@@ -277,6 +239,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut published_host_replacements: usize = 0;
     let mut upload = LfumUploadState::default();
     let mut fm_incoming = None;
+    let mut pending_peer_update = None;
     if failure.is_none() {
         loop {
             // Owned stop remains independent of FM connectivity. Link loss is
@@ -287,26 +250,33 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         adapter.record_error(error);
                     }
                 }
-                control = control_line(&mut control) => {
+                control = control.next(launch) => {
                     match control {
-                        Ok(Some(line)) if line == format!("stop {}\n", launch.capability).as_bytes() => break,
-                        Ok(Some(line)) => {
-                            let command = std::str::from_utf8(&line).map_err(err);
-                            let command = command.as_ref().map(|line| line.split_whitespace().collect::<Vec<_>>());
+                        Ok(Some(NodeControl::Stop {})) => break,
+                        Ok(Some(command)) => {
                             match command {
-                                Ok(parts) if parts.len() == 5 && parts[0] == "replace-host"
-                                    && parts[1] == launch.session && parts[2] == launch.capability
-                                    && launch.profile.mesh_peers() => {
-                                    let identity = parts[3].parse::<i64>().and_then(|id| {
-                                        parts[4].parse::<i64>().map(|instance| (id, instance))
-                                    });
-                                    let identity = match identity {
-                                        Ok(identity) => identity,
-                                        Err(error) => {
-                                            failure = Some(format!("invalid replacement predecessor: {error}"));
-                                            break;
-                                        }
-                                    };
+                                NodeControl::PeerDown { slot, instance } if launch.profile.mesh_peers() => {
+                                    if slot >= connections.len() {
+                                        failure = Some("peer control slot is outside the configured topology".into());
+                                        break;
+                                    }
+                                    if let Err(error) = peers::fence(launch, slot, instance, &mut node, &mut adapter, &mut connections).await {
+                                        failure = Some(error); break;
+                                    }
+                                }
+                                NodeControl::PeerUpdate { slot, instance } if launch.profile.mesh_peers() => {
+                                    if slot >= connections.len() {
+                                        failure = Some("peer control slot is outside the configured topology".into());
+                                        break;
+                                    }
+                                    if pending_peer_update.is_some() {
+                                        failure = Some("another peer incarnation update is pending".into());
+                                        break;
+                                    }
+                                    pending_peer_update = Some((slot, instance));
+                                }
+                                NodeControl::ReplaceHost { replica, instance } if launch.profile.mesh_peers() => {
+                                    let identity = (replica, instance);
                                     if !repaired_hosts.contains(&identity) {
                                         let current = uuid::Uuid::parse_str(&launch.partition).ok()
                                             .and_then(|id| node.snapshot(id.to_bytes_le()).committed);
@@ -320,39 +290,28 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                                         repair_requested = Some(identity);
                                     }
                                 }
-                                Ok(parts) if matches!(parts.len(), 4 | 5) && parts[0] == "peer"
-                                    && parts[1] == launch.session && parts[2] == launch.capability
-                                    && (launch.placement == 1 || launch.profile.mesh_peers()) && !launch.peers.is_empty() => {
-                                    let index = if parts.len() == 5 {
-                                        match parts[3].parse::<usize>() {
-                                            Ok(index) => index,
-                                            Err(error) => {
-                                                failure = Some(format!("invalid original peer index: {error}"));
-                                                break;
-                                            }
-                                        }
-                                    } else { 0 };
-                                    let Some(connection) = connections.get_mut(index).filter(|c| !c.dialed) else {
+                                NodeControl::DialPeer { slot, address }
+                                    if (launch.placement == 1 || launch.profile.mesh_peers()) && !launch.peers.is_empty() => {
+                                    let Some(connection) = connections.get_mut(slot).filter(|c| !c.dialed) else {
                                         failure = Some("invalid or already dialed original peer".into());
                                         break;
                                     };
                                     connection.dialed = true;
-                                    peer_listeners[index].take();
-                                    match dial_peer_to(launch, &launch.peers[index], parts[parts.len() - 1]).await {
+                                    peer_listeners[slot].take();
+                                    match dial_peer_target(&mut targets, &launch.peers[slot], address).await {
                                         Ok(link) => connection.link = Some(link),
                                         Err(error) => adapter.record_peer_error(error),
                                     }
                                 }
-                                Ok(parts) if parts.len() == 3 && matches!(parts[0], "create-idle" | "build-idle" | "remove-idle")
-                                    && parts[1] == launch.session && parts[2] == launch.capability
-                                    && launch.placement == 1 && !launch.peers.is_empty() => {
+                                command @ (NodeControl::CreateIdle {} | NodeControl::BuildIdle {} | NodeControl::RemoveIdle {})
+                                    if launch.placement == 1 && !launch.peers.is_empty() => {
                                     let submitted = if adapter.peer_commands().len() == 32 {
                                         Err("peer command receipt capacity".into())
                                     } else {
-                                        match parts[0] {
-                                            "create-idle" => create_idle(launch, &mut node),
-                                            "build-idle" => node.build_idle_on_peer().map_err(err),
-                                            "remove-idle" => node.remove_idle_on_peer().map_err(err),
+                                        match command {
+                                            NodeControl::CreateIdle {} => create_idle(launch, &mut node),
+                                            NodeControl::BuildIdle {} => node.build_idle_on_peer().map_err(err),
+                                            NodeControl::RemoveIdle {} => node.remove_idle_on_peer().map_err(err),
                                             _ => unreachable!(),
                                         }
                                     };
@@ -362,13 +321,13 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                                     }
                                 }
                                 _ => {
-                                    failure = Some("invalid original owner control".into());
+                                    failure = Some("Node control is not admitted in the current phase/profile".into());
                                     break;
                                 }
                             }
                         }
                         Ok(None) => { failure = Some("original owner control closed".into()); break; },
-                        other => { failure = Some(format!("invalid original owner control: {other:?}")); break; },
+                        Err(error) => { failure = Some(error); break; },
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(2)) => {},
@@ -378,7 +337,10 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     match tokio::time::timeout(Duration::from_millis(1), listener.accept()).await {
                         Ok(Ok((stream, _))) => {
                             listener_slot.take();
-                            match accept_peer_from(launch, &launch.peers[index], stream).await {
+                            match targets
+                                .accept(&launch.peers[index].node, stream, wire::deadline())
+                                .await
+                            {
                                 Ok(link) => connections[index].link = Some(link),
                                 Err(error) => adapter.record_peer_error(error),
                             }
@@ -394,6 +356,29 @@ async fn run_owned(launch: &Launch) -> Result<()> {
             if let Err(error) = node.drive() {
                 failure = Some(err(error));
                 break;
+            }
+            if let Some((slot, instance)) = pending_peer_update {
+                match peers::replace(
+                    launch,
+                    (slot, instance),
+                    &mut node,
+                    &mut adapter,
+                    &mut targets,
+                    &mut connections,
+                    &mut peer_listeners,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        ingress = launch.ingress()?;
+                        pending_peer_update = None;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
             }
             if let Err(error) = upload.advance(
                 &node,
@@ -414,7 +399,9 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 .front()
                 .and_then(|reply| peer_target(&reply.effect))
                 .and_then(|target| launch.peers.iter().position(|peer| &peer.node == target));
-            let selected_link = selected_peer.and_then(|index| connections[index].link.as_ref());
+            let selected_link = selected_peer
+                .and_then(|index| connections[index].link.as_ref())
+                .filter(|link| link.is_live());
             if let Err(error) = adapter
                 .advance_with_peer(
                     &mut node,
@@ -454,7 +441,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             }
                         }
                     }
-                    if adapter.peer_error().is_some() {
+                    if !current.is_live() {
                         if let Some(old) = connection.link.take() {
                             let _ = old.close().await;
                         }
@@ -763,7 +750,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
 }
 
 #[cfg(test)]
-async fn dial_peer(launch: &Launch, address: &str) -> Result<Link> {
+async fn dial_peer(launch: &Launch, address: std::net::SocketAddr) -> Result<Link> {
     dial_peer_to(
         launch,
         launch.peers.first().ok_or("no original peer binding")?,
@@ -771,18 +758,30 @@ async fn dial_peer(launch: &Launch, address: &str) -> Result<Link> {
     )
     .await
 }
-async fn dial_peer_to(launch: &Launch, peer: &Peer, address: &str) -> Result<Link> {
-    let address: std::net::SocketAddr = address.parse().map_err(err)?;
+#[cfg(test)]
+async fn dial_peer_to(launch: &Launch, peer: &Peer, address: std::net::SocketAddr) -> Result<Link> {
+    let mut targets = Targets::new(
+        launch.node.clone(),
+        vec![Target::new(
+            peer.node.clone(),
+            wire::Role::Peer,
+            None,
+            launch.generation.clone(),
+        )?],
+    )?;
+    dial_peer_target(&mut targets, peer, address).await
+}
+
+async fn dial_peer_target(
+    targets: &mut Targets,
+    peer: &Peer,
+    address: std::net::SocketAddr,
+) -> Result<Link> {
     if !address.ip().is_loopback() || address.port() == 0 {
         return Err("peer requires original numeric loopback listener".into());
     }
-    let channel = wire::connect(address, wire::Role::Peer, wire::deadline()).await?;
-    Link::new_peer(
-        channel,
-        launch.node.clone(),
-        peer.node.clone(),
-        launch.generation.clone(),
-    )
+    targets.set_address(&peer.node, address)?;
+    targets.connect(&peer.node, wire::deadline()).await
 }
 
 #[cfg(test)]
@@ -794,20 +793,22 @@ async fn accept_peer(launch: &Launch, stream: tokio::net::TcpStream) -> Result<L
     )
     .await
 }
+#[cfg(test)]
 async fn accept_peer_from(
     launch: &Launch,
     peer: &Peer,
     stream: tokio::net::TcpStream,
 ) -> Result<Link> {
-    let channel = wire::accept(stream, wire::Role::Peer, wire::deadline())
-        .await
-        .map_err(err)?;
-    Link::new_peer(
-        channel,
+    let mut targets = Targets::new(
         launch.node.clone(),
-        peer.node.clone(),
-        launch.generation.clone(),
-    )
+        vec![Target::new(
+            peer.node.clone(),
+            wire::Role::Peer,
+            None,
+            launch.generation.clone(),
+        )?],
+    )?;
+    targets.accept(&peer.node, stream, wire::deadline()).await
 }
 
 fn create_idle(launch: &Launch, node: &mut Node) -> Result<u64> {
@@ -3583,9 +3584,9 @@ pub(crate) mod report_tests {
                 return Err("unexpected original peer effect".into());
             };
             let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
-            let address = listener.local_addr().map_err(err)?.to_string();
+            let address = listener.local_addr().map_err(err)?;
             let (source_link, target_link) =
-                tokio::join!(dial_peer(&launches[0], &address), async {
+                tokio::join!(dial_peer(&launches[0], address), async {
                     let (stream, _) = listener.accept().await.map_err(err)?;
                     accept_peer(&launches[1], stream).await
                 });
@@ -4745,9 +4746,9 @@ pub(crate) mod report_tests {
                 return Err("Primary mutation did not complete".into());
             }
             let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
-            let address = listener.local_addr().map_err(err)?.to_string();
+            let address = listener.local_addr().map_err(err)?;
             let (source_link, target_link) = tokio::join!(
-                dial_peer(&launches[0], &address),
+                dial_peer(&launches[0], address),
                 async {
                     let (stream, _) = listener.accept().await.map_err(err)?;
                     accept_peer(&launches[1], stream).await

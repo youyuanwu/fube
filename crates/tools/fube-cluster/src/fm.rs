@@ -11,6 +11,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::Instant;
 
+mod node_lifecycle;
+pub(crate) use node_lifecycle::NodeFailure;
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Command {
@@ -31,6 +34,7 @@ impl Command {
             return Err("operation identity must be 1..64 ASCII identifier bytes".into());
         }
         match (self.action.as_str(), self.node) {
+            ("node-down" | "restart-node", Some(1..=64)) => Ok(()),
             ("create" | "delete" | "activate" | "deactivate", Some(1 | 2)) | ("status" | "quit", None) => Ok(()),
             _ => Err("expected create/delete/activate/deactivate with node 1|2, or status/quit without node".into()),
         }
@@ -51,6 +55,7 @@ pub enum Observed {
     Lost,
     Unknown,
     Error,
+    Down,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Bootstrap {
@@ -99,6 +104,7 @@ pub struct Placement {
     pub reusable: bool,
     pub retirement: Option<RetirementReceipt>,
     pub loss_reported: bool,
+    pub(crate) node_down: Option<crate::profile::NodeDownReceipt>,
     remove_received: bool,
     pending: Option<PendingPhase>,
     action_updated_at: Option<Instant>,
@@ -125,6 +131,8 @@ pub struct Ledger {
     pub(crate) repair: Option<ReplicaRepair>,
     pub(crate) repair_history: Vec<ReplicaRepair>,
     restoration: Option<[AddInstance; 2]>,
+    pub(crate) node_failures: Vec<NodeFailure>,
+    node_reconfiguration: Option<Epoch>,
 }
 pub(crate) struct ReplicaRepair {
     pub predecessor: AddInstance,
@@ -387,6 +395,7 @@ impl Placement {
             reusable: false,
             retirement: None,
             loss_reported: false,
+            node_down: None,
             remove_received: false,
             pending: None,
             action_updated_at: None,
@@ -539,11 +548,16 @@ impl Placement {
             "desired": self.desired, "observed": self.observed,
             "endpoint": self.endpoint, "created_lifetime": self.created,
             "link_alive": self.link_alive, "error": self.error,
+            "node_down": self.node_down.as_ref().map(|proof| json!({
+                "instance":proof.node.instance,"session":proof.session,
+                "node_pid":proof.node_pid,"fenced":proof.node_group_drained && proof.app_group_drained
+            })),
             "catalog_notified": self.catalog_notified,
             "reusable":self.reusable, "retired_lifetimes":self.retired.len(),
             "retirement":self.retirement,
             "loss_reported":self.loss_reported, "native_replica_deleted":self.remove_received,
             "activated":self.activated, "activation_sequence":self.activation_sequence,
+            "admitted":self.bootstrap == Bootstrap::Admitted,
             "node_control_pending":self.node_control,
             "type_enabled":self.type_enabled, "type_sequence":self.type_sequence,
             "service_update_version":self.service_description.as_ref().map(|s| s.update_version),
@@ -647,7 +661,11 @@ impl Ledger {
     }
 
     fn primary_transition_live(&self) -> bool {
-        if self.placements[0]
+        if self.node_reconfiguration.is_some_and(|epoch| {
+            self.swap
+                .as_ref()
+                .is_some_and(|swap| swap.body.configuration.unit.current == epoch)
+        }) || self.placements[0]
             .launch
             .profile
             .configured_sizes()
@@ -2723,10 +2741,17 @@ impl Ledger {
             repair: None,
             repair_history: Vec::new(),
             restoration: None,
+            node_failures: Vec::new(),
+            node_reconfiguration: None,
         }
     }
     pub fn accept(&mut self, command: Command) -> Result<Accepted> {
         command.validate()?;
+        if matches!(command.action.as_str(), "node-down" | "restart-node") {
+            return Err(
+                "Node controls require the original process supervisor and fencing proof".into(),
+            );
+        }
         if command
             .node
             .is_some_and(|node| usize::from(node) > self.placements.len())
@@ -3494,6 +3519,11 @@ impl Ledger {
             "configuration":self.configuration_status(),
             "repair":self.repair_status(),
             "generation_handshake": self.generation.as_ref().map(GenerationHandshake::status),
+            "node_failures":self.node_failures.iter().map(|failure| json!({
+                "node":failure.index + 1,"instance":failure.receipt.node.instance,
+                "session":failure.receipt.session,"recovery_error":failure.recovery_error,
+                "replacement_instance":failure.replacement.as_ref().map(|launch| launch.node.instance)
+            })).collect::<Vec<_>>(),
             "operations":self.operations.iter().map(|op|
                 if op.command.action == "status" {
                     json!({"op":op.command.op,"state":op.outcome["state"],"kind":"status"})
@@ -5113,6 +5143,10 @@ impl Ledger {
     }
     fn swap_reply(&mut self, index: usize, body: ConfigurationReply) -> Result<()> {
         let failover = self.primary_failover();
+        let same_primary_node_down = !failover
+            && self.swap.as_ref().is_some_and(|swap| {
+                self.node_reconfiguration == Some(swap.body.configuration.unit.current)
+            });
         let live = self.primary_transition_live();
         let primary = self.transition_primary_index();
         let lost = self.failed_primary_index();
@@ -5191,7 +5225,12 @@ impl Ledger {
             actual.service_endpoint = expected.service_endpoint.clone();
             if actual != *expected
                 || r.previous_role != 1
-                || (r.up && (r.first_lsn < 0 || r.last_lsn < 0))
+                || (r.up
+                    && if same_primary_node_down {
+                        r.first_lsn != expected.first_lsn || r.last_lsn != expected.last_lsn
+                    } else {
+                        r.first_lsn < 0 || r.last_lsn < 0
+                    })
             {
                 return Ok(());
             }
@@ -5261,7 +5300,7 @@ impl Ledger {
             } else {
                 "pending"
             };
-            return json!({"state":state,"ready":state == "ready","kind":if self.primary_failover() {"primary_failover"} else {"planned_primary_transfer"},
+            return json!({"state":state,"ready":state == "ready","kind":if self.node_reconfiguration == Some(swap.body.configuration.unit.current) {"node_down_reconfiguration"} else if self.primary_failover() {"primary_failover"} else {"planned_primary_transfer"},
                 "request":{"configuration":swap.body.configuration,"phase0_duration":swap.body.phase0_duration},
                 "reply":swap.reply,"endpoint_update":self.swap_endpoint,"primary_transfer":true,
                 "from":self.placements.iter().position(|p| swap.body.configuration.replicas.0.iter()

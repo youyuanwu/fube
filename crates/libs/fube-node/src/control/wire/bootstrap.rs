@@ -201,15 +201,23 @@ fn reserve(budget: &mut usize, bytes: usize) -> fubst::Result<()> {
 
 impl Link {
     pub async fn node_up(&self, body: &NodeUp) -> Result<(NodeUpAck, GenerationHeader)> {
-        let (ack, generation) = self
-            .bootstrap(
-                one_way::request(body, "NodeUp", FM_ACTOR, true, None)?,
-                FubstEncoder::<&NodeUp>::default(),
-                Method::NodeUp,
-            )
+        self.node_up_optional(body)
             .await?
-            .ok_or("native request reply timeout")?;
-        Ok((ack, generation.ok_or("NodeUpAck missing generation")?))
+            .ok_or("native request reply timeout".into())
+    }
+
+    pub(super) async fn node_up_optional(
+        &self,
+        body: &NodeUp,
+    ) -> Result<Option<(NodeUpAck, GenerationHeader)>> {
+        self.bootstrap(
+            one_way::request(body, "NodeUp", FM_ACTOR, true, None)?,
+            FubstEncoder::<&NodeUp>::default(),
+            Method::NodeUp,
+        )
+        .await?
+        .map(|(ack, generation)| Ok((ack, generation.ok_or("NodeUpAck missing generation")?)))
+        .transpose()
     }
 
     pub async fn lfum_upload(

@@ -80,7 +80,34 @@ it is not a failed-write receipt for work never submitted.
 | Shared one-way adaptation | [one_way.rs](../../../../crates/libs/fube-node/src/control/wire/one_way.rs) | Header preparation/sealing and typed body adaptation stay separate. |
 | Bootstrap clients | [bootstrap.rs](../../../../crates/libs/fube-node/src/control/wire/bootstrap.rs) | NodeUp/LFUMUpload use DTOs; GenerationProposal uses explicit bodyless encoding; reply decoding reads actual headers. |
 | Bootstrap replies | [bootstrap/server.rs](../../../../crates/libs/fube-node/src/control/wire/bootstrap/server.rs) | Reply DTO/unit encoding remains inside the original guarded response handoff. |
+| Logical target routing and fresh bootstrap | [targets.rs](../../../../crates/libs/fube-node/src/control/wire/targets.rs) | Configured exact Node instances reuse accepted or outgoing Links; connection acquisition never replays submitted work or admits a Node. |
 | Link authority and session ownership | [wire.rs](../../../../crates/libs/fube-node/src/control/wire.rs), [session.rs](../../../../crates/libs/fube-node/src/control/wire/session.rs) | Address/header edits cannot recreate original Link authority or move work between generations. |
+
+Both launcher compositions use the same target/session policy for FM and peer
+relationships. TCP initiation is separate from application direction: NodeUp is
+always Node-to-FM, including when the FM opens the socket. Fresh bootstrap retries
+a missing NodeUp ACK with a new request identity and requires the matching final
+empty inventory ACK before returning to the local Node admission path.
+
+The configured target set is fixed and caller-driven, with one live Link per
+target. Duplicate live connections reject explicitly. Fresh connection demand
+can replace a failed physical generation for the same exact Node instance;
+existing Links and invocations never retarget. A higher Node incarnation requires
+explicit owner-driven replacement after fencing. The target layer joins the old
+transport but cannot prove process termination or reconcile replica inventory.
+ListenInstance advertisements are not configuration or identity credentials.
+The [target tests](../../../../crates/libs/fube-node/src/control/wire/targets/tests.rs)
+exercise both TCP directions, bootstrap retry, reconnect without replay,
+generation continuity, and stale-capability rejection.
+
+Transport-only loss retains domain uncertainty. The local cluster's explicit
+[NodeDown/restart owner](../../../../crates/tools/fube-cluster/src/restart.rs)
+can provide physical fencing evidence, drive FM reconfiguration, and admit a
+fresh incarnation. The standalone runner retains its original-session loss
+gate. Shared target replacement itself does not provide failure detection,
+automatic restart, process adoption, Federation membership, or durable RA recovery.
+Cluster [parent controls](../../../../crates/tools/fube-cluster/src/process_control.rs)
+are typed private process messages, separate from native FM/RA transport.
 
 LFUM inventory is a domain-owned frozen DTO snapshot. Each call encodes under
 its current operation deadline; serialization failure occurs before native

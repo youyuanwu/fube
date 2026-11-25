@@ -981,6 +981,13 @@ impl Node {
     pub fn bind_peers(&self, sources: Vec<NodeInstance>) -> Result<()> {
         Ok(self.ra.bind_peers(sources)?)
     }
+    pub fn replace_peer_after_fencing(
+        &self,
+        previous: &NodeInstance,
+        replacement: NodeInstance,
+    ) -> Result<()> {
+        Ok(self.ra.replace_peer_after_fencing(previous, replacement)?)
+    }
     pub fn create_idle_on_peer(&mut self, replica: Replica) -> Result<u64> {
         if !self.fm_primary_profile()
             || !self.live.load(Ordering::SeqCst)

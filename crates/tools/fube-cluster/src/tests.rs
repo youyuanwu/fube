@@ -818,7 +818,7 @@ fn lfum_reconciliation_requires_both_exact_inventories_and_retains_duplicate_rec
     assert!(ledger.begin_generation().is_err());
 }
 
-fn launches() -> [Launch; 2] {
+pub(super) fn launches() -> [Launch; 2] {
     [1, 2].map(|placement| Launch {
         profile: ServiceProfile::Stateless,
         remote_replica_progress_query_wait_ms: fube_ra::entity::Settings::default().remote_replica_progress_query_wait_ms,
@@ -907,6 +907,63 @@ async fn typed_fm_manager() -> (Manager, Vec<wire::Link>) {
         });
     }
     (manager, nodes)
+}
+
+#[tokio::test]
+async fn repeated_native_node_up_preserves_bootstrap_progress_and_current_activation() {
+    let (mut manager, nodes) = typed_fm_manager().await;
+    let launch = manager.children[0].launch.clone();
+    let address = "127.0.0.1:12345".parse().unwrap();
+    manager.children[0].metadata = Some(Metadata {
+        deployment: launch.deployment.clone(),
+        session: launch.session.clone(),
+        node: launch.node.clone(),
+        pid: 555,
+        address,
+        peer_address: None,
+        peer_addresses: vec![],
+        profile: None,
+    });
+    manager.ledger.placements[0].bootstrap = Bootstrap::NodeUp;
+    let body = NodeUp::fresh_stateless(
+        launch.name(),
+        "fube-cluster-local".into(),
+        address,
+        FabricVersionInstance::native_default(),
+    )
+    .unwrap();
+    for (phase, activated, sequence) in [
+        (Bootstrap::NodeUp, true, 1),
+        (Bootstrap::FinalUpload, true, 1),
+        (Bootstrap::Admitted, false, 42),
+    ] {
+        manager.ledger.placements[0].bootstrap = phase.clone();
+        manager.ledger.placements[0].activated = activated;
+        manager.ledger.placements[0].activation_sequence = sequence;
+        let link = manager.children[0].link.as_ref().unwrap().clone();
+        let (reply, result) = tokio::join!(nodes[0].node_up(&body), async {
+            let incoming = link.receive(wire::deadline()).await.unwrap().unwrap();
+            manager.receive_message(0, incoming).await
+        });
+        result.unwrap();
+        let (ack, generation) = reply.unwrap();
+        assert_eq!((ack.activated, ack.activation_sequence), (activated, sequence));
+        assert_eq!(generation, launch.generation);
+        assert_eq!(
+            manager.ledger.placements[0].bootstrap,
+            if phase == Bootstrap::NodeUp {
+                Bootstrap::FinalUpload
+            } else {
+                phase
+            }
+        );
+        assert_eq!(manager.ledger.placements[0].activated, activated);
+        assert_eq!(manager.ledger.placements[0].activation_sequence, sequence);
+    }
+    manager.close().await.unwrap();
+    for node in nodes {
+        node.close().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -4688,8 +4745,9 @@ async fn fm_deletes_pre_registration_idle_with_distinct_child_cancellation_not_d
     for index in 0..2 { cluster.spawn(index).await.unwrap(); }
     let address = cluster.children[1].metadata.as_ref().and_then(|metadata| metadata.peer_address).unwrap();
     let child = &cluster.manager.children[0];
-    cluster.processes[0].as_mut().unwrap().command(
-        format!("peer {} {} {address}\n", child.launch.session, child.launch.capability).as_bytes(),
+    process_control::send(
+        cluster.processes[0].as_mut().unwrap(), &child.launch,
+        NodeControl::DialPeer { slot: 0, address },
     ).unwrap();
     let profile = cluster.children[1].metadata.as_ref().unwrap().profile.as_ref().unwrap();
     let work = profile.runtime_root.join(format!("deployment/{}_App1/work",
@@ -4764,8 +4822,9 @@ async fn fm_deletes_registered_open_idle_through_original_child_adapters_without
     for index in 0..2 { cluster.spawn(index).await.unwrap(); }
     let address = cluster.children[1].metadata.as_ref().and_then(|metadata| metadata.peer_address).unwrap();
     let child = &cluster.manager.children[0];
-    cluster.processes[0].as_mut().unwrap().command(
-        format!("peer {} {} {address}\n", child.launch.session, child.launch.capability).as_bytes(),
+    process_control::send(
+        cluster.processes[0].as_mut().unwrap(), &child.launch,
+        NodeControl::DialPeer { slot: 0, address },
     ).unwrap();
     let profile = cluster.children[1].metadata.as_ref().unwrap().profile.as_ref().unwrap();
     let work = profile.runtime_root.join(format!("deployment/{}_App1/work",
@@ -4868,9 +4927,10 @@ async fn fm_deletes_never_created_idle_before_peer_binding_and_publishes_separat
         let address = cluster.children[1].metadata.as_ref().and_then(|metadata| metadata.peer_address)
             .ok_or("missing original target peer listener")?;
         let child = &cluster.manager.children[0];
-        cluster.processes[0].as_mut().ok_or("missing original Primary owner")?.command(
-            format!("peer {} {} {address}\n", child.launch.session, child.launch.capability).as_bytes(),
-        ).map_err(err)?;
+        process_control::send(
+            cluster.processes[0].as_mut().ok_or("missing original Primary owner")?, &child.launch,
+            NodeControl::DialPeer { slot: 0, address },
+        )?;
         until(&mut cluster, |cluster| cluster.status()["peer_idle"]["peer_link_alive"] == json!([true, true])
             && cluster.ledger.idle_removal_status()["removed"] == true
             && cluster.status()["nodes"][1]["retained_work"]["commands"] == 0).await;
@@ -6228,10 +6288,10 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
                     let link = cluster.children[*i].link.as_ref().unwrap();
                     link.send(delete_replica_message(&DeleteReplica::new(body.clone(), false), &link.generation()).map_err(err)?).await?;
                     let child = &cluster.manager.children[*i];
-                    cluster.processes[*i].as_mut().unwrap().command(format!(
-                        "replace-host {} {} {} {}\n", child.launch.session, child.launch.capability,
-                        body.replica.id, body.replica.instance,
-                    ).as_bytes()).map_err(err)?;
+                    process_control::send(
+                        cluster.processes[*i].as_mut().unwrap(), &child.launch,
+                        NodeControl::ReplaceHost { replica: body.replica.id, instance: body.replica.instance },
+                    )?;
                 }
                 for (i, body) in &old_requests {
                     let link = cluster.children[*i].link.as_ref().unwrap();
@@ -6519,10 +6579,10 @@ async fn repeated_primary_failover_and_repair_preserve_current_owners_and_data()
                     let link = cluster.children[*i].link.as_ref().unwrap();
                     link.send(delete_replica_message(&DeleteReplica::new(body.clone(), false), &link.generation()).map_err(err)?).await?;
                     let child = &cluster.manager.children[*i];
-                    cluster.processes[*i].as_mut().unwrap().command(format!(
-                        "replace-host {} {} {} {}\n", child.launch.session, child.launch.capability,
-                        body.replica.id, body.replica.instance,
-                    ).as_bytes()).map_err(err)?;
+                    process_control::send(
+                        cluster.processes[*i].as_mut().unwrap(), &child.launch,
+                        NodeControl::ReplaceHost { replica: body.replica.id, instance: body.replica.instance },
+                    )?;
                 }
                 for (i, body) in &old_requests {
                     let link = cluster.children[*i].link.as_ref().unwrap();

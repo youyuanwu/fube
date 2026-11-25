@@ -48,6 +48,7 @@ pub struct Adapter {
     report_pending: Option<ReplicaUp>,
     acknowledgements: Vec<(u64, SemanticAck)>,
     rejected_change_configuration_reply: Option<FailoverUnitReply>,
+    retired_peers: Vec<NodeInstance>,
 }
 pub enum SemanticAck {
     Notification(ServiceTypeNotification),
@@ -226,6 +227,18 @@ pub fn ticks(ticks: i64) -> Duration {
     Duration::from_nanos((ticks.max(0) as u64).saturating_mul(100))
 }
 impl Adapter {
+    /// Discard unsent obligations to a fenced incarnation, never retarget them.
+    pub fn retire_peer(&mut self, peer: &NodeInstance) -> Result<()> {
+        if !self.retired_peers.contains(peer) {
+            if self.retired_peers.len() == 64 {
+                return Err("retired peer incarnation capacity exhausted".into());
+            }
+            self.retired_peers.push(peer.clone());
+        }
+        self.peer_replies
+            .retain(|reply| peer_target(&reply.effect) != Some(peer));
+        Ok(())
+    }
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -397,6 +410,11 @@ impl Adapter {
                             | ra::Effect::PeerGetLsnReply { .. }
                     )
                 {
+                    if peer_target(&receipt.dispatch.effect)
+                        .is_some_and(|peer| self.retired_peers.contains(peer))
+                    {
+                        continue;
+                    }
                     if let ra::Effect::PeerCreateReplicaReply { body, .. } =
                         &receipt.dispatch.effect
                     {

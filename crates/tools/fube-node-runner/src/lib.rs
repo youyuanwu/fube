@@ -12,7 +12,7 @@ use fube_node::{
     control::{
         ingress::{Admission, Ingress},
         peer_target,
-        wire::{self, Link},
+        wire::{self, Link, Target, Targets},
         Adapter, LfumUploadState,
     },
     local::Node,
@@ -24,7 +24,6 @@ use std::{
     fs::{self, OpenOptions},
     future::Future,
     io::Write,
-    net::SocketAddr,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::Path,
     sync::Arc,
@@ -93,12 +92,29 @@ struct Owner {
     description: Option<NodeDescription>,
     bootstrapped: bool,
     error: Option<String>,
+    targets: Targets,
 }
 
 impl Owner {
     fn new(config: Config) -> Result<Self> {
         config.validate()?;
         let ingress = config.ingress()?;
+        let mut routes = vec![Target::new(
+            config.fm.identity.native()?,
+            wire::Role::Node,
+            Some(config.fm.address.into()),
+            config.generation()?,
+        )?];
+        for peer in &config.peers {
+            routes.push(Target::new(
+                peer.identity.native()?,
+                wire::Role::Peer,
+                Some(peer.address.into()),
+                config.generation()?,
+            )?);
+        }
+        let targets = Targets::new(config.node.identity.native()?, routes)?
+            .source_ip((*config.node.address.ip()).into());
         Package::load_with_profile(
             &config.package,
             &config.application,
@@ -136,6 +152,7 @@ impl Owner {
             description: None,
             bootstrapped: false,
             error: None,
+            targets,
         };
         owner.status("starting", None)?;
         Ok(owner)
@@ -263,58 +280,6 @@ impl Owner {
         fs::rename(temporary, self.config.run_directory.join("status.json")).map_err(err)
     }
 
-    async fn connect(&self, target: SocketAddr, peer: bool, deadline: Instant) -> Result<Link> {
-        loop {
-            let socket = tokio::net::TcpSocket::new_v4().map_err(err)?;
-            socket
-                .bind(SocketAddr::new((*self.config.node.address.ip()).into(), 0))
-                .map_err(err)?;
-            match tokio::time::timeout_at(deadline, socket.connect(target))
-                .await
-                .map_err(err)?
-            {
-                Ok(stream) => {
-                    let channel = wire::initiate(
-                        stream,
-                        if peer {
-                            wire::Role::Peer
-                        } else {
-                            wire::Role::Node
-                        },
-                        deadline,
-                    )
-                    .await?;
-                    let remote = if peer {
-                        self.peers
-                            .iter()
-                            .find(|peer| SocketAddr::V4(peer.placement.address) == target)
-                            .ok_or("unconfigured peer destination")?
-                            .placement
-                            .identity
-                            .native()?
-                    } else {
-                        self.config.fm.identity.native()?
-                    };
-                    return (if peer { Link::new_peer } else { Link::new })(
-                        channel,
-                        self.config.node.identity.native()?,
-                        remote,
-                        self.config.generation()?,
-                    );
-                }
-                Err(error) if Instant::now() < deadline => {
-                    if deadline.saturating_duration_since(Instant::now())
-                        <= Duration::from_millis(20)
-                    {
-                        return Err(format!("initial TCP connection failed: {error}"));
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(error) => return Err(err(error)),
-            }
-        }
-    }
-
     async fn startup(&mut self) -> Result<()> {
         let deadline = Instant::now() + self.config.startup_budget();
         let local = self.config.node.identity.native()?;
@@ -334,11 +299,8 @@ impl Owner {
         outgoing.sort_unstable();
         for (_, index) in outgoing {
             let link = self
-                .connect(
-                    SocketAddr::V4(self.peers[index].placement.address),
-                    true,
-                    deadline,
-                )
+                .targets
+                .connect(&self.peers[index].placement.identity.native()?, deadline)
                 .await?;
             if let Some(error) = self
                 .adapter
@@ -374,54 +336,34 @@ impl Owner {
                 drop(stream);
                 continue;
             };
-            let channel = wire::accept(
-                stream,
-                wire::Role::Peer,
-                deadline.min(Instant::now() + Duration::from_secs(3)),
-            )
-            .await
-            .map_err(err)?;
-            self.peers[index].link = Some(Link::new_peer(
-                channel,
-                local.clone(),
-                self.peers[index].placement.identity.native()?,
-                self.config.generation()?,
-            )?);
+            self.peers[index].link = Some(
+                self.targets
+                    .accept(
+                        &self.peers[index].placement.identity.native()?,
+                        stream,
+                        deadline.min(Instant::now() + Duration::from_secs(3)),
+                    )
+                    .await?,
+            );
         }
         drop(listener);
         self.fm = Some(
-            self.connect(SocketAddr::V4(self.config.fm.address), false, deadline)
+            self.targets
+                .connect(&self.config.fm.identity.native()?, deadline)
                 .await?,
         );
-        let link = self.fm.as_ref().expect("original FM Channel");
         let version = FabricVersionInstance::native_default();
         let up = NodeUp::fresh_stateless(
             self.config.name.clone(),
             "fube-node".into(),
             self.config.node.address.into(),
-            version.clone(),
+            version,
         )
         .map_err(err)?;
-        let (ack, generation) = tokio::time::timeout_at(deadline, link.node_up(&up))
-            .await
-            .map_err(err)??;
-        ack.validate_fresh_activated(&version).map_err(err)?;
-        if generation != self.config.generation()? {
-            return Err("foreign NodeUpAck generation".into());
-        }
-        let upload = ReplicaUp {
-            last: true,
-            ..ReplicaUp::default()
-        };
-        link.replica_up(&upload).await?;
-        let incoming = link
-            .receive(deadline)
-            .await?
-            .ok_or("final inventory reply timeout")?;
-        let (body, generation) = incoming.replica_up_reply(link)?;
-        if body != upload || generation != self.config.generation()? {
-            return Err("fresh bootstrap requires the matching final empty inventory reply".into());
-        }
+        let (ack, generation) = self
+            .targets
+            .bootstrap_fresh(&self.config.fm.identity.native()?, &up, deadline)
+            .await?;
         self.store = Some(Arc::new(
             Store::new(Box::new(MemoryBackend::new()), Settings::default())
                 .await

@@ -3,7 +3,9 @@ mod interlock;
 mod management;
 mod manager;
 mod node;
+mod process_control;
 mod profile;
+mod restart;
 pub(crate) use fube_node::control::wire;
 
 pub use fm::Command;
@@ -17,6 +19,7 @@ use fm::Bootstrap;
 use fm::{Accepted, Ledger};
 use fube_local_host::process::OwnedApp;
 use fube_ra::protocol::*;
+use process_control::NodeControl;
 use profile::*;
 use serde_json::{json, Value};
 use std::{
@@ -41,6 +44,8 @@ pub struct Cluster {
     manager: manager::Manager,
     processes: Vec<Option<OwnedApp>>,
     remote: Option<management::Client>,
+    fenced_nodes: Vec<NodeDownReceipt>,
+    driver_commands: Vec<(Command, Option<Result<Value>>)>,
 }
 macro_rules! fm_action {
     ($name:ident, $operation:ident) => {
@@ -124,14 +129,76 @@ impl Cluster {
     }
 
     pub fn status(&self) -> Value {
-        self.remote
+        let mut status = self
+            .remote
             .as_ref()
-            .map_or_else(|| self.manager.status(), management::Client::status)
+            .map_or_else(|| self.manager.status(), management::Client::status);
+        status["node_controls"] = json!(self
+            .driver_commands
+            .iter()
+            .map(|(command, result)| {
+                match result {
+                    Some(Ok(value)) => value.clone(),
+                    Some(Err(error)) => json!({"op":command.op,"state":"rejected","error":error}),
+                    None => json!({"op":command.op,"state":"unknown","error":"Node control has no observed terminal outcome"}),
+                }
+            })
+            .collect::<Vec<_>>());
+        status
     }
 
     pub async fn execute(&mut self, command: Command) -> Result<Value> {
         if self.manager.finished.is_some() {
             return Err("deployment already shut down".into());
+        }
+        self.refresh_node_controls();
+        command.validate()?;
+        if let Some((original, result)) = self
+            .driver_commands
+            .iter()
+            .find(|(old, _)| old.op == command.op)
+        {
+            if original != &command {
+                return Err("operation identity reused with different canonical content".into());
+            }
+            if let Some(result) = result {
+                return result.clone();
+            }
+            return Err(
+                "interrupted Node control cannot be replayed; inspect current ownership".into(),
+            );
+        }
+        if matches!(command.action.as_str(), "node-down" | "restart-node") {
+            if self.driver_commands.len() == 64 {
+                return Err("64 driver operation identities retained; capacity exhausted".into());
+            }
+            let status = self
+                .remote
+                .as_ref()
+                .map_or_else(|| self.manager.status(), management::Client::status);
+            if status["operations"].as_array().is_some_and(|operations| {
+                operations
+                    .iter()
+                    .any(|operation| operation["op"] == command.op)
+            }) {
+                return Err("operation identity is already owned by an FM command".into());
+            }
+            self.driver_commands.push((command.clone(), None));
+            let result = if command.action == "node-down" {
+                self.node_down(command.node.unwrap()).await
+            } else {
+                self.restart_node(command.node.unwrap()).await
+            }
+            .map(|mut result| {
+                result["op"] = json!(command.op);
+                result
+            });
+            self.driver_commands
+                .iter_mut()
+                .find(|(old, _)| old.op == command.op)
+                .unwrap()
+                .1 = Some(result.clone());
+            return result;
         }
         if let Some(remote) = &mut self.remote {
             let mut outcome = remote
@@ -148,6 +215,13 @@ impl Cluster {
 
     pub async fn drive(&mut self) {
         for (index, process) in self.processes.iter_mut().enumerate() {
+            if self.manager.children.get(index).is_some_and(|child| {
+                self.fenced_nodes
+                    .iter()
+                    .any(|proof| proof.node == child.launch.node)
+            }) {
+                continue;
+            }
             if let Some(process) = process {
                 if let Err(error) = process.check_alive() {
                     self.manager.ledger.lost(index, err(error));
@@ -160,6 +234,7 @@ impl Cluster {
         } else {
             self.manager.drive().await;
         }
+        self.refresh_node_controls();
     }
 
     pub async fn update_service(&mut self, index: usize, service: Service) -> Result<()> {
@@ -268,6 +343,8 @@ impl Cluster {
             manager,
             processes: Vec::with_capacity(node_count),
             remote: None,
+            fenced_nodes: Vec::new(),
+            driver_commands: Vec::new(),
         })
     }
     pub async fn start(&mut self) -> Result<()> {
@@ -349,17 +426,16 @@ impl Cluster {
                         .position(|p| &p.node == target)
                         .ok_or("missing original mesh peer")?;
                     let child = &self.manager.children[source];
-                    self.processes[source]
-                        .as_mut()
-                        .ok_or("missing original Primary owner")?
-                        .command(
-                            format!(
-                                "peer {} {} {} {address}\n",
-                                child.launch.session, child.launch.capability, peer_index
-                            )
-                            .as_bytes(),
-                        )
-                        .map_err(err)?;
+                    process_control::send(
+                        self.processes[source]
+                            .as_mut()
+                            .ok_or("missing original Primary owner")?,
+                        &child.launch,
+                        NodeControl::DialPeer {
+                            slot: peer_index,
+                            address,
+                        },
+                    )?;
                 }
             }
         }
@@ -426,13 +502,17 @@ impl Cluster {
             .arg(launch.directory.join("launch.json"))
             .env("TMPDIR", launch.directory.join("scratch"))
             .current_dir(&launch.directory);
-        self.processes.push(None);
-        self.manager.children.push(manager::Connection {
-            launch: launch.clone(),
-            node_pid: 0,
-            link: None,
-            metadata: None,
-        });
+        if index == self.processes.len() {
+            self.processes.push(None);
+            self.manager.children.push(manager::Connection {
+                launch: launch.clone(),
+                node_pid: 0,
+                link: None,
+                metadata: None,
+            });
+        } else if self.processes[index].is_some() {
+            return Err("restart process slot still owns a predecessor".into());
+        }
         let started = OwnedApp::start(&mut self.processes[index], command).map_err(err);
         if let Some(process) = &self.processes[index] {
             self.manager.children[index].node_pid = process.pid();
@@ -460,11 +540,11 @@ impl Cluster {
                 {
                     return Err("listener metadata is not the original owned Node".into());
                 }
-                self.processes[index]
-                    .as_mut()
-                    .unwrap()
-                    .command(format!("admit {} {}\n", launch.session, launch.capability).as_bytes())
-                    .map_err(err)?;
+                process_control::send(
+                    self.processes[index].as_mut().unwrap(),
+                    &launch,
+                    NodeControl::Admit {},
+                )?;
                 if let Some(remote) = &mut self.remote {
                     let attached = remote
                         .request(management::Operation::Attach { index, metadata })
@@ -516,17 +596,13 @@ impl Cluster {
             return Ok(current);
         }
         let child = &self.manager.children[0];
-        self.processes[0]
-            .as_mut()
-            .ok_or("missing original Primary owner")?
-            .command(
-                format!(
-                    "create-idle {} {}\n",
-                    child.launch.session, child.launch.capability
-                )
-                .as_bytes(),
-            )
-            .map_err(err)?;
+        process_control::send(
+            self.processes[0]
+                .as_mut()
+                .ok_or("missing original Primary owner")?,
+            &child.launch,
+            NodeControl::CreateIdle {},
+        )?;
         self.manager.peer_idle_requested = true;
         Ok(json!({"state":"pending","kind":"peer_idle_open","built":false,"serving":false}))
     }
@@ -558,17 +634,13 @@ impl Cluster {
             return Ok(current);
         }
         let child = &self.manager.children[0];
-        self.processes[0]
-            .as_mut()
-            .ok_or("missing original Primary owner")?
-            .command(
-                format!(
-                    "build-idle {} {}\n",
-                    child.launch.session, child.launch.capability
-                )
-                .as_bytes(),
-            )
-            .map_err(err)?;
+        process_control::send(
+            self.processes[0]
+                .as_mut()
+                .ok_or("missing original Primary owner")?,
+            &child.launch,
+            NodeControl::BuildIdle {},
+        )?;
         Ok(json!({"state":"pending","kind":"peer_idle_build","built":false,"serving":false}))
     }
     /// Remove the original Idle from the Primary's replicator, not its remote
@@ -601,17 +673,13 @@ impl Cluster {
             return Err("peer removal requires the original opened Idle".into());
         }
         let child = &self.manager.children[0];
-        self.processes[0]
-            .as_mut()
-            .ok_or("missing original Primary owner")?
-            .command(
-                format!(
-                    "remove-idle {} {}\n",
-                    child.launch.session, child.launch.capability
-                )
-                .as_bytes(),
-            )
-            .map_err(err)?;
+        process_control::send(
+            self.processes[0]
+                .as_mut()
+                .ok_or("missing original Primary owner")?,
+            &child.launch,
+            NodeControl::RemoveIdle {},
+        )?;
         if let Some(idle) = self.manager.ledger.idles.first_mut() {
             idle.cancelled = true;
         }
@@ -658,10 +726,9 @@ impl Cluster {
         // before waiting for any sibling's independently owned cleanup.
         for (child, process) in self.manager.children.iter().zip(&mut self.processes) {
             if let Some(process) = process.as_mut() {
-                let stop =
-                    process.command(format!("stop {}\n", child.launch.capability).as_bytes());
+                let stop = process_control::send(process, &child.launch, NodeControl::Stop {});
                 if let Err(error) = stop {
-                    receipts.push(json!({"node":child.launch.placement,"stop_error":err(error)}));
+                    receipts.push(json!({"node":child.launch.placement,"stop_error":error}));
                 }
             }
         }
@@ -675,6 +742,39 @@ impl Cluster {
             let Some(process) = self.processes.get_mut(index).and_then(Option::as_mut) else {
                 continue;
             };
+            if let Some(proof) = self
+                .fenced_nodes
+                .iter()
+                .find(|proof| proof.node == child.launch.node)
+            {
+                let cleanup = process.cleanup();
+                let physical = process.status();
+                let valid = proof
+                    .validate(
+                        &child.launch,
+                        process.pid(),
+                        child
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.profile.as_ref()),
+                    )
+                    .is_ok()
+                    && physical.reaped
+                    && physical.group_drained
+                    && physical.exit_observed
+                    && restart::verify_fencing(proof).is_ok();
+                if !valid || cleanup.is_err() {
+                    complete = false;
+                }
+                item["node_down_fencing_valid"] = json!(valid);
+                item["node_down_fencing"] = json!(proof);
+                item["owned_process_cleanup"] = match cleanup {
+                    Ok(value) => value,
+                    Err(error) => json!({"error":err(error)}),
+                };
+                receipts.push(item);
+                continue;
+            }
             let exit = process.wait_exit(std::time::Instant::now() + Duration::from_secs(25));
             if let Err(error) = exit {
                 item["exit_error"] = json!(err(error));
@@ -783,7 +883,13 @@ impl Cluster {
             }
         }
         if complete {
-            if let Err(error) = self.interlock.publish_clean(&verified) {
+            let handoff = if self.fenced_nodes.is_empty() {
+                self.interlock.publish_clean(&verified)
+            } else {
+                self.interlock
+                    .publish_clean_with_fencing(&verified, &self.fenced_nodes)
+            };
+            if let Err(error) = handoff {
                 complete = false;
                 receipts.push(json!({"handoff_error":error}));
             }
@@ -816,6 +922,7 @@ pub async fn internal_node(config: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     include!("tests.rs");
+    mod restart;
 
     #[tokio::test]
     async fn report_retry_owns_current_stage_until_real_ra_clearance() {

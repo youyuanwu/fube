@@ -7,7 +7,7 @@ use fube_ra::protocol::*;
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 use tokio::time::Instant;
-use wire::{FmReport, Link, NodeClient, NodeRequest};
+use wire::{FmReport, Link, NodeClient, NodeRequest, Target, Targets};
 
 pub(crate) struct Connection {
     pub(crate) launch: Launch,
@@ -32,6 +32,7 @@ pub struct Manager {
     pub(crate) children: Vec<Connection>,
     pub(crate) peer_idle_requested: bool,
     pub(crate) finished: Option<Value>,
+    pub(crate) targets: Targets,
 }
 impl Manager {
     // Fence prior ordered ingress without claiming native completion or cancelling a consuming pump.
@@ -143,6 +144,20 @@ impl Manager {
                 return Err("FM requires one exact ordered original topology".into());
             }
         }
+        let targets = Targets::new(
+            first.fm.clone(),
+            launches
+                .iter()
+                .map(|launch| {
+                    Target::new(
+                        launch.node.clone(),
+                        wire::Role::Fm,
+                        None,
+                        launch.generation.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )?;
         Ok(Self {
             profile: first.profile,
             deployment: first.deployment.clone(),
@@ -150,6 +165,7 @@ impl Manager {
             children: Vec::new(),
             peer_idle_requested: false,
             finished: None,
+            targets,
         })
     }
 
@@ -165,10 +181,9 @@ impl Manager {
             || self.finished.is_some()
             || index > self.children.len()
             || self.ledger.placements[index].bootstrap != Bootstrap::NodeUp
-            || self
-                .children
-                .get(index)
-                .is_some_and(|child| child.link.is_some() || child.node_pid != metadata.pid)
+            || self.children.get(index).is_some_and(|child| {
+                child.link.is_some() || (child.node_pid != 0 && child.node_pid != metadata.pid)
+            })
         {
             return Err("invalid original Node attachment".into());
         }
@@ -181,17 +196,22 @@ impl Manager {
             };
             Self::check_metadata(&connection, &metadata, false)?;
             self.children.push(connection);
+        } else if self.children[index].node_pid == 0 {
+            let expected = Connection {
+                launch: launch.clone(),
+                node_pid: metadata.pid,
+                link: None,
+                metadata: None,
+            };
+            Self::check_metadata(&expected, &metadata, false)?;
+            self.children[index].node_pid = metadata.pid;
         }
         self.validate_metadata(index, &metadata, false)?;
         self.children[index].metadata = Some(metadata.clone());
         let end = Instant::now() + Duration::from_secs(30);
-        let channel = wire::connect(metadata.address, wire::Role::Fm, end).await?;
-        self.children[index].link = Some(Link::new(
-            channel,
-            launch.fm.clone(),
-            launch.node.clone(),
-            launch.generation.clone(),
-        )?);
+        self.targets.set_address(&launch.node, metadata.address)?;
+        self.children[index].link = Some(self.targets.connect(&launch.node, end).await?);
+        self.ledger.placements[index].link_alive = true;
         loop {
             self.pump(index).await?;
             if self.ledger.placements[index].bootstrap == Bootstrap::Metadata
@@ -314,20 +334,29 @@ impl Manager {
                             FabricVersionInstance::native_default(),
                         )
                         .map_err(err)?;
-                        if placement.bootstrap != Bootstrap::NodeUp || body != expected {
+                        if body != expected {
                             return Err(
                                 "unexpected/stale native NodeUp identity or recovery contents"
                                     .into(),
                             );
                         }
-                        placement.node_description = Some(body.node.clone());
-                        let ack = NodeUpAck::fresh_activated(body.node.version, 1).map_err(err)?;
-                        placement.activation_sequence = ack.activation_sequence;
-                        placement.activated = ack.activated;
+                        if placement.bootstrap == Bootstrap::NodeUp {
+                            placement.node_description = Some(body.node.clone());
+                            placement.activation_sequence = 1;
+                            placement.activated = true;
+                        }
+                        let mut ack = NodeUpAck::fresh_activated(
+                            body.node.version,
+                            placement.activation_sequence,
+                        )
+                        .map_err(err)?;
+                        ack.activated = placement.activated;
                         Ok((ack, generation))
                     })
                     .await?;
-                placement.bootstrap = Bootstrap::FinalUpload;
+                if placement.bootstrap == Bootstrap::NodeUp {
+                    placement.bootstrap = Bootstrap::FinalUpload;
+                }
                 return Ok(());
             }
             _ => {}

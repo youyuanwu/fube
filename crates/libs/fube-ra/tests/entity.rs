@@ -2899,6 +2899,79 @@ async fn fresh_spare_open_requires_compatible_primary_history_and_its_own_commit
 }
 
 #[tokio::test]
+async fn fenced_peer_incarnation_replacement_rejects_stale_senders_and_waits_for_commits() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let previous = peer_source();
+    executor.bind_peer(previous.clone()).unwrap();
+    let mut replacement = previous.clone();
+    replacement.instance += 1;
+    assert!(executor
+        .replace_peer_after_fencing(&previous, previous.clone())
+        .is_err());
+    let mut foreign = replacement.clone();
+    foreign.id = [99; 16];
+    assert!(executor
+        .replace_peer_after_fencing(&previous, foreign)
+        .is_err());
+    executor
+        .replace_peer_after_fencing(&previous, replacement.clone())
+        .unwrap();
+    assert!(!executor.is_peer(&previous));
+    assert!(executor.is_peer(&replacement));
+    assert!(executor
+        .replace_peer_after_fencing(&previous, replacement.clone())
+        .is_err());
+    assert!(executor
+        .submit(peer_create(peer_request()))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .is_err());
+    assert!(executor.snapshot([1; 16]).committed.is_none());
+    let (entered, release) = hooks.pause(false);
+    let ticket = executor
+        .submit(Command::CreateReplica {
+            body: Box::new(peer_request()),
+            source: replacement.clone(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        })
+        .unwrap();
+    entered.await.unwrap();
+    let mut next = replacement.clone();
+    next.instance += 1;
+    assert_eq!(
+        executor.replace_peer_after_fencing(&replacement, next),
+        Err(Failure::Capacity)
+    );
+    release.send(()).unwrap();
+    ticket.wait(WAIT).await.unwrap();
+    assert_eq!(
+        state(&executor).peer_creation.as_ref().unwrap().source,
+        replacement
+    );
+    effects(&executor);
+    finish(&store, &executor).await;
+
+    let (store, executor, _) = setup(WAIT).await;
+    active_configured_survivor(&executor, 3, 2).await;
+    let current = state(&executor);
+    let previous = peer_source();
+    let mut replacement = previous.clone();
+    replacement.instance += 1;
+    assert!(matches!(
+        executor.replace_peer_after_fencing(&previous, replacement.clone()),
+        Err(Failure::Unsupported(_))
+    ));
+    assert!(executor.is_peer(&previous));
+    assert!(!executor.is_peer(&replacement));
+    assert_eq!(state(&executor), current);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
 async fn peer_idle_open_reply_waits_for_both_commits_and_preserves_original_sender() {
     let (store, executor, hooks) = setup(WAIT).await;
     executor.bind_peer(peer_source()).unwrap();
