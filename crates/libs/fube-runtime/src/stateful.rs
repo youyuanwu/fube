@@ -94,6 +94,8 @@ pub(crate) struct Registry {
     remote_reply_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
     #[cfg(test)]
     build_cleanup_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
+    #[cfg(test)]
+    endpoint_prepare_error: Mutex<Option<Error>>,
 }
 #[cfg(test)]
 #[derive(Default)]
@@ -160,6 +162,8 @@ impl Registry {
             remote_reply_hook: Mutex::new(None),
             #[cfg(test)]
             build_cleanup_hook: Mutex::new(None),
+            #[cfg(test)]
+            endpoint_prepare_error: Mutex::new(None),
         }
     }
     #[cfg(test)]
@@ -256,13 +260,28 @@ impl Registry {
     }
     #[cfg(test)]
     pub(crate) fn endpoint_is_pending(&self, id: [u8; 16]) -> bool {
+        self.endpoint_cancellation(id).is_some()
+    }
+    #[cfg(test)]
+    pub(crate) fn endpoint_cancellation(&self, id: [u8; 16]) -> Option<Cancellation> {
         self.get(id)
             .unwrap()
             .state
             .lock()
             .unwrap()
             .endpoint_pending
-            .is_some()
+            .clone()
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_next_endpoint_preparation(&self, error: Error) {
+        *self.endpoint_prepare_error.lock().unwrap() = Some(error);
+    }
+    #[cfg(test)]
+    pub(crate) fn hold_endpoint_retry_capacity(&self) {
+        let mut retries = self.retries.lock().unwrap();
+        while retries.len() < crate::MAX_SERVICE_UNITS * 2 {
+            retries.push(self.core.spawn(std::future::pending()));
+        }
     }
     #[cfg(test)]
     pub(crate) fn catchup_is_cancelled(&self, id: [u8; 16]) -> bool {

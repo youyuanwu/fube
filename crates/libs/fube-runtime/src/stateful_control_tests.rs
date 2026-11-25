@@ -578,6 +578,167 @@ async fn promotion_notifies_original_endpoint_until_exact_ack_then_current_confi
     promotion_endpoint_scenario(None).await;
 }
 
+async fn endpoint_secondary_fixture() -> (Harness, ProxyRequest, ProxyRequest) {
+    let mut h = Harness::new().await;
+    register(&h);
+    let mut open = request(&h, 2, 1, 20);
+    open.local.current_role = 2;
+    h.send("ReplicaOpen", &open).await;
+    h.receive("ReplicaOpenReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    let mut secondary = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
+    secondary.local.current_role = 3;
+    secondary.remote.0[0].current_role = 3;
+    secondary.unit.current.configuration += 1;
+    secondary.unit.previous = open.unit.current.clone();
+    h.send("UpdateConfiguration", &secondary).await;
+    h.receive("UpdateConfigurationReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    (h, open, secondary)
+}
+
+async fn receive_endpoint_notification(h: &mut Harness) -> Message {
+    let mut notification = None;
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(Duration::from_secs(2), h.peer.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        match frame.metadata().unwrap().action.as_str() {
+            "ProxyReplicaEndpointUpdated" => notification = Some(frame),
+            "UpdateConfigurationReply" => assert_eq!(
+                from_slice::<ProxyReply>(&frame.body).unwrap().error.error,
+                0
+            ),
+            other => panic!("unexpected {other}"),
+        }
+    }
+    notification.unwrap()
+}
+
+#[tokio::test]
+async fn endpoint_retry_is_superseded_only_after_preparation_and_owner_admission_succeed() {
+    enum Failure {
+        Encoding,
+        Capacity,
+    }
+    for failure in [Some(Failure::Encoding), Some(Failure::Capacity), None] {
+        let (mut h, open, mut promote) = endpoint_secondary_fixture().await;
+        promote.local.current_role = 4;
+        promote.remote.0[0].current_role = 4;
+        promote.unit.current.configuration += 1 << 32;
+        promote.unit.previous = open.unit.current.clone();
+        promote.flags = 2;
+        h.send("UpdateConfiguration", &promote).await;
+        let original = receive_endpoint_notification(&mut h).await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let original_cancel = h
+            .engine
+            .shared
+            .stateful
+            .endpoint_cancellation([2; 16])
+            .unwrap();
+        match failure {
+            Some(Failure::Encoding) => h
+                .engine
+                .shared
+                .stateful
+                .fail_next_endpoint_preparation(Error::ResourceLimit("injected endpoint encoding")),
+            Some(Failure::Capacity) => h.engine.shared.stateful.hold_endpoint_retry_capacity(),
+            None => {}
+        }
+        let result = h.engine.shared.stateful.republish_endpoint([2; 16]).await;
+        let expected = if failure.is_some() {
+            assert!(matches!(result, Err(Error::ResourceLimit(_))));
+            assert!(!original_cancel.is_cancelled());
+            h.no_reply().await;
+            original
+        } else {
+            result.unwrap();
+            let notification = h.receive("ProxyReplicaEndpointUpdated").await;
+            assert!(original_cancel.is_cancelled());
+            assert_eq!(notification.body, original.body);
+            assert_ne!(
+                notification.metadata().unwrap().id,
+                original.metadata().unwrap().id
+            );
+            notification
+        };
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let current_cancel = h
+            .engine
+            .shared
+            .stateful
+            .endpoint_cancellation([2; 16])
+            .unwrap();
+        assert!(!current_cancel.is_cancelled());
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let retry = h.receive("ProxyReplicaEndpointUpdated").await;
+        assert_eq!(retry.body, expected.body);
+        assert_ne!(
+            retry.metadata().unwrap().id,
+            expected.metadata().unwrap().id
+        );
+        let body: ReplicaMessage = from_slice(&retry.body).unwrap();
+        let mut ack = control(&promote, "ProxyReplicaEndpointUpdatedReply", vec![]);
+        ack.runtime = open.runtime.clone();
+        ack.local = body.local;
+        h.send("ProxyReplicaEndpointUpdatedReply", &ack).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while h.engine.shared.stateful.endpoint_is_pending([2; 16]) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(original_cancel.is_cancelled());
+        assert!(current_cancel.is_cancelled());
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        h.no_reply().await;
+        tokio::time::resume();
+        h.engine.quiesce().await.unwrap();
+        crate::execution::shutdown(&h.engine.shared.execution, &h.engine.shared.authority)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn failed_endpoint_admission_without_a_previous_retry_does_not_install_a_phantom_owner() {
+    for capacity in [false, true] {
+        let (mut h, open, mut promote) = endpoint_secondary_fixture().await;
+        if capacity {
+            h.engine.shared.stateful.hold_endpoint_retry_capacity();
+        } else {
+            h.engine
+                .shared
+                .stateful
+                .fail_next_endpoint_preparation(Error::ResourceLimit("injected endpoint encoding"));
+        }
+        promote.local.current_role = 4;
+        promote.remote.0[0].current_role = 4;
+        promote.unit.current.configuration += 1 << 32;
+        promote.unit.previous = open.unit.current.clone();
+        promote.flags = 2;
+        h.send("UpdateConfiguration", &promote).await;
+        let reply: ProxyReply =
+            from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
+        assert_eq!(reply.error.error, 0x8007000eu32 as i32 as i64);
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        assert!(!h.engine.shared.stateful.endpoint_is_pending([2; 16]));
+        h.no_reply().await;
+        h.engine.quiesce().await.unwrap();
+        crate::execution::shutdown(&h.engine.shared.execution, &h.engine.shared.authority)
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn native_endpoint_notification_retry_and_quiescence_do_not_need_application_scheduler_progress(
 ) {
@@ -634,22 +795,7 @@ async fn promotion_endpoint_scenario(application: Option<tokio::runtime::Handle>
     promote.unit.previous = secondary.unit.current.clone();
     promote.flags = 2;
     h.send("UpdateConfiguration", &promote).await;
-    let mut notification = None;
-    for _ in 0..2 {
-        let frame = tokio::time::timeout(Duration::from_secs(2), h.peer.receive())
-            .await
-            .unwrap()
-            .unwrap();
-        match frame.metadata().unwrap().action.as_str() {
-            "ProxyReplicaEndpointUpdated" => notification = Some(frame),
-            "UpdateConfigurationReply" => assert_eq!(
-                from_slice::<ProxyReply>(&frame.body).unwrap().error.error,
-                0
-            ),
-            other => panic!("unexpected {other}"),
-        }
-    }
-    let notification = notification.unwrap();
+    let notification = receive_endpoint_notification(&mut h).await;
     let body: ReplicaMessage = from_slice(&notification.body).unwrap();
     assert_eq!(body.local.service_endpoint, "model://stateful/client");
     assert_eq!(body.local.replication_endpoint, "model://stateful/control");

@@ -292,6 +292,9 @@ still builds a fresh native message identity. The wrapper's native schema,
 activity/description stability, retry schedule and lifetime remain domain-owned.
 Using Body this way is already possible and is not itself a furpc API change.
 Do not add a generic replay cache or retain codecs between attempts.
+Endpoint publication prepares replacement bytes and admits its retry owner
+before cancelling the previous publication. Preparation/admission failures
+leave the original pending owner and frozen payload intact.
 
 Runtime's deferred one-way service must continue decoding after owned executor
 admission. Its native serving scope already completed at bounded enqueue, so
