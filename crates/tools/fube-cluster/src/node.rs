@@ -1,6 +1,6 @@
 use crate::{
     profile::*,
-    wire::{self, Link},
+    wire::{self, Link, Target, Targets},
 };
 use fube_hosting::local::{Activation, NodeContext, Options};
 #[cfg(test)]
@@ -91,6 +91,21 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         return Err("internal node requires original launcher parent".into());
     }
     let ingress = launch.ingress()?;
+    let mut routes = vec![Target::new(
+        launch.fm.clone(),
+        wire::Role::Node,
+        None,
+        launch.generation.clone(),
+    )?];
+    for peer in &launch.peers {
+        routes.push(Target::new(
+            peer.node.clone(),
+            wire::Role::Peer,
+            None,
+            launch.generation.clone(),
+        )?);
+    }
+    let mut targets = Targets::new(launch.node.clone(), routes)?;
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
     let address = listener.local_addr().map_err(err)?;
     let mut peer_listeners = vec![];
@@ -125,42 +140,13 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         .map_err(err)?
         .map_err(err)?;
     drop(listener); // Exactly one original session; no reconnect listener.
-    let channel = wire::accept(stream, wire::Role::Node, wire::deadline())
-        .await
-        .map_err(err)?;
-    let link = Link::new(
-        channel,
-        launch.node.clone(),
-        launch.fm.clone(),
-        launch.generation.clone(),
-    )?;
+    let link = targets.accept(&launch.fm, stream, wire::deadline()).await?;
     let fabric = FabricVersionInstance::native_default();
-    let up = NodeUp::fresh_stateless(
-        launch.name(),
-        "fube-cluster-local".into(),
-        address,
-        fabric.clone(),
-    )
-    .map_err(err)?;
-    let (ack, generation) = link.node_up(&up).await?;
-    ack.validate_fresh_activated(&fabric).map_err(err)?;
-    if generation != launch.generation {
-        return Err("foreign/stale NodeUpAck generation".into());
-    }
-    let final_upload = ReplicaUp {
-        last: true,
-        ..ReplicaUp::default()
-    };
-    link.replica_up(&final_upload).await?;
-    let incoming = link
-        .receive(wire::deadline())
-        .await?
-        .ok_or("final upload reply timeout")?;
-    let (uploaded, generation) = incoming.replica_up_reply(&link)?;
-    if uploaded != final_upload || generation != launch.generation {
-        link.retire();
-        return Err("foreign/stale/nonfinal bootstrap upload reply".into());
-    }
+    let up = NodeUp::fresh_stateless(launch.name(), "fube-cluster-local".into(), address, fabric)
+        .map_err(err)?;
+    let (ack, generation) = targets
+        .bootstrap_fresh(&launch.fm, &up, Instant::now() + Duration::from_secs(20))
+        .await?;
     // No RA/Hosting/process authority exists until BOTH native semantic
     // bootstrap exchanges completed for this original session.
     private_dir(&launch.directory.join("hosting"))?;
@@ -338,7 +324,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                                     };
                                     connection.dialed = true;
                                     peer_listeners[index].take();
-                                    match dial_peer_to(launch, &launch.peers[index], parts[parts.len() - 1]).await {
+                                    match dial_peer_target(&mut targets, &launch.peers[index], parts[parts.len() - 1]).await {
                                         Ok(link) => connection.link = Some(link),
                                         Err(error) => adapter.record_peer_error(error),
                                     }
@@ -378,7 +364,10 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     match tokio::time::timeout(Duration::from_millis(1), listener.accept()).await {
                         Ok(Ok((stream, _))) => {
                             listener_slot.take();
-                            match accept_peer_from(launch, &launch.peers[index], stream).await {
+                            match targets
+                                .accept(&launch.peers[index].node, stream, wire::deadline())
+                                .await
+                            {
                                 Ok(link) => connections[index].link = Some(link),
                                 Err(error) => adapter.record_peer_error(error),
                             }
@@ -771,18 +760,27 @@ async fn dial_peer(launch: &Launch, address: &str) -> Result<Link> {
     )
     .await
 }
+#[cfg(test)]
 async fn dial_peer_to(launch: &Launch, peer: &Peer, address: &str) -> Result<Link> {
+    let mut targets = Targets::new(
+        launch.node.clone(),
+        vec![Target::new(
+            peer.node.clone(),
+            wire::Role::Peer,
+            None,
+            launch.generation.clone(),
+        )?],
+    )?;
+    dial_peer_target(&mut targets, peer, address).await
+}
+
+async fn dial_peer_target(targets: &mut Targets, peer: &Peer, address: &str) -> Result<Link> {
     let address: std::net::SocketAddr = address.parse().map_err(err)?;
     if !address.ip().is_loopback() || address.port() == 0 {
         return Err("peer requires original numeric loopback listener".into());
     }
-    let channel = wire::connect(address, wire::Role::Peer, wire::deadline()).await?;
-    Link::new_peer(
-        channel,
-        launch.node.clone(),
-        peer.node.clone(),
-        launch.generation.clone(),
-    )
+    targets.set_address(&peer.node, address)?;
+    targets.connect(&peer.node, wire::deadline()).await
 }
 
 #[cfg(test)]
@@ -794,20 +792,22 @@ async fn accept_peer(launch: &Launch, stream: tokio::net::TcpStream) -> Result<L
     )
     .await
 }
+#[cfg(test)]
 async fn accept_peer_from(
     launch: &Launch,
     peer: &Peer,
     stream: tokio::net::TcpStream,
 ) -> Result<Link> {
-    let channel = wire::accept(stream, wire::Role::Peer, wire::deadline())
-        .await
-        .map_err(err)?;
-    Link::new_peer(
-        channel,
+    let mut targets = Targets::new(
         launch.node.clone(),
-        peer.node.clone(),
-        launch.generation.clone(),
-    )
+        vec![Target::new(
+            peer.node.clone(),
+            wire::Role::Peer,
+            None,
+            launch.generation.clone(),
+        )?],
+    )?;
+    targets.accept(&peer.node, stream, wire::deadline()).await
 }
 
 fn create_idle(launch: &Launch, node: &mut Node) -> Result<u64> {

@@ -1,4 +1,4 @@
-//! Native FM/RA and RA/RA channel policy, bounded decode and exact source binding.
+//! Native FM/RA and RA/RA target/session policy, bounded decode and exact source binding.
 use super::{err, Result, MAX_BODY_BYTES as LIMIT};
 use fube_ra::protocol::{
     GenerationHeader, NodeInstance, FM_ACTOR, GENERATION_HEADER, RA_ACTOR, RS_ACTOR,
@@ -21,6 +21,7 @@ mod one_way;
 mod peer_client;
 mod peer_intake;
 mod session;
+mod targets;
 pub use bootstrap::LfumUploadRequest;
 pub(super) use fm_client::FmClient;
 pub(super) use fm_intake::{generation_parts, Incoming as FmIncoming};
@@ -30,6 +31,7 @@ pub(super) use one_way::Call as OneWayCall;
 pub(super) use peer_client::PeerClient;
 pub(super) use peer_intake::Incoming as PeerIncoming;
 pub use session::{Failure, Incoming, Session};
+pub use targets::{Target, Targets};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -349,9 +351,8 @@ impl Link {
             *current = generation.clone();
         }
     }
-    // Only the composition owner constructs a Link, from its original one-use
-    // admitted Channel. Deployment/session binding is local capability state,
-    // not a fabricated universal native header or a reconnect credential.
+    // Each Link binds one physical generation. Resolving a logical target must
+    // never retarget this capability or turn headers into admission credentials.
     pub fn new(
         session: Session,
         local: NodeInstance,

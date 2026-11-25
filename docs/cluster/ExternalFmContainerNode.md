@@ -75,6 +75,21 @@ port. The mesh is established before application startup, without waiting for
 reliability traffic on every link. FM/RA control connections do not carry
 application data.
 
+Both launchers compose these relationships through the shared
+[logical target layer](../../crates/libs/fube-node/src/control/wire/targets.rs).
+It binds exact configured Node instances independently of TCP direction, reuses
+accepted or outgoing Links, and owns the common fresh-bootstrap exchange.
+A missing NodeUp ACK is retried; the external FM must answer a matching repeated
+NodeUp without resetting bootstrap progress or current activation state.
+The [local FM handler](../../crates/tools/fube-cluster/src/manager.rs) implements
+that replay behavior.
+
+Connection reacquisition and explicit incarnation replacement are transport
+facilities, not restart admission. This runner retains control uncertainty after
+original-session loss; it does not automatically reconnect, adopt a new
+incarnation, or recover volatile state. Neither an accepted socket nor a
+ListenInstance advertisement grants identity or serving authority.
+
 Use distinct, static IPv4 addresses for all original Nodes. The runner binds and
 publishes each configured concrete address directly, without `0.0.0.0` or a
 separate advertised-IP field. NAT/port translation, service VIPs and load

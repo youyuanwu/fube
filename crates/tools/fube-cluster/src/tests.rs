@@ -910,6 +910,63 @@ async fn typed_fm_manager() -> (Manager, Vec<wire::Link>) {
 }
 
 #[tokio::test]
+async fn repeated_native_node_up_preserves_bootstrap_progress_and_current_activation() {
+    let (mut manager, nodes) = typed_fm_manager().await;
+    let launch = manager.children[0].launch.clone();
+    let address = "127.0.0.1:12345".parse().unwrap();
+    manager.children[0].metadata = Some(Metadata {
+        deployment: launch.deployment.clone(),
+        session: launch.session.clone(),
+        node: launch.node.clone(),
+        pid: 555,
+        address,
+        peer_address: None,
+        peer_addresses: vec![],
+        profile: None,
+    });
+    manager.ledger.placements[0].bootstrap = Bootstrap::NodeUp;
+    let body = NodeUp::fresh_stateless(
+        launch.name(),
+        "fube-cluster-local".into(),
+        address,
+        FabricVersionInstance::native_default(),
+    )
+    .unwrap();
+    for (phase, activated, sequence) in [
+        (Bootstrap::NodeUp, true, 1),
+        (Bootstrap::FinalUpload, true, 1),
+        (Bootstrap::Admitted, false, 42),
+    ] {
+        manager.ledger.placements[0].bootstrap = phase.clone();
+        manager.ledger.placements[0].activated = activated;
+        manager.ledger.placements[0].activation_sequence = sequence;
+        let link = manager.children[0].link.as_ref().unwrap().clone();
+        let (reply, result) = tokio::join!(nodes[0].node_up(&body), async {
+            let incoming = link.receive(wire::deadline()).await.unwrap().unwrap();
+            manager.receive_message(0, incoming).await
+        });
+        result.unwrap();
+        let (ack, generation) = reply.unwrap();
+        assert_eq!((ack.activated, ack.activation_sequence), (activated, sequence));
+        assert_eq!(generation, launch.generation);
+        assert_eq!(
+            manager.ledger.placements[0].bootstrap,
+            if phase == Bootstrap::NodeUp {
+                Bootstrap::FinalUpload
+            } else {
+                phase
+            }
+        );
+        assert_eq!(manager.ledger.placements[0].activated, activated);
+        assert_eq!(manager.ledger.placements[0].activation_sequence, sequence);
+    }
+    manager.close().await.unwrap();
+    for node in nodes {
+        node.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn typed_fm_intake_keeps_cached_lifecycle_data_child_authority_and_profile_error_order() {
     let (mut manager, nodes) = typed_fm_manager().await;
     let pending = manager.execute(command("typed-create", "create", Some(1))).await.unwrap();
