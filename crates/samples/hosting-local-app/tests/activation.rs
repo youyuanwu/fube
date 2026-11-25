@@ -161,7 +161,7 @@ fn owned_stateful_factory_registers_and_resolves_without_replica_lifecycle() {
     let lease = owner.host_lease().unwrap();
     for action in ["ReplicaOpen", "ReplicaClose"] {
         assert!(matches!(
-            lease.send_lifecycle(action, vec![]),
+            lease.send_lifecycle(action, (), furpc::FubstEncoder::<()>::default()),
             Err(furpc::Error::Protocol(_))
         ));
     }

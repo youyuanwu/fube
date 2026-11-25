@@ -1,6 +1,6 @@
-use super::{ipc, ra, rap, Error, Result, BODY};
+use super::{ipc, ra, rap, Error, Result};
 use fube_ra::protocol::Service;
-use fubst::serde::{to_vec, ObjectArray};
+use fubst::serde::ObjectArray;
 
 pub(super) struct RapClient {
     lease: ipc::HostLease,
@@ -8,7 +8,7 @@ pub(super) struct RapClient {
 
 pub(super) struct Prepared {
     action: &'static str,
-    body: Vec<u8>,
+    body: rap::Request,
 }
 
 impl RapClient {
@@ -22,39 +22,38 @@ impl RapClient {
                 body, local, flags, ..
             } => (
                 "UpdateConfiguration",
-                to_vec(&rap::Request {
+                rap::Request {
                     runtime: String::new(),
                     unit: body.unit.clone(),
                     local: (**local).clone(),
                     remote: body.replicas.clone(),
                     service: Service::default(),
                     flags: *flags,
-                })
-                .map_err(|_| Error::Protocol)?,
+                },
             ),
             ra::Effect::RuntimeOpen {
                 body,
                 registration,
                 flags,
                 ..
-            } => ("ReplicaOpen", rap::request(registration, body, *flags)?),
+            } => ("ReplicaOpen", rap::request(registration, body, *flags)),
             ra::Effect::Close {
                 body,
                 registration,
                 flags,
                 ..
-            } => ("ReplicaClose", rap::request(registration, body, *flags)?),
+            } => ("ReplicaClose", rap::request(registration, body, *flags)),
             ra::Effect::UpdateServiceDescription { body, registration } => (
                 "ProxyUpdateServiceDescription",
-                rap::request(registration, body, 0)?,
+                rap::request(registration, body, 0),
             ),
             ra::Effect::BuildIdle { body, replica, .. } => (
                 "ReplicatorBuildIdleReplica",
-                rap::idle_request(body, replica)?,
+                rap::idle_request(body, replica),
             ),
             ra::Effect::RemoveIdle { body, replica, .. } => (
                 "ReplicatorRemoveIdleReplica",
-                rap::idle_request(body, replica)?,
+                rap::idle_request(body, replica),
             ),
             ra::Effect::QueryReplicaStatus { body, registration }
             | ra::Effect::AcknowledgeEndpoint { body, registration } => (
@@ -63,26 +62,26 @@ impl RapClient {
                 } else {
                     "ProxyReplicaEndpointUpdatedReply"
                 },
-                to_vec(&rap::Request {
+                rap::Request {
                     runtime: registration.runtime.clone(),
                     unit: body.unit.clone(),
                     local: body.replica.clone(),
                     remote: ObjectArray(vec![]),
                     service: Service::default(),
                     flags: 0,
-                })
-                .map_err(|_| Error::Protocol)?,
+                },
             ),
             _ => return Err(Error::Unsupported),
         };
-        if body.len() > BODY {
-            return Err(Error::Capacity);
-        }
         Ok(Prepared { action, body })
     }
 
     pub(super) fn send(&self, request: Prepared) -> furpc::Result<ipc::LifecycleSend> {
-        self.lease.send_lifecycle(request.action, request.body)
+        self.lease.send_lifecycle(
+            request.action,
+            request.body,
+            furpc::FubstEncoder::<rap::Request>::default(),
+        )
     }
 
     pub(super) fn take_reply(&self) -> Option<ipc::LifecycleReply> {
@@ -98,6 +97,7 @@ impl RapClient {
 mod tests {
     use super::*;
     use fube_ra::protocol::{AddInstance, Configuration, Replica};
+    use fubst::serde::to_vec;
     use std::sync::Arc;
 
     #[test]
@@ -221,7 +221,7 @@ mod tests {
             let request = RapClient::prepare(&effect).unwrap();
             assert_eq!(request.action, action);
             assert_eq!(
-                request.body,
+                to_vec(&request.body).unwrap(),
                 to_vec(&rap::Request {
                     runtime: runtime.into(),
                     unit: body.unit.clone(),
@@ -234,17 +234,6 @@ mod tests {
                 "{action}"
             );
         }
-        let mut oversized = (*body).clone();
-        oversized.service.name = "x".repeat(BODY);
-        assert!(matches!(
-            RapClient::prepare(&ra::Effect::RuntimeOpen {
-                token: 1,
-                body: Arc::new(oversized),
-                registration: Default::default(),
-                flags: 0,
-            }),
-            Err(Error::Capacity)
-        ));
         assert!(matches!(
             RapClient::prepare(&ra::Effect::ReleaseUsage { acquisition: 1 }),
             Err(Error::Unsupported)

@@ -92,27 +92,25 @@ pub mod rap {
         registration: &ra::RuntimeRegistration,
         body: &AddInstance,
         flags: i64,
-    ) -> Result<Vec<u8>> {
-        to_vec(&Request {
+    ) -> Request {
+        Request {
             runtime: registration.runtime.clone(),
             unit: body.unit.clone(),
             local: body.replica.clone(),
             remote: ObjectArray(vec![]),
             service: body.service.clone(),
             flags,
-        })
-        .map_err(|_| Error::Protocol)
+        }
     }
-    pub fn idle_request(body: &AddInstance, replica: &Replica) -> Result<Vec<u8>> {
-        to_vec(&Request {
+    pub fn idle_request(body: &AddInstance, replica: &Replica) -> Request {
+        Request {
             runtime: String::new(),
             unit: body.unit.clone(),
             local: body.replica.clone(),
             remote: ObjectArray(vec![replica.clone()]),
             service: Service::default(),
             flags: 0,
-        })
-        .map_err(|_| Error::Protocol)
+        }
     }
     pub use idle_request as build_request;
 }
@@ -269,6 +267,7 @@ struct Usage {
 struct Sending {
     dispatch: ra::Dispatched,
     send: ipc::LifecycleSend,
+    previous_route: Option<Route>,
 }
 struct Route {
     runtime: String,
@@ -2584,6 +2583,35 @@ impl Node {
         }
         result
     }
+    fn complete_send(
+        &mut self,
+        dispatch: ra::Dispatched,
+        previous_route: Option<Route>,
+        result: furpc::Result<()>,
+    ) -> Result<()> {
+        if let Err(furpc::Error::Codec {
+            phase: "encode",
+            source,
+        }) = &result
+        {
+            // No submission occurred: preserve original work and reply routing.
+            self.route = previous_route;
+            self.effects.push_front(dispatch);
+            return Err(match source {
+                furpc::CodecError::ResourceLimit { .. } => Error::Capacity,
+                furpc::CodecError::InvalidPayload { .. } => Error::Protocol,
+            });
+        }
+        self.receipts.push_back(EffectReceipt {
+            dispatch,
+            disposition: if result.is_ok() {
+                LocalDisposition::Written
+            } else {
+                LocalDisposition::WriteFailed
+            },
+        });
+        Ok(())
+    }
     fn drive_inner(&mut self) -> Result<()> {
         // Observation failure withdraws new activation use, not existing owners.
         let _ = self.activation.poll_registration();
@@ -2591,14 +2619,7 @@ impl Node {
         if let Some(sending) = &self.sending {
             if let Some(result) = sending.send.result() {
                 let sending = self.sending.take().unwrap();
-                self.receipts.push_back(EffectReceipt {
-                    dispatch: sending.dispatch,
-                    disposition: if result.is_ok() {
-                        LocalDisposition::Written
-                    } else {
-                        LocalDisposition::WriteFailed
-                    },
-                });
+                self.complete_send(sending.dispatch, sending.previous_route, result)?;
             }
         }
         let occupied =
@@ -3015,12 +3036,16 @@ impl Node {
                 let request = RapClient::prepare(&dispatch.effect)?;
                 match client.send(request) {
                     Ok(send) => {
-                        self.route = Some(Route {
+                        let previous_route = self.route.replace(Route {
                             runtime: registration.runtime.clone(),
                             client,
                         });
                         self.effects.pop_front();
-                        self.sending = Some(Sending { dispatch, send });
+                        self.sending = Some(Sending {
+                            dispatch,
+                            send,
+                            previous_route,
+                        });
                         return Ok(());
                     }
                     Err(furpc::Error::ResourceLimit(_)) => return Ok(()),
@@ -3051,12 +3076,16 @@ impl Node {
                 let request = RapClient::prepare(&dispatch.effect)?;
                 match client.send(request) {
                     Ok(send) => {
-                        self.route = Some(Route {
+                        let previous_route = self.route.replace(Route {
                             runtime: registration.runtime.clone(),
                             client,
                         });
                         self.effects.pop_front();
-                        self.sending = Some(Sending { dispatch, send });
+                        self.sending = Some(Sending {
+                            dispatch,
+                            send,
+                            previous_route,
+                        });
                         return Ok(());
                     }
                     Err(furpc::Error::ResourceLimit(_)) => return Ok(()),
@@ -3426,6 +3455,87 @@ mod ingress_tests {
             }
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test]
+    async fn encoding_failure_retains_the_original_rap_effect_without_a_failed_write_receipt() {
+        let store = Arc::new(Store::memory(StoreSettings::default()).await.unwrap());
+        let mut node = Node::new(
+            Activation::new(Options::new(std::env::temp_dir())).unwrap(),
+            store.clone(),
+            ra::Admission {
+                local_node: NodeInstance::default(),
+                fm_source: NodeInstance::default(),
+                generation: GenerationNumber::default(),
+                owner_ready: true,
+                node_open: true,
+                node_activated: true,
+                fabric_upgrading: false,
+            },
+            ra::Settings::default(),
+        )
+        .unwrap();
+        let dispatch = |operation| ra::Dispatched {
+            operation,
+            entity: [1; 16],
+            effect: ra::Effect::RuntimeOpen {
+                token: operation,
+                body: Arc::new(AddInstance::default()),
+                registration: ra::RuntimeRegistration::default(),
+                flags: 4,
+            },
+        };
+        for (source, expected) in [
+            (
+                furpc::CodecError::resource_limit("encoded body bytes"),
+                Error::Capacity,
+            ),
+            (
+                furpc::CodecError::invalid_payload("invalid RAP payload"),
+                Error::Protocol,
+            ),
+        ] {
+            node.effects.push_back(dispatch(8));
+            assert_eq!(
+                node.complete_send(
+                    dispatch(7),
+                    None,
+                    Err(furpc::Error::Codec {
+                        phase: "encode",
+                        source,
+                    }),
+                ),
+                Err(expected)
+            );
+            assert!(node.take_effect_receipts().is_empty());
+            assert!(node.route.is_none());
+            assert_eq!(node.effects.len(), 2);
+            let original = node.effects.pop_front().unwrap();
+            assert_eq!(original.operation, 7);
+            assert!(matches!(
+                original.effect,
+                ra::Effect::RuntimeOpen {
+                    token: 7,
+                    flags: 4,
+                    ..
+                }
+            ));
+            node.complete_send(original, None, Ok(())).unwrap();
+            let later = node.effects.pop_front().unwrap();
+            assert_eq!(later.operation, 8);
+            node.complete_send(later, None, Err(furpc::Error::Closed))
+                .unwrap();
+            let receipts = node.take_effect_receipts();
+            assert!(matches!(receipts[0].disposition, LocalDisposition::Written));
+            assert!(matches!(
+                receipts[1].disposition,
+                LocalDisposition::WriteFailed
+            ));
+            assert!(node.effects.is_empty());
+        }
+        assert!(node.terminate().unwrap());
+        node.close_executor(Duration::from_secs(3)).await.unwrap();
+        assert!(store.close().await.unwrap().is_clean());
     }
 
     #[tokio::test]

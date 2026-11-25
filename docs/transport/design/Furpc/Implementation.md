@@ -404,12 +404,16 @@ inline and retain the existing pre-clone/pre-encoding allocation checks.
 Lease polls remain independent of core state locking once registration completes.
 Admitted semantic RAP replies still expose the existing owned byte API; their
 contiguous copy occurs only after domain identity/readiness/inbox admission.
-Lifecycle sends use OneWayClient<PeerSendService> on the captured original Peer,
-with shared prepared-body encoding and one method profile inventory for envelope
-construction and the outbound guard. Public action/body inputs, send admission,
-authority checks, retained local-write observations and joined shutdown remain
-Hosting policy. This refactor adds no furpc API and does not update the
-exact-source native Hosting qualification recorded below.
+Lifecycle sends pass an owned typed payload and concrete Encoder through
+`HostLease::send_lifecycle` to OneWayClient on the captured original Peer.
+The eight-method profile inventory still owns envelope construction and the
+outbound guard; Hosting has no dependency on RA schemas. Original-entry middleware
+rechecks authority after encoding at service readiness/submission, without a
+strong reference cycle. Send admission, authority checks, retained local-write
+observations and joined shutdown remain Hosting policy. Encoding failures settle
+the observer without submitting a frame. The former byte-only send signature is
+intentionally replaced, not retained as a pass-through API. This refactor adds no
+furpc API and does not update the exact-source native Hosting qualification below.
 Private HostingServer and LifecycleClient facades now separate protocol
 composition from the connection/domain executor. HostingServer owns actor-wide
 ingress bindings, method dispatch and opaque deferred RPC/semantic invocations;
@@ -1030,12 +1034,20 @@ retry, reconnect or fresh native qualification.
 
 ## Node local RAP typed composition
 
-Node's local RA/RAP bridge now separates private client and reply-intake adapters
-from its domain executor. RapClient prepares the eight supported RA effects using
-the existing native ProxyRequest schemas and 64 KiB body bound. Opaque prepared
-requests keep action/payload pairing inside the adapter; submission uses the
-original Hosting lease and its existing typed furpc one-way service. It adds no
-reconnection, retry, serving task or new public Hosting/furpc API.
+Node's local RA/RAP bridge separates private client and reply-intake adapters
+from its domain executor. RapClient maps the eight supported RA effects to actual
+native ProxyRequest DTOs, retaining action/payload pairing inside the adapter.
+The request/idle helpers return DTOs, not serialized vectors. The original Hosting
+lease carries the DTO and a concrete `FubstEncoder<rap::Request>` into bounded
+`OneWayClient::send` execution on Hosting's existing owned task. No production
+prepared-body encoder or pre-encoding boundary remains on this path.
+
+The 64 KiB output bound is enforced during encoding, before transport submission.
+If encoding fails, Node restores its original retained effect and previous reply
+route, reports Capacity/Protocol as before and emits no failed-write receipt.
+Transport failures still produce WriteFailed; successful local writing still does
+not complete RA semantics. This adds no reconnection, retry, serving task or new
+furpc API.
 
 Reply intake checks exact opaque session provenance before action parsing or
 budgeted decoding, then selects typed load, service-description, endpoint and
