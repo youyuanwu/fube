@@ -100,8 +100,13 @@ fn bounded(message: &Message) -> furpc::Result<()> {
     bounded_parts(message.headers(), message.body())
 }
 fn bounded_parts(headers: &Headers, body: &Body) -> furpc::Result<()> {
-    if body.len() > LIMIT
-        || headers.records().count() > 16
+    if body.len() > LIMIT {
+        return Err(furpc::Error::ResourceLimit("cluster envelope"));
+    }
+    bounded_headers(headers)
+}
+fn bounded_headers(headers: &Headers) -> furpc::Result<()> {
+    if headers.records().count() > 16
         || headers
             .records()
             .map(|header| header.value().len())
@@ -112,8 +117,7 @@ fn bounded_parts(headers: &Headers, body: &Body) -> furpc::Result<()> {
     }
     Ok(())
 }
-fn fm_ingress(message: &Message, props: &Properties) -> furpc::Result<()> {
-    bounded(message)?;
+fn fm_profile(props: &Properties) -> furpc::Result<()> {
     if props.actor != FM_ACTOR
         || props.uncorrelated_reply
         || !matches!(
@@ -161,8 +165,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> furpc::Result<()> {
     }
     Ok(())
 }
-fn node_ingress(message: &Message, props: &Properties) -> furpc::Result<()> {
-    bounded(message)?;
+fn node_profile(props: &Properties) -> furpc::Result<()> {
     if props.actor != RA_ACTOR
         || props.expects_reply != (props.action == "GenerationProposal")
         || props.uncorrelated_reply
@@ -234,25 +237,7 @@ fn proposal_ack(message: &Message, props: &Properties) -> furpc::Result<()> {
     }
     Ok(())
 }
-fn fm_out(message: &Message, props: &Properties, request: bool) -> furpc::Result<()> {
-    if request != (props.action == "GenerationProposal") {
-        return Err(furpc::Error::Protocol("wrong FM send mechanism"));
-    }
-    let mut canonical = Properties::new(message)?;
-    canonical.expects_reply = canonical.action == "GenerationProposal";
-    node_ingress(message, &canonical)
-}
-fn node_out(message: &Message, props: &Properties, request: bool) -> furpc::Result<()> {
-    if request != matches!(props.action.as_str(), "NodeUp" | "LFUMUpload") {
-        return Err(furpc::Error::Protocol("wrong node send mechanism"));
-    }
-    // RPC adds ExpectsReply below outbound policy.
-    let mut canonical = Properties::new(message)?;
-    canonical.expects_reply = matches!(canonical.action.as_str(), "NodeUp" | "LFUMUpload");
-    fm_ingress(message, &canonical)
-}
-fn peer_ingress(message: &Message, props: &Properties) -> furpc::Result<()> {
-    bounded(message)?;
+fn peer_profile(headers: &Headers, props: &Properties) -> furpc::Result<()> {
     if props.actor != RA_ACTOR
         || !props.high_priority
         || props.expects_reply
@@ -269,8 +254,7 @@ fn peer_ingress(message: &Message, props: &Properties) -> furpc::Result<()> {
                 | "GetLSNReply"
                 | "DoReconfiguration"
         )
-        || message
-            .headers()
+        || headers
             .records()
             .filter(|header| header.id().get() == GENERATION_HEADER)
             .count()
@@ -280,26 +264,44 @@ fn peer_ingress(message: &Message, props: &Properties) -> furpc::Result<()> {
     }
     Ok(())
 }
-fn peer_out(message: &Message, props: &Properties, request: bool) -> furpc::Result<()> {
-    if request {
-        return Err(furpc::Error::Protocol("peer traffic is one-way"));
-    }
-    peer_ingress(message, props)
-}
 fn inbound(role: Role, message: &Message) -> furpc::Result<()> {
     let props = Properties::new(message)?;
+    bounded(message)?;
     match role {
-        Role::Fm => fm_ingress(message, &props),
-        Role::Node => node_ingress(message, &props),
-        Role::Peer => peer_ingress(message, &props),
+        Role::Fm => fm_profile(&props),
+        Role::Node => node_profile(&props),
+        Role::Peer => peer_profile(message.headers(), &props),
     }
 }
 fn outbound(role: Role, message: &Message, request: bool) -> furpc::Result<()> {
-    let props = Properties::new(message)?;
+    bounded(message)?;
+    outbound_headers(role, message.headers(), request)
+}
+fn outbound_headers(role: Role, headers: &Headers, request: bool) -> furpc::Result<()> {
+    bounded_headers(headers)?;
+    let mut props = Properties::from_headers(headers)?;
     match role {
-        Role::Fm => fm_out(message, &props, request),
-        Role::Node => node_out(message, &props, request),
-        Role::Peer => peer_out(message, &props, request),
+        Role::Fm => {
+            if request != (props.action == "GenerationProposal") {
+                return Err(furpc::Error::Protocol("wrong FM send mechanism"));
+            }
+            props.expects_reply = props.action == "GenerationProposal";
+            node_profile(&props)
+        }
+        Role::Node => {
+            if request != matches!(props.action.as_str(), "NodeUp" | "LFUMUpload") {
+                return Err(furpc::Error::Protocol("wrong node send mechanism"));
+            }
+            // RPC adds ExpectsReply below outbound policy.
+            props.expects_reply = matches!(props.action.as_str(), "NodeUp" | "LFUMUpload");
+            fm_profile(&props)
+        }
+        Role::Peer => {
+            if request {
+                return Err(furpc::Error::Protocol("peer traffic is one-way"));
+            }
+            peer_profile(headers, &props)
+        }
     }
 }
 pub fn deadline() -> Instant {
@@ -376,11 +378,18 @@ impl Link {
         Ok(link)
     }
     pub fn seal(&self, message: Message) -> Result<Message> {
-        if message
-            .headers()
-            .records()
-            .any(|header| header.id().get() == PTOP)
-        {
+        let mut headers = message.headers().clone();
+        self.seal_headers(&mut headers)?;
+        let mut builder = Message::builder().body(message.body().clone());
+        for header in headers.records() {
+            builder = builder.append_header(header.to_owned());
+        }
+        let message = builder.build().map_err(err)?;
+        bounded(&message).map_err(err)?;
+        Ok(message)
+    }
+    fn seal_headers(&self, headers: &mut Headers) -> Result<()> {
+        if headers.records().any(|header| header.id().get() == PTOP) {
             return Err("duplicate source header".into());
         }
         let source = HeaderRecord::native(
@@ -395,13 +404,8 @@ impl Link {
             },
         )
         .map_err(err)?;
-        let mut builder = Message::builder().body(message.body().clone());
-        for header in message.headers().records() {
-            builder = builder.append_header(header.to_owned());
-        }
-        let message = builder.append_header(source).build().map_err(err)?;
-        bounded(&message).map_err(err)?;
-        Ok(message)
+        headers.append(source).map_err(err)?;
+        bounded_headers(headers).map_err(err)
     }
     pub fn validate(&self, message: &Message) -> Result<()> {
         if !self.is_current(message)? {
@@ -1092,9 +1096,10 @@ mod tests {
             create_replica_reply_message(&CreateReplicaReply::default(), &generation).unwrap(),
         ] {
             let properties = Properties::new(&message).unwrap();
-            peer_ingress(&message, &properties).unwrap();
+            bounded(&message).unwrap();
+            peer_profile(message.headers(), &properties).unwrap();
             predecode(&message).unwrap();
-            assert!(peer_out(&message, &properties, true).is_err());
+            assert!(outbound(Role::Peer, &message, true).is_err());
             for invalid in [
                 Properties {
                     actor: FM_ACTOR,
@@ -1117,7 +1122,7 @@ mod tests {
                     ..Properties::new(&message).unwrap()
                 },
             ] {
-                assert!(peer_ingress(&message, &invalid).is_err());
+                assert!(peer_profile(message.headers(), &invalid).is_err());
             }
             let mut builder = Message::builder().body(message.body().clone());
             for h in message
@@ -1128,7 +1133,7 @@ mod tests {
                 builder = builder.append_header(h.to_owned());
             }
             let missing = builder.build().unwrap();
-            assert!(peer_ingress(&missing, &properties).is_err());
+            assert!(peer_profile(missing.headers(), &properties).is_err());
             let mut builder = Message::builder().body(message.body().clone());
             for h in message.headers().records() {
                 builder = builder.append_header(h.to_owned());
@@ -1137,7 +1142,7 @@ mod tests {
                 .append_header(generation.header().unwrap())
                 .build()
                 .unwrap();
-            assert!(peer_ingress(&duplicate, &properties).is_err());
+            assert!(peer_profile(duplicate.headers(), &properties).is_err());
         }
     }
 

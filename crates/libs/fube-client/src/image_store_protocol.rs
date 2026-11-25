@@ -1,11 +1,12 @@
-use fubst::serde::{from_slice, to_vec, Derived, Guid, Inline};
-use furpc::{header, ActorId, Body, HeaderId, HeaderRecord, Headers, Message, MessageId, Response};
+use fubst::serde::{from_slice, Derived, Guid, Inline};
+use furpc::{
+    header, ActorId, DecodeBuf, Decoder, FubstDecoder, HeaderId, HeaderRecord, Headers, Message,
+    MessageId,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::time::Instant;
 
-use crate::{
-    furpc_client::decode_body, DomainFailure, FurpcClientError, ImageStoreResult as Result,
-};
+use crate::{DomainFailure, FurpcClientError, ImageStoreError, ImageStoreResult as Result};
 
 pub(crate) const SERVICE: &str = "fabric:/System/ImageStoreService";
 pub(crate) const CREATE: u16 = 0x804f;
@@ -76,8 +77,15 @@ fn read_header<T: DeserializeOwned>(headers: &Headers, id: u16) -> Result<T> {
     Ok(from_slice(record.value())?)
 }
 
-fn failure(body: &Body) -> Result<DomainFailure> {
-    let failure: Failure = decode_body(body)?;
+fn failure(src: &mut DecodeBuf<'_>) -> Result<DomainFailure> {
+    let failure = FubstDecoder::<Failure>::default()
+        .decode(src)
+        .map_err(|source| {
+            ImageStoreError::from(furpc::Error::Codec {
+                phase: "decode",
+                source,
+            })
+        })?;
     if failure.code == 0 || i32::try_from(failure.code).is_err() {
         return Err(FurpcClientError::Protocol("invalid native upload failure code").into());
     }
@@ -88,7 +96,10 @@ fn failure(body: &Body) -> Result<DomainFailure> {
 }
 
 /// Interpret every semantic ACK before applying obsolete-Activity policy.
-pub(crate) fn decode_reply(headers: &Headers, body: &Body) -> Result<FileTransferReply> {
+pub(crate) fn decode_reply(
+    headers: &Headers,
+    body: &mut DecodeBuf<'_>,
+) -> Result<FileTransferReply> {
     let common = headers.effective();
     let success = common
         .action()
@@ -268,11 +279,11 @@ struct Route<'a> {
     derived: Derived<TypeScope<'a>>,
 }
 #[derive(Serialize)]
-struct Delete<'a> {
+pub(crate) struct Delete<'a> {
     path: &'a str,
 }
 
-pub(crate) fn delete(path: &str, activity: [u8; 16]) -> Result<(Vec<HeaderRecord>, Body)> {
+pub(crate) fn delete(path: &str, activity: [u8; 16]) -> Result<(Vec<HeaderRecord>, Delete<'_>)> {
     #[derive(Serialize)]
     struct Partition {
         id: Guid,
@@ -315,11 +326,13 @@ pub(crate) fn delete(path: &str, activity: [u8; 16]) -> Result<(Vec<HeaderRecord
             },
         )?,
     ]);
-    Ok((headers, Body::from_bytes(to_vec(&Delete { path })?)?))
+    Ok((headers, Delete { path }))
 }
 
-pub(crate) fn decode_delete(response: Response<Body>) -> Result<Option<[u8; 16]>> {
-    let headers = response.headers();
+pub(crate) fn decode_delete(
+    headers: &Headers,
+    body: &mut DecodeBuf<'_>,
+) -> Result<Option<[u8; 16]>> {
     let common = headers.effective();
     if headers.first_raw(header::FAULT).is_some()
         || common.expects_reply
@@ -334,7 +347,7 @@ pub(crate) fn decode_delete(response: Response<Body>) -> Result<Option<[u8; 16]>
             .copied()
             .eq("ClientOperationFailure".encode_utf16())
     {
-        let failure = failure(response.body())?;
+        let failure = failure(body)?;
         return if failure.code == FILE_NOT_FOUND {
             Ok(None)
         } else {
@@ -347,7 +360,7 @@ pub(crate) fn decode_delete(response: Response<Body>) -> Result<Option<[u8; 16]>
             .iter()
             .copied()
             .eq("OperationSuccessAction".encode_utf16())
-        || !response.body().is_empty()
+        || !body.is_empty()
     {
         return Err(
             FurpcClientError::Protocol("unexpected routed ImageStore Delete result").into(),

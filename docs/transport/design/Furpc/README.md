@@ -1,95 +1,70 @@
 # furpc design
 
-**Status:** design contract for `crates/libs/furpc`, now in the workspace.
-See [current implementation](Implementation.md#current-implementation) for
-delivered functionality and remaining qualification. Signatures and examples
-are not independent native interoperability evidence. Existing legacy transport
-support claims remain unchanged; TLS/claims implementation is deferred.
+`furpc` is the shared Service Fabric native transport. It separates byte I/O,
+connection progress, native messaging, Tower services, and typed body adaptation.
+It preserves Fabric framing and serialization rather than substituting HTTP or
+gRPC. The supported transport is clear TCP; native TLS and claims are not
+implemented.
 
-## Summary
+These documents describe responsibilities, ownership, and behavioral contracts.
+The [crate exports and Rustdoc](../../../../crates/libs/furpc/src/lib.rs) are the
+API reference. Signatures, defaults, executable examples, and implementation
+details live beside the code, not in parallel Markdown declarations.
 
-`furpc` rebuilds the shared Service Fabric native TCP transport as one reusable
-connection/messaging core. Gateway clients, runtime/Hosting IPC, replication,
-and future actor36 services are consumers above it, not special cases inside
-a gateway-shaped channel.
+## Layers
 
-Borrow Tokio, hyper, Tower, axum, and tonic's separation of I/O, connection
-progress, services, and typed APIs. Keep Fabric's native wire protocol; do not
-substitute HTTP/2 or gRPC or reproduce the entire ecosystem's abstractions.
-
-| Area | Decision |
+| Layer | Responsibility |
 | --- | --- |
-| Foundation | Immutable raw messages, segmented bodies, and one driver per physical generation. Standalone `Message::builder`/header construction is bounded; submission enforces scope policy. RPC is optional composition above raw messaging. |
-| Ownership | Channel clones and submitted service futures share one private dialed scope. There is no separate public dialed owner. `Server` configuration is consumed by one `serve_with_shutdown` future owning accepted work. Native Peer capabilities do not own either scope. |
-| Connections | URI-based Endpoint configures a stable logical Channel. Reusable `Service<http::Uri>` connectors establish/re-establish generations using the original URI on shared demand. Built-in TCP requires `tcp://host:port`; no HTTP wire semantics or implicit port/TLS defaults. Channel is the sole built-in client transport; Peer stays generation-bound. No replay/pooling/balancing. |
-| Local listener | Native-style listen_address/instance builder settings on Endpoint and ServerBuilder; wire ListenInstance stays internal. Explicit listeners default to native instance zero; existing omitted behavior is preserved. Socket binding, publication, actual I/O diagnostics and authentication remain separate. |
-| Requests | http-shaped, body-first `Request<B>` is shared by outbound calls, server middleware, and decoded handlers. Requests and parts allow bounded ordered-header edits; trusted context and original admission remain protected. Message/request/reply envelopes use generic header insertion; Actor/Action helpers are not special envelope fields. Body adaptation preserves current headers and context. |
-| Responses | http-shaped `Response<T>` body access and parts reassembly preserve editable headers, read-only native provenance/settlement, and accounting. No HTTP status/version semantics. |
-| Codecs | Native header/control serialization is fixed internally using `fubst`. RpcClient and OneWayClient wrap byte-facing Tower services, borrow them mutably, and consume codecs per call/send under explicit body limits. PeerRequestService/PeerSendService retain original-Peer authority; native Peer operations stay byte-facing. Typed notifications reuse RpcClient over an explicit notify adapter. Public codec helpers adapt standalone bodies; server method services construct `server::Rpc<C>`; routers are codec-free. |
-| Ingress | IngressService is canonical on Endpoint/Channel and Server: `Service<Request<Body>, Response = IngressResponse>` with shared bindings and scope-owned HandlerLimits. Ordinary and notification classes retain distinct authorization and class-local raw/Actor dispatch. Actor is optional; replication uses ReplicationActor without a synthetic Actor header or Actor-0 binding. |
-| Capabilities | IngressOptions configures one-way/request/notification authorization, not implicit general send authority. Restricted context/peer-ready Peers remain independent; replies and notification acknowledgments stay runner-owned. No native application pull API or hidden inbox: bounded application work queues compose inside services. |
-| Serving | The same raw service or optional Actor/Action Router installs on dialed and accepted owners. Separate RPC adapters provide typed handlers; the runner retains reply authority. Optional `on_peer_ready` work initiates accepted-side bootstrap after establishment. No full actor framework is introduced. |
-| Resources | Native frame/send-queue limits and explicit execution/backpressure policy are separate from wire validity. Shared storage uses reference counting, not allocation leases or aggregate heap quotas. No extra standalone construction ceilings. |
-| Framing | Internal incremental parsing and segmented output; applications receive complete messages, not streaming fragments or public frame objects. |
-| Lifecycle | Tonic-shaped signal-and-await server shutdown returns `Result<()>`; Channels close on last-owner release. Peer handles, native operations, and received requests are nonowning. Admitted replies/notification acknowledgments participate in runner drain. No independent closure observers or public client drain/abort methods. Errors/cancellation do not guarantee joined background cleanup. |
-| Security | Initial delivery is Linux/Tokio clear TCP. TLS/claims implementation is deferred, but native negotiation and protection boundaries are designed. No downgrade. |
-| Domain protocols | Discovery, readiness, replication operation queues/ACK scheduling/retry, session recovery, and application errors stay in consumers. Replication follows native's framework-owned flow control above furpc. Physical reconnect restores no domain session and replays no calls. |
-| Migration | All workspace consumers now use furpc; `fube-transport` is removed. Native qualification remains exact-source/profile-specific. |
+| I/O adapters | Acquire owned Tokio byte streams through URI connector services or `Accept`. |
+| Connection driver | Own one physical generation's I/O, native establishment, framing, ordered writes, timers, and retirement. |
+| Native messaging | Preserve ordered headers and segmented bodies; classify controls, replies, notifications, and ordinary ingress. |
+| Scope and services | Own dialed or accepted work, ingress bindings, service execution, correlation, and original-generation reply completion. |
+| Typed adaptation | Encode and decode actual protocol values above byte services, with explicit direction states and body limits. |
+| Consumers | Own SF schemas, protocol admission, sessions, retries, semantic acknowledgments, recovery, and application completion. |
+
+`Endpoint` configures a logical `Channel`; Channel clones and submitted service
+futures share its dialed lifetime. `Server::serve_with_shutdown` owns accepted
+work. Both use the same private connection driver. A `Peer` is a nonowning
+capability for one physical generation, never a reconnecting connection owner.
+
+`RpcClient` and `OneWayClient` compose over byte-facing Tower services.
+`server::unary` and `server::one_way` adapt typed handlers inside ingress
+services. Routing remains byte-facing and optional. Actual encoder and decoder
+values belong to each operation; the socket driver does not know application
+body types.
 
 ## Design map
 
-Each topic owns its detailed contract. Read the summary first, then follow
-the public or internal boundary relevant to the change; there is no second
-monolithic API document.
-
-| Part | Owns |
+| Document | Contract |
 | --- | --- |
-| [Architecture](Architecture.md) | Source baselines, scope, layering, dependencies, type ownership, and shared driver. |
-| [Connections](Connections.md) | URI Endpoint/validation, reconnecting logical Channel, native Peer, reusable URI connectors, Accept, serving/peer-ready hooks, and establishment/deadline budgets. |
-| [Messages](Messages.md) | Native header fidelity, raw `Message`/`Body`, standalone bounded construction, and raw sends. |
-| [Requests](Requests.md) | `Request<B>`/parts/context, transport-generic RpcClient/OneWayClient, original-Peer service adapters, client codec limits, `Response<T>`/parts, native IDs, and correlation/reply authority. |
-| [Codecs](Codecs.md) | Native serialization, public body-codec traits/helpers, and bounded encode/decode behavior. |
-| [Ingress](Actors.md) | Native classification, raw versus Actor service dispatch, ingress policies/send capabilities, generation binding, and Peer notifications with service-managed acknowledgments. |
-| [Services](Services.md) | Canonical IngressService/IngressResponse on Endpoint, Channel, and Server; native bindings, typed method adapters, private reply completion, HandlerLimits, and lifecycle. |
-| [Routing](Routing.md) | Byte-facing Actor/Action service routes, route options, exact matching, and routing limits. |
-| [Resources](Resources.md) | Shared storage ownership, native send-queue accounting, admission, and scheduling. |
-| [Operations](Operations.md) | Commitment, cancellation, deadlines, receipts, and error categories. |
-| [Lifecycle](Lifecycle.md) | Channel lifetime, graceful server completion, drop/cancellation, and cooperative cleanup. |
-| [Framing](Framing.md) | Private header codec, receive gates, integrity, discard, EOF, frame preparation, and write cursors. |
-| [Security](Security.md) | Deferred TLS/claims state, native wire transitions, and security release requirements. |
-| [Examples](Examples.md) | Raw and typed clients, routed/custom services, custom codecs/I/O, and shutdown usage. |
-| [Implementation](Implementation.md) | Gap ownership, implementation order, migration, acceptance, and remaining evidence. |
+| [Architecture](Architecture.md) | Layering, ownership, dependencies, and implementation map. |
+| [Connections](Connections.md) | Endpoint, Channel, connectors, acceptance, listener advertisement, and reconnection. |
+| [Messages](Messages.md) | Shared bytes, native headers, raw construction, and submission. |
+| [Requests](Requests.md) | Request/response envelopes, typed clients, and correlation. |
+| [Codecs](Codecs.md) | Directional body adaptation, header access, bounded buffers, and standalone helpers. |
+| [Ingress](Actors.md) | Native classification, raw/Actor bindings, capabilities, and notifications. |
+| [Services](Services.md) | Ingress execution, typed serving, private reply authority, and application queues. |
+| [Routing](Routing.md) | Exact Actor/Action matching and original-route identity. |
+| [Resources](Resources.md) | Wire limits, queue accounting, admission, and consumer backpressure. |
+| [Operations](Operations.md) | Commitment, deadlines, cancellation, receipts, and errors. |
+| [Lifecycle](Lifecycle.md) | Ownership, server drain, cancellation, and completion. |
+| [Framing](Framing.md) | Private receive gates, integrity, segmented preparation, and partial writes. |
+| [Security](Security.md) | Clear-transport boundary and native TLS/claims design constraints. |
+| [Examples](Examples.md) | Navigation to executable examples and concrete application composition. |
+| [Consumer composition](Implementation.md) | Application stubs, domain policy, and intentional byte-facing interfaces. |
 
-For the shortest usage path, read Connections, Requests, Routing, and Examples.
-For core work, read Architecture, Resources, Operations, Framing, and Lifecycle.
-Cross-topic references point to the owning contract rather than duplicating
-signatures or inventing a second control path.
+For application integration, start with Connections, Requests, Services, and
+Examples. For transport changes, start with Architecture, Framing, Resources,
+Operations, and Lifecycle.
 
-The delivered consumer slices now include
-[data replication](Implementation.md#data-replication-migration).
-Its furpc API prerequisite,
-[native-style listener configuration](Connections.md#native-style-listener-configuration),
-is now implemented for clear transport;
-the adapter uses the existing raw service/Peer contracts and
-explicitly changes the legacy adapter's admission and cancellation guarantees.
-The consumer migration is implemented; native replication qualification remains pending.
+## Scope
 
-The [public body helpers](Codecs.md#public-body-helpers) and
-[one-way client/Peer adapters](Requests.md#one-way-client-and-peer-service-adapters)
-are implemented. The [delivery and acceptance record](Implementation.md#generic-adapter-follow-up)
-keeps SF method policy, retry payload stability, and runtime admission/lifetime
-rules in consumers. Runtime has adopted them without changing its original-Peer
-ownership, semantic acknowledgment, or shutdown/unregister boundaries.
+The crate provides no discovery, pooling, load balancing, automatic replay,
+remote cancellation, durable messaging, generated stubs, COM/IDL ABI, or actor
+activation/persistence framework. Reconnection restores a physical transport
+for later demand, not a domain session or a failed invocation.
 
-## Non-goals and evidence
-
-The initial crate does not provide HTTP/gRPC, COM/IDL ABI compatibility,
-automatic replay, remote cancellation, durable messaging, generated stubs,
-actor activation/persistence, pooling/balancing, or transparent domain-session
-recovery/discovery. TLS and
-claims are designed future capabilities, not implemented support.
-
-The [source and scope record](Architecture.md#evidence-compatibility-and-scope)
-distinguishes native behavior, intentional Rust adaptations, finite resource
-policy, and independently demonstrated interoperability. Internal round trips
-and documentation consistency do not establish native compatibility.
+Local write, correlated reply, bounded domain enqueue, semantic acknowledgment,
+application completion, and physical cleanup are distinct boundaries. Shared
+byte ownership is not a heap quota. Header metadata and advertised addresses
+are not authentication or reply authority.

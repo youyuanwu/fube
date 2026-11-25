@@ -15,9 +15,10 @@ use std::{
 
 use fube_core::protocol::actor as actors;
 use furpc::{
-    codec, header, ActorId, Body, BoxError, Channel, ClientCodecLimits, Codec, Connected,
-    EncodeBuf, Encoder, Endpoint, FubstCodec, HeaderId, HeaderRecord, Headers, OneWayClient, Peer,
-    PeerRequestService, PeerSendService, Request, Response, RpcClient, TransportIo, WriteReceipt,
+    codec, header, ActorId, Body, BoxError, Channel, ClientCodecLimits, Connected, EncodeBuf,
+    Encoder, Endpoint, FubstDecoder, FubstEncoder, HeaderId, HeaderRecord, Headers, OneWayClient,
+    Peer, PeerRequestService, PeerSendService, Request, Response, RpcClient, TransportIo,
+    WriteReceipt,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
@@ -355,7 +356,7 @@ where
         self.send(
             RapMethod::ReplicaReply(kind),
             body,
-            FubstCodec::<_, ()>::default(),
+            FubstEncoder::<_>::default(),
             deadline,
             valid,
             SendLane::Replies,
@@ -373,7 +374,7 @@ where
         self.send(
             RapMethod::ReplicaReply(kind),
             body,
-            FubstCodec::<_, ()>::default(),
+            FubstEncoder::<_>::default(),
             deadline,
             valid,
             SendLane::Ordinary,
@@ -390,7 +391,7 @@ where
         self.send(
             RapMethod::ServiceUpdateReply,
             body,
-            FubstCodec::<_, ()>::default(),
+            FubstEncoder::<_>::default(),
             deadline,
             valid,
             SendLane::Replies,
@@ -407,7 +408,7 @@ where
         self.send(
             RapMethod::ServiceUpdateReply,
             body,
-            FubstCodec::<_, ()>::default(),
+            FubstEncoder::<_>::default(),
             deadline,
             valid,
             SendLane::Ordinary,
@@ -424,7 +425,7 @@ where
         self.send(
             RapMethod::Load,
             body,
-            FubstCodec::<_, ()>::default(),
+            FubstEncoder::<_>::default(),
             deadline,
             valid,
             SendLane::Ordinary,
@@ -441,7 +442,7 @@ where
         self.send(
             RapMethod::Fault,
             report.0,
-            PreparedBodyCodec,
+            PreparedBodyEncoder,
             deadline,
             valid,
             SendLane::Ordinary,
@@ -458,7 +459,7 @@ where
         self.send(
             RapMethod::EndpointUpdated,
             update.0,
-            PreparedBodyCodec,
+            PreparedBodyEncoder,
             deadline,
             valid,
             SendLane::Ordinary,
@@ -466,19 +467,18 @@ where
         .await
     }
 
-    async fn send<C>(
+    async fn send<E>(
         &mut self,
         method: RapMethod,
-        body: C::Encode,
-        codec: C,
+        body: E::Item,
+        encoder: E,
         deadline: Instant,
         valid: Check,
         lane: SendLane,
     ) -> Result<()>
     where
-        C: Codec + Send,
-        C::Encode: Send,
-        C::Encoder: Send,
+        E: Encoder + Send,
+        E::Item: Send,
     {
         let (actor, action) = method.envelope();
         let request = Request::new(body)
@@ -490,7 +490,7 @@ where
         service.valid = valid;
         service.lane = lane;
         self.inner
-            .send(request, codec, deadline)
+            .send(request, encoder, deadline)
             .await
             .map_err(native_error)?;
         Ok(())
@@ -499,7 +499,7 @@ where
 
 fn encode<T: Serialize>(value: T) -> Result<Body> {
     codec::encode(
-        &mut FubstCodec::<T, ()>::default().encoder(),
+        &mut FubstEncoder::<T>::default(),
         value,
         ClientCodecLimits::default().max_encoded_body_bytes,
     )
@@ -512,24 +512,9 @@ fn encode<T: Serialize>(value: T) -> Result<Body> {
 }
 
 // Adopt already-serialized retry bytes without serializing or copying them again.
-struct PreparedBodyCodec;
+struct PreparedBodyEncoder;
 
-impl Codec for PreparedBodyCodec {
-    type Encode = Body;
-    type Decode = ();
-    type Encoder = Self;
-    type Decoder = <FubstCodec<(), ()> as Codec>::Decoder;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        Self
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        FubstCodec::<(), ()>::default().decoder()
-    }
-}
-
-impl Encoder for PreparedBodyCodec {
+impl Encoder for PreparedBodyEncoder {
     type Item = Body;
 
     fn encode(
@@ -822,7 +807,12 @@ where
         self.inner.get_mut().valid = check.clone();
         let result = self
             .inner
-            .call(request, FubstCodec::<Q, R>::default(), deadline)
+            .call(
+                request,
+                FubstEncoder::<Q>::default(),
+                FubstDecoder::<R>::default(),
+                deadline,
+            )
             .await;
         let encoding = matches!(
             &result,

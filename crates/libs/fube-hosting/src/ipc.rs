@@ -9,7 +9,9 @@ use fube_core::protocol::actor as actors;
 use fubst::serde::to_vec;
 #[cfg(test)]
 use furpc::Body;
-use furpc::{header, Error as TransportError, Headers, MessageId, Result as TransportResult};
+use furpc::{
+    header, Encoder, Error as TransportError, Headers, MessageId, Result as TransportResult,
+};
 use serde::Deserialize;
 use std::{
     collections::{HashSet, VecDeque},
@@ -260,15 +262,23 @@ impl HostLease {
     /// Begin a bounded semantic one-way send on this exact admitted session.
     /// Success of the returned observer means only a complete local frame write.
     /// Registration-only activation handles reject before submitting any work.
-    pub fn send_lifecycle(&self, action: &str, body: Vec<u8>) -> TransportResult<LifecycleSend> {
+    /// The owned task encodes the DTO; encoding failures settle the observer
+    /// without submitting a frame.
+    pub fn send_lifecycle<E>(
+        &self,
+        action: &str,
+        body: E::Item,
+        encoder: E,
+    ) -> TransportResult<LifecycleSend>
+    where
+        E: Encoder + Send + 'static,
+        E::Item: Send + 'static,
+    {
         if !self.lifecycle_enabled {
             return Err(protocol("registration-only Hosting profile"));
         }
         let method = LifecycleMethod::select(action)
             .ok_or(protocol("unsupported local lifecycle action/body"))?;
-        if body.len() > MAX_INPUT {
-            return Err(protocol("unsupported local lifecycle action/body"));
-        }
         if !session_live(&self.entry) || !self.entry.ready.load(Ordering::SeqCst) {
             return Err(TransportError::Closed);
         }
@@ -306,7 +316,7 @@ impl HostLease {
                         return Err(TransportError::Closed);
                     }
                     lifecycle
-                        .send(request, tokio::time::Instant::now() + IO_DEADLINE)
+                        .send(request, encoder, tokio::time::Instant::now() + IO_DEADLINE)
                         .await?;
                     if !session_live(&entry) {
                         return Err(TransportError::Closed);
@@ -1326,7 +1336,7 @@ async fn run_connection(
             r.claimed = true;
             r.entry.connected.store(true, Ordering::SeqCst);
             *r.entry.session.lock().unwrap() = Some(Session {
-                lifecycle: LifecycleClient::new(peer.clone())?,
+                lifecycle: LifecycleClient::new(peer.clone(), Arc::downgrade(&r.entry))?,
                 executor: tokio::runtime::Handle::current(),
                 tasks: Arc::new(Mutex::new(Some(JoinSet::new()))),
             });

@@ -1,16 +1,17 @@
 use std::{
     fmt,
-    future::{ready, Ready},
+    future::{ready, Future, Ready},
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex, Weak},
     task::{Context, Poll},
     time::Duration,
 };
 
 use furpc::{
-    header, ActorId, Body, Channel, HeaderRecord, Headers, IngressLimits, IngressOptions,
-    IngressResponse, IngressService, Message, Peer, Request, ServiceBinding, Source,
+    header, ActorId, Body, Channel, Headers, IngressLimits, IngressOptions, IngressResponse,
+    IngressService, Request, ServiceBinding, Source,
 };
 use tokio::{
     fs::{self, File, ReadDir},
@@ -24,6 +25,9 @@ use crate::{
     image_store_protocol::{self as wire, FileTransferReply},
     DomainFailure, FurpcClientError,
 };
+
+mod transport;
+use transport::{UploadClient, UploadRequest};
 
 const MAX_DEPTH: usize = 128;
 const MAX_ENTRIES: usize = 1_000_000;
@@ -63,6 +67,21 @@ impl From<FurpcClientError> for ImageStoreError {
 
 impl From<furpc::Error> for ImageStoreError {
     fn from(error: furpc::Error) -> Self {
+        let source = std::error::Error::source(&error);
+        let source = if matches!(error, furpc::Error::Codec { .. }) {
+            source.and_then(std::error::Error::source)
+        } else {
+            source
+        };
+        if let Some(error) = source.and_then(|source| source.downcast_ref::<Self>()) {
+            return error.clone();
+        }
+        // Preserve the existing serializer-error category for typed encoding too.
+        if matches!(error, furpc::Error::Codec { .. }) {
+            if let Some(error) = source.and_then(|source| source.downcast_ref::<fubst::Error>()) {
+                return (*error).into();
+            }
+        }
         FurpcClientError::from_rpc(error).into()
     }
 }
@@ -155,7 +174,7 @@ impl UploadState {
 /// Last-owner release follows furpc lifecycle, not legacy close/abort guarantees.
 pub struct ImageStoreClient {
     state: Arc<UploadState>,
-    peer: Peer,
+    client: UploadClient,
     replies: mpsc::Receiver<FileTransferReply>,
     timeout: Duration,
 }
@@ -222,8 +241,8 @@ impl ImageStoreClient {
         state.connection.lock().unwrap().channel = Some(channel);
         state.check()?;
         Ok(Self {
+            client: UploadClient::new(peer, state.clone()),
             state,
-            peer,
             replies,
             timeout: options.default_timeout,
         })
@@ -270,13 +289,8 @@ impl ImageStoreClient {
                 if Instant::now() < deadline && self.state.check().is_ok() {
                     // Best effort within the original budget; never replace the primary failure.
                     let _ = self
-                        .send(
-                            "FileUploadDeleteSession",
-                            activity,
-                            vec![],
-                            vec![],
-                            deadline,
-                        )
+                        .client
+                        .send(UploadRequest::DeleteSession, activity, deadline)
                         .await;
                 }
             }
@@ -295,20 +309,7 @@ impl ImageStoreClient {
         session: &mut Option<[u8; 16]>,
     ) -> Result<()> {
         let activity = uuid::Uuid::new_v4().to_bytes_le();
-        let (mut headers, body) = wire::delete(&destination, activity)?;
-        headers.extend([
-            header::actor(ActorId::new(5)?)?,
-            header::action("ForwardMessage")?,
-            wire::timeout(deadline)?,
-        ]);
-        let mut request = Request::new(body);
-        for header in headers {
-            request = request.append_header(header)?;
-        }
-        request.set_deadline(deadline);
-        let response = self.peer.request(request, deadline).await?;
-        self.state.check()?;
-        let deleted = wire::decode_delete(response)?;
+        let deleted = self.client.delete(&destination, activity, deadline).await?;
         if deleted.is_some_and(|reply| reply != activity) {
             return Err(FurpcClientError::Protocol(
                 "Delete success Activity does not match request",
@@ -390,30 +391,6 @@ impl ImageStoreClient {
         Ok(())
     }
 
-    async fn send(
-        &self,
-        action: &str,
-        activity: [u8; 16],
-        extra: Vec<HeaderRecord>,
-        body: Vec<u8>,
-        deadline: Instant,
-    ) -> Result<()> {
-        self.state.check()?;
-        let mut headers = wire::headers(activity)?;
-        headers.extend(extra);
-        headers.extend([
-            header::actor(ActorId::new(26)?)?,
-            header::action(action)?,
-            wire::timeout(deadline)?,
-        ]);
-        let mut message = Message::builder().body(Body::from_bytes(body)?);
-        for header in headers {
-            message = message.append_header(header);
-        }
-        self.peer.send(message.build()?, deadline).await?;
-        Ok(())
-    }
-
     async fn receive(
         &mut self,
         activity: [u8; 16],
@@ -485,10 +462,11 @@ impl ImageStoreClient {
         session: &mut Option<[u8; 16]>,
     ) -> Result<()> {
         let activity = uuid::Uuid::new_v4().to_bytes_le();
-        let create = wire::create(path, size)?;
+        let create =
+            self.client
+                .prepare(UploadRequest::Create { path, size }, activity, deadline)?;
         *session = Some(activity);
-        self.send("FileCreate", activity, vec![create], vec![], deadline)
-            .await?;
+        self.client.send_request(create, deadline).await?;
         let created = self.receive(activity, Stage::Create, deadline).await?;
         created.result.map_err(FurpcClientError::Domain)?;
         let chunk_size = negotiated_size(created.sequence.unwrap().buffer_size)?;
@@ -514,14 +492,16 @@ impl ImageStoreClient {
                     }
                 }
             }
-            self.send(
-                "FileContent",
-                activity,
-                vec![wire::sequence(number, count as u64)?],
-                body,
-                deadline,
-            )
-            .await?;
+            self.client
+                .send(
+                    UploadRequest::Content {
+                        number,
+                        bytes: body,
+                    },
+                    activity,
+                    deadline,
+                )
+                .await?;
             let acknowledged = self
                 .receive(activity, Stage::Chunk(number), deadline)
                 .await?;
@@ -541,7 +521,8 @@ impl ImageStoreClient {
                 .ok_or(furpc::Error::ResourceLimit("native chunk sequence"))?;
         }
         loop {
-            self.send("FileUploadCommit", activity, vec![], vec![], deadline)
+            self.client
+                .send(UploadRequest::Commit, activity, deadline)
                 .await?;
             let committed = self
                 .receive(activity, Stage::Commit(number), deadline)
@@ -561,7 +542,8 @@ impl ImageStoreClient {
                 }
             }
         }
-        self.send("FileUploadCommitAck", activity, vec![], vec![], deadline)
+        self.client
+            .send(UploadRequest::CommitAck, activity, deadline)
             .await?;
         *session = None;
         Ok(())
@@ -671,7 +653,7 @@ struct UploadIngress {
 impl Service<Request<Body>> for UploadIngress {
     type Response = IngressResponse;
     type Error = ImageStoreError;
-    type Future = Ready<Result<IngressResponse>>;
+    type Future = Pin<Box<dyn Future<Output = Result<IngressResponse>> + Send>>;
 
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
         Poll::Ready(Ok(()))
@@ -679,32 +661,73 @@ impl Service<Request<Body>> for UploadIngress {
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         let Some(state) = self.state.upgrade() else {
-            return ready(Err(furpc::Error::Closed.into()));
+            return Box::pin(async { Err(furpc::Error::Closed.into()) });
         };
-        let result: Result<IngressResponse> = (|| {
-            state.check()?;
-            if request
-                .context()
-                .map(|context| context.source().generation())
-                != Some(self.generation)
-            {
-                return Err(
-                    FurpcClientError::Protocol("upload connection generation changed").into(),
-                );
-            }
-            let reply = wire::decode_reply(request.headers(), request.body())?;
-            self.replies.try_send(reply).map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => {
-                    ImageStoreError::from(furpc::Error::ResourceLimit("ImageStore ACK queue"))
+        let generation = self.generation;
+        let replies = self.replies.clone();
+        let guard = OperationGuard {
+            state: state.clone(),
+            armed: true,
+        };
+        Box::pin(async move {
+            let mut guard = guard;
+            let result = async {
+                state.check()?;
+                if request
+                    .context()
+                    .map(|context| context.source().generation())
+                    != Some(generation)
+                {
+                    return Err(
+                        FurpcClientError::Protocol("upload connection generation changed").into(),
+                    );
                 }
-                mpsc::error::TrySendError::Closed(_) => furpc::Error::Closed.into(),
-            })?;
-            Ok(IngressResponse::NoReply)
-        })();
-        if let Err(error) = &result {
-            state.fail(error.clone());
-        }
-        ready(result)
+                furpc::server::one_way(
+                    AckHandoff {
+                        state: state.clone(),
+                        replies,
+                    },
+                    request,
+                    transport::decode_ack,
+                )
+                .await
+                .map_err(ImageStoreError::from)
+            }
+            .await;
+            if let Err(error) = &result {
+                state.fail(error.clone());
+            }
+            guard.armed = false;
+            result
+        })
+    }
+}
+
+struct AckHandoff {
+    state: Arc<UploadState>,
+    replies: mpsc::Sender<FileTransferReply>,
+}
+
+impl Service<Request<FileTransferReply>> for AckHandoff {
+    type Response = ();
+    type Error = ImageStoreError;
+    type Future = Ready<Result<()>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<FileTransferReply>) -> Self::Future {
+        ready(self.state.check().and_then(|()| {
+            self.replies
+                .try_send(request.into_body())
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => {
+                        ImageStoreError::from(furpc::Error::ResourceLimit("ImageStore ACK queue"))
+                    }
+                    mpsc::error::TrySendError::Closed(_) => furpc::Error::Closed.into(),
+                })
+        }))
     }
 }
 

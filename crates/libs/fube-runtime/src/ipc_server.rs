@@ -11,8 +11,9 @@ use std::{
 
 use fube_core::protocol::actor as actors;
 use furpc::{
-    codec, header, Body, Codec, FubstCodec, Headers, IngressLimits, IngressResponse, MessageId,
-    OneWayRouteOptions, Reply, Request, RequestPolicy, RequestRouteOptions, Router, Source,
+    codec, header, Body, FubstDecoder, FubstEncoder, Headers, IngressLimits, IngressResponse,
+    MessageId, OneWayRouteOptions, Reply, Request, RequestPolicy, RequestRouteOptions, Router,
+    Source,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{sync::oneshot, time::timeout_at};
@@ -187,17 +188,18 @@ where
         S: Service<Request<Q>, Response = Reply<R>, Error = Error> + Send + 'static,
         S::Future: Send + 'static,
     {
-        let result = furpc::server::Rpc::new(FubstCodec::<R, Q>::default())
-            .unary(
-                ReplyHeaders {
-                    service,
-                    actor: self.actor,
-                    action: self.action,
-                },
-                self.request,
-            )
-            .await
-            .map_err(native_error);
+        let result = furpc::server::unary(
+            ReplyHeaders {
+                service,
+                actor: self.actor,
+                action: self.action,
+            },
+            self.request,
+            FubstDecoder::<Q>::default(),
+            FubstEncoder::<R>::default(),
+        )
+        .await
+        .map_err(native_error);
         let error = result.as_ref().err().cloned();
         let sent = self.response.send(result).map_err(|_| Error::Closed);
         match error {
@@ -220,10 +222,10 @@ impl<Q: DeserializeOwned> OneWayCall<Q> {
         S: Service<Request<Q>, Response = (), Error = Error>,
     {
         // The runner's one-way scope has ended; do not borrow its expired
-        // invocation authority via server::Rpc. Decode after domain admission.
+        // invocation authority via server::one_way. Decode after domain admission.
         let (parts, body) = self.request.into_parts();
         let value = codec::decode(
-            &mut FubstCodec::<(), Q>::default().decoder(),
+            &mut FubstDecoder::<Q>::default(),
             &body,
             self.max_body_bytes,
         )

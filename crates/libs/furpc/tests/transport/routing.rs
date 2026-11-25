@@ -154,16 +154,17 @@ async fn exact_routes_preserve_effective_headers_and_mix_typed_rpc_with_opaque_s
             "native\u{1f980}",
             rpc_options(),
             Function(|request: Request<Body>| async move {
-                server::Rpc::new(FubstCodec::<String, u32>::default())
-                    .unary(
-                        Function(|request: Request<u32>| async move {
-                            assert!(request.context().unwrap().peer().is_none());
-                            Reply::new(format!("value {}", request.into_body()))
-                                .append_header(header::action("reply")?)
-                        }),
-                        request,
-                    )
-                    .await
+                server::unary(
+                    Function(|request: Request<u32>| async move {
+                        assert!(request.context().unwrap().peer().is_none());
+                        Reply::new(format!("value {}", request.into_body()))
+                            .append_header(header::action("reply")?)
+                    }),
+                    request,
+                    FubstDecoder::<u32>::default(),
+                    FubstEncoder::<String>::default(),
+                )
+                .await
             }),
         )
         .unwrap()
@@ -298,7 +299,8 @@ async fn exact_routes_preserve_effective_headers_and_mix_typed_rpc_with_opaque_s
                 .unwrap()
                 .append_header(header::action("native\u{1f980}").unwrap())
                 .unwrap(),
-            FubstCodec::<u32, String>::default(),
+            FubstEncoder::<u32>::default(),
+            FubstDecoder::<String>::default(),
             deadline(),
         )
         .await
@@ -484,26 +486,27 @@ async fn whole_actor_services_share_admission_but_may_rewrite_actions_within_the
                 }
                 request.headers_mut().append(header::action("rewritten")?)?;
                 let result = if requests {
-                    server::Rpc::new(FubstCodec::<u32, u32>::default())
-                        .unary(
-                            Function(|request: Request<u32>| async move {
-                                assert_eq!(action(request.headers()), "rewritten");
-                                Ok::<_, Error>(Reply::new(request.into_body() + 1))
-                            }),
-                            request,
-                        )
-                        .await
+                    server::unary(
+                        Function(|request: Request<u32>| async move {
+                            assert_eq!(action(request.headers()), "rewritten");
+                            Ok::<_, Error>(Reply::new(request.into_body() + 1))
+                        }),
+                        request,
+                        FubstDecoder::<u32>::default(),
+                        FubstEncoder::<u32>::default(),
+                    )
+                    .await
                 } else {
-                    server::Rpc::new(FubstCodec::<(), u32>::default())
-                        .one_way(
-                            Function(|request: Request<u32>| async move {
-                                assert_eq!(request.headers().effective().actor, actor(7));
-                                assert_eq!(action(request.headers()), "rewritten");
-                                Ok::<_, Error>(())
-                            }),
-                            request,
-                        )
-                        .await
+                    server::one_way(
+                        Function(|request: Request<u32>| async move {
+                            assert_eq!(request.headers().effective().actor, actor(7));
+                            assert_eq!(action(request.headers()), "rewritten");
+                            Ok::<_, Error>(())
+                        }),
+                        request,
+                        furpc::FubstDecoder::<u32>::default(),
+                    )
+                    .await
                 };
                 observed
                     .send(result.as_ref().map(|_| ()).map_err(Clone::clone))
@@ -558,7 +561,8 @@ async fn whole_actor_services_share_admission_but_may_rewrite_actions_within_the
             Request::new(41u32)
                 .append_header(header::actor(actor(9)).unwrap())
                 .unwrap(),
-            FubstCodec::<u32, u32>::default(),
+            FubstEncoder::<u32>::default(),
+            FubstDecoder::<u32>::default(),
             deadline(),
         )
         .await
@@ -736,9 +740,12 @@ async fn routed_readiness_keeps_independent_waiters_same_instances_and_error_sou
                     move |request| {
                         let entered = entered.clone();
                         async move {
-                            server::Rpc::new(FubstCodec::<(), u32>::default())
-                                .one_way(PendingMethod(entered), request)
-                                .await
+                            server::one_way(
+                                PendingMethod(entered),
+                                request,
+                                furpc::FubstDecoder::<u32>::default(),
+                            )
+                            .await
                         }
                     }
                 }),
@@ -846,21 +853,22 @@ async fn routed_typed_replies_finish_during_drain_under_the_original_runner_tick
                     let entered = entered.clone();
                     let release = release.clone();
                     async move {
-                        server::Rpc::new(FubstCodec::<u32, u32>::default())
-                            .unary(
-                                Function(move |request: Request<u32>| {
-                                    let entered = entered.clone();
-                                    let release = release.clone();
-                                    async move {
-                                        assert!(request.context().unwrap().peer().is_none());
-                                        entered.notify_one();
-                                        release.notified().await;
-                                        Ok::<_, Error>(Reply::new(request.into_body()))
-                                    }
-                                }),
-                                request,
-                            )
-                            .await
+                        server::unary(
+                            Function(move |request: Request<u32>| {
+                                let entered = entered.clone();
+                                let release = release.clone();
+                                async move {
+                                    assert!(request.context().unwrap().peer().is_none());
+                                    entered.notify_one();
+                                    release.notified().await;
+                                    Ok::<_, Error>(Reply::new(request.into_body()))
+                                }
+                            }),
+                            request,
+                            FubstDecoder::<u32>::default(),
+                            FubstEncoder::<u32>::default(),
+                        )
+                        .await
                     }
                 }
             }),
@@ -875,7 +883,8 @@ async fn routed_typed_replies_finish_during_drain_under_the_original_runner_tick
                 .unwrap()
                 .append_header(header::action("rpc").unwrap())
                 .unwrap(),
-            FubstCodec::<u32, u32>::default(),
+            FubstEncoder::<u32>::default(),
+            FubstDecoder::<u32>::default(),
             deadline(),
         ),
     );

@@ -1451,6 +1451,13 @@ impl Registry {
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn republish_endpoint(&self, id: [u8; 16]) -> Result<()> {
+        let unit = self.get(id).ok_or(Error::Closed)?;
+        let request = unit.state.lock().unwrap().request.clone();
+        self.notify_endpoint(&unit, &request).await
+    }
+
     async fn notify_endpoint(&self, unit: &Arc<Unit>, request: &w::ProxyRequest) -> Result<()> {
         let completed = {
             let mut retries = self.retries.lock().unwrap();
@@ -1472,30 +1479,35 @@ impl Registry {
                 return Err(Error::Protocol("endpoint retry worker panicked"));
             }
         }
-        let (body, cancel, valid) = {
-            let mut state = unit.state.lock().unwrap();
-            if let Some(old) = state.endpoint_pending.take() {
-                old.cancel();
-            }
-            let cancel = Cancellation::default();
-            state.endpoint_pending = Some(cancel.clone());
+        let mut state = unit.state.lock().unwrap();
+        let body = {
             let status = state.status.lock().unwrap();
             let mut local = request.local.clone();
             local.service_endpoint = status.service_address.clone();
             local.replication_endpoint = status.replication_address.clone();
-            let body = crate::ipc_client::ReplicaEndpointUpdate::prepare(w::ReplicaMessage {
+            #[cfg(test)]
+            if let Some(error) = self.endpoint_prepare_error.lock().unwrap().take() {
+                return Err(error);
+            }
+            crate::ipc_client::ReplicaEndpointUpdate::prepare(w::ReplicaMessage {
                 unit: request.unit.clone(),
                 local,
                 service: state.request.service.clone(),
-            })?;
-            (body, cancel, state.valid.clone())
+            })?
         };
-        let connection = self.connection.clone();
-        let authority = self.authority.clone();
+        // Preparation and retry-owner admission must both succeed before supersession.
         let mut retries = self.retries.lock().unwrap();
         if retries.len() >= crate::MAX_SERVICE_UNITS * 2 {
             return Err(Error::ResourceLimit("endpoint retry owners"));
         }
+        let cancel = Cancellation::default();
+        if let Some(old) = state.endpoint_pending.replace(cancel.clone()) {
+            old.cancel();
+        }
+        let valid = state.valid.clone();
+        drop(state);
+        let connection = self.connection.clone();
+        let authority = self.authority.clone();
         let task = self.core.spawn(async move {
             let mut rap = connection.rap();
             loop {

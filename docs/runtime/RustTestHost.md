@@ -25,19 +25,15 @@ baseline is `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`; repository baseline is
 Private protocols must be qualified against the actual app-side runtime;
 section 2 records the binary profile and measured outcomes separately from source research.
 
-**Transport retirement:** the current fixture uses public furpc Server/Peer and
+**Transport composition:** the fixture uses public furpc Server/Peer and
 immutable messages. Furpc owns handshake validation and reply correlation; the
 fixture owns a bounded inbox, domain identity/lifecycle checks and joined
 serving-thread/socket cleanup. Reply submission hands data to the runner rather
 than proving a local write. Independent observers forward original bytes.
-The original five standalone fixture profiles have not been freshly rerun;
-their records below remain historical. Fresh clusterless production Hosting
-lease/factory-registration qualification at `c2776ac` is recorded separately in
-the [furpc implementation evidence](../transport/design/Furpc/Implementation.md).
-Fresh normal-construction local Node/native stateless Open/Close qualification at
-`116fa2d` is also recorded there. It includes exact usage release and explicit
-forced Activation cleanup, not graceful runtime unregister or native FM readiness.
-The broader design's former `fube-transport` references are obsolete.
+See [consumer composition](../transport/design/Furpc/Implementation.md) for
+the production Hosting/Node boundaries and explicit raw test-harness interfaces.
+The native profile records in section 2 qualify only their recorded fixture
+sources and scenarios.
 
 **Standalone does not mean SDK/library-free applications, production RA
 equivalence, a full application deployer, or a security sandbox.** The Rust host

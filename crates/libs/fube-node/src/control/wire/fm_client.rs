@@ -2,18 +2,10 @@
 use super::{err, one_way, Link, Result, LIMIT};
 use fube_ra::{
     entity::Effect,
-    protocol::{
-        add_instance_reply_message, add_primary_reply_message, add_replica_reply_message,
-        change_configuration_message, delete_replica_reply_message,
-        do_reconfiguration_reply_message, generation_update_reject_message,
-        node_activate_reply_message, node_deactivate_reply_message,
-        node_update_service_reply_message, remove_instance_reply_message,
-        remove_replica_reply_message, replica_endpoint_updated_message, replica_up_message,
-        report_load_message, service_type_disabled_message, service_type_enabled_message,
-        service_type_notification_message, GenerationNumber, Owner, ReplicaUp,
-    },
+    protocol::{GenerationNumber, ReplicaUp, FM_ACTOR},
 };
-use furpc::{Message, OneWayClient, PeerSendService};
+use furpc::{OneWayClient, PeerSendService};
+use serde::Serialize;
 
 pub(in crate::control) struct FmClient {
     link: Link,
@@ -30,58 +22,69 @@ impl FmClient {
         })
     }
 
-    fn prepare(effect: &Effect) -> Result<Message> {
+    pub(in crate::control) async fn send(&mut self, effect: &Effect) -> Result<()> {
         match effect {
-            Effect::NodeActivateReply(body) => node_activate_reply_message(body, Owner::Fm),
-            Effect::NodeDeactivateReply(body) => node_deactivate_reply_message(body, Owner::Fm),
+            Effect::NodeActivateReply(body) => {
+                self.send_body(body, "NodeActivateReply", false).await
+            }
+            Effect::NodeDeactivateReply(body) => {
+                self.send_body(body, "NodeDeactivateReply", false).await
+            }
             Effect::NodeUpdateServiceReply(body) => {
-                node_update_service_reply_message(body, Owner::Fm)
+                self.send_body(body, "NodeUpdateServiceReply", false).await
             }
-            Effect::Reply(body) => add_instance_reply_message(body, Owner::Fm),
+            Effect::Reply(body) => self.send_body(body, "AddInstanceReply", true).await,
             Effect::DoReconfigurationReply(body) => {
-                do_reconfiguration_reply_message(body, Owner::Fm)
+                self.send_body(body, "DoReconfigurationReply", true).await
             }
-            Effect::ChangeConfiguration(body) => change_configuration_message(body, Owner::Fm),
+            Effect::ChangeConfiguration(body) => {
+                self.send_body(body, "ChangeConfiguration", true).await
+            }
             Effect::ReplicaEndpointUpdated(body) => {
-                replica_endpoint_updated_message(body, Owner::Fm)
+                self.send_body(body, "ReplicaEndpointUpdated", false).await
             }
-            Effect::PrimaryReply(body) => add_primary_reply_message(body, Owner::Fm),
-            Effect::AddReplicaReply(body) => add_replica_reply_message(body, Owner::Fm),
-            Effect::RemoveReplicaReply(body) => remove_replica_reply_message(body, Owner::Fm),
-            Effect::RemoveReply(body) => remove_instance_reply_message(body, Owner::Fm),
-            Effect::DeleteReplicaReply(body) => delete_replica_reply_message(body, Owner::Fm),
+            Effect::PrimaryReply(body) => self.send_body(body, "AddPrimaryReply", true).await,
+            Effect::AddReplicaReply(body) => self.send_body(body, "AddReplicaReply", true).await,
+            Effect::RemoveReplicaReply(body) => {
+                self.send_body(body, "RemoveReplicaReply", true).await
+            }
+            Effect::RemoveReply(body) => self.send_body(body, "RemoveInstanceReply", true).await,
+            Effect::DeleteReplicaReply(body) => {
+                self.send_body(body, "DeleteReplicaReply", true).await
+            }
             Effect::ServiceTypeStatus {
                 enabled: true,
                 body,
-            } => service_type_enabled_message(body),
+            } => self.send_body(body, "ServiceTypeEnabled", false).await,
             Effect::ServiceTypeStatus {
                 enabled: false,
                 body,
-            } => service_type_disabled_message(body),
-            Effect::ReportLoad(body) => report_load_message(body),
+            } => self.send_body(body, "ServiceTypeDisabled", false).await,
+            Effect::ReportLoad(body) => self.send_body(body, "ReportLoad", false).await,
             Effect::ServiceTypeWorkCaptured {
                 body: Some(body), ..
-            } => service_type_notification_message(body),
-            Effect::ReplicaUp(body) => replica_up_message(body, Owner::Fm),
-            _ => return Err("unsupported FM control effect".into()),
+            } => self.send_body(body, "ServiceTypeNotification", false).await,
+            Effect::ReplicaUp(body) => self.send_body(body, "ReplicaUp", true).await,
+            _ => Err("unsupported FM control effect".into()),
         }
-        .map_err(err)
-    }
-
-    pub(in crate::control) async fn send(&mut self, effect: &Effect) -> Result<()> {
-        self.send_message(Self::prepare(effect)?).await
     }
 
     pub(in crate::control) async fn generation_update_reject(
         &mut self,
         proposed: &GenerationNumber,
     ) -> Result<()> {
-        self.send_message(generation_update_reject_message(proposed).map_err(err)?)
+        self.send_body(proposed, "GenerationUpdateReject", true)
             .await
     }
 
-    async fn send_message(&mut self, message: Message) -> Result<()> {
-        one_way::send_prepared(&self.link, &mut self.client, message).await
+    async fn send_body<T: Serialize + Sync>(
+        &mut self,
+        body: &T,
+        action: &str,
+        high_priority: bool,
+    ) -> Result<()> {
+        let request = one_way::request(body, action, FM_ACTOR, high_priority, None)?;
+        one_way::send(&self.link, &mut self.client, request).await
     }
 }
 
@@ -89,7 +92,7 @@ impl Link {
     /// Send a one-way inventory report; completion means local writing, not an FM ACK.
     pub async fn replica_up(&self, body: &ReplicaUp) -> Result<()> {
         FmClient::new(self)?
-            .send_message(replica_up_message(body, Owner::Fm).map_err(err)?)
+            .send_body(body, "ReplicaUp", true)
             .await
     }
 }
@@ -103,7 +106,7 @@ mod tests {
     use super::*;
     use fube_ra::protocol::*;
     use fubst::serde::{to_vec, ObjectArray};
-    use furpc::{header, Body};
+    use furpc::{header, Body, Message};
     use std::time::Duration;
     use tokio::time::Instant;
 

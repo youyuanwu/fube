@@ -312,7 +312,8 @@ async fn replay(node: &mut Node, dispatch: &ra::Dispatched, stale: bool) {
         .unwrap()
         .send_lifecycle(
             action,
-            fube_node::local::rap::request(registration, &body, flags).unwrap(),
+            fube_node::local::rap::request(registration, &body, flags),
+            furpc::FubstEncoder::<fube_node::local::rap::Request>::default(),
         )
         .unwrap();
     until(node, |_| send.result().is_some()).await;

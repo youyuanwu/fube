@@ -4,7 +4,7 @@
 //! scopes. Construct one per invocation in the outer service future.
 //!
 //! ```no_run
-//! use furpc::{server, Body, FubstCodec, IngressResponse, Reply, Request};
+//! use furpc::{server, Body, FubstEncoder, FubstDecoder, IngressResponse, Reply, Request};
 //! use std::{future::{ready, Ready}, task::{Context, Poll}};
 //! use tower_service::Service;
 //!
@@ -23,8 +23,8 @@
 //!
 //! // Install this byte-facing method through an IngressService request binding.
 //! async fn method(request: Request<Body>) -> furpc::Result<IngressResponse> {
-//!     server::Rpc::new(FubstCodec::<u32, u32>::default())
-//!         .unary(Echo, request).await
+//!     server::unary(Echo, request, FubstDecoder::<u32>::default(),
+//!         FubstEncoder::<u32>::default()).await
 //! }
 //! ```
 
@@ -34,107 +34,97 @@ use crate::{
     codec,
     service::{InvocationKind, InvocationState},
     wire::headers::HeaderDecodeContext,
-    Body, BoxError, Codec, Error, IngressResponse, Message, Reply, Request, Result,
+    Body, BoxError, Decoder, Encoder, Error, IngressResponse, Message, Reply, Request, Result,
 };
 
-/// An invocation-local codec adapting typed services above byte ingress.
-/// Construction is inert; the codec and typed services need neither Clone nor Sync.
-pub struct Rpc<C> {
-    codec: C,
+/// Decode, call the same prepared typed service, and encode response data.
+/// Accepts authorized ordinary requests or native notifications.
+/// The original runner alone correlates and sends the authorized reply.
+pub async fn unary<S, D, E>(
+    mut service: S,
+    request: Request<Body>,
+    mut decoder: D,
+    mut encoder: E,
+) -> Result<IngressResponse>
+where
+    E: Encoder + Send,
+    E::Item: Send + 'static,
+    D: Decoder + Send,
+    D::Item: Send + 'static,
+    S: Service<Request<D::Item>, Response = Reply<E::Item>> + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<BoxError>,
+{
+    let state = InvocationState::for_reply(&request)?;
+    state
+        .run(async {
+            let (parts, body) = request.into_parts();
+            let value = codec::decode_with(&body, &parts.headers, state.max_body_bytes, |src| {
+                decoder.decode(src)
+            })
+            .map_err(|source| Error::Codec {
+                phase: "decode",
+                source,
+            })?;
+            drop(body);
+            state.check()?;
+            state.ready(&mut service).await?;
+            let reply = service
+                .call(Request::from_parts(parts, value))
+                .await
+                .map_err(|error| Error::handler("typed handler", error))?;
+            state.check()?;
+            let (headers, item) = reply.into_parts();
+            let body = codec::encode_with_headers(
+                &mut encoder,
+                item,
+                &headers,
+                state.max_response_body_bytes,
+            )
+            .map_err(|source| Error::Codec {
+                phase: "encode",
+                source,
+            })?;
+            state.check()?;
+            let message = Message::from_received(headers, body);
+            message.validate(&HeaderDecodeContext::native(), u32::MAX as usize)?;
+            Ok(IngressResponse::Reply(message))
+        })
+        .await
 }
-
-impl<C: Codec> Rpc<C> {
-    pub fn new(codec: C) -> Self {
-        Self { codec }
-    }
-
-    /// Decode, call the same prepared typed service, and encode response data.
-    /// Accepts authorized ordinary requests or native notifications.
-    /// The original runner alone correlates and sends the authorized reply.
-    pub async fn unary<S>(
-        &mut self,
-        mut service: S,
-        request: Request<Body>,
-    ) -> Result<IngressResponse>
-    where
-        C: Send + 'static,
-        C::Encode: Send + 'static,
-        C::Decode: Send + 'static,
-        C::Encoder: Send + 'static,
-        C::Decoder: Send + 'static,
-        S: Service<Request<C::Decode>, Response = Reply<C::Encode>> + Send + 'static,
-        S::Future: Send + 'static,
-        S::Error: Into<BoxError>,
-    {
-        let state = InvocationState::for_reply(&request)?;
-        state
-            .run(async {
-                let (parts, body) = request.into_parts();
-                let value = codec::decode(&mut self.codec.decoder(), &body, state.max_body_bytes)
-                    .map_err(|source| Error::Codec {
-                    phase: "decode",
-                    source,
-                })?;
-                drop(body);
-                state.check()?;
-                state.ready(&mut service).await?;
-                let reply = service
-                    .call(Request::from_parts(parts, value))
-                    .await
-                    .map_err(|error| Error::handler("typed handler", error))?;
-                state.check()?;
-                let (headers, item) = reply.into_parts();
-                let body = codec::encode(
-                    &mut self.codec.encoder(),
-                    item,
-                    state.max_response_body_bytes,
-                )
-                .map_err(|source| Error::Codec {
-                    phase: "encode",
-                    source,
-                })?;
-                state.check()?;
-                let message = Message::from_received(headers, body);
-                message.validate(&HeaderDecodeContext::native(), u32::MAX as usize)?;
-                Ok(IngressResponse::Reply(message))
+/// Decode one original one-way invocation with its actual decoder state.
+pub async fn one_way<S, D>(
+    mut service: S,
+    request: Request<Body>,
+    mut decoder: D,
+) -> Result<IngressResponse>
+where
+    D: Decoder + Send,
+    D::Item: Send + 'static,
+    S: Service<Request<D::Item>, Response = ()> + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<BoxError>,
+{
+    let state = InvocationState::for_request(&request, InvocationKind::OneWay)?;
+    state
+        .run(async {
+            let (parts, body) = request.into_parts();
+            let value = codec::decode_with(&body, &parts.headers, state.max_body_bytes, |src| {
+                decoder.decode(src)
             })
-            .await
-    }
-
-    /// Decode and call a typed one-way service without constructing an encoder.
-    /// Completion is not a semantic ACK or permission to originate a reply.
-    pub async fn one_way<S>(
-        &mut self,
-        mut service: S,
-        request: Request<Body>,
-    ) -> Result<IngressResponse>
-    where
-        C: Send + 'static,
-        C::Decode: Send + 'static,
-        C::Decoder: Send + 'static,
-        S: Service<Request<C::Decode>, Response = ()> + Send + 'static,
-        S::Future: Send + 'static,
-        S::Error: Into<BoxError>,
-    {
-        let state = InvocationState::for_request(&request, InvocationKind::OneWay)?;
-        state
-            .run(async {
-                let (parts, body) = request.into_parts();
-                let value = codec::decode(&mut self.codec.decoder(), &body, state.max_body_bytes)
-                    .map_err(|source| Error::Codec {
-                    phase: "decode",
-                    source,
-                })?;
-                drop(body);
-                state.check()?;
-                state.ready(&mut service).await?;
-                service
-                    .call(Request::from_parts(parts, value))
-                    .await
-                    .map_err(|error| Error::handler("typed handler", error))?;
-                state.check()?;
-                Ok(IngressResponse::NoReply)
-            })
-            .await
-    }
+            .map_err(|source| Error::Codec {
+                phase: "decode",
+                source,
+            })?;
+            drop(body);
+            state.check()?;
+            state.ready(&mut service).await?;
+            service
+                .call(Request::from_parts(parts, value))
+                .await
+                .map_err(|error| Error::handler("typed handler", error))?;
+            state.check()?;
+            Ok(IngressResponse::NoReply)
+        })
+        .await
 }

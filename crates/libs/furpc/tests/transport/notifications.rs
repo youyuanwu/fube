@@ -172,15 +172,16 @@ async fn notifications_return_typed_data_in_both_directions_and_share_keys_with_
                         index: 99,
                     },
                 )?)?;
-                server::Rpc::new(FubstCodec::<String, u32>::default())
-                    .unary(
-                        Function(|request: Request<u32>| async move {
-                            Reply::new(format!("ack {}", request.into_body()))
-                                .append_header(header::action("Acknowledged")?)
-                        }),
-                        request,
-                    )
-                    .await
+                server::unary(
+                    Function(|request: Request<u32>| async move {
+                        Reply::new(format!("ack {}", request.into_body()))
+                            .append_header(header::action("Acknowledged")?)
+                    }),
+                    request,
+                    FubstDecoder::<u32>::default(),
+                    FubstEncoder::<String>::default(),
+                )
+                .await
             }),
         )
         .unwrap();
@@ -224,7 +225,8 @@ async fn notifications_return_typed_data_in_both_directions_and_share_keys_with_
         let response = client
             .call(
                 routed(42u32),
-                FubstCodec::<u32, String>::default(),
+                FubstEncoder::<u32>::default(),
+                FubstDecoder::<String>::default(),
                 deadline(),
             )
             .await
@@ -394,16 +396,16 @@ async fn failures_and_missing_acknowledgments_do_not_fabricate_success_or_faults
                     .build()?,
             )),
             6 => {
-                let result = server::Rpc::new(FubstCodec::<u32, u32>::default())
-                    .one_way(
-                        Function(|_: Request<u32>| {
-                            std::future::ready(Err::<(), _>(Error::Internal(
-                                "notification invoked a one-way typed handler",
-                            )))
-                        }),
-                        request,
-                    )
-                    .await;
+                let result = server::one_way(
+                    Function(|_: Request<u32>| {
+                        std::future::ready(Err::<(), _>(Error::Internal(
+                            "notification invoked a one-way typed handler",
+                        )))
+                    }),
+                    request,
+                    furpc::FubstDecoder::<u32>::default(),
+                )
+                .await;
                 assert!(matches!(
                     result,
                     Err(Error::InvalidInput("typed ingress exchange kind mismatch"))
@@ -777,14 +779,15 @@ async fn admitted_notification_data_can_complete_during_graceful_drain() {
             async move {
                 entered.notify_one();
                 release.notified().await;
-                server::Rpc::new(FubstCodec::<u32, u32>::default())
-                    .unary(
-                        Function(|request: Request<u32>| async move {
-                            Ok::<_, Error>(Reply::new(request.into_body() + 1))
-                        }),
-                        request,
-                    )
-                    .await
+                server::unary(
+                    Function(|request: Request<u32>| async move {
+                        Ok::<_, Error>(Reply::new(request.into_body() + 1))
+                    }),
+                    request,
+                    FubstDecoder::<u32>::default(),
+                    FubstEncoder::<u32>::default(),
+                )
+                .await
             }
         }
     }));

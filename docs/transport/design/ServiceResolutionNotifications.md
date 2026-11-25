@@ -378,7 +378,7 @@ Application
     byte-facing Tower service -> typed native resolution and other ordinary APIs
   ServiceNotificationClient
     own furpc Channel + original-generation Peer/native session
-      authorized notification ingress -> server::Rpc::unary -> page transaction
+      authorized notification ingress ->       server::unary -> page transaction
       bounded application queue -> recv()
       session/filter RPCs -> shared gateway adapter -> Peer::request
       RAII filter cleanup worker owns the Channel; furpc runner owns ACK completion
@@ -409,12 +409,12 @@ authorizes envelopes before body retention, and owns handler/reply capacity.
 There is no second socket reader, pull receiver, public reply grant, or
 notification transport inside `fube-client`.
 
-The service uses `server::Rpc::unary` with `FubstCodec<Status, PageBody>`.
+The service uses `server::unary` with `FubstDecoder<PageBody>` and `FubstEncoder<Status>`.
 Its typed handler waits for native session initialization, atomically commits
 the whole page, and returns typed ACK data only on success. Furpc supplies
 native flags, correlation and original-generation ACK submission. Decode,
 processing, cancellation and handler failures send no automatic success ACK.
-Session/filter RPCs reuse the ordinary gateway adapter and FubstCodec through a
+Session/filter RPCs reuse the ordinary gateway adapter and native encoder/decoder values through a
 small byte service forwarding to the original `Peer::request`, never the
 Channel's reconnecting request path. Native high-priority headers remain set.
 Priority cannot preempt a TCP frame whose write has already started.

@@ -11,8 +11,8 @@ use std::{
 };
 
 use furpc::{
-    codec, header, Body, ClientCodecLimits, Codec, CodecError, DecodeBuf, Decoder, EncodeBuf,
-    Encoder, Error, FubstCodec, Request, Response, RpcClient,
+    codec, header, Body, ClientCodecLimits, CodecError, DecodeBuf, Decoder, EncodeBuf, Encoder,
+    Error, FubstDecoder, FubstEncoder, Request, Response, RpcClient,
 };
 use futures_util::FutureExt;
 use tokio::{
@@ -67,19 +67,7 @@ struct Counts {
     decoded: AtomicUsize,
 }
 
-// Neither the codec nor its owned states are Clone or Sync.
-struct TextCodec {
-    state: Cell<bool>,
-    counts: Arc<Counts>,
-}
-impl TextCodec {
-    fn new(counts: &Arc<Counts>) -> Self {
-        Self {
-            state: Cell::new(false),
-            counts: counts.clone(),
-        }
-    }
-}
+// Neither direction state is Clone or Sync.
 struct TextEncoder(Arc<Counts>, Cell<bool>);
 struct TextDecoder(Arc<Counts>, Cell<bool>);
 
@@ -90,22 +78,6 @@ impl From<&str> for Text {
     }
 }
 
-impl Codec for TextCodec {
-    type Encode = Text;
-    type Decode = String;
-    type Encoder = TextEncoder;
-    type Decoder = TextDecoder;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        assert!(!self.state.replace(true));
-        TextEncoder(self.counts.clone(), Cell::new(false))
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        assert!(self.state.get());
-        TextDecoder(self.counts.clone(), Cell::new(false))
-    }
-}
 impl Encoder for TextEncoder {
     type Item = Text;
 
@@ -127,6 +99,225 @@ impl Decoder for TextDecoder {
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
+}
+
+#[test]
+fn directional_fubst_states_encode_actual_types_and_decode_fragmented_bodies() {
+    let bytes = fubst::serde::to_vec("typed").unwrap();
+    let encoded = codec::encode(
+        &mut FubstEncoder::<String>::default(),
+        "typed".into(),
+        bytes.len(),
+    )
+    .unwrap();
+    assert_eq!(encoded.segments().next().unwrap(), bytes);
+    let fragmented = Body::from_segments(vec![
+        encoded.slice(0..3).unwrap(),
+        encoded.slice(3..encoded.len()).unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(
+        codec::decode(
+            &mut FubstDecoder::<String>::default(),
+            &fragmented,
+            fragmented.len()
+        )
+        .unwrap(),
+        "typed"
+    );
+    assert!(matches!(
+        codec::decode(
+            &mut FubstDecoder::<String>::with_limits(fubst::Limits {
+                max_bytes: bytes.len() - 1,
+                ..Default::default()
+            }),
+            &fragmented,
+            fragmented.len()
+        ),
+        Err(CodecError::ResourceLimit { .. })
+    ));
+}
+
+struct HeaderOffsetEncoder;
+
+impl Encoder for HeaderOffsetEncoder {
+    type Item = u32;
+
+    fn encode(&mut self, value: u32, dst: &mut EncodeBuf<'_>) -> Result<(), CodecError> {
+        let increment = dst
+            .headers()
+            .effective()
+            .action()
+            .iter()
+            .copied()
+            .eq("Increment".encode_utf16());
+        FubstEncoder::<u32>::default().encode(value + u32::from(increment), dst)
+    }
+}
+
+#[tokio::test]
+async fn codecs_always_receive_headers_including_empty_standalone_contexts() {
+    let body = codec::encode(&mut HeaderOffsetEncoder, 7, 32).unwrap();
+    assert_eq!(
+        fubst::serde::from_slice::<u32>(body.segments().next().unwrap()).unwrap(),
+        7
+    );
+    let mut decode = |src: &mut DecodeBuf<'_>| {
+        let increment = src
+            .headers()
+            .effective()
+            .action()
+            .iter()
+            .copied()
+            .eq("Increment".encode_utf16());
+        let value = FubstDecoder::<u32>::default().decode(src)?;
+        Ok::<_, CodecError>(value - u32::from(increment))
+    };
+    assert_eq!(codec::decode(&mut decode, &body, body.len()).unwrap(), 7);
+
+    let mut rpc = RpcClient::new(service(|request: Request<Body>| {
+        ready(Ok(Response::new(request.into_body())))
+    }));
+    let response = rpc
+        .call(
+            Request::new(7u32)
+                .append_header(header::action("Increment").unwrap())
+                .unwrap(),
+            HeaderOffsetEncoder,
+            FubstDecoder::<u32>::default(),
+            deadline(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.into_body(), 8);
+}
+
+#[tokio::test]
+async fn header_aware_client_selects_decoding_inline_without_shared_header_state() {
+    let mut rpc = RpcClient::new(service(|request: Request<Body>| {
+        assert_eq!(
+            fubst::serde::from_slice::<String>(request.body().segments().next().unwrap()).unwrap(),
+            "typed"
+        );
+        let mut response = Response::new(request.into_body());
+        response
+            .headers_mut()
+            .append(header::action("NativeText").unwrap())
+            .unwrap();
+        ready(Ok(response))
+    }));
+    let selected = Cell::new(false);
+    let decoder = move |src: &mut DecodeBuf<'_>| {
+        assert!(!selected.replace(true));
+        let headers = src.headers();
+        assert!(headers
+            .effective()
+            .action()
+            .iter()
+            .copied()
+            .eq("NativeText".encode_utf16()));
+        FubstDecoder::<String>::default().decode(src)
+    };
+    let response = rpc
+        .call(
+            Request::new("typed".to_owned()),
+            FubstEncoder::<String>::default(),
+            decoder,
+            deadline(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.body(), "typed");
+    assert!(response
+        .headers()
+        .effective()
+        .action()
+        .iter()
+        .copied()
+        .eq("NativeText".encode_utf16()));
+}
+
+#[tokio::test]
+async fn header_aware_client_preserves_bounds_complete_consumption_and_error_sources() {
+    for mode in 0..4 {
+        let decoded = AtomicUsize::new(0);
+        let calls = AtomicUsize::new(0);
+        let counts = Arc::new(Counts::default());
+        let decoded_ref = &decoded;
+        let decoder = move |src: &mut DecodeBuf<'_>| {
+            assert!(src.headers().records().next().is_none());
+            decoded_ref.fetch_add(1, Ordering::SeqCst);
+            if mode == 2 {
+                return Err(CodecError::resource_limit(std::io::Error::other(
+                    "profile budget",
+                )));
+            }
+            src.take(1)
+        };
+        let mut rpc = RpcClient::new(service(|request: Request<Body>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            ready(Ok(Response::new(request.into_body())))
+        }))
+        .codec_limits(ClientCodecLimits {
+            max_encoded_body_bytes: 2,
+            max_response_body_bytes: if mode == 0 { 1 } else { 2 },
+        })
+        .unwrap();
+        let result = rpc
+            .call(
+                Request::new(Text::from("ab")),
+                TextEncoder(counts.clone(), Cell::new(false)),
+                decoder,
+                if mode == 3 {
+                    Instant::now()
+                } else {
+                    deadline()
+                },
+            )
+            .await;
+        if mode == 3 {
+            assert_eq!(result.unwrap_err(), Error::Timeout("RPC"));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error,
+                Error::Codec {
+                    phase: "decode",
+                    ..
+                }
+            ));
+            if mode == 1 {
+                assert!(matches!(
+                    error,
+                    Error::Codec {
+                        source: CodecError::InvalidPayload { .. },
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    Error::Codec {
+                        source: CodecError::ResourceLimit { .. },
+                        ..
+                    }
+                ));
+            }
+            if mode == 2 {
+                assert!(std::error::Error::source(&error)
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .is::<std::io::Error>());
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(
+            decoded.load(Ordering::SeqCst),
+            usize::from(mode == 1 || mode == 2)
+        );
+    }
 }
 
 #[tokio::test]
@@ -152,7 +343,8 @@ async fn client_is_inert_and_supports_per_call_codecs_on_the_same_borrowed_servi
     let mut rpc = RpcClient::new(transport);
     let call = rpc.call(
         Request::new("unpolled".into()),
-        TextCodec::new(&counts),
+        TextEncoder(counts.clone(), Cell::new(false)),
+        TextDecoder(counts.clone(), Cell::new(false)),
         effective,
     );
     drop(call);
@@ -165,7 +357,8 @@ async fn client_is_inert_and_supports_per_call_codecs_on_the_same_borrowed_servi
     request.set_deadline(effective);
     let response = send(rpc.call(
         request,
-        TextCodec::new(&counts),
+        TextEncoder(counts.clone(), Cell::new(false)),
+        TextDecoder(counts.clone(), Cell::new(false)),
         effective + Duration::from_secs(1),
     ))
     .await
@@ -179,7 +372,8 @@ async fn client_is_inert_and_supports_per_call_codecs_on_the_same_borrowed_servi
             Request::new(42u32)
                 .append_header(header::action("E").unwrap())
                 .unwrap(),
-            FubstCodec::<u32, u32>::default(),
+            FubstEncoder::<u32>::default(),
+            FubstDecoder::<u32>::default(),
             effective,
         )
         .await
@@ -211,7 +405,11 @@ async fn fubst_unit_bodies_work_with_zero_limits_but_reject_nonempty_responses()
         .unwrap();
     rpc.call(
         Request::new(()),
-        FubstCodec::<(), ()>::with_limits(fubst::Limits {
+        FubstEncoder::<()>::with_limits(fubst::Limits {
+            max_bytes: 0,
+            max_depth: 0,
+        }),
+        FubstDecoder::<()>::with_limits(fubst::Limits {
             max_bytes: 0,
             max_depth: 0,
         }),
@@ -229,7 +427,8 @@ async fn fubst_unit_bodies_work_with_zero_limits_but_reject_nonempty_responses()
     assert!(matches!(
         rpc.call(
             Request::new(()),
-            FubstCodec::<(), ()>::default(),
+            FubstEncoder::<()>::default(),
+            FubstDecoder::<()>::default(),
             deadline()
         )
         .await,
@@ -262,7 +461,8 @@ async fn explicit_body_limits_apply_before_submission_and_before_decode_includin
         let result = rpc
             .call(
                 Request::new(text.into()),
-                TextCodec::new(&counts),
+                TextEncoder(counts.clone(), Cell::new(false)),
+                TextDecoder(counts.clone(), Cell::new(false)),
                 deadline(),
             )
             .await;
@@ -306,7 +506,8 @@ async fn deadlines_cover_readiness_and_prevent_late_submission() {
         let result = rpc
             .call(
                 request,
-                TextCodec::new(&counts),
+                TextEncoder(counts.clone(), Cell::new(false)),
+                TextDecoder(counts.clone(), Cell::new(false)),
                 local + Duration::from_secs(20),
             )
             .await;
@@ -331,7 +532,8 @@ async fn synthetic_results_observed_late_timeout_before_decode() {
     }));
     let mut call = Box::pin(rpc.call(
         Request::new("echo".into()),
-        TextCodec::new(&counts),
+        TextEncoder(counts.clone(), Cell::new(false)),
+        TextDecoder(counts.clone(), Cell::new(false)),
         deadline(),
     ));
     assert!(call.as_mut().now_or_never().is_none());
@@ -366,8 +568,12 @@ async fn dropping_or_expiring_calls_drops_the_service_future_without_retry() {
                 pending::<furpc::Result<Response<Body>>>().await
             }
         }));
-        let mut call =
-            Box::pin(rpc.call(Request::new("".into()), TextCodec::new(&counts), deadline()));
+        let mut call = Box::pin(rpc.call(
+            Request::new("".into()),
+            TextEncoder(counts.clone(), Cell::new(false)),
+            TextDecoder(counts.clone(), Cell::new(false)),
+            deadline(),
+        ));
         assert!(call.as_mut().now_or_never().is_none());
         if expire {
             assert_eq!(call.await.unwrap_err(), Error::Timeout("RPC"));
@@ -380,20 +586,6 @@ async fn dropping_or_expiring_calls_drops_the_service_future_without_retry() {
     }
 }
 
-struct PartialCodec;
-impl Codec for PartialCodec {
-    type Encode = Text;
-    type Decode = Body;
-    type Encoder = TextEncoder;
-    type Decoder = PartialDecoder;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        TextEncoder(Arc::new(Counts::default()), Cell::new(false))
-    }
-    fn decoder(&mut self) -> Self::Decoder {
-        PartialDecoder
-    }
-}
 struct PartialDecoder;
 impl Decoder for PartialDecoder {
     type Item = Body;
@@ -412,7 +604,12 @@ async fn decoder_errors_and_unconsumed_bytes_are_call_local_with_original_source
         )))
     }));
     let error = rpc
-        .call(Request::new("".into()), TextCodec::new(&counts), deadline())
+        .call(
+            Request::new("".into()),
+            TextEncoder(counts.clone(), Cell::new(false)),
+            TextDecoder(counts.clone(), Cell::new(false)),
+            deadline(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(
@@ -426,8 +623,13 @@ async fn decoder_errors_and_unconsumed_bytes_are_call_local_with_original_source
     assert!(source.source().unwrap().is::<std::string::FromUtf8Error>());
 
     assert!(matches!(
-        rpc.call(Request::new("".into()), PartialCodec, deadline())
-            .await,
+        rpc.call(
+            Request::new("".into()),
+            TextEncoder(counts.clone(), Cell::new(false)),
+            PartialDecoder,
+            deadline()
+        )
+        .await,
         Err(Error::Codec {
             phase: "decode",
             source: CodecError::InvalidPayload { .. }
@@ -439,9 +641,14 @@ async fn decoder_errors_and_unconsumed_bytes_are_call_local_with_original_source
         ready(Err(Error::Closed))
     }));
     assert_eq!(
-        rpc.call(Request::new("".into()), TextCodec::new(&counts), deadline())
-            .await
-            .unwrap_err(),
+        rpc.call(
+            Request::new("".into()),
+            TextEncoder(counts.clone(), Cell::new(false)),
+            TextDecoder(counts.clone(), Cell::new(false)),
+            deadline()
+        )
+        .await
+        .unwrap_err(),
         Error::Closed
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);

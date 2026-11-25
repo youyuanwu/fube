@@ -2,7 +2,7 @@ use fube_hosting::{ipc::*, wire, ClosedRegisteredEvent, Error};
 #[path = "support/ipc_wire.rs"]
 mod ipc_wire;
 use fubst::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer};
-use furpc::MessageId;
+use furpc::{CodecError, EncodeBuf, Encoder, MessageId};
 use ipc_wire::{
     read_message, write_message, Header, ListenInstance, Message, EXPECTS_REPLY, FAULT, IPC,
     TIMEOUT, UNCORRELATED_REPLY,
@@ -91,6 +91,16 @@ fn config(duration: Duration) -> Config {
         projection_bytes: 256 * 1024,
         reply_bytes: 64 * 1024,
         lease_duration: duration,
+    }
+}
+
+struct BytesEncoder;
+
+impl Encoder for BytesEncoder {
+    type Item = Vec<u8>;
+
+    fn encode(&mut self, body: Vec<u8>, dst: &mut EncodeBuf<'_>) -> Result<(), CodecError> {
+        dst.write_all(&body)
     }
 }
 
@@ -875,6 +885,172 @@ async fn terminal_consumer_loss_cannot_be_postponed_by_continuous_lease_traffic(
 }
 
 #[tokio::test]
+async fn typed_lifecycle_encoding_failures_preserve_the_original_session_and_send_capacity() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct ObservedEncoder {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+    impl Encoder for ObservedEncoder {
+        type Item = wire::ErrorReply;
+
+        fn encode(&mut self, body: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), CodecError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(dst.headers().effective().actor.get(), 12);
+            assert_eq!(
+                String::from_utf16(dst.headers().effective().action()).unwrap(),
+                "ReplicaOpen"
+            );
+            if self.fail {
+                return Err(CodecError::invalid_payload("injected lifecycle failure"));
+            }
+            furpc::FubstEncoder::<wire::ErrorReply>::default().encode(body, dst)
+        }
+    }
+
+    let server = server(LOCAL_LEASE_DURATION);
+    let a = admission();
+    let lease = server.admit(a.clone()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let encoder = |fail| ObservedEncoder {
+        calls: calls.clone(),
+        fail,
+    };
+    assert!(matches!(
+        lease.send_lifecycle(
+            "ReplicaOpen",
+            wire::ErrorReply { error: 42 },
+            encoder(false)
+        ),
+        Err(furpc::Error::Closed)
+    ));
+    let mut peer = Peer::connect(&server, a).await;
+    peer.bootstrap().await;
+    assert!(lease
+        .send_lifecycle(
+            "ReplicaOpenReply",
+            wire::ErrorReply { error: 42 },
+            encoder(false)
+        )
+        .is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let failed = lease
+        .send_lifecycle("ReplicaOpen", wire::ErrorReply { error: 42 }, encoder(true))
+        .unwrap();
+    assert!(matches!(
+        lifecycle_result(&failed).await,
+        Err(furpc::Error::Codec {
+            phase: "encode",
+            source: CodecError::InvalidPayload { .. },
+        })
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(failed);
+    let oversized = lease
+        .send_lifecycle("ReplicaOpen", vec![0; 64 * 1024 + 1], BytesEncoder)
+        .unwrap();
+    assert!(matches!(
+        lifecycle_result(&oversized).await,
+        Err(furpc::Error::Codec {
+            phase: "encode",
+            source: CodecError::ResourceLimit { .. },
+        })
+    ));
+    drop(oversized);
+    assert!(peer.poll().await.unwrap() > 0);
+    assert!(server.status(&lease).unwrap().connected);
+
+    let sent = lease
+        .send_lifecycle(
+            "ReplicaOpen",
+            wire::ErrorReply { error: 42 },
+            encoder(false),
+        )
+        .unwrap();
+    let message = read_message(&mut peer.socket).await.unwrap();
+    assert_eq!(
+        from_slice::<wire::ErrorReply>(&message.body).unwrap().error,
+        42
+    );
+    lifecycle_result(&sent).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+async fn lifecycle_result(send: &LifecycleSend) -> furpc::Result<()> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(result) = send.result() {
+                return result;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn typed_lifecycle_rechecks_consumer_authority_after_encoding_before_submission() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct Gate(Arc<AtomicBool>);
+    impl RegistrationConsumerGate for Gate {
+        fn is_accepting(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    struct RetiringEncoder(Arc<AtomicBool>);
+    impl Encoder for RetiringEncoder {
+        type Item = wire::ErrorReply;
+
+        fn encode(&mut self, body: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), CodecError> {
+            furpc::FubstEncoder::<wire::ErrorReply>::default().encode(body, dst)?;
+            self.0.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let server = server(LOCAL_LEASE_DURATION);
+    let accepting = Arc::new(AtomicBool::new(true));
+    let owner = server
+        .registration_owner(Default::default())
+        .unwrap()
+        .with_consumer_gate(Arc::new(Gate(accepting.clone())))
+        .unwrap();
+    let a = admission();
+    let lease = server
+        .admit_registration(&owner, a.clone(), vec!["Widget".into()], "test")
+        .unwrap()
+        .lease;
+    let mut peer = Peer::connect(&server, a).await;
+    peer.bootstrap().await;
+    let send = lease
+        .send_lifecycle(
+            "ReplicaOpen",
+            wire::ErrorReply { error: 42 },
+            RetiringEncoder(accepting.clone()),
+        )
+        .unwrap();
+    assert_eq!(lifecycle_result(&send).await, Err(furpc::Error::Closed));
+    assert!(!accepting.load(Ordering::SeqCst));
+    assert!(
+        !matches!(
+            tokio::time::timeout(Duration::from_millis(100), read_message(&mut peer.socket)).await,
+            Ok(Ok(_))
+        ),
+        "withdrawal during encoding must not submit a lifecycle frame"
+    );
+}
+
+#[tokio::test]
 async fn saturated_lifecycle_preserves_lease_ingress_and_stop_settles_accepted_send() {
     let mut server = server(LOCAL_LEASE_DURATION);
     let a = admission();
@@ -884,7 +1060,7 @@ async fn saturated_lifecycle_preserves_lease_ingress_and_stop_settles_accepted_s
     let mut blocked = None;
     for _ in 0..200 {
         let send = lease
-            .send_lifecycle("ReplicaOpen", vec![0; 64_000])
+            .send_lifecycle("ReplicaOpen", vec![0; 64_000], BytesEncoder)
             .unwrap();
         tokio::time::sleep(Duration::from_millis(2)).await;
         if send.result().is_none() {
@@ -894,7 +1070,9 @@ async fn saturated_lifecycle_preserves_lease_ingress_and_stop_settles_accepted_s
         send.result().unwrap().unwrap();
     }
     let blocked = blocked.expect("actual TCP writer backpressure");
-    assert!(lease.send_lifecycle("ReplicaOpen", vec![]).is_err());
+    assert!(lease
+        .send_lifecycle("ReplicaOpen", vec![], BytesEncoder)
+        .is_err());
     let poll = peer.frame(15, "", vec![]);
     write_message(&mut peer.socket, &poll).await.unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
@@ -966,7 +1144,7 @@ async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_
     assert_eq!(received.body(), &[7, 8]);
     assert!(lease.take_lifecycle_reply().is_none());
     for action in ["RegisterFabricRuntimeRequest", "ReplicaOpenReply"] {
-        assert!(lease.send_lifecycle(action, vec![9]).is_err());
+        assert!(lease.send_lifecycle(action, vec![9], BytesEncoder).is_err());
     }
     // Only the lease had a correlated response. Lifecycle ingress emits none.
     let mut ids = std::collections::HashSet::new();
@@ -981,7 +1159,7 @@ async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_
         "ProxyReplicaEndpointUpdatedReply",
         "ReplicaClose",
     ] {
-        let send = lease.send_lifecycle(action, vec![9]).unwrap();
+        let send = lease.send_lifecycle(action, vec![9], BytesEncoder).unwrap();
         let request = read_message(&mut peer.socket).await.unwrap();
         let p = request.properties().unwrap();
         assert_eq!(p.actor, 12);
@@ -2022,7 +2200,8 @@ async fn managed_bootstrap(peer: &furpc::Peer, a: &Admission) {
     let reply = client
         .call(
             start,
-            furpc::FubstCodec::<_, wire::StartReply>::default(),
+            furpc::FubstEncoder::<_>::default(),
+            furpc::FubstDecoder::<wire::StartReply>::default(),
             tokio::time::Instant::now() + Duration::from_secs(5),
         )
         .await
@@ -2041,7 +2220,8 @@ async fn managed_bootstrap(peer: &furpc::Peer, a: &Admission) {
         client
             .call(
                 finish,
-                furpc::FubstCodec::<_, wire::ErrorReply>::default(),
+                furpc::FubstEncoder::<_>::default(),
+                furpc::FubstDecoder::<wire::ErrorReply>::default(),
                 tokio::time::Instant::now() + Duration::from_secs(5)
             )
             .await
@@ -2066,7 +2246,8 @@ async fn managed_bootstrap(peer: &furpc::Peer, a: &Admission) {
         client
             .call(
                 register,
-                furpc::FubstCodec::<_, wire::ErrorReply>::default(),
+                furpc::FubstEncoder::<_>::default(),
+                furpc::FubstDecoder::<wire::ErrorReply>::default(),
                 tokio::time::Instant::now() + Duration::from_secs(5)
             )
             .await

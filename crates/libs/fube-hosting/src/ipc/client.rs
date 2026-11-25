@@ -1,22 +1,30 @@
-//! Lifecycle envelopes and byte submission on one original nonowning Peer.
-use super::{action, MAX_INPUT};
+//! Typed lifecycle sends on one original nonowning Peer and Hosting authority.
+use super::{action, session_live, Entry, MAX_INPUT};
 use fube_core::protocol::actor as actors;
 use furpc::{
-    header, ActorId, Body, Codec, EncodeBuf, Encoder, Error, FubstCodec, Headers, OneWayClient,
-    Peer, PeerSendService, Request, Result, SendKind, SendPolicy, Source, WriteReceipt,
+    header, ActorId, Body, Encoder, Error, Headers, OneWayClient, Peer, PeerSendService, Request,
+    Result, SendKind, SendPolicy, Source, WriteReceipt,
+};
+use std::{
+    sync::{atomic::Ordering, Weak},
+    task::{Context, Poll},
 };
 use tokio::time::Instant;
+use tower_service::Service;
 
 #[derive(Clone)]
 pub(super) struct LifecycleClient {
-    client: OneWayClient<PeerSendService>,
+    client: OneWayClient<LifecycleService>,
 }
 
 impl LifecycleClient {
-    pub(super) fn new(peer: Peer) -> Result<Self> {
+    pub(super) fn new(peer: Peer, entry: Weak<Entry>) -> Result<Self> {
         Ok(Self {
-            client: OneWayClient::new(PeerSendService::new(peer))
-                .max_encoded_body_bytes(MAX_INPUT)?,
+            client: OneWayClient::new(LifecycleService {
+                transport: PeerSendService::new(peer),
+                entry,
+            })
+            .max_encoded_body_bytes(MAX_INPUT)?,
         })
     }
 
@@ -24,18 +32,21 @@ impl LifecycleClient {
         SendPolicy::new(outbound)
     }
 
-    pub(super) async fn send(
+    pub(super) async fn send<E>(
         &mut self,
-        request: LifecycleRequest,
+        request: LifecycleRequest<E::Item>,
+        encoder: E,
         deadline: Instant,
-    ) -> Result<WriteReceipt> {
-        self.client
-            .send(request.0, PreparedBodyCodec, deadline)
-            .await
+    ) -> Result<WriteReceipt>
+    where
+        E: Encoder + Send,
+        E::Item: Send,
+    {
+        self.client.send(request.0, encoder, deadline).await
     }
 }
 
-pub(super) struct LifecycleRequest(Request<Body>);
+pub(super) struct LifecycleRequest<T>(Request<T>);
 
 #[derive(Clone, Copy)]
 pub(super) enum Method {
@@ -80,9 +91,9 @@ impl Method {
         }
     }
 
-    pub(super) fn prepare(self, bytes: Vec<u8>) -> Result<LifecycleRequest> {
+    pub(super) fn prepare<T>(self, body: T) -> Result<LifecycleRequest<T>> {
         Ok(LifecycleRequest(
-            Request::new(Body::from_bytes(bytes)?)
+            Request::new(body)
                 .append_header(header::actor(ActorId::new(actors::RA)?)?)?
                 .append_header(header::action(self.action())?)?,
         ))
@@ -102,31 +113,38 @@ fn outbound(kind: SendKind, headers: &Headers, _: &Source) -> Result<()> {
     Ok(())
 }
 
-struct PreparedBodyCodec;
+#[derive(Clone)]
+struct LifecycleService {
+    transport: PeerSendService,
+    entry: Weak<Entry>,
+}
 
-impl Codec for PreparedBodyCodec {
-    type Encode = Body;
-    type Decode = ();
-    type Encoder = Self;
-    type Decoder = <FubstCodec<(), ()> as Codec>::Decoder;
-
-    fn encoder(&mut self) -> Self {
-        Self
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        FubstCodec::<(), ()>::default().decoder()
+impl LifecycleService {
+    fn check(&self) -> Result<()> {
+        let entry = self.entry.upgrade().ok_or(Error::Closed)?;
+        if !session_live(&entry) || !entry.ready.load(Ordering::SeqCst) {
+            return Err(Error::Closed);
+        }
+        Ok(())
     }
 }
 
-impl Encoder for PreparedBodyCodec {
-    type Item = Body;
+impl Service<Request<Body>> for LifecycleService {
+    type Response = WriteReceipt;
+    type Error = Error;
+    type Future = <PeerSendService as Service<Request<Body>>>::Future;
 
-    fn encode(
-        &mut self,
-        body: Body,
-        dst: &mut EncodeBuf<'_>,
-    ) -> std::result::Result<(), furpc::CodecError> {
-        dst.append_body(body)
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if let Err(error) = self.check() {
+            return Poll::Ready(Err(error));
+        }
+        self.transport.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        if let Err(error) = self.check() {
+            return Box::pin(async move { Err(error) });
+        }
+        self.transport.call(request)
     }
 }
