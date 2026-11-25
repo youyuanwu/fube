@@ -233,8 +233,10 @@ async fn explicit_stateless_node_controls_preserve_fm_and_use_fresh_owners() {
             .unwrap()
             .cleanup()
             .map_err(err)?;
-        cluster.drive().await;
-        assert_eq!(cluster.status()["nodes"][0]["observed"], "unknown");
+        until(&mut cluster, |c| {
+            c.status()["nodes"][0]["observed"] == "unknown"
+        })
+        .await;
         let down = cluster
             .execute(command("down-one", "node-down", Some(1)))
             .await?;
