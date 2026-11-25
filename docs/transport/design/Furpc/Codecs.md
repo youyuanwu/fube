@@ -1,307 +1,142 @@
 # furpc: Native serialization and body codecs
 
-**Status:** proposed; see the [design summary](README.md).
-
-Separates native header/control serialization from application-body
-codecs. `fubst` is the native authority and the default body codec, not
-a required application format. See [requests](Requests.md) for typed
-adapter bounds and [examples](Examples.md) for a custom codec.
+Native header/control serialization is fixed by the Fabric protocol.
+Application body adaptation is separate and replaceable. The
+[codec implementation](../../../../crates/libs/furpc/src/codec.rs) defines
+Encoder, Decoder, buffers, errors, whole-body helpers, and independent Fubst
+directions; it is the authority for their signatures and bounds.
 
 ## Layer boundary
 
-| Layer | Serialization contract | Configuration |
-| --- | --- | --- |
-| Native messaging | Built-in native headers, connection controls, and transport Fault schemas using `fubst`. | Native widths and configured transport policy; no extra constructor ceilings or public native-serializer selection. |
-| Service routing | Dispatch byte-facing services without body transformation. | Native route keys and ingress policies; no body format or schema selection. |
-| Client transport services | Channel, explicit original-Peer adapters, or custom Tower services exchange native byte envelopes without application decoding. Peer itself is a separate native capability, not a service. | Transport admission, deadlines, and native correlation where applicable; no application schema/codec. |
-| Typed body adapters | Public Encoder/Decoder state values with read-only headers on both buffers; standalone body operations receive an empty set. | RPC uses both directions; one-way uses only its needed state. Explicit client limits or admitted server budgets still apply. |
+| Layer | Serialization responsibility |
+| --- | --- |
+| Native framing/messaging | Fixed native headers, connection controls, and transport Fault schemas using `fubst`. |
+| Byte services and Router | Exchange or select complete encoded bodies without application decoding. |
+| Typed clients and server adapters | Run explicit encoder/decoder values for actual protocol types. |
+| Consumers | Choose schemas, validate method-specific headers, and define domain errors. |
 
-Raw clients and servers need native serialization for headers and connection
-setup even when they never decode an application body. That implementation
-stays inside the transport. Body codecs stay above it and can differ between
-operations on one connection. Endpoint, the server builder, connectors, and the
-router do not choose an application-body codec.
+Endpoint, connectors, ServerBuilder, and Router do not select body codecs.
+A custom body format cannot replace native headers, CRCs, controls,
+correlation, or an existing SF operation's specified wire schema.
 
 ## Native serialization
 
-Extend the existing codec rather than forking it into `furpc`. Required work
-includes selectable finite limits, missing native value/skip operations, and
-the supported schema-evolution behavior. This is the native header/control
-serialization authority and the implementation behind the default body codec,
-not a mandatory format for all application bodies.
+`fubst` is the native primitive/schema authority, not a second serializer
+forked into furpc. Native header interpretation lives in
+[wire/headers.rs](../../../../crates/libs/furpc/src/wire/headers.rs);
+ListenInstance lives in
+[connection/native.rs](../../../../crates/libs/furpc/src/connection/native.rs),
+and transport Fault bodies in
+[rpc.rs](../../../../crates/libs/furpc/src/rpc.rs).
 
-The transport constructs its scope-owned serialization context from validated
-native limits in `TransportLimits`. Public callers configure finite resource
-policy, not an encoder/decoder factory or native format override.
-Standalone `Message::builder` and `HeaderRecord` constructors use the same
-fixed implementation under native representation limits; they do not
-capture a client's or server's limits. Submission applies the actual scope
-context as specified by
-[message construction](Messages.md#construction-and-submission-limits).
-Application codec selection cannot change connection setup, native header
-interpretation, or native control/Fault decoding.
+Standalone construction and transport admission use native representation and
+frame/body bounds. They do not expose a connection-wide serializer factory or
+application codec override.
 
-Absent trailing fields default only where a schema declares the native
-initialized value. A real scope end is different from a malformed present
-field. ListenInstance's trailing nonce and Fault's trailing body flag are
-concrete required cases.
-
-Unknown-field handling must respect object/scope boundaries and metadata.
-Preserve unknown extension data where forwarding requires lossless
-re-emission; read-only domain decoding may explicitly skip supported suffixes.
-Unknown required polymorphic variants fail, rather than producing defaults.
-
-Preserve raw UTF-16 where wire fidelity requires it. Conversion to a Rust
-`String` is fallible; do not normalize or replace invalid code units silently.
-Manual and Serde schemas use the same primitive authority and limits.
+Absent trailing fields default only where their native schema declares a
+default. A malformed present field is not an absent field. Unknown suffix
+handling respects native object boundaries; opaque records retain encoded
+bytes. UTF-16 fidelity does not depend on lossy Rust string conversion.
 
 ## Application body codecs
 
-Follow [tonic's codec separation][tonic-codec]: the RPC adapter owns typed-body
-adaptation above byte transport; a user-replaceable codec maps typed values to
-and from application-body bytes. Provide public, externally implementable
-Encoder and Decoder traits. Custom implementations need no Serde traits
-or access to crate-private transport state.
+Encoder and Decoder are independent public traits. Each has its actual Item
+type and mutably borrowed state. Decoder functions/closures also implement the
+decoder contract directly. No coordinating codec trait, factory, or stored
+connection-wide codec is needed.
 
-The traits below are implemented in `furpc::codec` and re-exported at the crate
-root, together with `FubstEncoder`, `FubstDecoder`, `EncodeBuf`, `DecodeBuf`,
-and `CodecError`. The
-[typed RPC contract](Requests.md#rpc-calls-and-responses) specifies its
-typed-client ownership and concurrency requirements.
+| Operation | Direction states |
+| --- | --- |
+| `RpcClient::call` | Request encoder and response decoder. |
+| `OneWayClient::send` | Request encoder only. |
+| `server::unary` | Request decoder and reply encoder. |
+| `server::one_way` | Request decoder only. |
 
-```rust,ignore
-pub trait Encoder {
-    type Item;
+Callers construct state as ordinary local setup; actual encode/decode work
+runs inside the polled client or live server invocation. Async adapters apply
+their own Send/ownership bounds without making the base traits require
+Clone, Sync, or Serde. One-way paths impose no unused opposite-direction bounds.
 
-    fn encode(
-        &mut self,
-        item: Self::Item,
-        dst: &mut EncodeBuf<'_>,
-    ) -> Result<(), CodecError>;
-}
+`FubstEncoder<T>` and `FubstDecoder<T>` select native-format bodies independently.
+Their explicit `with_limits` settings apply only to that body direction, not
+native envelope decoding. The supported Serde mapping belongs to
+[fubst](../../../../crates/libs/fubst/src/).
+Root unit represents an absent body; an empty struct is a native object and
+is not interchangeable with unit.
 
-pub trait Decoder {
-    type Item;
+Ordinary typed boundaries carry DTOs until the actual encoder executes.
+Genuine byte-oriented content may have an encoder that emits its bytes
+unchanged. Consumer-owned frozen retry bytes are another intentional boundary,
+not a reason to pass every DTO through a nominal byte codec.
 
-    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Self::Item, CodecError>;
-}
-```
+## Header-aware method adaptation
 
-`Encoder::Item` is the locally sent type and `Decoder::Item` the locally received
-type. They need not be equal; clients and servers reverse these directions.
-The API consumes actual state values, not factories or a coordinating Codec.
-Callers construct those values as ordinary local setup. Actual encode/decode
-operations still run only when the guarded client/server future is polled.
-`CodecError` and `Error::Codec` remain the encode/decode error categories; they
-are not factory traits or wrapper objects.
+Both EncodeBuf and DecodeBuf always expose immutable `Headers`:
 
-- Client [`Grpc<T>`][tonic-client] wraps transport and takes a codec per RPC.
-  Furpc's `RpcClient<T>` likewise wraps a byte-facing Tower service; Channel is
-  the owning reconnecting transport, with explicit original-Peer adapters and
-  custom middleware/services also supported.
-  Calls are ordinary async methods using `&mut self`, with no stored encoder/decoder or
-  schema type parameters. Typed notifications use this same RpcClient adapter
-  over a byte service explicitly delegating to Peer::notify; Peer itself remains
-  byte-facing and does not implement Service. Generic codec work precedes native
-  admission and has the same ClientCodecLimits and cancellation contract as RPC.
-- Server functions server::unary and server::one_way adapt typed services inside
-  byte-facing ingress. Unary consumes a decoder and encoder; one_way consumes
-  only a decoder. Tower composition supplies those values per invocation.
-  The router dispatches the outer service without selecting a body format.
+| Work | Header view |
+| --- | --- |
+| Client encoding | Current request headers before native managed-field insertion. |
+| Client decoding | Current response headers after native settlement. |
+| Server decoding | Current admitted request headers after outer middleware edits. |
+| Server encoding | Current typed reply headers. |
+| Standalone helper | Empty headers. |
 
-The notification service path reuses `server::unary` for typed
-notification/acknowledgment bodies. The private runner ticket, not the codec,
-distinguishes an ordinary reply from a native notification acknowledgment.
+`DecodeBuf::with_headers` attaches explicit metadata for direct decoding.
+Metadata is not source identity, a live invocation, or reply authority.
+Header-dependent schemas must validate required fields explicitly.
 
-Different body types and codecs can share the current native generation and
-its pending table. RpcClient<Channel> remains usable across Channel reconnection
-for later independent calls; failed invocations and their codec state are not
-re-encoded or replayed. A notification adapter capturing a Peer remains bound
-to that generation; it must not silently acquire a replacement Peer or replay
-an invocation. Encoder/decoder state belongs to the call/invocation,
-never to the socket parser. Client and per-invocation server codecs need Send and owned Send
-encode/decode state, not Clone or Sync. Stored outer route services may need
-Clone/Sync; those bounds do not apply to codecs or typed services created
-inside their futures. One-way method adaptation uses only decoding, without
-unused encode-state bounds.
-Keep those execution bounds on the corresponding APIs, not every use of the
-public codec traits.
-
-Typed method boundaries carry the actual protocol request/reply types, not
-pre-encoded Body wrapped in a nominal codec. `FubstEncoder<T>` and
-`FubstDecoder<T>` have independent Default and with_limits constructors, so an
-encoding-only or decoding-only method needs no dummy opposite direction.
-`OneWayClient::send` consumes Request<E::Item> and an Encoder value.
-RpcClient::call consumes both actual directions. No Codec trait, tuple adapter,
-or encoder/decoder factory is required. Decoder functions and closures implement
-Decoder directly, so protocol decoding need not introduce a wrapper class.
-An actual byte-oriented payload, such as a file-content request, may have a
-dedicated typed encoder that emits its bytes unchanged. That is different
-from serializing an ordinary DTO before entering the typed method adapter.
-Byte-facing transport services and explicitly frozen retry storage remain
-separate legitimate uses of shared Body, not substitutes for typed composition.
-
-`FubstEncoder<Out>` and `FubstDecoder<In>` implement Default and are the native-format
-directions supplied explicitly to client and server functions. There is no
-hidden connection-wide default. Its built-in Serde mapping uses the documented
-`fubst` adapters and schema restrictions,
-not an assumption that every Serde data model has a native encoding. Users
-can implement another codec for their own types and protocol, or use raw
-messages without a typed codec at all.
-
-`fubst` maps a root `()` to an absent body: encoding writes zero bytes and
-decoding requires empty input. Transparent newtypes preserve that root mapping;
-unit fields, unit structs and unit-valued container elements remain unsupported.
-An empty struct still encodes as a framed native object. Consequently
-`FubstEncoder<()>` with `FubstDecoder<ReplyBody>` handles native empty-request operations such as Ping
-without a method-specific codec, including when encoded-body byte limits are zero.
-
-The extension point does not replace the fixed native frame, CRC, header,
-control, correlation, or security formats. Native headers and transport-control
-bodies still use their native `fubst` schemas regardless of the application
-codec. RPC processes native transport Faults before invoking the successful
-reply's body decoder. A custom body codec therefore does not remove that native
-dependency.
-An existing native gateway operation still requires its specified body bytes;
-choosing JSON or protobuf does not make that operation interoperable.
-
-Codec selection is trusted local configuration agreed by the application
-protocol. Do not invent a mandatory codec-ID header, automatic format sniffing,
-or peer-selected plugin loading.
-
-Each decode sees exactly one complete body, with no encoded native header bytes or
-bytes from the next message. It returns one value, not "need more TCP bytes".
-Successful decode consumes the entire body; format-defined extensions must be
-explicitly consumed or skipped. Domain streaming across multiple messages is a
-separate protocol, not implicit codec framing.
-
-### Header-aware method adaptation
-
-Encoder and Decoder retain their directional signatures; the coordinating
-Codec trait and all factory wrappers are removed.
-EncodeBuf and DecodeBuf always supply `&Headers` through headers(), not Option.
-Canonical clients supply current request headers while encoding and native
-response headers after settlement. Server decoding sees admitted request
-headers; reply encoding sees the typed service's current reply headers.
-Managed correlation fields added later by native submission are not promised
-to encoders. Input byte limits are
-checked before decoder work, and successful decoding must consume the complete
-body. Response provenance/settlement and typed Request context stay unchanged.
-
-RpcClient::call(request, encoder, decoder, deadline) and
-server::unary(service, request, decoder, encoder) consume the needed values.
-server::one_way(service, request, decoder) consumes only the decoder. All paths use the same
-guarded execution; there are no parallel `_with_decoder` RPC APIs.
-
-Decoders read current headers after any trusted outer middleware edits;
-those headers do not replace the original admission/authority snapshot.
-`DecodeBuf::new` and standalone codec::encode/decode supply an immutable empty
-header set. Header-dependent schemas must validate their required fields,
-not treat emptiness as success. with_headers() can attach metadata for direct
-decoding but cannot create invocation or reply authority.
-Encoder and decoder operations run inline and need no Clone/Sync bounds. Failures retain
-the decode phase and CodecError source/category. Header-dependent schemas remain
-in consumers, not furpc or fubst. There is no shared header-capture cell,
-connection-wide codec state, new worker task, or additional admission pool.
-
-Tonic's gRPC record prefixes, compression, and streaming bodies are not part
-of this native wire contract. Reuse the RPC/codec boundary, not another
-framing layer or an HTTP body dependency.
+The [client adapters](../../../../crates/libs/furpc/src/client.rs) bound input
+before decoder work. The
+[server adapters](../../../../crates/libs/furpc/src/server.rs) also validate
+live original invocation/kind and use its admitted budgets and deadline.
+Current header edits cannot replace the original admission snapshot.
 
 ## Bounded buffers and failures
 
-`EncodeBuf` supports fallible writes and shared segments without flattening.
-Native message representability and any explicitly selected codec restrictions
-bound encoded output; there is no additional mandatory construction profile.
-Encoding finishes before submission, so failure cannot leave a partial frame.
-`write_all` copies bytes into the current output segment; `append_body` adopts
-shared visible segments. `remaining` reports the operation's encoded-byte
-allowance. `DecodeBuf` supports checked advancement, shared `take` views,
-`copy_to_slice`, and fallible `copy_remaining`.
+EncodeBuf performs fallible byte writes and can append shared body segments
+without copying their payload. Encoding finishes before native submission;
+failure cannot leave a partial transport frame.
 
-`DecodeBuf` exposes exactly one complete body. Its
-`copy_remaining() -> Result<Vec<u8>, CodecError>` consumes and fallibly copies
-that range, without attaching a charge to the resulting value. Decoded values
-and custom codec allocations are ordinary application-owned Rust data.
-Request/response parts preserve metadata and provenance, not hidden allocation
-reservations. Zero-copy byte views retain backing storage by reference counting.
-Headers are read-only borrowed metadata and are not part of the body byte
-range. Neither buffer exposes native invocation authority.
+DecodeBuf views exactly one complete body, with checked cursor advancement,
+shared `take` views, and fallible copies. Successful adapter/helper decoding
+must consume or explicitly skip every byte. There is no incremental
+need-more-TCP-input result or hidden message-stream framing.
 
-Run codec work outside the socket driver, without detached workers. Custom
-code is trusted and cooperative; the transport does not universally bound its
-CPU work or heap usage. Explicit codec-specific limits remain independent of
-native frame/send-queue policy.
+Byte limits constrain encoded output and input, not arbitrary codec
+allocations or decoded values. Zero permits only empty bytes. Invalid limits
+and oversized input reject before codec execution. Native full-frame and
+send-queue policy still apply separately.
 
-Preserve codec failure phase, source, and resource-exhaustion category through
-`CodecError`. A malformed application body fails its typed call or handler;
-it is not automatically a connection-fatal native Protocol error. Malformed
-native headers and controls remain connection-protocol failures. A codec
-cannot manufacture reply authority, change routing metadata, or turn a local
-decode failure into a successful domain response.
+Codecs are synchronous, trusted, cooperative application code, run outside the
+socket driver without detached workers. They cannot be preempted universally
+or charged to an aggregate transport heap quota.
 
-Typed adaptation reports `Error::Codec { phase, source }`, with `phase` equal
-to `encode` or `decode`. `CodecError::InvalidPayload` and `ResourceLimit` retain
-their original error sources. FubstEncoder::with_limits and FubstDecoder::with_limits independently select
-codec-local `fubst::Limits`; default operations add no depth/work ceiling.
+CodecError distinguishes invalid payload from resource limits and retains the
+source. Async adapters wrap it in `Error::Codec` with encode/decode phase.
+Application codec failure is normally invocation-local, not a malformed native
+connection. It never creates a success-shaped empty body or automatic Fault.
 
 ## Public body helpers
 
-**Status:** implemented in furpc::codec. The same whole-body helpers are used
-by RpcClient, OneWayClient and server functions, and are available to direct native
-message consumers without creating an RPC exchange or borrowing ingress authority.
+`codec::encode` and `codec::decode` reuse the whole-body buffer implementation
+without transport submission. They perform no readiness, I/O, task creation,
+correlation, deadline renewal, or invocation admission.
 
-Runtime RapClient uses OneWayClient and native encoder factories for ordinary typed sends.
-Frozen fault/endpoint retry bodies use codec::encode once; a pass-through encoder
-adopts their shared bytes on each send without native reserialization.
-Deferred one-way server invocations use codec::decode with the Fubst decoder
-and retained route body limit after owned executor admission.
+These helpers are appropriate when the domain intentionally owns an encoded
+snapshot or decoding occurs after a transport invocation has ended. They must
+not reconstruct live server authority from retained metadata.
 
-```rust,ignore
-// Public functions in furpc::codec; no new format or transport operation.
-pub fn encode<E: Encoder>(
-    encoder: &mut E,
-    item: E::Item,
-    max_encoded_body_bytes: usize,
-) -> Result<Body, CodecError>;
+Runtime fault/endpoint reporting encodes once into immutable shared Body
+storage. Retry scheduling, frozen schema fields, fresh send identities, and
+failure-atomic ownership replacement remain Runtime responsibilities.
 
-pub fn decode<D: Decoder>(
-    decoder: &mut D,
-    body: &Body,
-    max_body_bytes: usize,
-) -> Result<D::Item, CodecError>;
-```
+Runtime deferred one-way ingress decodes after owned executor admission;
+furpc serving has already completed at bounded enqueue. Calling
+`server::one_way` there would incorrectly require live invocation authority.
+Hosting's opaque lifecycle handoff likewise retains original Entry provenance
+for Node's later bounded native decode. Their actual locations are listed in
+[Consumer composition](Implementation.md#owned-byte-facing-boundaries).
 
-The helpers reuse the existing buffers and whole-body implementation, including fallible
-shared-segment assembly, complete-input consumption, and original codec error
-sources. Explicit byte limits are not heap quotas; zero permits only an empty
-body. Invalid limits fail before codec work, oversized decode input fails before
-calling the decoder, and successful decoding must consume or explicitly skip
-the entire body. Call/invocation adapters retain responsibility for wrapping
-failures in `Error::Codec` with their encode/decode phase.
-
-These are synchronous, cooperative body transformations, not service or native
-submission adapters. They perform no I/O, readiness polling, task creation,
-admission, deadline renewal, routing, or correlation. They neither require nor
-create RequestContext or reply authority. Generic RPC adapters reuse the
-same helpers while continuing to supply their actual client/invocation budgets.
-
-For frozen fault/endpoint retry payloads, encode once and retain the immutable
-Body in a consumer-owned typed wrapper. Clones share bytes; each authorized send
-still builds a fresh native message identity. The wrapper's native schema,
-activity/description stability, retry schedule and lifetime remain domain-owned.
-Using Body this way is already possible and is not itself a furpc API change.
-Do not add a generic replay cache or retain codecs between attempts.
-Endpoint publication prepares replacement bytes and admits its retry owner
-before cancelling the previous publication. Preparation/admission failures
-leave the original pending owner and frozen payload intact.
-
-Runtime's deferred one-way service must continue decoding after owned executor
-admission. Its native serving scope already completed at bounded enqueue, so
-using server::one_way at that later point would incorrectly require live
-invocation authority. Public body helpers simplify that adapter without
-changing the completion boundary or reviving its context.
-
-[tonic-codec]: https://docs.rs/tonic/latest/tonic/codec/trait.Codec.html
-[tonic-client]: https://docs.rs/tonic/latest/tonic/client/struct.Grpc.html
-[tonic-server]: https://docs.rs/tonic/latest/tonic/server/struct.Grpc.html
+Buffer, custom-format, header-aware, and complete-consumption examples live in
+[client tests](../../../../crates/libs/furpc/tests/client.rs) and
+[codec unit tests](../../../../crates/libs/furpc/src/codec/tests.rs).

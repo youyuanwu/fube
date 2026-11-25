@@ -4,7 +4,7 @@
 guarantees. All consumers now use furpc and the legacy crate has been removed.
 Source links below are pinned to its final pre-removal revision; legacy commands
 are historical, not runnable current-workspace instructions.
-See the [current composition and retirement record](design/Furpc/Implementation.md).
+See the [furpc consumer composition](design/Furpc/Implementation.md).
 
 ## Supported composition
 

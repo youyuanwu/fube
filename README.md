@@ -85,9 +85,9 @@ repeated native SDK copy reliability is not claimed.
 
 - [Rust FabricClient API and native qualification](docs/transport/RustFabricClient.md)
 - [Native transport/TCP/TLS specification](docs/transport/Transport.md)
-- [Current furpc transport design, public APIs and migration evidence](docs/transport/design/Furpc/README.md)
-- [Historical legacy channel contracts and evidence](docs/transport/NativeChannel.md)
-- [Operational bounded typed native client contracts and borrowed observer](crates/libs/fube-client/src/contracts.rs)
+- [furpc transport architecture and contracts](docs/transport/design/Furpc/README.md)
+- [furpc consumer composition and implementation locations](docs/transport/design/Furpc/Implementation.md)
+- [Typed native client implementation](crates/libs/fube-client/src/furpc_client.rs)
 - [FabricClient behavior](docs/transport/FabricClient.md) and [message formats](docs/transport/FabricClientMessageFormat.md)
 - [Native FabricRuntime](docs/runtime/FabricRuntime.md) and [node-side host responsibilities](docs/runtime/FabricRuntimeHost.md)
 - [Standalone test host](docs/runtime/RustTestHost.md) and [manifest execution](docs/runtime/ManifestTestHost.md)

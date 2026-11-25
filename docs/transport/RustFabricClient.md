@@ -354,13 +354,11 @@ replayed. Peer/source metadata does not own that lifecycle or retarget the
 gateway to a service-published endpoint. There are no ordinary `close`,
 `is_closed`, `terminal_error`, optional-duration or typed-slot compatibility APIs.
 
-ImageStore's actual connect path uses its own Endpoint factory and common target,
-but keeps a dedicated mutable serial session, one private receiver, actor26 raw
-sends/actor25–27 semantic ACKs, delete RPC and cancellation retirement. Runtime/
-Hosting likewise use the same backend after their outgoing/accepted native IPC
-setup, without creating new inbox pumps. Raw receiver Clone/concurrent receive
-is supported, not safe arbitrary session sharing; explicit domain retirement
-can close retained raw observers. See [common composition](NativeChannel.md).
+ImageStore owns a dedicated Channel and serial upload session. Its typed
+commands encode at the send boundary; ingress services process semantic ACKs
+without a transport pull receiver. Runtime and Hosting compose the same furpc
+service/Peer APIs under their own IPC authority and lifecycle policy.
+See [consumer composition](design/Furpc/Implementation.md).
 
 ### Disposable onebox commands
 
@@ -536,9 +534,10 @@ Furpc owns managed correlation, send commitment, deadlines and physical
 generation retirement. Operation codecs own their success/failure envelopes and
 body validation. Malformed application data fails the call without inventing a
 successful result; transport integrity failures independently retire the
-physical generation. See the [furpc implementation](design/Furpc/Implementation.md)
-for current lifecycle/settlement behavior and [NativeChannel](NativeChannel.md)
-for the legacy transport still used by other workspace consumers.
+physical generation. See [operations](design/Furpc/Operations.md) for commitment
+and settlement, [lifecycle](design/Furpc/Lifecycle.md) for ownership/shutdown,
+and [consumer composition](design/Furpc/Implementation.md) for application
+boundaries.
 
 ### Native ImageStore application-package copy
 
