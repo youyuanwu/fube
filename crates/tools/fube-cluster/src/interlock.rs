@@ -1,4 +1,6 @@
-use crate::profile::{err, private_dir, read_json, write_json, CleanupReceipt, Result};
+use crate::profile::{
+    err, private_dir, read_json, write_json, CleanupReceipt, NodeDownReceipt, Result,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -16,6 +18,8 @@ struct Marker {
     clean: bool,
     predecessor: Option<String>,
     receipts: Option<Vec<CleanupReceipt>>,
+    #[serde(default)]
+    fenced_nodes: Option<Vec<NodeDownReceipt>>,
 }
 
 pub struct Interlock {
@@ -71,6 +75,14 @@ impl Interlock {
                             .iter()
                             .any(|receipt| receipt.deployment != marker.deployment)
                 })
+                || handoff.fenced_nodes.as_ref().is_some_and(|receipts| {
+                    receipts.len() > 64
+                        || receipts.iter().any(|receipt| {
+                            receipt.deployment != marker.deployment
+                                || !receipt.node_group_drained
+                                || !receipt.app_group_drained
+                        })
+                })
                 || root.join("deployment").exists()
             {
                 return Err(
@@ -95,6 +107,7 @@ impl Interlock {
                 clean: false,
                 predecessor: predecessor.clone(),
                 receipts: None,
+                fenced_nodes: None,
             },
         )?;
         write_json(
@@ -104,6 +117,7 @@ impl Interlock {
                 clean: false,
                 predecessor: predecessor.clone(),
                 receipts: None,
+                fenced_nodes: None,
             },
         )?;
         Ok(Self {
@@ -114,6 +128,14 @@ impl Interlock {
         })
     }
     pub fn publish_clean(&self, receipts: &[CleanupReceipt]) -> Result<()> {
+        self.publish_clean_with_fencing(receipts, &[])
+    }
+
+    pub fn publish_clean_with_fencing(
+        &self,
+        receipts: &[CleanupReceipt],
+        fenced_nodes: &[NodeDownReceipt],
+    ) -> Result<()> {
         if self.root.join("deployment").exists() {
             return Err("runtime tree remains; clean handoff forbidden".into());
         }
@@ -129,6 +151,15 @@ impl Interlock {
         {
             return Err("clean handoff proof does not match original deployment children".into());
         }
+        if fenced_nodes.len() > 64
+            || fenced_nodes.iter().any(|receipt| {
+                receipt.deployment != self.deployment
+                    || !receipt.node_group_drained
+                    || !receipt.app_group_drained
+            })
+        {
+            return Err("Node fencing proof does not match the owned deployment".into());
+        }
         write_json(
             &self.root.join("handoff.json"),
             &Marker {
@@ -136,6 +167,7 @@ impl Interlock {
                 clean: true,
                 predecessor: self.predecessor.clone(),
                 receipts: Some(receipts.to_vec()),
+                fenced_nodes: Some(fenced_nodes.to_vec()),
             },
         )
     }

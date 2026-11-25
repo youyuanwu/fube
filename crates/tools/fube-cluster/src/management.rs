@@ -32,6 +32,19 @@ pub(crate) enum Operation {
         index: usize,
         metadata: Metadata,
     },
+    NodeOwner {
+        index: usize,
+    },
+    NodeDown {
+        index: usize,
+        receipt: NodeDownReceipt,
+    },
+    PrepareNodeRestart {
+        index: usize,
+    },
+    FinishNodeRestart {
+        index: usize,
+    },
     Command {
         command: Command,
     },
@@ -133,6 +146,19 @@ async fn operate(manager: &mut Manager, operation: Operation) -> Result<Value> {
         Operation::Attach { index, metadata } => {
             serde_json::to_value(manager.attach(index, metadata).await?).map_err(err)
         }
+        Operation::NodeOwner { index } => serde_json::to_value(
+            manager
+                .children
+                .get(index)
+                .and_then(|child| child.metadata.clone())
+                .ok_or("Node metadata is not admitted")?,
+        )
+        .map_err(err),
+        Operation::NodeDown { index, receipt } => manager.node_down(index, receipt).await,
+        Operation::PrepareNodeRestart { index } => {
+            serde_json::to_value(manager.prepare_node_restart(index).await?).map_err(err)
+        }
+        Operation::FinishNodeRestart { index } => manager.finish_node_restart(index).await,
         Operation::Command { command } => manager.execute(command).await,
         Operation::Status => Ok(Value::Null),
         Operation::Generation => manager.begin_generation_handshake(),

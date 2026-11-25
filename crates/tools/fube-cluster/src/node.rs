@@ -28,6 +28,8 @@ struct PeerConnection {
     dialed: bool,
 }
 
+mod peers;
+
 async fn control_line(input: &mut BufReader<tokio::io::Stdin>) -> Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
@@ -55,9 +57,9 @@ async fn control_line(input: &mut BufReader<tokio::io::Stdin>) -> Result<Option<
 }
 
 pub async fn run(config: &Path) -> Result<()> {
-    let launch: Launch = read_json(config)?;
+    let mut launch: Launch = read_json(config)?;
     launch.validate()?;
-    let result = run_owned(&launch).await;
+    let result = run_owned(&mut launch).await;
     if result.is_err()
         && !launch.directory.join("activation-acquired.json").exists()
         && unsafe { libc::getppid() } as u32 == launch.parent_pid
@@ -86,11 +88,11 @@ pub async fn run(config: &Path) -> Result<()> {
     }
     result
 }
-async fn run_owned(launch: &Launch) -> Result<()> {
+async fn run_owned(launch: &mut Launch) -> Result<()> {
     if unsafe { libc::getppid() } as u32 != launch.parent_pid {
         return Err("internal node requires original launcher parent".into());
     }
-    let ingress = launch.ingress()?;
+    let mut ingress = launch.ingress()?;
     let mut routes = vec![Target::new(
         launch.fm.clone(),
         wire::Role::Node,
@@ -263,6 +265,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut published_host_replacements: usize = 0;
     let mut upload = LfumUploadState::default();
     let mut fm_incoming = None;
+    let mut pending_peer_update = None;
     if failure.is_none() {
         loop {
             // Owned stop remains independent of FM connectivity. Link loss is
@@ -280,6 +283,28 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             let command = std::str::from_utf8(&line).map_err(err);
                             let command = command.as_ref().map(|line| line.split_whitespace().collect::<Vec<_>>());
                             match command {
+                                Ok(parts) if parts.len() == 5 && matches!(parts[0], "peer-update" | "peer-down")
+                                    && parts[1] == launch.session && parts[2] == launch.capability
+                                    && launch.profile.mesh_peers() => {
+                                    let input = parts[3].parse::<usize>().map_err(err)
+                                        .and_then(|slot| parts[4].parse::<u64>().map(|instance| (slot, instance)).map_err(err));
+                                    let (slot, instance) = match input {
+                                        Ok(input) => input,
+                                        Err(error) => { failure = Some(error); break; }
+                                    };
+                                    if slot >= connections.len() {
+                                        failure = Some("peer control slot is outside the configured topology".into());
+                                        break;
+                                    }
+                                    if parts[0] == "peer-down" {
+                                        if let Err(error) = peers::fence(launch, slot, instance, &mut node, &mut adapter, &mut connections).await {
+                                            failure = Some(error); break;
+                                        }
+                                    } else if pending_peer_update.replace((slot, instance)).is_some() {
+                                        failure = Some("another peer incarnation update is pending".into());
+                                        break;
+                                    }
+                                }
                                 Ok(parts) if parts.len() == 5 && parts[0] == "replace-host"
                                     && parts[1] == launch.session && parts[2] == launch.capability
                                     && launch.profile.mesh_peers() => {
@@ -384,6 +409,29 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 failure = Some(err(error));
                 break;
             }
+            if let Some((slot, instance)) = pending_peer_update {
+                match peers::replace(
+                    launch,
+                    (slot, instance),
+                    &mut node,
+                    &mut adapter,
+                    &mut targets,
+                    &mut connections,
+                    &mut peer_listeners,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        ingress = launch.ingress()?;
+                        pending_peer_update = None;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
             if let Err(error) = upload.advance(
                 &node,
                 &up.node,
@@ -403,7 +451,9 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 .front()
                 .and_then(|reply| peer_target(&reply.effect))
                 .and_then(|target| launch.peers.iter().position(|peer| &peer.node == target));
-            let selected_link = selected_peer.and_then(|index| connections[index].link.as_ref());
+            let selected_link = selected_peer
+                .and_then(|index| connections[index].link.as_ref())
+                .filter(|link| link.is_live());
             if let Err(error) = adapter
                 .advance_with_peer(
                     &mut node,
@@ -443,7 +493,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             }
                         }
                     }
-                    if adapter.peer_error().is_some() {
+                    if !current.is_live() {
                         if let Some(old) = connection.link.take() {
                             let _ = old.close().await;
                         }

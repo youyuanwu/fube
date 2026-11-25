@@ -37,6 +37,32 @@ parent control, host-replacement receipts and process/Channel ownership remain
 outside it. Backpressure retains the original incoming frame and unacknowledged
 handoff rather than closing the FM connection.
 
+## Explicit Node failure and cold rejoin
+
+The [cluster controls](../../crates/tools/fube-cluster/README.md#explicit-nodedown-and-restart)
+provide explicit `node-down` and `restart-node` commands. They are supervisor
+operations over private management IPC, not new FM/RA wire actions or a
+Federation failure detector.
+
+[Driver-owned fencing](../../crates/tools/fube-cluster/src/restart.rs) distinguishes
+an unavailable connection from a terminated Node/application process group.
+The [FM lifecycle](../../crates/tools/fube-cluster/src/fm/node_lifecycle.rs) records
+the exact incarnation Down, then uses ordinary survivor-driven reconfiguration.
+Returning Nodes have fresh Node/runtime/replica instances, empty inventory and
+explicitly admitted [peer replacements](../../crates/tools/fube-cluster/src/node/peers.rs).
+RA's [peer binding and replacement admission](../../crates/libs/fube-ra/src/peer.rs)
+does not reuse old reply authority or change committed membership behind the
+reconfiguration protocol.
+
+Stateless desired instances are recreated through AddInstance. Replicated
+volatile replicas rebuild/copy from a surviving Primary and enter the active
+configuration only after actual native completion. The FM and surviving
+Node/app processes remain unchanged. This path requires stable membership,
+one confirmed failed member and sufficient surviving quorum/minimum. It does
+not implement automatic restart/placement, FM recovery, persisted-state
+adoption, arbitrary interrupted-transition recovery or recovery after all
+volatile copies are lost.
+
 ## Immutable configured initial membership
 
 The configured volatile profile is selected with
@@ -104,7 +130,7 @@ Repeated/reverse [healthy planned transfers](#healthy-planned-primary-transfer)
 are qualified at 2/1 and 3/2 without changing service sizes, including 3/2
 transfer after completed repair.
 Incremental/partial admission, resize, general planned transfer,
-healthy Secondary retirement, whole-node/FM restart and persisted recovery remain
+healthy Secondary retirement, FM restart and persisted recovery remain
 unsupported for this new profile. The older named profiles remain separate
 qualification fixtures with their existing behavior; their bounded lifecycle
 support is not implicitly enabled for arbitrary configured sizes.
@@ -333,8 +359,11 @@ No new native schema/action is introduced: the source-stream gate remains
 179 cases/55 native truncation rejections. This is source-derived model/process
 and native-stream/schema-adapter evidence, not full original C++ handler or
 Federation interoperability. Multi-loss repair, automatic
-restart, broader interrupted-transition recovery, resize and node/FM restart remain
-deferred. The 64 bound is model/resource qualification, not 64-process testing.
+restart, broader interrupted-transition recovery, resize and FM restart are
+outside this app-host repair path.
+[Explicit Node cold rejoin](#explicit-node-failure-and-cold-rejoin) has a separate
+confirmed-failure contract. The 64 bound is model/resource qualification,
+not 64-process testing.
 
 ## Preconfigured spare restoration
 

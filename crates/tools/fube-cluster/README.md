@@ -4,8 +4,9 @@ The CLI supervises a separate `fube-fm` child and, by default, two child process
 running the existing local RA/Hosting/runtime. The FM state remains in memory.
 The default stateless mode supports the fixed
 `ClusterStatelessApp/ClusterService/Code/ClusterStatelessType` package. This is
-not native Federation interoperability, full M1, recovery, failover or a general
-service host.
+not native Federation interoperability, full M1, durable recovery or a general
+service host. Node failures and cold rejoins use the explicit controls below;
+there is no automatic failure detector or restart policy.
 
 The reusable native wire, retained-effect/timer and semantic-ACK adapter lives
 in [`fube_node::control`](../../libs/fube-node/src/control/mod.rs). This launcher
@@ -66,6 +67,71 @@ manager embedded for precise message/commit fault scheduling.
 `begin_generation_round().await` works with either owner; the older synchronous
 `begin_generation_handshake()` is embedded-only. Direct peer/runtime test
 controls are not exposed as FM management actions.
+
+## Explicit NodeDown and restart
+
+The supervisor accepts these ordinary foreground commands:
+
+```json
+{"op":"report-node1-down","action":"node-down","node":1}
+{"op":"restart-node1","action":"restart-node","node":1}
+```
+
+Node numbers select an existing configured placement, including an unused spare.
+The [driver](src/restart.rs) implements `Cluster::node_down` and
+`Cluster::restart_node` for both embedded and separate FM ownership. The private
+[management interface](src/management.rs) carries incarnation-bound fencing
+evidence; it does not add a native RA NodeDown action.
+
+`node-down` requires the original owned Node to have exited. It drains/reaps that
+owned process group and independently observes that the recorded application
+group cannot serve. It rejects a still-live Node and cannot kill or adopt a
+process reconstructed from a PID. Socket closure alone remains **Unknown**.
+This fence covers the owned Node/application groups, not escaped or unowned
+processes.
+The event records **Down** only for the exact deployment/session/Node incarnation.
+Duplicate evidence is idempotent; stale evidence cannot take down a successor.
+
+The [FM node lifecycle](src/fm/node_lifecycle.rs) projects confirmed loss into
+native replica descriptions. With completed replicated membership and enough
+surviving quorum/minimum, it sends ordinary DoReconfiguration to a surviving RA.
+It does not wait for the dead RA's reply or manufacture deletion/disposal
+receipts. Same-Primary removal and Primary failover preserve configured sizes
+and complete through shared RA/RAP. The Down acknowledgment reports whether
+replica reconfiguration is pending, unnecessary or blocked; it is not recovery
+completion.
+
+`restart-node` can explicitly stop/fence a live owner or reuse an already
+confirmed failure. It waits for the old membership removal, then creates a
+higher Node instance, fresh session/capability, private directory and
+runtime/replica identities. FM remains alive. The new RA starts empty and must
+complete NodeUp/final empty inventory. Surviving Nodes
+[replace only the fenced peer incarnation](src/node/peers.rs), retaining their
+own processes, applications and current serving authority. Old Links,
+invocations and unsent peer obligations never retarget.
+
+If a stateless instance was desired, FM issues a fresh AddInstance. A replicated
+volatile rejoin builds a fresh Idle from the surviving Primary and admits it
+through normal configuration completion. The restarted replica is not
+automatically promoted back to Primary. `node_controls` exposes retained command
+completion, while `configuration.ready` and `repair.ready` describe the native
+recovery boundaries. Repeating an operation ID never restarts another process;
+changing its command content rejects.
+
+Recovery requires one failed member, stable completed membership and sufficient
+surviving quorum/minimum to remove the old incarnation. Active transition/LFUM
+overlaps, multiple concurrent failures, singleton/all-copy volatile loss,
+persisted-state adoption, FM restart and automatic placement/restart are not
+enabled. Blocked recovery is explicit; minimum is never lowered and empty data
+is never presented as recovered data. An unused Node can rejoin without creating
+a replica.
+
+Shutdown retains physical Node-fencing evidence separately from graceful
+RA/Hosting receipts in the [deployment handoff](src/interlock.rs). An unreported
+owner loss still prevents a clean handoff. The
+[executable restart cases](src/tests/restart.rs) cover live-node rejection,
+external termination, stateless recreation, Primary/Secondary data rebuild,
+repeated explicit restart, unchanged survivors and stale evidence.
 
 ## Service profiles
 
@@ -224,7 +290,9 @@ Insufficient read quorum blocks failover without declaring data loss. Additional
 loss during an in-flight transition makes its ownership unknown, not successful,
 except for the bounded pre-replacement Primary-loss supersession above.
 Another configured failover requires completed repair; general multi-loss repair,
-broader interrupted/superseding recovery and whole-node/FM restart remain unsupported.
+broader interrupted/superseding recovery and FM restart remain unsupported.
+[Explicit Node restart](#explicit-nodedown-and-restart) uses its own
+confirmed-failure and cold-rejoin contract.
 The named profiles below remain
 separate qualification paths, including their historical size transitions and
 repeated failover/repair.
@@ -272,8 +340,9 @@ continues on those owners. There is no automatic replacement of node1 or quorum
 fallback if another member is lost. Lost final replies replay without another
 promotion/Open; repeated old-Primary loss reports cannot undo the new endpoint.
 This first-cycle example qualifies Primary **app-host** loss with its RA/Node
-alive, not node/FM process failover, restart, mismatched-history repair or
-data-loss recovery. See [the SF flow and evidence](../../../docs/cluster/MinimalFmCluster.md#three-replica-primary-app-host-failover).
+alive. [Node process recovery](#explicit-nodedown-and-restart) is separate;
+FM restart, mismatched-history repair and data-loss recovery are not implied.
+See [the SF flow and evidence](../../../docs/cluster/MinimalFmCluster.md#three-replica-primary-app-host-failover).
 
 After completed failover and the old Primary's processed native loss/deletion,
 `Cluster::repair_primary_replica().await` explicitly starts one repair on node1.
@@ -417,8 +486,8 @@ member, stale earlier traffic, preserved owners/data and real quorum/no-quorum.
 Earlier swap completion remains historical evidence, never automatic failback
 or serving authority. Unfinished/unknown handoffs and other post-handoff sizes
 remain gated or unqualified; the legacy 2/1 new-Primary loss still yields unknown.
-Swap abort, Node/FM restart and full native handler/interoperability
-qualification remain gated.
+Swap abort, Node restart during an unfinished handoff, FM restart and full native
+handler/interoperability qualification remain gated.
 Missing, unknown or uncatchable Secondary progress follows SF's volatile
 restart path: shared RA projects the member down to RAP, sends force Deactivate
 with invalid history, and commits its successful Close/DeactivateReply as

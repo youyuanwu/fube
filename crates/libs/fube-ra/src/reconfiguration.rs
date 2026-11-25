@@ -370,8 +370,14 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                 }
             }
             if let Some(lost) = prior.replicas.0.iter().find(|r| r.current_role == 1) {
-                let fresh = local(body, &lost.node)?;
+                let fresh = body
+                    .replicas
+                    .0
+                    .iter()
+                    .find(|r| r.node.id == lost.node.id)
+                    .ok_or(Failure::Admission("repair omitted the lost logical Node"))?;
                 if fresh.previous_role != 2
+                    || fresh.node.instance < lost.node.instance
                     || fresh.id <= lost.id
                     || fresh.instance <= lost.instance
                 {

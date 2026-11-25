@@ -340,6 +340,55 @@ impl Executor {
         lock(&self.shared.view).peers.first().cloned()
     }
 
+    /// Replace configured membership only after the composition owner fences
+    /// the predecessor and completes any configuration removing that incarnation.
+    pub fn replace_peer_after_fencing(
+        &self,
+        previous: &NodeInstance,
+        replacement: NodeInstance,
+    ) -> Result<()> {
+        let mut view = lock(&self.shared.view);
+        if !view.accepting {
+            return Err(Failure::Closed);
+        }
+        if replacement.id != previous.id || replacement.instance <= previous.instance {
+            return Err(Failure::Admission(
+                "peer replacement must advance the exact Node incarnation",
+            ));
+        }
+        let index =
+            view.peers
+                .iter()
+                .position(|peer| peer == previous)
+                .ok_or(Failure::Admission(
+                    "peer predecessor is not currently bound",
+                ))?;
+        if view.stats.outstanding != 0 {
+            return Err(Failure::Capacity);
+        }
+        if view.entities.values().any(|snapshot| {
+            snapshot.fenced
+                || snapshot.committed.as_ref().is_some_and(|state| {
+                    state.configuration.as_ref().is_some_and(|configuration| {
+                        configuration.replicas.0.iter().any(|replica| {
+                            &replica.node == previous && replica.up && replica.current_role >= 3
+                        })
+                    }) || state.reconfiguration.as_ref().is_some_and(|configuration| {
+                        configuration.stage != ConfigurationStage::Complete
+                    }) || state
+                        .swap
+                        .as_ref()
+                        .is_some_and(|swap| swap.stage != SwapStage::Complete)
+                })
+        }) {
+            return Err(Failure::Unsupported(
+                "peer incarnation replacement requires completed old configuration removal",
+            ));
+        }
+        view.peers[index] = replacement;
+        Ok(())
+    }
+
     pub fn is_peer(&self, source: &NodeInstance) -> bool {
         lock(&self.shared.view).peers.contains(source)
     }
@@ -486,7 +535,11 @@ fn create_remote(
                 .chain(current.swap.iter().map(|s| &s.intent))
                 .any(|body| {
                     body.replicas.0.iter().any(|r| {
-                        r.node == target.node
+                        (r.node == target.node
+                            || (r.node.id == target.node.id
+                                && r.node.instance < target.node.instance
+                                && r.current_role == 1
+                                && r.state == 3))
                             && !r.up
                             && matches!(r.current_role, 1 | 3)
                             && target.id > r.id

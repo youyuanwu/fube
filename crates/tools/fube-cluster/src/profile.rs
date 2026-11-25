@@ -194,7 +194,7 @@ mod json_generation {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Peer {
     #[serde(with = "json_node")]
@@ -369,6 +369,78 @@ pub struct Metadata {
     #[serde(default)]
     pub peer_addresses: Vec<SocketAddr>,
     pub profile: Option<ActualProfile>,
+}
+
+/// Supervisor-observed physical fencing, never a graceful RA/Hosting receipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeDownReceipt {
+    pub deployment: String,
+    pub session: String,
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    pub node_pid: u32,
+    pub profile: Option<ActualProfile>,
+    pub node_group_drained: bool,
+    pub app_group_drained: bool,
+}
+
+impl NodeDownReceipt {
+    pub fn validate(
+        &self,
+        launch: &Launch,
+        pid: u32,
+        profile: Option<&ActualProfile>,
+    ) -> Result<()> {
+        if self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node != launch.node
+            || self.node_pid != pid
+            || pid == 0
+            || self.profile.as_ref() != profile
+            || !self.node_group_drained
+            || !self.app_group_drained
+        {
+            return Err("NodeDown does not fence the exact owned Node incarnation".into());
+        }
+        if let Some(profile) = &self.profile {
+            profile.validate(launch)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PeerUpdate {
+    pub deployment: String,
+    pub session: String,
+    pub previous: Peer,
+    pub replacement: Peer,
+    pub fencing: NodeDownReceipt,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PeerUpdateReceipt {
+    pub deployment: String,
+    pub session: String,
+    pub node_pid: u32,
+    #[serde(with = "json_node")]
+    pub previous: NodeInstance,
+    #[serde(with = "json_node")]
+    pub replacement: NodeInstance,
+    pub address: SocketAddr,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PeerDownReceipt {
+    pub deployment: String,
+    pub session: String,
+    pub node_pid: u32,
+    #[serde(with = "json_node")]
+    pub peer: NodeInstance,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
