@@ -25,31 +25,41 @@ pub(super) fn request<T>(
     high_priority: bool,
     generation: Option<&GenerationHeader>,
 ) -> Result<Request<T>> {
+    let mut request = Request::new(body);
+    *request.headers_mut() = headers(action, actor, high_priority, generation)?;
+    Ok(request)
+}
+
+pub(super) fn headers(
+    action: &str,
+    actor: i64,
+    high_priority: bool,
+    generation: Option<&GenerationHeader>,
+) -> Result<Headers> {
     #[derive(Serialize)]
     struct Priority {
         value: bool,
     }
-    let mut request = Request::new(body)
-        .append_header(header::actor(ActorId::new(actor).map_err(err)?).map_err(err)?)
-        .map_err(err)?
-        .append_header(header::action(action).map_err(err)?)
-        .map_err(err)?
-        .append_header(
-            HeaderRecord::native(
-                header::HIGH_PRIORITY,
-                &Priority {
-                    value: high_priority,
-                },
-            )
-            .map_err(err)?,
+    let mut headers = Headers::new();
+    for header in [
+        header::actor(ActorId::new(actor).map_err(err)?).map_err(err)?,
+        header::action(action).map_err(err)?,
+        HeaderRecord::native(
+            header::HIGH_PRIORITY,
+            &Priority {
+                value: high_priority,
+            },
         )
-        .map_err(err)?;
+        .map_err(err)?,
+    ] {
+        headers.append(header).map_err(err)?;
+    }
     if let Some(generation) = generation {
-        request = request
-            .append_header(generation.header().map_err(err)?)
+        headers
+            .append(generation.header().map_err(err)?)
             .map_err(err)?;
     }
-    Ok(request)
+    Ok(headers)
 }
 
 pub(super) async fn send<T: Serialize + Send>(

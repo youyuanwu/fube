@@ -873,23 +873,32 @@ native FM/RA run was executed. The earlier exact-source `154b4f1` native-data
 receipt does not qualify this changed RA/node code. TLS and broader routing stay
 unqualified.
 
-**Typed bootstrap follow-up:** NodeUp, LFUMUpload and GenerationProposal now use
-private RpcClient codecs over the original PeerRequestService. Method-specific
-reply envelopes, unique native headers and PToP/generation authority are checked
-before the bounded body decoder runs. NodeUpAck retains its shared header/body
-allocation budget; fragmented bodies alone require a contiguous copy. Existing
-RA request factories supply opaque prepared bytes without reserialization.
+**Typed bootstrap follow-up:** NodeUp, LFUMUpload and GenerationProposal use
+private RpcClient adapters over the original PeerRequestService. Actual request
+DTOs remain typed until bounded encoder execution; GenerationProposal uses an
+explicit unit encoder to preserve its genuinely bodyless wire profile.
+Method-specific reply envelopes, unique native headers and original-Link
+PToP/generation authority are admitted before decoding. The decoder reads the
+actual response headers directly, without OnceLock/shared metadata handoffs,
+and accounts for NodeUpAck headers and body under one allocation budget.
+Only fragmented bodies require a contiguous copy.
+
 Node/cluster/standalone callers consume typed acknowledgments instead of raw
-Messages and repeated full-schema decoding. LFUM still freezes its inventory
-and owns independent retries; optional request timeouts do not grant success or
-retire a healthy original session. Domain inboxes, response-slot ownership,
-semantic/store commit gates and physical cleanup are unchanged. This is consumer
-composition, not new generic furpc APIs or native FM/Federation qualification.
+Messages. LFUM requests own typed snapshots of the caller's frozen inventory;
+serialization errors are observed by request completion before any submission,
+not by snapshot construction. Independent retry ownership and generation
+advancement remain with the caller. Optional request timeouts do not grant success
+or retire a healthy original session. Domain inboxes, response-slot ownership,
+semantic/store commit gates and physical cleanup are unchanged. Native factories
+remain independent wire fixtures. This is consumer composition, not a new generic
+furpc API or native FM/Federation qualification.
 
 The matching bootstrap server adapters retain the original Request and invocation
 context inside each consuming response slot. After original-Link admission,
 server::unary decodes once, co-polls a typed handoff with the caller's borrowed
-domain handler, and encodes the prepared reply on that same invocation. No
+domain handler, and encodes its actual reply DTO on that same guarded invocation.
+Reply headers are sealed separately from body encoding. LFUMUploadReply uses the
+explicit unit encoder, with no serialized placeholder in its empty body. No
 per-message task or second inbox is introduced. Domain handlers keep Node/cluster
 mutation and semantic gates; completion remains encoded response-data handoff,
 not local-write completion. Expired/retired invocations cannot execute a late
