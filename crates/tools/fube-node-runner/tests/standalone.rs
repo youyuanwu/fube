@@ -51,6 +51,96 @@ impl Drop for PausedProcess {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ReportReplyOutcome {
+    Sent,
+    Retired,
+}
+
+async fn reply_to_report(
+    link: &Link,
+    message: Message,
+    stopping: bool,
+) -> Result<ReportReplyOutcome, String> {
+    match link.send(message).await {
+        Ok(()) => Ok(ReportReplyOutcome::Sent),
+        Err(error)
+            if stopping
+                && error == format!("{:?}", furpc::Error::Closed)
+                && matches!(
+                    link.terminal_error(),
+                    Some(wire::Failure::Native(furpc::Error::Closed))
+                ) =>
+        {
+            eprintln!("original Node report reply lost during owned teardown: {error}");
+            Ok(ReportReplyOutcome::Retired)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[tokio::test]
+async fn report_reply_retirement_requires_explicit_stop_and_actual_channel_closure() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node = wire::connect(
+        listener.local_addr().unwrap(),
+        wire::Role::Node,
+        wire::deadline(),
+    );
+    let (node, fm) = tokio::join!(node, async {
+        let (stream, _) = listener.accept().await.unwrap();
+        wire::accept(stream, wire::Role::Fm, wire::deadline()).await
+    });
+    let node_identity = NodeInstance {
+        id: [1; 16],
+        instance: 10,
+    };
+    let fm_identity = NodeInstance {
+        id: [2; 16],
+        instance: 20,
+    };
+    let generation = GenerationHeader {
+        number: GenerationNumber {
+            owner: fm_identity.id,
+            generation: 1,
+        },
+        for_fm_replica: false,
+    };
+    let node = Link::new(
+        node.unwrap(),
+        node_identity.clone(),
+        fm_identity.clone(),
+        generation.clone(),
+    )
+    .unwrap();
+    let fm = Link::new(fm.unwrap(), fm_identity, node_identity, generation.clone()).unwrap();
+    let reply = replica_up_reply_message(&ReplicaUp::default(), &generation).unwrap();
+    assert_eq!(
+        reply_to_report(&fm, reply.clone(), false).await.unwrap(),
+        ReportReplyOutcome::Sent
+    );
+    let received = node.receive(wire::deadline()).await.unwrap().unwrap();
+    assert_eq!(wire::action(&received.message).unwrap(), "ReplicaUpReply");
+    node.close().await.unwrap();
+    fm.closed(wire::deadline()).await.unwrap();
+    assert_eq!(
+        reply_to_report(&fm, reply.clone(), false)
+            .await
+            .unwrap_err(),
+        format!("{:?}", furpc::Error::Closed)
+    );
+    assert_eq!(
+        reply_to_report(&fm, reply.clone(), true).await.unwrap(),
+        ReportReplyOutcome::Retired
+    );
+    let invalid = fm.seal(reply).unwrap();
+    assert!(reply_to_report(&fm, invalid, true)
+        .await
+        .unwrap_err()
+        .contains("duplicate source header"));
+    fm.close().await.unwrap();
+}
+
 impl GroupHelper {
     fn join(pid: u64) -> Self {
         Self(
@@ -209,6 +299,9 @@ impl Fixture {
             fm.step().await;
         }
         assert_eq!(self.status(index)["stage"], "stopped");
+        if let Some(link) = fm.links[index].take() {
+            link.close().await.unwrap();
+        }
     }
 
     async fn await_control_loss(&mut self, fm: &mut FmFixture, index: usize) {
@@ -1014,9 +1107,17 @@ impl FmFixture {
                             self.losses.push(index);
                         }
                     }
-                    link.send(replica_up_reply_message(&body, &generation).unwrap())
-                        .await
-                        .unwrap();
+                    if reply_to_report(
+                        link,
+                        replica_up_reply_message(&body, &generation).unwrap(),
+                        self.stopping,
+                    )
+                    .await
+                    .unwrap()
+                        == ReportReplyOutcome::Retired
+                    {
+                        self.links[index].take().unwrap().close().await.unwrap();
+                    }
                 }
                 "ServiceTypeNotification" => {
                     let body = decode_service_type_notification(&incoming.message).unwrap();
