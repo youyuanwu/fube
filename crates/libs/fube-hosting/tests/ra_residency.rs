@@ -3,6 +3,7 @@
 //! H1 equal-version registration lookup is real. No native execution, live node,
 //! deployment, Hosting event router, RAP/physical teardown or native wire receipt
 //! serialization is qualified. Old ra_bridge.rs remains simulated usage evidence.
+use fube_core::protocol::NativeProxyFlags;
 use fube_core::protocol::NativeReplicaState;
 mod common;
 #[path = "support/residency_bridge.rs"]
@@ -294,7 +295,7 @@ async fn complete_open(executor: &ra::Executor, p: &mut Profile, issued: &Issued
             unit: before.body.unit.clone(),
             replica,
             error: 0,
-            flags: 0,
+            flags: NativeProxyFlags::NONE,
             detail: ra::ProxyErrorDetail::default(),
         })),
     )
@@ -400,7 +401,7 @@ async fn native_test_adaptation_add_down_with_processor_derived_reopen_and_local
             unit: current.body.unit.clone(),
             replica,
             error: ra::APPLICATION_HOST_CRASH,
-            flags: 0,
+            flags: NativeProxyFlags::NONE,
             detail: ra::ProxyErrorDetail::default(),
         })),
     )

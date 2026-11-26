@@ -4,6 +4,7 @@ use super::super::reporting_tests::{
 };
 use super::*;
 use crate::{ErrorKind, HealthInformation, HealthReportSendOption, LoadMetric, MoveCost};
+use fube_core::protocol::NativeProxyFlags;
 use fube_core::protocol::NativeReplicaRole;
 
 async fn opened(mode: u8, role: NativeReplicaRole) -> (Harness, Arc<StatefulCalls>, ProxyRequest) {
@@ -39,7 +40,7 @@ async fn stateful_reporting_native_current_role_selects_secondary_during_pending
     demote.local = local;
     demote.unit.current.configuration += 1 << 32;
     demote.unit.previous = open.unit.current.clone();
-    demote.flags = 2;
+    demote.flags = NativeProxyFlags::CATCH_UP;
     h.send("UpdateConfiguration", &demote).await;
     control_tests::wait_event(&calls, "waitAll", 1).await;
     let status = integration.status().unwrap();
@@ -152,7 +153,7 @@ async fn stateful_reporting_private_configuration_primary_secondary_idle_roles_a
                 demote.local = local;
                 demote.unit.current.configuration += 1 << 32;
                 demote.unit.previous = open.unit.current.clone();
-                demote.flags = 2;
+                demote.flags = NativeProxyFlags::CATCH_UP;
                 h.send("UpdateConfiguration", &demote).await;
                 let reply: ProxyReply =
                     from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();

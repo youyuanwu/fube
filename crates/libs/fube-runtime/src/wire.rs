@@ -1,6 +1,10 @@
 //! Private source-corresponding hosting records. Native source baseline:
 //! 3988b451, Hosting2 and ServiceModel FABRIC_FIELDS declarations.
-pub use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
+pub use fube_core::protocol::{
+    NativeApi, NativeApiDescription as ApiName, NativeApiName, NativeInterfaceName,
+    NativeProxyFlags, NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation,
+    NativeServiceOperation,
+};
 use fubst::serde::{ByteArray, Guid, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
 
@@ -271,13 +275,7 @@ pub struct ProxyRequest {
     pub local: Replica,
     pub remote: ObjectArray<Vec<Replica>>,
     pub service: Service,
-    pub flags: i64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiName {
-    pub api: i64,
-    pub interface: i64,
-    pub metadata: String,
+    pub flags: NativeProxyFlags,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyError {
@@ -291,7 +289,7 @@ pub struct ProxyReply {
     pub local: Replica,
     pub remote: ObjectArray<Vec<Replica>>,
     pub error: ProxyError,
-    pub flags: i64,
+    pub flags: NativeProxyFlags,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicaMessage {
@@ -315,9 +313,9 @@ pub struct ReplicaDetail {
     pub partition: Guid,
     pub replica_id: i64,
     pub instance_id: i64,
-    pub operation: i64,
+    pub operation: NativeServiceOperation,
     pub operation_start: i64,
-    pub replicator_operation: i64,
+    pub replicator_operation: NativeReplicatorOperation,
     pub loads: ObjectArray<Vec<ReportedLoad>>,
     pub read_status: i64,
     pub write_status: i64,

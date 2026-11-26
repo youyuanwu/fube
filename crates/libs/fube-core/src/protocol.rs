@@ -1,7 +1,27 @@
 //! Shared Service Fabric wire identifiers, not transport or subsystem policy.
 
+macro_rules! native_scalar {
+    ($name:ident, $code:ident, $from:ident) => {
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_i64(self.$code())
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                <i64 as serde::Deserialize>::deserialize(deserializer).map(Self::$from)
+            }
+        }
+    };
+}
+
 mod replica;
 pub use replica::{NativeReplicaRole, NativeReplicaState};
+mod rap;
+pub use rap::{
+    NativeApi, NativeApiDescription, NativeApiName, NativeInterfaceName, NativeProxyFlags,
+    NativeReplicatorOperation, NativeServiceOperation,
+};
 
 pub mod actor {
     //! Selected native `Transport::Actor` codes from

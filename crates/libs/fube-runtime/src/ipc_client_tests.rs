@@ -1,5 +1,8 @@
 use super::*;
 use crate::wire::{ErrorReply, IdRequest};
+use fube_core::protocol::NativeApiName;
+use fube_core::protocol::NativeInterfaceName;
+use fube_core::protocol::NativeProxyFlags;
 use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 use fubst::serde::{from_slice, to_vec, ByteArray, Guid, ObjectArray};
 use std::future::{ready, Ready};
@@ -396,12 +399,12 @@ fn proxy_reply() -> wire::ProxyReply {
             error: 0,
             message: String::new(),
             api: wire::ApiName {
-                api: 0,
-                interface: 0,
+                api: NativeApiName::Invalid,
+                interface: NativeInterfaceName::Invalid,
                 metadata: String::new(),
             },
         },
-        flags: 0,
+        flags: NativeProxyFlags::NONE,
     }
 }
 

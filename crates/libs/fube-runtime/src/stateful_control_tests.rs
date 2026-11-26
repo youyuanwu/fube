@@ -1,4 +1,7 @@
 use super::*;
+use fube_core::protocol::NativeApiName;
+use fube_core::protocol::NativeInterfaceName;
+use fube_core::protocol::NativeProxyFlags;
 use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 #[path = "stateful_binding_tests.rs"]
 mod binding_tests;
@@ -9,6 +12,104 @@ mod review_tests;
 use crate::ServicePartitionAccessStatus::{
     Granted as G, NotPrimary as N, ReconfigurationPending as T,
 };
+
+#[tokio::test]
+async fn native_proxy_flags_round_trip_without_widening_action_admission() {
+    #[derive(serde::Serialize)]
+    struct RawRequest<'a> {
+        runtime: &'a str,
+        unit: &'a FailoverUnit,
+        local: &'a Replica,
+        remote: &'a ObjectArray<Vec<Replica>>,
+        service: &'a Service,
+        flags: i64,
+    }
+    let h = Harness::new().await;
+    let calls = register(&h);
+    let open = request(&h, 2, 1, 20);
+    for action in [
+        RapAction::ReplicaOpen,
+        RapAction::ReplicaClose,
+        RapAction::UpdateService,
+        RapAction::UpdateConfiguration,
+        RapAction::BuildIdleReplica,
+        RapAction::RemoveIdleReplica,
+        RapAction::GetStatus,
+        RapAction::UpdateEpochAndGetStatus,
+        RapAction::CancelCatchupReplicaSet,
+        RapAction::EndpointUpdatedReply,
+    ] {
+        let request = match action {
+            RapAction::ReplicaOpen | RapAction::ReplicaClose | RapAction::UpdateService => {
+                open.clone()
+            }
+            _ => control(
+                &open,
+                action.action(),
+                if matches!(
+                    action,
+                    RapAction::UpdateConfiguration
+                        | RapAction::BuildIdleReplica
+                        | RapAction::RemoveIdleReplica
+                ) {
+                    vec![open.local.clone()]
+                } else {
+                    vec![]
+                },
+            ),
+        };
+        for flags in [16, 18, i64::MIN, i64::MIN | 4, -1] {
+            let bytes = to_vec(&RawRequest {
+                runtime: &request.runtime,
+                unit: &request.unit,
+                local: &request.local,
+                remote: &request.remote,
+                service: &request.service,
+                flags,
+            })
+            .unwrap();
+            let decoded: ProxyRequest = from_slice(&bytes).unwrap();
+            assert_eq!(decoded.flags.bits(), flags);
+            assert_eq!(to_vec(&decoded).unwrap(), bytes);
+            assert!(
+                matches!(
+                    h.engine.shared.stateful.dispatch(action, decoded).await,
+                    Err(Error::Protocol(_))
+                ),
+                "{}: flags {flags}",
+                action.action()
+            );
+        }
+    }
+    for (flags, admitted) in [
+        (NativeProxyFlags::NONE, true),
+        (NativeProxyFlags::END_RECONFIGURATION, true),
+        (NativeProxyFlags::CATCH_UP, true),
+        (
+            NativeProxyFlags::END_RECONFIGURATION | NativeProxyFlags::CATCH_UP,
+            true,
+        ),
+        (NativeProxyFlags::ABORT, false),
+        (NativeProxyFlags::DROP, false),
+    ] {
+        let mut request = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
+        request.flags = flags;
+        let result = h
+            .engine
+            .shared
+            .stateful
+            .dispatch(RapAction::UpdateConfiguration, request)
+            .await;
+        assert_eq!(result.is_ok(), admitted, "{flags:?}");
+    }
+    let mut query = open;
+    query.flags = NativeProxyFlags::from_bits_retain(i64::MIN);
+    assert!(matches!(
+        h.engine.shared.stateful.query_reply(&query),
+        Err(Error::Protocol(_))
+    ));
+    assert!(calls.events.lock().unwrap().is_empty());
+}
 
 #[tokio::test]
 async fn configuration_allows_only_fenced_old_node_and_fresh_replacement_across_pc_cc() {
@@ -65,7 +166,7 @@ async fn configuration_allows_only_fenced_old_node_and_fresh_replacement_across_
         }
         configuration.unit.previous = open.unit.current.clone();
         configuration.unit.current.configuration += 1;
-        configuration.flags = 2;
+        configuration.flags = NativeProxyFlags::CATCH_UP;
         h.send("UpdateConfiguration", &configuration).await;
         let reply: ProxyReply =
             from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
@@ -87,7 +188,7 @@ pub(super) fn control(request: &ProxyRequest, action: &str, remotes: Vec<Replica
         result.runtime.clear();
     }
     result.remote = ObjectArray(remotes);
-    result.flags = 0;
+    result.flags = NativeProxyFlags::NONE;
     result
 }
 pub(super) fn peer(local: &Replica, node: u8) -> Replica {
@@ -145,10 +246,13 @@ async fn default_metadata_configuration_projection_and_separate_access_quorums()
     );
     current.unit.current.configuration += 1;
     current.unit.previous = open.unit.current.clone();
-    current.flags = 2;
+    current.flags = NativeProxyFlags::CATCH_UP;
     h.send("UpdateConfiguration", &current).await;
     let reply: ProxyReply = from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
-    assert_eq!((reply.error.error, reply.flags), (0, 2));
+    assert_eq!(
+        (reply.error.error, reply.flags),
+        (0, NativeProxyFlags::CATCH_UP)
+    );
     let configurations = calls.configurations.lock().unwrap();
     let (cc, pc) = &configurations[0];
     assert_eq!(cc.write_quorum, 1); // Dropped clamps replicator configuration.
@@ -239,7 +343,7 @@ async fn demotion_orders_pre_revoke_all_epoch_all_role_and_progress() {
     demote.local = local;
     demote.unit.current.configuration += 1 << 32;
     demote.unit.previous = open.unit.current.clone();
-    demote.flags = 2;
+    demote.flags = NativeProxyFlags::CATCH_UP;
     h.send("UpdateConfiguration", &demote).await;
     let reply: ProxyReply = from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
     assert_eq!(reply.error.error, 0);
@@ -287,7 +391,10 @@ async fn demotion_orders_pre_revoke_all_epoch_all_role_and_progress() {
     let reply: ProxyReply =
         from_slice(&h.receive("CancelCatchupReplicaSetReply").await.body).unwrap();
     assert_eq!(reply.error.error, 0x80071d24u32 as i32 as i64);
-    assert_eq!((reply.error.api.api, reply.error.api.interface), (0, 0));
+    assert_eq!(
+        (reply.error.api.api, reply.error.api.interface),
+        (NativeApiName::Invalid, NativeInterfaceName::Invalid)
+    );
 }
 
 #[tokio::test]
@@ -307,7 +414,7 @@ async fn demotion_retries_during_catchup_do_not_acknowledge_an_unapplied_role() 
     demote.local = local;
     demote.unit.current.configuration += 1 << 32;
     demote.unit.previous = open.unit.current.clone();
-    demote.flags = 2;
+    demote.flags = NativeProxyFlags::CATCH_UP;
     h.send("UpdateConfiguration", &demote).await;
     wait_event(&calls, "waitAll", 1).await;
     h.send("UpdateConfiguration", &demote).await;
@@ -324,7 +431,10 @@ async fn demotion_retries_during_catchup_do_not_acknowledge_an_unapplied_role() 
         first.is_err() && second.is_err(),
         "demotion was acknowledged during catch-up"
     );
-    assert_eq!((reply.error.error, reply.flags), (0, 2));
+    assert_eq!(
+        (reply.error.error, reply.flags),
+        (0, NativeProxyFlags::CATCH_UP)
+    );
     let events = calls.events.lock().unwrap();
     assert!(events.contains(&"replicatorSecondary") && events.contains(&"serviceSecondary"));
 }
@@ -338,7 +448,7 @@ async fn configuration_can_overlap_catchup_but_cancel_drains_before_ack_and_new_
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
-    update.flags = 2;
+    update.flags = NativeProxyFlags::CATCH_UP;
     update.unit.current.configuration += 1;
     update.unit.previous = open.unit.current.clone();
     h.send("UpdateConfiguration", &update).await;
@@ -346,7 +456,10 @@ async fn configuration_can_overlap_catchup_but_cancel_drains_before_ack_and_new_
     h.send("UpdateConfiguration", &update).await;
     let overlapping: ProxyReply =
         from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
-    assert_eq!((overlapping.error.error, overlapping.flags), (0, 0));
+    assert_eq!(
+        (overlapping.error.error, overlapping.flags),
+        (0, NativeProxyFlags::NONE)
+    );
     assert_eq!(
         calls
             .events
@@ -375,7 +488,10 @@ async fn configuration_can_overlap_catchup_but_cancel_drains_before_ack_and_new_
     calls.catch_up_release.notify_one();
     let resumed: ProxyReply =
         from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
-    assert_eq!((resumed.error.error, resumed.flags), (0, 2));
+    assert_eq!(
+        (resumed.error.error, resumed.flags),
+        (0, NativeProxyFlags::CATCH_UP)
+    );
 }
 
 #[tokio::test]
@@ -395,6 +511,14 @@ async fn concurrent_builds_remove_cancel_and_tombstones_preserve_remote_incarnat
     h.send("ReplicatorBuildIdleReplica", &build_a).await;
     h.send("ReplicatorBuildIdleReplica", &build_b).await;
     wait_event(&calls, "build", 2).await;
+    let query = control(&open, "RAPQuery", vec![]);
+    h.send("RAPQuery", &query).await;
+    let active: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    assert_eq!(active.detail.operation, NativeServiceOperation::None);
+    assert_eq!(
+        active.detail.replicator_operation,
+        NativeReplicatorOperation::BUILD
+    );
     let remove = control(&open, "ReplicatorRemoveIdleReplica", vec![a]);
     h.send("ReplicatorRemoveIdleReplica", &remove).await;
     h.engine
@@ -696,7 +820,7 @@ async fn endpoint_retry_is_superseded_only_after_preparation_and_owner_admission
         promote.remote.0[0].current_role = NativeReplicaRole::Primary;
         promote.unit.current.configuration += 1 << 32;
         promote.unit.previous = open.unit.current.clone();
-        promote.flags = 2;
+        promote.flags = NativeProxyFlags::CATCH_UP;
         h.send("UpdateConfiguration", &promote).await;
         let original = receive_endpoint_notification(&mut h).await;
         h.engine.shared.stateful.wait_idle([2; 16]).await;
@@ -792,7 +916,7 @@ async fn failed_endpoint_admission_without_a_previous_retry_does_not_install_a_p
         promote.remote.0[0].current_role = NativeReplicaRole::Primary;
         promote.unit.current.configuration += 1 << 32;
         promote.unit.previous = open.unit.current.clone();
-        promote.flags = 2;
+        promote.flags = NativeProxyFlags::CATCH_UP;
         h.send("UpdateConfiguration", &promote).await;
         let reply: ProxyReply =
             from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
@@ -861,7 +985,7 @@ async fn promotion_endpoint_scenario(application: Option<tokio::runtime::Handle>
     promote.remote.0[0].current_role = NativeReplicaRole::Primary;
     promote.unit.current.configuration += 1 << 32;
     promote.unit.previous = secondary.unit.current.clone();
-    promote.flags = 2;
+    promote.flags = NativeProxyFlags::CATCH_UP;
     h.send("UpdateConfiguration", &promote).await;
     let notification = receive_endpoint_notification(&mut h).await;
     let body: ReplicaMessage = from_slice(&notification.body).unwrap();
@@ -916,7 +1040,10 @@ async fn promotion_endpoint_scenario(application: Option<tokio::runtime::Handle>
     h.send("UpdateConfiguration", &promote).await;
     let duplicate: ProxyReply =
         from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
-    assert_eq!((duplicate.error.error, duplicate.flags), (0, 2));
+    assert_eq!(
+        (duplicate.error.error, duplicate.flags),
+        (0, NativeProxyFlags::CATCH_UP)
+    );
     assert_eq!(
         calls
             .events
@@ -932,7 +1059,7 @@ async fn promotion_endpoint_scenario(application: Option<tokio::runtime::Handle>
         (G, T)
     );
     let mut end = promote;
-    end.flags = 1;
+    end.flags = NativeProxyFlags::END_RECONFIGURATION;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     h.send("UpdateConfiguration", &end).await;
     h.receive("UpdateConfigurationReply").await;
@@ -963,13 +1090,16 @@ async fn data_loss_state_change_is_a_control_outcome_not_a_failed_open_cleanup()
     h.send("ReplicaOpen", &open).await;
     let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(reply.error.error, 0x80071d28u32 as i32 as i64);
-    assert_eq!((reply.error.api.api, reply.error.api.interface), (0, 0));
+    assert_eq!(
+        (reply.error.api.api, reply.error.api.interface),
+        (NativeApiName::Invalid, NativeInterfaceName::Invalid)
+    );
     assert_eq!((reply.local.first_lsn, reply.local.last_lsn), (0, 0));
     assert!(calls.partitions.lock().unwrap()[0].validate().is_ok());
     assert!(!calls.events.lock().unwrap().contains(&"serviceAbort"));
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
-    update.flags = 2;
+    update.flags = NativeProxyFlags::CATCH_UP;
     update.unit.current.configuration += 1;
     h.send("UpdateConfiguration", &update).await;
     let reported: ProxyReply =
@@ -1012,12 +1142,15 @@ async fn native_last_open_retry_abort_flag_does_not_reopen_disposed_tombstone() 
     let mut h = Harness::new().await;
     let calls = register(&h);
     let mut open = request(&h, 2, 1, 1);
-    open.flags = 4;
+    open.flags = NativeProxyFlags::ABORT;
     h.send("ReplicaOpen", &open).await;
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
-    assert_eq!((failed.error.error, failed.flags), (-456, 4));
+    assert_eq!(
+        (failed.error.error, failed.flags),
+        (-456, NativeProxyFlags::ABORT)
+    );
     h.engine.shared.stateful.wait_idle([2; 16]).await;
-    open.flags = 0;
+    open.flags = NativeProxyFlags::NONE;
     open.service.initialization.0 = vec![20];
     h.send("ReplicaOpen", &open).await;
     let closed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
@@ -1037,7 +1170,10 @@ async fn progress_error_is_not_initialized_success_and_uses_replicator_api_metad
     h.send("ReplicatorGetStatus", &status).await;
     let reply: ProxyReply = from_slice(&h.receive("ReplicatorGetStatusReply").await.body).unwrap();
     assert_eq!(reply.error.error, -999);
-    assert_eq!((reply.error.api.api, reply.error.api.interface), (12, 4));
+    assert_eq!(
+        (reply.error.api.api, reply.error.api.interface),
+        (NativeApiName::GetStatus, NativeInterfaceName::Replicator)
+    );
     assert_eq!((reply.local.first_lsn, reply.local.last_lsn), (-1, -1));
 }
 
@@ -1058,7 +1194,10 @@ async fn data_loss_callback_failure_reports_transient_fault_before_failed_open_c
     );
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(failed.error.error, -995);
-    assert_eq!((failed.error.api.api, failed.error.api.interface), (7, 4));
+    assert_eq!(
+        (failed.error.api.api, failed.error.api.interface),
+        (NativeApiName::OnDataLoss, NativeInterfaceName::Replicator)
+    );
     assert!(calls.partitions.lock().unwrap()[0].validate().is_err());
     assert!(calls.events.lock().unwrap().contains(&"replicatorAbort"));
     assert!(calls.events.lock().unwrap().contains(&"serviceAbort"));

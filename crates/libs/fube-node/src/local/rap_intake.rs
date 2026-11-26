@@ -1,4 +1,5 @@
 use super::{decode, ipc, ra, rap, rap_client::RapClient, Error, Result, Work};
+use fube_ra::protocol::NativeProxyFlags;
 use fube_ra::protocol::{AddInstance, FailoverUnit, Replica, ReportLoad, Service};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -72,12 +73,26 @@ impl Incoming {
                 };
                 let body: rap::Reply = decode(bytes)?;
                 let valid = match kind {
-                    Kind::Built | Kind::Removed => body.remote.0.len() == 1 && body.flags == 0,
+                    Kind::Built | Kind::Removed => {
+                        body.remote.0.len() == 1 && body.flags.is_empty()
+                    }
                     Kind::Configuration => {
                         (2..=ra::MAX_CONFIGURATION_REPLICAS).contains(&body.remote.0.len())
-                            && body.flags & !3 == 0
+                            && body
+                                .flags
+                                .difference(
+                                    NativeProxyFlags::END_RECONFIGURATION
+                                        | NativeProxyFlags::CATCH_UP,
+                                )
+                                .is_empty()
                     }
-                    _ => body.remote.0.is_empty() && body.flags & !12 == 0,
+                    _ => {
+                        body.remote.0.is_empty()
+                            && body
+                                .flags
+                                .difference(NativeProxyFlags::ABORT | NativeProxyFlags::DROP)
+                                .is_empty()
+                    }
                 };
                 if !valid {
                     return Err(Error::Protocol);
@@ -168,7 +183,7 @@ mod tests {
                 message: "native error".into(),
                 api: Default::default(),
             },
-            flags,
+            flags: NativeProxyFlags::from_bits_retain(flags),
         }
     }
 
@@ -190,14 +205,14 @@ mod tests {
             match (action, proxy.into_work().unwrap()) {
                 ("ReplicaOpenReply", Work::Open(event)) => {
                     assert_eq!(event.error, -1);
-                    assert_eq!(event.flags, flags);
+                    assert_eq!(event.flags.bits(), flags);
                     assert_eq!(event.detail.message, "native error");
                 }
                 ("ReplicaCloseReply", Work::Closed(event)) => assert_eq!(event.error, -1),
                 ("ReplicatorUpdateEpochAndGetStatusReply", Work::ReplicaStatus(event))
                 | ("UpdateConfigurationReply", Work::Configured(event)) => {
                     assert_eq!(event.error, -1);
-                    assert_eq!(event.flags, flags);
+                    assert_eq!(event.flags.bits(), flags);
                     assert_eq!(event.replicas.0.len(), remotes);
                 }
                 ("ReplicatorBuildIdleReplicaReply", Work::Built(event))
@@ -222,6 +237,11 @@ mod tests {
             ("ReplicatorBuildIdleReplicaReply", 0, 0),
             ("ReplicatorBuildIdleReplicaReply", 1, 4),
             ("ReplicatorRemoveIdleReplicaReply", 2, 0),
+            ("ReplicaOpenReply", 0, 16),
+            ("ReplicaCloseReply", 0, i64::MIN | 4),
+            ("UpdateConfigurationReply", 2, 18),
+            ("UpdateConfigurationReply", 2, -1),
+            ("ReplicatorBuildIdleReplicaReply", 1, i64::MIN),
         ] {
             assert!(
                 matches!(

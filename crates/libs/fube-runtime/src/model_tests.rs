@@ -1,5 +1,6 @@
 //! Isolated loopback MODEL peers only; never native interoperability evidence.
 use super::*;
+use fube_core::protocol::NativeProxyFlags;
 use fube_rap_test_support::transport::{message, ModelPeer};
 use fubst::serde::{ObjectArray, Pointer};
 use furpc::MessageId;
@@ -564,7 +565,11 @@ async fn scenario(mode: &str, expected: i32) {
                         "Open acknowledged before final destructor completed"
                     );
                     let mut close = stateful_request.clone().unwrap();
-                    close.flags = if mode_owned.contains("abort") { 4 } else { 0 };
+                    close.flags = if mode_owned.contains("abort") {
+                        NativeProxyFlags::ABORT
+                    } else {
+                        NativeProxyFlags::NONE
+                    };
                     // Semantic Open reply can precede release of its dispatch
                     // gate. Native retries incompatible Close rather than
                     // assuming this first one-way attempt was admitted.

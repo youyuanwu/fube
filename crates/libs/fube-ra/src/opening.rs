@@ -17,7 +17,7 @@ pub const HOSTING_NOT_FOUND: i64 = hr(0x80071cf0);
 pub const HOSTING_SERVICE_TYPE_DISABLED: i64 = hr(0x80071d33);
 pub const APPLICATION_INSTANCE_DELETED: i64 = hr(0x80071cca);
 pub const PROXY_STATE_CHANGED_ON_DATA_LOSS: i64 = hr(0x80071d28);
-pub const ABORT: i64 = 4;
+pub const ABORT: NativeProxyFlags = NativeProxyFlags::ABORT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
@@ -66,11 +66,11 @@ impl RetryPolicy {
     pub fn clear(self, count: u64) -> bool {
         i128::from(count) >= i128::from(self.warning) || i128::from(count) >= i128::from(self.error)
     }
-    pub fn flags(self, count: u64) -> i64 {
+    pub fn flags(self, count: u64) -> NativeProxyFlags {
         if i128::from(count) == i128::from(self.drop) - 1 {
             ABORT
         } else {
-            0
+            NativeProxyFlags::NONE
         }
     }
 }
@@ -81,12 +81,7 @@ pub enum Action {
 }
 
 /// Trusted ProxyErrorCode detail, not a newly enabled proxy wire codec.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApiNameDescription {
-    pub api: i64,
-    pub interface: i64,
-    pub metadata: String,
-}
+pub use fube_core::protocol::NativeApiDescription as ApiNameDescription;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyErrorDetail {
     pub message: String,

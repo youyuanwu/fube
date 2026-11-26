@@ -9,6 +9,7 @@ furpc.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 serde.workspace = true
+bitflags.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

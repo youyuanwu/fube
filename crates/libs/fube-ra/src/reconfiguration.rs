@@ -1,5 +1,6 @@
 use super::*;
 use crate::protocol::{NativeReplicaRole, NativeReplicaState};
+use fube_core::protocol::NativeProxyFlags;
 use fubst::serde::ObjectArray;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +29,7 @@ pub struct ConfigurationCompletion {
     pub unit: FailoverUnit,
     pub local: Replica,
     pub replicas: ObjectArray<Vec<Replica>>,
-    pub flags: i64,
+    pub flags: NativeProxyFlags,
     pub error: i64,
 }
 
@@ -492,7 +493,7 @@ fn apply_body(state: &mut EntityState, body: &Configuration, node: &NodeInstance
     state.intermediate_configuration = None;
     Ok(())
 }
-fn configuration_effect(state: &EntityState, flags: i64) -> Effect {
+fn configuration_effect(state: &EntityState, flags: NativeProxyFlags) -> Effect {
     Effect::UpdateConfiguration {
         body: Box::new(
             state
@@ -569,9 +570,11 @@ pub(super) fn deactivate_reply(state: &EntityState) -> Effect {
 fn pending_effects(state: &EntityState) -> Vec<Effect> {
     let config = state.reconfiguration.as_ref().expect("owned configuration");
     let effect = match config.stage {
-        ConfigurationStage::Catchup => configuration_effect(state, 2),
-        ConfigurationStage::End => configuration_effect(state, 1),
-        ConfigurationStage::Secondary => configuration_effect(state, 0),
+        ConfigurationStage::Catchup => configuration_effect(state, NativeProxyFlags::CATCH_UP),
+        ConfigurationStage::End => {
+            configuration_effect(state, NativeProxyFlags::END_RECONFIGURATION)
+        }
+        ConfigurationStage::Secondary => configuration_effect(state, NativeProxyFlags::NONE),
         ConfigurationStage::Retiring => {
             if state.phase == Phase::Closed {
                 deactivate_reply(state)
@@ -1342,9 +1345,9 @@ pub(super) fn transition(
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             };
             let flags = match config.stage {
-                ConfigurationStage::Catchup => 2,
-                ConfigurationStage::End => 1,
-                ConfigurationStage::Secondary => 0,
+                ConfigurationStage::Catchup => NativeProxyFlags::CATCH_UP,
+                ConfigurationStage::End => NativeProxyFlags::END_RECONFIGURATION,
+                ConfigurationStage::Secondary => NativeProxyFlags::NONE,
                 _ => return Ok(Transition::ignored(Disposition::IgnoredStale)),
             };
             let mut local = body.local.clone();

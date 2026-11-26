@@ -1,6 +1,5 @@
 //! Reliability scalar codes, distinct from public SDK role numbers.
 //! Native scalar enums serialize as LONG64; unknown codes remain wire data.
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum NativeReplicaRole {
@@ -114,22 +113,8 @@ impl From<i64> for NativeReplicaState {
     }
 }
 
-macro_rules! scalar {
-    ($name:ident) => {
-        impl Serialize for $name {
-            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                serializer.serialize_i64(self.code())
-            }
-        }
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                i64::deserialize(deserializer).map(Self::from)
-            }
-        }
-    };
-}
-scalar!(NativeReplicaRole);
-scalar!(NativeReplicaState);
+native_scalar!(NativeReplicaRole, code, from);
+native_scalar!(NativeReplicaState, code, from);
 
 #[cfg(test)]
 mod tests {

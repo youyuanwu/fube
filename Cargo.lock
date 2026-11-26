@@ -363,6 +363,7 @@ dependencies = [
 name = "fube-core"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "fubst",
  "furpc",
  "serde",

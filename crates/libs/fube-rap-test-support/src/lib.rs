@@ -2,7 +2,9 @@
 //! traverse real Runtime IPC/issuer/binder paths; this is NOT deployed SF proof.
 //! Shared support depends only on public framework/runtime/transport contracts;
 //! it exposes no data engine, diagnostics, lifecycle hook or control setter.
-use fube_runtime::extensions::{NativeReplicaRole, NativeReplicaState};
+use fube_runtime::extensions::{
+    NativeApiDescription as ApiName, NativeProxyFlags, NativeReplicaRole, NativeReplicaState,
+};
 use fube_runtime::{
     extensions::{
         attach_runtime, NativeIntegrationProvider, NativeReplicaDescriptor,
@@ -173,18 +175,13 @@ record!(Service {
     update_version: u64, placement: ObjectArray<Vec<Placement>>, standby_keep: i64,
     activation_mode: i64, dns: String, scaling: EmptyObjectArray,
 });
-record!(ProxyRequest { runtime: String, unit: FailoverUnit, local: Replica, remote: ObjectArray<Vec<Replica>>, service: Service, flags: i64 });
-record!(ApiName {
-    api: i64,
-    interface: i64,
-    metadata: String
-});
+record!(ProxyRequest { runtime: String, unit: FailoverUnit, local: Replica, remote: ObjectArray<Vec<Replica>>, service: Service, flags: NativeProxyFlags });
 record!(ProxyError {
     error: i64,
     message: String,
     api: ApiName
 });
-record!(ProxyReply { unit: FailoverUnit, local: Replica, remote: ObjectArray<Vec<Replica>>, error: ProxyError, flags: i64 });
+record!(ProxyReply { unit: FailoverUnit, local: Replica, remote: ObjectArray<Vec<Replica>>, error: ProxyError, flags: NativeProxyFlags });
 record!(ReplicaMessage {
     unit: FailoverUnit,
     local: Replica,
@@ -607,7 +604,7 @@ fn base(
             dns: String::new(),
             scaling: EmptyObjectArray,
         },
-        flags: 0,
+        flags: NativeProxyFlags::NONE,
     }
 }
 fn control(base: &ProxyRequest) -> ProxyRequest {
@@ -618,7 +615,7 @@ fn control(base: &ProxyRequest) -> ProxyRequest {
     request.service.application.clear();
     request.service.service_type.name.clear();
     request.service.stateful = false;
-    request.flags = 0;
+    request.flags = NativeProxyFlags::NONE;
     request
 }
 async fn send(stream: &ModelPeer, action: &str, request: &ProxyRequest) -> Result<()> {
@@ -749,12 +746,12 @@ async fn serve(
                 let action = match command.action {
                     Action::Open => {
                         // Model startup is one final native Open attempt, even if its frame is retried.
-                        request.flags = 4;
+                        request.flags = NativeProxyFlags::ABORT;
                         "ReplicaOpen"
                     },
                     Action::Close => "ReplicaClose",
                     Action::Configure(configuration) => {
-                        request.flags = 1; // native end-reconfiguration/current configuration
+                        request.flags = NativeProxyFlags::END_RECONFIGURATION; // native end-reconfiguration/current configuration
                         request.unit.previous = Epoch { data_loss: 0, configuration: 0 };
                         request.unit.current = Epoch { data_loss: configuration.epoch.data_loss_number, configuration: configuration.epoch.configuration_number };
                         let mut me = request.local.clone(); me.state = NativeReplicaState::Ready;
@@ -765,7 +762,7 @@ async fn serve(
                         "UpdateConfiguration"
                     },
                     Action::CatchUp(current, previous) => {
-                        request.flags = 2;
+                        request.flags = NativeProxyFlags::CATCH_UP;
                         request.unit.current = Epoch { data_loss: current.epoch.data_loss_number, configuration: current.epoch.configuration_number };
                         request.unit.previous = if previous.epoch == fube_runtime::Epoch::INVALID { Epoch { data_loss: 0, configuration: 0 } } else { Epoch { data_loss: previous.epoch.data_loss_number, configuration: previous.epoch.configuration_number } };
                         let mut me = request.local.clone();
@@ -804,7 +801,7 @@ async fn serve(
                     Action::Epoch(epoch) => {
                         request.unit.current = Epoch { data_loss: epoch.data_loss_number, configuration: epoch.configuration_number };
                         if request.local.current_role == NativeReplicaRole::Primary {
-                            request.flags = 2;
+                            request.flags = NativeProxyFlags::CATCH_UP;
                             request.remote.0.push(request.local.clone());
                             "UpdateConfiguration"
                         } else {

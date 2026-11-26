@@ -800,6 +800,20 @@ wire values. Admission still rejects unsupported values. These native roles are
 not the public SDK `ReplicaRole`; conversion is explicit and checked, and the
 valid native `Unknown=0` is distinct from an unrecognized numeric code.
 
+RAP flags, query operations and API metadata use shared
+[`fube-core::protocol` types](../../crates/libs/fube-core/src/protocol/rap.rs).
+`NativeProxyFlags` and `NativeReplicatorOperation` are lossless bitmasks;
+`NativeServiceOperation` is single-choice, as in native
+`ServiceOperationManager::GetQueryInformation`. Replicator `NONE=1` is an idle
+marker, distinct from `INVALID=0`, and is removed when reporting active builds.
+`NativeApiName` and `NativeInterfaceName` are separate lossless scalar enums;
+`NativeApi` replaces internal numeric pairs and `NativeApiDescription` preserves
+the native API/interface/opaque-metadata field order. All retain numeric JSON and
+signed LONG64 encoding. Request/reply admission still uses each action's original
+allowed mask; `difference(allowed).is_empty()` checks unknown bits without
+silently truncating them. This typing does not expand supported RAP actions,
+recovery profiles or native interoperability claims.
+
 This scalar rule does not override `ArrayUtility`: a vector of a type marked
 `DEFINE_AS_BLITTABLE` without a specific array utility is serialized as raw
 byte array, `count * sizeof(T)` ([serialization:134–164,4997–5001][serialization]).

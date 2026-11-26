@@ -1,5 +1,8 @@
 use super::*;
+use fube_core::protocol::NativeProxyFlags;
 use fube_core::protocol::NativeReplicaRole;
+use fube_core::protocol::NativeReplicatorOperation;
+use fube_core::protocol::NativeServiceOperation;
 
 #[tokio::test]
 async fn cancel_before_catchup_install_survives_blocked_configuration_callback() {
@@ -10,7 +13,7 @@ async fn cancel_before_catchup_install_survives_blocked_configuration_callback()
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
-    update.flags = 2;
+    update.flags = NativeProxyFlags::CATCH_UP;
     update.unit.current.configuration += 1;
     h.send("UpdateConfiguration", &update).await;
     wait_event(&calls, "catchupConfiguration", 1).await;
@@ -47,7 +50,7 @@ async fn newer_configuration_while_waiting_does_not_authenticate_old_catchup_com
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
-    update.flags = 2;
+    update.flags = NativeProxyFlags::CATCH_UP;
     update.unit.current.configuration += 1;
     h.send("UpdateConfiguration", &update).await;
     wait_event(&calls, "waitQuorum", 1).await;
@@ -55,7 +58,10 @@ async fn newer_configuration_while_waiting_does_not_authenticate_old_catchup_com
     h.send("UpdateConfiguration", &update).await;
     let overlap: ProxyReply =
         from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
-    assert_eq!((overlap.error.error, overlap.flags), (0, 0));
+    assert_eq!(
+        (overlap.error.error, overlap.flags),
+        (0, NativeProxyFlags::NONE)
+    );
     calls.catch_up_release.notify_one();
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     h.no_reply().await;
@@ -71,7 +77,10 @@ async fn newer_configuration_while_waiting_does_not_authenticate_old_catchup_com
     calls.catch_up_release.notify_one();
     let current: ProxyReply =
         from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
-    assert_eq!((current.error.error, current.flags), (0, 2));
+    assert_eq!(
+        (current.error.error, current.flags),
+        (0, NativeProxyFlags::CATCH_UP)
+    );
 }
 
 #[tokio::test]
@@ -138,7 +147,7 @@ async fn abort_cancels_and_drains_build_before_per_replica_disposal_ack() {
     h.send("ReplicatorBuildIdleReplica", &build).await;
     wait_event(&calls, "build", 1).await;
     let mut close = open.clone();
-    close.flags = 4;
+    close.flags = NativeProxyFlags::ABORT;
     close.local.current_role = NativeReplicaRole::None;
     h.send("ReplicaClose", &close).await;
     h.engine
@@ -177,7 +186,7 @@ async fn query_observes_blocked_role_callback_without_protocol_locks_or_access_g
     promote.remote.0[0].current_role = NativeReplicaRole::Primary;
     promote.unit.current.configuration += 1 << 32;
     promote.unit.previous = open.unit.current.clone();
-    promote.flags = 2;
+    promote.flags = NativeProxyFlags::CATCH_UP;
     h.send("UpdateConfiguration", &promote).await;
     wait_event(&calls, "servicePrimary", 1).await;
     let mut query = control(&promote, "RAPQuery", vec![]);
@@ -190,7 +199,11 @@ async fn query_observes_blocked_role_callback_without_protocol_locks_or_access_g
             active.detail.operation,
             active.detail.replicator_operation
         ),
-        (0, 4, 1)
+        (
+            0,
+            NativeServiceOperation::ChangeRole,
+            NativeReplicatorOperation::NONE
+        )
     );
     assert_eq!(
         (active.detail.read_status, active.detail.write_status),
@@ -240,7 +253,11 @@ async fn query_observes_service_close_after_replicator_close_without_locking_cal
             closing.detail.operation,
             closing.detail.replicator_operation
         ),
-        (0, 8, 1)
+        (
+            0,
+            NativeServiceOperation::Close,
+            NativeReplicatorOperation::NONE
+        )
     );
     assert_eq!(
         (closing.detail.read_status, closing.detail.write_status),
@@ -259,7 +276,7 @@ async fn cancellation_is_not_acknowledged_until_an_uncooperative_future_actually
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
-    update.flags = 2;
+    update.flags = NativeProxyFlags::CATCH_UP;
     update.unit.current.configuration += 1;
     h.send("UpdateConfiguration", &update).await;
     wait_event(&calls, "waitQuorum", 1).await;

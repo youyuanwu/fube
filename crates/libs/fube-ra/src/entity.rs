@@ -6,6 +6,7 @@
 //! EntityJobItem; see the catalog's selected stateless decision/test tables.
 use crate::protocol::*;
 use crate::protocol::{NativeReplicaRole, NativeReplicaState};
+use fube_core::protocol::NativeProxyFlags;
 use fube_ra_store::{self as store, KeyValueStore, Output, Record, RecordId, Request};
 use fubst::serde::{from_slice, to_vec};
 use serde::{Deserialize, Serialize};
@@ -283,7 +284,7 @@ pub struct OpenCompletion {
     pub unit: FailoverUnit,
     pub replica: Replica,
     pub error: i64,
-    pub flags: i64,
+    pub flags: NativeProxyFlags,
     pub detail: ProxyErrorDetail,
 }
 pub enum Command {
@@ -739,7 +740,7 @@ pub enum Effect {
     UpdateConfiguration {
         body: Box<Configuration>,
         local: Box<Replica>,
-        flags: i64,
+        flags: NativeProxyFlags,
         registration: RuntimeRegistration,
     },
     AddReplicaReply(AddReplicaReply),
@@ -808,13 +809,13 @@ pub enum Effect {
         token: u64,
         body: Arc<AddInstance>,
         registration: RuntimeRegistration,
-        flags: i64,
+        flags: NativeProxyFlags,
     },
     Close {
         token: u64,
         body: Arc<AddInstance>,
         registration: RuntimeRegistration,
-        flags: i64,
+        flags: NativeProxyFlags,
     },
     /// Owned original-session RAP obligation, independent of the node/FM reply.
     /// The captured body remains sendable even if a subsequent Close clears pending.

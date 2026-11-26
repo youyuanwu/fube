@@ -1,5 +1,7 @@
 use crate::{api::*, lease::Authority, wire::*, ActivationContext, RuntimeMetrics};
 use crate::{Error, Result};
+use fube_core::protocol::NativeProxyFlags;
+use fube_core::protocol::NativeReplicatorOperation;
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 pub(crate) mod tests;
@@ -47,7 +49,7 @@ struct Snapshot {
     cancel: Cancellation,
     generation: u64,
     operation_start: i64,
-    operation_kind: i64,
+    operation_kind: NativeServiceOperation,
     live: Option<OwnedSemaphorePermit>,
     reporting: Option<Arc<crate::reporting::Reporting>>,
 }
@@ -429,7 +431,7 @@ fn validate(shared: &Shared, request: &ProxyRequest) -> Result<()> {
         || request.service.service_type.package != shared.activation.runtime.code.id.package.package
         || request.service.application != shared.activation.application_name
         || request.local.node.id.0.len() != 16
-        || request.flags & !15 != 0
+        || !request.flags.difference(NativeProxyFlags::all()).is_empty()
     {
         return Err(Error::Protocol(
             "unsupported/mismatched stateless command context",
@@ -483,7 +485,7 @@ fn unit(shared: &Shared, request: &ProxyRequest, create: bool) -> Result<Option<
             cancel: Cancellation::default(),
             generation: 0,
             operation_start: 0,
-            operation_kind: 0,
+            operation_kind: NativeServiceOperation::Invalid,
             live: None,
             reporting: None,
         }),
@@ -569,7 +571,7 @@ fn query_request(shared: &Shared, incoming: Request<ProxyRequest>) -> Result<Rep
         // Native queries intentionally carry the DEFAULT ServiceDescription.
         if request.runtime != shared.activation.runtime.id
             || request.local.node.id.0.len() != 16
-            || request.flags != 0
+            || !request.flags.is_empty()
         {
             return Err(Error::Protocol("invalid native RAPQuery context"));
         }
@@ -623,7 +625,7 @@ async fn dispatch(shared: Arc<Shared>, kind: RapAction, request: ProxyRequest) -
     }
     if kind == RapAction::ReplicaClose {
         shared.metrics.closes.fetch_add(1, Ordering::Relaxed);
-        if request.flags & 4 != 0 {
+        if request.flags.contains(NativeProxyFlags::ABORT) {
             shared.metrics.aborts.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -645,7 +647,11 @@ async fn dispatch(shared: Arc<Shared>, kind: RapAction, request: ProxyRequest) -
         Err(_) => {
             // Native RA retries incompatible work. Abort/drop cancels opening;
             // never invoke a second callback while the first still owns the unit.
-            if kind == RapAction::ReplicaClose && request.flags & 12 != 0 {
+            if kind == RapAction::ReplicaClose
+                && request
+                    .flags
+                    .intersects(NativeProxyFlags::ABORT | NativeProxyFlags::DROP)
+            {
                 let state = unit.state.lock().unwrap();
                 state.valid.store(false, Ordering::Release);
                 state.cancel.cancel();
@@ -682,7 +688,7 @@ async fn reply(
     request: ProxyRequest,
     endpoint: String,
     error: Option<Error>,
-    api: i64,
+    api: NativeApiName,
 ) -> Result<()> {
     // All successful endpoint publication, including cached duplicate Open,
     // crosses the same terminal-authority guard at the reply boundary.
@@ -709,11 +715,12 @@ async fn reply(
         error: ProxyError {
             error: error.as_ref().map_or(0, native_error),
             message: error.map_or_else(String::new, |e| e.to_string()),
-            api: ApiName {
-                api: if failed { api } else { 0 },
-                interface: if failed { 2 } else { 0 },
-                metadata: String::new(),
-            },
+            api: if failed {
+                NativeApi::new(NativeInterfaceName::StatelessServiceInstance, api)
+            } else {
+                NativeApi::default()
+            }
+            .into(),
         },
     };
     let sent = shared
@@ -772,7 +779,7 @@ async fn abort_unit(
 ) -> Result<()> {
     {
         let mut state = unit.state.lock().unwrap();
-        state.operation_kind = 16;
+        state.operation_kind = NativeServiceOperation::Abort;
         state.operation_start = filetime();
     }
     let reporting = unit.state.lock().unwrap().reporting.clone();
@@ -809,7 +816,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
                     request,
                     endpoint,
                     None,
-                    1,
+                    NativeApiName::Open,
                 )
                 .await
             }
@@ -820,7 +827,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
                     request,
                     String::new(),
                     Some(error),
-                    1,
+                    NativeApiName::Open,
                 )
                 .await
             }
@@ -845,7 +852,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         state.valid = Arc::new(AtomicBool::new(true));
         state.cancel = Cancellation::default();
         state.operation_start = filetime();
-        state.operation_kind = 2;
+        state.operation_kind = NativeServiceOperation::Open;
         (state.generation, state.cancel.clone(), state.valid.clone())
     };
     let factory = shared
@@ -970,7 +977,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
             Phase::Closed
         };
         state.endpoint = endpoint.clone();
-        state.operation_kind = 1;
+        state.operation_kind = NativeServiceOperation::None;
         if outcome.is_err() {
             state.valid.store(false, Ordering::Release);
             state.live = None;
@@ -984,7 +991,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         request,
         endpoint,
         outcome.err(),
-        1,
+        NativeApiName::Open,
     )
     .await
 }
@@ -996,7 +1003,11 @@ async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()
         state.cancel.cancel();
         state.phase = Phase::Closing;
         state.operation_start = filetime();
-        state.operation_kind = if request.flags & 4 != 0 { 16 } else { 8 };
+        state.operation_kind = if request.flags.contains(NativeProxyFlags::ABORT) {
+            NativeServiceOperation::Abort
+        } else {
+            NativeServiceOperation::Close
+        };
         (
             state.service.clone(),
             Cancellation::default(),
@@ -1009,7 +1020,7 @@ async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()
     }
     if !already_closed {
         if let Some(service) = service {
-            if request.flags & 4 != 0 {
+            if request.flags.contains(NativeProxyFlags::ABORT) {
                 abort_unit(shared, unit, service).await?;
             } else {
                 let close_service = service.clone();
@@ -1037,7 +1048,7 @@ async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()
         state.endpoint.clear();
         state.live = None;
         state.request = request.clone();
-        state.operation_kind = 1;
+        state.operation_kind = NativeServiceOperation::None;
         state.service.take()
     };
     shared
@@ -1053,7 +1064,7 @@ async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()
         request,
         String::new(),
         None,
-        2,
+        NativeApiName::Close,
     )
     .await
 }
@@ -1123,9 +1134,9 @@ fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
         partition: Guid([0; 16]),
         replica_id: 0,
         instance_id: 0,
-        operation: 0,
+        operation: NativeServiceOperation::Invalid,
         operation_start: 0,
-        replicator_operation: 0,
+        replicator_operation: NativeReplicatorOperation::INVALID,
         loads: ObjectArray(vec![]),
         read_status: 0,
         write_status: 0,

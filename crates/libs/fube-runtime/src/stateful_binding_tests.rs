@@ -4,6 +4,7 @@ use crate::extensions::{
     CallLane, CallOrigin, ExecutionRuntime, NativeControlBinding, NativeInvocation,
     NativeInvocationKind,
 };
+use fube_core::protocol::NativeProxyFlags;
 use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 use std::time::Instant;
 
@@ -244,7 +245,7 @@ async fn native_issuer_freezes_full_epochs_memberships_and_fences_old_proofs() {
     dropped.state = NativeReplicaState::Dropped;
     dropped.up = false;
     let mut configuration = control(&open, "UpdateConfiguration", vec![local, remote, dropped]);
-    configuration.flags = 2;
+    configuration.flags = NativeProxyFlags::CATCH_UP;
     configuration.unit.current.configuration += 1;
     configuration.unit.previous = open.unit.current.clone();
     h.send("UpdateConfiguration", &configuration).await;

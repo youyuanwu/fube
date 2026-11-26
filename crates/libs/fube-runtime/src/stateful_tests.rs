@@ -1,6 +1,7 @@
 //! Adapter tests use controlled callbacks, not a purported empty-state policy.
 //! The actual sample custom replicator has its own controlled-peer test gate.
 use super::*;
+use fube_core::protocol::NativeProxyFlags;
 use fube_core::protocol::NativeReplicaRole;
 #[path = "stateful_control_tests.rs"]
 mod control_tests;
@@ -865,7 +866,7 @@ async fn stateful_idle_open_never_grants_primary_access_and_drop_orders_none_bef
             crate::ServicePartitionAccessStatus::NotPrimary
         )
     );
-    request.flags = 8;
+    request.flags = NativeProxyFlags::DROP;
     request.local.current_role = NativeReplicaRole::None; // Native Close-only reconstructed descriptor.
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
@@ -899,7 +900,7 @@ async fn stateful_failed_open_fences_handle_and_abort_preserves_stateless_siblin
     let mut next = request(&h, 2, 2, 0);
     h.send("ReplicaOpen", &next).await;
     h.receive("ReplicaOpenReply").await;
-    next.flags = 4;
+    next.flags = NativeProxyFlags::ABORT;
     next.local.current_role = NativeReplicaRole::None;
     h.send("ReplicaClose", &next).await;
     h.receive("ReplicaCloseReply").await;
@@ -925,7 +926,7 @@ async fn stateful_abort_cancels_open_owner_and_fences_old_incarnation() {
     tokio::time::timeout(Duration::from_secs(2), calls.open_entered.notified())
         .await
         .unwrap();
-    request.flags = 4;
+    request.flags = NativeProxyFlags::ABORT;
     h.send("ReplicaClose", &request).await;
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_ne!(failed.error.error, 0);
@@ -933,7 +934,7 @@ async fn stateful_abort_cancels_open_owner_and_fences_old_incarnation() {
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
-    request.flags = 0;
+    request.flags = NativeProxyFlags::NONE;
     request.local.instance = 2;
     request.service.initialization.0 = vec![0];
     h.send("ReplicaOpen", &request).await;
@@ -957,7 +958,7 @@ async fn cancelled_open_returning_control_aborts_replicator_before_service_and_c
     tokio::time::timeout(Duration::from_secs(2), calls.open_entered.notified())
         .await
         .unwrap();
-    open.flags = 8;
+    open.flags = NativeProxyFlags::DROP;
     h.send("ReplicaClose", &open).await;
     let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_ne!(reply.error.error, 0);
@@ -1023,7 +1024,7 @@ async fn stateful_close_error_is_normalized_only_after_abort_and_panic_never_ack
     request.service.initialization.0 = vec![11];
     h.send("ReplicaOpen", &request).await;
     h.receive("ReplicaOpenReply").await;
-    request.flags = 4;
+    request.flags = NativeProxyFlags::ABORT;
     h.send("ReplicaClose", &request).await;
     h.engine.shared.connection.closed().await;
     assert!(h.engine.shared.authority.check().is_err());
@@ -1070,7 +1071,7 @@ async fn close_between_gate_and_generation_install_cannot_be_overwritten() {
     let mut request = request(&h, 2, 1, 0);
     h.send("ReplicaOpen", &request).await;
     hook.reached.notified().await;
-    request.flags = 4;
+    request.flags = NativeProxyFlags::ABORT;
     h.send("ReplicaClose", &request).await;
     tokio::time::timeout(Duration::from_secs(1), async {
         while h.engine.shared.stateful.close_through([2; 16]) != 1 {
@@ -1086,7 +1087,7 @@ async fn close_between_gate_and_generation_install_cannot_be_overwritten() {
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
-    request.flags = 0;
+    request.flags = NativeProxyFlags::NONE;
     request.local.instance = 2;
     h.send("ReplicaOpen", &request).await;
     let next: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();

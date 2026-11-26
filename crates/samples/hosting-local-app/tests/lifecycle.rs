@@ -1,6 +1,7 @@
 //! Real owned process + production local RA/effect/H2/RAP bridge.
 use fube_hosting::local::{Activation, Options};
 use fube_node::local::{EffectReceipt, Node};
+use fube_ra::protocol::NativeProxyFlags;
 use fube_ra::{entity as ra, protocol::*};
 use fube_ra_store::{MemoryBackend, Settings, Store};
 use fube_runtime::extensions::NativeReplicaRole;
@@ -688,7 +689,15 @@ async fn stateful_fm_delete_waits_for_real_provider_and_service_disposal_before_
         .await;
         let close = dispatched
             .iter()
-            .find(|r| matches!(r.dispatch.effect, ra::Effect::Close { flags: 8, .. }))
+            .find(|r| {
+                matches!(
+                    r.dispatch.effect,
+                    ra::Effect::Close {
+                        flags: NativeProxyFlags::DROP,
+                        ..
+                    }
+                )
+            })
             .unwrap()
             .dispatch
             .clone();
@@ -2272,7 +2281,7 @@ async fn production_reply_adapter_rejects_malformed_and_foreign_session_without_
                     message: String::new(),
                     api: Default::default(),
                 },
-                flags: 0,
+                flags: NativeProxyFlags::NONE,
             })
             .unwrap()
         } else {

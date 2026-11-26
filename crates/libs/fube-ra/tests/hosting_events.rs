@@ -1,5 +1,6 @@
 //! Real serialized consumer decisions over committed RA state. Lookup/runtime
 //! attachment premises below are qualification-only; no H2/RAP/deployment claim.
+use fube_core::protocol::NativeProxyFlags;
 use fube_ra::protocol::NativeReplicaState;
 use fube_ra::{entity::*, protocol::*};
 use fube_ra_store::{MemoryBackend, Settings as StoreSettings, Store};
@@ -496,7 +497,10 @@ async fn local_runtime_close_is_ordinary_and_host_close_finishes_distinctly() {
     assert!(matches!(
         executor.take_effects().as_slice(),
         [Dispatched {
-            effect: Effect::Close { flags: 0, .. },
+            effect: Effect::Close {
+                flags: NativeProxyFlags::NONE,
+                ..
+            },
             ..
         }]
     ));

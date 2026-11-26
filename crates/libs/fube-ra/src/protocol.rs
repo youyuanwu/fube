@@ -3,7 +3,10 @@
 //! Field order follows pinned native FABRIC_FIELDS, not declaration order.
 //! Scalar enums and ErrorCode values are LONG64; unknown values are retained.
 //! ErrorCode diagnostic strings are not serialized. No Federation routing.
-pub use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
+pub use fube_core::protocol::{
+    NativeApi, NativeApiDescription, NativeApiName, NativeInterfaceName, NativeProxyFlags,
+    NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation, NativeServiceOperation,
+};
 use fubst::serde::{ByteArray, Derived, Guid, Inline, NativeEnum, ObjectArray, Pointer};
 use furpc::{
     header::{self, ACTION, ACTOR, HIGH_PRIORITY},

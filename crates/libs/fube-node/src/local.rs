@@ -6,6 +6,7 @@
 //! this owner on Busy, Unknown or error; abandonment is not a cleanup receipt.
 use super::{command, service_type, version};
 use fube_hosting::{self as h, ipc, local::Activation};
+use fube_ra::protocol::NativeProxyFlags;
 use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use fube_ra::{entity as ra, protocol::*};
 use fube_ra_store::KeyValueStore;
@@ -73,7 +74,7 @@ pub mod rap {
         pub local: Replica,
         pub remote: ObjectArray<Vec<Replica>>,
         pub service: Service,
-        pub flags: i64,
+        pub flags: NativeProxyFlags,
     }
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ProxyError {
@@ -87,12 +88,12 @@ pub mod rap {
         pub local: Replica,
         pub remote: ObjectArray<Vec<Replica>>,
         pub error: ProxyError,
-        pub flags: i64,
+        pub flags: NativeProxyFlags,
     }
     pub fn request(
         registration: &ra::RuntimeRegistration,
         body: &AddInstance,
-        flags: i64,
+        flags: NativeProxyFlags,
     ) -> Request {
         Request {
             runtime: registration.runtime.clone(),
@@ -110,7 +111,7 @@ pub mod rap {
             local: body.replica.clone(),
             remote: ObjectArray(vec![replica.clone()]),
             service: Service::default(),
-            flags: 0,
+            flags: NativeProxyFlags::NONE,
         }
     }
     pub use idle_request as build_request;
@@ -3504,7 +3505,7 @@ mod ingress_tests {
                 token: operation,
                 body: Arc::new(AddInstance::default()),
                 registration: ra::RuntimeRegistration::default(),
-                flags: 4,
+                flags: NativeProxyFlags::ABORT,
             },
         };
         for (source, expected) in [
@@ -3538,7 +3539,7 @@ mod ingress_tests {
                 original.effect,
                 ra::Effect::RuntimeOpen {
                     token: 7,
-                    flags: 4,
+                    flags: NativeProxyFlags::ABORT,
                     ..
                 }
             ));

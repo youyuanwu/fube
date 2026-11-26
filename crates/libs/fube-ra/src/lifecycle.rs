@@ -286,14 +286,14 @@ pub(super) fn close_retry(state: &EntityState, effects: &mut Vec<Effect>) {
                 .close_mode
                 .is_some_and(|mode| mode.force() || mode == CloseMode::Abort)
             {
-                4
+                NativeProxyFlags::ABORT
             } else if matches!(
                 state.close_mode,
                 Some(CloseMode::Close | CloseMode::DeactivateNode)
             ) {
-                0
+                NativeProxyFlags::NONE
             } else {
-                8
+                NativeProxyFlags::DROP
             },
         });
     } else {

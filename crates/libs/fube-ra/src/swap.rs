@@ -1,5 +1,6 @@
 use super::*;
 use crate::protocol::{NativeReplicaRole, NativeReplicaState};
+use fube_core::protocol::NativeProxyFlags;
 use std::time::Instant;
 
 const GET_LSN_NOT_FOUND: i64 = 0x8007_1cf0_u32 as i32 as i64;
@@ -484,7 +485,7 @@ fn progress_query(
             let query = current.progress_query.as_ref().expect("query");
             if query.reply.is_some()
                 || event.unit != current.body.unit
-                || event.flags != 0
+                || !event.flags.is_empty()
                 || !event.replicas.0.is_empty()
                 || !same_replica(&event.local, &current.body.replica)
             {
@@ -944,7 +945,7 @@ fn validate(body: &Configuration, state: &EntityState) -> Result<()> {
     }
     Ok(())
 }
-fn configuration_effect(state: &EntityState, flags: i64) -> Effect {
+fn configuration_effect(state: &EntityState, flags: NativeProxyFlags) -> Effect {
     let body = &state.swap.as_ref().expect("swap").rap;
     Effect::UpdateConfiguration {
         body: Box::new(body.clone()),
@@ -990,7 +991,9 @@ fn get_lsn_request(state: &EntityState, remote: &Replica) -> Effect {
 fn effects(state: &EntityState) -> Vec<Effect> {
     let swap = state.swap.as_ref().expect("swap");
     let mut result = match swap.stage {
-        SwapStage::Demote | SwapStage::Catchup => vec![configuration_effect(state, 2)],
+        SwapStage::Demote | SwapStage::Catchup => {
+            vec![configuration_effect(state, NativeProxyFlags::CATCH_UP)]
+        }
         SwapStage::Continue => vec![Effect::PeerContinueSwap {
             target: swap
                 .body
@@ -1092,8 +1095,11 @@ fn effects(state: &EntityState) -> Vec<Effect> {
                 }),
             }]
         }
-        SwapStage::Secondary => vec![configuration_effect(state, 0)],
-        SwapStage::End => vec![configuration_effect(state, 1)],
+        SwapStage::Secondary => vec![configuration_effect(state, NativeProxyFlags::NONE)],
+        SwapStage::End => vec![configuration_effect(
+            state,
+            NativeProxyFlags::END_RECONFIGURATION,
+        )],
         SwapStage::Complete if state.body.replica.current_role == NativeReplicaRole::Primary => {
             vec![Effect::DoReconfigurationReply(ConfigurationReply {
                 unit: state.body.unit.clone(),
@@ -1566,7 +1572,7 @@ pub(super) fn transition(
             };
             if !matches!(swap.stage, SwapStage::GetLsn | SwapStage::Continue)
                 || body.unit != current.body.unit
-                || body.flags != 0
+                || !body.flags.is_empty()
                 || !body.replicas.0.is_empty()
                 || !same_replica(&body.local, &current.body.replica)
             {
@@ -1672,9 +1678,9 @@ pub(super) fn transition(
                 return stale();
             };
             let flags = match swap.stage {
-                SwapStage::Demote | SwapStage::Catchup => 2,
-                SwapStage::Secondary => 0,
-                SwapStage::End => 1,
+                SwapStage::Demote | SwapStage::Catchup => NativeProxyFlags::CATCH_UP,
+                SwapStage::Secondary => NativeProxyFlags::NONE,
+                SwapStage::End => NativeProxyFlags::END_RECONFIGURATION,
                 _ => return stale(),
             };
             if body.unit != swap.rap.unit

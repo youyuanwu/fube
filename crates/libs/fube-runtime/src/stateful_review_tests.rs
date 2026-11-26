@@ -1,4 +1,7 @@
 use super::*;
+use fube_core::protocol::NativeApiName;
+use fube_core::protocol::NativeInterfaceName;
+use fube_core::protocol::NativeProxyFlags;
 use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 
 #[tokio::test]
@@ -58,7 +61,7 @@ async fn close_drains_configuration_dispatch_references_even_after_callback_flag
         h.receive("ReplicaOpenReply").await;
         h.engine.shared.stateful.wait_idle([2; 16]).await;
         let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
-        update.flags = 2;
+        update.flags = NativeProxyFlags::CATCH_UP;
         update.unit.current.configuration += 1;
         h.send("UpdateConfiguration", &update).await;
         wait_event(&calls, "waitQuorum", 1).await;
@@ -139,7 +142,7 @@ async fn caught_up_with_built_peer(
         "UpdateConfiguration",
         vec![open.local.clone(), target],
     );
-    update.flags = 2;
+    update.flags = NativeProxyFlags::CATCH_UP;
     update.unit.current.configuration += 1;
     h.send("UpdateConfiguration", &update).await;
     h.receive("UpdateConfigurationReply").await;
@@ -190,7 +193,7 @@ async fn unchanged_projected_proof_does_not_hide_changed_native_observations_and
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
-    update.flags = 2;
+    update.flags = NativeProxyFlags::CATCH_UP;
     update.unit.current.configuration += 1;
     h.send("UpdateConfiguration", &update).await;
     h.receive("UpdateConfigurationReply").await;
@@ -378,7 +381,7 @@ async fn failed_configuration_observation_is_not_a_cached_success_receipt() {
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
-    update.flags = 2;
+    update.flags = NativeProxyFlags::CATCH_UP;
     update.unit.current.configuration += 1;
     h.send("UpdateConfiguration", &update).await;
     h.receive("UpdateConfigurationReply").await;
@@ -418,11 +421,14 @@ async fn same_epoch_demotion_retry_never_regrants_revoked_write_access() {
     demote.local = local;
     demote.unit.current.configuration += 1 << 32;
     demote.unit.previous = open.unit.current.clone();
-    demote.flags = 2;
+    demote.flags = NativeProxyFlags::CATCH_UP;
     h.send("UpdateConfiguration", &demote).await;
     let failed: ProxyReply = from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
     assert_eq!(failed.error.error, -996);
-    assert_eq!((failed.error.api.api, failed.error.api.interface), (6, 4));
+    assert_eq!(
+        (failed.error.api.api, failed.error.api.interface),
+        (NativeApiName::UpdateEpoch, NativeInterfaceName::Replicator)
+    );
     let partition = calls.partitions.lock().unwrap()[0].clone();
     assert_eq!(partition.access_status().unwrap(), (G, T));
     let before = calls.access_events.lock().unwrap().len();
@@ -449,7 +455,7 @@ async fn cancellation_drains_overlapping_configuration_and_suppresses_its_late_s
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
-    update.flags = 2;
+    update.flags = NativeProxyFlags::CATCH_UP;
     update.unit.current.configuration += 1;
     h.send("UpdateConfiguration", &update).await;
     wait_event(&calls, "waitQuorum", 1).await;

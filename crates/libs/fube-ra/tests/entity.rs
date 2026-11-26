@@ -1,3 +1,6 @@
+use fube_core::protocol::NativeApiName;
+use fube_core::protocol::NativeInterfaceName;
+use fube_core::protocol::NativeProxyFlags;
 use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use fube_ra::{entity::*, protocol::*};
 use fube_ra_store::{
@@ -130,7 +133,7 @@ fn complete(value: &AddInstance, _token: u64) -> OpenCompletion {
         unit: value.unit.clone(),
         replica,
         error: 0,
-        flags: 0,
+        flags: NativeProxyFlags::NONE,
         detail: ProxyErrorDetail::default(),
     }
 }
@@ -1343,7 +1346,13 @@ async fn node_deactivation_waits_for_all_original_entities_and_stale_activation_
     assert_eq!(
         close_effects
             .iter()
-            .filter(|effect| matches!(effect, Effect::Close { flags: 0, .. }))
+            .filter(|effect| matches!(
+                effect,
+                Effect::Close {
+                    flags: NativeProxyFlags::NONE,
+                    ..
+                }
+            ))
             .count(),
         2
     );
@@ -1584,7 +1593,10 @@ async fn local_stateful_idle_open_is_commit_gated_and_cannot_enable_primary_or_n
     let closing = executor.snapshot([1; 16]).committed.unwrap();
     assert!(matches!(
         effects(&executor).as_slice(),
-        [Effect::Close { flags: 0, .. }]
+        [Effect::Close {
+            flags: NativeProxyFlags::NONE,
+            ..
+        }]
     ));
     let closed = CloseCompletion {
         unit: closing.body.unit.clone(),
@@ -1820,7 +1832,10 @@ async fn local_initial_primary_requires_exact_committed_bootstrap_and_cannot_pro
         .unwrap();
     assert!(matches!(
         effects(&executor).as_slice(),
-        [Effect::Close { flags: 0, .. }]
+        [Effect::Close {
+            flags: NativeProxyFlags::NONE,
+            ..
+        }]
     ));
     let closing = executor.snapshot([1; 16]).committed.unwrap();
     let closed = CloseCompletion {
@@ -3395,7 +3410,7 @@ async fn peer_normal_close_or_drop_host_loss_preserves_open_origin_and_fences_la
         assert!(closing.peer_creation.as_ref().unwrap().close_started_open);
         assert!(!closing.peer_host_loss());
         assert!(matches!(effects(&executor).as_slice(),
-            [Effect::Close { flags, .. }] if *flags == if mode == CloseMode::Drop { 8 } else { 0 }));
+            [Effect::Close { flags, .. }] if *flags == if mode == CloseMode::Drop { NativeProxyFlags::DROP } else { NativeProxyFlags::NONE }));
         assert_eq!(
             run(
                 &executor,
@@ -3765,9 +3780,9 @@ async fn peer_opened_close_drop_and_abort_report_only_after_success_and_ack_only
             assert!(!state(&executor).peer_terminal_report());
             assert!(matches!(effects(&executor).as_slice(),
             [Effect::Close { flags, .. }] if *flags == match mode {
-                CloseMode::Drop => 8,
-                CloseMode::Abort => 4,
-                _ => 0,
+                CloseMode::Drop => NativeProxyFlags::DROP,
+                CloseMode::Abort => NativeProxyFlags::ABORT,
+                _ => NativeProxyFlags::NONE,
             }));
             let completion = close_completion(&executor, 0);
             run(
@@ -4444,7 +4459,7 @@ async fn fm_peer_idle_delete_uses_stateful_reply_and_retains_original_deleted_to
     incoming.replica.instance -= 1;
     run(&executor, primary_delete(incoming, false)).await;
     assert!(
-        matches!(effects(&executor).as_slice(), [Effect::Close { flags: 8, body, .. }]
+        matches!(effects(&executor).as_slice(), [Effect::Close { flags: NativeProxyFlags::DROP, body, .. }]
         if body.replica.current_role == NativeReplicaRole::Idle && body.replica.state == NativeReplicaState::Dropped
             && body.replica.replication_endpoint == original.body.replica.replication_endpoint)
     );
@@ -4905,7 +4920,10 @@ async fn peer_delete_error_force_abort_requires_applied_cleanup_and_original_del
         run(&executor, primary_delete(request.replica.0.clone(), false)).await;
         assert!(matches!(
             effects(&executor).as_slice(),
-            [Effect::Close { flags: 8, .. }]
+            [Effect::Close {
+                flags: NativeProxyFlags::DROP,
+                ..
+            }]
         ));
         close_done(&executor, -55).await;
         assert!(effects(&executor).is_empty());
@@ -4918,7 +4936,10 @@ async fn peer_delete_error_force_abort_requires_applied_cleanup_and_original_del
         .await;
         assert!(matches!(
             effects(&executor).as_slice(),
-            [Effect::Close { flags: 4, .. }]
+            [Effect::Close {
+                flags: NativeProxyFlags::ABORT,
+                ..
+            }]
         ));
         let original = state(&executor);
         let completion = close_completion(&executor, 0);
@@ -5124,9 +5145,9 @@ async fn runtime_open_failure_has_distinct_delete_origin_and_host_loss_does_not(
             -55
         };
         completion.flags = if registration_after_runtime_loss {
-            0
+            NativeProxyFlags::NONE
         } else {
-            4
+            NativeProxyFlags::ABORT
         };
         run(&executor, Command::CompleteOpen(Box::new(completion))).await;
         effects(&executor);
@@ -5416,7 +5437,10 @@ async fn fm_registered_peer_idle_delete_drains_open_without_publishing_creation(
     run(&executor, primary_delete(older, false)).await;
     assert!(matches!(
         effects(&executor).as_slice(),
-        [Effect::Close { flags: 8, .. }]
+        [Effect::Close {
+            flags: NativeProxyFlags::DROP,
+            ..
+        }]
     ));
     let closing = state(&executor);
     assert_eq!(closing.phase, Phase::Closing);
@@ -5451,7 +5475,10 @@ async fn fm_registered_peer_idle_delete_drains_open_without_publishing_creation(
     .await;
     assert!(matches!(
         effects(&executor).as_slice(),
-        [Effect::Close { flags: 8, .. }]
+        [Effect::Close {
+            flags: NativeProxyFlags::DROP,
+            ..
+        }]
     ));
     close_done(&executor, 0).await;
     let completed = effects(&executor);
@@ -5543,7 +5570,7 @@ async fn fm_peer_idle_delete_and_close_commit_barriers_fence_reply_and_usage_rel
                     assert_eq!(state(&executor).fm_stage, FmStage::None);
                 } else {
                     assert!(
-                        matches!(effects(&executor).as_slice(), [Effect::Close { flags: 8, body, .. }]
+                        matches!(effects(&executor).as_slice(), [Effect::Close { flags: NativeProxyFlags::DROP, body, .. }]
                         if body.replica.current_role == NativeReplicaRole::Idle && body.replica.state == NativeReplicaState::Dropped)
                     );
                     assert!(state(&executor).usage.is_some());
@@ -6609,7 +6636,7 @@ fn status_completion(actions: &[Effect]) -> ConfigurationCompletion {
                     unit: body.unit.clone(),
                     local,
                     replicas: fubst::serde::ObjectArray(vec![]),
-                    flags: 0,
+                    flags: NativeProxyFlags::NONE,
                     error: 0,
                 })
             }
@@ -6704,7 +6731,7 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
     reply.replica.unit.previous.configuration += 1;
     run(&executor, lsn_reply(reply)).await;
     let mut catchup = configured(&effects(&executor));
-    assert_eq!(catchup.flags, 2);
+    assert_eq!(catchup.flags, NativeProxyFlags::CATCH_UP);
     assert_eq!(
         catchup
             .replicas
@@ -6801,7 +6828,7 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
     )
     .await;
     let end = configured(&effects(&executor));
-    assert_eq!(end.flags, 1);
+    assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
     let (entered, release) = hooks.pause(false);
     let final_reply = executor
         .submit(Command::CompleteConfiguration(Box::new(end)))
@@ -6891,7 +6918,7 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
     release.send(()).unwrap();
     work.wait(WAIT).await.unwrap();
     let catchup = configured(&effects(&executor));
-    assert_eq!(catchup.flags, 2);
+    assert_eq!(catchup.flags, NativeProxyFlags::CATCH_UP);
     run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
     assert!(
         matches!(effects(&executor).as_slice(), [Effect::PeerDeactivate { target, .. }] if *target == survivor_peer())
@@ -6961,7 +6988,7 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
         .await;
     }
     let end = configured(&effects(&executor));
-    assert_eq!(end.flags, 1);
+    assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
     let (entered, release) = hooks.pause(false);
     let final_reply = executor
         .submit(Command::CompleteConfiguration(Box::new(end)))
@@ -7052,7 +7079,10 @@ async fn configured_active_deletion_requires_exact_completed_membership_and_clos
             assert_eq!(closing.usage, before.usage);
             assert!(matches!(
                 effects(&executor).as_slice(),
-                [Effect::Close { flags: 8, .. }]
+                [Effect::Close {
+                    flags: NativeProxyFlags::DROP,
+                    ..
+                }]
             ));
             finish(&store, &executor).await;
         }
@@ -7334,7 +7364,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
             actions = effects(&executor);
         }
         let end = configured(&actions);
-        assert_eq!(end.flags, 1);
+        assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
         let (entered, release) = hooks.pause(false);
         let ticket = executor
             .submit(Command::CompleteConfiguration(Box::new(end)))
@@ -7599,7 +7629,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
         release.send(()).unwrap();
         ticket.wait(WAIT).await.unwrap();
         let catchup = configured(&effects(&executor));
-        assert_eq!(catchup.flags, 2);
+        assert_eq!(catchup.flags, NativeProxyFlags::CATCH_UP);
         capture_committed_lfum(&executor, &repair, Epoch::default(), true).await;
         assert_eq!(
             catchup
@@ -7721,7 +7751,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
             actions = effects(&executor);
         }
         let end = configured(&actions);
-        assert_eq!(end.flags, 1);
+        assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
         let (entered, release) = hooks.pause(false);
         let ticket = executor
             .submit(Command::CompleteConfiguration(Box::new(end)))
@@ -7947,7 +7977,7 @@ async fn configured_failover_selects_history_before_lsn_and_redirects_without_pr
                 .await;
                 assert_eq!(effects(&executor), actions);
             } else {
-                assert_eq!(configured(&actions).flags, 2);
+                assert_eq!(configured(&actions).flags, NativeProxyFlags::CATCH_UP);
             }
         }
         assert_eq!(state(&executor).runtime, original.runtime);
@@ -8048,7 +8078,10 @@ async fn configured_failover_keeps_pc_and_cc_read_quorums_separate_and_waits_for
         Command::RetryConfiguration(intent.unit.id.clone()),
     )
     .await;
-    assert_eq!(configured(&effects(&executor)).flags, 2);
+    assert_eq!(
+        configured(&effects(&executor)).flags,
+        NativeProxyFlags::CATCH_UP
+    );
     finish(&store, &executor).await;
 }
 
@@ -8103,7 +8136,7 @@ async fn configured_failover_prefers_catchup_capability_only_when_a_secondary_is
                 if c.replicas.0[2].last_lsn == 10 && c.replicas.0[1].last_lsn == -1)
             );
         } else {
-            assert_eq!(configured(&actions).flags, 2);
+            assert_eq!(configured(&actions).flags, NativeProxyFlags::CATCH_UP);
         }
         finish(&store, &executor).await;
     }
@@ -8551,7 +8584,7 @@ async fn finish_same_primary_restoration(executor: &Executor, hooks: &Hooks, bod
         actions = effects(executor);
     }
     let end = configured(&actions);
-    assert_eq!(end.flags, 1);
+    assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
     let (entered, release) = hooks.pause(false);
     let ticket = executor
         .submit(Command::CompleteConfiguration(Box::new(end)))
@@ -8928,7 +8961,7 @@ async fn removal_primary_loss_inventory(lfum: bool) {
                 actions = effects(&executor);
             }
             let end = configured(&actions);
-            assert_eq!(end.flags, 1);
+            assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
             let fail = lfum && stage == 2;
             let (entered, release) = hooks.pause(fail);
             let ticket = executor
@@ -10226,7 +10259,7 @@ async fn original_primary_failover_lfum_preserves_sf_phases_and_final_commit_bar
         )
         .await;
         let completion = configured(&effects(&executor));
-        assert_eq!(completion.flags, 1);
+        assert_eq!(completion.flags, NativeProxyFlags::END_RECONFIGURATION);
         start_lfum(&executor, 12);
         assert_failover_lfum(
             &wait_lfum(&executor).await,
@@ -10708,7 +10741,7 @@ async fn configured_idle_delete_keeps_lfum_and_failed_or_unknown_close_commits_s
         .await;
         let closing = state(&executor);
         assert!(matches!(effects(&executor).as_slice(),
-            [Effect::Close { flags: 8, token, body, registration }]
+            [Effect::Close { flags: NativeProxyFlags::DROP, token, body, registration }]
             if *token == closing.close_token && body.unit == original.body.unit
                 && body.replica.id == original.body.replica.id
                 && body.replica.instance == original.body.replica.instance
@@ -11183,7 +11216,7 @@ async fn configured_initial_membership_preserves_sizes_and_waits_for_every_activ
                 .any(|e| matches!(e, Effect::DoReconfigurationReply(_))));
             if i + 1 == peers.len() {
                 let end = configured(&actions);
-                assert_eq!(end.flags, 1);
+                assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
                 run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
             }
         }
@@ -11312,7 +11345,7 @@ async fn three_replica_activation_waits_for_each_exact_peer_and_its_commit() {
         assert_eq!(run(&executor, ack(1)).await, Disposition::IgnoredStale);
         assert!(effects(&executor).is_empty());
         let mut early = catchup;
-        early.flags = 1;
+        early.flags = NativeProxyFlags::END_RECONFIGURATION;
         assert_eq!(
             run(&executor, Command::CompleteConfiguration(Box::new(early))).await,
             Disposition::IgnoredStale
@@ -11327,7 +11360,7 @@ async fn three_replica_activation_waits_for_each_exact_peer_and_its_commit() {
         );
         run(&executor, ack(2)).await;
         let end = configured(&effects(&executor));
-        assert_eq!(end.flags, 1);
+        assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
         run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
         assert!(
             matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(reply)] if reply.replicas.0.len() == 3)
@@ -11361,7 +11394,7 @@ async fn same_primary_configuration_requires_catchup_peer_activation_and_end_rep
     run(&executor, reconfigure(config.clone())).await;
     let actions = effects(&executor);
     let mut catchup = configured(&actions);
-    assert_eq!(catchup.flags, 2);
+    assert_eq!(catchup.flags, NativeProxyFlags::CATCH_UP);
     assert_eq!(
         catchup
             .replicas
@@ -11396,7 +11429,10 @@ async fn same_primary_configuration_requires_catchup_peer_activation_and_end_rep
         Command::RetryConfiguration(config.unit.id.clone()),
     )
     .await;
-    assert_eq!(configured(&effects(&executor)).flags, 2);
+    assert_eq!(
+        configured(&effects(&executor)).flags,
+        NativeProxyFlags::CATCH_UP
+    );
     catchup.error = 0;
     run(
         &executor,
@@ -11408,7 +11444,7 @@ async fn same_primary_configuration_requires_catchup_peer_activation_and_end_rep
         if body.configuration == config)
     );
     let mut premature = catchup;
-    premature.flags = 1;
+    premature.flags = NativeProxyFlags::END_RECONFIGURATION;
     assert_eq!(
         run(
             &executor,
@@ -11439,7 +11475,7 @@ async fn same_primary_configuration_requires_catchup_peer_activation_and_end_rep
     )
     .await;
     let end = configured(&effects(&executor));
-    assert_eq!(end.flags, 1);
+    assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
     let (entered, release) = hooks.pause(false);
     let completed = executor
         .submit(Command::CompleteConfiguration(Box::new(end.clone())))
@@ -11499,7 +11535,10 @@ async fn same_primary_configuration_creation_commit_failure_and_uncertainty_publ
             assert!(effects(&executor).is_empty());
         } else {
             ticket.resolve(WAIT).await.unwrap();
-            assert_eq!(configured(&effects(&executor)).flags, 2);
+            assert_eq!(
+                configured(&effects(&executor)).flags,
+                NativeProxyFlags::CATCH_UP
+            );
         }
         finish(&store, &executor).await;
     }
@@ -11540,9 +11579,12 @@ async fn secondary_activation_ack_waits_for_real_rap_result_and_its_commit() {
         };
         run(&executor, command()).await;
         let completion = configured(&effects(&executor));
-        assert_eq!(completion.flags, 0);
+        assert_eq!(completion.flags, NativeProxyFlags::NONE);
         run(&executor, command()).await;
-        assert_eq!(configured(&effects(&executor)).flags, 0);
+        assert_eq!(
+            configured(&effects(&executor)).flags,
+            NativeProxyFlags::NONE
+        );
         let pending = state(&executor);
         let mut stale = completion.clone();
         stale.local.instance -= 1;
@@ -12143,7 +12185,7 @@ async fn repeated_planned_swaps_use_latest_roles_history_and_commit_before_new_e
                     .await;
                 }
                 let end = configured(&effects(&executor));
-                assert_eq!(end.flags, 1);
+                assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
                 callbacks.push(end.clone());
                 run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
                 assert!(matches!(
@@ -12414,7 +12456,7 @@ async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_a
             }
         }
         let end = configured(&effects(&executor));
-        assert_eq!(end.flags, 1);
+        assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
         let (entered, release) = hooks.pause(fail);
         let ticket = executor
             .submit(Command::CompleteConfiguration(Box::new(end.clone())))
@@ -12599,7 +12641,7 @@ async fn planned_swap_uses_timed_read_quorums_and_history_without_failover_redir
                 .any(|e| matches!(e, Effect::UpdateConfiguration { .. })));
         } else {
             let mut catchup = configured(&actions);
-            assert_eq!(catchup.flags, 2);
+            assert_eq!(catchup.flags, NativeProxyFlags::CATCH_UP);
             assert_eq!(catchup.local.node, admission().local_node);
             assert_eq!(catchup.local.last_lsn, last);
             assert!(state(&executor).swap.as_ref().unwrap().change.is_none());
@@ -12614,8 +12656,10 @@ async fn planned_swap_uses_timed_read_quorums_and_history_without_failover_redir
                     Effect::PeerDeactivate { body, .. } if body.force)));
                 assert!(!retry.iter().any(|e| matches!(
                     e,
-                    Effect::UpdateConfiguration { flags: 1, .. }
-                        | Effect::DoReconfigurationReply(_)
+                    Effect::UpdateConfiguration {
+                        flags: NativeProxyFlags::END_RECONFIGURATION,
+                        ..
+                    } | Effect::DoReconfigurationReply(_)
                 )));
                 let restarted = &intent.replicas.0[2];
                 assert!(!catchup_replica(&actions, &restarted.node).up);
@@ -12701,7 +12745,7 @@ async fn planned_swap_uses_timed_read_quorums_and_history_without_failover_redir
                 assert_eq!(state(&executor), pending);
                 run(&executor, ack(reply)).await;
                 let end = configured(&effects(&executor));
-                assert_eq!(end.flags, 1);
+                assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
                 let dropped = end
                     .replicas
                     .0
@@ -13148,7 +13192,10 @@ async fn planned_swap_demote_commit_and_original_progress_precede_peer_continuat
             Command::RetryConfiguration(intent.unit.id.clone()),
         )
         .await;
-        assert_eq!(configured(&effects(&executor)).flags, 2);
+        assert_eq!(
+            configured(&effects(&executor)).flags,
+            NativeProxyFlags::CATCH_UP
+        );
         demoted.error = 0;
         demoted.local.service_endpoint.clear();
         demoted.local.first_lsn = 0;
@@ -13330,7 +13377,7 @@ async fn planned_swap_candidate_requires_both_lsn_results_endpoint_commit_and_fi
                 unit: local.body.unit.clone(),
                 local: sample,
                 replicas: Default::default(),
-                flags: 0,
+                flags: NativeProxyFlags::NONE,
                 error: 0,
             })),
         )
@@ -13361,7 +13408,7 @@ async fn planned_swap_candidate_requires_both_lsn_results_endpoint_commit_and_fi
         )
         .await;
         let mut catchup = configured(&effects(&executor));
-        assert_eq!(catchup.flags, 2);
+        assert_eq!(catchup.flags, NativeProxyFlags::CATCH_UP);
         executor
             .config()
             .set_node(NodeProperty::EndpointPublishTimeoutTicks, 0);
@@ -13455,7 +13502,7 @@ async fn planned_swap_candidate_requires_both_lsn_results_endpoint_commit_and_fi
         )
         .await;
         let end = configured(&effects(&executor));
-        assert_eq!(end.flags, 1);
+        assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
         let (entered, release) = hooks.pause(false);
         let ticket = executor
             .submit(Command::CompleteConfiguration(Box::new(end)))
@@ -13498,7 +13545,7 @@ async fn configured_secondary_retirement_preserves_both_quorums_and_exact_phase_
     }
     run(&executor, reconfigure(retirement.clone())).await;
     let mut catchup = configured(&effects(&executor));
-    assert_eq!(catchup.flags, 2);
+    assert_eq!(catchup.flags, NativeProxyFlags::CATCH_UP);
     assert_eq!(
         catchup
             .replicas
@@ -13534,7 +13581,10 @@ async fn configured_secondary_retirement_preserves_both_quorums_and_exact_phase_
         Command::RetryConfiguration(retirement.unit.id.clone()),
     )
     .await;
-    assert_eq!(configured(&effects(&executor)).flags, 2);
+    assert_eq!(
+        configured(&effects(&executor)).flags,
+        NativeProxyFlags::CATCH_UP
+    );
     catchup.error = 0;
     run(&executor, Command::CompleteConfiguration(Box::new(catchup))).await;
     let deactivate = effects(&executor);
@@ -13552,7 +13602,7 @@ async fn configured_secondary_retirement_preserves_both_quorums_and_exact_phase_
     assert!(effects(&executor).is_empty());
     run(&executor, peer_deactivated(deactivation_reply(&retirement))).await;
     let end = configured(&effects(&executor));
-    assert_eq!(end.flags, 1);
+    assert_eq!(end.flags, NativeProxyFlags::END_RECONFIGURATION);
     let (entered, release) = hooks.pause(false);
     let ticket = executor
         .submit(Command::CompleteConfiguration(Box::new(end)))
@@ -13649,9 +13699,13 @@ async fn configured_secondary_deactivate_ack_requires_successful_close_and_resol
         assert_eq!(state(&executor).phase, Phase::Ready);
         release.send(()).unwrap();
         start.wait(WAIT).await.unwrap();
-        assert!(effects(&executor)
-            .iter()
-            .any(|e| matches!(e, Effect::Close { flags: 8, .. })));
+        assert!(effects(&executor).iter().any(|e| matches!(
+            e,
+            Effect::Close {
+                flags: NativeProxyFlags::DROP,
+                ..
+            }
+        )));
         let closed = state(&executor);
         if lost {
             run(
@@ -14615,7 +14669,7 @@ async fn close_done(executor: &Executor, error: i64) -> Disposition {
     )
     .await
 }
-fn assert_close(effects: &[Effect], flags: i64, current: &EntityState) {
+fn assert_close(effects: &[Effect], flags: NativeProxyFlags, current: &EntityState) {
     let [Effect::Close {
         token,
         body,
@@ -14691,9 +14745,9 @@ async fn fm_stateful_terminal_reports_use_native_stages_and_ack_lists() {
                 assert!(matches!(effects(&executor).as_slice(),
                 [Effect::Close { flags, body, .. }]
                 if *flags == match mode {
-                    CloseMode::Drop => 8,
-                    CloseMode::Abort | CloseMode::ForceAbort => 4,
-                    _ => 0,
+                    CloseMode::Drop => NativeProxyFlags::DROP,
+                    CloseMode::Abort | CloseMode::ForceAbort => NativeProxyFlags::ABORT,
+                    _ => NativeProxyFlags::NONE,
                 }
                     && body.replica.current_role == NativeReplicaRole::Primary));
             }
@@ -14838,9 +14892,9 @@ async fn fm_stateful_terminal_and_ack_keep_private_proposals_until_actual_commit
                         effects(&executor).as_slice(),
                         [Effect::Close { flags, .. }]
                         if *flags == match mode {
-                            CloseMode::Drop => 8,
-                            CloseMode::Abort | CloseMode::ForceAbort => 4,
-                            _ => 0,
+                            CloseMode::Drop => NativeProxyFlags::DROP,
+                            CloseMode::Abort | CloseMode::ForceAbort => NativeProxyFlags::ABORT,
+                            _ => NativeProxyFlags::NONE,
                         }
                     ));
                 }
@@ -15198,7 +15252,7 @@ async fn native_stateful_delete_uses_original_epoch_id_and_canonical_reply_witho
     let closing = state(&executor);
     assert!(closing.local_deleted && !closing.cleanup_pending);
     assert!(matches!(effects(&executor).as_slice(),
-        [Effect::Close { flags: 8, body, .. }] if body.replica.current_role == NativeReplicaRole::Primary));
+        [Effect::Close { flags: NativeProxyFlags::DROP, body, .. }] if body.replica.current_role == NativeReplicaRole::Primary));
     assert_eq!(
         run(&executor, primary_delete(request.clone(), false)).await,
         Disposition::IgnoredPending
@@ -15421,14 +15475,14 @@ async fn native_ready_delete_duplicate_retry_and_close_completion_order() {
     assert_eq!(closing.close_mode, Some(CloseMode::Delete));
     assert!(closing.local_deleted);
     assert!(!closing.cleanup_pending);
-    assert_close(&effects(&executor), 8, &closing);
+    assert_close(&effects(&executor), NativeProxyFlags::DROP, &closing);
     assert_eq!(
         run(&executor, remove(request.clone(), false)).await,
         Disposition::IgnoredPending
     );
     assert!(effects(&executor).is_empty());
     run(&executor, Command::RetryClose(request.unit.id.clone())).await;
-    assert_close(&effects(&executor), 8, &closing);
+    assert_close(&effects(&executor), NativeProxyFlags::DROP, &closing);
     close_done(&executor, 0).await;
     assert!(matches!(effects(&executor).as_slice(), [
                 Effect::ReleaseRegistration(_), Effect::ReleaseUsage { .. }, Effect::Health(HealthEvent::Close), Effect::RemoveReply(r)
@@ -15534,7 +15588,11 @@ async fn native_open_remove_guards_accept_lower_instance_but_reject_impossible_n
                     [Effect::TerminateHost { .. }]
                 ));
             } else {
-                assert_close(&effects(&executor), 8, &state(&executor));
+                assert_close(
+                    &effects(&executor),
+                    NativeProxyFlags::DROP,
+                    &state(&executor),
+                );
             }
             assert_eq!(state(&executor).body.unit, request.unit); // open epoch not assigned
         }
@@ -15659,7 +15717,11 @@ async fn native_delete_open_races_before_and_after_registration_are_explicit() {
         run(&executor, remove(request.clone(), false)).await;
         if registered_first {
             assert_eq!(state(&executor).phase, Phase::Closing);
-            assert_close(&effects(&executor), 8, &state(&executor));
+            assert_close(
+                &effects(&executor),
+                NativeProxyFlags::DROP,
+                &state(&executor),
+            );
             assert_eq!(
                 run(
                     &executor,
@@ -15673,7 +15735,11 @@ async fn native_delete_open_races_before_and_after_registration_are_explicit() {
             assert_eq!(state(&executor).phase, Phase::Closing);
             assert!(effects(&executor).is_empty());
             run(&executor, Command::RetryClose(request.unit.id.clone())).await;
-            assert_close(&effects(&executor), 8, &state(&executor));
+            assert_close(
+                &effects(&executor),
+                NativeProxyFlags::DROP,
+                &state(&executor),
+            );
             close_done(&executor, 0).await; // trusted cancellation/drain/cleanup witness
             assert!(matches!(
                 effects(&executor).as_slice(),
@@ -15788,10 +15854,13 @@ async fn native_close_failures_warning_forceabort_and_captured_reply_mode() {
         if stateful {
             assert!(matches!(
                 aborted.as_slice(),
-                [Effect::Close { flags: 4, .. }]
+                [Effect::Close {
+                    flags: NativeProxyFlags::ABORT,
+                    ..
+                }]
             ));
         } else {
-            assert_close(&aborted, 4, &state(&executor));
+            assert_close(&aborted, NativeProxyFlags::ABORT, &state(&executor));
         }
         close_done(&executor, 0).await;
         assert!(matches!(
@@ -15982,7 +16051,11 @@ async fn native_replacement_drops_old_identity_and_recreates_only_from_fm_resend
     assert_eq!(state(&executor).runtime, ready.runtime);
     assert_eq!(state(&executor).usage, ready.usage);
     assert!(!state(&executor).local_deleted);
-    assert_close(&effects(&executor), 8, &state(&executor));
+    assert_close(
+        &effects(&executor),
+        NativeProxyFlags::DROP,
+        &state(&executor),
+    );
     let writes = operations(&hooks).len();
     replace.replica.instance += 1;
     replace.service.update_version = 100;
@@ -16111,7 +16184,7 @@ async fn native_ready_add_identity_epoch_matrix_has_no_independent_lower_id_guar
             2 => assert!(matches!(actions.as_slice(), [Effect::Reply(r)]
                 if r.unit==old.body.unit && r.replica==old.body.replica)),
             5 => {
-                assert_close(&actions, 8, &state(&executor));
+                assert_close(&actions, NativeProxyFlags::DROP, &state(&executor));
                 assert_eq!(state(&executor).body.unit.current, old.body.unit.current);
             }
             _ => assert!(actions.is_empty()),
@@ -16251,7 +16324,11 @@ async fn native_ineligible_description_is_helper_noop_not_add_rejection() {
         run(&executor, add(incoming)).await;
         assert_eq!(state(&executor).body.service, old.body.service);
         assert!(!state(&executor).service_description_pending);
-        assert_close(&effects(&executor), 8, &state(&executor));
+        assert_close(
+            &effects(&executor),
+            NativeProxyFlags::DROP,
+            &state(&executor),
+        );
         finish(&store, &executor).await;
     }
 }
@@ -16427,12 +16504,20 @@ async fn native_replacement_close_failures_use_drop_retry_and_forceabort_not_del
         [Effect::Health(HealthEvent::CloseWarning)]
     ));
     run(&executor, Command::RetryClose(request.unit.id.clone())).await;
-    assert_close(&effects(&executor), 8, &state(&executor));
+    assert_close(
+        &effects(&executor),
+        NativeProxyFlags::DROP,
+        &state(&executor),
+    );
     close_done(&executor, -123).await;
     assert_eq!(state(&executor).close_mode, Some(CloseMode::ForceAbort));
     assert!(effects(&executor).is_empty());
     run(&executor, Command::RetryClose(request.unit.id.clone())).await;
-    assert_close(&effects(&executor), 4, &state(&executor));
+    assert_close(
+        &effects(&executor),
+        NativeProxyFlags::ABORT,
+        &state(&executor),
+    );
     close_done(&executor, 0).await;
     assert_eq!(state(&executor).phase, Phase::Closed);
     assert!(!state(&executor).local_deleted);
@@ -16507,7 +16592,13 @@ async fn replacement_private_proposal_definite_and_unknown_outcomes_keep_origina
                 ));
                 if dropping {
                     assert_eq!(current.close_mode, Some(CloseMode::Drop));
-                    assert!(matches!(actions[1].effect, Effect::Close { flags: 8, .. }));
+                    assert!(matches!(
+                        actions[1].effect,
+                        Effect::Close {
+                            flags: NativeProxyFlags::DROP,
+                            ..
+                        }
+                    ));
                 } else {
                     assert!(current.service_description_pending);
                     assert!(matches!(actions[1].effect, Effect::Reply(_)));
@@ -17268,7 +17359,7 @@ async fn registration_retry_thresholds_warning_precedence_and_reacquire_are_nati
                 actions[0],
                 Effect::Health(HealthEvent::ClearServiceTypeRegistrationWarning)
             );
-            assert_close(&actions[1..], 8, &state(&executor));
+            assert_close(&actions[1..], NativeProxyFlags::DROP, &state(&executor));
             close_done(&executor, 0).await;
         } else {
             run(&executor, Command::Registered(Box::new(event))).await;
@@ -17321,7 +17412,11 @@ async fn lifecycle_effect_budget_is_reserved_through_store_and_retained_effects(
     ));
     effects(&executor);
     run(&executor, Command::RetryClose(request.unit.id)).await;
-    assert_close(&effects(&executor), 8, &state(&executor));
+    assert_close(
+        &effects(&executor),
+        NativeProxyFlags::DROP,
+        &state(&executor),
+    );
     finish(&store, &executor).await;
 }
 
@@ -18144,7 +18239,7 @@ async fn vanilla_raw_inbuild_open_reply_establishes_ready_without_copying_other_
     let token = begin_open(&executor).await;
     registered(&executor, &body(1), token).await;
     let before = state(&executor);
-    let mut reply = runtime_result(&executor, 0, 0);
+    let mut reply = runtime_result(&executor, 0, NativeProxyFlags::NONE);
     reply.replica = before.body.replica.clone(); // actual raw request-shaped IB
     reply.replica.service_endpoint = "native endpoint".into();
     reply.replica.replication_endpoint = "native replicator endpoint".into();
@@ -18186,7 +18281,7 @@ async fn vanilla_dynamic_open_policy_accepts_old_abort_echo_and_current_success_
     .await;
     let token = begin_open(&executor).await;
     registered(&executor, &body(1), token).await;
-    runtime_reply(&executor, -9, 0).await;
+    runtime_reply(&executor, -9, NativeProxyFlags::NONE).await;
     assert!(effects(&executor).is_empty());
     run(&executor, Command::RetryOpen(body(1).unit.id)).await;
     assert!(matches!(
@@ -18199,7 +18294,7 @@ async fn vanilla_dynamic_open_policy_accepts_old_abort_echo_and_current_success_
     assert_eq!(state(&executor).open_failures, 2);
     assert!(effects(&executor).is_empty());
     cfg.set(RetryState::Opening, Threshold::Drop, 1); // lowered below current
-    runtime_reply(&executor, -9, 0).await;
+    runtime_reply(&executor, -9, NativeProxyFlags::NONE).await;
     assert_eq!(state(&executor).open_failures, 3);
     cfg.set(RetryState::Opening, Threshold::Warning, -1);
     cfg.set(RetryState::Opening, Threshold::Error, 0);
@@ -18357,7 +18452,9 @@ async fn vanilla_retuning_during_unknown_commit_preserves_proposal_then_uses_new
     let (entered, release) = hooks.pause(false);
     let ticket = executor
         .submit(Command::CompleteOpen(Box::new(runtime_result(
-            &executor, -9, 0,
+            &executor,
+            -9,
+            NativeProxyFlags::NONE,
         ))))
         .unwrap();
     entered.await.unwrap();
@@ -18378,7 +18475,10 @@ async fn vanilla_retuning_during_unknown_commit_preserves_proposal_then_uses_new
     run(&executor, Command::RetryOpen(body(1).unit.id)).await;
     assert!(matches!(
         effects(&executor).as_slice(),
-        [Effect::RuntimeOpen { flags: 0, .. }]
+        [Effect::RuntimeOpen {
+            flags: NativeProxyFlags::NONE,
+            ..
+        }]
     ));
     assert_eq!(operations(&hooks), ["Insert", "Update"]);
     finish(&store, &executor).await;
@@ -18418,7 +18518,7 @@ fn lookup_result(executor: &Executor, error: i64) -> RegistrationCompletion {
     event.usage_acquired = error == 0 && s.usage.is_none();
     event
 }
-fn runtime_result(executor: &Executor, error: i64, flags: i64) -> OpenCompletion {
+fn runtime_result(executor: &Executor, error: i64, flags: NativeProxyFlags) -> OpenCompletion {
     let s = state(executor);
     let mut event = complete(&s.body, s.open_token);
     event.error = error;
@@ -18428,7 +18528,7 @@ fn runtime_result(executor: &Executor, error: i64, flags: i64) -> OpenCompletion
     }
     event
 }
-async fn runtime_reply(executor: &Executor, error: i64, flags: i64) {
+async fn runtime_reply(executor: &Executor, error: i64, flags: NativeProxyFlags) {
     let event = runtime_result(executor, error, flags);
     run(executor, Command::CompleteOpen(Box::new(event))).await;
 }
@@ -18535,7 +18635,7 @@ async fn native_registration_threshold_warning_clear_true_exhaustion_and_ties() 
         run(&executor, Command::Registered(Box::new(event))).await;
         if complete_success {
             assert!(
-                matches!(effects(&executor).as_slice(), [Effect::RequestServiceTypeWork { .. }, Effect::OpeningHealth(h), Effect::RuntimeOpen { flags:0,.. }] if h.event==HealthEvent::ClearServiceTypeRegistrationWarning)
+                matches!(effects(&executor).as_slice(), [Effect::RequestServiceTypeWork { .. }, Effect::OpeningHealth(h), Effect::RuntimeOpen { flags: NativeProxyFlags::NONE,.. }] if h.event==HealthEvent::ClearServiceTypeRegistrationWarning)
             );
             assert_eq!(state(&executor).phase, Phase::Opening);
             assert_eq!(state(&executor).registration_failures, 0);
@@ -18587,12 +18687,12 @@ async fn native_runtime_warning_abort_guard_terminal_cleanup_and_captured_reply(
     let token = begin_open(&executor).await;
     registered(&executor, &body(1), token).await;
     let captured = state(&executor).body.clone();
-    let mut event = runtime_result(&executor, -123, 0);
+    let mut event = runtime_result(&executor, -123, NativeProxyFlags::NONE);
     event.detail = ProxyErrorDetail {
         message: "user Open failed".into(),
         api: ApiNameDescription {
-            api: 3,
-            interface: 2,
+            api: NativeApiName::Abort,
+            interface: NativeInterfaceName::StatelessServiceInstance,
             metadata: "OpenInstance".into(),
         },
     };
@@ -18607,7 +18707,12 @@ async fn native_runtime_warning_abort_guard_terminal_cleanup_and_captured_reply(
             detail: event.detail.clone()
         }))]
     );
-    runtime_reply(&executor, HOSTING_SERVICE_TYPE_DISABLED, 0).await; // not fatal at RAP layer
+    runtime_reply(
+        &executor,
+        HOSTING_SERVICE_TYPE_DISABLED,
+        NativeProxyFlags::NONE,
+    )
+    .await; // not fatal at RAP layer
     assert!(effects(&executor).is_empty());
     assert_eq!(state(&executor).open_failures, 2);
     let before = state(&executor);
@@ -18621,7 +18726,11 @@ async fn native_runtime_warning_abort_guard_terminal_cleanup_and_captured_reply(
         assert_eq!(
             run(
                 &executor,
-                Command::CompleteOpen(Box::new(runtime_result(&executor, error, 0)))
+                Command::CompleteOpen(Box::new(runtime_result(
+                    &executor,
+                    error,
+                    NativeProxyFlags::NONE
+                )))
             )
             .await,
             Disposition::IgnoredStale
@@ -18760,11 +18869,11 @@ async fn closing_reacquisition_normalizes_version_and_disposes_rejected_mismatch
             assert_eq!(state(&executor).runtime, Some(event.registration.clone()));
             let actions = effects(&executor);
             assert!(
-                matches!(actions.as_slice(),[Effect::Close {body,flags:8,registration,..}] if body.service.version.instance==9 && body.replica.version==VersionInstance::invalid() && registration==&event.registration)
+                matches!(actions.as_slice(),[Effect::Close {body,flags: NativeProxyFlags::DROP,registration,..}] if body.service.version.instance==9 && body.replica.version==VersionInstance::invalid() && registration==&event.registration)
             );
             // SendReplicaCloseMessage.cpp authority is FailoverUnit.cpp:4760-4778:
             // wire closing replica is canonical, not the local selected version.
-            assert_close(&actions, 8, &state(&executor));
+            assert_close(&actions, NativeProxyFlags::DROP, &state(&executor));
             assert_eq!(state(&executor).body.replica.version.instance, 9);
             let info = executor.service_types()[0].info.clone();
             assert_eq!(info.versioned.version.instance, 9);
@@ -18853,7 +18962,12 @@ async fn native_usage_increment_failure_and_returned_version_selection_are_disti
         run(&executor, add(body(1))).await,
         Disposition::IgnoredPending
     );
-    runtime_reply(&executor, PROXY_STATE_CHANGED_ON_DATA_LOSS, 0).await;
+    runtime_reply(
+        &executor,
+        PROXY_STATE_CHANGED_ON_DATA_LOSS,
+        NativeProxyFlags::NONE,
+    )
+    .await;
     assert!(
         matches!(effects(&executor).as_slice(), [Effect::Reply(r)] if r.error==0 && r.replica.state==NativeReplicaState::Ready && !r.replica.service_endpoint.is_empty())
     );
@@ -18888,7 +19002,7 @@ async fn native_opening_host_down_retains_usage_accepts_replacement_and_exhausts
     )
     .await;
     effects(&executor);
-    let old_open = runtime_result(&executor, 0, 0);
+    let old_open = runtime_result(&executor, 0, NativeProxyFlags::NONE);
     run(
         &executor,
         Command::HostDown(Box::new(HostDown {
@@ -18998,7 +19112,15 @@ async fn opening_intermediate_terminal_and_host_down_updates_keep_state_effects_
                         host: registration().host,
                     }))
                 } else {
-                    let e = runtime_result(&executor, -77, if kind == 2 { ABORT } else { 0 });
+                    let e = runtime_result(
+                        &executor,
+                        -77,
+                        if kind == 2 {
+                            ABORT
+                        } else {
+                            NativeProxyFlags::NONE
+                        },
+                    );
                     Command::CompleteOpen(Box::new(e))
                 };
                 let (entered, release) = hooks.pause(fail);
@@ -19081,14 +19203,14 @@ async fn native_open_success_clears_warning_or_error_threshold_without_inventing
         registered(&executor, &body(1), token).await;
         let failures = if policy.warning == 1 { 1 } else { 2 };
         for n in 1..=failures {
-            runtime_reply(&executor, -45, 0).await;
+            runtime_reply(&executor, -45, NativeProxyFlags::NONE).await;
             let actions = effects(&executor);
             assert_eq!(actions.len(), usize::from(policy.warning == n));
             assert_eq!(state(&executor).open_failures, n as u64);
         }
         let runtime = state(&executor).runtime.clone();
         let usage = state(&executor).usage;
-        runtime_reply(&executor, 0, 0).await;
+        runtime_reply(&executor, 0, NativeProxyFlags::NONE).await;
         assert!(
             matches!(effects(&executor).as_slice(),[Effect::OpeningHealth(h),Effect::Reply(r)] if h.event==HealthEvent::ClearOpenWarning && r.error==0 && r.replica.state==NativeReplicaState::Ready && !r.replica.service_endpoint.is_empty())
         );

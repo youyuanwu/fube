@@ -1,4 +1,6 @@
 use super::*;
+use fube_core::protocol::NativeProxyFlags;
+use fube_core::protocol::NativeServiceOperation;
 use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 #[path = "reporting_tests.rs"]
 mod reporting_tests;
@@ -8,6 +10,21 @@ use fube_rap_test_support::transport::{message, ModelPeer, Received as Message};
 use fubst::serde::{from_slice, to_vec};
 use furpc::MessageId;
 use tokio::{net::TcpListener, sync::Notify};
+
+#[tokio::test]
+async fn stateless_flag_admission_retains_unknown_bits_until_rejection() {
+    let h = Harness::new().await;
+    let mut request = h.request(1, 1, 0);
+    for bits in [16, 18, i64::MIN, i64::MIN | 4, -1] {
+        request.flags = NativeProxyFlags::from_bits_retain(bits);
+        let decoded: ProxyRequest = from_slice(&to_vec(&request).unwrap()).unwrap();
+        assert_eq!(decoded.flags.bits(), bits);
+        assert!(matches!(
+            validate(&h.engine.shared, &decoded),
+            Err(Error::Protocol(_))
+        ));
+    }
+}
 
 #[derive(Default)]
 struct Calls {
@@ -390,7 +407,7 @@ async fn abort_cancels_outstanding_health_without_retiring_sibling_authority() {
     };
     let task = tokio::spawn(async move { target.report_health(&health_report()).await });
     let original = h.receive("ReportHealth").await;
-    target_request.flags = 4;
+    target_request.flags = NativeProxyFlags::ABORT;
     h.send("ReplicaClose", &target_request).await;
     let result = tokio::time::timeout(Duration::from_millis(100), task)
         .await
@@ -864,13 +881,13 @@ impl Harness {
                 dns: String::new(),
                 scaling: fubst::serde::EmptyObjectArray,
             },
-            flags: 0,
+            flags: NativeProxyFlags::NONE,
         }
     }
     async fn send(&mut self, action: &str, request: &ProxyRequest) {
         let mut request = request.clone();
         if action == "RAPQuery" {
-            request.flags = 0;
+            request.flags = NativeProxyFlags::NONE;
         }
         let message = message(12, action, to_vec(&request).unwrap()).unwrap();
         if action == "RAPQuery" {
@@ -1208,7 +1225,7 @@ async fn open_readiness_query_duplicate_close_and_partition_invalidation() {
     let query: QueryReply = from_slice(&response.body).unwrap();
     assert_eq!(query.error, 0);
     assert_eq!(query.detail.instance_id, 100);
-    assert_eq!(query.detail.operation, 1);
+    assert_eq!(query.detail.operation, NativeServiceOperation::None);
     native_query.local.instance += 1;
     h.send("RAPQuery", &native_query).await;
     let newer_query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
@@ -1247,14 +1264,14 @@ async fn independent_units_progress_and_abort_fences_late_open() {
     .unwrap();
     h.send("RAPQuery", &blocked).await;
     let opening: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
-    assert_eq!(opening.detail.operation, 2);
+    assert_eq!(opening.detail.operation, NativeServiceOperation::Open);
     assert!(opening.local.service_endpoint.is_empty());
     let other = h.request(2, 1, 0);
     h.send("ReplicaOpen", &other).await;
     let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(reply.unit.id.id, Guid([2; 16]));
     let mut abort = blocked.clone();
-    abort.flags = 4;
+    abort.flags = NativeProxyFlags::ABORT;
     h.send("ReplicaClose", &abort).await;
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(failed.error.error, OBJECT_CLOSED);
@@ -1403,7 +1420,7 @@ async fn query_tracks_actual_abort_cleanup_and_graceful_close_operations() {
         if mode != 5 {
             h.receive("ReplicaOpenReply").await;
             if mode == 4 {
-                request.flags = 4
+                request.flags = NativeProxyFlags::ABORT
             }
 
             h.send("ReplicaClose", &request).await;
@@ -1412,7 +1429,11 @@ async fn query_tracks_actual_abort_cleanup_and_graceful_close_operations() {
             loop {
                 let u = unit(&h.engine.shared, &request, false).unwrap();
                 if let Some(u) = u {
-                    let expected = if mode == 7 { 8 } else { 16 };
+                    let expected = if mode == 7 {
+                        NativeServiceOperation::Close
+                    } else {
+                        NativeServiceOperation::Abort
+                    };
                     if u.state.lock().unwrap().operation_kind == expected
                         && if mode == 7 {
                             h.calls.closes.load(Ordering::SeqCst) > 0
@@ -1437,7 +1458,14 @@ async fn query_tracks_actual_abort_cleanup_and_graceful_close_operations() {
         });
         h.send("RAPQuery", &request).await;
         let query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
-        assert_eq!(query.detail.operation, if mode == 7 { 8 } else { 16 });
+        assert_eq!(
+            query.detail.operation,
+            if mode == 7 {
+                NativeServiceOperation::Close
+            } else {
+                NativeServiceOperation::Abort
+            }
+        );
         assert!(query.detail.operation_start > 0);
         h.calls.abort_release.store(true, Ordering::Release);
         h.calls.release.cancel();
@@ -1458,7 +1486,7 @@ async fn abort_panic_or_cleanup_timeout_never_acknowledges_disposal() {
         let mut request = h.request(1, 1, mode);
         h.send("ReplicaOpen", &request).await;
         h.receive("ReplicaOpenReply").await;
-        request.flags = 4;
+        request.flags = NativeProxyFlags::ABORT;
         h.send("ReplicaClose", &request).await;
         let retired =
             tokio::time::timeout(Duration::from_secs(1), h.engine.shared.connection.closed()).await;
@@ -1586,7 +1614,7 @@ async fn locally_revoked_admitted_stateless_success_preserves_siblings_and_close
         .await
         .unwrap();
         let mut close = request.clone();
-        close.flags = 4;
+        close.flags = NativeProxyFlags::ABORT;
         h.send("ReplicaClose", &close).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while valid.load(Ordering::Acquire) {

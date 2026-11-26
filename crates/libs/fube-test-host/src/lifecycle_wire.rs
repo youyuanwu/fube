@@ -1,6 +1,7 @@
 //! Native RA12 stateless subset. Source: ServiceModel/reliability/failover/
 //! and Reliability/Failover/{common,ra}/ declarations at the pinned revision.
 use crate::wire::{PackageId, VersionInstance};
+pub use fube_ra::protocol::{NativeApiDescription as ApiName, NativeProxyFlags};
 use fubst::serde::{ByteArray, EmptyObjectArray, Guid};
 use serde::{Deserialize, Serialize};
 
@@ -91,13 +92,7 @@ pub struct ProxyRequest {
     pub local: Replica,
     pub remote: EmptyObjectArray,
     pub service: Service,
-    pub flags: i64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiName {
-    pub api: i64,
-    pub interface: i64,
-    pub metadata: String,
+    pub flags: NativeProxyFlags,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyError {
@@ -111,5 +106,5 @@ pub struct ProxyReply {
     pub local: Replica,
     pub remote: EmptyObjectArray,
     pub error: ProxyError,
-    pub flags: i64,
+    pub flags: NativeProxyFlags,
 }
