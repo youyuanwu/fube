@@ -1,5 +1,211 @@
 use super::*;
 
+#[tokio::test]
+async fn manual_spare_replacement_uses_public_controls_and_semantic_waits() {
+    let fixture = Fixture::new("manual-spare-replacement");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::Stateful {
+        target: 3,
+        minimum: 3,
+    };
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::with_node_pool(config, 4).unwrap();
+    cluster
+        .set_recovery_mode(crate::RecoveryMode::Manual)
+        .unwrap();
+    cluster
+        .start_with_fm(&support::binary("fube-fm", "FUBE_FM_EXE"))
+        .await
+        .unwrap();
+    let result = peer_idle_catch(async {
+        let partition = cluster.status()["nodes"][0]["partition"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        cluster.create_partition("create", &partition, 1).await?;
+        cluster
+            .wait_operation("create", Duration::from_secs(30))
+            .await?;
+        let original = cluster.status();
+        let endpoint = original["nodes"][0]["endpoint"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        until(&mut cluster, |_| {
+            data_contact(&endpoint, b"read\n").starts_with("OK ")
+        })
+        .await;
+        assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+        cluster.kill_node("kill-member", 3).await?;
+        cluster
+            .execute(command("down-member", "node-down", Some(3)))
+            .await?;
+        let predecessor: crate::ReplicaRef =
+            serde_json::from_value(cluster.status()["node_failures"][0]["predecessor"].clone())
+                .map_err(err)?;
+        cluster
+            .reconfigure_partition("reconfigure", &partition, predecessor.clone())
+            .await?;
+        cluster
+            .wait_operation("reconfigure", Duration::from_secs(30))
+            .await?;
+        assert_eq!(cluster.status()["nodes"][3]["observed"], "absent");
+        cluster
+            .rebuild_replica("replace", &partition, predecessor, 4)
+            .await?;
+        cluster
+            .wait_operation("replace", Duration::from_secs(30))
+            .await?;
+        let restored = cluster.status();
+        assert_eq!(restored["replica_set"]["minimum"], 3);
+        for node in [0, 1, 3] {
+            assert_eq!(
+                restored["nodes"][node]["node_pid"],
+                original["nodes"][node]["node_pid"]
+            );
+            assert_eq!(
+                restored["nodes"][node]["app_pid"],
+                original["nodes"][node]["app_pid"]
+            );
+        }
+        cluster.kill_node("kill-secondary", 2).await?;
+        assert!(data_contact(&endpoint, b"write 2\n").contains("committed=2"));
+        cluster
+            .execute(command("down-secondary", "node-down", Some(2)))
+            .await?;
+        Ok::<(), String>(())
+    })
+    .await;
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn owned_stop_and_kill_controls_never_retarget_a_restarted_node() {
+    let fixture = Fixture::new("owned-node-controls");
+    let mut cluster = Cluster::new(fixture.config()).unwrap();
+    cluster
+        .set_recovery_mode(crate::RecoveryMode::Manual)
+        .unwrap();
+    cluster.start().await.unwrap();
+    let result = peer_idle_catch(async {
+        let original = cluster.status()["nodes"][0].clone();
+        let partition = original["partition"].as_str().unwrap();
+        let pid = cluster.manager.children[0].node_pid;
+        cluster.manager.children[0].node_pid += 1;
+        assert!(cluster.kill_node("foreign-owner", 1).await.is_err());
+        cluster.manager.children[0].node_pid = pid;
+        assert!(cluster.kill_node("zero-node", 0).await.is_err());
+        cluster.create_partition("create", partition, 1).await?;
+        cluster
+            .wait_operation("create", Duration::from_secs(12))
+            .await?;
+        let stop = cluster.stop_node("stop", 1).await?;
+        assert_eq!(stop["forced"], false);
+        assert_eq!(stop["node_down"], "not_reported");
+        assert!(cluster.status()["node_failures"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(cluster.wait_operation("stop", Duration::ZERO).await?, stop);
+        cluster
+            .execute(command("down", "node-down", Some(1)))
+            .await?;
+        assert_eq!(
+            cluster.wait_operation("down", Duration::ZERO).await?["state"],
+            "down"
+        );
+        cluster
+            .execute(command("restart", "restart-node", Some(1)))
+            .await?;
+        let restarted = cluster.status()["nodes"][0].clone();
+        assert_ne!(restarted["node_instance"], original["node_instance"]);
+        assert_eq!(cluster.stop_node("stop", 1).await?, stop);
+        assert!(cluster.kill_node("stop", 1).await.is_err());
+        cluster
+            .create_partition("after-replay", partition, 1)
+            .await?;
+        cluster
+            .wait_operation("after-replay", Duration::from_secs(12))
+            .await?;
+        assert_eq!(
+            cluster.status()["nodes"][0]["node_pid"],
+            restarted["node_pid"]
+        );
+        let kill = cluster.kill_node("kill", 1).await?;
+        assert_eq!(kill["forced"], true);
+        assert_eq!(kill["node_down"], "not_reported");
+        cluster
+            .execute(command("down-again", "node-down", Some(1)))
+            .await?;
+        Ok::<(), String>(())
+    })
+    .await;
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn operation_wait_deadline_does_not_cancel_or_complete_pending_work() {
+    let fixture = Fixture::new("operation-wait-deadline");
+    let mut cluster = Cluster::new(fixture.config()).unwrap();
+    cluster.manager.ledger.operations.push(fm::Operation {
+        command: command("pending", "create", Some(1)),
+        outcome: json!({"op":"pending","state":"pending"}),
+    });
+    assert!(cluster
+        .wait_operation("pending", Duration::from_millis(10))
+        .await
+        .unwrap_err()
+        .contains("does not cancel"));
+    assert_eq!(cluster.manager.ledger.result("pending")["state"], "pending");
+    assert!(cluster
+        .wait_operation("missing", Duration::ZERO)
+        .await
+        .unwrap_err()
+        .contains("not retained"));
+    assert!(cluster
+        .wait_operation("pending", Duration::MAX)
+        .await
+        .is_err());
+    cluster
+        .manager
+        .ledger
+        .complete("pending", json!({"op":"pending","state":"complete"}));
+    assert_eq!(
+        cluster
+            .wait_operation("pending", Duration::ZERO)
+            .await
+            .unwrap()["state"],
+        "complete"
+    );
+    assert_eq!(cluster.manager.ledger.operations.len(), 1);
+    assert_eq!(cluster.shutdown().await["clean"], true);
+}
+
+#[tokio::test]
+async fn operation_wait_reports_original_failure_uncertainty_and_cancellation() {
+    let fixture = Fixture::new("operation-wait-failure");
+    let mut cluster = Cluster::new(fixture.config()).unwrap();
+    for state in ["failed", "unknown", "cancelled", "rejected"] {
+        cluster.manager.ledger.operations.push(fm::Operation {
+            command: command(state, "create", Some(1)),
+            outcome: json!({"op":state,"state":state,"error":"original owner ended"}),
+        });
+        let error = cluster
+            .wait_operation(state, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains(state) && error.contains("original owner ended"),
+            "{error}"
+        );
+    }
+    assert_eq!(cluster.shutdown().await["clean"], true);
+}
+
 fn proof(ledger: &Ledger, index: usize) -> NodeDownReceipt {
     let p = &ledger.placements[index];
     NodeDownReceipt {
@@ -450,21 +656,27 @@ async fn manual_stateless_rejoin_waits_for_partition_scoped_recreation() {
         .await
         .unwrap();
     let result = peer_idle_catch(async {
-        let partition = cluster.manager.children[0].launch.partition.clone();
-        cluster.create_partition("create", &partition, 1).await?;
-        until(&mut cluster, |c| {
-            c.status()["nodes"][0]["observed"] == "running"
-        })
-        .await;
-        let predecessor = replica_ref(&cluster.manager.ledger, 0);
-        cluster.processes[0]
-            .as_mut()
+        let partition = cluster.status()["nodes"][0]["partition"]
+            .as_str()
             .unwrap()
-            .cleanup()
-            .map_err(err)?;
+            .to_string();
+        cluster.create_partition("create", &partition, 1).await?;
+        cluster
+            .wait_operation("create", Duration::from_secs(12))
+            .await?;
+        let stopped = cluster.stop_node("stop", 1).await?;
+        assert_eq!(stopped["forced"], false);
+        assert_eq!(stopped["node_down"], "not_reported");
+        assert!(cluster.status()["node_failures"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         cluster
             .execute(command("down", "node-down", Some(1)))
             .await?;
+        let predecessor: crate::ReplicaRef =
+            serde_json::from_value(cluster.status()["node_failures"][0]["predecessor"].clone())
+                .map_err(err)?;
         let restart = cluster
             .execute(command("restart", "restart-node", Some(1)))
             .await?;
@@ -473,7 +685,10 @@ async fn manual_stateless_rejoin_waits_for_partition_scoped_recreation() {
             cluster.drive().await;
         }
         assert_eq!(cluster.status()["nodes"][0]["observed"], "absent");
-        let other_partition = cluster.manager.children[1].launch.partition.clone();
+        let other_partition = cluster.status()["nodes"][1]["partition"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(cluster
             .rebuild_replica("wrong-partition", &other_partition, predecessor.clone(), 1)
             .await
@@ -481,10 +696,9 @@ async fn manual_stateless_rejoin_waits_for_partition_scoped_recreation() {
         cluster
             .rebuild_replica("rebuild", &partition, predecessor.clone(), 1)
             .await?;
-        until(&mut cluster, |c| {
-            c.status()["nodes"][0]["observed"] == "running"
-        })
-        .await;
+        cluster
+            .wait_operation("rebuild", Duration::from_secs(12))
+            .await?;
         assert_eq!(
             cluster
                 .rebuild_replica("rebuild", &partition, predecessor, 1)
@@ -530,12 +744,14 @@ async fn manual_minimum_sized_node_recovery_requires_each_control_and_preserves_
                 .set_recovery_mode(crate::RecoveryMode::Legacy)
                 .is_err());
             assert_eq!(cluster.status()["recovery_mode"], "manual");
-            let partition = cluster.manager.children[0].launch.partition.clone();
+            let partition = cluster.status()["nodes"][0]["partition"]
+                .as_str()
+                .unwrap()
+                .to_string();
             cluster.create_partition("create", &partition, 1).await?;
-            until(&mut cluster, |c| {
-                c.status()["configuration"]["ready"] == true
-            })
-            .await;
+            cluster
+                .wait_operation("create", Duration::from_secs(30))
+                .await?;
             let original = cluster.status();
             let endpoint = original["nodes"][0]["endpoint"]
                 .as_str()
@@ -554,15 +770,28 @@ async fn manual_minimum_sized_node_recovery_requires_each_control_and_preserves_
                 })
             })
             .await;
-            let predecessor = replica_ref(&cluster.manager.ledger, lost);
-            cluster.processes[lost]
-                .as_mut()
+            let node = (lost + 1) as u8;
+            let killed = cluster.kill_node("kill", node).await?;
+            assert_eq!(killed["node_down"], "not_reported");
+            assert!(cluster.status()["node_failures"]
+                .as_array()
                 .unwrap()
-                .cleanup()
-                .map_err(err)?;
+                .is_empty());
             cluster
                 .execute(command("down", "node-down", Some((lost + 1) as u8)))
                 .await?;
+            let predecessor: crate::ReplicaRef = serde_json::from_value(
+                cluster.status()["node_failures"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|failure| {
+                        failure["node"] == node && failure["instance"] == killed["node_instance"]
+                    })
+                    .unwrap()["predecessor"]
+                    .clone(),
+            )
+            .map_err(err)?;
             for _ in 0..10 {
                 cluster.drive().await;
             }
@@ -571,10 +800,9 @@ async fn manual_minimum_sized_node_recovery_requires_each_control_and_preserves_
             cluster
                 .reconfigure_partition("reconfigure", &partition, predecessor.clone())
                 .await?;
-            until(&mut cluster, |c| {
-                c.status()["configuration"]["ready"] == true
-            })
-            .await;
+            cluster
+                .wait_operation("reconfigure", Duration::from_secs(30))
+                .await?;
             let status = cluster.status();
             let primary = status["nodes"]
                 .as_array()
@@ -608,10 +836,9 @@ async fn manual_minimum_sized_node_recovery_requires_each_control_and_preserves_
                     .await?["replica"],
                 rebuild["replica"]
             );
-            until_with_budget(&mut cluster, Duration::from_secs(30), |c| {
-                c.status()["repair"]["ready"] == true
-            })
-            .await;
+            cluster
+                .wait_operation("rebuild", Duration::from_secs(30))
+                .await?;
             let status = cluster.status();
             assert_eq!(status["replica_set"]["minimum"], target);
             assert_eq!(
@@ -625,11 +852,21 @@ async fn manual_minimum_sized_node_recovery_requires_each_control_and_preserves_
             );
             assert!(data_contact(&endpoint, b"write 3\n").contains("committed=3"));
             if target == 3 && separate_fm {
-                cluster.restart_node((lost + 1) as u8).await?;
-                until_with_budget(&mut cluster, Duration::from_secs(30), |c| {
-                    c.status()["repair"]["ready"] == true
-                })
-                .await;
+                let bundled = cluster.restart_node(node).await?;
+                cluster
+                    .wait_operation(
+                        bundled["rebuild_operation"]
+                            .as_str()
+                            .ok_or("bundled restart did not retain a rebuild operation")?,
+                        Duration::from_secs(30),
+                    )
+                    .await?;
+                let restarted = cluster.status()["nodes"][lost]["node_instance"].clone();
+                assert_eq!(
+                    cluster.kill_node("kill", node).await?["node_instance"],
+                    killed["node_instance"]
+                );
+                assert_eq!(cluster.status()["nodes"][lost]["node_instance"], restarted);
                 assert!(data_contact(&endpoint, b"read\n").contains("committed=3"));
             }
             for node in 0..target as usize {

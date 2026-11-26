@@ -160,6 +160,23 @@ the surviving RAs describe its old incarnation as down before rebinding peers.
 Background FM driving still processes reports and advances/retries work that a
 command has already authorized.
 
+`stop-node` requests graceful termination through the original Node's private
+control capability. It waits for normal exit and Node-group retirement; a stop
+deadline does not silently escalate to a kill. `kill-node` explicitly forces
+cleanup through the retained `OwnedApp`, never a process reconstructed from a
+status PID. Both report physical Node-group completion only: neither reports
+NodeDown, proves application-group fencing, nor recreates a replica. Submit
+`node-down` separately to validate the complete failure evidence.
+
+```json
+{"op":"kill-1","action":"kill-node","node":1}
+{"op":"down-1","action":"node-down","node":1}
+```
+
+The matching Rust methods are `stop_node(op, node)` and `kill_node(op, node)`.
+Their operation IDs share the supervisor's retained control history: replaying
+an old stop/kill after rejoin cannot target the successor.
+
 The current service definitions, partition IDs, sizes and Node pool remain
 preconfigured. These controls do not add a dynamic service/partition catalog.
 Read `nodes[].partition` and the exact `node_failures[].predecessor` from status.
@@ -205,12 +222,43 @@ removal, with failure/unknown outcomes explicit. `create-partition` distinguishe
 opening from initial-membership completion. Cancellation does not imply
 destination deletion or disposal.
 
+Use `wait_operation(op, budget).await` for the retained semantic outcome rather
+than repeatedly polling readiness JSON. It drives embedded FM work or polls
+the separate FM, returns completed commands (including recorded NodeDown), and
+reports rejection, failure, cancellation, uncertainty and deadlines explicitly.
+An ordinary wait deadline does not cancel or replay the command. Timed-out
+separate-FM status observations retain their original request ID and partial
+write/read state for the next poll. If a deadline interrupts an embedded native
+send/reply handoff, control authority becomes Unknown and its original Links
+are retired; no completion or reconnect is invented.
+
+For a replicated manual scenario:
+
+```text
+kill_node("kill-1", 1)
+node-down("down-1", 1)
+reconfigure_partition("reconfigure-1", partition, exact_predecessor)
+wait_operation("reconfigure-1", budget)
+restart-node("restart-1", 1)
+rebuild_replica("rebuild-1", partition, exact_predecessor, 1)
+wait_operation("rebuild-1", budget)
+```
+
+Read the exact predecessor from the reported failure's status. The manual
+stateless, Primary/Secondary 3/3 and 4/4 scenarios use public process controls
+and semantic waits; application-data observations remain separate from command
+completion. Default/legacy scenarios remain compatibility coverage.
+
 Existing repair/replacement helpers reuse the same ledger/native repair
 primitives. `restart_node` remains a bundled library convenience workflow;
 `restart_node_infrastructure` is the process-only primitive. Existing foreground
 `restart-node` keeps its bundled behavior under `legacy`, while manual mode
 uses the process-only primitive. No existing default profile silently switches
 policy.
+
+The bundled library restart result exposes `rebuild_operation` when it
+authorizes restoration, so its actual recovery can also be awaited by operation
+ID instead of global repair readiness.
 
 ## Service profiles
 

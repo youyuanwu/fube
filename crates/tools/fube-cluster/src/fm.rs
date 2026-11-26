@@ -29,6 +29,13 @@ pub struct Command {
     pub operation: Option<String>,
 }
 impl Command {
+    pub(crate) fn supervisor_control(&self) -> bool {
+        matches!(
+            self.action.as_str(),
+            "node-down" | "restart-node" | "stop-node" | "kill-node"
+        )
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.op.is_empty()
             || self.op.len() > 64
@@ -70,7 +77,7 @@ impl Command {
             return Err("control fields do not match the command action".into());
         }
         match (self.action.as_str(), self.node) {
-            ("node-down" | "restart-node", Some(1..=64)) => Ok(()),
+            ("node-down" | "restart-node" | "stop-node" | "kill-node", Some(1..=64)) => Ok(()),
             ("create" | "delete" | "activate" | "deactivate", Some(1 | 2)) | ("status" | "quit", None) => Ok(()),
             _ => Err("expected create/delete/activate/deactivate with node 1|2, or status/quit without node".into()),
         }
@@ -2789,7 +2796,7 @@ impl Ledger {
     }
     pub fn accept(&mut self, command: Command) -> Result<Accepted> {
         command.validate()?;
-        if matches!(command.action.as_str(), "node-down" | "restart-node") {
+        if command.supervisor_control() {
             return Err(
                 "Node controls require the original process supervisor and fencing proof".into(),
             );

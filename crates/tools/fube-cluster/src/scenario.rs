@@ -8,6 +8,7 @@ use crate::{
 use fube_ra::protocol::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::time::Duration;
 use tokio::time::Instant;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +30,95 @@ pub struct ReplicaRef {
 }
 
 impl Cluster {
+    pub async fn stop_node(&mut self, op: &str, node: u8) -> Result<Value> {
+        self.execute(Command {
+            op: op.into(),
+            action: "stop-node".into(),
+            node: Some(node),
+            ..Command::default()
+        })
+        .await
+    }
+
+    pub async fn kill_node(&mut self, op: &str, node: u8) -> Result<Value> {
+        self.execute(Command {
+            op: op.into(),
+            action: "kill-node".into(),
+            node: Some(node),
+            ..Command::default()
+        })
+        .await
+    }
+
+    /// Wait for the retained semantic outcome, never local submission or replica registration.
+    pub async fn wait_operation(&mut self, op: &str, budget: Duration) -> Result<Value> {
+        Command {
+            op: op.into(),
+            action: "status".into(),
+            ..Command::default()
+        }
+        .validate()?;
+        let deadline = Instant::now()
+            .checked_add(budget)
+            .ok_or("operation wait budget exceeds the clock range")?;
+        loop {
+            let status = self.status();
+            let outcome = status["operations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(status["node_controls"].as_array().into_iter().flatten())
+                .find(|outcome| outcome["op"] == op)
+                .ok_or_else(|| format!("operation {op} is not retained"))?;
+            match outcome["state"].as_str() {
+                Some("complete" | "down") => return Ok(outcome.clone()),
+                Some("rejected" | "failed" | "unknown" | "cancelled") => {
+                    return Err(format!(
+                        "operation {op} ended as {}: {}",
+                        outcome["state"], outcome["error"]
+                    ))
+                }
+                Some("pending") => {}
+                _ => {
+                    return Err(format!(
+                        "operation {op} has an invalid retained outcome: {outcome}"
+                    ))
+                }
+            }
+            if self.manager.finished.is_some() {
+                return Err(format!("cluster closed before operation {op} completed"));
+            }
+            if Instant::now() >= deadline || !self.poll_operation_progress(deadline).await? {
+                return Err(format!(
+                    "operation {op} wait deadline elapsed; waiting does not cancel the operation"
+                ));
+            }
+            tokio::time::sleep_until((Instant::now() + Duration::from_millis(5)).min(deadline))
+                .await;
+        }
+    }
+
+    async fn poll_operation_progress(&mut self, deadline: Instant) -> Result<bool> {
+        self.observe_node_owners();
+        if let Some(remote) = &mut self.remote {
+            if remote.poll_status_until(deadline).await?.is_none() {
+                return Ok(false);
+            }
+        } else if tokio::time::timeout_at(deadline, self.manager.drive())
+            .await
+            .is_err()
+        {
+            if self.manager.progressing_io {
+                let error = "operation wait interrupted native FM progress; original control authority is unknown";
+                self.manager.interrupt_progress(error);
+                return Err(error.into());
+            }
+            return Ok(false);
+        }
+        self.refresh_node_controls();
+        Ok(true)
+    }
+
     /// Select the recovery policy before any FM or Node is started.
     pub fn set_recovery_mode(&mut self, mode: RecoveryMode) -> Result<()> {
         if !self.manager.children.is_empty()

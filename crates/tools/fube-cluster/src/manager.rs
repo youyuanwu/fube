@@ -33,6 +33,7 @@ pub struct Manager {
     pub(crate) peer_idle_requested: bool,
     pub(crate) finished: Option<Value>,
     pub(crate) targets: Targets,
+    pub(crate) progressing_io: bool,
 }
 impl Manager {
     // Fence prior ordered ingress without claiming native completion or cancelling a consuming pump.
@@ -166,6 +167,7 @@ impl Manager {
             peer_idle_requested: false,
             finished: None,
             targets,
+            progressing_io: false,
         })
     }
 
@@ -286,7 +288,10 @@ impl Manager {
         let Some(incoming) = incoming else {
             return Ok(());
         };
-        self.receive_message(index, incoming).await
+        self.progressing_io = true;
+        let result = self.receive_message(index, incoming).await;
+        self.progressing_io = false;
+        result
     }
     pub(crate) async fn receive_message(
         &mut self,
@@ -501,11 +506,18 @@ impl Manager {
         Ok(())
     }
     pub async fn drive(&mut self) {
+        if self.progressing_io {
+            self.interrupt_progress(
+                "previous FM progress was interrupted; original control authority is unknown",
+            );
+            return;
+        }
         for index in 0..self.children.len() {
             if !self.ledger.placements[index].link_alive {
                 continue;
             }
             let result = self.pump(index).await;
+            self.progressing_io = true;
             let result = result.and_then(|()| self.read_retirement(index));
             let result = match result {
                 Ok(()) if self.ledger.generation_pending() => self.retry_generation(index).await,
@@ -547,7 +559,9 @@ impl Manager {
                 if let Some(link) = &self.children[index].link {
                     link.retire();
                 }
+                self.progressing_io = false;
             }
+            self.progressing_io = true;
         }
         if let Err(error) = self.advance_initial_membership().await {
             self.ledger.lost(0, error);
@@ -560,6 +574,21 @@ impl Manager {
                 .lost(self.ledger.repair_destination_index().unwrap_or(0), error);
         }
         self.ledger.refresh_scenario_operations();
+        self.progressing_io = false;
+    }
+
+    pub(crate) fn interrupt_progress(&mut self, error: &str) {
+        eprintln!("{error}");
+        for index in 0..self.children.len() {
+            if self.ledger.placements[index].link_alive {
+                self.ledger.lost(index, error.into());
+                if let Some(link) = &self.children[index].link {
+                    link.retire();
+                }
+            }
+        }
+        self.ledger.refresh_scenario_operations();
+        self.progressing_io = false;
     }
     pub(crate) async fn advance_initial_membership(&mut self) -> Result<()> {
         if self.profile.configured_sizes().is_none()

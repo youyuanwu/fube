@@ -48,6 +48,11 @@ manual reconfiguration can retain the fenced down member until a real copied
 replacement permits combined removal/admission without lowering minimum.
 Partition definitions and Node placements remain static; this adds neither
 dynamic service creation nor general multi-failure/persisted recovery.
+Owner-bound stop/kill controls separate physical Node termination from the
+subsequent explicit NodeDown report. Bounded semantic operation waits preserve
+original FM exchange identities across observational deadlines; migrated
+manual process scenarios no longer need private process handles or global
+configuration/repair readiness polling.
 
 The [cluster controls](../../crates/tools/fube-cluster/README.md#explicit-nodedown-and-restart)
 provide explicit `node-down` and `restart-node` commands. They are supervisor

@@ -148,6 +148,7 @@ impl Manager {
             return Err("restart completion requires an admitted current Node incarnation".into());
         }
         let restore_replica = self.ledger.restart_desired(index)? == Desired::Running;
+        let mut rebuild_operation = None;
         if restore_replica {
             let launch = self.children[index].launch.clone();
             let failure = self
@@ -165,8 +166,9 @@ impl Manager {
                 .body
                 .as_ref()
                 .ok_or("restarted Node had no replica to restore")?;
+            let op = format!("restart-rebuild-{}", launch.session);
             self.execute(Command {
-                op: format!("restart-rebuild-{}", launch.session),
+                op: op.clone(),
                 action: "rebuild-replica".into(),
                 node: Some((index + 1) as u8),
                 partition: Some(launch.partition),
@@ -179,16 +181,65 @@ impl Manager {
                 ..Command::default()
             })
             .await?;
+            rebuild_operation = Some(op);
         }
         Ok(
             json!({"state":if restore_replica {"pending"} else {"complete"},"kind":"node_restart","node":index + 1,
             "node_instance":self.children[index].launch.node.instance,
+            "rebuild_operation":rebuild_operation,
             "replica_recovery":if restore_replica {"pending"} else {"not_required"}}),
         )
     }
 }
 
 impl Cluster {
+    pub(crate) async fn terminate_node_owned(&mut self, node: u8, force: bool) -> Result<Value> {
+        let index = self.node_index(node)?;
+        let child = &self.manager.children[index];
+        let launch = child.launch.clone();
+        let process = self.processes[index]
+            .as_mut()
+            .ok_or("missing original Node process owner")?;
+        if child.node_pid != process.pid() || launch.parent_pid != std::process::id() {
+            return Err("Node process slot does not match its original launch owner".into());
+        }
+        let pid = process.pid();
+        if force {
+            process.cleanup().map_err(err)?;
+        } else {
+            if process.observed_exit().map_err(err)?.is_none() {
+                process_control::send(process, &launch, NodeControl::Stop {})?;
+            }
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(exit) = process.observed_exit().map_err(err)? {
+                    if !exit.success() {
+                        return Err(format!(
+                            "Node exited abnormally during graceful stop: {exit}"
+                        ));
+                    }
+                    if group_stopped(pid)? {
+                        process.cleanup().map_err(err)?;
+                        break;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err("graceful Node stop deadline; use an explicit kill-node control to force termination".into());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        let status = process.status();
+        if !status.reaped || !status.group_drained || !status.exit_observed {
+            return Err("owned Node termination did not prove process-group retirement".into());
+        }
+        Ok(
+            json!({"state":"complete","kind":if force {"node_kill"} else {"node_stop"},
+            "node":node,"node_instance":launch.node.instance,"node_pid":pid,
+            "node_group_drained":true,"forced":status.cleanup_forced,"node_down":"not_reported"}),
+        )
+    }
+
     pub(crate) fn refresh_node_controls(&mut self) {
         if !self.driver_commands.iter().any(|(command, result)| {
             command.action == "restart-node"

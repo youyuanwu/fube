@@ -170,7 +170,7 @@ impl Cluster {
                 "interrupted Node control cannot be replayed; inspect current ownership".into(),
             );
         }
-        if matches!(command.action.as_str(), "node-down" | "restart-node") {
+        if command.supervisor_control() {
             if self.driver_commands.len() == 64 {
                 return Err("64 driver operation identities retained; capacity exhausted".into());
             }
@@ -186,13 +186,16 @@ impl Cluster {
                 return Err("operation identity is already owned by an FM command".into());
             }
             self.driver_commands.push((command.clone(), None));
-            let result = if command.action == "node-down" {
-                self.node_down(command.node.unwrap()).await
-            } else if self.manager.ledger.recovery_mode == RecoveryMode::Manual {
-                self.restart_node_infrastructure(command.node.unwrap())
-                    .await
-            } else {
-                self.restart_node(command.node.unwrap()).await
+            let node = command.node.unwrap();
+            let result = match command.action.as_str() {
+                "node-down" => self.node_down(node).await,
+                "stop-node" => self.terminate_node_owned(node, false).await,
+                "kill-node" => self.terminate_node_owned(node, true).await,
+                "restart-node" if self.manager.ledger.recovery_mode == RecoveryMode::Manual => {
+                    self.restart_node_infrastructure(node).await
+                }
+                "restart-node" => self.restart_node(node).await,
+                _ => unreachable!(),
             }
             .map(|mut result| {
                 result["op"] = json!(command.op);
@@ -234,6 +237,17 @@ impl Cluster {
     }
 
     pub async fn drive(&mut self) {
+        self.observe_node_owners();
+        if let Some(remote) = &mut self.remote {
+            // A failed exchange is retained as control uncertainty in every status.
+            let _retained_result = remote.request(management::Operation::Status).await;
+        } else {
+            self.manager.drive().await;
+        }
+        self.refresh_node_controls();
+    }
+
+    pub(crate) fn observe_node_owners(&mut self) {
         for (index, process) in self.processes.iter_mut().enumerate() {
             if self.manager.children.get(index).is_some_and(|child| {
                 self.fenced_nodes
@@ -248,13 +262,6 @@ impl Cluster {
                 }
             }
         }
-        if let Some(remote) = &mut self.remote {
-            // A failed exchange is retained as control uncertainty in every status.
-            let _retained_result = remote.request(management::Operation::Status).await;
-        } else {
-            self.manager.drive().await;
-        }
-        self.refresh_node_controls();
     }
 
     pub async fn update_service(&mut self, index: usize, service: Service) -> Result<()> {
