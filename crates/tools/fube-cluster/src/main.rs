@@ -248,6 +248,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn obsolete_recovery_mode_flags_are_rejected() {
+        let base = ["fube-cluster", "--root", "/root", "--app", "/app"];
+        assert!(Arguments::try_parse_from(base).is_ok());
+        for flag in ["--manual-recovery", "--legacy-recovery"] {
+            assert!(Arguments::try_parse_from(base.into_iter().chain([flag])).is_err());
+        }
+    }
+
+    #[test]
     fn parses_foreground_profiles_and_original_internal_node() {
         for profile in ["--stateful-singleton", "--stateful-peer-idle"] {
             let args = Arguments::try_parse_from([

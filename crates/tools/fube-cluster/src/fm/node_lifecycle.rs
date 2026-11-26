@@ -99,16 +99,42 @@ impl Ledger {
         if let Some(repair) = &mut self.repair {
             repair.unknown = true;
         }
+        Ok(None)
+    }
+
+    pub(crate) fn reconfigure_node_down(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<DoReconfiguration>> {
+        let failure = self
+            .node_failures
+            .iter()
+            .rposition(|failure| failure.index == index)
+            .ok_or("reconfiguration requires confirmed NodeDown")?;
+        let lost = &self.node_failures[failure].receipt.node;
+        if self.swap.as_ref().is_some_and(|configuration| {
+            self.node_reconfiguration == Some(configuration.body.configuration.unit.current)
+                && configuration
+                    .body
+                    .configuration
+                    .replicas
+                    .0
+                    .iter()
+                    .any(|r| r.node == *lost && !r.up)
+        }) {
+            return Ok(None);
+        }
         match self.node_down_configuration(index) {
             Ok(body) => {
                 self.install_primary_failover(body.clone(), Instant::now())?;
                 self.node_reconfiguration = Some(body.configuration.unit.current);
+                self.node_failures[failure].recovery_error = None;
                 Ok(Some(body))
             }
             Err(error) => {
                 eprintln!("NodeDown recorded; replica recovery blocked: {error}");
-                self.node_failures.last_mut().unwrap().recovery_error = Some(error);
-                Ok(None)
+                self.node_failures[failure].recovery_error = Some(error.clone());
+                Err(error)
             }
         }
     }
@@ -131,7 +157,14 @@ impl Ledger {
             .latest_completed_configuration()
             .ok_or("missing completed membership")?;
         let previous = active.reply.as_ref().unwrap();
-        let lost = &self.placements[index].launch.node;
+        let lost = &self
+            .node_failures
+            .iter()
+            .rev()
+            .find(|f| f.index == index)
+            .ok_or("missing NodeDown lineage")?
+            .receipt
+            .node;
         if !previous.replicas.0.iter().any(|r| &r.node == lost) {
             return Err("failed Node is not in the latest completed membership".into());
         }
@@ -145,9 +178,7 @@ impl Ledger {
             })
         };
         let survivors: Vec<_> = previous.replicas.0.iter().filter(available).collect();
-        if survivors.len() < previous.replicas.0.len() / 2 + 1
-            || survivors.len() < previous.unit.minimum as usize
-        {
+        if survivors.len() < previous.replicas.0.len() / 2 + 1 {
             return Err("insufficient surviving quorum/minimum for volatile Node recovery".into());
         }
         if survivors.len() + 1 != previous.replicas.0.len() {
@@ -178,7 +209,11 @@ impl Ledger {
         for replica in &mut body.configuration.replicas.0 {
             replica.previous_role = replica.current_role;
             if &replica.node == lost {
-                replica.current_role = 1;
+                replica.current_role = if survivors.len() >= previous.unit.minimum as usize {
+                    1
+                } else {
+                    3
+                };
                 replica.up = false;
                 replica.state = 3;
             } else if replica.node == primary.node {
@@ -223,25 +258,24 @@ impl Ledger {
         {
             return Err("Node restart waits for completed membership and inventory work".into());
         }
-        if let Some(error) = &failure.recovery_error {
-            return Err(format!("Node restart recovery is blocked: {error}"));
-        }
-        if failure
-            .body
-            .as_ref()
-            .is_some_and(|body| body.service.stateful)
-            && self.latest_completed_configuration().is_none_or(|c| {
-                c.reply
-                    .as_ref()
-                    .unwrap()
-                    .replicas
-                    .0
-                    .iter()
-                    .any(|r| r.node.id == placement.launch.node.id)
-            })
+        if placement.launch.profile.mesh_peers()
+            && failure.body.is_some()
+            && self
+                .latest_completed_configuration()
+                .is_none_or(|configuration| {
+                    configuration
+                        .reply
+                        .as_ref()
+                        .unwrap()
+                        .replicas
+                        .0
+                        .iter()
+                        .any(|replica| replica.node == proof.node && replica.up)
+                })
         {
             return Err(
-                "restart is waiting for completed removal of the old Node incarnation".into(),
+                "manual infrastructure restart waits for completed survivor failure metadata"
+                    .into(),
             );
         }
         let next = self
@@ -318,8 +352,15 @@ impl Ledger {
             .map_err(str::to_owned)
     }
 
-    pub(crate) fn begin_rejoined_replica(&mut self, index: usize) -> Result<bool> {
-        let target = &self.placements[index];
+    pub(crate) fn begin_node_replica_rebuild(
+        &mut self,
+        index: usize,
+        destination: usize,
+    ) -> Result<bool> {
+        let target = self
+            .placements
+            .get(destination)
+            .ok_or("unknown rebuild destination")?;
         if self
             .repair
             .as_ref()
@@ -330,11 +371,8 @@ impl Ledger {
         let failure = self
             .node_failures
             .iter()
-            .find(|f| {
-                f.replacement
-                    .as_ref()
-                    .is_some_and(|l| l.node == target.launch.node)
-            })
+            .rev()
+            .find(|f| f.index == index)
             .ok_or("missing rejoined Node lineage")?;
         let predecessor = failure
             .body
@@ -352,13 +390,45 @@ impl Ledger {
                 .is_some_and(|r| r.configuration.as_ref().is_none_or(|c| c.reply.is_none()))
             || target.bootstrap != Bootstrap::Admitted
             || !target.link_alive
+            || !target.activated
+            || !target.type_enabled
+            || target.node_control.is_some()
+            || target.pending.is_some()
+            || target.service_update.is_some()
+            || active.unknown
             || previous
                 .replicas
                 .0
                 .iter()
-                .any(|r| r.node.id == target.launch.node.id)
+                .any(|r| r.node.id == target.launch.node.id && r.up)
+            || target.created
+            || (destination == index
+                && failure
+                    .replacement
+                    .as_ref()
+                    .is_none_or(|l| l.node != target.launch.node))
+            || previous
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.up && r.current_role >= 3)
+                .any(|r| {
+                    self.placements
+                        .iter()
+                        .find(|p| p.launch.node == r.node)
+                        .is_none_or(|p| {
+                            !p.link_alive || p.loss_reported || p.observed != Observed::Running
+                        })
+                })
+            || previous
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.up && r.current_role >= 3)
+                .count()
+                < previous.replicas.0.len() / 2 + 1
         {
-            return Err("rejoined replica requires admitted fresh inventory and completed old membership removal".into());
+            return Err("rebuild requires admitted fresh inventory, completed failure reconfiguration and a live majority".into());
         }
         let mut build = target.body()?;
         build.unit = previous.unit.clone();
@@ -391,7 +461,7 @@ impl Ledger {
             superseded_by: None,
             unknown: false,
         };
-        let placement = &mut self.placements[index];
+        let placement = &mut self.placements[destination];
         placement.active_unit = Some(build.unit);
         placement.service_description = Some(build.service);
         placement.ready_replica = Some(build.replica);

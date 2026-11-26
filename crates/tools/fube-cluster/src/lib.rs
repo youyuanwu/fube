@@ -6,6 +6,7 @@ mod node;
 mod process_control;
 mod profile;
 mod restart;
+mod scenario;
 pub(crate) use fube_node::control::wire;
 
 pub use fm::Command;
@@ -13,6 +14,7 @@ pub use management::run as run_fm;
 use manager::Manager;
 pub use profile::Result;
 pub use profile::ServiceProfile;
+pub use scenario::{RecoveryMode, ReplicaRef};
 
 use fm::Bootstrap;
 #[cfg(test)]
@@ -168,7 +170,7 @@ impl Cluster {
                 "interrupted Node control cannot be replayed; inspect current ownership".into(),
             );
         }
-        if matches!(command.action.as_str(), "node-down" | "restart-node") {
+        if command.supervisor_control() {
             if self.driver_commands.len() == 64 {
                 return Err("64 driver operation identities retained; capacity exhausted".into());
             }
@@ -184,10 +186,13 @@ impl Cluster {
                 return Err("operation identity is already owned by an FM command".into());
             }
             self.driver_commands.push((command.clone(), None));
-            let result = if command.action == "node-down" {
-                self.node_down(command.node.unwrap()).await
-            } else {
-                self.restart_node(command.node.unwrap()).await
+            let node = command.node.unwrap();
+            let result = match command.action.as_str() {
+                "node-down" => self.node_down(node).await,
+                "stop-node" => self.terminate_node_owned(node, false).await,
+                "kill-node" => self.terminate_node_owned(node, true).await,
+                "restart-node" => self.restart_node_infrastructure(node).await,
+                _ => unreachable!(),
             }
             .map(|mut result| {
                 result["op"] = json!(command.op);
@@ -200,12 +205,27 @@ impl Cluster {
                 .1 = Some(result.clone());
             return result;
         }
+        self.execute_fm_command(command).await
+    }
+
+    pub(crate) async fn execute_fm_command(&mut self, command: Command) -> Result<Value> {
+        if self.manager.finished.is_some() {
+            return Err("deployment already shut down".into());
+        }
+        command.validate()?;
+        if self
+            .driver_commands
+            .iter()
+            .any(|(original, _)| original.op == command.op)
+        {
+            return Err("operation identity is already owned by a Node control".into());
+        }
         if let Some(remote) = &mut self.remote {
             let mut outcome = remote
                 .request(management::Operation::Command { command })
                 .await?;
             if outcome.get("status").is_some() {
-                outcome["status"] = remote.status();
+                outcome["status"] = self.status();
             }
             Ok(outcome)
         } else {
@@ -214,6 +234,17 @@ impl Cluster {
     }
 
     pub async fn drive(&mut self) {
+        self.observe_node_owners();
+        if let Some(remote) = &mut self.remote {
+            // A failed exchange is retained as control uncertainty in every status.
+            let _retained_result = remote.request(management::Operation::Status).await;
+        } else {
+            self.manager.drive().await;
+        }
+        self.refresh_node_controls();
+    }
+
+    pub(crate) fn observe_node_owners(&mut self) {
         for (index, process) in self.processes.iter_mut().enumerate() {
             if self.manager.children.get(index).is_some_and(|child| {
                 self.fenced_nodes
@@ -228,13 +259,6 @@ impl Cluster {
                 }
             }
         }
-        if let Some(remote) = &mut self.remote {
-            // A failed exchange is retained as control uncertainty in every status.
-            let _retained_result = remote.request(management::Operation::Status).await;
-        } else {
-            self.manager.drive().await;
-        }
-        self.refresh_node_controls();
     }
 
     pub async fn update_service(&mut self, index: usize, service: Service) -> Result<()> {
@@ -384,6 +408,7 @@ impl Cluster {
                 &management::Manifest {
                     schema_version: 1,
                     launches,
+                    recovery_mode: self.manager.ledger.recovery_mode,
                 },
             )?;
             self.remote = Some(management::Client::new());
@@ -979,7 +1004,8 @@ mod tests {
                 ledger.result("create"),
                 json!({
                     "op":"create", "state":"error", "native_error":-7,
-                    "replica":1, "incarnation":801
+                    "replica":1, "incarnation":801,
+                    "node_instance":ledger.placements[0].launch.node.instance
                 })
             );
             assert_eq!(ledger.placements[0].observed, Observed::Error);
@@ -1012,7 +1038,8 @@ mod tests {
                 ledger.result("delete"),
                 json!({
                     "op":"delete", "state":"complete", "observed":"absent",
-                    "replica":1, "incarnation":801, "cleanup":"verified_original_instance"
+                    "replica":1, "incarnation":801, "cleanup":"verified_original_instance",
+                    "node_instance":ledger.placements[0].launch.node.instance
                 })
             );
 
@@ -1034,7 +1061,8 @@ mod tests {
                 ledger.result("delete2"),
                 json!({
                     "op":"delete2", "state":"error", "native_error":-7,
-                    "replica":2, "incarnation":802
+                    "replica":2, "incarnation":802,
+                    "node_instance":ledger.placements[1].launch.node.instance
                 })
             );
             assert_eq!(ledger.placements[1].observed, Observed::Error);

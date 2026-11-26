@@ -39,6 +39,74 @@ handoff rather than closing the FM connection.
 
 ## Explicit Node failure and cold rejoin
 
+The [Manual-only scenario policy](../../crates/tools/fube-cluster/README.md#manual-scenario-controls)
+separates failure reporting, survivor reconfiguration, infrastructure restart
+and partition-scoped replica rebuild. It uses the same FM operation ledger
+and RA/RAP native sequencing, not a second recovery engine. At 3/3 and 4/4,
+manual reconfiguration can retain the fenced down member until a real copied
+replacement permits combined removal/admission without lowering minimum.
+Partition definitions and Node placements remain static; this adds neither
+dynamic service creation nor general multi-failure/persisted recovery.
+Owner-bound stop/kill controls separate physical Node termination from the
+subsequent explicit NodeDown report. Bounded semantic operation waits preserve
+original FM exchange identities across observational deadlines; migrated
+manual process scenarios no longer need private process handles or global
+configuration/repair readiness polling.
+
+Manual app-host recovery keeps the original Node/RA sessions alive and does not
+report NodeDown. After native loss/deletion observations, Primary failover needs
+explicit partition reconfiguration and completion before original-Node rebuild;
+Secondary rebuild authorizes its removal/copy/admission sequence directly.
+The repeated configured Primary and Secondary app-host scenarios now use scoped
+commands and semantic operation waits, including lost-reply retries. They
+verify that observation alone authorizes neither failover nor fresh-host repair.
+Original-node minimum and unsupported multi-loss gates remain unchanged.
+
+The supported original-Node 3/2 cancellation scenario also uses Manual
+failover/rebuild/cancel commands and waits on the cancellation operation.
+Native removal completion settles that operation and cancels the original
+rebuild; destination deletion/disposal and older LFUM upload acknowledgments
+remain independent. Command replay does not reauthorize or resend native work.
+Cancellation during admission, Secondary/spare repair and successor recovery
+remain gated.
+
+Primary failover, Primary repair, repeated recovery and repair-deactivation
+LFUM overlap fixtures now use Manual scoped intent and operation waits.
+Old/current upload acknowledgments and local role/Close completion are checked
+independently: none can complete a pending failover or rebuild before the final
+native configuration reply. Deactivation can dispose a replica without restoring
+membership. Stable-generation separate-FM scenarios use the same Manual policy;
+native progress and ownership boundaries are retained.
+
+Manual foreground coverage exercises minimum-preserving 3/3 Primary recovery
+through JSON kill, NodeDown, partition reconfiguration, infrastructure restart
+and replica rebuild. Bounded polling selects the exact retained operation from
+FM or supervisor history; public status includes both. Replaying an old control
+cannot stop the successor, restart alone creates no service replica, and the
+rebuilt replica supplies a real vote after another Secondary is fenced.
+Manual is the library/CLI default and only policy; independent process/host
+cleanup remains covered.
+
+Stable post-handoff repair and sequential app-host spare replacement also use
+Manual scoped intent. Completed spare history fences resolved predecessors at
+reconfiguration/rebuild entry, and the shared spare primitive binds its chosen
+current loss to explicit intent before allocating or joining work. Healthy
+planned transfers retain their explicit existing workflows. The
+[migration coverage table](../../crates/tools/fube-cluster/README.md#recovery-migration-coverage)
+separates supported explicit recovery from unsupported broader recovery.
+Legacy scheduling and the old opt-in CLI flag are removed. FM manifests require
+an explicit Manual policy; missing or Legacy policy values reject rather than
+reinterpreting the original deployment.
+
+Bounded Primary loss during pending Secondary removal is also explicit:
+`supersede_rebuild` identifies the pending operation and exact new failed Primary.
+The original rebuild becomes terminal `superseded`, never ready; the new
+operation waits for native failover completion. Both read quorums, original
+live sessions and pre-replacement ownership remain required, including across
+the qualified LFUM overlap. Subsequent two-lineage restoration uses separate
+exact original-placement rebuild operations in the existing minimum-preserving
+order. Additional failures and authority loss do not gain recovery permission.
+
 The [cluster controls](../../crates/tools/fube-cluster/README.md#explicit-nodedown-and-restart)
 provide explicit `node-down` and `restart-node` commands. They are supervisor
 operations over private management IPC, not new FM/RA wire actions or a

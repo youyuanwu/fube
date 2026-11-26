@@ -14,27 +14,69 @@ use tokio::time::Instant;
 mod node_lifecycle;
 pub(crate) use node_lifecycle::NodeFailure;
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Command {
     pub op: String,
     pub action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor: Option<crate::ReplicaRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
 }
 impl Command {
+    pub(crate) fn supervisor_control(&self) -> bool {
+        matches!(
+            self.action.as_str(),
+            "node-down" | "restart-node" | "stop-node" | "kill-node"
+        )
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if self.op.is_empty()
-            || self.op.len() > 64
-            || !self
-                .op
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-        {
-            return Err("operation identity must be 1..64 ASCII identifier bytes".into());
+        for operation in std::iter::once(&self.op).chain(self.operation.iter()) {
+            if operation.is_empty()
+                || operation.len() > 64
+                || !operation
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+            {
+                return Err("operation identity must be 1..64 ASCII identifier bytes".into());
+            }
+        }
+        if let Some(partition) = &self.partition {
+            uuid::Uuid::parse_str(partition).map_err(crate::profile::err)?;
+        }
+        let scoped = self.partition.is_some();
+        let predecessor = self.predecessor.is_some();
+        let cancellation = self.operation.is_some();
+        if self.predecessor.as_ref().is_some_and(|predecessor| {
+            !(1..=64).contains(&predecessor.node)
+                || predecessor.node_instance == 0
+                || predecessor.replica <= 0
+                || predecessor.incarnation <= 0
+        }) {
+            return Err("invalid exact replica predecessor".into());
         }
         match (self.action.as_str(), self.node) {
-            ("node-down" | "restart-node", Some(1..=64)) => Ok(()),
+            ("create-partition", Some(1..=64)) if scoped && !predecessor && !cancellation => {
+                return Ok(())
+            }
+            ("reconfigure-partition", None) if scoped && predecessor => return Ok(()),
+            ("rebuild-replica", Some(1..=64)) if scoped && predecessor && !cancellation => {
+                return Ok(())
+            }
+            ("cancel-rebuild", None) if !scoped && !predecessor && cancellation => return Ok(()),
+            _ => {}
+        }
+        if scoped || predecessor || cancellation {
+            return Err("control fields do not match the command action".into());
+        }
+        match (self.action.as_str(), self.node) {
+            ("node-down" | "restart-node" | "stop-node" | "kill-node", Some(1..=64)) => Ok(()),
             ("create" | "delete" | "activate" | "deactivate", Some(1 | 2)) | ("status" | "quit", None) => Ok(()),
             _ => Err("expected create/delete/activate/deactivate with node 1|2, or status/quit without node".into()),
         }
@@ -116,6 +158,7 @@ pub struct Operation {
     pub outcome: Value,
 }
 pub struct Ledger {
+    pub(crate) recovery_mode: crate::RecoveryMode,
     pub placements: Vec<Placement>,
     pub operations: Vec<Operation>,
     pub(crate) generation: Option<GenerationHandshake>,
@@ -130,7 +173,7 @@ pub struct Ledger {
     configuration_history: Vec<ActiveConfiguration>,
     pub(crate) repair: Option<ReplicaRepair>,
     pub(crate) repair_history: Vec<ReplicaRepair>,
-    restoration: Option<[AddInstance; 2]>,
+    pub(crate) restoration: Option<[AddInstance; 2]>,
     pub(crate) node_failures: Vec<NodeFailure>,
     node_reconfiguration: Option<Epoch>,
 }
@@ -358,6 +401,10 @@ pub enum Accepted {
     Duplicate(Value),
     Create(usize, Box<AddInstance>),
     Delete(usize, Box<RemoveInstance>),
+    Reconfigure(Box<DoReconfiguration>),
+    Build,
+    Cancel(Box<RemoveReplica>),
+    Progress,
     Status,
     Quit,
 }
@@ -963,6 +1010,63 @@ impl Ledger {
             r.last_lsn = -1;
         }
         Ok(Some(body))
+    }
+
+    pub(crate) fn supersede_rebuild(
+        &mut self,
+        predecessor: usize,
+        operation: &str,
+        superseding_operation: &str,
+    ) -> Result<DoReconfiguration> {
+        let target = self
+            .operations
+            .iter()
+            .find(|target| target.command.op == operation)
+            .ok_or("unknown rebuild operation to supersede")?;
+        let repair = self
+            .repair
+            .as_ref()
+            .ok_or("no rebuild owner to supersede")?;
+        let removal = repair
+            .removal
+            .as_ref()
+            .ok_or("supersession requires pending Secondary removal")?;
+        if target.command.action != "rebuild-replica"
+            || !matches!(
+                target.outcome["state"].as_str(),
+                Some("pending" | "unknown")
+            )
+            || removal.reply.is_some()
+            || repair.base.is_some()
+            || repair.host_requested
+            || repair.profile.is_some()
+            || repair.build.reply.is_some()
+            || repair.configuration.is_some()
+            || json!(repair.build.body.replica.id) != target.outcome["replica"]
+            || json!(repair.build.body.replica.instance) != target.outcome["incarnation"]
+            || json!(repair.build.body.replica.node.instance) != target.outcome["node_instance"]
+            || !removal.body.configuration.replicas.0.iter().any(|replica| {
+                replica.node == self.placements[predecessor].launch.node
+                    && replica.id == self.placements[predecessor].replica
+                    && replica.instance == self.placements[predecessor].incarnation
+                    && replica.previous_role == 4
+                    && replica.current_role == 4
+            })
+        {
+            return Err("supersession must bind the original pending removal and exact failed Primary before replacement".into());
+        }
+        let mut outcome = target.outcome.clone();
+        let body = self.secondary_removal_failover()?.ok_or(
+            "supersession requires the original live sessions and both surviving read quorums",
+        )?;
+        self.install_primary_failover(body.clone(), Instant::now())?;
+        outcome["state"] = json!("superseded");
+        outcome["phase"] = json!("superseded");
+        outcome["superseded_by"] = json!(superseding_operation);
+        outcome["error"] =
+            json!("pending removal superseded by explicit Primary failure reconfiguration");
+        self.complete(operation, outcome);
+        Ok(body)
     }
 
     fn install_primary_failover(&mut self, body: DoReconfiguration, now: Instant) -> Result<()> {
@@ -2726,6 +2830,7 @@ impl Ledger {
     }
     pub fn new(launches: impl IntoIterator<Item = Launch>) -> Self {
         Self {
+            recovery_mode: crate::RecoveryMode::default(),
             placements: launches.into_iter().map(Placement::new).collect(),
             operations: vec![],
             generation: None,
@@ -2747,7 +2852,7 @@ impl Ledger {
     }
     pub fn accept(&mut self, command: Command) -> Result<Accepted> {
         command.validate()?;
-        if matches!(command.action.as_str(), "node-down" | "restart-node") {
+        if command.supervisor_control() {
             return Err(
                 "Node controls require the original process supervisor and fencing proof".into(),
             );
@@ -2769,17 +2874,30 @@ impl Ledger {
                 Err("operation identity reused with different canonical content".into())
             };
         }
-        if self.generation_pending() && !matches!(command.action.as_str(), "status" | "quit") {
+        if self.generation_pending()
+            && !matches!(command.action.as_str(), "status" | "quit")
+            && !(command.action == "reconfigure-partition" && command.operation.is_some())
+        {
             return Err("generation rebuild is awaiting LFUM upload; mutations disabled".into());
         }
-        if self.configuration.is_some() && !matches!(command.action.as_str(), "status" | "quit") {
+        let scenario = matches!(
+            command.action.as_str(),
+            "reconfigure-partition" | "rebuild-replica" | "cancel-rebuild"
+        );
+        if let Some(partition) = &command.partition {
+            self.validate_partition(partition)?;
+        }
+        if self.configuration.is_some()
+            && !scenario
+            && !matches!(command.action.as_str(), "status" | "quit")
+        {
             return Err("active-configuration lifecycle changes remain gated".into());
         }
         if self.placements[0].launch.profile.peer_replicas()
             && (matches!(
                 command.action.as_str(),
                 "delete" | "activate" | "deactivate"
-            ) || (command.action == "create"
+            ) || (matches!(command.action.as_str(), "create" | "create-partition")
                 && (command.node != Some(1) || self.placements[0].created)))
         {
             return Err("peer-idle profile admits only the original node1 Primary creation, status and quit".into());
@@ -2828,51 +2946,23 @@ impl Ledger {
                     },
                 )
             }
-            "create" => {
+            "create" | "create-partition" => {
                 let index = usize::from(command.node.unwrap() - 1);
-                let placement = &mut self.placements[index];
-                if placement.bootstrap != Bootstrap::Admitted
-                    || !placement.activated
-                    || !placement.type_enabled
-                    || placement.node_control.is_some()
-                    || !placement.link_alive
-                    || (placement.created && !placement.reusable)
+                let placement = &self.placements[index];
+                if command
+                    .partition
+                    .as_ref()
+                    .is_some_and(|partition| *partition != placement.launch.partition)
                 {
-                    return Err(
-                        "node unadmitted, uncertain, or predecessor cleanup not verified".into(),
-                    );
+                    return Err("creation destination belongs to another partition".into());
                 }
-                if placement.created {
-                    let replica = placement
-                        .replica
-                        .checked_add(1)
-                        .ok_or("replica identity exhausted")?;
-                    let incarnation = placement
-                        .incarnation
-                        .checked_add(1)
-                        .ok_or("instance identity exhausted")?;
-                    placement.replica = replica;
-                    placement.incarnation = incarnation;
+                if command.action == "create-partition"
+                    && placement.launch.profile.mesh_peers()
+                    && (index != 0 || self.placements.iter().any(|p| p.created))
+                {
+                    return Err("partition creation requires the unused profile's initial Primary placement".into());
                 }
-                let body = placement.body()?;
-                placement.created = true;
-                placement.reusable = false;
-                placement.retirement = None;
-                placement.loss_reported = false;
-                placement.remove_received = false;
-                placement.delete_op = None;
-                placement.endpoint = None;
-                placement.error = None;
-                placement.desired = Desired::Running;
-                placement.observed = Observed::Pending;
-                placement.create_op = Some(command.op.clone());
-                placement.pending = Some(PendingPhase::Create);
-                if placement.launch.profile.stateful() {
-                    let now = Instant::now();
-                    placement.action_updated_at = Some(now);
-                    placement.action_last_at = Some(now);
-                }
-                Accepted::Create(index, Box::new(body))
+                self.begin_creation(index, &command.op)?
             }
             "delete" => {
                 let index = usize::from(command.node.unwrap() - 1);
@@ -2915,16 +3005,158 @@ impl Ledger {
             }
             "status" => Accepted::Status,
             "quit" => Accepted::Quit,
+            "reconfigure-partition" => {
+                let body = if let Some(operation) = &command.operation {
+                    let predecessor = self.predecessor_index(
+                        command.partition.as_ref().unwrap(),
+                        command.predecessor.as_ref().unwrap(),
+                    )?;
+                    Some(self.supersede_rebuild(predecessor, operation, &command.op)?)
+                } else {
+                    self.reconfigure_failed_replica(
+                        command.partition.as_ref().unwrap(),
+                        command.predecessor.as_ref().unwrap(),
+                    )?
+                };
+                match body {
+                    Some(body) => Accepted::Reconfigure(Box::new(body)),
+                    None => Accepted::Progress,
+                }
+            }
+            "rebuild-replica" => self.begin_explicit_rebuild(
+                command.partition.as_ref().unwrap(),
+                command.predecessor.as_ref().unwrap(),
+                usize::from(command.node.unwrap() - 1),
+                &command.op,
+            )?,
+            "cancel-rebuild" => {
+                let target = self
+                    .operations
+                    .iter()
+                    .find(|op| Some(&op.command.op) == command.operation.as_ref())
+                    .ok_or("unknown rebuild operation")?;
+                if target.command.action != "rebuild-replica"
+                    || target.outcome["state"] != "pending"
+                    || self.repair.as_ref().is_none_or(|repair| {
+                        json!(repair.build.body.replica.id) != target.outcome["replica"]
+                            || json!(repair.build.body.replica.instance)
+                                != target.outcome["incarnation"]
+                            || json!(repair.build.body.replica.node.instance)
+                                != target.outcome["node_instance"]
+                    })
+                {
+                    return Err("cancellation does not identify the current pending rebuild".into());
+                }
+                Accepted::Cancel(Box::new(self.cancel_repair_build(Instant::now())?))
+            }
             _ => unreachable!(),
         };
         let mut outcome = json!({"op":command.op,"state":"pending"});
+        if let Some(partition) = &command.partition {
+            outcome["partition"] = json!(partition);
+        }
         if let Some(node) = command.node {
             let placement = &self.placements[usize::from(node - 1)];
             outcome["replica"] = json!(placement.replica);
             outcome["incarnation"] = json!(placement.incarnation);
+            outcome["node_instance"] = json!(placement.launch.node.instance);
+        }
+        if scenario {
+            if command.action == "reconfigure-partition" {
+                outcome["epoch"] = self.configuration_status()["request"]["configuration"]["unit"]
+                    ["current"]
+                    .clone();
+                if let Some(operation) = &command.operation {
+                    outcome["operation"] = json!(operation);
+                }
+            }
+            if command.action == "rebuild-replica"
+                && self.placements[usize::from(command.node.unwrap() - 1)]
+                    .launch
+                    .profile
+                    .stateful()
+            {
+                let build = &self
+                    .repair
+                    .as_ref()
+                    .ok_or("rebuild did not retain a repair owner")?
+                    .build
+                    .body
+                    .replica;
+                outcome["replica"] = json!(build.id);
+                outcome["incarnation"] = json!(build.instance);
+                outcome["node_instance"] = json!(build.node.instance);
+                outcome["phase"] = json!("building");
+            }
+            if command.action == "cancel-rebuild" {
+                let build = &self
+                    .repair
+                    .as_ref()
+                    .ok_or("missing cancelled repair owner")?
+                    .build
+                    .body
+                    .replica;
+                outcome["replica"] = json!(build.id);
+                outcome["incarnation"] = json!(build.instance);
+                outcome["node_instance"] = json!(build.node.instance);
+                outcome["operation"] = json!(command.operation);
+                outcome["phase"] = json!("removing");
+            }
         }
         self.operations.push(Operation { outcome, command });
         Ok(accepted)
+    }
+    pub(crate) fn begin_creation(&mut self, index: usize, op: &str) -> Result<Accepted> {
+        if self.placements[index].launch.profile.stateful()
+            && self.node_failures.iter().any(|failure| {
+                failure.index == index
+                    && failure.body.is_some()
+                    && failure.desired == Desired::Running
+            })
+        {
+            return Err("an existing stateful partition requires survivor rebuild; data-loss recreation is not enabled".into());
+        }
+        let placement = &mut self.placements[index];
+        if placement.bootstrap != Bootstrap::Admitted
+            || !placement.activated
+            || !placement.type_enabled
+            || placement.node_control.is_some()
+            || !placement.link_alive
+            || (placement.created && !placement.reusable)
+        {
+            return Err("node unadmitted, uncertain, or predecessor cleanup not verified".into());
+        }
+        if placement.created {
+            let replica = placement
+                .replica
+                .checked_add(1)
+                .ok_or("replica identity exhausted")?;
+            let incarnation = placement
+                .incarnation
+                .checked_add(1)
+                .ok_or("instance identity exhausted")?;
+            placement.replica = replica;
+            placement.incarnation = incarnation;
+        }
+        let body = placement.body()?;
+        placement.created = true;
+        placement.reusable = false;
+        placement.retirement = None;
+        placement.loss_reported = false;
+        placement.remove_received = false;
+        placement.delete_op = None;
+        placement.endpoint = None;
+        placement.error = None;
+        placement.desired = Desired::Running;
+        placement.observed = Observed::Pending;
+        placement.create_op = Some(op.into());
+        placement.pending = Some(PendingPhase::Create);
+        if placement.launch.profile.stateful() {
+            let now = Instant::now();
+            placement.action_updated_at = Some(now);
+            placement.action_last_at = Some(now);
+        }
+        Ok(Accepted::Create(index, Box::new(body)))
     }
     pub fn result(&self, op: &str) -> Value {
         self.operations
@@ -3054,7 +3286,13 @@ impl Ledger {
             .iter_mut()
             .find(|item| item.command.op == op)
         {
-            for key in ["replica", "incarnation"] {
+            for key in [
+                "replica",
+                "incarnation",
+                "partition",
+                "node_instance",
+                "epoch",
+            ] {
                 if outcome.get(key).is_none() {
                     if let Some(value) = operation.outcome.get(key) {
                         outcome[key] = value.clone();
@@ -3062,6 +3300,13 @@ impl Ledger {
                 }
             }
             operation.outcome = outcome;
+            if operation.outcome["state"] == "complete" {
+                if operation.command.action == "create-partition" {
+                    operation.outcome["phase"] = json!("membership_ready");
+                } else if operation.command.action == "rebuild-replica" {
+                    operation.outcome["phase"] = json!("ready");
+                }
+            }
         }
     }
     pub fn lost(&mut self, index: usize, error: String) {
@@ -3510,6 +3755,7 @@ impl Ledger {
     }
     pub fn status(&self) -> Value {
         json!({"nodes":self.placements.iter().map(Placement::status).collect::<Vec<_>>(),
+            "recovery_mode":self.recovery_mode,
             "replica_set":self.placements[0].launch.profile.configured_sizes().map(|(target, minimum)|
                 json!({"target":target,"minimum":minimum,"immutable":true})),
             "idle_build":self.idle_status(),
@@ -3522,6 +3768,11 @@ impl Ledger {
             "node_failures":self.node_failures.iter().map(|failure| json!({
                 "node":failure.index + 1,"instance":failure.receipt.node.instance,
                 "session":failure.receipt.session,"recovery_error":failure.recovery_error,
+                "partition":self.placements[failure.index].launch.partition,
+                "predecessor":failure.body.as_ref().map(|body| crate::ReplicaRef {
+                    node:(failure.index + 1) as u8, node_instance:failure.receipt.node.instance,
+                    replica:body.replica.id, incarnation:body.replica.instance,
+                }),
                 "replacement_instance":failure.replacement.as_ref().map(|launch| launch.node.instance)
             })).collect::<Vec<_>>(),
             "operations":self.operations.iter().map(|op|
@@ -3608,16 +3859,40 @@ impl Ledger {
             .position(|p| p.launch.node == repair.build.body.replica.node)
     }
 
-    pub fn begin_spare_replacement(&mut self, destination: usize, now: Instant) -> Result<bool> {
+    pub fn begin_spare_replacement(
+        &mut self,
+        destination: usize,
+        predecessor: Option<usize>,
+        now: Instant,
+    ) -> Result<bool> {
         let profile = self.placements[0].launch.profile;
         if profile.configured_sizes().is_none() || destination >= self.placements.len() {
             return Err("replacement requires an explicit configured spare placement".into());
         }
+        let predecessor_node = match predecessor {
+            Some(index) => Some(
+                self.placements
+                    .get(index)
+                    .ok_or("unknown rebuild predecessor placement")?
+                    .launch
+                    .node
+                    .clone(),
+            ),
+            None => None,
+        };
         if let Some(repair) = &self.repair {
             if repair.uses_spare()
                 && self.repair_destination_index() == Some(destination)
                 && !repair.unknown
             {
+                if predecessor_node
+                    .as_ref()
+                    .is_some_and(|node| *node != repair.predecessor.replica.node)
+                {
+                    return Err(
+                        "rebuild predecessor does not identify this spare-replacement owner".into(),
+                    );
+                }
                 return Ok(false);
             }
             if !repair.uses_spare()
@@ -3657,6 +3932,15 @@ impl Ledger {
                     .into(),
             );
         };
+        if predecessor_node
+            .as_ref()
+            .is_some_and(|node| *node != lost.launch.node)
+        {
+            return Err(
+                "rebuild predecessor is not the lost member of the latest completed membership"
+                    .into(),
+            );
+        }
         let retained = previous
             .replicas
             .0
@@ -3864,7 +4148,7 @@ impl Ledger {
         })
     }
 
-    fn known_spare_loss(&self, placement: &Placement) -> bool {
+    pub(crate) fn known_spare_loss(&self, placement: &Placement) -> bool {
         placement.loss_reported
             && placement.remove_received
             && self.repair.iter().chain(&self.repair_history).any(|r| {
@@ -3887,6 +4171,14 @@ impl Ledger {
 
     fn repair_members_live(&self) -> bool {
         self.placements.iter().all(|p| {
+            if self.repair.as_ref().is_some_and(|repair| {
+                repair.predecessor.replica.node == p.launch.node
+                    && p.node_down
+                        .as_ref()
+                        .is_some_and(|proof| proof.node == p.launch.node)
+            }) {
+                return true;
+            }
             p.link_alive
                 && (!p.loss_reported
                     || self.known_restoration_loss(p)

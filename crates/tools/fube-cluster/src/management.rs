@@ -13,7 +13,10 @@ use std::{
     process::Command as ProcessCommand,
     time::Duration,
 };
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::{
+    io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, BufReader},
+    time::Instant,
+};
 
 /// Private same-host deployment manifest, not an SF reliability message.
 #[derive(Serialize, Deserialize)]
@@ -21,6 +24,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 pub(crate) struct Manifest {
     pub schema_version: u32,
     pub launches: Vec<PathBuf>,
+    pub recovery_mode: crate::RecoveryMode,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -48,6 +52,9 @@ pub(crate) enum Operation {
         index: usize,
     },
     FinishNodeRestart {
+        index: usize,
+    },
+    FinishNodeInfrastructure {
         index: usize,
     },
     Command {
@@ -94,6 +101,74 @@ struct Response {
     status: Option<Value>,
 }
 
+fn decode_response(line: &[u8], id: u64) -> Result<(Result<Value>, Value)> {
+    let response: Response = serde_json::from_slice(line).map_err(err)?;
+    if response.id != id {
+        return Err("FM management reply identity mismatch".into());
+    }
+    let status = response
+        .status
+        .or_else(|| {
+            response
+                .result
+                .as_ref()
+                .ok()
+                .and_then(|result| result.get("status"))
+                .cloned()
+        })
+        .filter(Value::is_object)
+        .ok_or("FM management reply lacks status")?;
+    Ok((response.result, status))
+}
+
+// A timed-out observer retains the original read-only exchange, including partial writes.
+struct PendingStatus {
+    id: u64,
+    bytes: Vec<u8>,
+    written: usize,
+    deadline: Instant,
+}
+
+impl PendingStatus {
+    fn new(id: u64) -> Result<Self> {
+        Ok(Self {
+            id,
+            bytes: frame(
+                &Request {
+                    id,
+                    operation: Operation::Status,
+                },
+                LIMIT,
+            )?,
+            written: 0,
+            deadline: Instant::now() + Duration::from_secs(35),
+        })
+    }
+
+    async fn advance(
+        &mut self,
+        input: &mut (impl AsyncWrite + Unpin),
+        output: &mut Lines<impl AsyncBufRead + Unpin>,
+    ) -> Result<(Result<Value>, Value)> {
+        while self.written < self.bytes.len() {
+            let count = input
+                .write(&self.bytes[self.written..])
+                .await
+                .map_err(err)?;
+            if count == 0 {
+                return Err("FM management stdin closed during status write".into());
+            }
+            self.written += count;
+        }
+        input.flush().await.map_err(err)?;
+        let line = output
+            .next()
+            .await?
+            .ok_or("FM management stdout closed during status polling")?;
+        decode_response(&line, self.id)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ShutdownState {
@@ -119,6 +194,7 @@ async fn operate(manager: &mut Manager, operation: Operation) -> Result<Value> {
             serde_json::to_value(manager.prepare_node_restart(index).await?).map_err(err)
         }
         Operation::FinishNodeRestart { index } => manager.finish_node_restart(index).await,
+        Operation::FinishNodeInfrastructure { index } => manager.finish_node_infrastructure(index),
         Operation::Command { command } => manager.execute(command).await,
         Operation::Status => Ok(Value::Null),
         Operation::Generation => manager.begin_generation_handshake(),
@@ -168,6 +244,7 @@ pub async fn run(path: &Path) -> Result<()> {
         .map(|path| read_json(path))
         .collect::<Result<Vec<Launch>>>()?;
     let mut manager = Manager::new(launches)?;
+    manager.ledger.recovery_mode = manifest.recovery_mode;
     let mut lines = Lines::new(BufReader::new(tokio::io::stdin()), LIMIT);
     let mut expected = 1u64;
     let serving = async {
@@ -228,6 +305,7 @@ pub(crate) struct Client {
     next: u64,
     status: Value,
     error: Option<String>,
+    pending_status: Option<PendingStatus>,
 }
 impl Client {
     pub(crate) fn new() -> Self {
@@ -238,6 +316,7 @@ impl Client {
             next: 1,
             status: Value::Null,
             error: None,
+            pending_status: None,
         }
     }
 
@@ -300,7 +379,17 @@ impl Client {
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
-        let result = tokio::time::timeout(Duration::from_secs(35), self.exchange(operation))
+        let deadline = Instant::now() + Duration::from_secs(35);
+        if self.pending_status.is_some() {
+            let outcome = self.poll_status_until(deadline).await?;
+            let Some(outcome) = outcome else {
+                return Err(self.record_error("FM management exchange deadline".into()));
+            };
+            if matches!(operation, Operation::Status) {
+                return Ok(outcome);
+            }
+        }
+        let result = tokio::time::timeout_at(deadline, self.exchange(operation))
             .await
             .map_err(|_| "FM management exchange deadline".to_string())
             .and_then(|result| result);
@@ -309,10 +398,55 @@ impl Client {
                 self.status = status;
                 outcome
             }
-            Err(error) => {
-                eprintln!("FM control unavailable: {error}");
-                self.error = Some(error.clone());
-                Err(error)
+            Err(error) => Err(self.record_error(error)),
+        }
+    }
+
+    fn record_error(&mut self, error: String) -> String {
+        if self.error.is_none() {
+            eprintln!("FM control unavailable: {error}");
+            self.error = Some(error);
+        }
+        self.error.as_ref().unwrap().clone()
+    }
+
+    pub(crate) async fn poll_status_until(&mut self, deadline: Instant) -> Result<Option<Value>> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        if self.pending_status.is_none() {
+            let process = self.process.as_mut().ok_or("FM process not started")?;
+            if let Err(error) = process.check_alive().map_err(err) {
+                return Err(self.record_error(error));
+            }
+            let pending = PendingStatus::new(self.next)?;
+            self.next = self
+                .next
+                .checked_add(1)
+                .ok_or("FM management sequence exhausted")?;
+            self.pending_status = Some(pending);
+        }
+        let protocol_deadline = self.pending_status.as_ref().unwrap().deadline;
+        let result = tokio::time::timeout_at(deadline.min(protocol_deadline), async {
+            let pending = self.pending_status.as_mut().unwrap();
+            let input = self.input.as_mut().ok_or("FM protocol stdin absent")?;
+            let output = self.output.as_mut().ok_or("FM protocol stdout absent")?;
+            pending.advance(input, output).await
+        })
+        .await;
+        match result {
+            Err(_) if Instant::now() >= protocol_deadline => {
+                Err(self.record_error("FM management exchange deadline".into()))
+            }
+            Err(_) => Ok(None),
+            Ok(Err(error)) => Err(self.record_error(error)),
+            Ok(Ok((outcome, status))) => {
+                self.pending_status.take();
+                self.status = status;
+                outcome.map(Some)
             }
         }
     }
@@ -342,23 +476,7 @@ impl Client {
                     process.logs().iter().rev().take(8).collect::<Vec<_>>()
                 )
             })?;
-        let response: Response = serde_json::from_slice(&line).map_err(err)?;
-        if response.id != id {
-            return Err("FM management reply identity mismatch".into());
-        }
-        let status = response
-            .status
-            .or_else(|| {
-                response
-                    .result
-                    .as_ref()
-                    .ok()
-                    .and_then(|result| result.get("status"))
-                    .cloned()
-            })
-            .filter(Value::is_object)
-            .ok_or("FM management reply lacks status")?;
-        Ok((response.result, status))
+        decode_response(&line, id)
     }
 
     pub(crate) async fn stop(&mut self) -> Result<ShutdownState> {
@@ -384,6 +502,110 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifests_require_explicit_manual_policy_and_reject_legacy() {
+        let mut value = serde_json::json!({
+            "schema_version":1,"launches":[],"recovery_mode":"manual"
+        });
+        assert!(serde_json::from_value::<Manifest>(value.clone()).is_ok());
+        value["recovery_mode"] = serde_json::json!("legacy");
+        assert!(serde_json::from_value::<Manifest>(value.clone())
+            .err()
+            .expect("Legacy policy must be rejected")
+            .to_string()
+            .contains("unknown variant"));
+        value.as_object_mut().unwrap().remove("recovery_mode");
+        assert!(serde_json::from_value::<Manifest>(value)
+            .err()
+            .expect("Missing policy must be rejected")
+            .to_string()
+            .contains("missing field"));
+    }
+
+    #[tokio::test]
+    async fn status_observation_deadlines_preserve_partial_writes_reads_and_request_identity() {
+        use tokio::io::AsyncReadExt;
+        let (mut input, mut request_reader) = tokio::io::duplex(8);
+        let (mut response_writer, response_reader) = tokio::io::duplex(128);
+        let mut output = Lines::new(BufReader::new(response_reader), LIMIT);
+        let mut pending = PendingStatus::new(1).unwrap();
+        let expected = pending.bytes.clone();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1),
+            pending.advance(&mut input, &mut output)
+        )
+        .await
+        .is_err());
+        assert!(pending.written > 0 && pending.written < expected.len());
+        let response = frame(
+            &Response {
+                id: 1,
+                result: Ok(Value::Null),
+                status: Some(json!({"operations":[{"op":"build","state":"pending"}]})),
+            },
+            LIMIT,
+        )
+        .unwrap();
+        let delivery = async {
+            let mut request = vec![0; expected.len()];
+            request_reader.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, expected);
+            response_writer.write_all(&response[..10]).await.unwrap();
+            response_writer
+        };
+        let mut response_writer = {
+            let progress = pending.advance(&mut input, &mut output);
+            tokio::pin!(progress);
+            tokio::select! {
+                result = &mut progress => panic!("status reply completed before its tail: {result:?}"),
+                writer = delivery => writer,
+            }
+        };
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1),
+            pending.advance(&mut input, &mut output)
+        )
+        .await
+        .is_err());
+        response_writer.write_all(&response[10..]).await.unwrap();
+        let (result, status) = pending.advance(&mut input, &mut output).await.unwrap();
+        assert_eq!(result.unwrap(), Value::Null);
+        assert_eq!(status["operations"][0]["state"], "pending");
+        let mut extra = [0; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), request_reader.read(&mut extra))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_status_rejects_a_reply_from_another_exchange() {
+        let (mut input, _request_reader) = tokio::io::duplex(128);
+        let (mut response_writer, response_reader) = tokio::io::duplex(128);
+        let mut output = Lines::new(BufReader::new(response_reader), LIMIT);
+        response_writer
+            .write_all(
+                &frame(
+                    &Response {
+                        id: 2,
+                        result: Ok(Value::Null),
+                        status: Some(json!({})),
+                    },
+                    LIMIT,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let error = PendingStatus::new(1)
+            .unwrap()
+            .advance(&mut input, &mut output)
+            .await
+            .unwrap_err();
+        assert!(error.contains("identity mismatch"), "{error}");
+    }
 
     #[tokio::test]
     async fn management_frames_retain_partial_input_and_reject_truncation_or_overflow() {

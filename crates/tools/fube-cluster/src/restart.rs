@@ -108,7 +108,7 @@ impl Manager {
         }
         let failure = self.ledger.node_failures.last().unwrap();
         Ok(json!({"state":"down","node":index + 1,
-            "replica_reconfiguration":if failure.recovery_error.is_some() {"blocked"} else if body.is_some() {"pending"} else {"not_required"},
+            "replica_reconfiguration":if failure.recovery_error.is_some() {"blocked"} else if body.is_some() {"pending"} else if failure.body.as_ref().is_some_and(|body| body.service.stateful) && failure.desired == Desired::Running {"not_requested"} else {"not_required"},
             "error":failure.recovery_error}))
     }
 
@@ -148,30 +148,98 @@ impl Manager {
             return Err("restart completion requires an admitted current Node incarnation".into());
         }
         let restore_replica = self.ledger.restart_desired(index)? == Desired::Running;
+        let mut rebuild_operation = None;
         if restore_replica {
-            if self.profile.stateful() {
-                if self.ledger.begin_rejoined_replica(index)? {
-                    self.request_repair_build().await?;
-                }
-            } else {
-                let session = self.children[index].launch.session.clone();
-                self.execute(Command {
-                    op: format!("restart-{session}"),
-                    action: "create".into(),
-                    node: Some((index + 1) as u8),
+            let launch = self.children[index].launch.clone();
+            let failure = self
+                .ledger
+                .node_failures
+                .iter()
+                .find(|failure| {
+                    failure
+                        .replacement
+                        .as_ref()
+                        .is_some_and(|replacement| replacement.node == launch.node)
                 })
-                .await?;
-            }
+                .ok_or("missing restarted replica predecessor")?;
+            let body = failure
+                .body
+                .as_ref()
+                .ok_or("restarted Node had no replica to restore")?;
+            let op = format!("restart-rebuild-{}", launch.session);
+            self.execute(Command {
+                op: op.clone(),
+                action: "rebuild-replica".into(),
+                node: Some((index + 1) as u8),
+                partition: Some(launch.partition),
+                predecessor: Some(crate::ReplicaRef {
+                    node: (index + 1) as u8,
+                    node_instance: failure.receipt.node.instance,
+                    replica: body.replica.id,
+                    incarnation: body.replica.instance,
+                }),
+                ..Command::default()
+            })
+            .await?;
+            rebuild_operation = Some(op);
         }
         Ok(
             json!({"state":if restore_replica {"pending"} else {"complete"},"kind":"node_restart","node":index + 1,
             "node_instance":self.children[index].launch.node.instance,
+            "rebuild_operation":rebuild_operation,
             "replica_recovery":if restore_replica {"pending"} else {"not_required"}}),
         )
     }
 }
 
 impl Cluster {
+    pub(crate) async fn terminate_node_owned(&mut self, node: u8, force: bool) -> Result<Value> {
+        let index = self.node_index(node)?;
+        let child = &self.manager.children[index];
+        let launch = child.launch.clone();
+        let process = self.processes[index]
+            .as_mut()
+            .ok_or("missing original Node process owner")?;
+        if child.node_pid != process.pid() || launch.parent_pid != std::process::id() {
+            return Err("Node process slot does not match its original launch owner".into());
+        }
+        let pid = process.pid();
+        if force {
+            process.cleanup().map_err(err)?;
+        } else {
+            if process.observed_exit().map_err(err)?.is_none() {
+                process_control::send(process, &launch, NodeControl::Stop {})?;
+            }
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(exit) = process.observed_exit().map_err(err)? {
+                    if !exit.success() {
+                        return Err(format!(
+                            "Node exited abnormally during graceful stop: {exit}"
+                        ));
+                    }
+                    if group_stopped(pid)? {
+                        process.cleanup().map_err(err)?;
+                        break;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err("graceful Node stop deadline; use an explicit kill-node control to force termination".into());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        let status = process.status();
+        if !status.reaped || !status.group_drained || !status.exit_observed {
+            return Err("owned Node termination did not prove process-group retirement".into());
+        }
+        Ok(
+            json!({"state":"complete","kind":if force {"node_kill"} else {"node_stop"},
+            "node":node,"node_instance":launch.node.instance,"node_pid":pid,
+            "node_group_drained":true,"forced":status.cleanup_forced,"node_down":"not_reported"}),
+        )
+    }
+
     pub(crate) fn refresh_node_controls(&mut self) {
         if !self.driver_commands.iter().any(|(command, result)| {
             command.action == "restart-node"
@@ -345,7 +413,19 @@ impl Cluster {
 
     /// Explicitly retire an old owner and rejoin with fresh Node/runtime/replica identities.
     pub async fn restart_node(&mut self, node: u8) -> Result<Value> {
+        self.restart_node_owned(node, true).await
+    }
+
+    pub(crate) async fn restart_node_owned(&mut self, node: u8, restore: bool) -> Result<Value> {
         let index = self.node_index(node)?;
+        if !restore
+            && !self
+                .fenced_nodes
+                .iter()
+                .any(|proof| proof.node == self.manager.children[index].launch.node)
+        {
+            return Err("infrastructure restart requires previously confirmed NodeDown".into());
+        }
         if let Some(remote) = &mut self.remote {
             remote.request(Operation::Status).await?;
         } else {
@@ -390,14 +470,37 @@ impl Cluster {
                 process.cleanup().map_err(err)?;
             }
         }
-        let down = self.node_down(node).await?;
-        if down["replica_reconfiguration"] == "blocked" {
+        let mut down = self.node_down(node).await?;
+        if restore
+            && matches!(
+                down["replica_reconfiguration"].as_str(),
+                Some("not_requested" | "recorded")
+            )
+        {
+            let launch = self.manager.children[index].launch.clone();
+            let predecessor = crate::ReplicaRef {
+                node,
+                node_instance: launch.node.instance,
+                replica: self.manager.ledger.placements[index].replica,
+                incarnation: self.manager.ledger.placements[index].incarnation,
+            };
+            let result = self
+                .reconfigure_partition(
+                    &format!("restart-reconfigure-{}", launch.session),
+                    &launch.partition,
+                    predecessor,
+                )
+                .await?;
+            down["replica_reconfiguration"] = result["state"].clone();
+        }
+        if restore && down["replica_reconfiguration"] == "blocked" {
             return Err(format!(
                 "NodeDown recorded, restart recovery blocked: {}",
                 down["error"]
             ));
         }
-        if self.config.profile.stateful() && down["replica_reconfiguration"] != "not_required" {
+        if restore && self.config.profile.stateful() && down["replica_reconfiguration"] == "pending"
+        {
             let until = Instant::now() + Duration::from_secs(30);
             while self.status()["configuration"]["ready"] != true {
                 self.drive().await;
@@ -448,7 +551,9 @@ impl Cluster {
         self.spawn(index).await?;
         self.rebind_node_peers(index, &predecessor, &fencing)
             .await?;
-        if let Some(remote) = &mut self.remote {
+        if !restore {
+            self.finish_node_infrastructure(index).await
+        } else if let Some(remote) = &mut self.remote {
             remote.request(Operation::FinishNodeRestart { index }).await
         } else {
             self.manager.finish_node_restart(index).await

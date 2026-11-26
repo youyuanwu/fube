@@ -51,12 +51,38 @@ pub fn retired_configuration(state: &EntityState) -> bool {
     })
 }
 pub(super) fn secondary_removal(body: &Configuration) -> bool {
-    body.replicas
+    let removed = body
+        .replicas
         .0
         .iter()
         .filter(|r| r.previous_role == 3 && r.current_role == 1 && !r.up && r.state == 3)
-        .count()
-        == 1
+        .count();
+    removed == 1
+        || (removed == 0
+            && body.replicas.0.len() == body.unit.minimum as usize
+            && body.replicas.0.iter().all(|r| r.current_role >= 3)
+            && body
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.previous_role == 3 && r.current_role == 3 && !r.up && r.state == 3)
+                .count()
+                == 1)
+}
+
+fn fenced_replacement(old: &Replica, fresh: &Replica) -> bool {
+    old.node.id == fresh.node.id
+        && old.node.instance < fresh.node.instance
+        && old.previous_role == 3
+        && old.current_role == 1
+        && !old.up
+        && old.state == 3
+        && fresh.previous_role == 2
+        && fresh.current_role == 3
+        && fresh.up
+        && fresh.state == 2
+        && fresh.id > old.id
+        && fresh.instance > old.instance
 }
 pub fn completed_secondary_removal(state: &EntityState) -> bool {
     state.reconfiguration.as_ref().is_some_and(|c| {
@@ -170,6 +196,13 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
             .filter(|r| r.previous_role == 2 && r.current_role == 3)
             .count();
         let prior = completed_configuration(old);
+        let removed = body
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.current_role == 1)
+            .count();
+        let retaining = removed == 0;
         if prior.is_none() && !(fresh == 1 && old.body.replica.current_role == 2) {
             return Err(Failure::Unsupported(
                 "Secondary removal requires completed membership or the fresh Idle",
@@ -202,8 +235,8 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
             || fresh > 1
             || body.replicas.0.len() != members.len() + fresh
             || members.len() > body.service.target as usize
-            || members.len() + fresh <= body.service.minimum as usize
-            || members.len() + fresh - 1 > body.service.target as usize
+            || members.len() + fresh - removed < body.service.minimum as usize
+            || members.len() + fresh - removed > body.service.target as usize
             || local(body, primary)?.previous_role != 4
             || local(body, primary)?.current_role != 4
             || body.replicas.0.iter().enumerate().any(|(i, r)| {
@@ -211,11 +244,16 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                     || r.instance < 0
                     || r.version != body.service.version
                     || (r.current_role == 4 && r.node != *primary)
-                    || body.replicas.0[..i]
-                        .iter()
-                        .any(|old| old.node.id == r.node.id || old.id == r.id)
+                    || body.replicas.0[..i].iter().any(|old| {
+                        old.id == r.id
+                            || (old.node.id == r.node.id
+                                && !fenced_replacement(old, r)
+                                && !fenced_replacement(r, old))
+                    })
                     || if r.current_role == 1 {
                         r.previous_role != 3 || r.up || r.state != 3
+                    } else if retaining && r.current_role == 3 && !r.up {
+                        r.previous_role != 3 || r.state != 3
                     } else {
                         !r.up
                             || r.state != 2
@@ -245,17 +283,20 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
             normalized.last_lsn = expected.last_lsn;
             if normalized != *expected
                 || actual.previous_role != expected.current_role
-                || body
-                    .replicas
-                    .0
-                    .iter()
-                    .filter(|r| r.node.id == expected.node.id)
-                    .count()
-                    != 1
+                || body.replicas.0.iter().any(|r| {
+                    r.node.id == expected.node.id
+                        && r.node != expected.node
+                        && !fenced_replacement(actual, r)
+                })
                 || if actual.current_role == 1 {
                     expected.current_role != 3 || actual.up || actual.state != 3
                 } else {
-                    actual.current_role != expected.current_role || !actual.up || actual.state != 2
+                    actual.current_role != expected.current_role
+                        || if retaining && !actual.up {
+                            actual.state != 3
+                        } else {
+                            !actual.up || actual.state != 2
+                        }
                 }
             {
                 return Err(Failure::Admission(
@@ -512,7 +553,9 @@ fn pending_effects(state: &EntityState) -> Vec<Effect> {
                 .0
                 .iter()
                 .filter(|target| {
-                    target.current_role == 3 && !config.activated.contains(&target.node)
+                    target.current_role == 3
+                        && target.up
+                        && !config.activated.contains(&target.node)
                 })
                 .map(|target| Effect::PeerActivate {
                     target: target.node.clone(),
@@ -1227,7 +1270,7 @@ pub(super) fn transition(
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.current_role == 3)
+                .filter(|r| r.current_role == 3 && r.up)
                 .all(|r| config.activated.contains(&r.node))
             {
                 config.stage = ConfigurationStage::End;

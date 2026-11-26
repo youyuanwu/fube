@@ -160,6 +160,7 @@ fn foreground_configured_service_builds_four_replicas_from_one_create() {
     let mut foreground = Foreground::start_options(&root, true, Some((4, 3)));
     let ready = foreground.read();
     assert_eq!(ready["event"], "ready", "{ready}");
+    assert_eq!(ready["status"]["recovery_mode"], "manual");
     assert_eq!(ready["status"]["nodes"].as_array().unwrap().len(), 4);
     assert_eq!(ready["status"]["fm"]["separate_process"], true);
     let fm_pid = ready["status"]["fm"]["pid"].as_u64().unwrap() as u32;
@@ -209,6 +210,198 @@ fn foreground_configured_service_builds_four_replicas_from_one_create() {
     assert_eq!(next.read()["event"], "ready");
     next.finish();
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn manual_foreground_requires_scoped_recovery_and_replays_only_original_owners() {
+    let root = support::parent().join(format!("manual-foreground-{}", uuid::Uuid::new_v4()));
+    let mut foreground = Foreground::start_options(&root, true, Some((3, 3)));
+    let ready = foreground.read();
+    assert_eq!(ready["event"], "ready", "{ready}");
+    assert_eq!(ready["status"]["recovery_mode"], "manual");
+    assert_eq!(ready["status"]["fm"]["separate_process"], true);
+    let fm_pid = ready["status"]["fm"]["pid"].as_u64().unwrap() as u32;
+    let fm_start = process_start(fm_pid);
+    let original: Vec<_> = (1..=3).map(|node| Expected::capture(&root, node)).collect();
+    let partition = ready["status"]["nodes"][0]["partition"].clone();
+    let create = json!({"op":"create","action":"create-partition","partition":partition,"node":1});
+    assert_eq!(foreground.command(&create)["state"], "pending");
+    let mut next = 0;
+    let running = wait_operation(&mut foreground, &mut next, "create");
+    let endpoint = running["nodes"][0]["endpoint"].as_str().unwrap().to_owned();
+    poll(&mut foreground, &mut next, |_| {
+        data_contact(&endpoint, b"read\n").starts_with("OK ")
+    });
+    assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+    poll(&mut foreground, &mut next, |status| {
+        (1..3).all(|node| {
+            status["nodes"][node]["retained_work"]["app_observation"]["idle_data"]["provider"]
+                ["last"]
+                == 1
+        })
+    });
+
+    let kill = json!({"op":"kill-primary","action":"kill-node","node":1});
+    let killed = foreground.command(&kill);
+    assert_eq!(killed["state"], "complete", "{killed}");
+    assert_eq!(killed["node_down"], "not_reported");
+    let stopped = wait_operation(&mut foreground, &mut next, "kill-primary");
+    assert!(stopped["node_failures"].as_array().unwrap().is_empty());
+    let down = json!({"op":"down-primary","action":"node-down","node":1});
+    assert_eq!(foreground.command(&down)["state"], "down");
+    let failed = wait_operation(&mut foreground, &mut next, "down-primary");
+    original[0].assert_gone();
+    assert_eq!(failed["repair"]["state"], "absent");
+    assert_eq!(failed["configuration"]["ready"], false);
+    assert_eq!(
+        failed["configuration"]["request"],
+        running["configuration"]["request"]
+    );
+    let predecessor = failed["node_failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|failure| failure["node"] == 1 && failure["instance"] == killed["node_instance"])
+        .unwrap()["predecessor"]
+        .clone();
+    let rebuild = json!({"op":"rebuild","action":"rebuild-replica","partition":partition,
+        "predecessor":predecessor,"node":1});
+    let mut premature = rebuild.clone();
+    premature["op"] = json!("premature");
+    assert_eq!(foreground.command(&premature)["state"], "rejected");
+    let reconfigure = json!({"op":"reconfigure","action":"reconfigure-partition",
+        "partition":partition,"predecessor":predecessor});
+    assert_eq!(foreground.command(&reconfigure)["state"], "pending");
+    let configured = wait_operation(&mut foreground, &mut next, "reconfigure");
+    assert_eq!(
+        configured["replica_set"],
+        json!({"target":3,"minimum":3,"immutable":true})
+    );
+    let replicas = configured["configuration"]["reply"]["replicas"]
+        .as_array()
+        .unwrap();
+    assert_eq!(replicas.len(), 3);
+    let retained = replicas
+        .iter()
+        .find(|replica| {
+            replica["node"]["instance"] == predecessor["node_instance"]
+                && replica["id"] == predecessor["replica"]
+        })
+        .unwrap();
+    assert_eq!(retained["up"], false);
+    assert_eq!(retained["current_role"], 3);
+    let promoted = configured["nodes"][1]["endpoint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(data_contact(&promoted, b"read\n").contains("committed=1"));
+    assert!(data_contact(&promoted, b"write-more\n").contains("committed=2"));
+
+    let restart = json!({"op":"restart-primary","action":"restart-node","node":1});
+    let restarted = foreground.command(&restart);
+    assert_eq!(restarted["state"], "complete", "{restarted}");
+    assert_eq!(restarted["replica_recovery"], "not_requested");
+    let infrastructure = wait_operation(&mut foreground, &mut next, "restart-primary");
+    assert_eq!(infrastructure["repair"]["state"], "absent");
+    assert_eq!(infrastructure["nodes"][0]["observed"], "absent");
+    assert_eq!(infrastructure["nodes"][0]["created_lifetime"], false);
+    let instance = infrastructure["nodes"][0]["node_instance"]
+        .as_u64()
+        .unwrap();
+    assert!(instance > original[0].launch["node"]["instance"].as_u64().unwrap());
+    let fresh =
+        Expected::capture_directory(&root.join(format!("deployment/node1-instance-{instance}")));
+    assert_eq!(fresh.node_id, original[0].node_id);
+    assert_ne!(fresh.node_pid, original[0].node_pid);
+    assert_ne!(fresh.app_pid, original[0].app_pid);
+    assert_ne!(fresh.launch["session"], original[0].launch["session"]);
+    assert_eq!(foreground.command(&kill), killed);
+    let mut changed = kill.clone();
+    changed["node"] = json!(2);
+    assert_eq!(foreground.command(&changed)["state"], "rejected");
+    let absent = poll(&mut foreground, &mut next, |status| {
+        let node = &status["nodes"][0];
+        assert_eq!(node["node_pid"], fresh.node_pid);
+        assert_eq!(node["observed"], "absent");
+        assert_eq!(status["repair"]["state"], "absent");
+        node["retained_work"]["app_observation"]["opens"] == 0
+    });
+    assert_eq!(absent["nodes"][0]["admitted"], true);
+
+    let building = foreground.command(&rebuild);
+    assert_eq!(building["state"], "pending", "{building}");
+    assert_eq!(building["node_instance"], instance);
+    assert!(building["replica"].as_i64().unwrap() > predecessor["replica"].as_i64().unwrap());
+    assert!(
+        building["incarnation"].as_i64().unwrap() > predecessor["incarnation"].as_i64().unwrap()
+    );
+    let restored = wait_operation(&mut foreground, &mut next, "rebuild");
+    let completed = foreground.command(&rebuild);
+    assert_eq!(completed["state"], "complete");
+    assert_eq!(completed["phase"], "ready");
+    assert_eq!(completed["replica"], building["replica"]);
+    assert_eq!(completed["incarnation"], building["incarnation"]);
+    assert_eq!(foreground.command(&kill), killed);
+    assert_eq!(foreground.command(&restart), restarted);
+    assert_eq!(restored["nodes"][0]["node_pid"], fresh.node_pid);
+    assert_eq!(process_start(fresh.node_pid), fresh.node_start);
+    assert_eq!(process_start(fresh.app_pid), fresh.app_start);
+    for (node, owner) in original.iter().enumerate().skip(1) {
+        assert_eq!(restored["nodes"][node]["node_pid"], owner.node_pid);
+        assert_eq!(restored["nodes"][node]["app_pid"], owner.app_pid);
+        assert_eq!(process_start(owner.node_pid), owner.node_start);
+        assert_eq!(process_start(owner.app_pid), owner.app_start);
+        assert_eq!(
+            restored["nodes"][node]["retained_work"]["app_observation"]["opens"],
+            1
+        );
+    }
+    assert_eq!(
+        restored["replica_set"],
+        json!({"target":3,"minimum":3,"immutable":true})
+    );
+    assert!(data_contact(&promoted, b"read\n").contains("committed=2 value=continued"));
+    poll(&mut foreground, &mut next, |status| {
+        status["nodes"][0]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 2
+    });
+    assert_eq!(
+        foreground.command(&json!({"op":"kill-secondary","action":"kill-node","node":3}))["state"],
+        "complete"
+    );
+    assert_eq!(
+        foreground.command(&json!({"op":"down-secondary","action":"node-down","node":3}))["state"],
+        "down"
+    );
+    wait_operation(&mut foreground, &mut next, "down-secondary");
+    original[2].assert_gone();
+    assert!(data_contact(&promoted, b"write-final\n").contains("committed=3 value=final"));
+    assert_eq!(process_start(fm_pid), fm_start);
+    let cleanup = foreground.finish();
+    assert_eq!(cleanup["fm"]["pid"], fm_pid);
+    assert_eq!(cleanup["fm"]["reaped"], true);
+    assert_eq!(cleanup["fm"]["group_drained"], true);
+    for owner in original {
+        owner.assert_gone();
+    }
+    fresh.assert_gone();
+    assert!(!root.join("deployment").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn data_contact(endpoint: &str, request: &[u8]) -> String {
+    let mut socket =
+        TcpStream::connect_timeout(&endpoint.parse().unwrap(), Duration::from_secs(2)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    socket.write_all(request).unwrap();
+    let mut response = String::new();
+    socket.take(1025).read_to_string(&mut response).unwrap();
+    assert!(response.len() <= 1024 && response.ends_with('\n'));
+    response
 }
 
 #[test]
@@ -363,7 +556,9 @@ fn process_start(pid: u32) -> String {
 }
 impl Expected {
     fn capture(root: &Path, node: usize) -> Self {
-        let directory = root.join(format!("deployment/node{node}"));
+        Self::capture_directory(&root.join(format!("deployment/node{node}")))
+    }
+    fn capture_directory(directory: &Path) -> Self {
         let launch = metadata(directory.join("launch.json"));
         let actual = metadata(directory.join("profile.json"));
         let id: [u8; 16] = serde_json::from_value(launch["node"]["id"].clone()).unwrap();
@@ -423,6 +618,23 @@ fn poll(owner: &mut Foreground, next: &mut usize, predicate: impl Fn(&Value) -> 
         std::thread::sleep(Duration::from_millis(250));
     }
     panic!("semantic progress deadline");
+}
+
+fn wait_operation(owner: &mut Foreground, next: &mut usize, operation: &str) -> Value {
+    poll(owner, next, |status| {
+        let outcome = status["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(status["node_controls"].as_array().unwrap().iter())
+            .find(|outcome| outcome["op"] == operation)
+            .unwrap_or_else(|| panic!("operation {operation} is not retained: {status}"));
+        match outcome["state"].as_str() {
+            Some("complete" | "down") => true,
+            Some("pending") => false,
+            _ => panic!("operation {operation} did not complete: {outcome}"),
+        }
+    })
 }
 
 #[test]
