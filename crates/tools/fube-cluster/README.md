@@ -81,6 +81,11 @@ controls are not exposed as FM management actions.
 
 ## Explicit NodeDown and restart
 
+The default `legacy` policy preserves the bundled behavior below. Select
+[`RecoveryMode::Manual`](src/scenario.rs) before library startup with
+`set_recovery_mode`, or pass `--manual-recovery` to the CLI, for the
+[explicit scenario controls](#manual-scenario-controls).
+
 The supervisor accepts these ordinary foreground commands:
 
 ```json
@@ -143,6 +148,69 @@ owner loss still prevents a clean handoff. The
 [executable restart cases](src/tests/restart.rs) cover live-node rejection,
 external termination, stateless recreation, Primary/Secondary data rebuild,
 repeated explicit restart, unchanged survivors and stale evidence.
+
+## Manual scenario controls
+
+Manual mode never initiates failover or replacement from a timer, transport
+closure, host-loss report or returning Node. Explicit `node-down` verifies
+physical fencing and records the failure; `restart-node` admits fresh Node/RA
+infrastructure with empty inventory, without recreating any service replica.
+For a replicated member, first complete explicit survivor reconfiguration so
+the surviving RAs describe its old incarnation as down before rebinding peers.
+Background FM driving still processes reports and advances/retries work that a
+command has already authorized.
+
+The current service definitions, partition IDs, sizes and Node pool remain
+preconfigured. These controls do not add a dynamic service/partition catalog.
+Read `nodes[].partition` and the exact `node_failures[].predecessor` from status.
+For app-host failure, the predecessor is the affected Node's current
+`node`, `node_instance`, `replica` and `incarnation`.
+
+| Action | Additional fields | Boundary |
+| --- | --- | --- |
+| `create-partition` | `partition`, `node` | Create the profile's initial Primary/instance. Configured replicated creation includes the original Secondary builds and initial configuration. |
+| `reconfigure-partition` | `partition`, `predecessor` | Explicit survivor reconfiguration for confirmed NodeDown or supported Primary app-host failover; no replica creation. |
+| `rebuild-replica` | `partition`, `predecessor`, destination `node` | Create/copy a fresh replacement and complete native configuration admission, or recreate a stateless instance on its fresh rejoined Node. |
+| `cancel-rebuild` | `operation` | Cancel the identified pending rebuild through native removal. Existing original-Node 3/2 app-host repair cancellation is supported; Node-rejoin/spare cancellation remains gated. |
+
+Every command carries an `op` identifier, uses the existing FM operation ledger,
+and has identical Rust/library and foreground semantics. The corresponding
+library methods are `create_partition`, `reconfigure_partition`,
+`rebuild_replica` and `cancel_rebuild`. A predecessor is a strictly decoded
+object with `node`, `node_instance`, `replica` and `incarnation`; node number
+alone cannot select a historical failure. Changed content under an existing
+operation ID rejects. Pending completion is bound to the original
+configuration/replica owner, not whatever later recovery happens to be ready.
+
+For example, after reporting and reconfiguring a failed member:
+
+```json
+{"op":"restart-1","action":"restart-node","node":1}
+{"op":"rebuild-1","action":"rebuild-replica","partition":"<existing-partition-uuid>","node":1,"predecessor":{"node":1,"node_instance":123,"replica":1,"incarnation":456}}
+```
+
+Use actual status identities, not the illustrative values above. Rebuilding
+requires a freshly admitted same-Node incarnation or an explicitly selected
+unused admitted spare, a completed failure configuration and a surviving
+majority. At `minimum == target`, manual reconfiguration retains the fenced
+down member; removal and replacement admission are combined after real copy.
+Primary and Secondary whole-Node scenarios are covered at 3/3 and 4/4 without
+reopening surviving hosts. This remains a one-failure, stable-membership
+profile: interrupted/multiple-failure recovery and data-loss recreation are
+not enabled. A returning singleton cannot turn lost volatile data into an
+empty "recovered" Primary.
+
+Operation status distinguishes `building`, `admitting`, `ready` and native
+removal, with failure/unknown outcomes explicit. `create-partition` distinguishes
+opening from initial-membership completion. Cancellation does not imply
+destination deletion or disposal.
+
+Existing repair/replacement helpers reuse the same ledger/native repair
+primitives. `restart_node` remains a bundled library convenience workflow;
+`restart_node_infrastructure` is the process-only primitive. Existing foreground
+`restart-node` keeps its bundled behavior under `legacy`, while manual mode
+uses the process-only primitive. No existing default profile silently switches
+policy.
 
 ## Service profiles
 

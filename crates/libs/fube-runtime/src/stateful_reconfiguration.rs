@@ -1660,12 +1660,32 @@ fn project(
     let (mut ncc, mut ndcc, mut npc, mut ndpc) = (0, 0, 0, 0);
     let mut remotes = vec![];
     let mut ids = std::collections::HashSet::new();
-    let mut nodes = std::collections::HashSet::new();
+    let mut nodes = std::collections::HashMap::<_, (&w::Replica, usize)>::new();
     let mut local_seen = false;
     let (mut local_cc, mut local_pc) = (false, false);
     for replica in &request.remote.0 {
         let mut info = information(replica, replica.current_role == 4)?;
-        if !ids.insert(replica.id) || !nodes.insert(info.node_id) {
+        let (previous, count) = nodes.entry(info.node_id).or_insert((replica, 0));
+        *count += 1;
+        let fenced_replacement = |old: &w::Replica, fresh: &w::Replica| {
+            old.node.instance < fresh.node.instance
+                && old.previous_role == 3
+                && old.current_role == 1
+                && !old.up
+                && old.state == 3
+                && fresh.previous_role == 2
+                && fresh.current_role == 3
+                && fresh.up
+                && fresh.state == 2
+                && old.id < fresh.id
+                && old.instance < fresh.instance
+        };
+        if !ids.insert(replica.id)
+            || *count > 2
+            || (*count == 2
+                && !fenced_replacement(previous, replica)
+                && !fenced_replacement(replica, previous))
+        {
             return Err(Error::Protocol("duplicate configuration identity/node"));
         }
         if replica.current_role >= 3 {

@@ -552,11 +552,14 @@ impl Manager {
         if let Err(error) = self.advance_initial_membership().await {
             self.ledger.lost(0, error);
         }
-        self.start_failover().await;
+        if self.ledger.recovery_mode == crate::RecoveryMode::Legacy {
+            self.start_failover().await;
+        }
         if let Err(error) = self.advance_repair().await {
             self.ledger
                 .lost(self.ledger.repair_destination_index().unwrap_or(0), error);
         }
+        self.ledger.refresh_scenario_operations();
     }
     pub(crate) async fn advance_initial_membership(&mut self) -> Result<()> {
         if self.profile.configured_sizes().is_none()
@@ -1334,6 +1337,31 @@ impl Manager {
                     self.ledger.lost(index, error);
                 }
             }
+            Accepted::Reconfigure(body) => {
+                if let Err(error) = self.send_configuration(&body).await {
+                    self.ledger
+                        .lost(self.ledger.configuration_target_index(), error.clone());
+                    self.ledger
+                        .complete(&op, json!({"op":op,"state":"unknown","error":error}));
+                    return Err(error);
+                }
+            }
+            Accepted::Build => {
+                if let Err(error) = self.request_repair_build().await {
+                    self.ledger
+                        .complete(&op, json!({"op":op,"state":"unknown","error":error}));
+                    return Err(error);
+                }
+            }
+            Accepted::Cancel(body) => {
+                if let Err(error) = self.send_idle_removal(&body).await {
+                    self.ledger.lost(self.ledger.primary_index(), error.clone());
+                    self.ledger
+                        .complete(&op, json!({"op":op,"state":"unknown","error":error}));
+                    return Err(error);
+                }
+            }
+            Accepted::Progress => {}
             Accepted::Status => {
                 self.ledger
                     .complete(&op, json!({"op":op,"state":"complete","kind":"status"}));
@@ -1343,6 +1371,7 @@ impl Manager {
             }
             Accepted::Quit => {}
         }
+        self.ledger.refresh_scenario_operations();
         Ok(self.ledger.result(&op))
     }
     pub async fn update_service(&mut self, index: usize, service: Service) -> Result<()> {

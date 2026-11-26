@@ -1796,6 +1796,7 @@ pub(crate) mod report_tests {
             op: op.into(),
             action: action.into(),
             node: Some(1),
+            ..crate::fm::Command::default()
         };
         ledger.accept(command("a", "create"))?;
         fm.send(add_instance_message(&body, &launch.generation).map_err(err)?)
@@ -2356,6 +2357,7 @@ pub(crate) mod report_tests {
             op: "loss-primary".into(),
             action: "create".into(),
             node: Some(launch.placement),
+            ..Command::default()
         })?
         else {
             return Err("original Primary create not accepted".into());
@@ -2737,6 +2739,7 @@ pub(crate) mod report_tests {
                 op: "replacement".into(),
                 action: "create".into(),
                 node: Some(launch.placement),
+                ..Command::default()
             })
             .is_ok()
         {
@@ -3547,6 +3550,7 @@ pub(crate) mod report_tests {
                 op: "original-primary".into(),
                 action: "create".into(),
                 node: Some(1),
+                ..crate::fm::Command::default()
             })?;
             ledger.reply(
                 0,

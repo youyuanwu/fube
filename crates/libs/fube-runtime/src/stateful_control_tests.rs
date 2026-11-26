@@ -9,6 +9,67 @@ use crate::ServicePartitionAccessStatus::{
     Granted as G, NotPrimary as N, ReconfigurationPending as T,
 };
 
+#[tokio::test]
+async fn configuration_allows_only_fenced_old_node_and_fresh_replacement_across_pc_cc() {
+    for invalid in [
+        None,
+        Some("live-predecessor"),
+        Some("same-node-instance"),
+        Some("multiple-predecessors"),
+    ] {
+        let mut h = Harness::new().await;
+        let _calls = register(&h);
+        let open = request(&h, 2, 1, 20);
+        h.send("ReplicaOpen", &open).await;
+        h.receive("ReplicaOpenReply").await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let mut old = peer(&open.local, 3);
+        old.current_role = 1;
+        old.state = 3;
+        old.up = false;
+        let mut fresh = old.clone();
+        fresh.node.instance += 1;
+        fresh.id += 1;
+        fresh.instance += 1;
+        fresh.previous_role = 2;
+        fresh.current_role = 3;
+        fresh.state = 2;
+        fresh.up = true;
+        if invalid == Some("live-predecessor") {
+            old.up = true;
+            old.state = 2;
+        } else if invalid == Some("same-node-instance") {
+            fresh.node.instance = old.node.instance;
+        } else if invalid == Some("multiple-predecessors") {
+            fresh.node.instance += 1;
+            fresh.id += 1;
+            fresh.instance += 1;
+        }
+        let mut configuration = control(
+            &open,
+            "UpdateConfiguration",
+            vec![open.local.clone(), peer(&open.local, 4), old.clone(), fresh],
+        );
+        if invalid == Some("multiple-predecessors") {
+            old.node.instance += 1;
+            old.id += 1;
+            old.instance += 1;
+            configuration.remote.0.push(old);
+        }
+        configuration.unit.previous = open.unit.current.clone();
+        configuration.unit.current.configuration += 1;
+        configuration.flags = 2;
+        h.send("UpdateConfiguration", &configuration).await;
+        let reply: ProxyReply =
+            from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
+        assert_eq!(
+            reply.error.error == 0,
+            invalid.is_none(),
+            "{invalid:?}: {reply:?}"
+        );
+    }
+}
+
 pub(super) fn control(request: &ProxyRequest, action: &str, remotes: Vec<Replica>) -> ProxyRequest {
     let mut result = request.clone();
     result.service = native_default_service(result.service);

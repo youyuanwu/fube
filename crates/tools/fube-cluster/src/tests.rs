@@ -7698,6 +7698,7 @@ fn command(op: &str, action: &str, node: Option<u8>) -> Command {
         op: op.into(),
         action: action.into(),
         node,
+        ..Command::default()
     }
 }
 fn ready_reply(placement: &fm::Placement) -> AddInstanceReply {

@@ -108,7 +108,7 @@ impl Manager {
         }
         let failure = self.ledger.node_failures.last().unwrap();
         Ok(json!({"state":"down","node":index + 1,
-            "replica_reconfiguration":if failure.recovery_error.is_some() {"blocked"} else if body.is_some() {"pending"} else {"not_required"},
+            "replica_reconfiguration":if failure.recovery_error.is_some() {"blocked"} else if body.is_some() {"pending"} else if self.ledger.recovery_mode == crate::RecoveryMode::Manual && failure.body.as_ref().is_some_and(|body| body.service.stateful) && failure.desired == Desired::Running {"not_requested"} else {"not_required"},
             "error":failure.recovery_error}))
     }
 
@@ -149,19 +149,36 @@ impl Manager {
         }
         let restore_replica = self.ledger.restart_desired(index)? == Desired::Running;
         if restore_replica {
-            if self.profile.stateful() {
-                if self.ledger.begin_rejoined_replica(index)? {
-                    self.request_repair_build().await?;
-                }
-            } else {
-                let session = self.children[index].launch.session.clone();
-                self.execute(Command {
-                    op: format!("restart-{session}"),
-                    action: "create".into(),
-                    node: Some((index + 1) as u8),
+            let launch = self.children[index].launch.clone();
+            let failure = self
+                .ledger
+                .node_failures
+                .iter()
+                .find(|failure| {
+                    failure
+                        .replacement
+                        .as_ref()
+                        .is_some_and(|replacement| replacement.node == launch.node)
                 })
-                .await?;
-            }
+                .ok_or("missing restarted replica predecessor")?;
+            let body = failure
+                .body
+                .as_ref()
+                .ok_or("restarted Node had no replica to restore")?;
+            self.execute(Command {
+                op: format!("restart-rebuild-{}", launch.session),
+                action: "rebuild-replica".into(),
+                node: Some((index + 1) as u8),
+                partition: Some(launch.partition),
+                predecessor: Some(crate::ReplicaRef {
+                    node: (index + 1) as u8,
+                    node_instance: failure.receipt.node.instance,
+                    replica: body.replica.id,
+                    incarnation: body.replica.instance,
+                }),
+                ..Command::default()
+            })
+            .await?;
         }
         Ok(
             json!({"state":if restore_replica {"pending"} else {"complete"},"kind":"node_restart","node":index + 1,
@@ -345,7 +362,19 @@ impl Cluster {
 
     /// Explicitly retire an old owner and rejoin with fresh Node/runtime/replica identities.
     pub async fn restart_node(&mut self, node: u8) -> Result<Value> {
+        self.restart_node_owned(node, true).await
+    }
+
+    pub(crate) async fn restart_node_owned(&mut self, node: u8, restore: bool) -> Result<Value> {
         let index = self.node_index(node)?;
+        if !restore
+            && !self
+                .fenced_nodes
+                .iter()
+                .any(|proof| proof.node == self.manager.children[index].launch.node)
+        {
+            return Err("infrastructure restart requires previously confirmed NodeDown".into());
+        }
         if let Some(remote) = &mut self.remote {
             remote.request(Operation::Status).await?;
         } else {
@@ -390,14 +419,38 @@ impl Cluster {
                 process.cleanup().map_err(err)?;
             }
         }
-        let down = self.node_down(node).await?;
-        if down["replica_reconfiguration"] == "blocked" {
+        let mut down = self.node_down(node).await?;
+        if restore
+            && self.manager.ledger.recovery_mode == crate::RecoveryMode::Manual
+            && matches!(
+                down["replica_reconfiguration"].as_str(),
+                Some("not_requested" | "recorded")
+            )
+        {
+            let launch = self.manager.children[index].launch.clone();
+            let predecessor = crate::ReplicaRef {
+                node,
+                node_instance: launch.node.instance,
+                replica: self.manager.ledger.placements[index].replica,
+                incarnation: self.manager.ledger.placements[index].incarnation,
+            };
+            let result = self
+                .reconfigure_partition(
+                    &format!("restart-reconfigure-{}", launch.session),
+                    &launch.partition,
+                    predecessor,
+                )
+                .await?;
+            down["replica_reconfiguration"] = result["state"].clone();
+        }
+        if restore && down["replica_reconfiguration"] == "blocked" {
             return Err(format!(
                 "NodeDown recorded, restart recovery blocked: {}",
                 down["error"]
             ));
         }
-        if self.config.profile.stateful() && down["replica_reconfiguration"] != "not_required" {
+        if restore && self.config.profile.stateful() && down["replica_reconfiguration"] == "pending"
+        {
             let until = Instant::now() + Duration::from_secs(30);
             while self.status()["configuration"]["ready"] != true {
                 self.drive().await;
@@ -448,7 +501,9 @@ impl Cluster {
         self.spawn(index).await?;
         self.rebind_node_peers(index, &predecessor, &fencing)
             .await?;
-        if let Some(remote) = &mut self.remote {
+        if !restore {
+            self.finish_node_infrastructure(index).await
+        } else if let Some(remote) = &mut self.remote {
             remote.request(Operation::FinishNodeRestart { index }).await
         } else {
             self.manager.finish_node_restart(index).await

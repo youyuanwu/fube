@@ -95,7 +95,7 @@ fn confirmed_node_down_reconfigures_without_the_dead_link_and_rejoin_is_incarnat
         assert_eq!(ledger.placements[lost].launch.node, launch.node);
         assert!(ledger.placements[lost].link_alive);
         assert!(ledger.record_node_down((lost + 1) % 3, proof).is_err());
-        assert!(ledger.begin_rejoined_replica(lost).unwrap());
+        assert!(ledger.begin_node_replica_rebuild(lost, lost).unwrap());
         let build = ledger.repair.as_ref().unwrap().build.body.clone();
         let mut replica = build.replica.clone();
         replica.state = 2;
@@ -171,6 +171,486 @@ fn unused_spare_node_failure_does_not_invalidate_ready_membership() {
     let successor = ledger.prepare_node_restart(3).unwrap();
     ledger.install_node_restart(3, successor).unwrap();
     assert_eq!(ledger.restart_desired(3).unwrap(), fm::Desired::Absent);
+}
+
+fn replica_ref(ledger: &Ledger, index: usize) -> crate::ReplicaRef {
+    let placement = &ledger.placements[index];
+    crate::ReplicaRef {
+        node: (index + 1) as u8,
+        node_instance: placement.launch.node.instance,
+        replica: placement.replica,
+        incarnation: placement.incarnation,
+    }
+}
+
+#[test]
+fn scoped_control_schema_rejects_mixed_fields_and_unproved_failure() {
+    let mut ledger = configured_ledger(3, 3);
+    ledger.recovery_mode = crate::RecoveryMode::Manual;
+    let predecessor = replica_ref(&ledger, 0);
+    let partition = ledger.placements[0].launch.partition.clone();
+    let request = Command {
+        op: "rebuild".into(),
+        action: "rebuild-replica".into(),
+        node: Some(1),
+        partition: Some(partition),
+        predecessor: Some(predecessor),
+        ..Command::default()
+    };
+    let bytes = serde_json::to_vec(&request).unwrap();
+    assert_eq!(serde_json::from_slice::<Command>(&bytes).unwrap(), request);
+    let mut mixed = request.clone();
+    mixed.action = "node-down".into();
+    assert!(mixed.validate().is_err());
+    let mut missing = request.clone();
+    missing.predecessor = None;
+    assert!(missing.validate().is_err());
+    ledger.lost(0, "socket closure is not a NodeDown receipt".into());
+    assert!(ledger.accept(request).is_err());
+    assert!(ledger.repair.is_none());
+}
+
+#[test]
+fn manual_node_recovery_is_scoped_retained_and_preserves_minimum() {
+    for lost in [0, 2] {
+        let mut ledger = configured_ledger(3, 3);
+        ledger.recovery_mode = crate::RecoveryMode::Manual;
+        let partition = ledger.placements[lost].launch.partition.clone();
+        let predecessor = replica_ref(&ledger, lost);
+        let fence = proof(&ledger, lost);
+        assert!(ledger
+            .record_node_down(lost, fence.clone())
+            .unwrap()
+            .is_none());
+        assert!(ledger.swap.is_none());
+        assert!(ledger.repair.is_none());
+        assert!(ledger.prepare_node_restart(lost).is_err());
+        let reconfigure = Command {
+            op: "reconfigure".into(),
+            action: "reconfigure-partition".into(),
+            partition: Some(partition.clone()),
+            predecessor: Some(predecessor.clone()),
+            ..Command::default()
+        };
+        let mut foreign = reconfigure.clone();
+        foreign.partition = Some(uuid::Uuid::new_v4().to_string());
+        assert!(ledger.accept(foreign).is_err());
+        let mut stale = reconfigure.clone();
+        stale.predecessor.as_mut().unwrap().node_instance += 1;
+        assert!(ledger.accept(stale).is_err());
+        let Accepted::Reconfigure(request) = ledger.accept(reconfigure.clone()).unwrap() else {
+            panic!("explicit survivor reconfiguration required");
+        };
+        assert_eq!(request.configuration.unit.minimum, 3);
+        assert_eq!(
+            request
+                .configuration
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.current_role >= 3)
+                .count(),
+            3
+        );
+        assert_eq!(
+            request
+                .configuration
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.up)
+                .count(),
+            2
+        );
+        assert!(matches!(
+            ledger.accept(reconfigure.clone()).unwrap(),
+            Accepted::Duplicate(_)
+        ));
+        let primary = ledger.configuration_target_index();
+        ledger
+            .configuration_reply(primary, completed(&request))
+            .unwrap();
+        ledger.refresh_scenario_operations();
+        assert_eq!(ledger.result("reconfigure")["state"], "complete");
+        let launch = ledger.prepare_node_restart(lost).unwrap();
+        ledger.install_node_restart(lost, launch.clone()).unwrap();
+        ledger.placements[lost].bootstrap = Bootstrap::Metadata;
+        ledger.placements[lost].link_alive = true;
+        let mut actual = profile(&launch);
+        actual.service = launch.profile.service().into();
+        actual.service_type = fixed_type_for(launch.profile);
+        ledger.placements[lost].admit_profile(actual).unwrap();
+        assert!(ledger.repair.is_none());
+        let rebuild = Command {
+            op: "rebuild".into(),
+            action: "rebuild-replica".into(),
+            node: Some((lost + 1) as u8),
+            partition: Some(partition),
+            predecessor: Some(predecessor),
+            ..Command::default()
+        };
+        assert!(matches!(
+            ledger.accept(rebuild.clone()).unwrap(),
+            Accepted::Build
+        ));
+        let owner = ledger.repair.as_ref().unwrap().build.body.clone();
+        assert!(matches!(
+            ledger.accept(rebuild.clone()).unwrap(),
+            Accepted::Duplicate(_)
+        ));
+        assert_eq!(ledger.repair.as_ref().unwrap().build.body, owner);
+        let mut changed = rebuild.clone();
+        changed.node = Some(((lost + 1) % 3 + 1) as u8);
+        assert!(ledger.accept(changed).is_err());
+        let mut replica = owner.replica.clone();
+        replica.state = 2;
+        replica.replication_endpoint = "127.0.0.1:23460".into();
+        ledger
+            .idle_reply(
+                primary,
+                AddReplicaReply {
+                    unit: owner.unit,
+                    replica,
+                    error: 0,
+                },
+            )
+            .unwrap();
+        let admission = ledger
+            .start_repair_configuration(Instant::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(admission.configuration.unit.minimum, 3);
+        assert_eq!(
+            admission
+                .configuration
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.current_role >= 3)
+                .count(),
+            3
+        );
+        ledger
+            .configuration_reply(primary, completed(&admission))
+            .unwrap();
+        ledger.refresh_scenario_operations();
+        assert_eq!(ledger.result("rebuild")["state"], "complete");
+        assert_eq!(ledger.configuration_status()["ready"], true);
+        let mut another = rebuild;
+        another.op = "stale-rebuild".into();
+        assert!(ledger.accept(another).is_err());
+    }
+}
+
+#[test]
+fn scoped_cancellation_owns_the_exact_pending_rebuild() {
+    let mut ledger = configured_ledger(3, 2);
+    let predecessor = replica_ref(&ledger, 0);
+    let partition = ledger.placements[0].launch.partition.clone();
+    let old = ledger.placements[0].body().unwrap();
+    ledger
+        .report(0, &stateful_loss_report(&ledger.placements[0]))
+        .unwrap();
+    ledger
+        .reply(
+            0,
+            AddInstanceReply {
+                unit: old.unit,
+                replica: dropped_replica(&old.replica),
+                error: 0,
+            },
+            true,
+        )
+        .unwrap();
+    let failover = ledger
+        .start_primary_failover(Instant::now())
+        .unwrap()
+        .unwrap();
+    let primary = ledger.configuration_target_index();
+    ledger
+        .configuration_reply(primary, completed(&failover))
+        .unwrap();
+    let rebuild = Command {
+        op: "rebuild".into(),
+        action: "rebuild-replica".into(),
+        node: Some(1),
+        partition: Some(partition),
+        predecessor: Some(predecessor),
+        ..Command::default()
+    };
+    assert!(matches!(ledger.accept(rebuild).unwrap(), Accepted::Build));
+    let repair = ledger.repair.as_mut().unwrap();
+    repair.profile = Some(repair.old_profile.clone());
+    repair.host_requested = true;
+    ledger.placements[0].loss_reported = false;
+    let cancel = Command {
+        op: "cancel".into(),
+        action: "cancel-rebuild".into(),
+        operation: Some("rebuild".into()),
+        ..Command::default()
+    };
+    let mut wrong = cancel.clone();
+    wrong.operation = Some("primary".into());
+    assert!(ledger.accept(wrong).is_err());
+    ledger
+        .repair
+        .as_mut()
+        .unwrap()
+        .build
+        .body
+        .replica
+        .node
+        .instance += 1;
+    assert!(ledger.accept(cancel.clone()).is_err());
+    ledger
+        .repair
+        .as_mut()
+        .unwrap()
+        .build
+        .body
+        .replica
+        .node
+        .instance -= 1;
+    let Accepted::Cancel(removal) = ledger.accept(cancel.clone()).unwrap() else {
+        panic!("native removal must own cancellation");
+    };
+    assert!(matches!(
+        ledger.accept(cancel).unwrap(),
+        Accepted::Duplicate(_)
+    ));
+    let mut removed = removal.replica;
+    removed.state = 3;
+    removed.replication_endpoint = "127.0.0.1:23460".into();
+    ledger
+        .idle_removal_reply(
+            primary,
+            RemoveReplicaReply {
+                unit: removal.unit,
+                replica: removed,
+                error: 0,
+            },
+        )
+        .unwrap();
+    ledger.refresh_scenario_operations();
+    assert_eq!(ledger.result("cancel")["state"], "complete");
+    assert_eq!(ledger.result("rebuild")["state"], "cancelled");
+    assert_eq!(ledger.repair_status()["destination_deleted"], false);
+    assert_eq!(ledger.repair_status()["disposed"], false);
+}
+
+#[tokio::test]
+async fn manual_stateless_rejoin_waits_for_partition_scoped_recreation() {
+    let fixture = Fixture::new("manual-stateless-rejoin");
+    let mut cluster = Cluster::new(fixture.config()).unwrap();
+    cluster
+        .set_recovery_mode(crate::RecoveryMode::Manual)
+        .unwrap();
+    cluster
+        .start_with_fm(&support::binary("fube-fm", "FUBE_FM_EXE"))
+        .await
+        .unwrap();
+    let result = peer_idle_catch(async {
+        let partition = cluster.manager.children[0].launch.partition.clone();
+        cluster.create_partition("create", &partition, 1).await?;
+        until(&mut cluster, |c| {
+            c.status()["nodes"][0]["observed"] == "running"
+        })
+        .await;
+        let predecessor = replica_ref(&cluster.manager.ledger, 0);
+        cluster.processes[0]
+            .as_mut()
+            .unwrap()
+            .cleanup()
+            .map_err(err)?;
+        cluster
+            .execute(command("down", "node-down", Some(1)))
+            .await?;
+        let restart = cluster
+            .execute(command("restart", "restart-node", Some(1)))
+            .await?;
+        assert_eq!(restart["state"], "complete");
+        for _ in 0..10 {
+            cluster.drive().await;
+        }
+        assert_eq!(cluster.status()["nodes"][0]["observed"], "absent");
+        let other_partition = cluster.manager.children[1].launch.partition.clone();
+        assert!(cluster
+            .rebuild_replica("wrong-partition", &other_partition, predecessor.clone(), 1)
+            .await
+            .is_err());
+        cluster
+            .rebuild_replica("rebuild", &partition, predecessor.clone(), 1)
+            .await?;
+        until(&mut cluster, |c| {
+            c.status()["nodes"][0]["observed"] == "running"
+        })
+        .await;
+        assert_eq!(
+            cluster
+                .rebuild_replica("rebuild", &partition, predecessor, 1)
+                .await?["state"],
+            "complete"
+        );
+        assert!(cluster
+            .execute(command("rebuild", "node-down", Some(1)))
+            .await
+            .is_err());
+        Ok::<(), String>(())
+    })
+    .await;
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn manual_minimum_sized_node_recovery_requires_each_control_and_preserves_data() {
+    for (target, lost, separate_fm) in [(3, 2, false), (3, 0, true), (4, 1, false), (4, 0, true)] {
+        let fixture = Fixture::new("manual-three-of-three-rejoin");
+        let mut config = fixture.config();
+        config.profile = ServiceProfile::Stateful {
+            target,
+            minimum: target,
+        };
+        config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+        let mut cluster = Cluster::new(config).unwrap();
+        cluster
+            .set_recovery_mode(crate::RecoveryMode::Manual)
+            .unwrap();
+        if separate_fm {
+            cluster
+                .start_with_fm(&support::binary("fube-fm", "FUBE_FM_EXE"))
+                .await
+                .unwrap();
+        } else {
+            cluster.start().await.unwrap();
+        }
+        let result = peer_idle_catch(async {
+            assert!(cluster
+                .set_recovery_mode(crate::RecoveryMode::Legacy)
+                .is_err());
+            assert_eq!(cluster.status()["recovery_mode"], "manual");
+            let partition = cluster.manager.children[0].launch.partition.clone();
+            cluster.create_partition("create", &partition, 1).await?;
+            until(&mut cluster, |c| {
+                c.status()["configuration"]["ready"] == true
+            })
+            .await;
+            let original = cluster.status();
+            let endpoint = original["nodes"][0]["endpoint"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            until(&mut cluster, |_| {
+                data_contact(&endpoint, b"read\n").starts_with("OK ")
+            })
+            .await;
+            assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
+            until(&mut cluster, |c| {
+                (1..target as usize).all(|i| {
+                    c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]
+                        ["provider"]["last"]
+                        == 1
+                })
+            })
+            .await;
+            let predecessor = replica_ref(&cluster.manager.ledger, lost);
+            cluster.processes[lost]
+                .as_mut()
+                .unwrap()
+                .cleanup()
+                .map_err(err)?;
+            cluster
+                .execute(command("down", "node-down", Some((lost + 1) as u8)))
+                .await?;
+            for _ in 0..10 {
+                cluster.drive().await;
+            }
+            assert_eq!(cluster.status()["repair"]["state"], "absent");
+            assert_eq!(cluster.status()["configuration"]["ready"], false);
+            cluster
+                .reconfigure_partition("reconfigure", &partition, predecessor.clone())
+                .await?;
+            until(&mut cluster, |c| {
+                c.status()["configuration"]["ready"] == true
+            })
+            .await;
+            let status = cluster.status();
+            let primary = status["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|node| node["endpoint"].as_str().is_some())
+                .unwrap();
+            let endpoint = status["nodes"][primary]["endpoint"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(data_contact(&endpoint, b"read\n").contains("committed=1"));
+            assert!(data_contact(&endpoint, b"write 2\n").contains("committed=2"));
+            let restart = cluster
+                .execute(command("restart", "restart-node", Some((lost + 1) as u8)))
+                .await?;
+            assert_eq!(restart["state"], "complete");
+            assert_eq!(restart["replica_recovery"], "not_requested");
+            for _ in 0..10 {
+                cluster.drive().await;
+            }
+            assert_eq!(cluster.status()["repair"]["state"], "absent");
+            assert_eq!(cluster.status()["nodes"][lost]["observed"], "absent");
+            let rebuild = cluster
+                .rebuild_replica("rebuild", &partition, predecessor.clone(), (lost + 1) as u8)
+                .await?;
+            assert_eq!(rebuild["state"], "pending");
+            assert_eq!(
+                cluster
+                    .rebuild_replica("rebuild", &partition, predecessor, (lost + 1) as u8)
+                    .await?["replica"],
+                rebuild["replica"]
+            );
+            until_with_budget(&mut cluster, Duration::from_secs(30), |c| {
+                c.status()["repair"]["ready"] == true
+            })
+            .await;
+            let status = cluster.status();
+            assert_eq!(status["replica_set"]["minimum"], target);
+            assert_eq!(
+                status["operations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|op| op["op"] == "rebuild")
+                    .unwrap()["state"],
+                "complete"
+            );
+            assert!(data_contact(&endpoint, b"write 3\n").contains("committed=3"));
+            if target == 3 && separate_fm {
+                cluster.restart_node((lost + 1) as u8).await?;
+                until_with_budget(&mut cluster, Duration::from_secs(30), |c| {
+                    c.status()["repair"]["ready"] == true
+                })
+                .await;
+                assert!(data_contact(&endpoint, b"read\n").contains("committed=3"));
+            }
+            for node in 0..target as usize {
+                if node != lost {
+                    assert_eq!(
+                        status["nodes"][node]["node_pid"],
+                        original["nodes"][node]["node_pid"]
+                    );
+                    assert_eq!(
+                        status["nodes"][node]["app_pid"],
+                        original["nodes"][node]["app_pid"]
+                    );
+                }
+            }
+            Ok::<(), String>(())
+        })
+        .await;
+        let cleanup = cluster.shutdown().await;
+        assert_eq!(cleanup["clean"], true, "{cleanup}");
+        result.unwrap().unwrap();
+    }
 }
 
 #[tokio::test]

@@ -21,6 +21,8 @@ use tokio::io::{AsyncWriteExt, BufReader};
 pub(crate) struct Manifest {
     pub schema_version: u32,
     pub launches: Vec<PathBuf>,
+    #[serde(default)]
+    pub recovery_mode: crate::RecoveryMode,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -48,6 +50,9 @@ pub(crate) enum Operation {
         index: usize,
     },
     FinishNodeRestart {
+        index: usize,
+    },
+    FinishNodeInfrastructure {
         index: usize,
     },
     Command {
@@ -119,6 +124,7 @@ async fn operate(manager: &mut Manager, operation: Operation) -> Result<Value> {
             serde_json::to_value(manager.prepare_node_restart(index).await?).map_err(err)
         }
         Operation::FinishNodeRestart { index } => manager.finish_node_restart(index).await,
+        Operation::FinishNodeInfrastructure { index } => manager.finish_node_infrastructure(index),
         Operation::Command { command } => manager.execute(command).await,
         Operation::Status => Ok(Value::Null),
         Operation::Generation => manager.begin_generation_handshake(),
@@ -168,6 +174,7 @@ pub async fn run(path: &Path) -> Result<()> {
         .map(|path| read_json(path))
         .collect::<Result<Vec<Launch>>>()?;
     let mut manager = Manager::new(launches)?;
+    manager.ledger.recovery_mode = manifest.recovery_mode;
     let mut lines = Lines::new(BufReader::new(tokio::io::stdin()), LIMIT);
     let mut expected = 1u64;
     let serving = async {

@@ -6,6 +6,7 @@ mod node;
 mod process_control;
 mod profile;
 mod restart;
+mod scenario;
 pub(crate) use fube_node::control::wire;
 
 pub use fm::Command;
@@ -13,6 +14,7 @@ pub use management::run as run_fm;
 use manager::Manager;
 pub use profile::Result;
 pub use profile::ServiceProfile;
+pub use scenario::{RecoveryMode, ReplicaRef};
 
 use fm::Bootstrap;
 #[cfg(test)]
@@ -186,6 +188,9 @@ impl Cluster {
             self.driver_commands.push((command.clone(), None));
             let result = if command.action == "node-down" {
                 self.node_down(command.node.unwrap()).await
+            } else if self.manager.ledger.recovery_mode == RecoveryMode::Manual {
+                self.restart_node_infrastructure(command.node.unwrap())
+                    .await
             } else {
                 self.restart_node(command.node.unwrap()).await
             }
@@ -199,6 +204,21 @@ impl Cluster {
                 .unwrap()
                 .1 = Some(result.clone());
             return result;
+        }
+        self.execute_fm_command(command).await
+    }
+
+    pub(crate) async fn execute_fm_command(&mut self, command: Command) -> Result<Value> {
+        if self.manager.finished.is_some() {
+            return Err("deployment already shut down".into());
+        }
+        command.validate()?;
+        if self
+            .driver_commands
+            .iter()
+            .any(|(original, _)| original.op == command.op)
+        {
+            return Err("operation identity is already owned by a Node control".into());
         }
         if let Some(remote) = &mut self.remote {
             let mut outcome = remote
@@ -384,6 +404,7 @@ impl Cluster {
                 &management::Manifest {
                     schema_version: 1,
                     launches,
+                    recovery_mode: self.manager.ledger.recovery_mode,
                 },
             )?;
             self.remote = Some(management::Client::new());

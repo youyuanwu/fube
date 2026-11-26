@@ -39,6 +39,16 @@ handoff rather than closing the FM connection.
 
 ## Explicit Node failure and cold rejoin
 
+The default legacy policy retains its original bundled NodeDown/restart
+contract. The opt-in [manual scenario policy](../../crates/tools/fube-cluster/README.md#manual-scenario-controls)
+separates failure reporting, survivor reconfiguration, infrastructure restart
+and partition-scoped replica rebuild. It uses the same FM operation ledger
+and RA/RAP native sequencing, not a second recovery engine. At 3/3 and 4/4,
+manual reconfiguration can retain the fenced down member until a real copied
+replacement permits combined removal/admission without lowering minimum.
+Partition definitions and Node placements remain static; this adds neither
+dynamic service creation nor general multi-failure/persisted recovery.
+
 The [cluster controls](../../crates/tools/fube-cluster/README.md#explicit-nodedown-and-restart)
 provide explicit `node-down` and `restart-node` commands. They are supervisor
 operations over private management IPC, not new FM/RA wire actions or a

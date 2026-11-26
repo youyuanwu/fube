@@ -341,7 +341,7 @@ impl Executor {
     }
 
     /// Replace configured membership only after the composition owner fences
-    /// the predecessor and completes any configuration removing that incarnation.
+    /// the predecessor and completes configuration marking it down or removed.
     pub fn replace_peer_after_fencing(
         &self,
         previous: &NodeInstance,
@@ -382,7 +382,7 @@ impl Executor {
                 })
         }) {
             return Err(Failure::Unsupported(
-                "peer incarnation replacement requires completed old configuration removal",
+                "peer incarnation replacement requires completed configuration with the predecessor down or removed",
             ));
         }
         view.peers[index] = replacement;
@@ -538,7 +538,7 @@ fn create_remote(
                         (r.node == target.node
                             || (r.node.id == target.node.id
                                 && r.node.instance < target.node.instance
-                                && r.current_role == 1
+                                && matches!(r.current_role, 1 | 3)
                                 && r.state == 3))
                             && !r.up
                             && matches!(r.current_role, 1 | 3)
