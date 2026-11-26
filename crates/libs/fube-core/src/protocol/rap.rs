@@ -2,40 +2,6 @@
 //! FabricTypes.idl at native revision 3988b451. All use signed LONG64 encoding.
 use serde::{Deserialize, Serialize};
 
-macro_rules! native_enum {
-    ($name:ident { $default:ident = $zero:literal, $($variant:ident = $code:literal),* $(,)? }) => {
-        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-        pub enum $name {
-            #[default]
-            $default,
-            $($variant,)*
-            Unrecognized(i64),
-        }
-        impl $name {
-            pub const fn code(self) -> i64 {
-                match self {
-                    Self::$default => $zero,
-                    $(Self::$variant => $code,)*
-                    Self::Unrecognized(code) => code,
-                }
-            }
-            pub const fn is_known(self) -> bool {
-                !matches!(self, Self::Unrecognized(_))
-            }
-        }
-        impl From<i64> for $name {
-            fn from(code: i64) -> Self {
-                match code {
-                    $zero => Self::$default,
-                    $($code => Self::$variant,)*
-                    code => Self::Unrecognized(code),
-                }
-            }
-        }
-        native_scalar!($name, code, from);
-    };
-}
-
 bitflags::bitflags! {
     /// Unknown wire bits are retained. Admission must use difference(allowed),
     /// not a bitflags complement, which truncates unknown bits.
@@ -132,23 +98,7 @@ impl From<NativeApi> for NativeApiDescription {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn check_scalar<T>(value: T, code: i64)
-    where
-        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
-    {
-        let expected = fubst::serde::to_vec(&code).unwrap();
-        assert_eq!(fubst::serde::to_vec(&value).unwrap(), expected);
-        assert_eq!(fubst::serde::from_slice::<T>(&expected).unwrap(), value);
-        assert_eq!(
-            serde_json::to_value(&value).unwrap(),
-            serde_json::json!(code)
-        );
-        assert_eq!(
-            serde_json::from_value::<T>(serde_json::json!(code)).unwrap(),
-            value
-        );
-    }
+    use crate::protocol::check_scalar;
 
     #[test]
     fn rap_scalars_preserve_signed_long64_and_numeric_json_including_unknowns() {

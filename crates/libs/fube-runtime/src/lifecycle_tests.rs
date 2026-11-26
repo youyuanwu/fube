@@ -1,6 +1,8 @@
 use super::*;
+use fube_core::protocol::NativeActivityType;
 use fube_core::protocol::NativeProxyFlags;
 use fube_core::protocol::NativeServiceOperation;
+use fube_core::protocol::NativeServicePackageActivationMode;
 use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 #[path = "reporting_tests.rs"]
 mod reporting_tests;
@@ -333,7 +335,10 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
     let fault: FaultBody = from_slice(&message.body).unwrap();
     assert_eq!(fault.fault, 1); // public COM Transient=2 must NOT leak here
     assert_eq!(fault.local.instance, 1);
-    assert_eq!(fault.activity.kind, 2);
+    assert_eq!(
+        fault.activity.kind,
+        NativeActivityType::ServiceReportFaultEvent
+    );
     assert_eq!(
         partition
             .report_fault(FaultType::Transient)
@@ -877,7 +882,7 @@ impl Harness {
                 update_version: 1,
                 placement: fubst::serde::ObjectArray(vec![]),
                 standby_keep: 0,
-                activation_mode: 0,
+                activation_mode: NativeServicePackageActivationMode::SharedProcess,
                 dns: String::new(),
                 scaling: fubst::serde::EmptyObjectArray,
             },
@@ -1719,7 +1724,7 @@ async fn prepared_fault_report_preserves_original_payload_across_retry_writes() 
                 guid: Guid([7; 16]),
                 index: 17,
             },
-            kind: 2,
+            kind: NativeActivityType::ServiceReportFaultEvent,
         },
     };
     let report = crate::ipc_client::FaultReport::prepare(body.clone()).unwrap();

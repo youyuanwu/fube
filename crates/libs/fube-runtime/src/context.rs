@@ -84,7 +84,10 @@ impl ActivationContext {
         {
             return Err(Error::InvalidInput("unsupported SF host/security profile"));
         }
-        if !get("Fabric_ApplicationHostType")?.eq_ignore_ascii_case("Activated_SingleCodePackage") {
+        if !matches!(
+            get("Fabric_ApplicationHostType")?.parse::<NativeApplicationHostType>(),
+            Ok(NativeApplicationHostType::ActivatedSingleCodePackage)
+        ) {
             return Err(Error::InvalidInput(
                 "requires SF-activated single-code-package ExeHost",
             ));
@@ -125,7 +128,7 @@ impl ActivationContext {
         let activation = match env.get("Fabric_ServicePackageActivationGuid") {
             None => Activation {
                 guid: Guid([0; 16]),
-                mode: 0,
+                mode: NativeServicePackageActivationMode::SharedProcess,
             },
             Some(value) => {
                 let guid = uuid::Uuid::parse_str(value)
@@ -135,7 +138,7 @@ impl ActivationContext {
                 }
                 Activation {
                     guid: Guid(guid.to_bytes_le()),
-                    mode: 1,
+                    mode: NativeServicePackageActivationMode::ExclusiveProcess,
                 }
             }
         };
@@ -143,7 +146,9 @@ impl ActivationContext {
             .get("Fabric_ServicePackageActivationId")
             .cloned()
             .unwrap_or_default();
-        if activation.mode == 1 || !public_id.is_empty() {
+        if activation.mode == NativeServicePackageActivationMode::ExclusiveProcess
+            || !public_id.is_empty()
+        {
             uuid::Uuid::parse_str(&public_id)
                 .map_err(|_| Error::InvalidInput("invalid public activation ID"))?;
         }
@@ -198,7 +203,7 @@ impl ActivationContext {
             id: uuid::Uuid::new_v4().to_string(),
             host: HostContext {
                 id: host_id.clone(),
-                kind: 1,
+                kind: NativeApplicationHostType::ActivatedSingleCodePackage,
                 pid: std::process::id(),
                 container: false,
                 activator: false,
@@ -294,6 +299,10 @@ pub(crate) mod tests {
             ("Fabric_IsContainerHost", "true"),
             ("Fabric_IsCodePackageActivatorHost", "true"),
             ("Fabric_ApplicationHostType", "NonActivated"),
+            ("Fabric_ApplicationHostType", "Activated_MultiCodePackage"),
+            ("Fabric_ApplicationHostType", "Activated_InProcess"),
+            ("Fabric_ApplicationHostType", "Activated_Unknown"),
+            ("Fabric_ApplicationHostType", "1"),
             ("Fabric_RuntimeConnectionAddress", "172.30.91.11:4000"),
             (
                 "Fabric_ServicePackageActivationGuid",
@@ -304,6 +313,47 @@ pub(crate) mod tests {
             e.insert(k.into(), v.into());
             assert!(ActivationContext::parse(&e).is_err(), "{k}");
         }
+    }
+
+    #[test]
+    fn typed_activation_preserves_environment_validation_and_shared_only_deployment() {
+        let mut source = env();
+        source.insert(
+            "Fabric_ApplicationHostType".into(),
+            "activated_singlecodepackage".into(),
+        );
+        let shared = ActivationContext::parse(&source).unwrap();
+        assert_eq!(
+            shared.runtime.host.kind,
+            NativeApplicationHostType::ActivatedSingleCodePackage
+        );
+        assert_eq!(
+            shared.runtime.code.id.package.activation.mode,
+            NativeServicePackageActivationMode::SharedProcess
+        );
+        let guid = uuid::Uuid::new_v4();
+        source.insert(
+            "Fabric_ServicePackageActivationGuid".into(),
+            guid.to_string(),
+        );
+        assert!(ActivationContext::parse(&source).is_err());
+        source.insert("Fabric_ServicePackageActivationId".into(), guid.to_string());
+        let exclusive = ActivationContext::parse(&source).unwrap();
+        assert_eq!(
+            exclusive.runtime.code.id.package.activation.mode,
+            NativeServicePackageActivationMode::ExclusiveProcess
+        );
+        assert_eq!(
+            exclusive.runtime.code.id.package.activation.guid.0,
+            guid.to_bytes_le()
+        );
+        assert!(matches!(
+            crate::packages::load(
+                &exclusive,
+                std::path::Path::new("/unused-exclusive-deployment")
+            ),
+            Err(Error::InvalidInput(_))
+        ));
     }
 
     #[test]

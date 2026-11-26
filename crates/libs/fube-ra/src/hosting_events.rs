@@ -59,7 +59,9 @@ pub(super) fn consume(
                 let exclusive = event.activation.guid.0 != [0; 16];
                 if !compare_service_types(&s.body.service.service_type, &event.service_type).is_eq()
                     || s.body.replica.version != event.version
-                    || (s.body.service.activation_mode == 1) != exclusive
+                    || (s.body.service.activation_mode
+                        == NativeServicePackageActivationMode::ExclusiveProcess)
+                        != exclusive
                     || (exclusive && event.activation.guid != event.unit.guid)
                 {
                     Disposition::IgnoredStale

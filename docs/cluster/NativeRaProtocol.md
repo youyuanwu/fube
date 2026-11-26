@@ -814,6 +814,18 @@ allowed mask; `difference(allowed).is_empty()` checks unknown bits without
 silently truncating them. This typing does not expand supported RAP actions,
 recovery profiles or native interoperability claims.
 
+Hosting contexts use shared
+[`NativeApplicationHostType`, `NativeServicePackageActivationMode` and
+`NativeActivityType`](../../crates/libs/fube-core/src/protocol/hosting.rs).
+Host types describe nonactivated, single-code-package, multi-code-package and
+in-process activation; container/activator booleans remain independent.
+The activation mode is shared with RA/RAP service descriptions. Checked native
+environment-name parsing preserves case-insensitive names, without enabling
+other host types or exclusive execution. These scalars retain signed LONG64 and
+numeric JSON, including unrecognized codes; original single-code-package and
+SharedProcess admission remains authoritative. Activity kinds remain diagnostic
+metadata, including unknown values, not cleanup or recovery permission.
+
 This scalar rule does not override `ArrayUtility`: a vector of a type marked
 `DEFINE_AS_BLITTABLE` without a specific array utility is serialized as raw
 byte array, `count * sizeof(T)` ([serialization:134–164,4997–5001][serialization]).

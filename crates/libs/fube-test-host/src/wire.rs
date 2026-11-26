@@ -1,3 +1,6 @@
+pub use fube_hosting::wire::{
+    NativeActivityType, NativeApplicationHostType, NativeServicePackageActivationMode,
+};
 use fubst::serde::{EmptyObjectArray, Guid, Pointer};
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +24,7 @@ pub struct IpcIdentity {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HostStart {
     pub host: String,
-    pub kind: i64,
+    pub kind: NativeApplicationHostType,
     pub pid: u32,
     pub timeout: i64,
     pub container: bool,
@@ -88,7 +91,7 @@ pub struct PackageId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Activation {
     pub guid: Guid,
-    pub mode: i64,
+    pub mode: NativeServicePackageActivationMode,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackageInstance {
@@ -131,7 +134,7 @@ pub struct CodeContext {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostContext {
     pub host: String,
-    pub kind: i64,
+    pub kind: NativeApplicationHostType,
     pub pid: u32,
     pub container: bool,
     pub activator: bool,
@@ -168,7 +171,7 @@ pub struct ActivityId {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Activity {
     pub id: ActivityId,
-    pub kind: i64,
+    pub kind: NativeActivityType,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HostUnregister {
@@ -198,7 +201,7 @@ pub fn code_context(
                 },
                 activation: Activation {
                     guid: Guid([0; 16]),
-                    mode: 0,
+                    mode: NativeServicePackageActivationMode::SharedProcess,
                 },
                 public_id: String::new(),
             },

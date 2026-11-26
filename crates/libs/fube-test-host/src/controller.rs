@@ -1,4 +1,5 @@
 use crate::{ipc::Session, lifecycle_wire::*, require, wire, HostError, Result};
+use fube_hosting::wire::NativeServicePackageActivationMode;
 use fube_ra::protocol::NativeProxyFlags;
 use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use fubst::serde::{to_vec, ByteArray, EmptyObjectArray, Guid};
@@ -103,7 +104,7 @@ impl ServiceUnit {
                     update_version: 1,
                     placement: EmptyObjectArray,
                     standby_keep: i64::MIN,
-                    activation_mode: 0,
+                    activation_mode: NativeServicePackageActivationMode::SharedProcess,
                     dns: String::new(),
                     scaling: EmptyObjectArray,
                 },
@@ -231,6 +232,7 @@ fn require_connection_refused(connection: std::io::Result<TcpStream>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fube_hosting::wire::NativeApplicationHostType;
     use fube_ra::protocol::{NativeApiName, NativeInterfaceName};
     use furpc::{header, ActorId, Body};
 
@@ -240,7 +242,7 @@ mod tests {
                 id: "observed-runtime".into(),
                 host: wire::HostContext {
                     host: "owned".into(),
-                    kind: 1,
+                    kind: NativeApplicationHostType::ActivatedSingleCodePackage,
                     pid: 42,
                     container: false,
                     activator: false,

@@ -1,5 +1,8 @@
 //! Actual owned node/Hosting/RA paths with explicit trusted qualification
 //! readiness and simulated FT creation. No H2 acquisition/RAP/FM completion.
+use fube_hosting::wire::NativeActivityType;
+use fube_hosting::wire::NativeApplicationHostType;
+use fube_hosting::wire::NativeServicePackageActivationMode;
 use fube_hosting::{self as hosting, ipc::*, wire};
 use fube_node::{Config, Handle, Input, Node, Response};
 use fube_ra::protocol::NativeReplicaState;
@@ -92,7 +95,7 @@ fn host_admission() -> Admission {
         deadlines: RequestDeadlines::Propagated,
         host: wire::HostContext {
             id: uuid::Uuid::new_v4().to_string(),
-            kind: 1,
+            kind: NativeApplicationHostType::ActivatedSingleCodePackage,
             pid: std::process::id(),
             container: false,
             activator: false,
@@ -109,7 +112,7 @@ fn host_admission() -> Admission {
                     },
                     activation: wire::Activation {
                         guid: Guid([0; 16]),
-                        mode: 0,
+                        mode: NativeServicePackageActivationMode::SharedProcess,
                     },
                     public_id: String::new(),
                 },
@@ -493,7 +496,7 @@ async fn actual_node_registration_lookup_all_five_consumers_and_owned_gated_resi
                         guid: Guid([2; 16]),
                         index: 1,
                     },
-                    kind: 0,
+                    kind: NativeActivityType::Unknown,
                 },
             },
         )
@@ -736,7 +739,7 @@ async fn full_fanout_budget_preserves_empty_closure_head_and_uncollected_receipt
                         guid: Guid([2; 16]),
                         index: 1,
                     },
-                    kind: 0,
+                    kind: NativeActivityType::Unknown,
                 },
             },
         )

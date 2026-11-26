@@ -211,7 +211,10 @@ impl Bridge {
         }
         // This bounded profile consumes actual equal-version successful H1 results.
         // An error-shaped candidate is NOT silently upgraded into an acquisition.
-        if snapshot.result.is_err() || issued.body.service.activation_mode != 0 {
+        if snapshot.result.is_err()
+            || issued.body.service.activation_mode
+                != fube_core::protocol::NativeServicePackageActivationMode::SharedProcess
+        {
             return Err(Error::InvalidResult);
         }
         let candidate = snapshot.candidate.as_ref().ok_or(Error::InvalidResult)?;

@@ -1,6 +1,7 @@
 use fube_core::protocol::NativeApiName;
 use fube_core::protocol::NativeInterfaceName;
 use fube_core::protocol::NativeProxyFlags;
+use fube_core::protocol::NativeServicePackageActivationMode;
 use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use fube_ra::{entity::*, protocol::*};
 use fube_ra_store::{
@@ -16224,7 +16225,7 @@ async fn native_add_description_update_precedes_drop_or_duplicate_and_preserves_
         incoming.service.minimum = 2;
         incoming.service.service_type.name = "ChangedType".into();
         incoming.service.service_type.package.name = "ChangedPackage".into();
-        incoming.service.activation_mode = 1;
+        incoming.service.activation_mode = NativeServicePackageActivationMode::ExclusiveProcess;
         incoming.service.constraints = "NodeType == Blue".into();
         incoming.unit.current.configuration += 1;
         if dropping {
@@ -16245,7 +16246,10 @@ async fn native_add_description_update_precedes_drop_or_duplicate_and_preserves_
             current.body.service.service_type,
             incoming.service.service_type
         );
-        assert_eq!(current.body.service.activation_mode, 1);
+        assert_eq!(
+            current.body.service.activation_mode,
+            NativeServicePackageActivationMode::ExclusiveProcess
+        );
         assert_eq!(
             (current.body.unit.target, current.body.unit.minimum),
             (5, 2)

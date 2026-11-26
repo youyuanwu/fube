@@ -4,6 +4,8 @@
 //! cleanup errors preserve every resource here; owner abandonment/abrupt death
 //! and escaped descendants have no durable recovery guarantee.
 use crate::{ipc, wire, *};
+use fube_core::protocol::NativeApplicationHostType;
+use fube_core::protocol::NativeServicePackageActivationMode;
 pub use fube_local_host::manifest::Profile;
 pub use fube_local_host::process::NativeRuntime;
 use fube_local_host::{
@@ -276,7 +278,7 @@ impl Activation {
                     },
                     activation: wire::Activation {
                         guid: Guid([0; 16]),
-                        mode: 0,
+                        mode: NativeServicePackageActivationMode::SharedProcess,
                     },
                     public_id: String::new(),
                 },
@@ -303,7 +305,7 @@ impl Activation {
             id: String::new(),
             host: wire::HostContext {
                 id: host_id.clone(),
-                kind: 1,
+                kind: NativeApplicationHostType::ActivatedSingleCodePackage,
                 pid: 1,
                 container: false,
                 activator: false,
@@ -429,7 +431,7 @@ impl Activation {
             ipc::Admission {
                 host: wire::HostContext {
                     id: host_id,
-                    kind: 1,
+                    kind: NativeApplicationHostType::ActivatedSingleCodePackage,
                     pid,
                     container: false,
                     activator: false,

@@ -1,8 +1,10 @@
 //! Adapter tests use controlled callbacks, not a purported empty-state policy.
 //! The actual sample custom replicator has its own controlled-peer test gate.
 use super::*;
+use fube_core::protocol::NativeActivityType;
 use fube_core::protocol::NativeProxyFlags;
 use fube_core::protocol::NativeReplicaRole;
+use fube_core::protocol::NativeServicePackageActivationMode;
 #[path = "stateful_control_tests.rs"]
 mod control_tests;
 #[path = "stateful_reporting_tests.rs"]
@@ -607,7 +609,10 @@ async fn owned_stateful_fault_uses_native_identity_epochs_and_generation_fences(
     assert_eq!((fault.local.id, fault.local.instance), (100, 17));
     assert_eq!(fault.local.node.id.0, current.local.node.id.0);
     assert_eq!(fault.local.node.instance, current.local.node.instance);
-    assert_eq!(fault.activity.kind, 2);
+    assert_eq!(
+        fault.activity.kind,
+        NativeActivityType::ServiceReportFaultEvent
+    );
     assert_eq!(
         partition
             .report_fault(FaultType::Transient)
@@ -1159,7 +1164,7 @@ fn native_default_service(mut service: Service) -> Service {
     service.update_version = 0;
     service.placement.0.clear();
     service.standby_keep = i64::MIN;
-    service.activation_mode = 0;
+    service.activation_mode = NativeServicePackageActivationMode::SharedProcess;
     service.dns.clear();
     service
 }

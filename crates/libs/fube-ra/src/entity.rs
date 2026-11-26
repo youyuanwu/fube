@@ -2078,7 +2078,8 @@ fn transition(
                 && (body.replica.previous_role != NativeReplicaRole::None
                     || body.service.partitions != 1
                     || !valid_stateful_sizes(&body.service)
-                    || body.service.activation_mode != 0
+                    || body.service.activation_mode
+                        != NativeServicePackageActivationMode::SharedProcess
                     || !body.service.scaling.0.is_empty()
                     || body.unit.consistency.kind != 1
                     || body.unit.consistency.id != body.unit.id

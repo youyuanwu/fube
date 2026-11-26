@@ -15,6 +15,44 @@ macro_rules! native_scalar {
     };
 }
 
+macro_rules! native_enum {
+    ($name:ident { $default:ident = $zero:literal, $($variant:ident = $code:literal),* $(,)? }) => {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+        pub enum $name {
+            #[default]
+            $default,
+            $($variant,)*
+            Unrecognized(i64),
+        }
+        impl $name {
+            pub const fn code(self) -> i64 {
+                match self {
+                    Self::$default => $zero,
+                    $(Self::$variant => $code,)*
+                    Self::Unrecognized(code) => code,
+                }
+            }
+            pub const fn is_known(self) -> bool {
+                !matches!(self, Self::Unrecognized(_))
+            }
+        }
+        impl From<i64> for $name {
+            fn from(code: i64) -> Self {
+                match code {
+                    $zero => Self::$default,
+                    $($code => Self::$variant,)*
+                    code => Self::Unrecognized(code),
+                }
+            }
+        }
+        native_scalar!($name, code, from);
+    };
+}
+
+mod hosting;
+pub use hosting::{
+    NativeActivityType, NativeApplicationHostType, NativeServicePackageActivationMode,
+};
 mod replica;
 pub use replica::{NativeReplicaRole, NativeReplicaState};
 mod rap;
@@ -39,4 +77,22 @@ pub mod actor {
     pub const HM: i64 = 16;
     pub const FILE_SENDER: i64 = 25;
     pub const FILE_TRANSFER_CLIENT: i64 = 27;
+}
+
+#[cfg(test)]
+fn check_scalar<T>(value: T, code: i64)
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    let bytes = fubst::serde::to_vec(&code).unwrap();
+    assert_eq!(fubst::serde::to_vec(&value).unwrap(), bytes);
+    assert_eq!(fubst::serde::from_slice::<T>(&bytes).unwrap(), value);
+    assert_eq!(
+        serde_json::to_value(&value).unwrap(),
+        serde_json::json!(code)
+    );
+    assert_eq!(
+        serde_json::from_value::<T>(serde_json::json!(code)).unwrap(),
+        value
+    );
 }

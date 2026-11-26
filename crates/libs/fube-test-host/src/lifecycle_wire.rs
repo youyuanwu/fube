@@ -1,7 +1,9 @@
 //! Native RA12 stateless subset. Source: ServiceModel/reliability/failover/
 //! and Reliability/Failover/{common,ra}/ declarations at the pinned revision.
 use crate::wire::{PackageId, VersionInstance};
-pub use fube_ra::protocol::{NativeApiDescription as ApiName, NativeProxyFlags};
+pub use fube_ra::protocol::{
+    NativeApiDescription as ApiName, NativeProxyFlags, NativeServicePackageActivationMode,
+};
 use fubst::serde::{ByteArray, EmptyObjectArray, Guid};
 use serde::{Deserialize, Serialize};
 
@@ -81,7 +83,7 @@ pub struct Service {
     pub update_version: u64,
     pub placement: EmptyObjectArray,
     pub standby_keep: i64,
-    pub activation_mode: i64,
+    pub activation_mode: NativeServicePackageActivationMode,
     pub dns: String,
     pub scaling: EmptyObjectArray,
 }

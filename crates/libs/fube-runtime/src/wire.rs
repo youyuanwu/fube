@@ -1,9 +1,10 @@
 //! Private source-corresponding hosting records. Native source baseline:
 //! 3988b451, Hosting2 and ServiceModel FABRIC_FIELDS declarations.
 pub use fube_core::protocol::{
-    NativeApi, NativeApiDescription as ApiName, NativeApiName, NativeInterfaceName,
-    NativeProxyFlags, NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation,
-    NativeServiceOperation,
+    NativeActivityType, NativeApi, NativeApiDescription as ApiName, NativeApiName,
+    NativeApplicationHostType, NativeInterfaceName, NativeProxyFlags, NativeReplicaRole,
+    NativeReplicaState, NativeReplicatorOperation, NativeServiceOperation,
+    NativeServicePackageActivationMode,
 };
 use fubst::serde::{ByteArray, Guid, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostContext {
     pub id: String,
-    pub kind: i64,
+    pub kind: NativeApplicationHostType,
     pub pid: u32,
     pub container: bool,
     pub activator: bool,
@@ -29,7 +30,7 @@ pub struct PackageId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Activation {
     pub guid: Guid,
-    pub mode: i64,
+    pub mode: NativeServicePackageActivationMode,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackageInstance {
@@ -78,7 +79,7 @@ pub struct RuntimeContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartRequest {
     pub id: String,
-    pub kind: i64,
+    pub kind: NativeApplicationHostType,
     pub pid: u32,
     pub timeout: i64,
     pub container: bool,
@@ -143,7 +144,7 @@ pub struct ActivityId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Activity {
     pub id: ActivityId,
-    pub kind: i64,
+    pub kind: NativeActivityType,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnregisterHost {
@@ -264,7 +265,7 @@ pub struct Service {
     pub update_version: u64,
     pub placement: ObjectArray<Vec<Placement>>,
     pub standby_keep: i64,
-    pub activation_mode: i64,
+    pub activation_mode: NativeServicePackageActivationMode,
     pub dns: String,
     pub scaling: fubst::serde::EmptyObjectArray,
 }

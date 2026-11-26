@@ -3,6 +3,7 @@
 use crate::{
     complete, deployment, process, require, HostError, Options, Result, RunReport, Scenario,
 };
+use fube_hosting::wire::NativeApplicationHostType;
 use fube_hosting::{ipc, wire};
 use fube_rap_test_support::transport::relay::Frame;
 use fubst::serde::{from_slice, to_vec, ObjectArray, Pointer};
@@ -241,7 +242,7 @@ pub fn run_hosting_leases(options: Options) -> Result<RunReport> {
                 host: wire::HostContext {
                     id: host.clone(),
                     pid,
-                    kind: 1,
+                    kind: NativeApplicationHostType::ActivatedSingleCodePackage,
                     container: false,
                     activator: false,
                 },

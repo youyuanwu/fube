@@ -6,6 +6,7 @@
 pub use fube_core::protocol::{
     NativeApi, NativeApiDescription, NativeApiName, NativeInterfaceName, NativeProxyFlags,
     NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation, NativeServiceOperation,
+    NativeServicePackageActivationMode,
 };
 use fubst::serde::{ByteArray, Derived, Guid, Inline, NativeEnum, ObjectArray, Pointer};
 use furpc::{
@@ -332,7 +333,7 @@ pub struct Service {
     pub update_version: u64,
     pub placement: ObjectArray<Vec<Placement>>,
     pub standby_keep: i64,
-    pub activation_mode: i64,
+    pub activation_mode: NativeServicePackageActivationMode,
     pub dns: String,
     pub scaling: ObjectArray<Vec<ScalingPolicy>>,
 }
@@ -361,7 +362,7 @@ impl Default for Service {
             update_version: 0,
             placement: ObjectArray::default(),
             standby_keep: i64::MIN,
-            activation_mode: 0,
+            activation_mode: NativeServicePackageActivationMode::SharedProcess,
             dns: String::new(),
             scaling: ObjectArray::default(),
         }

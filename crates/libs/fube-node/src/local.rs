@@ -810,7 +810,8 @@ impl Node {
                             || service.target != 1
                             || service.minimum != 1
                             || service.partitions != 1
-                            || service.activation_mode != 0
+                            || service.activation_mode
+                                != NativeServicePackageActivationMode::SharedProcess
                             || !service.scaling.0.is_empty())
                     {
                         return Err(Error::Unsupported);
@@ -1918,7 +1919,7 @@ impl Node {
             || body.service.stateful != stateful
             || body.service.persisted
             || body.service.group
-            || body.service.activation_mode != 0
+            || body.service.activation_mode != NativeServicePackageActivationMode::SharedProcess
             || !body.service.scaling.0.is_empty()
             || body.service.partitions != 1
             || matches!(self.activation.profile(),

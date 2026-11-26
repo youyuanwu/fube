@@ -185,7 +185,7 @@ impl Rich for Service {
         self.update_version.rich(c);
         self.placement.rich(c);
         self.standby_keep.rich(c);
-        self.activation_mode = i64::from(next(c) % 5);
+        self.activation_mode = enum_sample(c);
         self.dns.rich(c);
         let null = ScalingPolicy {
             trigger: Pointer(None),

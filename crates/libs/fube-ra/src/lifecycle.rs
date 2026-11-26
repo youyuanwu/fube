@@ -645,7 +645,8 @@ pub(super) fn transition(
                                     .as_ref()
                                     .is_none_or(|c| c.stage != ConfigurationStage::Complete)
                         }))
-                    || body.service.activation_mode != 0
+                    || body.service.activation_mode
+                        != NativeServicePackageActivationMode::SharedProcess
                     || !body.service.scaling.0.is_empty()
                     || body.replica.node != admission.local_node
                     || body.unit.consistency.id != body.unit.id

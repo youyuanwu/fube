@@ -1,5 +1,6 @@
 use super::*;
 use crate::wire::{ErrorReply, IdRequest};
+use fube_core::protocol::NativeActivityType;
 use fube_core::protocol::NativeApiName;
 use fube_core::protocol::NativeInterfaceName;
 use fube_core::protocol::NativeProxyFlags;
@@ -419,7 +420,7 @@ fn fault_report() -> FaultReport {
                 guid: Guid([7; 16]),
                 index: 17,
             },
-            kind: 2,
+            kind: NativeActivityType::ServiceReportFaultEvent,
         },
     })
     .unwrap()

@@ -38,6 +38,7 @@ pub use crate::stateful_api::{
     StatefulCallbackGuard,
 };
 pub use fube_core::protocol::{
-    NativeApi, NativeApiDescription, NativeApiName, NativeInterfaceName, NativeProxyFlags,
-    NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation, NativeServiceOperation,
+    NativeActivityType, NativeApi, NativeApiDescription, NativeApiName, NativeApplicationHostType,
+    NativeInterfaceName, NativeProxyFlags, NativeReplicaRole, NativeReplicaState,
+    NativeReplicatorOperation, NativeServiceOperation, NativeServicePackageActivationMode,
 };

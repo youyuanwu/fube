@@ -6,6 +6,7 @@ use crate::hosting_leases::{
 use crate::{
     complete, deployment, process, require, HostError, Options, Result, RunReport, Scenario,
 };
+use fube_hosting::wire::NativeApplicationHostType;
 use fube_hosting::{self as hosting, ipc, wire};
 use fube_node::{Config, Input, Node, Response};
 use fube_ra::{entity as ra, protocol};
@@ -53,7 +54,7 @@ pub fn run_hosting_registration(options: Options) -> Result<RunReport> {
         let code: wire::CodeContext = from_slice(&to_vec(&bundle.identity)?)?;
         let Response::Prepared(prepared) = handle.submit(Input::Admit { admission: ipc::Admission {
             deadlines: ipc::RequestDeadlines::NativeClientLocal,
-            host: wire::HostContext { id: host.clone(), pid, kind: 1, container: false, activator: false }, code,
+            host: wire::HostContext { id: host.clone(), pid, kind: NativeApplicationHostType::ActivatedSingleCodePackage, container: false, activator: false }, code,
         }, types: vec![bundle.service_type.clone()], source: "prepared-native-service-manifest".into() })
             .map_err(|e| HostError(format!("node admission submit: {e:?}")))?
             .wait(Duration::from_secs(3)).map_err(|e| HostError(format!("node admission: {e:?}")))?

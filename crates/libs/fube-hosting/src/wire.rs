@@ -1,13 +1,16 @@
 //! Hosting2 ordered wire records, pinned native baseline 3988b451.
 //! Ordered bootstrap/runtime/type records. Schema alone enables no consumer,
 //! reports or deployment; factory capability requires explicit owned admission.
+pub use fube_core::protocol::{
+    NativeActivityType, NativeApplicationHostType, NativeServicePackageActivationMode,
+};
 use fubst::serde::{ByteArray, Guid, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostContext {
     pub id: String,
-    pub kind: i64,
+    pub kind: NativeApplicationHostType,
     pub pid: u32,
     pub container: bool,
     pub activator: bool,
@@ -25,7 +28,7 @@ pub struct PackageId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Activation {
     pub guid: Guid,
-    pub mode: i64,
+    pub mode: NativeServicePackageActivationMode,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackageInstance {
@@ -74,7 +77,7 @@ pub struct RuntimeContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartRequest {
     pub id: String,
-    pub kind: i64,
+    pub kind: NativeApplicationHostType,
     pub pid: u32,
     pub timeout: i64,
     pub container: bool,
@@ -149,7 +152,7 @@ pub struct ActivityId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Activity {
     pub id: ActivityId,
-    pub kind: i64,
+    pub kind: NativeActivityType,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnregisterHost {

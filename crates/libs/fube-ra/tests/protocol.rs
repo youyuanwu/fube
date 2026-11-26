@@ -754,6 +754,14 @@ fn errors_and_unknown_scalar_enum_values_are_lossless() {
             reply
         );
     }
+    for mode in [-1, 2, i64::MIN, i64::MAX] {
+        let mut request = support::rich_request();
+        request.service.activation_mode = NativeServicePackageActivationMode::from(mode);
+        assert_eq!(
+            from_slice::<AddInstance>(&to_vec(&request).unwrap()).unwrap(),
+            request
+        );
+    }
 }
 
 #[test]

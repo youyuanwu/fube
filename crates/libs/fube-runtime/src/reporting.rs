@@ -2,6 +2,7 @@
 use crate::ipc_client::{deadline_after, native_error, Check, FaultReport};
 use crate::{api::FaultType, lease::Authority, wire::*};
 use crate::{Error, Result};
+use fube_core::protocol::NativeActivityType;
 use fubst::serde::{EmptyObjectArray, NativeEnum, ObjectArray, Pointer};
 use furpc::{HeaderId, HeaderRecord, Request};
 use std::{
@@ -506,7 +507,7 @@ impl Reporting {
                             guid: fubst::serde::Guid(uuid::Uuid::new_v4().to_bytes_le()),
                             index: 0,
                         },
-                        kind: 2,
+                        kind: NativeActivityType::ServiceReportFaultEvent,
                     },
                 })?;
                 if let Some(old) = &*stage {

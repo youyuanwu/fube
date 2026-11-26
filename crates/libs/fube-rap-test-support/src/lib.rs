@@ -3,7 +3,8 @@
 //! Shared support depends only on public framework/runtime/transport contracts;
 //! it exposes no data engine, diagnostics, lifecycle hook or control setter.
 use fube_runtime::extensions::{
-    NativeApiDescription as ApiName, NativeProxyFlags, NativeReplicaRole, NativeReplicaState,
+    NativeApiDescription as ApiName, NativeApplicationHostType, NativeProxyFlags,
+    NativeReplicaRole, NativeReplicaState, NativeServicePackageActivationMode,
 };
 use fube_runtime::{
     extensions::{
@@ -35,7 +36,7 @@ macro_rules! record {
 }
 record!(HostContext {
     id: String,
-    kind: i64,
+    kind: NativeApplicationHostType,
     pid: u32,
     container: bool,
     activator: bool
@@ -50,7 +51,7 @@ record!(PackageId {
 });
 record!(Activation {
     guid: Guid,
-    mode: i64
+    mode: NativeServicePackageActivationMode
 });
 record!(PackageInstance {
     package: PackageId,
@@ -173,7 +174,7 @@ record!(Service {
     correlations: ObjectArray<Vec<Correlation>>, constraints: String, scaleout: i32,
     metrics: ObjectArray<Vec<Metric>>, move_cost: u32, restart_wait: i64, quorum_wait: i64,
     update_version: u64, placement: ObjectArray<Vec<Placement>>, standby_keep: i64,
-    activation_mode: i64, dns: String, scaling: EmptyObjectArray,
+    activation_mode: NativeServicePackageActivationMode, dns: String, scaling: EmptyObjectArray,
 });
 record!(ProxyRequest { runtime: String, unit: FailoverUnit, local: Replica, remote: ObjectArray<Vec<Replica>>, service: Service, flags: NativeProxyFlags });
 record!(ProxyError {
@@ -600,7 +601,7 @@ fn base(
             update_version: 1,
             placement: ObjectArray(vec![]),
             standby_keep: 0,
-            activation_mode: 0,
+            activation_mode: NativeServicePackageActivationMode::SharedProcess,
             dns: String::new(),
             scaling: EmptyObjectArray,
         },
