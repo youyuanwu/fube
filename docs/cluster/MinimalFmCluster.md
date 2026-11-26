@@ -87,6 +87,15 @@ cannot stop the successor, restart alone creates no service replica, and the
 rebuilt replica supplies a real vote after another Secondary is fenced.
 Legacy CLI defaults and independent process/host cleanup remain covered.
 
+Stable post-handoff repair and sequential app-host spare replacement also use
+Manual scoped intent. Completed spare history fences resolved predecessors at
+reconfiguration/rebuild entry, and the shared spare primitive binds its chosen
+current loss to explicit intent before allocating or joining work. Healthy
+planned transfers retain their explicit existing workflows. The
+[migration coverage table](../../crates/tools/fube-cluster/README.md#recovery-migration-coverage)
+separates these cases from Legacy removal-supersession qualification and
+unsupported broader recovery; the default policy remains Legacy.
+
 The [cluster controls](../../crates/tools/fube-cluster/README.md#explicit-nodedown-and-restart)
 provide explicit `node-down` and `restart-node` commands. They are supervisor
 operations over private management IPC, not new FM/RA wire actions or a

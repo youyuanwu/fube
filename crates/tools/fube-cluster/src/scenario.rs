@@ -239,6 +239,12 @@ impl Ledger {
         if placement.launch.partition != partition {
             return Err("predecessor belongs to another partition".into());
         }
+        if self.known_spare_loss(placement) {
+            return Err(
+                "predecessor was already replaced on a spare and is no longer a current failure"
+                    .into(),
+            );
+        }
         if matches(
             &placement.launch.node,
             placement.replica,
@@ -317,7 +323,7 @@ impl Ledger {
             return Ok(Accepted::Progress);
         }
         if destination != index {
-            if self.begin_spare_replacement(destination, Instant::now())? {
+            if self.begin_spare_replacement(destination, Some(index), Instant::now())? {
                 return Ok(Accepted::Build);
             }
         } else if self.failed_primary_index() == Some(index) {

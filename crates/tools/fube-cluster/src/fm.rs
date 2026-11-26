@@ -3788,16 +3788,40 @@ impl Ledger {
             .position(|p| p.launch.node == repair.build.body.replica.node)
     }
 
-    pub fn begin_spare_replacement(&mut self, destination: usize, now: Instant) -> Result<bool> {
+    pub fn begin_spare_replacement(
+        &mut self,
+        destination: usize,
+        predecessor: Option<usize>,
+        now: Instant,
+    ) -> Result<bool> {
         let profile = self.placements[0].launch.profile;
         if profile.configured_sizes().is_none() || destination >= self.placements.len() {
             return Err("replacement requires an explicit configured spare placement".into());
         }
+        let predecessor_node = match predecessor {
+            Some(index) => Some(
+                self.placements
+                    .get(index)
+                    .ok_or("unknown rebuild predecessor placement")?
+                    .launch
+                    .node
+                    .clone(),
+            ),
+            None => None,
+        };
         if let Some(repair) = &self.repair {
             if repair.uses_spare()
                 && self.repair_destination_index() == Some(destination)
                 && !repair.unknown
             {
+                if predecessor_node
+                    .as_ref()
+                    .is_some_and(|node| *node != repair.predecessor.replica.node)
+                {
+                    return Err(
+                        "rebuild predecessor does not identify this spare-replacement owner".into(),
+                    );
+                }
                 return Ok(false);
             }
             if !repair.uses_spare()
@@ -3837,6 +3861,15 @@ impl Ledger {
                     .into(),
             );
         };
+        if predecessor_node
+            .as_ref()
+            .is_some_and(|node| *node != lost.launch.node)
+        {
+            return Err(
+                "rebuild predecessor is not the lost member of the latest completed membership"
+                    .into(),
+            );
+        }
         let retained = previous
             .replicas
             .0
@@ -4044,7 +4077,7 @@ impl Ledger {
         })
     }
 
-    fn known_spare_loss(&self, placement: &Placement) -> bool {
+    pub(crate) fn known_spare_loss(&self, placement: &Placement) -> bool {
         placement.loss_reported
             && placement.remove_received
             && self.repair.iter().chain(&self.repair_history).any(|r| {

@@ -304,6 +304,25 @@ The bundled library restart result exposes `rebuild_operation` when it
 authorizes restoration, so its actual recovery can also be awaited by operation
 ID instead of global repair readiness.
 
+### Recovery migration coverage
+
+Stable post-handoff Primary/Secondary repair and static spare replacement now
+use Manual scoped controls, including sequential spare cycles and restoration
+after a completed handoff drops a member. A predecessor already replaced on a
+spare cannot authorize another reconfiguration or rebuild. The shared spare
+primitive also binds explicit intent to its selected current loss, including
+when another operation tries to join a pending build.
+
+| Family | Classification and boundary |
+| --- | --- |
+| Stable app-host/Node recovery, post-handoff repair, sequential spares, supported cancellation and LFUM overlaps | Manual coverage using exact predecessors and operation waits. Native copy/configuration and physical cleanup remain independent evidence. |
+| Healthy planned transfers and representative Legacy lifecycle/protocol fixtures | Compatibility coverage. Existing transfer helpers explicitly authorize native handoff; their configuration observations do not authorize or complete a scoped rebuild. |
+| Primary loss during pending Secondary removal and subsequent two-lineage restoration | Bounded Legacy qualification retained. Manual superseded-operation and multi-lineage intent semantics are not advertised by this migration. |
+| Cancellation during admission or Secondary/spare repair; general interrupted/multi-loss, data-loss and persisted recovery | Existing unsupported-profile gates remain unchanged. |
+
+Legacy remains the default; changing it is a separate policy decision.
+These migrations reuse native progress and add no recovery capability.
+
 ## Service profiles
 
 An explicit `--stateful-singleton` variant admits the existing

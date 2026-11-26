@@ -707,10 +707,11 @@ impl Manager {
         {
             return Err("replacement requires the original running Node pool".into());
         }
-        if self
-            .ledger
-            .begin_spare_replacement(usize::from(destination - 1), Instant::now())?
-        {
+        if self.ledger.begin_spare_replacement(
+            usize::from(destination - 1),
+            None,
+            Instant::now(),
+        )? {
             self.request_repair_build().await?;
         }
         Ok(self.ledger.repair_status())
