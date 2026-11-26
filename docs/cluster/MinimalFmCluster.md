@@ -54,6 +54,15 @@ original FM exchange identities across observational deadlines; migrated
 manual process scenarios no longer need private process handles or global
 configuration/repair readiness polling.
 
+Manual app-host recovery keeps the original Node/RA sessions alive and does not
+report NodeDown. After native loss/deletion observations, Primary failover needs
+explicit partition reconfiguration and completion before original-Node rebuild;
+Secondary rebuild authorizes its removal/copy/admission sequence directly.
+The repeated configured Primary and Secondary app-host scenarios now use scoped
+commands and semantic operation waits, including lost-reply retries. They
+verify that observation alone authorizes neither failover nor fresh-host repair.
+Original-node minimum/multi-loss gates and Legacy compatibility remain unchanged.
+
 The [cluster controls](../../crates/tools/fube-cluster/README.md#explicit-nodedown-and-restart)
 provide explicit `node-down` and `restart-node` commands. They are supervisor
 operations over private management IPC, not new FM/RA wire actions or a

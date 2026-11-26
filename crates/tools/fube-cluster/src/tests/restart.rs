@@ -379,16 +379,6 @@ fn unused_spare_node_failure_does_not_invalidate_ready_membership() {
     assert_eq!(ledger.restart_desired(3).unwrap(), fm::Desired::Absent);
 }
 
-fn replica_ref(ledger: &Ledger, index: usize) -> crate::ReplicaRef {
-    let placement = &ledger.placements[index];
-    crate::ReplicaRef {
-        node: (index + 1) as u8,
-        node_instance: placement.launch.node.instance,
-        replica: placement.replica,
-        incarnation: placement.incarnation,
-    }
-}
-
 #[test]
 fn scoped_control_schema_rejects_mixed_fields_and_unproved_failure() {
     let mut ledger = configured_ledger(3, 3);

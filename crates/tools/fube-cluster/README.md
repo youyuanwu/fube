@@ -249,6 +249,23 @@ stateless, Primary/Secondary 3/3 and 4/4 scenarios use public process controls
 and semantic waits; application-data observations remain separate from command
 completion. Default/legacy scenarios remain compatibility coverage.
 
+For an app-host failure, keep the original Node/RA sessions alive: do not
+report `node-down` or restart Node infrastructure. Drive observations until the
+exact predecessor's native loss report and closed-replica deletion are
+processed. Primary loss requires `reconfigure_partition` and its
+`wait_operation` before `rebuild_replica` on the original Node. Secondary loss
+uses `rebuild_replica` directly; that operation authorizes same-Primary removal,
+fresh-host copy and native admission together. Original-Node app-host repair
+still requires one missing member and every other member live; Secondary
+removal at minimum remains blocked.
+
+The [Manual app-host scenarios](src/tests.rs) cover repeated Primary/Secondary
+repair, no unsolicited failover or fresh-host creation, and lost build/final
+replies. They wait on the exact operation, not global `repair.ready`; data
+continuity and physical predecessor retirement are checked independently.
+Existing Legacy and interrupted-recovery scenarios remain compatibility and
+boundary coverage; this migration does not expand supported recovery.
+
 Existing repair/replacement helpers reuse the same ledger/native repair
 primitives. `restart_node` remains a bundled library convenience workflow;
 `restart_node_infrastructure` is the process-only primitive. Existing foreground
@@ -300,9 +317,10 @@ or the retained create result, not registration or transport completion.
 Status exposes `replica_set: { target, minimum, immutable: true }`.
 For N = 1 the normal AddPrimary completion settles creation.
 
-After completed initial membership, explicit repair or qualified healthy 3/2
-planned handoff, a matched Primary app-host
-loss can start no-data-loss failover on the original live Node/RA sessions. Available
+Under the Legacy policy, after completed initial membership, explicit repair or
+qualified healthy 3/2 planned handoff, a matched Primary app-host
+loss can start no-data-loss failover on the original live Node/RA sessions.
+Manual policy requires explicit `reconfigure-partition` intent instead. Available
 Secondaries need not all have identical progress. RA collects per-member
 GetLSN/history, checks separate PC/CC read quorums, selects using deactivation
 history before LSN and can redirect the FM candidate with ChangeConfiguration.

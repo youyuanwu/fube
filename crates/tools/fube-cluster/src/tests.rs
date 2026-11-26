@@ -5969,22 +5969,22 @@ async fn sequential_repair_after_removal_supersession_restores_target_and_later_
 }
 
 #[tokio::test]
-async fn secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover_2_1() {
+async fn manual_secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover_2_1() {
     secondary_loss_repair(2, 1).await;
 }
 
 #[tokio::test]
-async fn secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover_4_2() {
+async fn manual_secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover_4_2() {
     secondary_loss_repair(4, 2).await;
 }
 
 #[tokio::test]
-async fn secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover_4_3() {
+async fn manual_secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover_4_3() {
     secondary_loss_repair(4, 3).await;
 }
 
 #[tokio::test]
-async fn secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover_5_3() {
+async fn manual_secondary_loss_repair_preserves_primary_repeats_and_then_survives_primary_failover_5_3() {
     secondary_loss_repair(5, 3).await;
 }
 
@@ -5994,14 +5994,15 @@ async fn secondary_loss_repair(target: i32, minimum: i32) {
         config.profile = ServiceProfile::Stateful { target, minimum };
         config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
         let mut cluster = Cluster::new(config).unwrap();
+        cluster.set_recovery_mode(crate::RecoveryMode::Manual).unwrap();
         if let Err(error) = cluster.start().await {
             let cleanup = cluster.shutdown().await;
             panic!("Secondary repair startup: {error}; cleanup={cleanup}");
         }
         let result = peer_idle_catch(async {
-            assert!(cluster.repair_secondary_replica(2).await.is_err());
-            cluster.execute(command("primary", "create", Some(1))).await?;
-            until(&mut cluster, |c| c.ledger.result("primary")["state"] == "complete").await;
+            let partition = cluster.ledger.placements[0].launch.partition.clone();
+            cluster.create_partition("primary", &partition, 1).await?;
+            cluster.wait_operation("primary", Duration::from_secs(30)).await?;
             let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
             until(&mut cluster, |_| data_contact(&endpoint, b"read\n").starts_with("OK ")).await;
             assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
@@ -6013,6 +6014,9 @@ async fn secondary_loss_repair(target: i32, minimum: i32) {
             let mut predecessors = Vec::new();
             for cycle in 0..2 {
                 let old = cluster.ledger.placements[1].body()?;
+                let predecessor = replica_ref(&cluster.ledger, 1);
+                let operation = format!("rebuild-secondary-{cycle}");
+                let configuration = cluster.ledger.configuration_status();
                 let report = stateful_loss_report(&cluster.ledger.placements[1]);
                 let profile = cluster.ledger.placements[1].profile.clone().unwrap();
                 let peers: Vec<_> = cluster.ledger.placements.iter().enumerate().filter(|(i,_)| *i != 1)
@@ -6020,15 +6024,23 @@ async fn secondary_loss_repair(target: i32, minimum: i32) {
                 assert!(std::process::Command::new("kill").args(["-KILL",&profile.app_pid.to_string()]).status().map_err(err)?.success());
                 until(&mut cluster, |c| c.ledger.placements[1].loss_reported
                     && c.ledger.placements[1].status()["native_replica_deleted"] == true).await;
-                assert!(cluster.repair_secondary_replica(1).await.is_err());
-                assert_eq!(cluster.repair_secondary_replica(2).await?["state"], "pending");
-                assert_eq!(cluster.repair_secondary_replica(2).await?["state"], "pending");
+                for _ in 0..20 { cluster.drive().await; }
+                assert_eq!(cluster.ledger.configuration_status()["request"], configuration["request"]);
+                assert!(cluster.ledger.repair.as_ref().is_none_or(|repair|
+                    repair.configuration.as_ref().is_some_and(|c| c.reply.is_some())));
+                assert_eq!(cluster.ledger.placements[1].profile.as_ref(), Some(&profile));
+                assert!(!cluster.children[1].launch.host_replacement_path(old.replica.id, old.replica.instance).exists());
+                assert!(cluster.rebuild_replica("wrong-destination", &partition, predecessor.clone(), 1).await.is_err());
+                let pending = cluster.rebuild_replica(&operation, &partition, predecessor.clone(), 2).await?;
+                assert_eq!(pending["state"], "pending");
+                assert_eq!(cluster.rebuild_replica(&operation, &partition, predecessor.clone(), 2).await?, pending);
                 let lost = hold_peer_loss_frame(&mut cluster, 0, "DoReconfigurationReply", Duration::from_secs(30)).await?;
                 assert_eq!(cluster.ledger.repair_status()["removed"], false);
                 assert!(!cluster.ledger.repair.as_ref().unwrap().host_requested);
                 assert_eq!(cluster.ledger.placements[1].profile.as_ref(), Some(&profile));
                 let (reply,_) = decode_do_reconfiguration_reply(&lost).map_err(err)?;
                 assert_eq!(reply.replicas.0.len(), target as usize - 1);
+                assert_eq!(cluster.ledger.result(&operation)["state"], "pending");
                 let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11)).ok_or("missing Secondary removal retry")?;
                 assert_eq!(retry.configuration.service, service);
                 assert_eq!(retry.configuration.unit.current.data_loss, old.unit.current.data_loss);
@@ -6037,22 +6049,27 @@ async fn secondary_loss_repair(target: i32, minimum: i32) {
                 let lost = hold_peer_loss_frame(&mut cluster, 0, "AddReplicaReply", Duration::from_secs(30)).await?;
                 assert_eq!(cluster.ledger.repair_status()["removed"], true);
                 assert_eq!(cluster.ledger.repair_status()["built"], false);
+                assert_eq!(cluster.ledger.result(&operation)["state"], "pending");
                 let (built,_) = decode_add_replica_reply(&lost).map_err(err)?;
                 assert!(built.replica.id > old.replica.id && built.replica.instance > old.replica.instance);
                 let retry = cluster.ledger.idle_retry(0, Instant::now() + Duration::from_secs(11)).ok_or("missing Secondary build retry")?;
                 cluster.send_idle(&retry).await?;
                 let lost = hold_peer_loss_frame(&mut cluster, 0, "DoReconfigurationReply", Duration::from_secs(30)).await?;
                 assert_eq!(cluster.ledger.repair_status()["ready"], false);
+                assert_eq!(cluster.ledger.result(&operation)["state"], "pending");
                 let (reply,_) = decode_do_reconfiguration_reply(&lost).map_err(err)?;
                 assert_eq!(reply.replicas.0.len(), target as usize);
                 let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11)).ok_or("missing Secondary admission retry")?;
                 cluster.send_configuration(&retry).await?;
-                until(&mut cluster, |c| c.ledger.repair_status()["ready"] == true
-                    && c.status()["nodes"][1]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == if cycle == 0 { 1 } else { 2 }).await;
+                let completed = cluster.wait_operation(&operation, Duration::from_secs(30)).await?;
+                assert_eq!(completed["phase"], "ready");
+                until(&mut cluster, |c|
+                    c.status()["nodes"][1]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == if cycle == 0 { 1 } else { 2 }).await;
                 assert_eq!(cluster.ledger.primary_index(), 0);
                 assert_eq!(cluster.ledger.placements[0].endpoint.as_ref(), Some(&endpoint));
                 assert_eq!(cluster.ledger.placements[0].profile.as_ref(), Some(&primary));
-                assert_eq!(cluster.repair_secondary_replica(2).await?["state"], "ready");
+                assert_eq!(cluster.wait_operation(&operation, Duration::ZERO).await?, completed);
+                assert_eq!(cluster.rebuild_replica(&operation, &partition, predecessor, 2).await?, completed);
                 for (i,p) in peers { assert_eq!(cluster.ledger.placements[i].profile.as_ref(), Some(&p)); }
                 assert!(!Path::new(&format!("/proc/{}",profile.app_pid)).exists());
                 assert!(!profile.runtime_root.exists());
@@ -6075,15 +6092,23 @@ async fn secondary_loss_repair(target: i32, minimum: i32) {
                         c.status()["nodes"][i]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 2)).await;
                 }
             }
+            let predecessor = replica_ref(&cluster.ledger, 0);
+            let configuration = cluster.ledger.configuration_status();
             assert!(std::process::Command::new("kill").args(["-KILL",&primary.app_pid.to_string()]).status().map_err(err)?.success());
-            until(&mut cluster, |c| c.ledger.failed_primary_index() == Some(0)
-                && c.ledger.swap.as_ref().is_some_and(|s| s.reply.is_some())
+            until(&mut cluster, |c| c.ledger.placements[0].loss_reported
                 && c.ledger.placements[0].status()["native_replica_deleted"] == true).await;
+            for _ in 0..20 { cluster.drive().await; }
+            assert_eq!(cluster.ledger.configuration_status()["request"], configuration["request"]);
+            assert_eq!(cluster.ledger.primary_index(), 0);
+            assert!(cluster.ledger.swap.is_none());
+            cluster.reconfigure_partition("failover", &partition, predecessor.clone()).await?;
+            cluster.wait_operation("failover", Duration::from_secs(30)).await?;
             assert_eq!(cluster.ledger.primary_index(), 1);
             let endpoint = cluster.ledger.placements[1].endpoint.clone().ok_or("missing rebuilt Primary endpoint")?;
             assert!(data_contact(&endpoint, b"read\n").contains("committed=2 value=continued"));
-            cluster.repair_primary_replica().await?;
-            until(&mut cluster, |c| c.ledger.repair_status()["ready"] == true).await;
+            assert!(cluster.ledger.repair.is_none());
+            cluster.rebuild_replica("rebuild-primary", &partition, predecessor, 1).await?;
+            cluster.wait_operation("rebuild-primary", Duration::from_secs(30)).await?;
             assert!(data_contact(&endpoint, b"write-final\n").contains("committed=3 value=final"));
             Ok::<(),String>(())
         }).await;
@@ -6170,21 +6195,22 @@ async fn secondary_repair_blocks_at_minimum_without_quorum_and_after_another_los
 }
 
 #[tokio::test]
-async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing() {
+async fn manual_configured_primary_repair_repeats_fresh_owner_cycles_without_resizing() {
     for (target, minimum, interrupted) in [(2, 1, false), (4, 2, false), (5, 3, false), (4, 3, true)] {
         let fixture = Fixture::new("configured-repair");
         let mut config = fixture.config();
         config.profile = ServiceProfile::Stateful { target, minimum };
         config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
         let mut cluster = Cluster::new(config).unwrap();
+        cluster.set_recovery_mode(crate::RecoveryMode::Manual).unwrap();
         if let Err(error) = cluster.start().await {
             let cleanup = cluster.shutdown().await;
             panic!("configured repair startup: {error}; cleanup={cleanup}");
         }
         let result = peer_idle_catch(async {
-            assert!(cluster.repair_primary_replica().await.is_err());
-            cluster.execute(command("primary", "create", Some(1))).await?;
-            until(&mut cluster, |c| c.ledger.result("primary")["state"] == "complete").await;
+            let partition = cluster.ledger.placements[0].launch.partition.clone();
+            cluster.create_partition("primary", &partition, 1).await?;
+            cluster.wait_operation("primary", Duration::from_secs(30)).await?;
             let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
             until(&mut cluster, |_| data_contact(&endpoint, b"read\n").starts_with("OK ")).await;
             assert!(data_contact(&endpoint, b"write\n").contains("committed=1"));
@@ -6199,6 +6225,10 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
             for cycle in 0..3 {
                 let lost = cluster.ledger.primary_index();
                 let original = cluster.ledger.placements[lost].body()?;
+                let predecessor = replica_ref(&cluster.ledger, lost);
+                let reconfigure = format!("failover-{cycle}");
+                let rebuild = format!("rebuild-{cycle}");
+                let configuration = cluster.ledger.configuration_status();
                 let loss = stateful_loss_report(&cluster.ledger.placements[lost]);
                 let profile = cluster.ledger.placements[lost].profile.clone().unwrap();
                 let survivors = cluster.ledger.placements.iter().enumerate()
@@ -6217,10 +6247,20 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
                         link.send(do_reconfiguration_message(body, &link.generation()).map_err(err)?).await?;
                     }
                 }
-                until(&mut cluster, |c| c.ledger.failed_primary_index() == Some(lost)
-                    && c.ledger.swap.as_ref().is_some_and(|s| s.reply.is_some())
-                    && c.ledger.placements[lost].status()["native_replica_deleted"] == true
-                    && c.ledger.repair.is_none()).await;
+                until(&mut cluster, |c| c.ledger.placements[lost].loss_reported
+                    && c.ledger.placements[lost].status()["native_replica_deleted"] == true).await;
+                for _ in 0..20 { cluster.drive().await; }
+                assert_eq!(cluster.ledger.configuration_status()["request"], configuration["request"]);
+                assert_eq!(cluster.ledger.primary_index(), lost);
+                assert_eq!(cluster.ledger.placements[lost].profile.as_ref(), Some(&profile));
+                assert!(!cluster.children[lost].launch.host_replacement_path(original.replica.id, original.replica.instance).exists());
+                assert!(cluster.rebuild_replica(&format!("premature-{cycle}"), &partition, predecessor.clone(), (lost + 1) as u8).await.is_err());
+                let pending = cluster.reconfigure_partition(&reconfigure, &partition, predecessor.clone()).await?;
+                assert_eq!(pending["state"], "pending");
+                assert_eq!(cluster.reconfigure_partition(&reconfigure, &partition, predecessor.clone()).await?, pending);
+                cluster.wait_operation(&reconfigure, Duration::from_secs(30)).await?;
+                assert_eq!(cluster.ledger.failed_primary_index(), Some(lost));
+                assert!(cluster.ledger.repair.is_none());
                 let primary = cluster.ledger.primary_index();
                 let endpoint = cluster.ledger.placements[primary].endpoint.clone().ok_or("missing repaired-cycle endpoint")?;
                 assert!(data_contact(&endpoint, b"read\n").contains(&format!("committed={}", if cycle == 0 { 1 } else { 2 })));
@@ -6229,8 +6269,9 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
                 assert_eq!(failover.configuration.unit.previous, epoch);
                 assert_eq!(failover.configuration.unit.current.data_loss, epoch.data_loss);
                 old_requests.push((primary, failover));
-                assert_eq!(cluster.repair_primary_replica().await?["state"], "pending");
-                assert_eq!(cluster.repair_primary_replica().await?["state"], "pending");
+                let pending = cluster.rebuild_replica(&rebuild, &partition, predecessor.clone(), (lost + 1) as u8).await?;
+                assert_eq!(pending["state"], "pending");
+                assert_eq!(cluster.rebuild_replica(&rebuild, &partition, predecessor.clone(), (lost + 1) as u8).await?, pending);
                 if interrupted && cycle == 1 {
                     let path = cluster.children[lost].launch.host_replacement_path(original.replica.id, original.replica.instance);
                     let end = Instant::now() + Duration::from_secs(10);
@@ -6239,12 +6280,14 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     assert_eq!(cluster.ledger.repair_status()["host_ready"], false);
+                    assert_eq!(cluster.ledger.result(&rebuild)["state"], "pending");
                     return Ok(());
                 }
                 if cycle == 1 {
                     let lost_reply = hold_peer_loss_frame(&mut cluster, primary, "AddReplicaReply", Duration::from_secs(30)).await?;
                     let (built, _) = decode_add_replica_reply(&lost_reply).map_err(err)?;
                     assert_eq!(cluster.ledger.repair_status()["built"], false);
+                    assert_eq!(cluster.ledger.result(&rebuild)["state"], "pending");
                     let retry = cluster.ledger.idle_retry(primary, Instant::now() + Duration::from_secs(11))
                         .ok_or("missing configured repair build retry")?;
                     cluster.send_idle(&retry).await?;
@@ -6252,6 +6295,7 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
                     let (completed, _) = decode_do_reconfiguration_reply(&lost_reply).map_err(err)?;
                     assert_eq!(cluster.ledger.repair.as_ref().unwrap().build.reply.as_ref(), Some(&built));
                     assert_eq!(cluster.ledger.repair_status()["ready"], false);
+                    assert_eq!(cluster.ledger.result(&rebuild)["state"], "pending");
                     assert_eq!(completed.replicas.0.len(), target as usize);
                     let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11))
                         .ok_or("missing configured repair configuration retry")?;
@@ -6259,8 +6303,9 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
                     assert_eq!(retry.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), target as usize - 1);
                     cluster.send_configuration(&retry).await?;
                 }
-                until(&mut cluster, |c| c.ledger.repair_status()["ready"] == true
-                    && c.status()["nodes"][lost]["retained_work"]["local_replica"]["replica"]["current_role"] == 3
+                let completed = cluster.wait_operation(&rebuild, Duration::from_secs(30)).await?;
+                assert_eq!(completed["phase"], "ready");
+                until(&mut cluster, |c| c.status()["nodes"][lost]["retained_work"]["local_replica"]["replica"]["current_role"] == 3
                     && c.status()["nodes"][lost]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == if cycle == 0 { 1 } else { 2 }).await;
                 let repair = cluster.ledger.repair.as_ref().unwrap();
                 assert_eq!(repair.build.body.service, service);
@@ -6298,7 +6343,8 @@ async fn configured_primary_repair_repeats_fresh_owner_cycles_without_resizing()
                     link.send(do_reconfiguration_message(body, &link.generation()).map_err(err)?).await?;
                 }
                 for _ in 0..20 { cluster.drive().await; }
-                assert_eq!(cluster.repair_primary_replica().await?["state"], "ready");
+                assert_eq!(cluster.wait_operation(&rebuild, Duration::ZERO).await?, completed);
+                assert_eq!(cluster.rebuild_replica(&rebuild, &partition, predecessor, (lost + 1) as u8).await?, completed);
                 assert!(cluster.ledger.placements.iter().all(|p| p.link_alive && !p.loss_reported));
                 let status = cluster.status();
                 for i in 0..target as usize {
@@ -10083,6 +10129,16 @@ async fn stateful_delete_lost_reply_retries_original_lifetime_after_independent_
     assert_eq!(cluster.shutdown().await["clean"], true);
     assert!(gone(profile.app_pid));
     assert!(!profile.runtime_root.exists());
+}
+
+fn replica_ref(ledger: &Ledger, index: usize) -> crate::ReplicaRef {
+    let placement = &ledger.placements[index];
+    crate::ReplicaRef {
+        node: (index + 1) as u8,
+        node_instance: placement.launch.node.instance,
+        replica: placement.replica,
+        incarnation: placement.incarnation,
+    }
 }
 
 fn stateful_loss_report(placement: &fm::Placement) -> ReplicaUp {
