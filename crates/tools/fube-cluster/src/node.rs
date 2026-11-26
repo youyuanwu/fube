@@ -633,7 +633,7 @@ async fn run_owned(launch: &mut Launch) -> Result<()> {
                 let local_replica = state.map(|state| {
                     serde_json::json!({
                         "open":state.phase == ra::Phase::Ready && state.runtime.is_some(),
-                        "phase":format!("{:?}",state.phase), "replica":state.body.replica,
+                        "phase":crate::status::ReplicaPhase::from(state.phase), "replica":state.body.replica,
                         "open_token":state.open_token, "usage":format!("{:?}",state.usage),
                         "fm_stage":format!("{:?}",state.fm_stage),
                         "local_deleted":state.local_deleted,

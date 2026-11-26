@@ -748,7 +748,7 @@ fn generation_rebuild_gates_mutations_without_relabeling_existing_serving_state(
     }
     assert!(matches!(
         ledger.accept(command("a", "create", Some(1))).unwrap(),
-        Accepted::Duplicate(outcome) if outcome == prior
+        Accepted::Duplicate(outcome) if outcome.json() == prior
     ));
     assert!(ledger.begin_generation().is_err());
 }
@@ -1204,6 +1204,17 @@ fn initial_configured_ledger_in_pool(target: i32, minimum: i32, nodes: i32) -> L
     ledger.accept(command("primary", "create", Some(1))).unwrap();
     ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
     ledger
+}
+
+#[test]
+fn typed_cluster_status_round_trips_native_configuration_and_retained_operations() {
+    let ledger = configured_ledger(3, 2);
+    let expected = ledger.status();
+    let typed: crate::status::ClusterStatus = serde_json::from_value(expected.clone()).unwrap();
+    assert!(typed.configuration.ready);
+    assert_eq!(typed.configuration.state, crate::status::ConfigurationState::Ready);
+    assert_eq!(typed.configuration.request.as_ref().unwrap().configuration.unit.target, 3);
+    assert_eq!(typed.json(), expected);
 }
 
 fn configured_ledger(target: i32, minimum: i32) -> Ledger {
@@ -8048,7 +8059,7 @@ fn serialized_retirement_join_rejects_missing_old_and_cross_owner_proofs_in_both
         assert_eq!(ledger.result("d"), deleted);
         assert!(
             matches!(ledger.accept(command("a", "create", Some(1))).unwrap(),
-                Accepted::Duplicate(value) if value == first_result)
+                Accepted::Duplicate(value) if value.json() == first_result)
         );
         assert!(ledger.accept(command("a", "create", Some(2))).is_err());
         assert!(ledger
@@ -8277,7 +8288,7 @@ fn finite_identities_are_not_evicted_and_uncertainty_retains_authority() {
     assert_eq!(repeated.operations.len(), 64);
     assert!(
         matches!(repeated.accept(command("c0", "create", Some(1))).unwrap(),
-        Accepted::Duplicate(value) if value == old)
+        Accepted::Duplicate(value) if value.json() == old)
     );
     assert!(repeated.accept(command("c0", "create", Some(2))).is_err());
 }

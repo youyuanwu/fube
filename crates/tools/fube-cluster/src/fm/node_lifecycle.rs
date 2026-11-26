@@ -66,7 +66,7 @@ impl Ledger {
             desired: if placement.launch.profile.stateful() && affects_membership == Some(false) {
                 Desired::Absent
             } else {
-                placement.desired.clone()
+                placement.desired
             },
             receipt: receipt.clone(),
             replacement: None,
@@ -82,7 +82,11 @@ impl Ledger {
         let operations = [placement.create_op.clone(), placement.delete_op.clone()];
         self.node_failures.push(failure);
         for operation in operations.into_iter().flatten() {
-            self.complete(&operation, json!({"op":operation,"state":"unknown","error":"owned Node incarnation is confirmed down"}));
+            self.complete(
+                &operation,
+                crate::OperationOutcome::new(&operation, crate::OperationState::Unknown)
+                    .with_error("owned Node incarnation is confirmed down"),
+            );
         }
         if !self.placements[index].launch.profile.stateful()
             || !self.placements[index].created
@@ -347,7 +351,7 @@ impl Ledger {
         self.node_failures
             .iter()
             .find(|f| f.replacement.as_ref().is_some_and(|l| &l.node == node))
-            .map(|f| f.desired.clone())
+            .map(|f| f.desired)
             .ok_or("Node is not an admitted restart")
             .map_err(str::to_owned)
     }

@@ -1,8 +1,13 @@
+pub use crate::control::Command;
+use crate::control::{
+    CommandAction, CommandRequest, OperationOutcome, OperationPhase, OperationState,
+};
 use crate::profile::{
     absent_replica_body, add_body, dropped_replica, pre_open_cancelled_body, AbsenceReceipt,
     ActualProfile, FailedOpenReceipt, FailedRegistrationReceipt, HostLossReceipt, Launch,
     PreOpenCancellationReceipt, Result, RetirementReceipt,
 };
+use crate::status::*;
 use fube_ra::protocol::*;
 use fubst::serde::ObjectArray;
 use serde::{Deserialize, Serialize};
@@ -14,81 +19,13 @@ use tokio::time::Instant;
 mod node_lifecycle;
 pub(crate) use node_lifecycle::NodeFailure;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Command {
-    pub op: String,
-    pub action: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub predecessor: Option<crate::ReplicaRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation: Option<String>,
-}
-impl Command {
-    pub(crate) fn supervisor_control(&self) -> bool {
-        matches!(
-            self.action.as_str(),
-            "node-down" | "restart-node" | "stop-node" | "kill-node"
-        )
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        for operation in std::iter::once(&self.op).chain(self.operation.iter()) {
-            if operation.is_empty()
-                || operation.len() > 64
-                || !operation
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-            {
-                return Err("operation identity must be 1..64 ASCII identifier bytes".into());
-            }
-        }
-        if let Some(partition) = &self.partition {
-            uuid::Uuid::parse_str(partition).map_err(crate::profile::err)?;
-        }
-        let scoped = self.partition.is_some();
-        let predecessor = self.predecessor.is_some();
-        let cancellation = self.operation.is_some();
-        if self.predecessor.as_ref().is_some_and(|predecessor| {
-            !(1..=64).contains(&predecessor.node)
-                || predecessor.node_instance == 0
-                || predecessor.replica <= 0
-                || predecessor.incarnation <= 0
-        }) {
-            return Err("invalid exact replica predecessor".into());
-        }
-        match (self.action.as_str(), self.node) {
-            ("create-partition", Some(1..=64)) if scoped && !predecessor && !cancellation => {
-                return Ok(())
-            }
-            ("reconfigure-partition", None) if scoped && predecessor => return Ok(()),
-            ("rebuild-replica", Some(1..=64)) if scoped && predecessor && !cancellation => {
-                return Ok(())
-            }
-            ("cancel-rebuild", None) if !scoped && !predecessor && cancellation => return Ok(()),
-            _ => {}
-        }
-        if scoped || predecessor || cancellation {
-            return Err("control fields do not match the command action".into());
-        }
-        match (self.action.as_str(), self.node) {
-            ("node-down" | "restart-node" | "stop-node" | "kill-node", Some(1..=64)) => Ok(()),
-            ("create" | "delete" | "activate" | "deactivate", Some(1 | 2)) | ("status" | "quit", None) => Ok(()),
-            _ => Err("expected create/delete/activate/deactivate with node 1|2, or status/quit without node".into()),
-        }
-    }
-}
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Desired {
     Absent,
     Running,
 }
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Observed {
     Absent,
@@ -154,8 +91,8 @@ pub struct Placement {
 }
 #[derive(Clone)]
 pub struct Operation {
-    pub command: Command,
-    pub outcome: Value,
+    pub command: CommandRequest,
+    pub outcome: OperationOutcome,
 }
 pub struct Ledger {
     pub(crate) recovery_mode: crate::RecoveryMode,
@@ -194,6 +131,12 @@ pub(crate) struct ReplicaRepair {
 impl ReplicaRepair {
     pub(crate) fn uses_spare(&self) -> bool {
         self.predecessor.replica.node != self.build.body.replica.node
+    }
+
+    pub(crate) fn replicator_removed(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|removal| removal.reply.is_some())
     }
 }
 struct RepairDeletion {
@@ -256,8 +199,9 @@ fn action_retry_due(started: Instant, last: Instant, now: Instant) -> bool {
     };
     now > last + Duration::from_secs(interval)
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GenerationPhase {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationPhase {
     Proposing,
     AwaitingUpload,
     Complete,
@@ -380,25 +324,25 @@ impl GenerationHandshake {
             _ => None,
         }
     }
-    fn status(&self) -> Value {
-        json!({
-            "generation": self.number,
-            "phase": match self.phase {
-                GenerationPhase::Proposing => "proposing",
-                GenerationPhase::AwaitingUpload => "awaiting_upload",
-                GenerationPhase::Complete => "complete",
-            },
-            "proposal_replies": self.proposed,
-            "updates_sent": self.updates_sent,
-            "uploads":self.uploads,
-            "upload_supported": true,
-            "complete": self.phase == GenerationPhase::Complete,
-        })
+    fn status(&self) -> GenerationStatus {
+        GenerationStatus {
+            phase: self.phase,
+            complete: self.phase == GenerationPhase::Complete,
+            details: [
+                ("generation".into(), json!(self.number)),
+                ("proposal_replies".into(), json!(self.proposed)),
+                ("updates_sent".into(), json!(self.updates_sent)),
+                ("uploads".into(), json!(self.uploads)),
+                ("upload_supported".into(), json!(true)),
+            ]
+            .into_iter()
+            .collect(),
+        }
     }
 }
 pub enum Accepted {
     NodeControl(usize, bool, NodeActivationRequest),
-    Duplicate(Value),
+    Duplicate(Box<OperationOutcome>),
     Create(usize, Box<AddInstance>),
     Delete(usize, Box<RemoveInstance>),
     Reconfigure(Box<DoReconfiguration>),
@@ -585,34 +529,48 @@ impl Placement {
             from_fmm: false,
         }))
     }
+    #[cfg(test)]
     pub fn status(&self) -> Value {
-        json!({
-            "node": self.launch.placement, "node_id": crate::profile::node_hex(&self.launch.node),
-            "node_instance": self.launch.node.instance, "session": self.launch.session,
-            "partition": self.launch.partition, "replica": self.replica,
-            "incarnation": self.incarnation, "service": self.launch.profile.service(),
-            "service_type": crate::profile::fixed_type_for(self.launch.profile).name,
-            "desired": self.desired, "observed": self.observed,
-            "endpoint": self.endpoint, "created_lifetime": self.created,
-            "link_alive": self.link_alive, "error": self.error,
-            "node_down": self.node_down.as_ref().map(|proof| json!({
+        json!(self.status_typed())
+    }
+
+    pub fn status_typed(&self) -> NodeStatus {
+        NodeStatus {
+            node: self.launch.placement, node_instance: self.launch.node.instance,
+            desired: self.desired, observed: self.observed, endpoint: self.endpoint.clone(),
+            created_lifetime: self.created, link_alive: self.link_alive,
+            admitted: self.bootstrap == Bootstrap::Admitted, retained_work: None,
+            details: [
+            ("node_id".into(), json!(crate::profile::node_hex(&self.launch.node))),
+            ("session".into(), json!(self.launch.session)),
+            ("partition".into(), json!(self.launch.partition)),
+            ("replica".into(), json!(self.replica)),
+            ("incarnation".into(), json!(self.incarnation)),
+            ("service".into(), json!(self.launch.profile.service())),
+            ("service_type".into(), json!(crate::profile::fixed_type_for(self.launch.profile).name)),
+            ("error".into(), json!(self.error)),
+            ("node_down".into(), json!(self.node_down.as_ref().map(|proof| json!({
                 "instance":proof.node.instance,"session":proof.session,
                 "node_pid":proof.node_pid,"fenced":proof.node_group_drained && proof.app_group_drained
-            })),
-            "catalog_notified": self.catalog_notified,
-            "reusable":self.reusable, "retired_lifetimes":self.retired.len(),
-            "retirement":self.retirement,
-            "loss_reported":self.loss_reported, "native_replica_deleted":self.remove_received,
-            "activated":self.activated, "activation_sequence":self.activation_sequence,
-            "admitted":self.bootstrap == Bootstrap::Admitted,
-            "node_control_pending":self.node_control,
-            "type_enabled":self.type_enabled, "type_sequence":self.type_sequence,
-            "service_update_version":self.service_description.as_ref().map(|s| s.update_version),
-            "service_update_pending":self.service_update.is_some(),
-            "load_report_received":self.last_load.is_some(),
-            "app_pid": self.profile.as_ref().map(|p| p.app_pid),
-            "runtime_root": self.profile.as_ref().map(|p| &p.runtime_root),
-        })
+            })))),
+            ("catalog_notified".into(), json!(self.catalog_notified)),
+            ("reusable".into(), json!(self.reusable)),
+            ("retired_lifetimes".into(), json!(self.retired.len())),
+            ("retirement".into(), json!(self.retirement)),
+            ("loss_reported".into(), json!(self.loss_reported)),
+            ("native_replica_deleted".into(), json!(self.remove_received)),
+            ("activated".into(), json!(self.activated)),
+            ("activation_sequence".into(), json!(self.activation_sequence)),
+            ("node_control_pending".into(), json!(self.node_control)),
+            ("type_enabled".into(), json!(self.type_enabled)),
+            ("type_sequence".into(), json!(self.type_sequence)),
+            ("service_update_version".into(), json!(self.service_description.as_ref().map(|s| s.update_version))),
+            ("service_update_pending".into(), json!(self.service_update.is_some())),
+            ("load_report_received".into(), json!(self.last_load.is_some())),
+            ("app_pid".into(), json!(self.profile.as_ref().map(|p| p.app_pid))),
+            ("runtime_root".into(), json!(self.profile.as_ref().map(|p| &p.runtime_root))),
+            ].into_iter().collect(),
+        }
     }
 }
 fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Result<()> {
@@ -1031,10 +989,10 @@ impl Ledger {
             .removal
             .as_ref()
             .ok_or("supersession requires pending Secondary removal")?;
-        if target.command.action != "rebuild-replica"
+        if !matches!(target.command.action, CommandAction::RebuildReplica { .. })
             || !matches!(
-                target.outcome["state"].as_str(),
-                Some("pending" | "unknown")
+                target.outcome.state,
+                OperationState::Pending | OperationState::Unknown
             )
             || removal.reply.is_some()
             || repair.base.is_some()
@@ -1042,9 +1000,7 @@ impl Ledger {
             || repair.profile.is_some()
             || repair.build.reply.is_some()
             || repair.configuration.is_some()
-            || json!(repair.build.body.replica.id) != target.outcome["replica"]
-            || json!(repair.build.body.replica.instance) != target.outcome["incarnation"]
-            || json!(repair.build.body.replica.node.instance) != target.outcome["node_instance"]
+            || !target.outcome.owns_replica(&repair.build.body.replica)
             || !removal.body.configuration.replicas.0.iter().any(|replica| {
                 replica.node == self.placements[predecessor].launch.node
                     && replica.id == self.placements[predecessor].replica
@@ -1060,11 +1016,12 @@ impl Ledger {
             "supersession requires the original live sessions and both surviving read quorums",
         )?;
         self.install_primary_failover(body.clone(), Instant::now())?;
-        outcome["state"] = json!("superseded");
-        outcome["phase"] = json!("superseded");
-        outcome["superseded_by"] = json!(superseding_operation);
-        outcome["error"] =
-            json!("pending removal superseded by explicit Primary failure reconfiguration");
+        outcome.state = OperationState::Superseded;
+        outcome.phase = Some(OperationPhase::Superseded);
+        outcome.superseded_by = Some(superseding_operation.into());
+        outcome.error = Some(json!(
+            "pending removal superseded by explicit Primary failure reconfiguration"
+        ));
         self.complete(operation, outcome);
         Ok(body)
     }
@@ -2543,7 +2500,10 @@ impl Ledger {
             }
             let operations = [placement.create_op.clone(), placement.delete_op.clone()];
             for op in operations.into_iter().flatten() {
-                self.complete(&op, json!({"op":op,"state":"lost","error":error}));
+                self.complete(
+                    &op,
+                    OperationOutcome::new(&op, OperationState::Lost).with_error(error),
+                );
             }
         }
         Ok(response)
@@ -2851,14 +2811,14 @@ impl Ledger {
         }
     }
     pub fn accept(&mut self, command: Command) -> Result<Accepted> {
-        command.validate()?;
+        let command = command.request()?;
         if command.supervisor_control() {
             return Err(
                 "Node controls require the original process supervisor and fencing proof".into(),
             );
         }
         if command
-            .node
+            .node()
             .is_some_and(|node| usize::from(node) > self.placements.len())
         {
             return Err("node is outside the configured topology".into());
@@ -2869,36 +2829,48 @@ impl Ledger {
             .find(|op| op.command.op == command.op)
         {
             return if operation.command == command {
-                Ok(Accepted::Duplicate(operation.outcome.clone()))
+                Ok(Accepted::Duplicate(Box::new(operation.outcome.clone())))
             } else {
                 Err("operation identity reused with different canonical content".into())
             };
         }
         if self.generation_pending()
-            && !matches!(command.action.as_str(), "status" | "quit")
-            && !(command.action == "reconfigure-partition" && command.operation.is_some())
+            && !matches!(command.action, CommandAction::Status | CommandAction::Quit)
+            && !matches!(
+                command.action,
+                CommandAction::ReconfigurePartition {
+                    operation: Some(_),
+                    ..
+                }
+            )
         {
             return Err("generation rebuild is awaiting LFUM upload; mutations disabled".into());
         }
         let scenario = matches!(
-            command.action.as_str(),
-            "reconfigure-partition" | "rebuild-replica" | "cancel-rebuild"
+            command.action,
+            CommandAction::ReconfigurePartition { .. }
+                | CommandAction::RebuildReplica { .. }
+                | CommandAction::CancelRebuild { .. }
         );
-        if let Some(partition) = &command.partition {
+        if let Some(partition) = command.partition() {
             self.validate_partition(partition)?;
         }
         if self.configuration.is_some()
             && !scenario
-            && !matches!(command.action.as_str(), "status" | "quit")
+            && !matches!(command.action, CommandAction::Status | CommandAction::Quit)
         {
             return Err("active-configuration lifecycle changes remain gated".into());
         }
         if self.placements[0].launch.profile.peer_replicas()
             && (matches!(
-                command.action.as_str(),
-                "delete" | "activate" | "deactivate"
-            ) || (matches!(command.action.as_str(), "create" | "create-partition")
-                && (command.node != Some(1) || self.placements[0].created)))
+                command.action,
+                CommandAction::Delete { .. }
+                    | CommandAction::Activate { .. }
+                    | CommandAction::Deactivate { .. }
+            ) || (matches!(
+                command.action,
+                CommandAction::Create { .. } | CommandAction::CreatePartition { .. }
+            ) && (command.node() != Some(1) || self.placements[0].created)))
         {
             return Err("peer-idle profile admits only the original node1 Primary creation, status and quit".into());
         }
@@ -2907,23 +2879,25 @@ impl Ledger {
                 "64 operation identities retained; capacity exhausted (no eviction)".into(),
             );
         }
-        let accepted = match command.action.as_str() {
-            "activate" | "deactivate" => {
-                let index = usize::from(command.node.unwrap() - 1);
+        let accepted = match &command.action {
+            CommandAction::Activate { node } | CommandAction::Deactivate { node } => {
+                let index = usize::from(node - 1);
                 let placement = &mut self.placements[index];
                 if placement.bootstrap != Bootstrap::Admitted
                     || !placement.link_alive
                     || placement
                         .node_control
                         .as_ref()
-                        .is_some_and(|(_, intent, _)| *intent == (command.action == "activate"))
+                        .is_some_and(|(_, intent, _)| {
+                            *intent == matches!(command.action, CommandAction::Activate { .. })
+                        })
                 {
                     return Err(
                         "node activation requires admitted current session without same-intent pending control"
                             .into(),
                     );
                 }
-                let activate = command.action == "activate";
+                let activate = matches!(command.action, CommandAction::Activate { .. });
                 let sequence = placement
                     .activation_sequence
                     .checked_add(1)
@@ -2935,7 +2909,11 @@ impl Ledger {
                 placement.activation_sequence = sequence;
                 placement.node_control_retry_at = Some(Instant::now() + Duration::from_secs(5));
                 if let Some((op, _, _)) = superseded {
-                    self.complete(&op, json!({"op":op,"state":"unknown","error":"superseded by newer node intent"}));
+                    self.complete(
+                        &op,
+                        OperationOutcome::new(&op, OperationState::Unknown)
+                            .with_error("superseded by newer node intent"),
+                    );
                 }
                 Accepted::NodeControl(
                     index,
@@ -2946,17 +2924,16 @@ impl Ledger {
                     },
                 )
             }
-            "create" | "create-partition" => {
-                let index = usize::from(command.node.unwrap() - 1);
+            CommandAction::Create { node } | CommandAction::CreatePartition { node, .. } => {
+                let index = usize::from(node - 1);
                 let placement = &self.placements[index];
                 if command
-                    .partition
-                    .as_ref()
-                    .is_some_and(|partition| *partition != placement.launch.partition)
+                    .partition()
+                    .is_some_and(|partition| partition != placement.launch.partition)
                 {
                     return Err("creation destination belongs to another partition".into());
                 }
-                if command.action == "create-partition"
+                if matches!(command.action, CommandAction::CreatePartition { .. })
                     && placement.launch.profile.mesh_peers()
                     && (index != 0 || self.placements.iter().any(|p| p.created))
                 {
@@ -2964,8 +2941,8 @@ impl Ledger {
                 }
                 self.begin_creation(index, &command.op)?
             }
-            "delete" => {
-                let index = usize::from(command.node.unwrap() - 1);
+            CommandAction::Delete { node } => {
+                let index = usize::from(node - 1);
                 let placement = &mut self.placements[index];
                 if placement.launch.profile.stateful() && placement.observed != Observed::Running {
                     return Err(
@@ -2998,51 +2975,50 @@ impl Ledger {
                 if let Some(op) = superseded {
                     self.complete(
                         &op,
-                        json!({"op":op,"state":"unknown","error":"create superseded by deletion"}),
+                        OperationOutcome::new(&op, OperationState::Unknown)
+                            .with_error("create superseded by deletion"),
                     );
                 }
                 Accepted::Delete(index, Box::new(RemoveInstance::new(body, false)))
             }
-            "status" => Accepted::Status,
-            "quit" => Accepted::Quit,
-            "reconfigure-partition" => {
-                let body = if let Some(operation) = &command.operation {
-                    let predecessor = self.predecessor_index(
-                        command.partition.as_ref().unwrap(),
-                        command.predecessor.as_ref().unwrap(),
-                    )?;
+            CommandAction::Status => Accepted::Status,
+            CommandAction::Quit => Accepted::Quit,
+            CommandAction::ReconfigurePartition {
+                partition,
+                predecessor,
+                operation,
+            } => {
+                let body = if let Some(operation) = operation {
+                    let predecessor = self.predecessor_index(partition, predecessor)?;
                     Some(self.supersede_rebuild(predecessor, operation, &command.op)?)
                 } else {
-                    self.reconfigure_failed_replica(
-                        command.partition.as_ref().unwrap(),
-                        command.predecessor.as_ref().unwrap(),
-                    )?
+                    self.reconfigure_failed_replica(partition, predecessor)?
                 };
                 match body {
                     Some(body) => Accepted::Reconfigure(Box::new(body)),
                     None => Accepted::Progress,
                 }
             }
-            "rebuild-replica" => self.begin_explicit_rebuild(
-                command.partition.as_ref().unwrap(),
-                command.predecessor.as_ref().unwrap(),
-                usize::from(command.node.unwrap() - 1),
+            CommandAction::RebuildReplica {
+                partition,
+                predecessor,
+                node,
+            } => self.begin_explicit_rebuild(
+                partition,
+                predecessor,
+                usize::from(node - 1),
                 &command.op,
             )?,
-            "cancel-rebuild" => {
+            CommandAction::CancelRebuild { operation } => {
                 let target = self
                     .operations
                     .iter()
-                    .find(|op| Some(&op.command.op) == command.operation.as_ref())
+                    .find(|op| &op.command.op == operation)
                     .ok_or("unknown rebuild operation")?;
-                if target.command.action != "rebuild-replica"
-                    || target.outcome["state"] != "pending"
+                if !matches!(target.command.action, CommandAction::RebuildReplica { .. })
+                    || target.outcome.state != OperationState::Pending
                     || self.repair.as_ref().is_none_or(|repair| {
-                        json!(repair.build.body.replica.id) != target.outcome["replica"]
-                            || json!(repair.build.body.replica.instance)
-                                != target.outcome["incarnation"]
-                            || json!(repair.build.body.replica.node.instance)
-                                != target.outcome["node_instance"]
+                        !target.outcome.owns_replica(&repair.build.body.replica)
                     })
                 {
                     return Err("cancellation does not identify the current pending rebuild".into());
@@ -3051,27 +3027,28 @@ impl Ledger {
             }
             _ => unreachable!(),
         };
-        let mut outcome = json!({"op":command.op,"state":"pending"});
-        if let Some(partition) = &command.partition {
-            outcome["partition"] = json!(partition);
+        let mut outcome = OperationOutcome::new(&command.op, OperationState::Pending);
+        if let Some(partition) = command.partition() {
+            outcome.partition = Some(partition.into());
         }
-        if let Some(node) = command.node {
+        if let Some(node) = command.node() {
             let placement = &self.placements[usize::from(node - 1)];
-            outcome["replica"] = json!(placement.replica);
-            outcome["incarnation"] = json!(placement.incarnation);
-            outcome["node_instance"] = json!(placement.launch.node.instance);
+            outcome.replica = Some(placement.replica);
+            outcome.incarnation = Some(placement.incarnation);
+            outcome.node_instance = Some(placement.launch.node.instance);
         }
         if scenario {
-            if command.action == "reconfigure-partition" {
-                outcome["epoch"] = self.configuration_status()["request"]["configuration"]["unit"]
-                    ["current"]
-                    .clone();
-                if let Some(operation) = &command.operation {
-                    outcome["operation"] = json!(operation);
-                }
+            if let CommandAction::ReconfigurePartition { operation, .. } = &command.action {
+                outcome.epoch = Some(
+                    self.configuration_view()
+                        .request
+                        .as_ref()
+                        .map(|request| request.configuration.unit.current),
+                );
+                outcome.operation = operation.clone();
             }
-            if command.action == "rebuild-replica"
-                && self.placements[usize::from(command.node.unwrap() - 1)]
+            if matches!(command.action, CommandAction::RebuildReplica { .. })
+                && self.placements[usize::from(command.node().unwrap() - 1)]
                     .launch
                     .profile
                     .stateful()
@@ -3083,12 +3060,10 @@ impl Ledger {
                     .build
                     .body
                     .replica;
-                outcome["replica"] = json!(build.id);
-                outcome["incarnation"] = json!(build.instance);
-                outcome["node_instance"] = json!(build.node.instance);
-                outcome["phase"] = json!("building");
+                outcome.bind_replica(build);
+                outcome.phase = Some(OperationPhase::Building);
             }
-            if command.action == "cancel-rebuild" {
+            if let CommandAction::CancelRebuild { operation } = &command.action {
                 let build = &self
                     .repair
                     .as_ref()
@@ -3096,11 +3071,9 @@ impl Ledger {
                     .build
                     .body
                     .replica;
-                outcome["replica"] = json!(build.id);
-                outcome["incarnation"] = json!(build.instance);
-                outcome["node_instance"] = json!(build.node.instance);
-                outcome["operation"] = json!(command.operation);
-                outcome["phase"] = json!("removing");
+                outcome.bind_replica(build);
+                outcome.operation = Some(operation.clone());
+                outcome.phase = Some(OperationPhase::Removing);
             }
         }
         self.operations.push(Operation { outcome, command });
@@ -3162,7 +3135,7 @@ impl Ledger {
         self.operations
             .iter()
             .find(|item| item.command.op == op)
-            .map(|item| item.outcome.clone())
+            .map(|item| item.outcome.json())
             .unwrap_or_else(|| json!({"state":"rejected"}))
     }
     pub fn node_control_reply(
@@ -3190,7 +3163,9 @@ impl Ledger {
         placement.activation_sequence = sequence;
         self.complete(
             &op,
-            json!({"op":op,"state":"complete","activated":activate,"sequence":sequence}),
+            OperationOutcome::new(&op, OperationState::Complete)
+                .detail("activated", activate)
+                .detail("sequence", sequence),
         );
         Ok(())
     }
@@ -3280,31 +3255,25 @@ impl Ledger {
             sequence: body.sequence,
         })
     }
-    pub fn complete(&mut self, op: &str, mut outcome: Value) {
+    pub fn complete(&mut self, op: &str, mut outcome: OperationOutcome) {
         if let Some(operation) = self
             .operations
             .iter_mut()
             .find(|item| item.command.op == op)
         {
-            for key in [
-                "replica",
-                "incarnation",
-                "partition",
-                "node_instance",
-                "epoch",
-            ] {
-                if outcome.get(key).is_none() {
-                    if let Some(value) = operation.outcome.get(key) {
-                        outcome[key] = value.clone();
-                    }
-                }
-            }
+            outcome.retain_owner(&operation.outcome);
             operation.outcome = outcome;
-            if operation.outcome["state"] == "complete" {
-                if operation.command.action == "create-partition" {
-                    operation.outcome["phase"] = json!("membership_ready");
-                } else if operation.command.action == "rebuild-replica" {
-                    operation.outcome["phase"] = json!("ready");
+            if operation.outcome.state == OperationState::Complete {
+                if matches!(
+                    operation.command.action,
+                    CommandAction::CreatePartition { .. }
+                ) {
+                    operation.outcome.phase = Some(OperationPhase::MembershipReady);
+                } else if matches!(
+                    operation.command.action,
+                    CommandAction::RebuildReplica { .. }
+                ) {
+                    operation.outcome.phase = Some(OperationPhase::Ready);
                 }
             }
         }
@@ -3361,11 +3330,15 @@ impl Ledger {
             // after session loss. Desired authority and tombstones stay intact.
             self.complete(
                 &operation,
-                json!({"op":operation,"state":"unknown","error":error}),
+                OperationOutcome::new(&operation, OperationState::Unknown)
+                    .with_error(error.clone()),
             );
         }
         if let Some(op) = control {
-            self.complete(&op, json!({"op":op,"state":"unknown","error":error}));
+            self.complete(
+                &op,
+                OperationOutcome::new(&op, OperationState::Unknown).with_error(error),
+            );
         }
     }
     pub fn down(&mut self, index: usize) {
@@ -3407,7 +3380,10 @@ impl Ledger {
         }
         let operations = [placement.create_op.clone(), placement.delete_op.clone()];
         for op in operations.into_iter().flatten() {
-            self.complete(&op, json!({"op":op,"state":"unknown","error":error}));
+            self.complete(
+                &op,
+                OperationOutcome::new(&op, OperationState::Unknown).with_error(error),
+            );
         }
     }
     pub fn reply(&mut self, index: usize, body: AddInstanceReply, removing: bool) -> Result<()> {
@@ -3538,7 +3514,8 @@ impl Ledger {
             placement.error = Some(format!("native semantic error {}", body.error));
             self.complete(
                 &op,
-                json!({"op":op,"state":"error","native_error":body.error}),
+                OperationOutcome::new(&op, OperationState::Error)
+                    .detail("native_error", body.error),
             );
             return Ok(());
         }
@@ -3558,9 +3535,18 @@ impl Ledger {
             .profile
             .configured_sizes()
             .is_some_and(|(target, _)| target > 1);
-        let outcome = json!({"op":op,"state":if configuring { "pending" } else { "complete" },
-            "observed":"running", "replica":placement.replica,
-            "incarnation":placement.incarnation, "endpoint":placement.endpoint});
+        let mut outcome = OperationOutcome::new(
+            &op,
+            if configuring {
+                OperationState::Pending
+            } else {
+                OperationState::Complete
+            },
+        )
+        .detail("observed", Observed::Running)
+        .detail("endpoint", &placement.endpoint);
+        outcome.replica = Some(placement.replica);
+        outcome.incarnation = Some(placement.incarnation);
         self.complete(&op, outcome);
         Ok(())
     }
@@ -3748,24 +3734,35 @@ impl Ledger {
             .retired
             .push((placement.replica, placement.incarnation));
         let op = placement.delete_op.clone().unwrap();
-        let outcome = json!({"op":op,"state":"complete","observed":"absent",
-            "replica":placement.replica,"incarnation":placement.incarnation,
-            "cleanup":"verified_original_instance"});
+        let mut outcome = OperationOutcome::new(&op, OperationState::Complete)
+            .detail("observed", Observed::Absent)
+            .detail("cleanup", "verified_original_instance");
+        outcome.replica = Some(placement.replica);
+        outcome.incarnation = Some(placement.incarnation);
         self.complete(&op, outcome);
     }
+    #[cfg(test)]
     pub fn status(&self) -> Value {
-        json!({"nodes":self.placements.iter().map(Placement::status).collect::<Vec<_>>(),
-            "recovery_mode":self.recovery_mode,
-            "replica_set":self.placements[0].launch.profile.configured_sizes().map(|(target, minimum)|
-                json!({"target":target,"minimum":minimum,"immutable":true})),
-            "idle_build":self.idle_status(),
-            "idle_removal":self.idle_removal_status(),
-            "idle_deletion":self.idle_deletion_status(),
-            "idle_predecessor":self.idle_predecessor,
-            "configuration":self.configuration_status(),
-            "repair":self.repair_status(),
-            "generation_handshake": self.generation.as_ref().map(GenerationHandshake::status),
-            "node_failures":self.node_failures.iter().map(|failure| json!({
+        self.status_typed().json()
+    }
+
+    pub fn status_typed(&self) -> ClusterStatus {
+        ClusterStatus {
+            nodes: self.placements.iter().map(Placement::status_typed).collect(),
+            configuration: self.configuration_view(), repair: self.repair_view(),
+            idle_build: self.idle_view(), idle_removal: self.idle_removal_view(), idle_deletion: self.idle_deletion_view(),
+            generation_handshake: self.generation.as_ref().map(GenerationHandshake::status),
+            node_controls: None, peer_idle: None,
+            operations: self.operations.iter().map(|op|
+                if matches!(op.command.action, CommandAction::Status) {
+                    OperationOutcome::new(&op.command.op, op.outcome.state).detail("kind", "status")
+                } else { op.outcome.clone() }).collect(),
+            details: [
+            ("recovery_mode".into(), json!(self.recovery_mode)),
+            ("replica_set".into(), json!(self.placements[0].launch.profile.configured_sizes().map(|(target, minimum)|
+                json!({"target":target,"minimum":minimum,"immutable":true})))),
+            ("idle_predecessor".into(), json!(self.idle_predecessor)),
+            ("node_failures".into(), json!(self.node_failures.iter().map(|failure| json!({
                 "node":failure.index + 1,"instance":failure.receipt.node.instance,
                 "session":failure.receipt.session,"recovery_error":failure.recovery_error,
                 "partition":self.placements[failure.index].launch.partition,
@@ -3774,13 +3771,12 @@ impl Ledger {
                     replica:body.replica.id, incarnation:body.replica.instance,
                 }),
                 "replacement_instance":failure.replacement.as_ref().map(|launch| launch.node.instance)
-            })).collect::<Vec<_>>(),
-            "operations":self.operations.iter().map(|op|
-                if op.command.action == "status" {
-                    json!({"op":op.command.op,"state":op.outcome["state"],"kind":"status"})
-                } else { op.outcome.clone() }).collect::<Vec<_>>(),
-            "operation_capacity":64, "retained_operations":self.operations.len(),
-            "unsupported":"all native families outside the selected fixed lifecycle profile"})
+            })).collect::<Vec<_>>())),
+            ("operation_capacity".into(), json!(64)),
+            ("retained_operations".into(), json!(self.operations.len())),
+            ("unsupported".into(), json!("all native families outside the selected fixed lifecycle profile")),
+            ].into_iter().collect(),
+        }
     }
     pub fn request_idle(&mut self, now: Instant) -> Result<AddReplica> {
         self.request_idle_on(1, now)
@@ -4768,39 +4764,88 @@ impl Ledger {
     }
 
     pub fn repair_status(&self) -> Value {
+        json!(self.repair_view())
+    }
+
+    pub fn repair_view(&self) -> RepairStatus {
         let Some(r) = self.repair.as_ref().or_else(|| {
             self.repair_history
                 .last()
                 .filter(|r| r.superseded_by.is_some())
         }) else {
-            return json!({"state":"absent","ready":false});
+            return RepairStatus::new(RepairState::Absent, false, None);
         };
         let state = if r.superseded_by.is_some() {
-            "superseded"
+            RepairState::Superseded
         } else if r.unknown {
-            "unknown"
+            RepairState::Unknown
         } else if r.build.cancelled {
-            "cancelled"
+            RepairState::Cancelled
         } else if r.configuration.as_ref().is_some_and(|c| c.reply.is_some()) {
-            "ready"
+            RepairState::Ready
         } else if r.build.reply.as_ref().is_some_and(|b| b.error != 0) {
-            "failed"
+            RepairState::Failed
         } else {
-            "pending"
+            RepairState::Pending
         };
-        json!({"state":state,"ready":state == "ready","predecessor":r.predecessor,
-            "target_restored":state == "ready" && self.restoration.is_none(),
-            "remaining_lost":self.placements.iter().enumerate().filter(|(_,p)| p.loss_reported).map(|(i,_)| i+1).collect::<Vec<_>>(),
-            "superseded_by":r.superseded_by,
-            "kind":if r.uses_spare() {"spare_replacement"} else if r.base.is_some() {"restoration"} else if r.removal.is_some() {"secondary"} else {"primary"},
-            "removed":r.removal.as_ref().is_some_and(|c| c.reply.is_some()),
-            "old_profile":r.old_profile,"profile":r.profile,"request":r.build.body,"build_reply":r.build.reply,
-            "host_ready":r.profile.is_some(),"built":r.build.reply.as_ref().is_some_and(|b| b.error == 0),
-            "cancelled":r.build.cancelled,
-            "pending_remove":r.cancellation.as_ref().is_some_and(|c| c.reply.is_none()),
-            "replicator_removed":r.cancellation.as_ref().is_some_and(|c| c.reply.is_some()),
-            "destination_deleted":r.deletion.as_ref().is_some_and(|d| d.reply.is_some()),
-            "disposed":r.deletion.as_ref().is_some_and(|d| d.disposal.is_some())})
+        RepairStatus::new(
+            state,
+            state == RepairState::Ready,
+            Some(if r.uses_spare() {
+                RepairKind::SpareReplacement
+            } else if r.base.is_some() {
+                RepairKind::Restoration
+            } else if r.removal.is_some() {
+                RepairKind::Secondary
+            } else {
+                RepairKind::Primary
+            }),
+        )
+        .detail("predecessor", &r.predecessor)
+        .detail(
+            "target_restored",
+            state == RepairState::Ready && self.restoration.is_none(),
+        )
+        .detail(
+            "remaining_lost",
+            self.placements
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.loss_reported)
+                .map(|(i, _)| i + 1)
+                .collect::<Vec<_>>(),
+        )
+        .detail("superseded_by", r.superseded_by)
+        .detail(
+            "removed",
+            r.removal.as_ref().is_some_and(|c| c.reply.is_some()),
+        )
+        .detail("old_profile", &r.old_profile)
+        .detail("profile", &r.profile)
+        .detail("request", &r.build.body)
+        .detail("build_reply", &r.build.reply)
+        .detail("host_ready", r.profile.is_some())
+        .detail(
+            "built",
+            r.build.reply.as_ref().is_some_and(|b| b.error == 0),
+        )
+        .detail("cancelled", r.build.cancelled)
+        .detail(
+            "pending_remove",
+            r.cancellation.as_ref().is_some_and(|c| c.reply.is_none()),
+        )
+        .detail(
+            "replicator_removed",
+            r.cancellation.as_ref().is_some_and(|c| c.reply.is_some()),
+        )
+        .detail(
+            "destination_deleted",
+            r.deletion.as_ref().is_some_and(|d| d.reply.is_some()),
+        )
+        .detail(
+            "disposed",
+            r.deletion.as_ref().is_some_and(|d| d.disposal.is_some()),
+        )
     }
     pub fn request_idle_on(&mut self, destination: usize, now: Instant) -> Result<AddReplica> {
         let count = self.placements[0].launch.profile.node_count();
@@ -5173,8 +5218,14 @@ impl Ledger {
             .is_some()
         {
             if let Some(op) = self.placements[0].create_op.clone() {
-                let mut outcome = self.result(&op);
-                outcome["state"] = json!("complete");
+                let mut outcome = self
+                    .operations
+                    .iter()
+                    .find(|operation| operation.command.op == op)
+                    .ok_or("initial membership lacks its retained creation operation")?
+                    .outcome
+                    .clone();
+                outcome.state = OperationState::Complete;
                 self.complete(&op, outcome);
             }
         }
@@ -5570,52 +5621,108 @@ impl Ledger {
         Ok(())
     }
     pub fn configuration_status(&self) -> Value {
+        json!(self.configuration_view())
+    }
+
+    pub fn configuration_view(&self) -> ConfigurationStatus {
+        let view = |config: &ActiveConfiguration, unknown, kind| ConfigurationStatus {
+            state: if unknown {
+                ConfigurationState::Unknown
+            } else if config.reply.is_some() {
+                ConfigurationState::Ready
+            } else {
+                ConfigurationState::Pending
+            },
+            ready: !unknown && config.reply.is_some(),
+            kind: Some(kind),
+            request: Some(ConfigurationRequest {
+                configuration: (&config.body.configuration).into(),
+                phase0_duration: config.body.phase0_duration,
+            }),
+            details: [("reply".into(), json!(config.reply))]
+                .into_iter()
+                .collect(),
+        };
         if let Some(repair) = &self.repair {
             if let Some(config) = repair.configuration.as_ref().or(repair.removal.as_ref()) {
-                let state = if repair.unknown || config.unknown {
-                    "unknown"
-                } else if config.reply.is_some() {
-                    "ready"
+                let kind = if repair.uses_spare() {
+                    ConfigurationKind::SpareReplacement
+                } else if repair.base.is_some() {
+                    ConfigurationKind::SequentialRestoration
+                } else if repair.configuration.is_some() {
+                    if repair.removal.is_some() {
+                        ConfigurationKind::SecondaryRepair
+                    } else {
+                        ConfigurationKind::PostFailoverRepair
+                    }
                 } else {
-                    "pending"
+                    ConfigurationKind::SecondaryLossRemoval
                 };
-                return json!({"state":state,"ready":state == "ready","kind":if repair.uses_spare() {"spare_replacement"} else if repair.base.is_some() {"sequential_restoration"} else if repair.configuration.is_some() {if repair.removal.is_some() {"secondary_repair"} else {"post_failover_repair"}} else {"secondary_loss_removal"},
-                    "request":{"configuration":config.body.configuration,"phase0_duration":config.body.phase0_duration},
-                    "reply":config.reply});
+                return view(config, repair.unknown || config.unknown, kind);
             }
         }
         if let Some(swap) = &self.swap {
-            let state = if swap.unknown {
-                "unknown"
-            } else if swap.reply.is_some() {
-                "ready"
+            let kind = if self.node_reconfiguration == Some(swap.body.configuration.unit.current) {
+                ConfigurationKind::NodeDownReconfiguration
+            } else if self.primary_failover() {
+                ConfigurationKind::PrimaryFailover
             } else {
-                "pending"
+                ConfigurationKind::PlannedPrimaryTransfer
             };
-            return json!({"state":state,"ready":state == "ready","kind":if self.node_reconfiguration == Some(swap.body.configuration.unit.current) {"node_down_reconfiguration"} else if self.primary_failover() {"primary_failover"} else {"planned_primary_transfer"},
-                "request":{"configuration":swap.body.configuration,"phase0_duration":swap.body.phase0_duration},
-                "reply":swap.reply,"endpoint_update":self.swap_endpoint,"primary_transfer":true,
-                "from":self.placements.iter().position(|p| swap.body.configuration.replicas.0.iter()
-                    .any(|r| r.node == p.launch.node && r.previous_role == 4)).map(|i| i + 1),
-                "to":self.transition_primary_index() + 1,
-                "candidate_redirections":self.candidate_changes,
-                "history":self.configuration_history.iter().chain(self.configuration.iter()).map(|c| json!({"request":c.body.configuration,"reply":c.reply})).collect::<Vec<_>>()});
+            return view(swap, swap.unknown, kind)
+                .detail("endpoint_update", &self.swap_endpoint)
+                .detail("primary_transfer", true)
+                .detail(
+                    "from",
+                    self.placements
+                        .iter()
+                        .position(|p| {
+                            swap.body
+                                .configuration
+                                .replicas
+                                .0
+                                .iter()
+                                .any(|r| r.node == p.launch.node && r.previous_role == 4)
+                        })
+                        .map(|i| i + 1),
+                )
+                .detail("to", self.transition_primary_index() + 1)
+                .detail("candidate_redirections", &self.candidate_changes)
+                .detail(
+                    "history",
+                    self.configuration_history
+                        .iter()
+                        .chain(self.configuration.iter())
+                        .map(|c| json!({"request":c.body.configuration,"reply":c.reply}))
+                        .collect::<Vec<_>>(),
+                );
         }
         let Some(config) = &self.configuration else {
-            return json!({"state":"absent","ready":false});
+            return ConfigurationStatus {
+                state: ConfigurationState::Absent,
+                ready: false,
+                kind: None,
+                request: None,
+                details: Default::default(),
+            };
         };
-        let state = if config.unknown {
-            "unknown"
-        } else if config.reply.is_some() {
-            "ready"
-        } else {
-            "pending"
-        };
-        json!({"state":state,"ready":state == "ready",
-            "kind":if config.body.configuration.unit.target == 1 {"same_primary_retirement"} else {"same_primary_configuration"},
-            "request":{"configuration":config.body.configuration,"phase0_duration":config.body.phase0_duration},
-            "reply":config.reply,"primary_transfer":false,
-            "history":self.configuration_history.iter().map(|c| json!({"request":c.body.configuration,"reply":c.reply})).collect::<Vec<_>>()})
+        view(
+            config,
+            config.unknown,
+            if config.body.configuration.unit.target == 1 {
+                ConfigurationKind::SamePrimaryRetirement
+            } else {
+                ConfigurationKind::SamePrimaryConfiguration
+            },
+        )
+        .detail("primary_transfer", false)
+        .detail(
+            "history",
+            self.configuration_history
+                .iter()
+                .map(|c| json!({"request":c.body.configuration,"reply":c.reply}))
+                .collect::<Vec<_>>(),
+        )
     }
     pub fn request_idle_replacement(&mut self, now: Instant) -> Result<AddReplica> {
         if self.swap.is_some() {
@@ -5794,6 +5901,10 @@ impl Ledger {
         Some(idle.body.clone())
     }
     pub fn idle_status(&self) -> Value {
+        json!(self.idle_view())
+    }
+
+    pub fn idle_view(&self) -> IdleStatus {
         if self.placements[0].launch.profile == crate::ServiceProfile::StatefulThree
             || self.placements[0]
                 .launch
@@ -5801,60 +5912,93 @@ impl Ledger {
                 .configured_sizes()
                 .is_some()
         {
-            let builds: Vec<_> = self.idles.iter().map(|idle| {
-                let error = idle.reply.as_ref().map(|r| r.error);
-                let state = if idle.unknown { "unknown" }
-                    else if idle.cancelled { "cancelled" }
-                    else if error == Some(0) { "ready" }
-                    else if error.is_some() { "failed" } else { "pending" };
-                json!({"state":state,"ready":state == "ready","request":idle.body,"reply":idle.reply,
-                    "to_be_dropped":error.is_some_and(|e| e != 0),
-                    "cleanup_required":error.is_some_and(|e| e != 0)})
-            }).collect();
+            let builds: Vec<_> = self
+                .idles
+                .iter()
+                .map(|idle| {
+                    let error = idle.reply.as_ref().map(|r| r.error);
+                    let state = if idle.unknown {
+                        IdleState::Unknown
+                    } else if idle.cancelled {
+                        IdleState::Cancelled
+                    } else if error == Some(0) {
+                        IdleState::Ready
+                    } else if error.is_some() {
+                        IdleState::Failed
+                    } else {
+                        IdleState::Pending
+                    };
+                    IdleStatus::new(state, state == IdleState::Ready, None)
+                        .detail("request", &idle.body)
+                        .detail("reply", &idle.reply)
+                        .detail("to_be_dropped", error.is_some_and(|e| e != 0))
+                        .detail("cleanup_required", error.is_some_and(|e| e != 0))
+                })
+                .collect();
             let ready = builds.len() == self.placements[0].launch.profile.node_count() - 1
-                && builds.iter().all(|b| b["ready"] == true);
-            let state = if builds.iter().any(|b| b["state"] == "unknown") {
-                "unknown"
-            } else if builds.iter().any(|b| b["state"] == "failed") {
-                "failed"
+                && builds.iter().all(|b| b.ready);
+            let state = if builds.iter().any(|b| b.state == IdleState::Unknown) {
+                IdleState::Unknown
+            } else if builds.iter().any(|b| b.state == IdleState::Failed) {
+                IdleState::Failed
             } else if ready {
-                "ready"
+                IdleState::Ready
             } else if builds.is_empty() {
-                "absent"
+                IdleState::Absent
             } else {
-                "pending"
+                IdleState::Pending
             };
-            return json!({"state":state,
-                "ready":ready,"serving":false,"builds":builds});
+            return IdleStatus::new(state, ready, None)
+                .detail("serving", false)
+                .detail("builds", builds);
         }
         let Some(idle) = self.idles.first() else {
-            return json!({"state":"absent","ready":false});
+            return IdleStatus::new(IdleState::Absent, false, None);
         };
         let error = idle.reply.as_ref().map(|reply| reply.error);
         let destination_lost = self.placements[1].loss_reported;
         let state = if destination_lost {
-            "lost"
+            IdleState::Lost
         } else if idle.unknown {
-            "unknown"
+            IdleState::Unknown
         } else if idle.cancelled {
-            "cancelled"
+            IdleState::Cancelled
         } else if error == Some(0) {
-            "ready"
+            IdleState::Ready
         } else if error.is_some() {
-            "failed"
+            IdleState::Failed
         } else {
-            "pending"
+            IdleState::Pending
         };
-        json!({"state":state, "kind":"fm_idle_build", "ready":state == "ready",
-            "serving":false, "request":idle.body, "reply":idle.reply,
-            "destination_lost":destination_lost,
-            "native_replica_deleted":self.placements[1].remove_received,
-            "to_be_dropped":(error.is_some_and(|e| e != 0) || self.idle_deletion.is_some())
+        IdleStatus::new(
+            state,
+            state == IdleState::Ready,
+            Some(IdleKind::FmIdleBuild),
+        )
+        .detail("serving", false)
+        .detail("request", &idle.body)
+        .detail("reply", &idle.reply)
+        .detail("destination_lost", destination_lost)
+        .detail("native_replica_deleted", self.placements[1].remove_received)
+        .detail(
+            "to_be_dropped",
+            (error.is_some_and(|e| e != 0) || self.idle_deletion.is_some())
                 && !self.idle_destination_deleted(),
-            "destination_cleanup_required":(destination_lost || error.is_some_and(|e| e != 0) || self.idle_deletion.is_some())
+        )
+        .detail(
+            "destination_cleanup_required",
+            (destination_lost || error.is_some_and(|e| e != 0) || self.idle_deletion.is_some())
                 && !self.idle_deletion_complete(),
-            "error":error, "cleanup_required":(destination_lost || idle.cancelled || error.is_some_and(|e| e != 0))
-                && self.idle_removal.as_ref().is_none_or(|removal| removal.reply.is_none())})
+        )
+        .detail("error", error)
+        .detail(
+            "cleanup_required",
+            (destination_lost || idle.cancelled || error.is_some_and(|e| e != 0))
+                && self
+                    .idle_removal
+                    .as_ref()
+                    .is_none_or(|removal| removal.reply.is_none()),
+        )
     }
     pub fn request_idle_removal(&mut self, now: Instant) -> Result<RemoveReplica> {
         if self.configuration.is_some()
@@ -5987,27 +6131,52 @@ impl Ledger {
         Some(removal.body.clone())
     }
     pub fn idle_removal_status(&self) -> Value {
+        json!(self.idle_removal_view())
+    }
+
+    pub fn idle_removal_view(&self) -> RemovalStatus {
         let Some(removal) = &self.idle_removal else {
-            return json!({"state":"absent","pending_remove":false,"removed":false});
+            return RemovalStatus {
+                state: RemovalState::Absent,
+                pending_remove: false,
+                removed: false,
+                completion: None,
+                details: Default::default(),
+            };
         };
         let state = if removal.reply.is_some() {
-            "removed"
+            RemovalState::Removed
         } else if removal.unknown {
-            "unknown"
+            RemovalState::Unknown
         } else {
-            "pending"
+            RemovalState::Pending
         };
-        json!({"state":state, "kind":"fm_idle_removal",
-            "pending_remove":removal.reply.is_none(), "removed":state == "removed",
-            "completion":removal.reply.as_ref().map(|reply| if removal.failed_creation {
-                "failed_creation_retired"
-            } else if reply.replica.state == 1 {
-                "creation_cancelled"
-            } else {
-                "replicator_removed"
-            }),
-            "request":removal.body, "reply":removal.reply,
-            "destination_deleted":self.idle_destination_deleted(), "serving":false})
+        RemovalStatus {
+            state,
+            pending_remove: removal.reply.is_none(),
+            removed: state == RemovalState::Removed,
+            completion: Some(removal.reply.as_ref().map(|reply| {
+                if removal.failed_creation {
+                    RemovalCompletion::FailedCreationRetired
+                } else if reply.replica.state == 1 {
+                    RemovalCompletion::CreationCancelled
+                } else {
+                    RemovalCompletion::ReplicatorRemoved
+                }
+            })),
+            details: [
+                ("kind".into(), json!("fm_idle_removal")),
+                ("request".into(), json!(removal.body)),
+                ("reply".into(), json!(removal.reply)),
+                (
+                    "destination_deleted".into(),
+                    json!(self.idle_destination_deleted()),
+                ),
+                ("serving".into(), json!(false)),
+            ]
+            .into_iter()
+            .collect(),
+        }
     }
     fn idle_destination_deleted(&self) -> bool {
         self.idle_deletion
@@ -6215,31 +6384,87 @@ impl Ledger {
         Some(deletion.body.clone())
     }
     pub fn idle_deletion_status(&self) -> Value {
+        json!(self.idle_deletion_view())
+    }
+
+    pub fn idle_deletion_view(&self) -> DeletionStatus {
         let Some(deletion) = &self.idle_deletion else {
-            return json!({"state":"absent","destination_deleted":false,"disposed":false,"never_created":false,"pre_open_cancelled":false,"failed_registration":false,"failed_open":false,"complete":false});
+            return DeletionStatus {
+                state: DeletionState::Absent,
+                destination_deleted: false,
+                disposed: false,
+                never_created: false,
+                pre_open_cancelled: false,
+                failed_registration: false,
+                failed_open: false,
+                complete: false,
+                cleanup_state: None,
+                completion: None,
+                details: Default::default(),
+            };
         };
         let complete = self.idle_deletion_complete();
-        json!({"state":if complete { "deleted" } else if deletion.unknown { "unknown" } else { "pending" },
-            "cleanup_state":if complete { "complete" } else if deletion.unknown { "unknown" }
-                else if deletion.reply.is_some() { "unproved" } else { "pending_reply" },
-            "kind":"fm_idle_deletion", "request":deletion.body, "reply":deletion.reply,
-            "destination_deleted":self.idle_destination_deleted(),
-            "disposed":self.placements[1].retirement.is_some() || deletion.failed_open.is_some(),
-            "host_lost":deletion.host_loss.is_some(),
-            "force":deletion.body.deletion.0.force,
-            "never_created":deletion.absence.is_some(),
-            "pre_open_cancelled":deletion.cancellation.is_some(),
-            "failed_registration":deletion.failed_registration.is_some(),
-            "failed_open":deletion.failed_open.is_some(),
-            "completion":if !complete { None } else if self.placements[1].retirement.is_some() { Some("disposed") }
-                else if deletion.absence.is_some() { Some("never_created") }
-                else if deletion.cancellation.is_some() { Some("pre_open_cancelled") }
-                else if deletion.failed_registration.is_some() { Some("failed_registration") }
-                else if deletion.failed_open.is_some() { Some("failed_open") }
-                else if deletion.host_loss.is_some() { Some("host_lost") } else { None },
-            "complete":complete, "cleanup_required":!complete,
-            "pending_remove":self.idle_removal.as_ref().is_some_and(|removal| removal.reply.is_none()),
-            "reusable":false, "serving":false})
+        DeletionStatus {
+            state: if complete {
+                DeletionState::Deleted
+            } else if deletion.unknown {
+                DeletionState::Unknown
+            } else {
+                DeletionState::Pending
+            },
+            destination_deleted: self.idle_destination_deleted(),
+            disposed: self.placements[1].retirement.is_some() || deletion.failed_open.is_some(),
+            never_created: deletion.absence.is_some(),
+            pre_open_cancelled: deletion.cancellation.is_some(),
+            failed_registration: deletion.failed_registration.is_some(),
+            failed_open: deletion.failed_open.is_some(),
+            complete,
+            cleanup_state: Some(if complete {
+                CleanupState::Complete
+            } else if deletion.unknown {
+                CleanupState::Unknown
+            } else if deletion.reply.is_some() {
+                CleanupState::Unproved
+            } else {
+                CleanupState::PendingReply
+            }),
+            completion: Some(if !complete {
+                None
+            } else if self.placements[1].retirement.is_some() {
+                Some(DeletionCompletion::Disposed)
+            } else if deletion.absence.is_some() {
+                Some(DeletionCompletion::NeverCreated)
+            } else if deletion.cancellation.is_some() {
+                Some(DeletionCompletion::PreOpenCancelled)
+            } else if deletion.failed_registration.is_some() {
+                Some(DeletionCompletion::FailedRegistration)
+            } else if deletion.failed_open.is_some() {
+                Some(DeletionCompletion::FailedOpen)
+            } else if deletion.host_loss.is_some() {
+                Some(DeletionCompletion::HostLost)
+            } else {
+                None
+            }),
+            details: [
+                ("kind".into(), json!("fm_idle_deletion")),
+                ("request".into(), json!(deletion.body)),
+                ("reply".into(), json!(deletion.reply)),
+                ("host_lost".into(), json!(deletion.host_loss.is_some())),
+                ("force".into(), json!(deletion.body.deletion.0.force)),
+                ("cleanup_required".into(), json!(!complete)),
+                (
+                    "pending_remove".into(),
+                    json!(self
+                        .idle_removal
+                        .as_ref()
+                        .is_some_and(|removal| removal.reply.is_none())),
+                ),
+                ("reusable".into(), json!(false)),
+                ("serving".into(), json!(false)),
+            ]
+            .into_iter()
+            .collect(),
+        }
     }
     /// Native Replica::CanGenerateAction and PendingTask's creating-primary branch.
     pub fn primary_retry(&mut self, index: usize, now: Instant) -> Result<Option<AddPrimary>> {

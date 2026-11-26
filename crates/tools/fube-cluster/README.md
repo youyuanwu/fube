@@ -205,6 +205,14 @@ alone cannot select a historical failure. Changed content under an existing
 operation ID rejects. Pending completion is bound to the original
 configuration/replica owner, not whatever later recovery happens to be ready.
 
+Rust callers can construct `Command::new(op, CommandAction::...)` or a
+payload-bearing `CommandRequest`, then use `execute_request` for a typed
+`OperationOutcome`. `wait_operation_typed` and `status_typed` expose typed
+operation states/phases and independent configuration, repair and cleanup
+facts. The existing JSON methods and command DTO remain compatible; only that
+boundary uses action strings. Status projections preserve opaque native receipt
+fields rather than decoding them through the native binary codec.
+
 `supersede_rebuild(op, partition, failed_primary, rebuild_operation)` uses
 `reconfigure-partition` with `operation`. It binds the exact failed Primary
 and original removal owner before any replacement starts. Both read quorums

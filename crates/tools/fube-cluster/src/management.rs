@@ -98,26 +98,27 @@ pub(crate) enum Operation {
 struct Response {
     id: u64,
     result: Result<Value>,
-    status: Option<Value>,
+    status: Option<crate::status::ClusterStatus>,
 }
 
-fn decode_response(line: &[u8], id: u64) -> Result<(Result<Value>, Value)> {
+fn decode_response(line: &[u8], id: u64) -> Result<(Result<Value>, crate::status::ClusterStatus)> {
     let response: Response = serde_json::from_slice(line).map_err(err)?;
     if response.id != id {
         return Err("FM management reply identity mismatch".into());
     }
-    let status = response
-        .status
-        .or_else(|| {
+    let status = match response.status {
+        Some(status) => status,
+        None => serde_json::from_value(
             response
                 .result
                 .as_ref()
                 .ok()
                 .and_then(|result| result.get("status"))
                 .cloned()
-        })
-        .filter(Value::is_object)
-        .ok_or("FM management reply lacks status")?;
+                .ok_or("FM management reply lacks status")?,
+        )
+        .map_err(err)?,
+    };
     Ok((response.result, status))
 }
 
@@ -149,7 +150,7 @@ impl PendingStatus {
         &mut self,
         input: &mut (impl AsyncWrite + Unpin),
         output: &mut Lines<impl AsyncBufRead + Unpin>,
-    ) -> Result<(Result<Value>, Value)> {
+    ) -> Result<(Result<Value>, crate::status::ClusterStatus)> {
         while self.written < self.bytes.len() {
             let count = input
                 .write(&self.bytes[self.written..])
@@ -271,7 +272,7 @@ pub async fn run(path: &Path) -> Result<()> {
             let contains_status = result
                 .as_ref()
                 .is_ok_and(|value| value["status"].is_object());
-            let status = (!contains_status).then(|| manager.status());
+            let status = (!contains_status).then(|| manager.status_typed());
             let response = Response {
                 id: request.id,
                 result,
@@ -303,18 +304,18 @@ pub(crate) struct Client {
     input: Option<tokio::process::ChildStdin>,
     output: Option<Lines<BufReader<tokio::process::ChildStdout>>>,
     next: u64,
-    status: Value,
+    status: crate::status::ClusterStatus,
     error: Option<String>,
     pending_status: Option<PendingStatus>,
 }
 impl Client {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(status: crate::status::ClusterStatus) -> Self {
         Self {
             process: None,
             input: None,
             output: None,
             next: 1,
-            status: Value::Null,
+            status,
             error: None,
             pending_status: None,
         }
@@ -334,28 +335,27 @@ impl Client {
         Ok(())
     }
 
-    pub(crate) fn status(&self) -> Value {
+    pub(crate) fn status_typed(&self) -> crate::status::ClusterStatus {
         let mut status = self.status.clone();
-        status["fm"] = json!({
-            "pid": self.process.as_ref().map(OwnedApp::pid),
-            "separate_process": true,
-            "control_unknown": self.error.is_some(),
-            "error": self.error,
-        });
+        status.details.insert(
+            "fm".into(),
+            json!({
+                "pid": self.process.as_ref().map(OwnedApp::pid),
+                "separate_process": true,
+                "control_unknown": self.error.is_some(),
+                "error": self.error,
+            }),
+        );
         if self.error.is_some() {
-            if let Some(nodes) = status["nodes"].as_array_mut() {
-                for node in nodes {
-                    node["observed"] = json!("unknown");
-                    node["endpoint"] = Value::Null;
-                    node["link_alive"] = json!(false);
-                }
+            for node in &mut status.nodes {
+                node.observed = crate::Observed::Unknown;
+                node.endpoint = None;
+                node.link_alive = false;
             }
-            if let Some(operations) = status["operations"].as_array_mut() {
-                for operation in operations {
-                    if operation["state"] == "pending" {
-                        operation["state"] = json!("unknown");
-                        operation["error"] = json!(self.error);
-                    }
+            for operation in &mut status.operations {
+                if operation.state == crate::OperationState::Pending {
+                    operation.state = crate::OperationState::Unknown;
+                    operation.error = Some(json!(self.error));
                 }
             }
         }
@@ -451,7 +451,10 @@ impl Client {
         }
     }
 
-    async fn exchange(&mut self, operation: Operation) -> Result<(Result<Value>, Value)> {
+    async fn exchange(
+        &mut self,
+        operation: Operation,
+    ) -> Result<(Result<Value>, crate::status::ClusterStatus)> {
         let process = self.process.as_mut().ok_or("FM process not started")?;
         process.check_alive().map_err(err)?;
         let id = self.next;
@@ -503,6 +506,50 @@ impl Client {
 mod tests {
     use super::*;
 
+    fn status_fixture() -> crate::status::ClusterStatus {
+        serde_json::from_value(json!({
+            "nodes":[], "operations":[],
+            "configuration":{"state":"absent","ready":false},
+            "repair":{"state":"absent","ready":false},
+            "idle_build":{"state":"absent","ready":false},
+            "idle_removal":{"state":"absent","pending_remove":false,"removed":false},
+            "idle_deletion":{"state":"absent","destination_deleted":false,"disposed":false,
+                "never_created":false,"pre_open_cancelled":false,"failed_registration":false,
+                "failed_open":false,"complete":false},
+            "generation_handshake":null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn management_rejects_malformed_typed_control_facts() {
+        let mut status = status_fixture();
+        status.operations.push(crate::OperationOutcome::new(
+            "build",
+            crate::OperationState::Pending,
+        ));
+        let response = serde_json::to_value(Response {
+            id: 1,
+            result: Ok(Value::Null),
+            status: Some(status),
+        })
+        .unwrap();
+        for (field, invalid) in [("state", json!("typo")), ("phase", json!("typo"))] {
+            let mut response = response.clone();
+            response["status"]["operations"][0][field] = invalid;
+            assert!(decode_response(&serde_json::to_vec(&response).unwrap(), 1).is_err());
+        }
+        let mut invalid = response.clone();
+        invalid["status"]["configuration"]["ready"] = json!("true");
+        assert!(decode_response(&serde_json::to_vec(&invalid).unwrap(), 1).is_err());
+        let mut missing = response;
+        missing["status"]["repair"]
+            .as_object_mut()
+            .unwrap()
+            .remove("state");
+        assert!(decode_response(&serde_json::to_vec(&missing).unwrap(), 1).is_err());
+    }
+
     #[test]
     fn manifests_require_explicit_manual_policy_and_reject_legacy() {
         let mut value = serde_json::json!({
@@ -527,7 +574,7 @@ mod tests {
     async fn status_observation_deadlines_preserve_partial_writes_reads_and_request_identity() {
         use tokio::io::AsyncReadExt;
         let (mut input, mut request_reader) = tokio::io::duplex(8);
-        let (mut response_writer, response_reader) = tokio::io::duplex(128);
+        let (mut response_writer, response_reader) = tokio::io::duplex(4096);
         let mut output = Lines::new(BufReader::new(response_reader), LIMIT);
         let mut pending = PendingStatus::new(1).unwrap();
         let expected = pending.bytes.clone();
@@ -538,11 +585,16 @@ mod tests {
         .await
         .is_err());
         assert!(pending.written > 0 && pending.written < expected.len());
+        let mut status = status_fixture();
+        status.operations.push(crate::OperationOutcome::new(
+            "build",
+            crate::OperationState::Pending,
+        ));
         let response = frame(
             &Response {
                 id: 1,
                 result: Ok(Value::Null),
-                status: Some(json!({"operations":[{"op":"build","state":"pending"}]})),
+                status: Some(status),
             },
             LIMIT,
         )
@@ -571,7 +623,7 @@ mod tests {
         response_writer.write_all(&response[10..]).await.unwrap();
         let (result, status) = pending.advance(&mut input, &mut output).await.unwrap();
         assert_eq!(result.unwrap(), Value::Null);
-        assert_eq!(status["operations"][0]["state"], "pending");
+        assert_eq!(status.operations[0].state, crate::OperationState::Pending);
         let mut extra = [0; 1];
         assert!(
             tokio::time::timeout(Duration::from_millis(1), request_reader.read(&mut extra))
@@ -583,7 +635,7 @@ mod tests {
     #[tokio::test]
     async fn pending_status_rejects_a_reply_from_another_exchange() {
         let (mut input, _request_reader) = tokio::io::duplex(128);
-        let (mut response_writer, response_reader) = tokio::io::duplex(128);
+        let (mut response_writer, response_reader) = tokio::io::duplex(4096);
         let mut output = Lines::new(BufReader::new(response_reader), LIMIT);
         response_writer
             .write_all(
@@ -591,7 +643,7 @@ mod tests {
                     &Response {
                         id: 2,
                         result: Ok(Value::Null),
-                        status: Some(json!({})),
+                        status: Some(status_fixture()),
                     },
                     LIMIT,
                 )

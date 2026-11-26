@@ -152,8 +152,8 @@ async fn operation_wait_deadline_does_not_cancel_or_complete_pending_work() {
     let fixture = Fixture::new("operation-wait-deadline");
     let mut cluster = Cluster::new(fixture.config()).unwrap();
     cluster.manager.ledger.operations.push(fm::Operation {
-        command: command("pending", "create", Some(1)),
-        outcome: json!({"op":"pending","state":"pending"}),
+        command: command("pending", "create", Some(1)).request().unwrap(),
+        outcome: crate::OperationOutcome::new("pending", crate::OperationState::Pending),
     });
     assert!(cluster
         .wait_operation("pending", Duration::from_millis(10))
@@ -170,10 +170,10 @@ async fn operation_wait_deadline_does_not_cancel_or_complete_pending_work() {
         .wait_operation("pending", Duration::MAX)
         .await
         .is_err());
-    cluster
-        .manager
-        .ledger
-        .complete("pending", json!({"op":"pending","state":"complete"}));
+    cluster.manager.ledger.complete(
+        "pending",
+        crate::OperationOutcome::new("pending", crate::OperationState::Complete),
+    );
     assert_eq!(
         cluster
             .wait_operation("pending", Duration::ZERO)
@@ -189,17 +189,24 @@ async fn operation_wait_deadline_does_not_cancel_or_complete_pending_work() {
 async fn operation_wait_reports_original_failure_uncertainty_and_cancellation() {
     let fixture = Fixture::new("operation-wait-failure");
     let mut cluster = Cluster::new(fixture.config()).unwrap();
-    for state in ["failed", "unknown", "cancelled", "rejected"] {
+    for state in [
+        crate::OperationState::Failed,
+        crate::OperationState::Unknown,
+        crate::OperationState::Cancelled,
+        crate::OperationState::Rejected,
+    ] {
+        let name = serde_json::to_value(state).unwrap();
+        let name = name.as_str().unwrap();
         cluster.manager.ledger.operations.push(fm::Operation {
-            command: command(state, "create", Some(1)),
-            outcome: json!({"op":state,"state":state,"error":"original owner ended"}),
+            command: command(name, "create", Some(1)).request().unwrap(),
+            outcome: crate::OperationOutcome::new(name, state).with_error("original owner ended"),
         });
         let error = cluster
-            .wait_operation(state, Duration::ZERO)
+            .wait_operation(name, Duration::ZERO)
             .await
             .unwrap_err();
         assert!(
-            error.contains(state) && error.contains("original owner ended"),
+            error.contains(name) && error.contains("original owner ended"),
             "{error}"
         );
     }

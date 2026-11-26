@@ -1,3 +1,4 @@
+mod control;
 mod fm;
 mod interlock;
 mod management;
@@ -7,9 +8,15 @@ mod process_control;
 mod profile;
 mod restart;
 mod scenario;
+pub mod status;
 pub(crate) use fube_node::control::wire;
 
+pub use control::{
+    CommandAction, CommandRequest, OperationOutcome, OperationPhase, OperationState,
+    ReplicaRecovery,
+};
 pub use fm::Command;
+pub use fm::{Desired, Observed};
 pub use management::run as run_fm;
 use manager::Manager;
 pub use profile::Result;
@@ -47,7 +54,7 @@ pub struct Cluster {
     processes: Vec<Option<OwnedApp>>,
     remote: Option<management::Client>,
     fenced_nodes: Vec<NodeDownReceipt>,
-    driver_commands: Vec<(Command, Option<Result<Value>>)>,
+    driver_commands: Vec<(CommandRequest, Option<Result<OperationOutcome>>)>,
 }
 macro_rules! fm_action {
     ($name:ident, $operation:ident) => {
@@ -131,21 +138,28 @@ impl Cluster {
     }
 
     pub fn status(&self) -> Value {
-        let mut status = self
-            .remote
-            .as_ref()
-            .map_or_else(|| self.manager.status(), management::Client::status);
-        status["node_controls"] = json!(self
-            .driver_commands
-            .iter()
-            .map(|(command, result)| {
-                match result {
+        self.status_typed().json()
+    }
+
+    pub fn status_typed(&self) -> status::ClusterStatus {
+        let mut status = self.remote.as_ref().map_or_else(
+            || self.manager.status_typed(),
+            management::Client::status_typed,
+        );
+        status.node_controls = Some(
+            self.driver_commands
+                .iter()
+                .map(|(command, result)| match result {
                     Some(Ok(value)) => value.clone(),
-                    Some(Err(error)) => json!({"op":command.op,"state":"rejected","error":error}),
-                    None => json!({"op":command.op,"state":"unknown","error":"Node control has no observed terminal outcome"}),
-                }
-            })
-            .collect::<Vec<_>>());
+                    Some(Err(error)) => {
+                        OperationOutcome::new(&command.op, OperationState::Rejected)
+                            .with_error(error.clone())
+                    }
+                    None => OperationOutcome::new(&command.op, OperationState::Unknown)
+                        .with_error("Node control has no observed terminal outcome"),
+                })
+                .collect(),
+        );
         status
     }
 
@@ -154,58 +168,59 @@ impl Cluster {
             return Err("deployment already shut down".into());
         }
         self.refresh_node_controls();
-        command.validate()?;
+        let request = command.request()?;
         if let Some((original, result)) = self
             .driver_commands
             .iter()
-            .find(|(old, _)| old.op == command.op)
+            .find(|(old, _)| old.op == request.op)
         {
-            if original != &command {
+            if original != &request {
                 return Err("operation identity reused with different canonical content".into());
             }
             if let Some(result) = result {
-                return result.clone();
+                return result.clone().map(|outcome| outcome.json());
             }
             return Err(
                 "interrupted Node control cannot be replayed; inspect current ownership".into(),
             );
         }
-        if command.supervisor_control() {
+        if request.supervisor_control() {
             if self.driver_commands.len() == 64 {
                 return Err("64 driver operation identities retained; capacity exhausted".into());
             }
-            let status = self
-                .remote
-                .as_ref()
-                .map_or_else(|| self.manager.status(), management::Client::status);
-            if status["operations"].as_array().is_some_and(|operations| {
-                operations
-                    .iter()
-                    .any(|operation| operation["op"] == command.op)
-            }) {
+            let status = self.status_typed();
+            if status
+                .operations
+                .iter()
+                .any(|operation| operation.op == request.op)
+            {
                 return Err("operation identity is already owned by an FM command".into());
             }
-            self.driver_commands.push((command.clone(), None));
-            let node = command.node.unwrap();
-            let result = match command.action.as_str() {
-                "node-down" => self.node_down(node).await,
-                "stop-node" => self.terminate_node_owned(node, false).await,
-                "kill-node" => self.terminate_node_owned(node, true).await,
-                "restart-node" => self.restart_node_infrastructure(node).await,
+            self.driver_commands.push((request.clone(), None));
+            let result = match request.action {
+                CommandAction::NodeDown { node } => self.node_down(node).await,
+                CommandAction::StopNode { node } => self.terminate_node_owned(node, false).await,
+                CommandAction::KillNode { node } => self.terminate_node_owned(node, true).await,
+                CommandAction::RestartNode { node } => self.restart_node_infrastructure(node).await,
                 _ => unreachable!(),
             }
             .map(|mut result| {
-                result["op"] = json!(command.op);
+                result["op"] = json!(request.op);
                 result
-            });
+            })
+            .and_then(|result| serde_json::from_value::<OperationOutcome>(result).map_err(err));
             self.driver_commands
                 .iter_mut()
-                .find(|(old, _)| old.op == command.op)
+                .find(|(old, _)| old.op == request.op)
                 .unwrap()
                 .1 = Some(result.clone());
-            return result;
+            return result.map(|outcome| outcome.json());
         }
         self.execute_fm_command(command).await
+    }
+
+    pub async fn execute_request(&mut self, request: CommandRequest) -> Result<OperationOutcome> {
+        serde_json::from_value(self.execute(request.into()).await?).map_err(err)
     }
 
     pub(crate) async fn execute_fm_command(&mut self, command: Command) -> Result<Value> {
@@ -411,7 +426,7 @@ impl Cluster {
                     recovery_mode: self.manager.ledger.recovery_mode,
                 },
             )?;
-            self.remote = Some(management::Client::new());
+            self.remote = Some(management::Client::new(self.manager.status_typed()));
             self.remote
                 .as_mut()
                 .expect("stored FM owner")
@@ -613,12 +628,17 @@ impl Cluster {
                 "peer Idle requires the original admitted sessions and Ready node1 Primary".into(),
             );
         }
-        let current = self.status()["peer_idle"].clone();
+        let current = self
+            .status_typed()
+            .peer_idle
+            .ok_or("peer-idle status missing")?;
         if matches!(
-            current["state"].as_str(),
-            Some("failed" | "removing" | "removed")
+            current.state,
+            status::PeerIdleState::Failed
+                | status::PeerIdleState::Removing
+                | status::PeerIdleState::Removed
         ) {
-            return Ok(current);
+            return Ok(json!(current));
         }
         let child = &self.manager.children[0];
         process_control::send(
@@ -650,13 +670,19 @@ impl Cluster {
                     || placement.bootstrap != Bootstrap::Admitted
                     || !placement.activated
             })
-            || self.status()["peer_idle"]["state"] != "open"
+            || !self
+                .status_typed()
+                .peer_idle
+                .is_some_and(|peer| peer.state == status::PeerIdleState::Open)
         {
             return Err("peer build requires the original Ready Primary and opened Idle".into());
         }
-        let current = self.status()["peer_idle"].clone();
-        if current["built"] == true {
-            return Ok(current);
+        let current = self
+            .status_typed()
+            .peer_idle
+            .ok_or("peer-idle status missing")?;
+        if current.built {
+            return Ok(json!(current));
         }
         let child = &self.manager.children[0];
         process_control::send(
@@ -690,11 +716,17 @@ impl Cluster {
         {
             return Err("peer removal requires the original Ready Primary and opened Idle".into());
         }
-        let current = self.status()["peer_idle"].clone();
-        if current["state"] == "removed" {
-            return Ok(current);
+        let current = self
+            .status_typed()
+            .peer_idle
+            .ok_or("peer-idle status missing")?;
+        if current.state == status::PeerIdleState::Removed {
+            return Ok(json!(current));
         }
-        if !matches!(current["state"].as_str(), Some("open" | "removing")) {
+        if !matches!(
+            current.state,
+            status::PeerIdleState::Open | status::PeerIdleState::Removing
+        ) {
             return Err("peer removal requires the original opened Idle".into());
         }
         let child = &self.manager.children[0];
@@ -1143,7 +1175,7 @@ mod tests {
                 assert_eq!(ledger.result("create")["state"], "unknown");
                 assert!(
                     matches!(ledger.accept(command("create", "create", Some(1))).unwrap(),
-                    Accepted::Duplicate(outcome) if outcome["state"] == "unknown")
+                    Accepted::Duplicate(outcome) if outcome.state == OperationState::Unknown)
                 );
                 ledger.accept(command("delete", "delete", Some(1))).unwrap();
                 ledger.down(0);
