@@ -63,6 +63,30 @@ commands and semantic operation waits, including lost-reply retries. They
 verify that observation alone authorizes neither failover nor fresh-host repair.
 Original-node minimum/multi-loss gates and Legacy compatibility remain unchanged.
 
+The supported original-Node 3/2 cancellation scenario also uses Manual
+failover/rebuild/cancel commands and waits on the cancellation operation.
+Native removal completion settles that operation and cancels the original
+rebuild; destination deletion/disposal and older LFUM upload acknowledgments
+remain independent. Command replay does not reauthorize or resend native work.
+Cancellation during admission, Secondary/spare repair and successor recovery
+remain gated.
+
+Primary failover, Primary repair, repeated recovery and repair-deactivation
+LFUM overlap fixtures now use Manual scoped intent and operation waits.
+Old/current upload acknowledgments and local role/Close completion are checked
+independently: none can complete a pending failover or rebuild before the final
+native configuration reply. Deactivation can dispose a replica without restoring
+membership. Stable-generation separate-FM scenarios retain Legacy compatibility
+coverage; no interrupted or multi-loss recovery capability is added.
+
+Manual foreground coverage exercises minimum-preserving 3/3 Primary recovery
+through JSON kill, NodeDown, partition reconfiguration, infrastructure restart
+and replica rebuild. Bounded polling selects the exact retained operation from
+FM or supervisor history; public status includes both. Replaying an old control
+cannot stop the successor, restart alone creates no service replica, and the
+rebuilt replica supplies a real vote after another Secondary is fenced.
+Legacy CLI defaults and independent process/host cleanup remain covered.
+
 The [cluster controls](../../crates/tools/fube-cluster/README.md#explicit-nodedown-and-restart)
 provide explicit `node-down` and `restart-node` commands. They are supervisor
 operations over private management IPC, not new FM/RA wire actions or a

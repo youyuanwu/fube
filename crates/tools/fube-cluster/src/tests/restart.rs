@@ -541,6 +541,7 @@ fn manual_node_recovery_is_scoped_retained_and_preserves_minimum() {
 #[test]
 fn scoped_cancellation_owns_the_exact_pending_rebuild() {
     let mut ledger = configured_ledger(3, 2);
+    ledger.recovery_mode = crate::RecoveryMode::Manual;
     let predecessor = replica_ref(&ledger, 0);
     let partition = ledger.placements[0].launch.partition.clone();
     let old = ledger.placements[0].body().unwrap();
@@ -558,10 +559,18 @@ fn scoped_cancellation_owns_the_exact_pending_rebuild() {
             true,
         )
         .unwrap();
-    let failover = ledger
-        .start_primary_failover(Instant::now())
+    let Accepted::Reconfigure(failover) = ledger
+        .accept(Command {
+            op: "failover".into(),
+            action: "reconfigure-partition".into(),
+            partition: Some(partition.clone()),
+            predecessor: Some(predecessor.clone()),
+            ..Command::default()
+        })
         .unwrap()
-        .unwrap();
+    else {
+        panic!("explicit failover must own native survivor reconfiguration");
+    };
     let primary = ledger.configuration_target_index();
     ledger
         .configuration_reply(primary, completed(&failover))

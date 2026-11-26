@@ -266,6 +266,33 @@ continuity and physical predecessor retirement are checked independently.
 Existing Legacy and interrupted-recovery scenarios remain compatibility and
 boundary coverage; this migration does not expand supported recovery.
 
+For supported original-Node 3/2 Primary repair before admission, submit
+`cancel_rebuild("cancel", "rebuild")` and wait on `"cancel"`. Only the matched
+native RemoveReplicaReply completes cancellation; waiting on `"rebuild"` then
+reports cancellation, never restored membership. Replaying the cancellation ID
+does not resend removal: the authorized native retry driver owns that progress.
+`delete_cancelled_repair` still independently authorizes destination deletion,
+and its native reply and disposal receipt cannot complete Primary removal.
+The Manual fixture covers a cancelled public copy stream and a completed build
+with a withheld reply, including older LFUM uploads and stale build traffic.
+
+Manual LFUM overlap scenarios also authorize each Primary failover and rebuild
+before rolling generations, including repeated recovery and repair deactivation.
+Upload acknowledgments, local role completion and fresh-host readiness cannot
+settle those operations; final native configuration completion remains required.
+Native deactivation during admission can drain the replica's resources without
+completing its rebuild. Generation/upload observations remain separate from
+operation waits, and older frozen uploads retain their original reply owners.
+
+The [foreground CLI fixture](tests/foreground.rs) exercises the Manual 3/3
+Primary sequence with bounded `status` polling for exact operation IDs.
+Status includes FM `operations` and the supervisor's retained `node_controls`;
+the CLI does not add a `wait-operation` action. Infrastructure-only restart
+leaves the replica absent, and replaying old kill/restart IDs cannot target its
+successor. After explicit rebuild, a write with another Secondary physically
+fenced proves that the replacement supplies a real quorum vote. Existing
+Legacy foreground scenarios remain unchanged apart from shared fixture support.
+
 Existing repair/replacement helpers reuse the same ledger/native repair
 primitives. `restart_node` remains a bundled library convenience workflow;
 `restart_node_infrastructure` is the process-only primitive. Existing foreground

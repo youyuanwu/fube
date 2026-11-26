@@ -228,7 +228,7 @@ impl Cluster {
                 .request(management::Operation::Command { command })
                 .await?;
             if outcome.get("status").is_some() {
-                outcome["status"] = remote.status();
+                outcome["status"] = self.status();
             }
             Ok(outcome)
         } else {
