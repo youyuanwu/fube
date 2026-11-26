@@ -2,6 +2,7 @@
 //! readiness and simulated FT creation. No H2 acquisition/RAP/FM completion.
 use fube_hosting::{self as hosting, ipc::*, wire};
 use fube_node::{Config, Handle, Input, Node, Response};
+use fube_ra::protocol::NativeReplicaState;
 use fube_ra::{entity as ra, protocol as p};
 use fube_ra_store::{
     Backend, BackendContext, MemoryBackend, Output, Request as StoreRequest,
@@ -160,7 +161,7 @@ fn ra_body() -> p::AddInstance {
     b.replica.node = ra_admission().local_node;
     b.replica.id = 40;
     b.replica.instance = 50;
-    b.replica.state = 1;
+    b.replica.state = NativeReplicaState::InBuild;
     b.replica.version = p::VersionInstance::default();
     b.service.name = "fabric:/App/service".into();
     b.service.service_type = p::ServiceType {

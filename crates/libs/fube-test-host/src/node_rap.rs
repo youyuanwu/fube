@@ -8,6 +8,7 @@ use fube_hosting::{
     local::{Activation, NativeRuntime},
 };
 use fube_node::local::{self, CommandReceipt, EffectReceipt, LocalDisposition, Node};
+use fube_ra::protocol::NativeReplicaState;
 use fube_ra::{entity as ra, protocol as p};
 use fube_ra_store::{Settings, Store};
 use fubst::serde::{from_slice, to_vec, ByteArray};
@@ -80,7 +81,7 @@ fn body(node: &Node) -> Result<p::AddInstance> {
     body.replica.node = admission().local_node;
     body.replica.id = 1;
     body.replica.instance = 1;
-    body.replica.state = 1;
+    body.replica.state = NativeReplicaState::InBuild;
     body.service.name = premise.service_name.clone();
     body.service.application = premise.application_name.clone();
     body.service.service_type = p::ServiceType {

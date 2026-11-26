@@ -352,8 +352,8 @@ pub struct PeerCreationReply {
 pub struct PeerReplicaSnapshot {
     pub id: i64,
     pub instance: i64,
-    pub current_role: i64,
-    pub state: i64,
+    pub current_role: fube_ra::protocol::NativeReplicaRole,
+    pub state: fube_ra::protocol::NativeReplicaState,
     pub replication_endpoint: String,
     #[serde(flatten)]
     pub(crate) details: Map<String, Value>,

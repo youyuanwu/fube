@@ -1,5 +1,7 @@
 //! Budgeted FM bodies; generation and domain admission stay in Ingress.
 use super::{err, one_way, peer_intake::Payload, Headers, Properties, Result};
+#[cfg(test)]
+use fube_ra::protocol::NativeReplicaRole;
 use fube_ra::protocol::{
     AddInstance, AddInstanceReply, AddPrimary, AddReplica, DeleteReplica, DoReconfiguration,
     GenerationHeader, GenerationUpdate, NodeActivateRequest, NodeDeactivateRequest,
@@ -208,7 +210,7 @@ mod tests {
                         unit: base.unit,
                         replicas: ObjectArray(vec![ReplicaInfo {
                             description: base.replica,
-                            intermediate_role: 2,
+                            intermediate_role: NativeReplicaRole::Idle,
                         }]),
                         ..Default::default()
                     }]),

@@ -1,4 +1,5 @@
 use crate::{ipc::Session, lifecycle_wire::*, require, wire, HostError, Result};
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use fubst::serde::{to_vec, ByteArray, EmptyObjectArray, Guid};
 use furpc::Message;
 use std::{
@@ -64,12 +65,12 @@ impl ServiceUnit {
                     },
                     id: 1,
                     instance: 1,
-                    current_role: 1,
-                    previous_role: 1,
+                    current_role: NativeReplicaRole::None,
+                    previous_role: NativeReplicaRole::None,
                     up: true,
                     last_lsn: -1,
                     first_lsn: -1,
-                    state: 1,
+                    state: NativeReplicaState::InBuild,
                     version: runtime.code.version.clone(),
                     service_endpoint: String::new(),
                     replication_endpoint: String::new(),
@@ -125,7 +126,7 @@ impl ServiceUnit {
             "Close/Abort not legal in current unit state",
         )?;
         self.request.flags = if abort { 4 } else { 0 };
-        self.request.local.state = 2; // Native closing ReplicaDescription defaults to Ready.
+        self.request.local.state = NativeReplicaState::Ready; // Native closing ReplicaDescription defaults to Ready.
         self.state = UnitState::ClosePending;
         session.one_way(12, "ReplicaClose", to_vec(&self.request)?)
     }
@@ -155,8 +156,8 @@ impl ServiceUnit {
                 && reply.local.id == self.request.local.id
                 && reply.local.instance == self.request.local.instance
                 && reply.flags == self.request.flags
-                && reply.local.current_role == 1
-                && reply.local.previous_role == 1
+                && reply.local.current_role == NativeReplicaRole::None
+                && reply.local.previous_role == NativeReplicaRole::None
                 && reply.local.replication_endpoint.is_empty()
                 && reply.local.version == self.request.local.version,
             "stale/mismatched lifecycle reply identity/flags",

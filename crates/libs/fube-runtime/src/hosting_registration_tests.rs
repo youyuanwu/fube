@@ -2,6 +2,7 @@
 //! The blocked-store FT/readiness premise is qualification-only, not deployment.
 use super::*;
 use crate::hosting_tests::{marker, node, observe, Observation};
+use fube_core::protocol::NativeReplicaState;
 use fube_hosting::{ipc, wire as hw};
 use fube_node::{Config, Input, Node, Response};
 use fube_ra::{entity as ra, protocol as p};
@@ -133,7 +134,7 @@ async fn run(mode: &str) {
         b.replica.node = admission.local_node.clone();
         b.replica.id = 1;
         b.replica.instance = 1;
-        b.replica.state = 1;
+        b.replica.state = NativeReplicaState::InBuild;
         b.replica.version = from_slice(&to_vec(&expected.code.version).unwrap()).unwrap();
         b.service.version = b.replica.version.clone();
         b.service.name = "fabric:/app/service".into();

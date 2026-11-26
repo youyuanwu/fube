@@ -6,6 +6,7 @@
 //! this owner on Busy, Unknown or error; abandonment is not a cleanup receipt.
 use super::{command, service_type, version};
 use fube_hosting::{self as h, ipc, local::Activation};
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use fube_ra::{entity as ra, protocol::*};
 use fube_ra_store::KeyValueStore;
 use fubst::serde::{from_slice_with_budget, to_vec, ObjectArray};
@@ -724,7 +725,11 @@ impl Node {
             return Err(Error::Unsupported);
         }
         self.admit_fm(source, generation)?;
-        self.authorize_open(body, 1, Some((source.clone(), generation.clone())))
+        self.authorize_open(
+            body,
+            NativeReplicaRole::None,
+            Some((source.clone(), generation.clone())),
+        )
     }
     pub fn fm_work(&mut self, work: FmWork) -> Result<u64> {
         let stateless = self.activation.profile() == h::local::Profile::Stateless;
@@ -837,8 +842,10 @@ impl Node {
                     self.activation.profile(),
                     h::local::Profile::VolatileStatefulExternalFm { .. }
                 ) && current.as_ref().is_some_and(|state| {
-                    matches!(state.body.replica.current_role, 3 | 4)
-                        && (state.fm_primary || state.peer_creation.is_some())
+                    matches!(
+                        state.body.replica.current_role,
+                        NativeReplicaRole::Secondary | NativeReplicaRole::Primary
+                    ) && (state.fm_primary || state.peer_creation.is_some())
                         && state.body.replica.node == incoming.replica.node
                         && state.body.replica.id == incoming.replica.id
                         && incoming.replica.instance <= state.body.replica.instance
@@ -862,7 +869,8 @@ impl Node {
                                 && ((never_created(state)
                                     && state.body.replica.instance == incoming.replica.instance)
                                     || (state.peer_creation.is_some()
-                                        && (state.body.replica.current_role == 2
+                                        && (state.body.replica.current_role
+                                            == NativeReplicaRole::Idle
                                             || (incoming.replica.id < state.body.replica.id
                                                 && incoming.replica.instance
                                                     < state.body.replica.instance)
@@ -879,9 +887,9 @@ impl Node {
                     };
                     if !eligible
                         || (current.is_none()
-                            && (incoming.replica.current_role != 2
-                                || incoming.replica.previous_role != 1
-                                || incoming.replica.state != 1
+                            && (incoming.replica.current_role != NativeReplicaRole::Idle
+                                || incoming.replica.previous_role != NativeReplicaRole::None
+                                || incoming.replica.state != NativeReplicaState::InBuild
                                 || !incoming.replica.up
                                 || incoming.replica.version != incoming.service.version
                                 || !incoming.replica.service_endpoint.is_empty()
@@ -1181,7 +1189,7 @@ impl Node {
                 .committed
                 .is_some_and(|s| {
                     s.fm_primary
-                        && s.body.replica.current_role == 4
+                        && s.body.replica.current_role == NativeReplicaRole::Primary
                         && ra::completed_primary_change(&s)
                 }))
             || !self.ra.is_peer(source)
@@ -1472,7 +1480,7 @@ impl Node {
         let snapshot = self.ra.snapshot(proof.body.unit.id.guid.0);
         let state = snapshot.committed?;
         let mut closed = proof.body.clone();
-        closed.replica.state = 3;
+        closed.replica.state = NativeReplicaState::Dropped;
         closed.replica.up = false;
         (!snapshot.fenced
             && disposal.applied
@@ -1536,21 +1544,21 @@ impl Node {
         if self.activation.profile() != h::local::Profile::Stateless {
             return Err(Error::Unsupported);
         }
-        self.authorize_open(body, 1, None)
+        self.authorize_open(body, NativeReplicaRole::None, None)
     }
     /// One volatile Idle lifetime. No primary, replacement, build or FM/peer authority.
     pub fn open_stateful(&mut self, body: AddInstance) -> Result<u64> {
         if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle {
             return Err(Error::Unsupported);
         }
-        self.authorize_open(body, 2, None)
+        self.authorize_open(body, NativeReplicaRole::Idle, None)
     }
     /// One fresh volatile 1/1 Primary lifetime, never promotion/adoption or FM authority.
     pub fn open_stateful_primary(&mut self, body: AddInstance) -> Result<u64> {
         if self.activation.profile() != h::local::Profile::VolatileStatefulPrimaryLifecycle {
             return Err(Error::Unsupported);
         }
-        self.authorize_open(body, 4, None)
+        self.authorize_open(body, NativeReplicaRole::Primary, None)
     }
     pub fn add_primary_from_fm(
         &mut self,
@@ -1562,7 +1570,11 @@ impl Node {
             return Err(Error::Unsupported);
         }
         self.admit_fm(source, generation)?;
-        self.authorize_open(body, 4, Some((source.clone(), generation.clone())))
+        self.authorize_open(
+            body,
+            NativeReplicaRole::Primary,
+            Some((source.clone(), generation.clone())),
+        )
     }
     pub fn add_replica_from_fm(
         &mut self,
@@ -1684,7 +1696,7 @@ impl Node {
                 .is_some_and(|state| {
                     state.phase == ra::Phase::Ready
                         && state.fm_primary
-                        && state.body.replica.current_role == 4
+                        && state.body.replica.current_role == NativeReplicaRole::Primary
                         && state.reconfiguration.as_ref().is_some_and(|configuration| {
                             configuration.request == body.configuration
                         })
@@ -1766,7 +1778,7 @@ impl Node {
                 .committed
                 .is_some_and(|s| {
                     s.fm_primary
-                        && s.body.replica.current_role == 4
+                        && s.body.replica.current_role == NativeReplicaRole::Primary
                         && ra::completed_primary_change(&s)
                 }))
             || !self.ra.is_peer(source)
@@ -1864,7 +1876,7 @@ impl Node {
                 .committed
                 .is_some_and(|s| {
                     s.fm_primary
-                        && s.body.replica.current_role == 4
+                        && s.body.replica.current_role == NativeReplicaRole::Primary
                         && ra::completed_primary_change(&s)
                 }))
             || !self.live.load(Ordering::SeqCst)
@@ -1931,10 +1943,10 @@ impl Node {
     fn authorize_open(
         &mut self,
         body: AddInstance,
-        role: i64,
+        role: NativeReplicaRole,
         fm: Option<(NodeInstance, GenerationHeader)>,
     ) -> Result<u64> {
-        let stateful = role != 1;
+        let stateful = role != NativeReplicaRole::None;
         let current = self.ra.snapshot(body.unit.id.guid.0).committed;
         let closed_request = fm.is_some()
             && current.as_ref().is_some_and(|state| {
@@ -1968,7 +1980,7 @@ impl Node {
         if (lookup.result == Err(h::Error::InvalidServiceType) && !closed_request)
             || body.replica.version != version(&premise.version)
             || body.replica.current_role != role
-            || body.replica.state != 1
+            || body.replica.state != NativeReplicaState::InBuild
             || !body.replica.up
             || body.replica.id < 0
             || body.replica.instance < 0
@@ -1976,11 +1988,14 @@ impl Node {
         {
             return Err(Error::Unsupported);
         }
-        if role == 4 && fm.is_none() && body.unit.previous != Epoch::default() {
+        if role == NativeReplicaRole::Primary
+            && fm.is_none()
+            && body.unit.previous != Epoch::default()
+        {
             return Err(Error::Unsupported);
         }
         if stateful
-            && (body.replica.previous_role != 1
+            && (body.replica.previous_role != NativeReplicaRole::None
                 || body.unit.current.configuration <= 0
                 || body.unit.current.data_loss < 0
                 || !body.replica.service_endpoint.is_empty()
@@ -2059,11 +2074,11 @@ impl Node {
             return Err(Error::Unsupported);
         }
         let work = match (role, fm) {
-            (4, Some((source, generation))) => {
+            (NativeReplicaRole::Primary, Some((source, generation))) => {
                 Work::AddPrimary(Arc::new(body.clone()), source, generation)
             }
-            (4, None) => Work::PrimaryOpen(Arc::new(body.clone())),
-            (2, _) => Work::StatefulOpen(Arc::new(body.clone())),
+            (NativeReplicaRole::Primary, None) => Work::PrimaryOpen(Arc::new(body.clone())),
+            (NativeReplicaRole::Idle, _) => Work::StatefulOpen(Arc::new(body.clone())),
             (_, fm) => {
                 let (source, generation) = fm.unwrap_or_else(|| {
                     (
@@ -3268,7 +3283,7 @@ impl Node {
             && event.replica.instance == state.body.replica.instance
             && event.replica.current_role == state.body.replica.current_role
             && event.replica.previous_role == state.body.replica.previous_role
-            && event.replica.up && event.replica.state != 0)
+            && event.replica.up && event.replica.state != NativeReplicaState::StandBy)
             && state.phase == ra::Phase::Opening
             && state.peer_creation.is_some()
             && state.close_token == 0

@@ -56,6 +56,9 @@ class InputTests(unittest.TestCase):
         (transport / "src/transport").mkdir(parents=True)
         paths.extend([transport / "Cargo.toml", transport / "src/lib.rs",
                       transport / "src/transport/session.rs"])
+        core = self.root / "crates/libs/fube-core"
+        (core / "src/protocol").mkdir(parents=True)
+        paths.extend([core / "Cargo.toml", core / "src/protocol/replica.rs"])
         for path in paths:
             path.write_text("original")
         with patch.object(producer, "ROOT", self.root), patch.object(

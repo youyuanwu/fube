@@ -1,4 +1,5 @@
 use super::*;
+use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 #[path = "stateful_binding_tests.rs"]
 mod binding_tests;
 #[path = "stateful_overlap_tests.rs"]
@@ -16,6 +17,8 @@ async fn configuration_allows_only_fenced_old_node_and_fresh_replacement_across_
         Some("live-predecessor"),
         Some("same-node-instance"),
         Some("multiple-predecessors"),
+        Some("unrecognized-role"),
+        Some("unrecognized-state"),
     ] {
         let mut h = Harness::new().await;
         let _calls = register(&h);
@@ -24,26 +27,30 @@ async fn configuration_allows_only_fenced_old_node_and_fresh_replacement_across_
         h.receive("ReplicaOpenReply").await;
         h.engine.shared.stateful.wait_idle([2; 16]).await;
         let mut old = peer(&open.local, 3);
-        old.current_role = 1;
-        old.state = 3;
+        old.current_role = NativeReplicaRole::None;
+        old.state = NativeReplicaState::Dropped;
         old.up = false;
         let mut fresh = old.clone();
         fresh.node.instance += 1;
         fresh.id += 1;
         fresh.instance += 1;
-        fresh.previous_role = 2;
-        fresh.current_role = 3;
-        fresh.state = 2;
+        fresh.previous_role = NativeReplicaRole::Idle;
+        fresh.current_role = NativeReplicaRole::Secondary;
+        fresh.state = NativeReplicaState::Ready;
         fresh.up = true;
         if invalid == Some("live-predecessor") {
             old.up = true;
-            old.state = 2;
+            old.state = NativeReplicaState::Ready;
         } else if invalid == Some("same-node-instance") {
             fresh.node.instance = old.node.instance;
         } else if invalid == Some("multiple-predecessors") {
             fresh.node.instance += 1;
             fresh.id += 1;
             fresh.instance += 1;
+        } else if invalid == Some("unrecognized-role") {
+            fresh.current_role = NativeReplicaRole::Unrecognized(99);
+        } else if invalid == Some("unrecognized-state") {
+            fresh.state = NativeReplicaState::Unrecognized(99);
         }
         let mut configuration = control(
             &open,
@@ -88,9 +95,9 @@ pub(super) fn peer(local: &Replica, node: u8) -> Replica {
     replica.node.id.0 = vec![node; 16];
     replica.id = node as i64 * 100;
     replica.instance = 1;
-    replica.current_role = 3;
-    replica.previous_role = 3;
-    replica.state = 2;
+    replica.current_role = NativeReplicaRole::Secondary;
+    replica.previous_role = NativeReplicaRole::Secondary;
+    replica.state = NativeReplicaState::Ready;
     replica.first_lsn = 0;
     replica.last_lsn = 0;
     replica.replication_endpoint = format!("model://peer/{node}");
@@ -126,10 +133,10 @@ async fn default_metadata_configuration_projection_and_separate_access_quorums()
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut dropped = peer(&open.local, 3);
-    dropped.state = 3;
+    dropped.state = NativeReplicaState::Dropped;
     dropped.up = false;
     let mut other = peer(&open.local, 2);
-    other.state = 3;
+    other.state = NativeReplicaState::Dropped;
     other.up = false;
     let mut current = control(
         &open,
@@ -224,10 +231,10 @@ async fn demotion_orders_pre_revoke_all_epoch_all_role_and_progress() {
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut target = peer(&open.local, 2);
-    target.current_role = 4;
+    target.current_role = NativeReplicaRole::Primary;
     let mut local = open.local.clone();
-    local.current_role = 3;
-    local.previous_role = 4;
+    local.current_role = NativeReplicaRole::Secondary;
+    local.previous_role = NativeReplicaRole::Primary;
     let mut demote = control(&open, "UpdateConfiguration", vec![local.clone(), target]);
     demote.local = local;
     demote.unit.current.configuration += 1 << 32;
@@ -292,10 +299,10 @@ async fn demotion_retries_during_catchup_do_not_acknowledge_an_unapplied_role() 
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut target = peer(&open.local, 3);
-    target.current_role = 4;
+    target.current_role = NativeReplicaRole::Primary;
     let mut local = open.local.clone();
-    local.current_role = 3;
-    local.previous_role = 4;
+    local.current_role = NativeReplicaRole::Secondary;
+    local.previous_role = NativeReplicaRole::Primary;
     let mut demote = control(&open, "UpdateConfiguration", vec![local.clone(), target]);
     demote.local = local;
     demote.unit.current.configuration += 1 << 32;
@@ -380,9 +387,9 @@ async fn concurrent_builds_remove_cancel_and_tombstones_preserve_remote_incarnat
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut a = peer(&open.local, 2);
-    a.current_role = 2;
+    a.current_role = NativeReplicaRole::Idle;
     let mut b = peer(&open.local, 3);
-    b.current_role = 2;
+    b.current_role = NativeReplicaRole::Idle;
     let build_a = control(&open, "ReplicatorBuildIdleReplica", vec![a.clone()]);
     let build_b = control(&open, "ReplicatorBuildIdleReplica", vec![b]);
     h.send("ReplicatorBuildIdleReplica", &build_a).await;
@@ -426,8 +433,8 @@ async fn idle_removal_before_build_is_idempotent_and_suppresses_delayed_build() 
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut idle = peer(&open.local, 2);
-    idle.current_role = 2;
-    idle.state = 3;
+    idle.current_role = NativeReplicaRole::Idle;
+    idle.state = NativeReplicaState::Dropped;
     let remove = control(&open, "ReplicatorRemoveIdleReplica", vec![idle.clone()]);
     for _ in 0..2 {
         h.send("ReplicatorRemoveIdleReplica", &remove).await;
@@ -449,7 +456,7 @@ async fn idle_removal_before_build_is_idempotent_and_suppresses_delayed_build() 
             .wait_remote_idle([2; 16], [2; 16])
             .await;
     }
-    idle.state = 1;
+    idle.state = NativeReplicaState::InBuild;
     let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle]);
     h.send("ReplicatorBuildIdleReplica", &build).await;
     h.no_reply().await;
@@ -466,7 +473,7 @@ async fn captured_retry_cleanup_cannot_repeat_or_remove_a_rebuilt_remote() {
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut idle = peer(&open.local, 2);
-    idle.current_role = 2;
+    idle.current_role = NativeReplicaRole::Idle;
     let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle]);
     h.send("ReplicatorBuildIdleReplica", &build).await;
     let first: ProxyReply =
@@ -524,7 +531,7 @@ async fn replicator_absence_completes_retry_cleanup_and_terminal_idle_removal() 
         h.receive("ReplicaOpenReply").await;
         h.engine.shared.stateful.wait_idle([2; 16]).await;
         let mut idle = peer(&open.local, 2);
-        idle.current_role = 2;
+        idle.current_role = NativeReplicaRole::Idle;
         let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle.clone()]);
         h.send("ReplicatorBuildIdleReplica", &build).await;
         let first: ProxyReply =
@@ -557,7 +564,7 @@ async fn replicator_absence_completes_retry_cleanup_and_terminal_idle_removal() 
                 .wait_remote_idle([2; 16], [2; 16])
                 .await;
         }
-        idle.state = 3;
+        idle.state = NativeReplicaState::Dropped;
         let remove = control(&open, "ReplicatorRemoveIdleReplica", vec![idle]);
         if mode == 44 {
             calls.uncertain_removal.store(true, Ordering::Release);
@@ -606,7 +613,7 @@ async fn newer_built_incarnation_removes_old_resource_then_retries_and_fences_ol
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut target = peer(&open.local, 2);
-    target.current_role = 2;
+    target.current_role = NativeReplicaRole::Idle;
     let old = control(&open, "ReplicatorBuildIdleReplica", vec![target]);
     h.send("ReplicatorBuildIdleReplica", &old).await;
     h.receive("ReplicatorBuildIdleReplicaReply").await;
@@ -643,13 +650,13 @@ async fn endpoint_secondary_fixture() -> (Harness, ProxyRequest, ProxyRequest) {
     let mut h = Harness::new().await;
     register(&h);
     let mut open = request(&h, 2, 1, 20);
-    open.local.current_role = 2;
+    open.local.current_role = NativeReplicaRole::Idle;
     h.send("ReplicaOpen", &open).await;
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut secondary = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
-    secondary.local.current_role = 3;
-    secondary.remote.0[0].current_role = 3;
+    secondary.local.current_role = NativeReplicaRole::Secondary;
+    secondary.remote.0[0].current_role = NativeReplicaRole::Secondary;
     secondary.unit.current.configuration += 1;
     secondary.unit.previous = open.unit.current.clone();
     h.send("UpdateConfiguration", &secondary).await;
@@ -685,8 +692,8 @@ async fn endpoint_retry_is_superseded_only_after_preparation_and_owner_admission
     }
     for failure in [Some(Failure::Encoding), Some(Failure::Capacity), None] {
         let (mut h, open, mut promote) = endpoint_secondary_fixture().await;
-        promote.local.current_role = 4;
-        promote.remote.0[0].current_role = 4;
+        promote.local.current_role = NativeReplicaRole::Primary;
+        promote.remote.0[0].current_role = NativeReplicaRole::Primary;
         promote.unit.current.configuration += 1 << 32;
         promote.unit.previous = open.unit.current.clone();
         promote.flags = 2;
@@ -781,8 +788,8 @@ async fn failed_endpoint_admission_without_a_previous_retry_does_not_install_a_p
                 .stateful
                 .fail_next_endpoint_preparation(Error::ResourceLimit("injected endpoint encoding"));
         }
-        promote.local.current_role = 4;
-        promote.remote.0[0].current_role = 4;
+        promote.local.current_role = NativeReplicaRole::Primary;
+        promote.remote.0[0].current_role = NativeReplicaRole::Primary;
         promote.unit.current.configuration += 1 << 32;
         promote.unit.previous = open.unit.current.clone();
         promote.flags = 2;
@@ -837,21 +844,21 @@ async fn promotion_endpoint_scenario(application: Option<tokio::runtime::Handle>
     let mut h = Harness::new_with_application(application).await;
     let calls = register(&h);
     let mut open = request(&h, 2, 1, 20);
-    open.local.current_role = 2;
+    open.local.current_role = NativeReplicaRole::Idle;
     h.send("ReplicaOpen", &open).await;
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut secondary = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
-    secondary.local.current_role = 3;
-    secondary.remote.0[0].current_role = 3;
+    secondary.local.current_role = NativeReplicaRole::Secondary;
+    secondary.remote.0[0].current_role = NativeReplicaRole::Secondary;
     secondary.unit.current.configuration += 1;
     secondary.unit.previous = open.unit.current.clone();
     h.send("UpdateConfiguration", &secondary).await;
     h.receive("UpdateConfigurationReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut promote = secondary.clone();
-    promote.local.current_role = 4;
-    promote.remote.0[0].current_role = 4;
+    promote.local.current_role = NativeReplicaRole::Primary;
+    promote.remote.0[0].current_role = NativeReplicaRole::Primary;
     promote.unit.current.configuration += 1 << 32;
     promote.unit.previous = secondary.unit.current.clone();
     promote.flags = 2;

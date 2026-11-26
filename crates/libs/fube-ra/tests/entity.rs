@@ -1,3 +1,4 @@
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use fube_ra::{entity::*, protocol::*};
 use fube_ra_store::{
     Backend, BackendContext, Error, ErrorKind, Identity, MemoryBackend, Output, Request,
@@ -105,7 +106,7 @@ fn body(id: u8) -> AddInstance {
     value.replica.node = admission().local_node;
     value.replica.id = 40;
     value.replica.instance = 50;
-    value.replica.state = 1;
+    value.replica.state = NativeReplicaState::InBuild;
     value.replica.version = VersionInstance::default();
     value.service.name = "fabric:/app/stateless".into();
     value.service.service_type.name = "Type".into();
@@ -465,7 +466,7 @@ async fn repeated_generation_update_captures_fresh_inventory_and_old_ack_does_no
     assert_eq!(fresh.generation, original.generation);
     assert!(!fresh.units.0[0].report_from_primary);
     let dropped = &fresh.units.0[0].replicas.0[0].description;
-    assert_eq!(dropped.state, 3);
+    assert_eq!(dropped.state, NativeReplicaState::Dropped);
     assert!(!dropped.up);
     assert_eq!(
         (dropped.id, dropped.instance),
@@ -685,7 +686,10 @@ async fn lfum_read_jobs_capture_each_committed_replica_without_advancing_runtime
         assert_eq!(info.service, state.body.service);
         assert!(!info.report_from_primary);
         assert!(!info.local_deleted);
-        assert_eq!(info.replicas.0[0].intermediate_role, 1);
+        assert_eq!(
+            info.replicas.0[0].intermediate_role,
+            NativeReplicaRole::None
+        );
         assert_eq!(info.replicas.0[0].description, state.body.replica);
         assert_eq!(
             executor
@@ -771,7 +775,7 @@ async fn lfum_reports_open_then_canonical_closed_replica_without_claiming_deleti
             id: 40,
             instance: 50,
             up: false,
-            state: 3,
+            state: NativeReplicaState::Dropped,
             ..Replica::default()
         }
     );
@@ -1466,7 +1470,7 @@ async fn local_stateful_idle_open_is_commit_gated_and_cannot_enable_primary_or_n
     request.service.partitions = 1;
     request.service.target = 1;
     request.service.minimum = 1;
-    request.replica.current_role = 2;
+    request.replica.current_role = NativeReplicaRole::Idle;
     assert!(matches!(
         executor
             .submit(add(request.clone()))
@@ -1476,7 +1480,7 @@ async fn local_stateful_idle_open_is_commit_gated_and_cannot_enable_primary_or_n
         Err(Failure::Unsupported(_))
     ));
     let mut primary = request.clone();
-    primary.replica.current_role = 4;
+    primary.replica.current_role = NativeReplicaRole::Primary;
     assert!(matches!(
         executor
             .submit(Command::OpenLocalStateful(Box::new(primary)))
@@ -1504,7 +1508,7 @@ async fn local_stateful_idle_open_is_commit_gated_and_cannot_enable_primary_or_n
     result.replica.service_endpoint.clear();
     result.replica.replication_endpoint = "127.0.0.1:12345".into();
     let mut forged = result.clone();
-    forged.replica.current_role = 4;
+    forged.replica.current_role = NativeReplicaRole::Primary;
     assert_eq!(
         executor
             .submit(Command::CompleteOpen(Box::new(forged)))
@@ -1539,7 +1543,7 @@ async fn local_stateful_idle_open_is_commit_gated_and_cannot_enable_primary_or_n
     let state = executor.snapshot([1; 16]).committed.unwrap();
     assert_eq!(
         (state.body.replica.current_role, state.body.replica.state),
-        (2, 1)
+        (NativeReplicaRole::Idle, NativeReplicaState::InBuild)
     );
     assert_eq!(state.phase, Phase::Ready);
     assert!(matches!(
@@ -1647,7 +1651,7 @@ async fn local_initial_primary_requires_exact_committed_bootstrap_and_cannot_pro
     request.service.partitions = 1;
     request.service.target = 1;
     request.service.minimum = 1;
-    request.replica.current_role = 4;
+    request.replica.current_role = NativeReplicaRole::Primary;
     request.unit.current.configuration = (1 << 32) + 5;
     let mut previous = request.clone();
     previous.unit.previous = request.unit.current;
@@ -1702,7 +1706,7 @@ async fn local_initial_primary_requires_exact_committed_bootstrap_and_cannot_pro
             1 => event.replica.id -= 1,
             2 => event.replica.instance -= 1,
             3 => event.unit.current.configuration += 1,
-            4 => event.replica.current_role = 2,
+            4 => event.replica.current_role = NativeReplicaRole::Idle,
             _ => event.replica.up = false,
         }
         assert_eq!(
@@ -1720,7 +1724,7 @@ async fn local_initial_primary_requires_exact_committed_bootstrap_and_cannot_pro
         match invalid {
             0 => event.replica.service_endpoint.clear(),
             1 => event.replica.replication_endpoint.clear(),
-            2 => event.replica.state = 2,
+            2 => event.replica.state = NativeReplicaState::Ready,
             _ => event.error = PROXY_STATE_CHANGED_ON_DATA_LOSS,
         }
         assert!(matches!(
@@ -1752,7 +1756,7 @@ async fn local_initial_primary_requires_exact_committed_bootstrap_and_cannot_pro
     let opened = executor.snapshot([1; 16]).committed.unwrap();
     assert_eq!(
         (opened.body.replica.current_role, opened.body.replica.state),
-        (4, 2)
+        (NativeReplicaRole::Primary, NativeReplicaState::Ready)
     );
     assert_eq!(
         opened.body.replica.service_endpoint,
@@ -1763,7 +1767,7 @@ async fn local_initial_primary_requires_exact_committed_bootstrap_and_cannot_pro
         [Effect::LocalStatefulOpenReply(_)]
     ));
     let mut idle = request.clone();
-    idle.replica.current_role = 2;
+    idle.replica.current_role = NativeReplicaRole::Idle;
     assert!(matches!(
         executor
             .submit(Command::OpenLocalStateful(Box::new(idle)))
@@ -1825,7 +1829,7 @@ async fn local_initial_primary_requires_exact_committed_bootstrap_and_cannot_pro
         error: 0,
     };
     let mut wrong_role = closed.clone();
-    wrong_role.replica.current_role = 2;
+    wrong_role.replica.current_role = NativeReplicaRole::Idle;
     assert_eq!(
         executor
             .submit(Command::CompleteClose(Box::new(wrong_role)))
@@ -1906,7 +1910,7 @@ async fn fm_add_primary_preserves_native_commit_retry_reply_and_closed_stale_sem
     request.service.partitions = 1;
     request.service.target = 1;
     request.service.minimum = 1;
-    request.replica.current_role = 4;
+    request.replica.current_role = NativeReplicaRole::Primary;
     request.unit.current.configuration = (1 << 32) + 5;
     let mut generation = admission().generation;
     generation.generation -= 1;
@@ -1993,7 +1997,7 @@ async fn fm_add_primary_preserves_native_commit_retry_reply_and_closed_stale_sem
     let mut reply = complete(&normalized, accepted.id);
     reply.replica.replication_endpoint = "127.0.0.1:12345".into();
     let mut forged = reply.clone();
-    forged.replica.current_role = 2;
+    forged.replica.current_role = NativeReplicaRole::Idle;
     assert_eq!(
         executor
             .submit(Command::CompleteOpen(Box::new(forged)))
@@ -2022,7 +2026,7 @@ async fn fm_add_primary_preserves_native_commit_retry_reply_and_closed_stale_sem
     let ready = executor.snapshot([1; 16]).committed.unwrap();
     assert_eq!(
         (ready.body.replica.current_role, ready.body.replica.state),
-        (4, 2)
+        (NativeReplicaRole::Primary, NativeReplicaState::Ready)
     );
     assert_eq!(ready.primary_deactivation, Some((request.unit.current, 0)));
     // Native Ready duplicate replies from the existing FT, not the new request epoch.
@@ -2118,7 +2122,7 @@ async fn fm_add_primary_unknown_completion_holds_original_reply_and_duplicate_un
     request.service.partitions = 1;
     request.service.target = 1;
     request.service.minimum = 1;
-    request.replica.current_role = 4;
+    request.replica.current_role = NativeReplicaRole::Primary;
     let accepted = executor.submit(primary_add(request.clone())).unwrap();
     accepted.wait(WAIT).await.unwrap();
     effects(&executor);
@@ -2789,7 +2793,7 @@ fn peer_source() -> NodeInstance {
 }
 fn peer_request() -> CreateReplica {
     let mut request = primary_body();
-    request.replica.current_role = 2;
+    request.replica.current_role = NativeReplicaRole::Idle;
     let epoch = request.unit.current;
     CreateReplica::new(
         request,
@@ -2882,7 +2886,10 @@ async fn fresh_spare_open_requires_compatible_primary_history_and_its_own_commit
                 effects(&executor).as_slice(),
                 [Effect::PeerCreateReplicaReply { .. }]
             ));
-            assert_eq!(state(&executor).body.replica.current_role, 2);
+            assert_eq!(
+                state(&executor).body.replica.current_role,
+                NativeReplicaRole::Idle
+            );
             assert!(state(&executor).reconfiguration.is_none());
             let mut changed = request.clone();
             changed.deactivation.catchup_lsn += 1;
@@ -3026,7 +3033,7 @@ async fn peer_idle_open_reply_waits_for_both_commits_and_preserves_original_send
     };
     assert_eq!(
         (reply.replica.current_role, reply.replica.state, reply.error),
-        (2, 1, 0)
+        (NativeReplicaRole::Idle, NativeReplicaState::InBuild, 0)
     );
     assert!(reply.replica.service_endpoint.is_empty());
     assert!(!reply.replica.replication_endpoint.is_empty());
@@ -3107,8 +3114,14 @@ async fn peer_idle_failed_or_unknown_open_commit_cannot_publish_reply_or_reopen(
             .iter()
             .all(|effect| matches!(effect, Effect::PeerCreateReplicaReply { .. })));
         assert_eq!(effects.len(), if fail { 1 } else { 2 });
-        assert_eq!(state(&executor).body.replica.current_role, 2);
-        assert_eq!(state(&executor).body.replica.state, 1);
+        assert_eq!(
+            state(&executor).body.replica.current_role,
+            NativeReplicaRole::Idle
+        );
+        assert_eq!(
+            state(&executor).body.replica.state,
+            NativeReplicaState::InBuild
+        );
         assert_eq!(hooks.calls.load(Ordering::SeqCst), if fail { 3 } else { 2 });
         finish(&store, &executor).await;
     }
@@ -3210,7 +3223,7 @@ async fn opened_peer_host_loss_uses_down_stage_and_native_closed_metadata_ack_wi
                 node: original.body.replica.node.clone(),
                 id: original.body.replica.id,
                 instance: original.body.replica.instance,
-                state: 3,
+                state: NativeReplicaState::Dropped,
                 up: false,
                 ..Replica::default()
             }
@@ -3817,7 +3830,7 @@ async fn peer_opened_close_drop_and_abort_report_only_after_success_and_ack_only
                     node: original.body.replica.node.clone(),
                     id: original.body.replica.id,
                     instance: original.body.replica.instance,
-                    state: 3,
+                    state: NativeReplicaState::Dropped,
                     up: false,
                     ..Replica::default()
                 }
@@ -3834,7 +3847,7 @@ async fn peer_opened_close_drop_and_abort_report_only_after_success_and_ack_only
                     1 => info.replicas.0[0].description.instance -= 1,
                     2 => info.unit.current.configuration -= 1,
                     3 => info.replicas.0[0].description.node.instance += 1,
-                    _ => info.replicas.0[0].description.state = 2,
+                    _ => info.replicas.0[0].description.state = NativeReplicaState::Ready,
                 }
                 assert_eq!(
                     run(&executor, ack(invalid, in_dropped)).await,
@@ -4172,18 +4185,18 @@ async fn peer_drop_and_abort_ack_requires_dropped_state_before_first_retry() {
                         node: closed.body.replica.node.clone(),
                         id: closed.body.replica.id,
                         instance: closed.body.replica.instance,
-                        state: 3,
+                        state: NativeReplicaState::Dropped,
                         up: false,
                         ..Replica::default()
                     },
-                    intermediate_role: 1,
+                    intermediate_role: NativeReplicaRole::None,
                 }]),
                 ..FailoverUnitInfo::default()
             }]),
             ..ReplicaUp::default()
         };
         let mut stale = report.clone();
-        stale.dropped.0[0].replicas.0[0].description.state = 2;
+        stale.dropped.0[0].replicas.0[0].description.state = NativeReplicaState::Ready;
         assert_eq!(
             run(&executor, ack(stale, in_dropped)).await,
             Disposition::IgnoredStale
@@ -4432,7 +4445,7 @@ async fn fm_peer_idle_delete_uses_stateful_reply_and_retains_original_deleted_to
     run(&executor, primary_delete(incoming, false)).await;
     assert!(
         matches!(effects(&executor).as_slice(), [Effect::Close { flags: 8, body, .. }]
-        if body.replica.current_role == 2 && body.replica.state == 3
+        if body.replica.current_role == NativeReplicaRole::Idle && body.replica.state == NativeReplicaState::Dropped
             && body.replica.replication_endpoint == original.body.replica.replication_endpoint)
     );
     assert!(state(&executor).local_deleted && state(&executor).usage.is_some());
@@ -4448,7 +4461,7 @@ async fn fm_peer_idle_delete_uses_stateful_reply_and_retains_original_deleted_to
         id: request.replica.0.replica.id,
         instance: request.replica.0.replica.instance,
         up: false,
-        state: 3,
+        state: NativeReplicaState::Dropped,
         ..Replica::default()
     };
     assert!(matches!(actions.as_slice(), [
@@ -4587,7 +4600,7 @@ async fn fm_delete_before_peer_create_retains_native_absent_tombstone_without_op
             id: request.replica.0.replica.id,
             instance: request.replica.0.replica.instance,
             up: false,
-            state: 3,
+            state: NativeReplicaState::Dropped,
             ..Replica::default()
         },
         error: 0,
@@ -4992,7 +5005,7 @@ async fn fail_peer_registration(executor: &Executor, request: &CreateReplica, er
     assert!(
         matches!(actions.as_slice(), [Effect::Health(HealthEvent::Close),
         Effect::PeerCreateReplicaReply { body, .. }, Effect::StatefulClosePending { .. }]
-        if body.error == error && body.replica.state == 1)
+        if body.error == error && body.replica.state == NativeReplicaState::InBuild)
     );
     assert_eq!(state(executor).failed_registration_error(), Some(error));
 }
@@ -5011,8 +5024,8 @@ async fn failed_peer_registration_delete_preserves_error_and_drains_late_acquisi
         run(&executor, primary_delete(request.replica.0.clone(), false)).await;
         assert!(
             matches!(effects(&executor).as_slice(), [Effect::DeleteReplicaReply(reply)]
-            if reply.unit == failed.body.unit && reply.replica.current_role == 1
-                && reply.replica.state == 3 && !reply.replica.up)
+            if reply.unit == failed.body.unit && reply.replica.current_role == NativeReplicaRole::None
+                && reply.replica.state == NativeReplicaState::Dropped && !reply.replica.up)
         );
         assert!(state(&executor).local_deleted && state(&executor).cleanup_pending);
         assert_eq!(state(&executor).close_token, 0);
@@ -5161,7 +5174,7 @@ async fn runtime_open_failure_has_distinct_delete_origin_and_host_loss_does_not(
                         node: request.replica.0.replica.node.clone(),
                         id: request.replica.0.replica.id,
                         instance: request.replica.0.replica.instance,
-                        state: 3, up: false, ..Replica::default()
+                        state: NativeReplicaState::Dropped, up: false, ..Replica::default()
                     }),
                     "{actions:?}"
                 );
@@ -5289,7 +5302,7 @@ async fn fm_pre_registration_peer_delete_drains_late_lookup_without_rap_or_absen
     assert!(
         matches!(actions.as_slice(), [Effect::Health(HealthEvent::Close), Effect::DeleteReplicaReply(reply)]
         if reply.unit == opening.body.unit && reply.unit.target == 1
-            && reply.replica.current_role == 1 && reply.replica.state == 3 && !reply.replica.up)
+            && reply.replica.current_role == NativeReplicaRole::None && reply.replica.state == NativeReplicaState::Dropped && !reply.replica.up)
     );
     let closed = state(&executor);
     assert_eq!(closed.phase, Phase::Closed);
@@ -5447,8 +5460,8 @@ async fn fm_registered_peer_idle_delete_drains_open_without_publishing_creation(
         Effect::Health(HealthEvent::Close), Effect::DeleteReplicaReply(reply)
     ] if reply.replica.id == request.replica.0.replica.id
         && reply.replica.instance == request.replica.0.replica.instance
-        && reply.replica.current_role == 1 && reply.replica.previous_role == 1
-        && reply.replica.state == 3 && !reply.replica.up
+        && reply.replica.current_role == NativeReplicaRole::None && reply.replica.previous_role == NativeReplicaRole::None
+        && reply.replica.state == NativeReplicaState::Dropped && !reply.replica.up
         && reply.replica.replication_endpoint.is_empty()));
     assert_eq!(state(&executor).fm_stage, FmStage::None);
     assert!(state(&executor).cleanup_pending && state(&executor).usage.is_none());
@@ -5531,7 +5544,7 @@ async fn fm_peer_idle_delete_and_close_commit_barriers_fence_reply_and_usage_rel
                 } else {
                     assert!(
                         matches!(effects(&executor).as_slice(), [Effect::Close { flags: 8, body, .. }]
-                        if body.replica.current_role == 2 && body.replica.state == 3)
+                        if body.replica.current_role == NativeReplicaRole::Idle && body.replica.state == NativeReplicaState::Dropped)
                     );
                     assert!(state(&executor).usage.is_some());
                 }
@@ -5587,7 +5600,7 @@ async fn peer_creation_rejects_unbound_foreign_primary_and_persisted_requests() 
         },
         peer_create({
             let mut value = request.clone();
-            value.replica.0.replica.current_role = 4;
+            value.replica.0.replica.current_role = NativeReplicaRole::Primary;
             value
         }),
         peer_create({
@@ -5726,8 +5739,8 @@ async fn primary_peer_open_observation_never_builds_or_changes_quorum_and_close_
         node: peer_source(),
         id: 41,
         instance: 51,
-        current_role: 2,
-        state: 1,
+        current_role: NativeReplicaRole::Idle,
+        state: NativeReplicaState::InBuild,
         version: primary.body.service.version.clone(),
         ..Replica::default()
     };
@@ -5817,8 +5830,8 @@ async fn opened_peer_primary() -> (Store, Executor, CreateReplicaReply) {
     replica.node = peer_source();
     replica.id += 1;
     replica.instance += 1;
-    replica.current_role = 2;
-    replica.state = 1;
+    replica.current_role = NativeReplicaRole::Idle;
+    replica.state = NativeReplicaState::InBuild;
     replica.service_endpoint.clear();
     replica.replication_endpoint.clear();
     run(
@@ -5961,7 +5974,7 @@ async fn peer_build_is_explicit_correlated_and_never_grants_membership() {
             .unwrap()
             .replica
             .state,
-        1
+        NativeReplicaState::InBuild
     );
     assert_eq!(run(&executor, build()).await, Disposition::IgnoredStale);
     assert_eq!(
@@ -6089,7 +6102,7 @@ async fn peer_idle_removal_is_terminal_for_unbuilt_pending_successful_and_failed
         run(&executor, remove()).await;
         let first = effects(&executor);
         let mut dropped = remote.replica.clone();
-        dropped.state = 3;
+        dropped.state = NativeReplicaState::Dropped;
         assert!(
             matches!(&first[..], [Effect::RemoveIdle { body, replica, registration }]
             if body == &primary.body && **replica == dropped
@@ -6244,7 +6257,7 @@ async fn primary_close_fences_pending_idle_removal_without_claiming_remote_dispo
     .await;
     effects(&executor);
     let mut replica = remote.replica;
-    replica.state = 3;
+    replica.state = NativeReplicaState::Dropped;
     let completion = RemovalCompletion {
         unit: primary.body.unit.clone(),
         local: primary.body.replica.clone(),
@@ -6277,8 +6290,8 @@ fn fm_idle_request(primary: &EntityState) -> AddReplica {
     body.replica.node = peer_source();
     body.replica.id += 1;
     body.replica.instance += 1;
-    body.replica.current_role = 2;
-    body.replica.state = 1;
+    body.replica.current_role = NativeReplicaRole::Idle;
+    body.replica.state = NativeReplicaState::InBuild;
     body.replica.service_endpoint.clear();
     body.replica.replication_endpoint.clear();
     body
@@ -6313,13 +6326,13 @@ fn secondary_configuration(primary: &AddInstance, secondary: &Replica) -> Config
     service.target = 2;
     service.update_version += 1;
     let mut p = primary.replica.clone();
-    p.current_role = 4;
-    p.previous_role = 4;
-    p.state = 2;
+    p.current_role = NativeReplicaRole::Primary;
+    p.previous_role = NativeReplicaRole::Primary;
+    p.state = NativeReplicaState::Ready;
     let mut s = secondary.clone();
-    s.current_role = 3;
-    s.previous_role = 2;
-    s.state = 2;
+    s.current_role = NativeReplicaRole::Secondary;
+    s.previous_role = NativeReplicaRole::Idle;
+    s.state = NativeReplicaState::Ready;
     Configuration {
         unit,
         service,
@@ -6491,9 +6504,9 @@ async fn built_three_idles(executor: &Executor) -> Configuration {
     config.service.target = 3;
     config.service.minimum = 2;
     let mut secondary = opened[1].clone();
-    secondary.previous_role = 2;
-    secondary.current_role = 3;
-    secondary.state = 2;
+    secondary.previous_role = NativeReplicaRole::Idle;
+    secondary.current_role = NativeReplicaRole::Secondary;
+    secondary.state = NativeReplicaState::Ready;
     config.replicas.0.push(secondary);
     config
 }
@@ -6557,12 +6570,12 @@ fn failover_from_configuration(active: &Configuration, candidate: &NodeInstance)
     config.unit.current.configuration += 0x1_0000_0001;
     for r in &mut config.replicas.0 {
         r.previous_role = r.current_role;
-        if r.current_role == 4 {
-            r.current_role = 3;
-            r.state = 3;
+        if r.current_role == NativeReplicaRole::Primary {
+            r.current_role = NativeReplicaRole::Secondary;
+            r.state = NativeReplicaState::Dropped;
             r.up = false;
         } else if &r.node == candidate {
-            r.current_role = 4;
+            r.current_role = NativeReplicaRole::Primary;
         }
         r.first_lsn = -1;
         r.last_lsn = -1;
@@ -6571,11 +6584,14 @@ fn failover_from_configuration(active: &Configuration, candidate: &NodeInstance)
         .replicas
         .0
         .iter()
-        .filter(|r| r.current_role >= 3)
+        .filter(|r| r.current_role.is_active())
         .count();
     for r in &mut config.replicas.0 {
-        if !r.up && r.current_role == 3 && count > config.unit.minimum as usize {
-            r.current_role = 1;
+        if !r.up
+            && r.current_role == NativeReplicaRole::Secondary
+            && count > config.unit.minimum as usize
+        {
+            r.current_role = NativeReplicaRole::None;
             count -= 1;
         }
     }
@@ -6614,7 +6630,7 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
             0 => bad.unit.current.data_loss += 1,
             1 => bad.replicas.0[0].up = true,
             2 => bad.replicas.0[2].id = bad.replicas.0[1].id,
-            _ => bad.replicas.0[2].current_role = 4,
+            _ => bad.replicas.0[2].current_role = NativeReplicaRole::Primary,
         }
         assert!(executor
             .submit(reconfigure(bad))
@@ -6694,7 +6710,7 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
             .replicas
             .0
             .iter()
-            .filter(|r| r.previous_role >= 3)
+            .filter(|r| r.previous_role.is_active())
             .count(),
         3
     );
@@ -6703,7 +6719,7 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
             .replicas
             .0
             .iter()
-            .filter(|r| r.current_role >= 3)
+            .filter(|r| r.current_role.is_active())
             .count(),
         2
     );
@@ -6747,7 +6763,7 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
                 id: intent.replicas.0[2].id,
                 instance: intent.replicas.0[2].instance,
                 up: false,
-                state: 3,
+                state: NativeReplicaState::Dropped,
                 ..Replica::default()
             },
             error: 0,
@@ -6770,7 +6786,7 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
     let mut unit = intent.unit.clone();
     unit.previous = Epoch::default();
     let mut remote = state(&executor).swap.as_ref().unwrap().body.replicas.0[2].clone();
-    remote.previous_role = 1;
+    remote.previous_role = NativeReplicaRole::None;
     run(
         &executor,
         Command::ActivateReply {
@@ -6796,7 +6812,7 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
     final_reply.wait(WAIT).await.unwrap();
     assert!(
         matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(reply)]
-        if reply.replicas.0.len() == 2 && reply.replicas.0.iter().all(|r| r.current_role >= 3 && r.previous_role == 1))
+        if reply.replicas.0.len() == 2 && reply.replicas.0.iter().all(|r| r.current_role.is_active() && r.previous_role == NativeReplicaRole::None))
     );
     assert_eq!(state(&executor).runtime, original.runtime);
     assert_eq!(state(&executor).usage, original.usage);
@@ -6809,9 +6825,9 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
     let mut target = intent.replicas.0[0].clone();
     target.id += 100;
     target.instance += 100;
-    target.previous_role = 1;
-    target.current_role = 2;
-    target.state = 1;
+    target.previous_role = NativeReplicaRole::None;
+    target.current_role = NativeReplicaRole::Idle;
+    target.state = NativeReplicaState::InBuild;
     target.up = true;
     target.service_endpoint.clear();
     target.replication_endpoint.clear();
@@ -6864,9 +6880,9 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
     for r in &mut repair.replicas.0 {
         r.previous_role = r.current_role;
     }
-    target.state = 2;
-    target.previous_role = 2;
-    target.current_role = 3;
+    target.state = NativeReplicaState::Ready;
+    target.previous_role = NativeReplicaRole::Idle;
+    target.current_role = NativeReplicaRole::Secondary;
     repair.replicas.0.push(target);
     let (entered, release) = hooks.pause(false);
     let work = executor.submit(reconfigure(repair.clone())).unwrap();
@@ -6898,7 +6914,7 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
                     id: survivor.id,
                     instance: survivor.instance,
                     up: false,
-                    state: 3,
+                    state: NativeReplicaState::Dropped,
                     ..Replica::default()
                 },
                 error: 0,
@@ -6920,11 +6936,16 @@ async fn failover_requires_both_progress_results_history_deactivation_and_final_
             .count(),
         2
     );
-    for remote in repair.replicas.0.iter().filter(|r| r.current_role == 3) {
+    for remote in repair
+        .replicas
+        .0
+        .iter()
+        .filter(|r| r.current_role == NativeReplicaRole::Secondary)
+    {
         let mut unit = repair.unit.clone();
         unit.previous = Epoch::default();
         let mut replica = remote.clone();
-        replica.previous_role = 1;
+        replica.previous_role = NativeReplicaRole::None;
         run(
             &executor,
             Command::ActivateReply {
@@ -7066,15 +7087,15 @@ async fn activating_configured_survivor_in_pool(
     open_peer_request(executor, peers.clone(), request).await;
     let original = state(executor);
     let mut local = original.body.replica.clone();
-    local.previous_role = 2;
-    local.current_role = 3;
-    local.state = 2;
+    local.previous_role = NativeReplicaRole::Idle;
+    local.current_role = NativeReplicaRole::Secondary;
+    local.state = NativeReplicaState::Ready;
     let mut primary = local.clone();
     primary.node = peer_source();
     primary.id += 1;
     primary.instance += 1;
-    primary.previous_role = 4;
-    primary.current_role = 4;
+    primary.previous_role = NativeReplicaRole::Primary;
+    primary.current_role = NativeReplicaRole::Primary;
     primary.replication_endpoint = "127.0.0.1:12346".into();
     let mut replicas = vec![primary, local];
     for (i, peer) in peers
@@ -7179,7 +7200,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
                 match invalid {
                     0 => bad.replicas.0[0].instance += 1,
                     1 => bad.replicas.0[0].up = true,
-                    2 => bad.replicas.0[0].state = 2,
+                    2 => bad.replicas.0[0].state = NativeReplicaState::Ready,
                     _ => bad.unit.current.configuration += 1,
                 }
                 assert!(executor
@@ -7210,7 +7231,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
             .replicas
             .0
             .iter()
-            .filter(|r| r.up && r.current_role == 3)
+            .filter(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
             .enumerate()
         {
             run(
@@ -7247,7 +7268,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
             .replicas
             .0
             .iter()
-            .filter(|r| r.up && r.current_role == 3)
+            .filter(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
         {
             let ack = Command::DeactivateReply {
                 source: remote.node.clone(),
@@ -7259,7 +7280,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
                         id: remote.id,
                         instance: remote.instance,
                         up: false,
-                        state: 3,
+                        state: NativeReplicaState::Dropped,
                         ..Replica::default()
                     },
                     error: 0,
@@ -7282,12 +7303,12 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
             .replicas
             .0
             .iter()
-            .filter(|r| r.up && r.current_role == 3)
+            .filter(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
         {
             let mut unit = intent.unit.clone();
             unit.previous = Epoch::default();
             let mut replica = remote.clone();
-            replica.previous_role = 1;
+            replica.previous_role = NativeReplicaRole::None;
             replica.first_lsn = 1;
             replica.last_lsn = 8;
             let ack = Command::ActivateReply {
@@ -7352,7 +7373,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
                 .iter()
                 .find(|r| r.node == peer_source())
                 .unwrap();
-            assert_eq!(retained.current_role, 3);
+            assert_eq!(retained.current_role, NativeReplicaRole::Secondary);
             assert!(!retained.up);
             assert_eq!(
                 retained.id,
@@ -7378,9 +7399,9 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
                 instance: 100 + (target - 2) as u64,
             };
         }
-        fresh.previous_role = 1;
-        fresh.current_role = 2;
-        fresh.state = 1;
+        fresh.previous_role = NativeReplicaRole::None;
+        fresh.current_role = NativeReplicaRole::Idle;
+        fresh.state = NativeReplicaState::InBuild;
         fresh.up = true;
         fresh.service_endpoint.clear();
         fresh.replication_endpoint.clear();
@@ -7433,7 +7454,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
             run(&executor, fm_remove_idle(build.clone())).await;
             let removal = effects(&executor);
             let mut dropped = fresh.clone();
-            dropped.state = 3;
+            dropped.state = NativeReplicaState::Dropped;
             assert!(
                 matches!(removal.as_slice(), [Effect::RemoveIdle { replica, .. }]
                 if **replica == dropped)
@@ -7454,7 +7475,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
                     .unwrap()
                     .description
                     .state,
-                1
+                NativeReplicaState::InBuild
             );
             assert_eq!(
                 run(
@@ -7509,13 +7530,13 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
             for r in &mut premature.replicas.0 {
                 r.previous_role = r.current_role;
                 if !r.up {
-                    r.current_role = 1;
+                    r.current_role = NativeReplicaRole::None;
                 }
             }
             let mut replica = fresh.clone();
-            replica.previous_role = 2;
-            replica.current_role = 3;
-            replica.state = 2;
+            replica.previous_role = NativeReplicaRole::Idle;
+            replica.current_role = NativeReplicaRole::Secondary;
+            replica.state = NativeReplicaState::Ready;
             premature.replicas.0.push(replica);
             let before = state(&executor);
             assert!(executor
@@ -7548,12 +7569,12 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
         for r in &mut repair.replicas.0 {
             r.previous_role = r.current_role;
             if !r.up {
-                r.current_role = 1;
+                r.current_role = NativeReplicaRole::None;
             }
         }
-        fresh.previous_role = 2;
-        fresh.current_role = 3;
-        fresh.state = 2;
+        fresh.previous_role = NativeReplicaRole::Idle;
+        fresh.current_role = NativeReplicaRole::Secondary;
+        fresh.state = NativeReplicaState::Ready;
         repair.replicas.0.push(fresh.clone());
         for kind in 0..4 {
             let mut bad = repair.clone();
@@ -7585,7 +7606,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.previous_role >= 3)
+                .filter(|r| r.previous_role.is_active())
                 .count(),
             if target == minimum {
                 target as usize
@@ -7600,7 +7621,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
             .replicas
             .0
             .iter()
-            .filter(|r| r.previous_role == 3 && r.up)
+            .filter(|r| r.previous_role == NativeReplicaRole::Secondary && r.up)
         {
             assert!(!actions
                 .iter()
@@ -7615,7 +7636,7 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
                         id: remote.id,
                         instance: remote.instance,
                         up: false,
-                        state: 3,
+                        state: NativeReplicaState::Dropped,
                         ..Replica::default()
                     },
                     error: 0,
@@ -7656,11 +7677,16 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
                 .count(),
             target as usize - 1
         );
-        for remote in repair.replicas.0.iter().filter(|r| r.current_role == 3) {
+        for remote in repair
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.current_role == NativeReplicaRole::Secondary)
+        {
             let mut unit = repair.unit.clone();
             unit.previous = Epoch::default();
             let mut replica = remote.clone();
-            replica.previous_role = 1;
+            replica.previous_role = NativeReplicaRole::None;
             let before = state(&executor)
                 .reconfiguration
                 .as_ref()
@@ -7714,10 +7740,10 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
         let mut stable = repair.clone();
         stable.unit.previous = Epoch::default();
         if spare {
-            stable.replicas.0.retain(|r| r.current_role >= 3);
+            stable.replicas.0.retain(|r| r.current_role.is_active());
         }
         for replica in &mut stable.replicas.0 {
-            replica.previous_role = 1;
+            replica.previous_role = NativeReplicaRole::None;
         }
         capture_committed_lfum(&executor, &stable, Epoch::default(), true).await;
         assert_eq!(frozen_failover.units.0[0].unit, intent.unit);
@@ -7762,15 +7788,15 @@ async fn configured_failover_and_supported_repair_track_every_survivor_and_commi
             for r in &mut next.replicas.0 {
                 r.previous_role = r.current_role;
                 if r.node == fresh.node {
-                    r.current_role = 1;
-                    r.state = 3;
+                    r.current_role = NativeReplicaRole::None;
+                    r.state = NativeReplicaState::Dropped;
                     r.up = false;
                 }
             }
             let mut replica = opened.replica.clone();
-            replica.previous_role = 2;
-            replica.current_role = 3;
-            replica.state = 2;
+            replica.previous_role = NativeReplicaRole::Idle;
+            replica.current_role = NativeReplicaRole::Secondary;
+            replica.state = NativeReplicaState::Ready;
             next.replicas.0.push(replica);
             let before = state(&executor);
             assert!(executor
@@ -7857,7 +7883,12 @@ async fn configured_failover_selects_history_before_lsn_and_redirects_without_pr
         if old_remote_history {
             history.epoch.configuration -= 0x1_0000_0000;
         }
-        for remote in intent.replicas.0.iter().filter(|r| r.current_role == 3) {
+        for remote in intent
+            .replicas
+            .0
+            .iter()
+            .filter(|r| r.current_role == NativeReplicaRole::Secondary)
+        {
             let (entered, release) = hooks.pause(false);
             let ticket = executor
                 .submit(failover_progress(
@@ -7890,7 +7921,10 @@ async fn configured_failover_selects_history_before_lsn_and_redirects_without_pr
                     change.replicas.0.iter().filter(|r| r.last_lsn >= 0).count(),
                     1
                 );
-                assert_eq!(state(&executor).body.replica.current_role, 3);
+                assert_eq!(
+                    state(&executor).body.replica.current_role,
+                    NativeReplicaRole::Secondary
+                );
                 assert_eq!(state(&executor).body.unit, intent.unit);
                 let mut expected = intent.clone();
                 for replica in &mut expected.replicas.0 {
@@ -7930,9 +7964,9 @@ async fn configured_failover_keeps_pc_and_cc_read_quorums_separate_and_waits_for
         let mut intent = failover_configuration(&original, &admission().local_node);
         for r in &mut intent.replicas.0[3..] {
             r.up = false;
-            r.state = 3;
+            r.state = NativeReplicaState::Dropped;
             if pc_only {
-                r.current_role = 1;
+                r.current_role = NativeReplicaRole::None;
             }
         }
         run(&executor, reconfigure(intent.clone())).await;
@@ -8086,7 +8120,12 @@ async fn redirected_candidate_rejoins_as_secondary_and_replays_activation_after_
     let local = status_completion(&effects(&executor));
     run(&executor, Command::CompleteStatus(Box::new(local))).await;
     effects(&executor);
-    for remote in intent.replicas.0.iter().filter(|r| r.current_role == 3) {
+    for remote in intent
+        .replicas
+        .0
+        .iter()
+        .filter(|r| r.current_role == NativeReplicaRole::Secondary)
+    {
         run(
             &executor,
             failover_progress(
@@ -8111,8 +8150,8 @@ async fn redirected_candidate_rejoins_as_secondary_and_replays_activation_after_
     let mut next = intent.clone();
     let primary = next.replicas.0[2].node.clone();
     next.unit.current.configuration += 0x1_0000_0001;
-    next.replicas.0[1].current_role = 3;
-    next.replicas.0[2].current_role = 4;
+    next.replicas.0[1].current_role = NativeReplicaRole::Secondary;
+    next.replicas.0[2].current_role = NativeReplicaRole::Primary;
     run(
         &executor,
         Command::GetLsn {
@@ -8180,7 +8219,10 @@ async fn redirected_candidate_rejoins_as_secondary_and_replays_activation_after_
     assert!(
         matches!(effects(&executor).as_slice(), [Effect::PeerActivateReply { target, .. }] if *target == primary)
     );
-    assert_eq!(state(&executor).body.replica.current_role, 3);
+    assert_eq!(
+        state(&executor).body.replica.current_role,
+        NativeReplicaRole::Secondary
+    );
     assert_eq!(state(&executor).runtime, original.runtime);
     finish(&store, &executor).await;
 }
@@ -8338,14 +8380,14 @@ async fn failover_survivor_get_lsn_and_ss_deactivate_wait_for_their_own_commits(
                     .replicas
                     .0
                     .iter()
-                    .find(|r| r.current_role == 1)
+                    .find(|r| r.current_role == NativeReplicaRole::None)
                     .unwrap()
                     .clone();
                 fresh.id += 100;
                 fresh.instance += 100;
-                fresh.previous_role = 2;
-                fresh.current_role = 3;
-                fresh.state = 2;
+                fresh.previous_role = NativeReplicaRole::Idle;
+                fresh.current_role = NativeReplicaRole::Secondary;
+                fresh.state = NativeReplicaState::Ready;
                 fresh.up = true;
                 fresh.service_endpoint.clear();
                 fresh.replication_endpoint = "127.0.0.1:12350".into();
@@ -8458,7 +8500,7 @@ async fn finish_same_primary_restoration(executor: &Executor, hooks: &Hooks, bod
         .replicas
         .0
         .iter()
-        .filter(|r| r.up && r.previous_role == 3)
+        .filter(|r| r.up && r.previous_role == NativeReplicaRole::Secondary)
     {
         run(
             executor,
@@ -8472,7 +8514,7 @@ async fn finish_same_primary_restoration(executor: &Executor, hooks: &Hooks, bod
                         id: r.id,
                         instance: r.instance,
                         up: false,
-                        state: 3,
+                        state: NativeReplicaState::Dropped,
                         ..Replica::default()
                     },
                     error: 0,
@@ -8487,12 +8529,12 @@ async fn finish_same_primary_restoration(executor: &Executor, hooks: &Hooks, bod
         .replicas
         .0
         .iter()
-        .filter(|r| r.up && r.current_role == 3)
+        .filter(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
     {
         let mut unit = body.unit.clone();
         unit.previous = Epoch::default();
         let mut replica = r.clone();
-        replica.previous_role = 1;
+        replica.previous_role = NativeReplicaRole::None;
         run(
             executor,
             Command::ActivateReply {
@@ -8562,9 +8604,9 @@ async fn removal_primary_loss_inventory(lfum: bool) {
                 r.previous_role = r.current_role;
             }
             let lost = removal.replicas.0.last_mut().unwrap();
-            lost.current_role = 1;
+            lost.current_role = NativeReplicaRole::None;
             lost.up = false;
-            lost.state = 3;
+            lost.state = NativeReplicaState::Dropped;
             let history = original
                 .peer_creation
                 .as_ref()
@@ -8612,9 +8654,12 @@ async fn removal_primary_loss_inventory(lfum: bool) {
             };
             if stage == 0 || stage == 3 {
                 removal_view.unit.previous = Epoch::default();
-                removal_view.replicas.0.retain(|r| r.current_role >= 3);
+                removal_view
+                    .replicas
+                    .0
+                    .retain(|r| r.current_role.is_active());
                 for r in &mut removal_view.replicas.0 {
-                    r.previous_role = 1;
+                    r.previous_role = NativeReplicaRole::None;
                 }
             }
             let removal_ic = if stage == 1 {
@@ -8633,12 +8678,12 @@ async fn removal_primary_loss_inventory(lfum: bool) {
             let mut intent = removal.clone();
             intent.unit.current.configuration += 0x1_0000_0001;
             for r in &mut intent.replicas.0 {
-                if r.current_role == 4 {
-                    r.current_role = 3;
+                if r.current_role == NativeReplicaRole::Primary {
+                    r.current_role = NativeReplicaRole::Secondary;
                     r.up = false;
-                    r.state = 3;
+                    r.state = NativeReplicaState::Dropped;
                 } else if r.node == admission().local_node {
-                    r.current_role = 4;
+                    r.current_role = NativeReplicaRole::Primary;
                 }
                 r.first_lsn = -1;
                 r.last_lsn = -1;
@@ -8647,8 +8692,8 @@ async fn removal_primary_loss_inventory(lfum: bool) {
                 let mut bad = intent.clone();
                 match invalid {
                     0 => bad.unit.previous = removal.unit.current,
-                    1 => bad.replicas.0[0].current_role = 1,
-                    2 => bad.replicas.0[2].previous_role = 1,
+                    1 => bad.replicas.0[0].current_role = NativeReplicaRole::None,
+                    2 => bad.replicas.0[2].previous_role = NativeReplicaRole::None,
                     3 => bad.replicas.0[2].instance += 1,
                     _ => bad.service.minimum -= 1,
                 }
@@ -8711,7 +8756,7 @@ async fn removal_primary_loss_inventory(lfum: bool) {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.up && r.current_role == 3)
+                .filter(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
             {
                 let mut progress = failover_progress(&intent, remote, history.clone(), 7);
                 if let Command::GetLsnReply { generation, .. } = &mut progress {
@@ -8785,7 +8830,7 @@ async fn removal_primary_loss_inventory(lfum: bool) {
                     .replicas
                     .0
                     .iter()
-                    .filter(|r| r.previous_role >= 3)
+                    .filter(|r| r.previous_role.is_active())
                     .count(),
                 target as usize
             );
@@ -8794,7 +8839,7 @@ async fn removal_primary_loss_inventory(lfum: bool) {
                     .replicas
                     .0
                     .iter()
-                    .filter(|r| r.current_role >= 3)
+                    .filter(|r| r.current_role.is_active())
                     .count(),
                 target as usize - 1
             );
@@ -8823,7 +8868,7 @@ async fn removal_primary_loss_inventory(lfum: bool) {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.up && r.current_role == 3)
+                .filter(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
             {
                 let (entered, release) = hooks.pause(false);
                 let ticket = executor
@@ -8839,7 +8884,7 @@ async fn removal_primary_loss_inventory(lfum: bool) {
                                 id: remote.id,
                                 instance: remote.instance,
                                 up: false,
-                                state: 3,
+                                state: NativeReplicaState::Dropped,
                                 ..Replica::default()
                             },
                             error: 0,
@@ -8857,12 +8902,12 @@ async fn removal_primary_loss_inventory(lfum: bool) {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.up && r.current_role == 3)
+                .filter(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
             {
                 let mut unit = intent.unit.clone();
                 unit.previous = Epoch::default();
                 let mut replica = remote.clone();
-                replica.previous_role = 1;
+                replica.previous_role = NativeReplicaRole::None;
                 replica.first_lsn = 1;
                 replica.last_lsn = 7;
                 run(
@@ -8919,9 +8964,9 @@ async fn removal_primary_loss_inventory(lfum: bool) {
             if lfum {
                 let mut complete = failover_view;
                 complete.unit.previous = Epoch::default();
-                complete.replicas.0.retain(|r| r.current_role >= 3);
+                complete.replicas.0.retain(|r| r.current_role.is_active());
                 for r in &mut complete.replicas.0 {
-                    r.previous_role = 1;
+                    r.previous_role = NativeReplicaRole::None;
                 }
                 if !fail {
                     let committed = wait_lfum(&executor).await;
@@ -8939,7 +8984,7 @@ async fn removal_primary_loss_inventory(lfum: bool) {
             for r in &mut removal.replicas.0 {
                 r.previous_role = r.current_role;
                 if !r.up {
-                    r.current_role = 1;
+                    r.current_role = NativeReplicaRole::None;
                 }
             }
             let ready_idle_first = target - 1 == minimum;
@@ -8959,10 +9004,10 @@ async fn removal_primary_loss_inventory(lfum: bool) {
                 let mut fresh = lost;
                 fresh.id += 1000;
                 fresh.instance += 1000;
-                fresh.previous_role = 1;
-                fresh.current_role = 2;
+                fresh.previous_role = NativeReplicaRole::None;
+                fresh.current_role = NativeReplicaRole::Idle;
                 fresh.up = true;
-                fresh.state = 1;
+                fresh.state = NativeReplicaState::InBuild;
                 fresh.service_endpoint.clear();
                 fresh.replication_endpoint.clear();
                 fresh.first_lsn = -1;
@@ -9010,18 +9055,18 @@ async fn removal_primary_loss_inventory(lfum: bool) {
                     effects(&executor).as_slice(),
                     [Effect::AddReplicaReply(_)]
                 ));
-                active.replicas.0.retain(|r| r.current_role >= 3);
+                active.replicas.0.retain(|r| r.current_role.is_active());
                 active.unit.previous = active.unit.current;
                 active.unit.current.configuration += 1;
                 for r in &mut active.replicas.0 {
                     r.previous_role = r.current_role;
                     if !r.up {
-                        r.current_role = 1;
+                        r.current_role = NativeReplicaRole::None;
                     }
                 }
-                fresh.previous_role = 2;
-                fresh.current_role = 3;
-                fresh.state = 2;
+                fresh.previous_role = NativeReplicaRole::Idle;
+                fresh.current_role = NativeReplicaRole::Secondary;
+                fresh.state = NativeReplicaState::Ready;
                 active.replicas.0.push(fresh);
                 let mut omitted = active.clone();
                 omitted.replicas.0.remove(0);
@@ -9094,9 +9139,9 @@ async fn removal_survivor_queries_retained_history_and_fences_old_activation() {
             r.previous_role = r.current_role;
         }
         let lost = removal.replicas.0.last_mut().unwrap();
-        lost.current_role = 1;
+        lost.current_role = NativeReplicaRole::None;
         lost.up = false;
-        lost.state = 3;
+        lost.state = NativeReplicaState::Dropped;
         let old_deactivate = || Command::Deactivate {
             source: peer_source(),
             generation: generation_header(admission().generation.generation),
@@ -9135,12 +9180,12 @@ async fn removal_survivor_queries_retained_history_and_fences_old_activation() {
         let mut intent = removal.clone();
         intent.unit.current.configuration += 0x1_0000_0001;
         for r in &mut intent.replicas.0 {
-            if r.current_role == 4 {
-                r.current_role = 3;
+            if r.current_role == NativeReplicaRole::Primary {
+                r.current_role = NativeReplicaRole::Secondary;
                 r.up = false;
-                r.state = 3;
+                r.state = NativeReplicaState::Dropped;
             } else if r.node == candidate {
-                r.current_role = 4;
+                r.current_role = NativeReplicaRole::Primary;
             }
             r.first_lsn = -1;
             r.last_lsn = -1;
@@ -9277,9 +9322,9 @@ async fn closed_secondary_replacement_from_promoted_primary_requires_exact_fresh
     let mut body = (*original.body).clone();
     body.unit.previous = Epoch::default();
     body.unit.current.configuration += 0x1_0000_0004;
-    body.replica.previous_role = 1;
-    body.replica.current_role = 2;
-    body.replica.state = 1;
+    body.replica.previous_role = NativeReplicaRole::None;
+    body.replica.current_role = NativeReplicaRole::Idle;
+    body.replica.state = NativeReplicaState::InBuild;
     body.replica.id += 1000;
     body.replica.instance += 1000;
     body.replica.service_endpoint.clear();
@@ -9361,8 +9406,8 @@ async fn completed_spare_replacement_starts_next_failover_from_committed_cc() {
                 r.previous_role = r.current_role;
             }
             let lost = replacement.replicas.0.last_mut().unwrap();
-            lost.current_role = 1;
-            lost.state = 3;
+            lost.current_role = NativeReplicaRole::None;
+            lost.state = NativeReplicaState::Dropped;
             lost.up = false;
             let retired = lost.clone();
             let mut fresh = retired.clone();
@@ -9372,10 +9417,10 @@ async fn completed_spare_replacement_starts_next_failover_from_committed_cc() {
             };
             fresh.id += 1000;
             fresh.instance += 1000;
-            fresh.previous_role = 2;
-            fresh.current_role = 3;
+            fresh.previous_role = NativeReplicaRole::Idle;
+            fresh.current_role = NativeReplicaRole::Secondary;
             fresh.up = true;
-            fresh.state = 2;
+            fresh.state = NativeReplicaState::Ready;
             fresh.replication_endpoint = "127.0.0.1:12350".into();
             replacement.replicas.0.push(fresh);
             let history = original
@@ -9479,8 +9524,8 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
             r.previous_role = r.current_role;
         }
         let lost = removal.replicas.0.last_mut().unwrap();
-        lost.current_role = 1;
-        lost.state = 3;
+        lost.current_role = NativeReplicaRole::None;
+        lost.state = NativeReplicaState::Dropped;
         lost.up = false;
         let lost = lost.clone();
         let history = original
@@ -9527,9 +9572,9 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
         fresh.id += 1000;
         fresh.instance += 1000;
         fresh.up = true;
-        fresh.previous_role = 2;
-        fresh.current_role = 3;
-        fresh.state = 2;
+        fresh.previous_role = NativeReplicaRole::Idle;
+        fresh.current_role = NativeReplicaRole::Secondary;
+        fresh.state = NativeReplicaState::Ready;
         fresh.replication_endpoint = "127.0.0.1:12350".into();
         if target == minimum {
             fresh.node.id = [90; 16];
@@ -9538,7 +9583,7 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
         let mut repair = removal.clone();
         repair.unit.previous = repair.unit.current;
         repair.unit.current.configuration += 1;
-        repair.replicas.0.retain(|r| r.current_role >= 3);
+        repair.replicas.0.retain(|r| r.current_role.is_active());
         for r in &mut repair.replicas.0 {
             r.previous_role = r.current_role;
         }
@@ -9598,9 +9643,9 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
             stable
                 .replicas
                 .0
-                .retain(|replica| replica.current_role >= 3);
+                .retain(|replica| replica.current_role.is_active());
             for replica in &mut stable.replicas.0 {
-                replica.previous_role = 1;
+                replica.previous_role = NativeReplicaRole::None;
             }
             capture_committed_lfum(&executor, &stable, Epoch::default(), false).await;
             assert!(matches!(
@@ -9638,7 +9683,7 @@ async fn secondary_loss_metadata_and_repair_preserve_history_and_each_applied_co
             queried
                 .replicas
                 .0
-                .retain(|replica| replica.current_role >= 3);
+                .retain(|replica| replica.current_role.is_active());
             for replica in &mut queried.replicas.0 {
                 replica.previous_role = replica.current_role;
             }
@@ -9696,7 +9741,7 @@ async fn replicated_lfum_waits_for_final_membership_commit_and_clears_all_lsn() 
             let mut unit = config.unit.clone();
             unit.previous = Epoch::default();
             let mut replica = replica.clone();
-            replica.previous_role = 1;
+            replica.previous_role = NativeReplicaRole::None;
             run(
                 &executor,
                 Command::ActivateReply {
@@ -9777,14 +9822,12 @@ async fn replicated_lfum_waits_for_final_membership_commit_and_clears_all_lsn() 
         assert_eq!(info.replicas.0.len(), 3);
         for replica in &config.replicas.0 {
             let mut expected = replica.clone();
-            expected.previous_role = 1;
+            expected.previous_role = NativeReplicaRole::None;
             expected.first_lsn = -1;
             expected.last_lsn = -1;
-            assert!(info
-                .replicas
-                .0
-                .iter()
-                .any(|r| r.description == expected && r.intermediate_role == 1));
+            assert!(info.replicas.0.iter().any(
+                |r| r.description == expected && r.intermediate_role == NativeReplicaRole::None
+            ));
         }
         assert_eq!(executor.lfum_inventory().unwrap(), Some(inventory.clone()));
         assert_eq!(state(&executor), committed);
@@ -9835,14 +9878,14 @@ async fn secondary_lfum_reports_full_committed_membership_without_primary_author
     assert_eq!(info.replicas.0.len(), 3);
     for replica in &before.reconfiguration.as_ref().unwrap().request.replicas.0 {
         let mut expected = replica.clone();
-        expected.previous_role = 1;
+        expected.previous_role = NativeReplicaRole::None;
         expected.first_lsn = -1;
         expected.last_lsn = -1;
         assert!(info
             .replicas
             .0
             .iter()
-            .any(|r| r.description == expected && r.intermediate_role == 1));
+            .any(|r| r.description == expected && r.intermediate_role == NativeReplicaRole::None));
     }
     assert_eq!(state(&executor), before);
     assert!(effects(&executor).is_empty());
@@ -9994,7 +10037,7 @@ fn assert_failover_lfum(
         description.first_lsn = -1;
         description.last_lsn = -1;
         let intermediate_role = if ic == Epoch::default() {
-            1
+            NativeReplicaRole::None
         } else {
             description.current_role
         };
@@ -10088,7 +10131,7 @@ async fn original_primary_failover_lfum_preserves_sf_phases_and_final_commit_bar
             .replicas
             .0
             .iter()
-            .find(|r| r.up && r.current_role == 3)
+            .find(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
             .unwrap();
         let mut progress = failover_progress(
             &intent,
@@ -10143,7 +10186,7 @@ async fn original_primary_failover_lfum_preserves_sf_phases_and_final_commit_bar
                         id: remote.id,
                         instance: remote.instance,
                         up: false,
-                        state: 3,
+                        state: NativeReplicaState::Dropped,
                         ..Replica::default()
                     },
                     error: 0,
@@ -10166,7 +10209,7 @@ async fn original_primary_failover_lfum_preserves_sf_phases_and_final_commit_bar
         let mut unit = intent.unit.clone();
         unit.previous = Epoch::default();
         let mut replica = remote.clone();
-        replica.previous_role = 1;
+        replica.previous_role = NativeReplicaRole::None;
         replica.first_lsn = 1;
         replica.last_lsn = 8;
         run(
@@ -10213,9 +10256,9 @@ async fn original_primary_failover_lfum_preserves_sf_phases_and_final_commit_bar
         }
         if !fail {
             expected.unit.previous = Epoch::default();
-            expected.replicas.0.retain(|r| r.current_role >= 3);
+            expected.replicas.0.retain(|r| r.current_role.is_active());
             for r in &mut expected.replicas.0 {
-                r.previous_role = 1;
+                r.previous_role = NativeReplicaRole::None;
             }
         }
         let inventory = wait_lfum(&executor).await;
@@ -10306,7 +10349,7 @@ async fn queried_failover_survivor_lfum_copies_old_cc_to_pc_and_clears_ic_on_act
             r.first_lsn = 1;
             r.last_lsn = 8;
         }
-        if r.current_role == 4 {
+        if r.current_role == NativeReplicaRole::Primary {
             r.service_endpoint = "127.0.0.1:12349".into();
         }
     }
@@ -10367,9 +10410,9 @@ async fn queried_failover_survivor_lfum_copies_old_cc_to_pc_and_clears_ic_on_act
     .await;
     effects(&executor);
     intent.unit.previous = Epoch::default();
-    intent.replicas.0.retain(|r| r.current_role >= 3);
+    intent.replicas.0.retain(|r| r.current_role.is_active());
     for r in &mut intent.replicas.0 {
-        r.previous_role = 1;
+        r.previous_role = NativeReplicaRole::None;
     }
     start_lfum(&executor, 11);
     assert_failover_lfum(
@@ -10544,7 +10587,7 @@ async fn initial_idle_build_lfum_preserves_sf_states_and_allows_normal_removal_b
     )
     .await;
     assert!(
-        matches!(effects(&executor).as_slice(), [Effect::AddReplicaReply(body)] if body.replica.state == 2)
+        matches!(effects(&executor).as_slice(), [Effect::AddReplicaReply(body)] if body.replica.state == NativeReplicaState::Ready)
     );
     assert_eq!(executor.lfum_inventory().unwrap(), Some(building));
     assert!(!executor
@@ -10557,14 +10600,14 @@ async fn initial_idle_build_lfum_preserves_sf_states_and_allows_normal_removal_b
     begin(10);
     let ready = wait_lfum(&executor).await;
     let mut expected = opened.replica;
-    expected.state = 2;
+    expected.state = NativeReplicaState::Ready;
     assert_eq!(ready.units.0[0].replicas.0[1].description, expected);
     assert_eq!(ready.units.0[0].intermediate, Epoch::default());
     assert!(ready.units.0[0]
         .replicas
         .0
         .iter()
-        .all(|r| r.intermediate_role == 1
+        .all(|r| r.intermediate_role == NativeReplicaRole::None
             && r.description.first_lsn == -1
             && r.description.last_lsn == -1));
     assert_eq!(state(&executor).open_token, primary.open_token);
@@ -10589,8 +10632,14 @@ async fn initial_idle_build_lfum_preserves_sf_states_and_allows_normal_removal_b
         .unwrap();
     begin(11);
     let dropping = wait_lfum(&executor).await;
-    assert_eq!(dropping.units.0[0].replicas.0[1].description.state, 3);
-    assert_eq!(ready.units.0[0].replicas.0[1].description.state, 2);
+    assert_eq!(
+        dropping.units.0[0].replicas.0[1].description.state,
+        NativeReplicaState::Dropped
+    );
+    assert_eq!(
+        ready.units.0[0].replicas.0[1].description.state,
+        NativeReplicaState::Ready
+    );
     run(
         &executor,
         Command::CompleteRemoval(Box::new(BuildCompletion {
@@ -10663,7 +10712,7 @@ async fn configured_idle_delete_keeps_lfum_and_failed_or_unknown_close_commits_s
             if *token == closing.close_token && body.unit == original.body.unit
                 && body.replica.id == original.body.replica.id
                 && body.replica.instance == original.body.replica.instance
-                && body.replica.state == 3 && Some(registration) == original.runtime.as_ref()));
+                && body.replica.state == NativeReplicaState::Dropped && Some(registration) == original.runtime.as_ref()));
         assert_eq!(closing.runtime, original.runtime);
         assert!(executor
             .complete_lfum_upload(frozen.upload, &admission().fm_source, &generation_header(8))
@@ -10700,7 +10749,10 @@ async fn configured_idle_delete_keeps_lfum_and_failed_or_unknown_close_commits_s
             .any(|e| matches!(e, Effect::DeleteReplicaReply(r) if r.error == 0)));
         start_lfum(&executor, 10);
         assert!(wait_lfum(&executor).await.units.0.is_empty());
-        assert_eq!(frozen.units.0[0].replicas.0[0].description.state, 1);
+        assert_eq!(
+            frozen.units.0[0].replicas.0[0].description.state,
+            NativeReplicaState::InBuild
+        );
         finish(&store, &executor).await;
     }
 }
@@ -10758,9 +10810,18 @@ async fn initial_idle_lfum_reads_wait_for_private_open_and_never_promote_the_idl
             info.replicas.0[0].description,
             state(&executor).body.replica
         );
-        assert_eq!(info.replicas.0[0].description.current_role, 2);
-        assert_eq!(info.replicas.0[0].description.state, 1);
-        assert_eq!(info.replicas.0[0].intermediate_role, 1);
+        assert_eq!(
+            info.replicas.0[0].description.current_role,
+            NativeReplicaRole::Idle
+        );
+        assert_eq!(
+            info.replicas.0[0].description.state,
+            NativeReplicaState::InBuild
+        );
+        assert_eq!(
+            info.replicas.0[0].intermediate_role,
+            NativeReplicaRole::None
+        );
         assert_eq!(state(&executor).open_token, before.open_token);
         if fail {
             assert_eq!(state(&executor), before);
@@ -10795,8 +10856,11 @@ async fn initial_membership_lfum_reports_sf_phase_epochs_and_continues_before_up
     assert_eq!(catchup_inventory.units.0[0].unit, config.unit);
     assert_eq!(catchup_inventory.units.0[0].intermediate, Epoch::default());
     for replica in &catchup_inventory.units.0[0].replicas.0 {
-        assert_eq!(replica.intermediate_role, 1);
-        assert!(matches!(replica.description.previous_role, 2 | 4));
+        assert_eq!(replica.intermediate_role, NativeReplicaRole::None);
+        assert!(matches!(
+            replica.description.previous_role,
+            NativeReplicaRole::Idle | NativeReplicaRole::Primary
+        ));
         assert_eq!(
             (replica.description.first_lsn, replica.description.last_lsn),
             (-1, -1)
@@ -10850,7 +10914,7 @@ async fn initial_membership_lfum_reports_sf_phase_epochs_and_continues_before_up
         let mut unit = config.unit.clone();
         unit.previous = Epoch::default();
         let mut replica = replica.clone();
-        replica.previous_role = 1;
+        replica.previous_role = NativeReplicaRole::None;
         run(
             &executor,
             Command::ActivateReply {
@@ -10895,7 +10959,8 @@ async fn initial_membership_lfum_reports_sf_phase_epochs_and_continues_before_up
         .replicas
         .0
         .iter()
-        .all(|r| r.description.previous_role == 1 && r.intermediate_role == 1));
+        .all(|r| r.description.previous_role == NativeReplicaRole::None
+            && r.intermediate_role == NativeReplicaRole::None));
     assert_eq!(catchup_inventory.units.0[0].intermediate, Epoch::default());
     assert_eq!(state(&executor).runtime, original.runtime);
     assert_eq!(state(&executor).usage, original.usage);
@@ -10938,7 +11003,7 @@ async fn activating_secondary_lfum_retains_pc_but_not_ic_until_its_rap_commit() 
         .replicas
         .0
         .iter()
-        .all(|r| r.intermediate_role == 1));
+        .all(|r| r.intermediate_role == NativeReplicaRole::None));
     assert_eq!(
         executor.take_lfum_inventory().unwrap(),
         Some(inventory.clone())
@@ -10963,7 +11028,8 @@ async fn activating_secondary_lfum_retains_pc_but_not_ic_until_its_rap_commit() 
         .replicas
         .0
         .iter()
-        .all(|r| r.description.previous_role == 1 && r.intermediate_role == 1));
+        .all(|r| r.description.previous_role == NativeReplicaRole::None
+            && r.intermediate_role == NativeReplicaRole::None));
     assert_ne!(completed.units, inventory.units);
     assert_eq!(state(&executor).runtime, before.runtime);
     assert_eq!(state(&executor).usage, before.usage);
@@ -10989,7 +11055,7 @@ async fn configured_initial_membership_preserves_sizes_and_waits_for_every_activ
         make_ready(&executor, &request).await;
         let original = state(&executor);
         let mut replicas = vec![original.body.replica.clone()];
-        replicas[0].previous_role = 4;
+        replicas[0].previous_role = NativeReplicaRole::Primary;
         for (i, peer) in peers.iter().enumerate() {
             let mut add = fm_idle_request(&original);
             add.replica.node = peer.clone();
@@ -11031,9 +11097,9 @@ async fn configured_initial_membership_preserves_sizes_and_waits_for_every_activ
                 effects(&executor).as_slice(),
                 [Effect::AddReplicaReply(_)]
             ));
-            opened.replica.previous_role = 2;
-            opened.replica.current_role = 3;
-            opened.replica.state = 2;
+            opened.replica.previous_role = NativeReplicaRole::Idle;
+            opened.replica.current_role = NativeReplicaRole::Secondary;
+            opened.replica.state = NativeReplicaState::Ready;
             replicas.push(opened.replica);
         }
         let mut unit = request.unit.clone();
@@ -11086,7 +11152,7 @@ async fn configured_initial_membership_preserves_sizes_and_waits_for_every_activ
             let mut unit = config.unit.clone();
             unit.previous = Epoch::default();
             let mut replica = config.replicas.0[i + 1].clone();
-            replica.previous_role = 1;
+            replica.previous_role = NativeReplicaRole::None;
             let ack = Command::ActivateReply {
                 source: peer.clone(),
                 body: Box::new(ActivateReply {
@@ -11150,7 +11216,7 @@ async fn three_replica_activation_waits_for_each_exact_peer_and_its_commit() {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.previous_role >= 3)
+                .filter(|r| r.previous_role.is_active())
                 .count(),
             1
         );
@@ -11159,7 +11225,7 @@ async fn three_replica_activation_waits_for_each_exact_peer_and_its_commit() {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.current_role >= 3)
+                .filter(|r| r.current_role.is_active())
                 .count(),
             3
         );
@@ -11180,7 +11246,7 @@ async fn three_replica_activation_waits_for_each_exact_peer_and_its_commit() {
         unit.previous = Epoch::default();
         let ack = |index: usize| {
             let mut replica = config.replicas.0[index].clone();
-            replica.previous_role = 1;
+            replica.previous_role = NativeReplicaRole::None;
             Command::ActivateReply {
                 source: replica.node.clone(),
                 body: Box::new(ActivateReply {
@@ -11301,7 +11367,7 @@ async fn same_primary_configuration_requires_catchup_peer_activation_and_end_rep
             .replicas
             .0
             .iter()
-            .filter(|r| r.previous_role >= 3)
+            .filter(|r| r.previous_role.is_active())
             .count(),
         1
     );
@@ -11310,7 +11376,7 @@ async fn same_primary_configuration_requires_catchup_peer_activation_and_end_rep
             .replicas
             .0
             .iter()
-            .filter(|r| r.current_role >= 3)
+            .filter(|r| r.current_role.is_active())
             .count(),
         2
     );
@@ -11355,7 +11421,7 @@ async fn same_primary_configuration_requires_catchup_peer_activation_and_end_rep
     let mut unit = config.unit.clone();
     unit.previous = Epoch::default();
     let mut replica = config.replicas.0[1].clone();
-    replica.previous_role = 1;
+    replica.previous_role = NativeReplicaRole::None;
     run(
         &executor,
         Command::ActivateReply {
@@ -11389,7 +11455,7 @@ async fn same_primary_configuration_requires_catchup_peer_activation_and_end_rep
     let reply = effects(&executor);
     assert!(
         matches!(reply.as_slice(), [Effect::DoReconfigurationReply(body)]
-        if body.unit.previous == Epoch::default() && body.replicas.0.iter().all(|r| r.previous_role == 1))
+        if body.unit.previous == Epoch::default() && body.replicas.0.iter().all(|r| r.previous_role == NativeReplicaRole::None))
     );
     assert_eq!(
         state(&executor).reconfiguration.as_ref().unwrap().stage,
@@ -11510,7 +11576,7 @@ async fn secondary_activation_ack_waits_for_real_rap_result_and_its_commit() {
         let reply = effects(&executor);
         assert!(
             matches!(reply.as_slice(), [Effect::PeerActivateReply { body, .. }]
-            if body.replica.current_role == 3 && body.replica.previous_role == 1
+            if body.replica.current_role == NativeReplicaRole::Secondary && body.replica.previous_role == NativeReplicaRole::None
                 && body.unit.previous == Epoch::default())
         );
         run(&executor, command()).await;
@@ -11528,8 +11594,8 @@ fn retiring_configuration(active: &Configuration) -> Configuration {
     body.service.update_version += 1;
     for r in &mut body.replicas.0 {
         r.previous_role = r.current_role;
-        if r.current_role == 3 {
-            r.current_role = 1;
+        if r.current_role == NativeReplicaRole::Secondary {
+            r.current_role = NativeReplicaRole::None;
         }
     }
     body
@@ -11543,7 +11609,7 @@ fn deactivation_reply(config: &Configuration) -> DeactivateReply {
             id: s.id,
             instance: s.instance,
             up: false,
-            state: 3,
+            state: NativeReplicaState::Dropped,
             ..Replica::default()
         },
         error: 0,
@@ -11577,7 +11643,7 @@ async fn complete_primary_activation(executor: &Executor, config: &Configuration
         let mut unit = config.unit.clone();
         unit.previous = Epoch::default();
         let mut replica = replica.clone();
-        replica.previous_role = 1;
+        replica.previous_role = NativeReplicaRole::None;
         run(
             executor,
             Command::ActivateReply {
@@ -11612,7 +11678,11 @@ async fn completed_handoff_survivor(executor: &Executor) -> Configuration {
     intent.unit.current.configuration += 0x1_0000_0001;
     for r in &mut intent.replicas.0 {
         r.previous_role = r.current_role;
-        r.current_role = if r.node == candidate { 4 } else { 3 };
+        r.current_role = if r.node == candidate {
+            NativeReplicaRole::Primary
+        } else {
+            NativeReplicaRole::Secondary
+        };
         r.service_endpoint = if r.node == candidate {
             "127.0.0.1:23457".into()
         } else {
@@ -11809,7 +11879,7 @@ async fn post_handoff_secondary_rebuild_requires_deleted_lifetime_and_current_pr
             .replicas
             .0
             .iter()
-            .find(|r| r.current_role == 4)
+            .find(|r| r.current_role == NativeReplicaRole::Primary)
             .unwrap()
             .node
             .clone();
@@ -11828,8 +11898,8 @@ async fn post_handoff_secondary_rebuild_requires_deleted_lifetime_and_current_pr
             node: original.body.replica.node.clone(),
             id: original.body.replica.id + 100,
             instance: original.body.replica.instance + 100,
-            current_role: 2,
-            state: 1,
+            current_role: NativeReplicaRole::Idle,
+            state: NativeReplicaState::InBuild,
             version: body.service.version.clone(),
             ..Replica::default()
         };
@@ -11936,13 +12006,17 @@ async fn repeated_planned_swaps_use_latest_roles_history_and_commit_before_new_e
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
                 .unwrap()
                 .node
                 .clone();
             for r in &mut intent.replicas.0 {
                 r.previous_role = r.current_role;
-                r.current_role = if r.node == candidate { 4 } else { 3 };
+                r.current_role = if r.node == candidate {
+                    NativeReplicaRole::Primary
+                } else {
+                    NativeReplicaRole::Secondary
+                };
             }
             let start = || Command::DoReconfiguration {
                 source: if candidate == admission().local_node {
@@ -12050,7 +12124,7 @@ async fn repeated_planned_swaps_use_latest_roles_history_and_commit_before_new_e
                         .find(|r| r.node == target)
                         .unwrap()
                         .clone();
-                    remote.previous_role = 1;
+                    remote.previous_role = NativeReplicaRole::None;
                     remote.service_endpoint.clear();
                     let mut unit = body.configuration.unit.clone();
                     unit.previous = Epoch::default();
@@ -12171,9 +12245,9 @@ async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_a
         for r in &mut intent.replicas.0 {
             r.previous_role = r.current_role;
             r.current_role = if r.node == admission().local_node {
-                4
+                NativeReplicaRole::Primary
             } else {
-                3
+                NativeReplicaRole::Secondary
             };
             r.service_endpoint.clear();
         }
@@ -12189,7 +12263,7 @@ async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_a
         for invalid in 0..6 {
             let mut bad = intent.clone();
             match invalid {
-                0 => bad.replicas.0[0].current_role = 4,
+                0 => bad.replicas.0[0].current_role = NativeReplicaRole::Primary,
                 1 => bad.replicas.0[0].instance += 1,
                 2 => bad.replicas.0[0].up = false,
                 3 => bad.replicas.0[0] = bad.replicas.0[1].clone(),
@@ -12286,7 +12360,7 @@ async fn planned_three_member_swap_accepts_unequal_progress_and_waits_for_each_a
         let mut stable = state(&executor).swap.as_ref().unwrap().body.clone();
         stable.unit.previous = Epoch::default();
         for r in &mut stable.replicas.0 {
-            r.previous_role = 1;
+            r.previous_role = NativeReplicaRole::None;
         }
         for (index, remote) in remotes.iter().enumerate() {
             let ack = || Command::ActivateReply {
@@ -12425,9 +12499,9 @@ async fn planned_swap_uses_timed_read_quorums_and_history_without_failover_redir
         for r in &mut intent.replicas.0 {
             r.previous_role = r.current_role;
             r.current_role = if r.node == admission().local_node {
-                4
+                NativeReplicaRole::Primary
             } else {
-                3
+                NativeReplicaRole::Secondary
             };
             r.service_endpoint.clear();
         }
@@ -12548,11 +12622,11 @@ async fn planned_swap_uses_timed_read_quorums_and_history_without_failover_redir
                 let mut stable = state(&executor).swap.as_ref().unwrap().body.clone();
                 stable.unit.previous = Epoch::default();
                 for r in &mut stable.replicas.0 {
-                    r.previous_role = 1;
+                    r.previous_role = NativeReplicaRole::None;
                 }
                 let before = state(&executor);
                 let mut premature = restarted.clone();
-                premature.previous_role = 1;
+                premature.previous_role = NativeReplicaRole::None;
                 assert_eq!(
                     run(
                         &executor,
@@ -12603,7 +12677,7 @@ async fn planned_swap_uses_timed_read_quorums_and_history_without_failover_redir
                         id: restarted.id,
                         instance: restarted.instance,
                         up: false,
-                        state: 3,
+                        state: NativeReplicaState::Dropped,
                         ..Replica::default()
                     },
                     error: 0,
@@ -12634,7 +12708,11 @@ async fn planned_swap_uses_timed_read_quorums_and_history_without_failover_redir
                     .iter()
                     .find(|r| r.node == restarted.node)
                     .unwrap();
-                assert!(!dropped.up && dropped.state == 3 && dropped.current_role == 3);
+                assert!(
+                    !dropped.up
+                        && dropped.state == NativeReplicaState::Dropped
+                        && dropped.current_role == NativeReplicaRole::Secondary
+                );
                 run(&executor, Command::CompleteConfiguration(Box::new(end))).await;
                 assert!(
                     matches!(effects(&executor).as_slice(), [Effect::DoReconfigurationReply(reply)]
@@ -12680,7 +12758,10 @@ async fn planned_forced_deactivation_closes_exact_lifetime_before_reply_without_
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 3 && r.node != admission().local_node)
+                .find(|r| {
+                    r.current_role == NativeReplicaRole::Secondary
+                        && r.node != admission().local_node
+                })
                 .unwrap()
                 .node
                 .clone();
@@ -12688,7 +12769,11 @@ async fn planned_forced_deactivation_closes_exact_lifetime_before_reply_without_
             intent.unit.current.configuration += 0x1_0000_0001;
             for r in &mut intent.replicas.0 {
                 r.previous_role = r.current_role;
-                r.current_role = if r.node == candidate { 4 } else { 3 };
+                r.current_role = if r.node == candidate {
+                    NativeReplicaRole::Primary
+                } else {
+                    NativeReplicaRole::Secondary
+                };
             }
             if former_primary {
                 run(&executor, reconfigure(intent.clone())).await;
@@ -12709,7 +12794,7 @@ async fn planned_forced_deactivation_closes_exact_lifetime_before_reply_without_
                     .clone();
             }
             for r in &mut intent.replicas.0 {
-                r.previous_role = 1;
+                r.previous_role = NativeReplicaRole::None;
             }
             let request = Deactivate {
                 configuration: intent,
@@ -12839,8 +12924,12 @@ async fn planned_forced_deactivation_of_closed_secondary_replies_without_reopeni
     intent.unit.previous = intent.unit.current;
     intent.unit.current.configuration += 0x1_0000_0001;
     for r in &mut intent.replicas.0 {
-        r.previous_role = 1;
-        r.current_role = if r.node == candidate { 4 } else { 3 };
+        r.previous_role = NativeReplicaRole::None;
+        r.current_role = if r.node == candidate {
+            NativeReplicaRole::Primary
+        } else {
+            NativeReplicaRole::Secondary
+        };
         r.service_endpoint.clear();
     }
     run(
@@ -12909,7 +12998,11 @@ async fn planned_swap_unchanged_secondary_commits_activation_before_acknowledgin
         intent.unit.current.configuration += 0x1_0000_0001;
         for r in &mut intent.replicas.0 {
             r.previous_role = r.current_role;
-            r.current_role = if r.node == candidate { 4 } else { 3 };
+            r.current_role = if r.node == candidate {
+                NativeReplicaRole::Primary
+            } else {
+                NativeReplicaRole::Secondary
+            };
             r.service_endpoint.clear();
             r.first_lsn = 1;
             r.last_lsn = 8;
@@ -12963,7 +13056,7 @@ async fn planned_swap_unchanged_secondary_commits_activation_before_acknowledgin
             let mut bad = intent.clone();
             match invalid {
                 0 => bad.replicas.0[0].instance += 1,
-                1 => bad.replicas.0[0].current_role = 4,
+                1 => bad.replicas.0[0].current_role = NativeReplicaRole::Primary,
                 _ => bad.unit.current.configuration += 1,
             }
             assert!(executor
@@ -12997,7 +13090,7 @@ async fn planned_swap_unchanged_secondary_commits_activation_before_acknowledgin
         assert!(
             matches!(ack.as_slice(), [Effect::PeerActivateReply { target, body }]
             if target == &candidate && body.unit.previous == Epoch::default()
-                && body.replica.previous_role == 1 && body.replica.current_role == 3)
+                && body.replica.previous_role == NativeReplicaRole::None && body.replica.current_role == NativeReplicaRole::Secondary)
         );
         assert_eq!(state(&executor).runtime, original.runtime);
         assert_eq!(state(&executor).usage, original.usage);
@@ -13033,7 +13126,11 @@ async fn planned_swap_demote_commit_and_original_progress_precede_peer_continuat
         intent.unit.current.configuration += 0x1_0000_0001;
         for r in &mut intent.replicas.0 {
             r.previous_role = r.current_role;
-            r.current_role = if r.current_role == 4 { 3 } else { 4 };
+            r.current_role = if r.current_role == NativeReplicaRole::Primary {
+                NativeReplicaRole::Secondary
+            } else {
+                NativeReplicaRole::Primary
+            };
         }
         run(&executor, reconfigure(intent.clone())).await;
         let mut demoted = configured(&effects(&executor));
@@ -13093,7 +13190,7 @@ async fn planned_swap_demote_commit_and_original_progress_precede_peer_continuat
             .find(|replica| replica.node == admission().local_node)
             .unwrap();
         local.service_endpoint.clear();
-        local.state = 1;
+        local.state = NativeReplicaState::InBuild;
         capture_committed_lfum(&executor, &reported, Epoch::default(), false).await;
         run(&executor, reconfigure(intent)).await;
         assert_eq!(effects(&executor), forwarded);
@@ -13114,7 +13211,7 @@ async fn planned_swap_demote_commit_and_original_progress_precede_peer_continuat
             .replicas
             .0
             .iter_mut()
-            .find(|r| r.current_role == 4)
+            .find(|r| r.current_role == NativeReplicaRole::Primary)
             .unwrap()
             .service_endpoint = "127.0.0.1:23456".into();
         let activate = || Command::Activate {
@@ -13144,7 +13241,7 @@ async fn planned_swap_demote_commit_and_original_progress_precede_peer_continuat
         let activated = effects(&executor);
         assert!(
             matches!(activated.as_slice(), [Effect::PeerActivateReply { body, .. }]
-            if body.unit.previous == Epoch::default() && body.replica.current_role == 3)
+            if body.unit.previous == Epoch::default() && body.replica.current_role == NativeReplicaRole::Secondary)
         );
         run(&executor, activate()).await;
         assert_eq!(effects(&executor), activated);
@@ -13197,7 +13294,11 @@ async fn planned_swap_candidate_requires_both_lsn_results_endpoint_commit_and_fi
         intent.unit.current.configuration += 0x1_0000_0001;
         for r in &mut intent.replicas.0 {
             r.previous_role = r.current_role;
-            r.current_role = if r.current_role == 4 { 3 } else { 4 };
+            r.current_role = if r.current_role == NativeReplicaRole::Primary {
+                NativeReplicaRole::Secondary
+            } else {
+                NativeReplicaRole::Primary
+            };
         }
         let continue_swap = || Command::DoReconfiguration {
             body: Box::new(DoReconfiguration {
@@ -13335,7 +13436,7 @@ async fn planned_swap_candidate_requires_both_lsn_results_endpoint_commit_and_fi
         let mut stable = activate.configuration.clone();
         stable.unit.previous = Epoch::default();
         for r in &mut stable.replicas.0 {
-            r.previous_role = 1;
+            r.previous_role = NativeReplicaRole::None;
         }
         run(
             &executor,
@@ -13403,7 +13504,7 @@ async fn configured_secondary_retirement_preserves_both_quorums_and_exact_phase_
             .replicas
             .0
             .iter()
-            .filter(|r| r.previous_role >= 3)
+            .filter(|r| r.previous_role.is_active())
             .count(),
         2
     );
@@ -13412,7 +13513,7 @@ async fn configured_secondary_retirement_preserves_both_quorums_and_exact_phase_
             .replicas
             .0
             .iter()
-            .filter(|r| r.current_role >= 3)
+            .filter(|r| r.current_role.is_active())
             .count(),
         1
     );
@@ -13611,7 +13712,7 @@ async fn configured_secondary_deactivate_ack_requires_successful_close_and_resol
             ticket.resolve(WAIT).await.unwrap();
         }
         let actions = effects(&executor);
-        assert!(actions.iter().any(|e| matches!(e, Effect::PeerDeactivateReply { body, .. } if body.replica.state == 3 && !body.replica.up)));
+        assert!(actions.iter().any(|e| matches!(e, Effect::PeerDeactivateReply { body, .. } if body.replica.state == NativeReplicaState::Dropped && !body.replica.up)));
         assert_eq!(state(&executor).phase, Phase::Closed);
         assert!(state(&executor).runtime.is_none() && state(&executor).usage.is_none());
         run(&executor, command()).await;
@@ -13651,7 +13752,7 @@ async fn fm_idle_replacement_requires_completed_removal_and_ignores_predecessor_
     effects(&executor);
     let mut removal = original.clone();
     removal.replica = opened.replica.clone();
-    removal.replica.state = 2;
+    removal.replica.state = NativeReplicaState::Ready;
     run(&executor, fm_remove_idle(removal.clone())).await;
     effects(&executor);
     let mut successor = original.clone();
@@ -13665,7 +13766,7 @@ async fn fm_idle_replacement_requires_completed_removal_and_ignores_predecessor_
         .is_err());
     assert!(effects(&executor).is_empty());
     let mut removed = built.clone();
-    removed.remote.state = 3;
+    removed.remote.state = NativeReplicaState::Dropped;
     run(
         &executor,
         Command::CompleteRemoval(Box::new(removed.clone())),
@@ -13717,7 +13818,7 @@ async fn fm_idle_replacement_requires_completed_removal_and_ignores_predecessor_
     .await;
     assert!(
         matches!(effects(&executor).as_slice(), [Effect::AddReplicaReply(reply)]
-        if reply.replica.id == successor.replica.id && reply.replica.state == 2)
+        if reply.replica.id == successor.replica.id && reply.replica.state == NativeReplicaState::Ready)
     );
     assert_eq!(state(&executor).body, primary.body);
     assert_eq!(state(&executor).runtime, primary.runtime);
@@ -13765,7 +13866,7 @@ async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_seman
             effects(&executor);
             if error == 0 {
                 request.replica = opened.replica.clone();
-                request.replica.state = 2;
+                request.replica.state = NativeReplicaState::Ready;
             }
         }
         for command in [
@@ -13807,7 +13908,7 @@ async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_seman
         run(&executor, fm_remove_idle(request.clone())).await;
         let first = effects(&executor);
         let mut dropped = opened.replica.clone();
-        dropped.state = 3;
+        dropped.state = NativeReplicaState::Dropped;
         assert!(
             matches!(&first[..], [Effect::RemoveIdle { body, replica, registration }]
                 if body == &primary.body && **replica == dropped
@@ -13823,7 +13924,11 @@ async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_seman
         run(&executor, fm_remove_idle(request.clone())).await;
         assert_eq!(effects(&executor), first);
         let mut changed = request.clone();
-        changed.replica.state = if request.replica.state == 1 { 2 } else { 1 };
+        changed.replica.state = if request.replica.state == NativeReplicaState::InBuild {
+            NativeReplicaState::Ready
+        } else {
+            NativeReplicaState::InBuild
+        };
         assert!(executor
             .submit(fm_remove_idle(changed))
             .unwrap()
@@ -13960,7 +14065,7 @@ async fn fm_remove_in_create_echoes_request_without_rap_and_fences_late_open_and
         let mut foreign = request.clone();
         match field {
             0 => foreign.replica.instance += 1,
-            1 => foreign.replica.state = 2,
+            1 => foreign.replica.state = NativeReplicaState::Ready,
             2 => foreign.replica.replication_endpoint = "unobserved".into(),
             _ => foreign.unit.current.configuration += 1,
         }
@@ -14066,7 +14171,7 @@ async fn fm_remove_unbuilt_idle_keeps_original_lifetime_and_close_fences_pending
         [Effect::RemoveIdle { .. }]
     ));
     let mut dropped = opened.replica;
-    dropped.state = 3;
+    dropped.state = NativeReplicaState::Dropped;
     let completion = RemovalCompletion {
         unit: primary.body.unit.clone(),
         local: primary.body.replica.clone(),
@@ -14159,7 +14264,7 @@ async fn fm_add_idle_retries_creation_build_and_ready_reply_without_granting_mem
     )
     .await;
     let mut ready = opened.clone();
-    ready.replica.state = 2;
+    ready.replica.state = NativeReplicaState::Ready;
     let reply = vec![Effect::AddReplicaReply(ready)];
     assert_eq!(effects(&executor), reply);
     let built = state(&executor);
@@ -14322,7 +14427,7 @@ async fn failed_peer_creation_is_retired_by_original_fm_removal_without_rap_or_r
         replica: request.replica.clone(),
         error: RA_NOT_READY,
     };
-    failed.replica.state = 3;
+    failed.replica.state = NativeReplicaState::Dropped;
     failed.replica.up = false;
     failed.replica.version.instance += 1;
     run(&executor, peer_opened(failed.clone())).await;
@@ -14435,7 +14540,7 @@ fn primary_body() -> AddPrimary {
     request.service.partitions = 1;
     request.service.target = 1;
     request.service.minimum = 1;
-    request.replica.current_role = 4;
+    request.replica.current_role = NativeReplicaRole::Primary;
     request.unit.current.configuration = (1 << 32) + 5;
     request
 }
@@ -14590,7 +14695,7 @@ async fn fm_stateful_terminal_reports_use_native_stages_and_ack_lists() {
                     CloseMode::Abort | CloseMode::ForceAbort => 4,
                     _ => 0,
                 }
-                    && body.replica.current_role == 4));
+                    && body.replica.current_role == NativeReplicaRole::Primary));
             }
             let completion = if mode != CloseMode::AppHostDown {
                 Command::CompleteClose(Box::new(close_completion(&executor, 0)))
@@ -14629,7 +14734,7 @@ async fn fm_stateful_terminal_reports_use_native_stages_and_ack_lists() {
                     node: admission().local_node,
                     id: request.replica.id,
                     instance: request.replica.instance,
-                    state: 3,
+                    state: NativeReplicaState::Dropped,
                     up: false,
                     ..Replica::default()
                 }
@@ -14650,7 +14755,7 @@ async fn fm_stateful_terminal_reports_use_native_stages_and_ack_lists() {
                     2 => info.replicas.0[0].description.node.instance += 1,
                     3 => info.unit.current.configuration -= 1,
                     4 => info.replicas.0[0].description.id += 1,
-                    _ => info.replicas.0[0].description.state = 2,
+                    _ => info.replicas.0[0].description.state = NativeReplicaState::Ready,
                 }
                 assert_eq!(
                     run(&executor, ack(invalid, in_dropped)).await,
@@ -14970,18 +15075,18 @@ async fn fm_stateful_drop_ack_requires_dropped_state_before_first_retry() {
                             node: request.replica.node.clone(),
                             id: request.replica.id,
                             instance: request.replica.instance,
-                            state: 3,
+                            state: NativeReplicaState::Dropped,
                             up: false,
                             ..Replica::default()
                         },
-                        intermediate_role: 1,
+                        intermediate_role: NativeReplicaRole::None,
                     }]),
                     ..FailoverUnitInfo::default()
                 }]),
                 ..ReplicaUp::default()
             };
             let mut stale = report.clone();
-            stale.dropped.0[0].replicas.0[0].description.state = 2;
+            stale.dropped.0[0].replicas.0[0].description.state = NativeReplicaState::Ready;
             assert_eq!(
                 run(&executor, ack(stale, in_dropped)).await,
                 Disposition::IgnoredStale
@@ -15093,14 +15198,14 @@ async fn native_stateful_delete_uses_original_epoch_id_and_canonical_reply_witho
     let closing = state(&executor);
     assert!(closing.local_deleted && !closing.cleanup_pending);
     assert!(matches!(effects(&executor).as_slice(),
-        [Effect::Close { flags: 8, body, .. }] if body.replica.current_role == 4));
+        [Effect::Close { flags: 8, body, .. }] if body.replica.current_role == NativeReplicaRole::Primary));
     assert_eq!(
         run(&executor, primary_delete(request.clone(), false)).await,
         Disposition::IgnoredPending
     );
     assert!(effects(&executor).is_empty());
     let mut wrong_role = close_completion(&executor, 0);
-    wrong_role.replica.current_role = 2;
+    wrong_role.replica.current_role = NativeReplicaRole::Idle;
     assert_eq!(
         run(&executor, Command::CompleteClose(Box::new(wrong_role))).await,
         Disposition::IgnoredStale
@@ -15117,7 +15222,7 @@ async fn native_stateful_delete_uses_original_epoch_id_and_canonical_reply_witho
         Effect::Health(HealthEvent::Close), Effect::DeleteReplicaReply(reply)
     ] if reply.replica == Replica {
         node: admission().local_node, id: request.replica.id, instance: request.replica.instance,
-        up: false, state: 3, ..Replica::default()
+        up: false, state: NativeReplicaState::Dropped, ..Replica::default()
     } && reply.unit == old.body.unit && reply.error == 0));
     let writes = operations(&hooks).len();
     run(&executor, primary_delete(request.clone(), false)).await;
@@ -15327,7 +15432,7 @@ async fn native_ready_delete_duplicate_retry_and_close_completion_order() {
     close_done(&executor, 0).await;
     assert!(matches!(effects(&executor).as_slice(), [
                 Effect::ReleaseRegistration(_), Effect::ReleaseUsage { .. }, Effect::Health(HealthEvent::Close), Effect::RemoveReply(r)
-            ] if r.error==0 && r.replica.state==3 && !r.replica.up && r.replica.service_endpoint.is_empty()
+            ] if r.error==0 && r.replica.state==NativeReplicaState::Dropped && !r.replica.up && r.replica.service_endpoint.is_empty()
                 && r.replica.version==VersionInstance::invalid()));
     assert_eq!(state(&executor).phase, Phase::Closed);
     assert!(state(&executor).cleanup_pending);
@@ -15497,8 +15602,14 @@ async fn native_obliterate_requires_host_down_reports_replica_up_and_ack_list_se
         assert!(
             !info.local_deleted && !info.report_from_primary && !report.last && !report.from_fmm
         );
-        assert_eq!(info.replicas.0[0].intermediate_role, 1);
-        assert_eq!(info.replicas.0[0].description.state, 3);
+        assert_eq!(
+            info.replicas.0[0].intermediate_role,
+            NativeReplicaRole::None
+        );
+        assert_eq!(
+            info.replicas.0[0].description.state,
+            NativeReplicaState::Dropped
+        );
         run(&executor, Command::RetryReport(request.unit.id.clone())).await;
         assert_eq!(effects(&executor), vec![Effect::ReplicaUp(report.clone())]);
         assert_eq!(state(&executor).fm_stage, FmStage::ReplicaDropped); // send is not ack
@@ -16082,7 +16193,7 @@ async fn native_add_description_update_precedes_drop_or_duplicate_and_preserves_
             panic!("update before lifecycle effect: {actions:?}");
         };
         assert_eq!(captured.service, current.body.service);
-        assert_eq!(captured.replica.state, 2); // captured BEFORE Drop's InDrop
+        assert_eq!(captured.replica.state, NativeReplicaState::Ready); // captured BEFORE Drop's InDrop
         assert_eq!(Some(registration), old.runtime.as_ref());
         if dropping {
             assert!(matches!(second, Effect::Close { .. }));
@@ -16607,7 +16718,7 @@ fn description_ack(executor: &Executor, update: u64) -> Command {
         unit: current.body.unit.clone(),
         replicas: fubst::serde::ObjectArray(vec![ReplicaInfo {
             description: current.body.replica.clone(),
-            intermediate_role: 1,
+            intermediate_role: NativeReplicaRole::None,
         }]),
         ..FailoverUnitInfo::default()
     });
@@ -16985,7 +17096,7 @@ async fn missing_remove_stores_native_constructed_tombstone_not_request_or_physi
         assert_eq!((stored.body.unit.target, stored.body.unit.minimum), (0, 0));
         assert_eq!(stored.body.unit.current, request.unit.current);
         assert_eq!(stored.body.service, request.service);
-        assert_eq!(stored.body.replica.state, 3);
+        assert_eq!(stored.body.replica.state, NativeReplicaState::Dropped);
         assert!(!stored.body.replica.up && stored.body.replica.service_endpoint.is_empty());
         assert_eq!(stored.body.replica.version, VersionInstance::invalid());
         assert_eq!(
@@ -18041,12 +18152,12 @@ async fn vanilla_raw_inbuild_open_reply_establishes_ready_without_copying_other_
     reply.replica.node.instance += 1;
     reply.replica.version.instance += 1;
     reply.replica.first_lsn = 123;
-    reply.replica.current_role = 0;
+    reply.replica.current_role = NativeReplicaRole::Unknown;
     reply.replica.up = false;
     reply.unit.current.configuration += 1; // generic rejects LOWER epoch only
     run(&executor, Command::CompleteOpen(Box::new(reply))).await;
     let mut expected = before.body.replica.clone();
-    expected.state = 2;
+    expected.state = NativeReplicaState::Ready;
     expected.service_endpoint = "native endpoint".into();
     expected.replication_endpoint = "native replicator endpoint".into();
     assert_eq!(state(&executor).body.replica, expected);
@@ -18431,7 +18542,7 @@ async fn native_registration_threshold_warning_clear_true_exhaustion_and_ties() 
         } else {
             assert_eq!(state(&executor).phase, Phase::Closed);
             assert!(
-                matches!(effects(&executor).as_slice(), [Effect::Health(HealthEvent::Close), Effect::Reply(r)] if r.error==HOSTING_DEPLOYMENT_IN_PROGRESS && r.replica.state==1)
+                matches!(effects(&executor).as_slice(), [Effect::Health(HealthEvent::Close), Effect::Reply(r)] if r.error==HOSTING_DEPLOYMENT_IN_PROGRESS && r.replica.state==NativeReplicaState::InBuild)
             );
         }
         assert_eq!(operations(&hooks), ["Insert"]);
@@ -18580,7 +18691,7 @@ async fn returned_version_keeps_original_add_retry_and_closed_recreation_support
             let writes = operations(&hooks);
             run(&executor, add(body(1))).await;
             assert!(
-                matches!(effects(&executor).as_slice(),[Effect::Reply(r)] if r.error==0 && r.replica.version.instance==9 && r.replica.state==2)
+                matches!(effects(&executor).as_slice(),[Effect::Reply(r)] if r.error==0 && r.replica.version.instance==9 && r.replica.state==NativeReplicaState::Ready)
             );
             assert_eq!(operations(&hooks), writes);
             run(&executor, remove(body(1), false)).await;
@@ -18744,7 +18855,7 @@ async fn native_usage_increment_failure_and_returned_version_selection_are_disti
     );
     runtime_reply(&executor, PROXY_STATE_CHANGED_ON_DATA_LOSS, 0).await;
     assert!(
-        matches!(effects(&executor).as_slice(), [Effect::Reply(r)] if r.error==0 && r.replica.state==2 && !r.replica.service_endpoint.is_empty())
+        matches!(effects(&executor).as_slice(), [Effect::Reply(r)] if r.error==0 && r.replica.state==NativeReplicaState::Ready && !r.replica.service_endpoint.is_empty())
     );
     assert_eq!(operations(&hooks), ["Insert", "Update"]);
     finish(&store, &executor).await;
@@ -18979,7 +19090,7 @@ async fn native_open_success_clears_warning_or_error_threshold_without_inventing
         let usage = state(&executor).usage;
         runtime_reply(&executor, 0, 0).await;
         assert!(
-            matches!(effects(&executor).as_slice(),[Effect::OpeningHealth(h),Effect::Reply(r)] if h.event==HealthEvent::ClearOpenWarning && r.error==0 && r.replica.state==2 && !r.replica.service_endpoint.is_empty())
+            matches!(effects(&executor).as_slice(),[Effect::OpeningHealth(h),Effect::Reply(r)] if h.event==HealthEvent::ClearOpenWarning && r.error==0 && r.replica.state==NativeReplicaState::Ready && !r.replica.service_endpoint.is_empty())
         );
         assert_eq!(state(&executor).open_failures, 0);
         assert_eq!(state(&executor).runtime, runtime);

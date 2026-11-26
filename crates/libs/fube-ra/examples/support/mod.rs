@@ -73,9 +73,13 @@ impl<T: Rich + Default> Rich for ObjectArray<Vec<T>> {
             .collect();
     }
 }
+fn enum_sample<T: From<i64>>(counter: &mut i32) -> T {
+    i64::from(next(counter) % 5).into()
+}
+
 macro_rules! field {
     ($v:ident, $c:ident, [$f:ident]) => {
-        $v.$f = i64::from(next($c) % 5);
+        $v.$f = enum_sample($c);
     };
     ($v:ident, $c:ident, $f:ident) => {
         $v.$f.rich($c);

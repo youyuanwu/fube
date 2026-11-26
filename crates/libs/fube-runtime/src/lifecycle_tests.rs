@@ -1,4 +1,5 @@
 use super::*;
+use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 #[path = "reporting_tests.rs"]
 mod reporting_tests;
 #[path = "stateful_tests.rs"]
@@ -822,12 +823,12 @@ impl Harness {
                 },
                 id: 100,
                 instance: incarnation,
-                current_role: 4,
-                previous_role: 0,
+                current_role: NativeReplicaRole::Primary,
+                previous_role: NativeReplicaRole::Unknown,
                 up: true,
                 last_lsn: -1,
                 first_lsn: -1,
-                state: 2,
+                state: NativeReplicaState::Ready,
                 version: version.clone(),
                 service_endpoint: String::new(),
                 replication_endpoint: String::new(),

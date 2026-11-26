@@ -552,7 +552,7 @@ python3 -m tests.ra_protocol.producer \
 Producer compilation is intentional, never a consumer fallback. It records
 compiler/flags, native input hashes, generated schema, repository HEAD and
 source-input hashes, and SHA256 for the complete prebuilt inventory.
-Source identity includes the RA/store/furpc Rust sources, manifests/lockfile
+Source identity includes the core/RA/store/furpc/fubst Rust sources, manifests/lockfile
 and producer/consumer/schema/platform inputs. HEAD identifies the source base;
 source_digest also binds dirty tracked/new work during development.
 

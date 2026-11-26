@@ -1,5 +1,8 @@
 //! Shared Service Fabric wire identifiers, not transport or subsystem policy.
 
+mod replica;
+pub use replica::{NativeReplicaRole, NativeReplicaState};
+
 pub mod actor {
     //! Selected native `Transport::Actor` codes from
     //! [the pinned enumeration](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/Actor.h).

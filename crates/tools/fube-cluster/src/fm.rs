@@ -9,6 +9,7 @@ use crate::profile::{
 };
 use crate::status::*;
 use fube_ra::protocol::*;
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use fubst::serde::ObjectArray;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -497,7 +498,7 @@ impl Placement {
                         || info.local_deleted
                         || info.report_from_primary
                         || info.intermediate != Epoch::default()
-                        || info.replicas.0[0].intermediate_role != 1
+                        || info.replicas.0[0].intermediate_role != NativeReplicaRole::None
                     {
                         return Err("unsupported stateful terminal report".into());
                     }
@@ -507,10 +508,15 @@ impl Placement {
                     // This ephemeral FM can semantically forget the exact
                     // dropped instance only after desired deletion. Unexpected
                     // loss remains uncertain rather than enabling replacement.
-                    if replica.state != 3 || self.desired != Desired::Absent {
+                    if replica.state != NativeReplicaState::Dropped
+                        || self.desired != Desired::Absent
+                    {
                         return Err("unrequested dropped authority remains staged".into());
                     }
-                } else if replica.up || replica.state == 3 || info.local_deleted {
+                } else if replica.up
+                    || replica.state == NativeReplicaState::Dropped
+                    || info.local_deleted
+                {
                     return Err("unsupported normal report semantics".into());
                 }
             }
@@ -583,8 +589,18 @@ fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Resul
             } else {
                 expected.version.clone()
             }
-        || actual.current_role != if canonical { 1 } else { expected.current_role }
-        || actual.previous_role != if canonical { 1 } else { expected.previous_role }
+        || actual.current_role
+            != if canonical {
+                NativeReplicaRole::None
+            } else {
+                expected.current_role
+            }
+        || actual.previous_role
+            != if canonical {
+                NativeReplicaRole::None
+            } else {
+                expected.previous_role
+            }
     {
         return Err("foreign/stale replica incarnation/version".into());
     }
@@ -593,9 +609,9 @@ fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Resul
 fn completed_inventory(configuration: &Configuration) -> Configuration {
     let mut completed = configuration.clone();
     completed.unit.previous = Epoch::default();
-    completed.replicas.0.retain(|r| r.current_role >= 3);
+    completed.replicas.0.retain(|r| r.current_role.is_active());
     for replica in &mut completed.replicas.0 {
-        replica.previous_role = 1;
+        replica.previous_role = NativeReplicaRole::None;
     }
     completed
 }
@@ -617,7 +633,7 @@ fn inventory_view_matches(
                 .replicas
                 .0
                 .iter()
-                .any(|r| &r.node == local && r.current_role == 4)
+                .any(|r| &r.node == local && r.current_role == NativeReplicaRole::Primary)
     {
         return false;
     }
@@ -636,7 +652,7 @@ fn inventory_view_matches(
         let mut expected = expected.clone();
         expected.first_lsn = -1;
         expected.last_lsn = -1;
-        if promoted == Some(&expected.node) && expected.current_role == 4 {
+        if promoted == Some(&expected.node) && expected.current_role == NativeReplicaRole::Primary {
             expected.service_endpoint = actual.description.service_endpoint.clone();
         }
         let intermediate_role = intermediate
@@ -647,16 +663,20 @@ fn inventory_view_matches(
                         && r.instance == expected.instance
                 })
             })
-            .map_or(1, |r| r.current_role);
+            .map_or(NativeReplicaRole::None, |r| r.current_role);
         actual.description == expected && actual.intermediate_role == intermediate_role
     })
 }
 
 fn primary_failover_configuration(body: &Configuration) -> bool {
-    body.replicas
-        .0
-        .iter()
-        .any(|r| r.previous_role == 4 && matches!(r.current_role, 1 | 3) && !r.up)
+    body.replicas.0.iter().any(|r| {
+        r.previous_role == NativeReplicaRole::Primary
+            && matches!(
+                r.current_role,
+                NativeReplicaRole::None | NativeReplicaRole::Secondary
+            )
+            && !r.up
+    })
 }
 impl Ledger {
     pub fn primary_failover(&self) -> bool {
@@ -683,12 +703,13 @@ impl Ledger {
                     .replicas
                     .0
                     .iter()
-                    .filter(|r| r.up && r.current_role >= 3)
+                    .filter(|r| r.up && r.current_role.is_active())
                     .all(|r| {
                         self.placements.iter().any(|p| {
                             p.launch.node == r.node
                                 && p.link_alive
-                                && (!p.loss_reported || (planned && r.current_role == 3))
+                                && (!p.loss_reported
+                                    || (planned && r.current_role == NativeReplicaRole::Secondary))
                         })
                     })
             });
@@ -767,11 +788,11 @@ impl Ledger {
             return Ok(None);
         }
         let lost = self.placements.iter().position(|p| {
-            previous
-                .replicas
-                .0
-                .iter()
-                .any(|r| r.node == p.launch.node && r.current_role == 4 && p.loss_reported)
+            previous.replicas.0.iter().any(|r| {
+                r.node == p.launch.node
+                    && r.current_role == NativeReplicaRole::Primary
+                    && p.loss_reported
+            })
         });
         let Some(lost) = lost else {
             return Ok(None);
@@ -803,7 +824,7 @@ impl Ledger {
                 .0
                 .iter()
                 .filter(|r| {
-                    r.current_role >= 3
+                    r.current_role.is_active()
                         && self
                             .placements
                             .iter()
@@ -820,9 +841,9 @@ impl Ledger {
             .position(|p| {
                 previous.replicas.0.iter().any(|r| {
                     r.node == p.launch.node
-                        && r.current_role == 3
+                        && r.current_role == NativeReplicaRole::Secondary
                         && r.up
-                        && r.state == 2
+                        && r.state == NativeReplicaState::Ready
                         && available(p)
                 })
             })
@@ -840,11 +861,11 @@ impl Ledger {
         for r in &mut body.configuration.replicas.0 {
             r.previous_role = r.current_role;
             if r.node == self.placements[lost].launch.node {
-                r.current_role = 3;
+                r.current_role = NativeReplicaRole::Secondary;
                 r.up = false;
-                r.state = 3;
+                r.state = NativeReplicaState::Dropped;
             } else if r.node == self.placements[candidate].launch.node {
-                r.current_role = 4;
+                r.current_role = NativeReplicaRole::Primary;
             } else if configured {
                 let placement = self
                     .placements
@@ -853,7 +874,7 @@ impl Ledger {
                     .ok_or("missing configured member owner")?;
                 r.up = available(placement);
                 if placement.loss_reported {
-                    r.state = 3;
+                    r.state = NativeReplicaState::Dropped;
                 }
             }
             r.first_lsn = -1;
@@ -864,11 +885,14 @@ impl Ledger {
             .replicas
             .0
             .iter()
-            .filter(|r| r.current_role >= 3)
+            .filter(|r| r.current_role.is_active())
             .count();
         for r in &mut body.configuration.replicas.0 {
-            if !r.up && r.current_role == 3 && count > body.configuration.unit.minimum as usize {
-                r.current_role = 1;
+            if !r.up
+                && r.current_role == NativeReplicaRole::Secondary
+                && count > body.configuration.unit.minimum as usize
+            {
+                r.current_role = NativeReplicaRole::None;
                 count -= 1;
             }
         }
@@ -890,12 +914,10 @@ impl Ledger {
             return Ok(None);
         };
         let configuration = &removal.body.configuration;
-        let Some(primary) = configuration
-            .replicas
-            .0
-            .iter()
-            .find(|r| r.previous_role == 4 && r.current_role == 4)
-        else {
+        let Some(primary) = configuration.replicas.0.iter().find(|r| {
+            r.previous_role == NativeReplicaRole::Primary
+                && r.current_role == NativeReplicaRole::Primary
+        }) else {
             return Ok(None);
         };
         if (self.generation_pending()
@@ -932,9 +954,9 @@ impl Ledger {
                 .iter()
                 .filter(|r| {
                     if previous {
-                        r.previous_role >= 3
+                        r.previous_role.is_active()
                     } else {
-                        r.current_role >= 3
+                        r.current_role.is_active()
                     }
                 })
                 .collect();
@@ -946,7 +968,7 @@ impl Ledger {
             .replicas
             .0
             .iter()
-            .find(|r| r.up && r.current_role == 3)
+            .find(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
             .ok_or("missing surviving Secondary during removal")?;
         let mut body = removal.body.clone();
         body.configuration.unit.current.configuration = configuration
@@ -958,11 +980,11 @@ impl Ledger {
         // SF preserves PC and the CC set during an in-flight Primary change.
         for r in &mut body.configuration.replicas.0 {
             if r.node == primary.node {
-                r.current_role = 3;
+                r.current_role = NativeReplicaRole::Secondary;
                 r.up = false;
-                r.state = 3;
+                r.state = NativeReplicaState::Dropped;
             } else if r.node == candidate.node {
-                r.current_role = 4;
+                r.current_role = NativeReplicaRole::Primary;
             }
             r.first_lsn = -1;
             r.last_lsn = -1;
@@ -1005,8 +1027,8 @@ impl Ledger {
                 replica.node == self.placements[predecessor].launch.node
                     && replica.id == self.placements[predecessor].replica
                     && replica.instance == self.placements[predecessor].incarnation
-                    && replica.previous_role == 4
-                    && replica.current_role == 4
+                    && replica.previous_role == NativeReplicaRole::Primary
+                    && replica.current_role == NativeReplicaRole::Primary
             })
         {
             return Err("supersession must bind the original pending removal and exact failed Primary before replacement".into());
@@ -1036,11 +1058,11 @@ impl Ledger {
                 .placements
                 .iter()
                 .find(|p| {
-                    body.configuration
-                        .replicas
-                        .0
-                        .iter()
-                        .any(|r| r.node == p.launch.node && r.previous_role == 4 && !r.up)
+                    body.configuration.replicas.0.iter().any(|r| {
+                        r.node == p.launch.node
+                            && r.previous_role == NativeReplicaRole::Primary
+                            && !r.up
+                    })
                 })
                 .ok_or("missing superseded Primary owner")?;
             self.restoration = Some([lost.body()?, repair.predecessor.clone()]);
@@ -1051,7 +1073,7 @@ impl Ledger {
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.node == p.launch.node && r.up && r.current_role >= 3)
+                .find(|r| r.node == p.launch.node && r.up && r.current_role.is_active())
             else {
                 continue;
             };
@@ -1112,11 +1134,10 @@ impl Ledger {
         };
         if self.candidate_changes.iter().any(|previous| {
             previous == &body
-                && previous
-                    .replicas
-                    .0
-                    .iter()
-                    .any(|r| r.current_role == 4 && r.node == self.placements[index].launch.node)
+                && previous.replicas.0.iter().any(|r| {
+                    r.current_role == NativeReplicaRole::Primary
+                        && r.node == self.placements[index].launch.node
+                })
         }) {
             return Ok(Some(FailoverUnitReply {
                 unit: swap.body.configuration.unit.clone(),
@@ -1152,7 +1173,7 @@ impl Ledger {
             if actual.last_lsn >= 0 {
                 if actual.first_lsn < 0
                     || !actual.up
-                    || actual.current_role != 3
+                    || actual.current_role != NativeReplicaRole::Secondary
                     || selected.is_some()
                 {
                     return Ok(None);
@@ -1177,11 +1198,11 @@ impl Ledger {
             .checked_add(0x1_0000_0001)
             .ok_or("Primary redirection epoch exhausted")?;
         for r in &mut next.configuration.replicas.0 {
-            if r.current_role == 4 {
-                r.current_role = 3;
+            if r.current_role == NativeReplicaRole::Primary {
+                r.current_role = NativeReplicaRole::Secondary;
             }
             if r.node == selected {
-                r.current_role = 4;
+                r.current_role = NativeReplicaRole::Primary;
             }
             r.first_lsn = -1;
             r.last_lsn = -1;
@@ -1276,9 +1297,9 @@ impl Ledger {
                 );
             }
             let replica = &info.replicas.0[0];
-            let dropped = replica.description.state == 3;
+            let dropped = replica.description.state == NativeReplicaState::Dropped;
             exact_replica(&expected.replica, &replica.description, dropped)?;
-            if replica.intermediate_role != 1
+            if replica.intermediate_role != NativeReplicaRole::None
                 || (placement.observed == Observed::Running
                     && (Some(&replica.description) != placement.ready_replica.as_ref() || dropped))
                 || info.report_from_primary != (!dropped && expected.service.stateful)
@@ -1370,11 +1391,9 @@ impl Ledger {
         if !in_progress {
             unit.previous = Epoch::default();
         }
-        let primary = request
-            .replicas
-            .0
-            .iter()
-            .any(|r| r.node == placement.launch.node && r.current_role == 4);
+        let primary = request.replicas.0.iter().any(|r| {
+            r.node == placement.launch.node && r.current_role == NativeReplicaRole::Primary
+        });
         if (initial.is_none() && configuration.reply.is_none())
             || info.service
                 != if initial.is_some() {
@@ -1394,12 +1413,12 @@ impl Ledger {
         for expected in &request.replicas.0 {
             let mut expected = expected.clone();
             if !in_progress {
-                expected.previous_role = 1;
+                expected.previous_role = NativeReplicaRole::None;
             }
             expected.first_lsn = -1;
             expected.last_lsn = -1;
             let intermediate_role = if info.intermediate == Epoch::default() {
-                1
+                NativeReplicaRole::None
             } else {
                 expected.current_role
             };
@@ -1471,17 +1490,21 @@ impl Ledger {
             }
             let actual = &replica.description;
             exact_replica(&expected, actual, false)?;
-            if replica.intermediate_role != 1
+            if replica.intermediate_role != NativeReplicaRole::None
                 || !actual.up
                 || actual.first_lsn != -1
                 || actual.last_lsn != -1
-                || if expected.current_role == 4 {
+                || if expected.current_role == NativeReplicaRole::Primary {
                     *actual != expected
                 } else {
                     !actual.service_endpoint.is_empty()
-                        || !matches!(actual.state, 1 | 2)
-                        || (index != 0 && actual.state != 1)
-                        || (actual.state == 2 && actual.replication_endpoint.is_empty())
+                        || !matches!(
+                            actual.state,
+                            NativeReplicaState::InBuild | NativeReplicaState::Ready
+                        )
+                        || (index != 0 && actual.state != NativeReplicaState::InBuild)
+                        || (actual.state == NativeReplicaState::Ready
+                            && actual.replication_endpoint.is_empty())
                 }
             {
                 return Err(format!(
@@ -1511,7 +1534,7 @@ impl Ledger {
             .replicas
             .0
             .iter()
-            .find(|r| r.previous_role == 4)
+            .find(|r| r.previous_role == NativeReplicaRole::Primary)
             .ok_or("missing original lost Primary")?;
         if placement.launch.node == lost.node {
             if let Some(info) = body.units.0.first() {
@@ -1527,7 +1550,7 @@ impl Ledger {
                     || info.report_from_primary
                     || info.local_deleted
                     || info.replicas.0.len() != 1
-                    || info.replicas.0[0].intermediate_role != 1
+                    || info.replicas.0[0].intermediate_role != NativeReplicaRole::None
                     || info.replicas.0[0].description != dropped_replica(expected)
                 {
                     return Err("closed former Primary must report canonical dropped metadata or omit its deleted entry".into());
@@ -1546,11 +1569,10 @@ impl Ledger {
             replicas: original.replicas.clone(),
         };
         let query = info.unit == intent.unit
-            && info
-                .replicas
-                .0
-                .iter()
-                .any(|r| r.description.node == lost.node && r.description.current_role == 4);
+            && info.replicas.0.iter().any(|r| {
+                r.description.node == lost.node
+                    && r.description.current_role == NativeReplicaRole::Primary
+            });
         let mut complete = intent.unit.clone();
         complete.previous = Epoch::default();
         let transitioning = info.unit == intent.unit && !query;
@@ -1563,17 +1585,15 @@ impl Ledger {
             expected = intent.clone();
             if !transitioning {
                 expected.unit = complete;
-                expected.replicas.0.retain(|r| r.current_role >= 3);
+                expected.replicas.0.retain(|r| r.current_role.is_active());
                 for r in &mut expected.replicas.0 {
-                    r.previous_role = 1;
+                    r.previous_role = NativeReplicaRole::None;
                 }
             }
         }
-        let primary = expected
-            .replicas
-            .0
-            .iter()
-            .any(|r| r.node == placement.launch.node && r.current_role == 4);
+        let primary = expected.replicas.0.iter().any(|r| {
+            r.node == placement.launch.node && r.current_role == NativeReplicaRole::Primary
+        });
         if info.service != expected.service
             || info.unit != expected.unit
             || info.local_deleted
@@ -1593,12 +1613,15 @@ impl Ledger {
                 .iter()
                 .filter(|r| r.description.node == expected.node);
             let actual = matching.next().ok_or("missing original failover member")?;
-            if expected.current_role == 4 && expected.node != lost.node && !query {
+            if expected.current_role == NativeReplicaRole::Primary
+                && expected.node != lost.node
+                && !query
+            {
                 // Role completion may publish a new service endpoint; replication identity stays fixed.
                 expected.service_endpoint = actual.description.service_endpoint.clone();
             }
             let intermediate_role = if info.intermediate == Epoch::default() {
-                1
+                NativeReplicaRole::None
             } else {
                 expected.current_role
             };
@@ -1633,13 +1656,13 @@ impl Ledger {
             .replicas
             .0
             .iter()
-            .find(|r| r.previous_role == 4)
+            .find(|r| r.previous_role == NativeReplicaRole::Primary)
             .ok_or("missing transfer source")?;
         let candidate = intent
             .replicas
             .0
             .iter()
-            .find(|r| r.current_role == 4)
+            .find(|r| r.current_role == NativeReplicaRole::Primary)
             .ok_or("missing transfer candidate")?;
         let mut complete = intent.unit.clone();
         complete.previous = Epoch::default();
@@ -1653,7 +1676,7 @@ impl Ledger {
         } else if info.unit == complete {
             expected.unit = complete.clone();
             for r in &mut expected.replicas.0 {
-                r.previous_role = 1;
+                r.previous_role = NativeReplicaRole::None;
             }
             primary = placement.launch.node == candidate.node;
         } else if info.unit == intent.unit {
@@ -1667,7 +1690,7 @@ impl Ledger {
                         .iter_mut()
                         .find(|r| r.node == old.node)
                         .unwrap();
-                    local.state = 1;
+                    local.state = NativeReplicaState::InBuild;
                     local.service_endpoint.clear();
                 }
             } else if placement.launch.node == candidate.node {
@@ -1726,7 +1749,7 @@ impl Ledger {
                 || actual.description != expected
                 || actual.intermediate_role
                     != if intermediate == Epoch::default() {
-                        1
+                        NativeReplicaRole::None
                     } else {
                         expected.current_role
                     }
@@ -1766,11 +1789,9 @@ impl Ledger {
             service: repair.build.service.clone(),
             replicas: repair.previous.replicas.clone(),
         };
-        let primary = expected
-            .replicas
-            .0
-            .iter()
-            .any(|r| r.node == placement.launch.node && r.current_role == 4);
+        let primary = expected.replicas.0.iter().any(|r| {
+            r.node == placement.launch.node && r.current_role == NativeReplicaRole::Primary
+        });
         let mut transitioning = false;
         if let Some(request) = &repair.configuration {
             let mut complete = request.unit.clone();
@@ -1781,7 +1802,7 @@ impl Ledger {
                 if !transitioning {
                     expected.unit = complete;
                     for r in &mut expected.replicas.0 {
-                        r.previous_role = 1;
+                        r.previous_role = NativeReplicaRole::None;
                     }
                 }
             }
@@ -1824,12 +1845,16 @@ impl Ledger {
             let actual = matching.next().ok_or("missing known repair replica")?;
             let duplicate = matching.next().is_some();
             if building && expected.node == repair.build.replica.node {
-                let dropped = actual.description.state == 3;
+                let dropped = actual.description.state == NativeReplicaState::Dropped;
                 if dropped && !(repair.cancelled && (primary || repair.deleting)) {
                     return Err("LFUM repair drop requires explicit cancellation/deletion".into());
                 }
-                if !matches!(actual.description.state, 1..=3)
-                    || (fresh && actual.description.state == 2)
+                if !matches!(
+                    actual.description.state,
+                    NativeReplicaState::InBuild
+                        | NativeReplicaState::Ready
+                        | NativeReplicaState::Dropped
+                ) || (fresh && actual.description.state == NativeReplicaState::Ready)
                     || actual.description.replication_endpoint.is_empty()
                         && !(fresh && dropped && repair.deleting)
                     || !actual.description.service_endpoint.is_empty()
@@ -1846,7 +1871,7 @@ impl Ledger {
                 || actual.description != expected
                 || actual.intermediate_role
                     != if info.intermediate == Epoch::default() {
-                        1
+                        NativeReplicaRole::None
                     } else {
                         expected.current_role
                     }
@@ -1893,7 +1918,11 @@ impl Ledger {
             .reply
             .as_ref()
             .filter(|r| r.error == 0)?;
-        let primary = previous.replicas.0.iter().find(|r| r.current_role == 4)?;
+        let primary = previous
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.current_role == NativeReplicaRole::Primary)?;
         let lost = &repair.predecessor.replica;
         if repair.host_requested
             || repair.profile.is_some()
@@ -1906,7 +1935,7 @@ impl Ledger {
                 .replicas
                 .0
                 .iter()
-                .any(|r| r == lost && r.current_role == 3)
+                .any(|r| r == lost && r.current_role == NativeReplicaRole::Secondary)
             || !self
                 .placements
                 .iter()
@@ -1932,9 +1961,9 @@ impl Ledger {
         for r in &mut expected.replicas.0 {
             r.previous_role = r.current_role;
             if r.node == lost.node {
-                r.current_role = 1;
+                r.current_role = NativeReplicaRole::None;
                 r.up = false;
-                r.state = 3;
+                r.state = NativeReplicaState::Dropped;
             }
         }
         if expected != *removal {
@@ -1945,16 +1974,16 @@ impl Ledger {
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)?;
+                .find(|r| r.current_role == NativeReplicaRole::Primary)?;
             if !self
                 .placements
                 .iter()
                 .any(|p| p.launch.node == primary.node && p.loss_reported)
-                || !expected
-                    .replicas
-                    .0
-                    .iter()
-                    .any(|r| r.node == candidate.node && r.current_role == 3 && r.up)
+                || !expected.replicas.0.iter().any(|r| {
+                    r.node == candidate.node
+                        && r.current_role == NativeReplicaRole::Secondary
+                        && r.up
+                })
             {
                 return None;
             }
@@ -1965,11 +1994,11 @@ impl Ledger {
                 .checked_add(0x1_0000_0001)?;
             for r in &mut expected.replicas.0 {
                 if r.node == primary.node {
-                    r.current_role = 3;
+                    r.current_role = NativeReplicaRole::Secondary;
                     r.up = false;
-                    r.state = 3;
+                    r.state = NativeReplicaState::Dropped;
                 } else if r.node == candidate.node {
-                    r.current_role = 4;
+                    r.current_role = NativeReplicaRole::Primary;
                 }
                 r.first_lsn = -1;
                 r.last_lsn = -1;
@@ -2010,14 +2039,12 @@ impl Ledger {
             .iter()
             .find(|r| r.node == placement.launch.node)
             .ok_or("removal inventory omitted its original owner")?;
-        let known_loss = placement.loss_reported
-            && (local.current_role == 4
-                || inventory
-                    .removal
-                    .replicas
-                    .0
-                    .iter()
-                    .any(|r| r.node == local.node && r.current_role == 1));
+        let known_loss =
+            placement.loss_reported
+                && (local.current_role == NativeReplicaRole::Primary
+                    || inventory.removal.replicas.0.iter().any(|r| {
+                        r.node == local.node && r.current_role == NativeReplicaRole::None
+                    }));
         if known_loss {
             let Some(info) = body.units.0.first() else {
                 return Ok(());
@@ -2036,12 +2063,12 @@ impl Ledger {
                 && info.replicas.0
                     == vec![ReplicaInfo {
                         description: dropped_replica(local),
-                        intermediate_role: 1,
+                        intermediate_role: NativeReplicaRole::None,
                     }]
             {
                 return Ok(());
             }
-            if local.current_role == 3 {
+            if local.current_role == NativeReplicaRole::Secondary {
                 return Err("deleted removal destination cannot report a live membership".into());
             }
         }
@@ -2056,10 +2083,12 @@ impl Ledger {
             (inventory.removal.clone(), Some(&inventory.removal)),
             (completed_removal.clone(), None),
         ];
-        let promoted = inventory
-            .supersession
-            .as_ref()
-            .and_then(|f| f.replicas.0.iter().find(|r| r.current_role == 4));
+        let promoted = inventory.supersession.as_ref().and_then(|f| {
+            f.replicas
+                .0
+                .iter()
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
+        });
         if let Some(failover) = inventory.supersession.as_ref().filter(|_| !known_loss) {
             views.extend([
                 (failover.clone(), None),
@@ -2191,10 +2220,10 @@ impl Ledger {
                     .count()
                     == 1
                 && swap.body.configuration.replicas.0.iter().any(|r| {
-                    r.previous_role == 4
-                        && r.current_role == 1
+                    r.previous_role == NativeReplicaRole::Primary
+                        && r.current_role == NativeReplicaRole::None
                         && !r.up
-                        && r.state == 3
+                        && r.state == NativeReplicaState::Dropped
                         && self.placements.iter().any(|p| {
                             p.launch.node == r.node
                                 && (p.loss_reported
@@ -2303,14 +2332,17 @@ impl Ledger {
                     let lost_primary = (repair.is_none()
                         && failover.as_ref().is_some_and(|inventory| {
                             inventory.configuration.replicas.0.iter().any(|r| {
-                                r.node == placement.launch.node && r.previous_role == 4 && !r.up
+                                r.node == placement.launch.node
+                                    && r.previous_role == NativeReplicaRole::Primary
+                                    && !r.up
                             })
                         }))
                         || (placement.loss_reported
                             && removal.as_ref().is_some_and(|inventory| {
                                 inventory.removal.replicas.0.iter().any(|r| {
                                     r.node == placement.launch.node
-                                        && (r.previous_role == 4 || r.current_role == 1)
+                                        && (r.previous_role == NativeReplicaRole::Primary
+                                            || r.current_role == NativeReplicaRole::None)
                                 })
                             }));
                     placement.bootstrap != Bootstrap::Admitted
@@ -2424,7 +2456,7 @@ impl Ledger {
                     && !info.local_deleted
                     && !info.report_from_primary
                     && info.intermediate == Epoch::default()
-                    && info.replicas.0[0].intermediate_role == 1
+                    && info.replicas.0[0].intermediate_role == NativeReplicaRole::None
                 {
                     return Ok(None);
                 }
@@ -2445,11 +2477,14 @@ impl Ledger {
                 s.body.configuration.unit.target == 3
                     && s.body.configuration.unit.minimum == 2
                     && s.body.configuration.replicas.0.iter().any(|r| {
-                        r.node == self.placements[index].launch.node && r.current_role == 3
+                        r.node == self.placements[index].launch.node
+                            && r.current_role == NativeReplicaRole::Secondary
                     })
                     && s.reply.as_ref().is_none_or(|reply| {
                         reply.replicas.0.iter().any(|r| {
-                            r.node == self.placements[index].launch.node && !r.up && r.state == 3
+                            r.node == self.placements[index].launch.node
+                                && !r.up
+                                && r.state == NativeReplicaState::Dropped
                         })
                     })
             });
@@ -2462,12 +2497,9 @@ impl Ledger {
                 (s.reply.is_none() || failover)
                     && !old_failover_primary
                     && !planned_secondary
-                    && s.body
-                        .configuration
-                        .replicas
-                        .0
-                        .iter()
-                        .any(|r| r.node == placement.launch.node && r.up && r.current_role >= 3)
+                    && s.body.configuration.replicas.0.iter().any(|r| {
+                        r.node == placement.launch.node && r.up && r.current_role.is_active()
+                    })
             }) {
                 swap.unknown = true;
             }
@@ -3287,7 +3319,9 @@ impl Ledger {
         if let Some(swap) = self.swap.as_mut().filter(|s| {
             !old_primary
                 && s.body.configuration.replicas.0.iter().any(|r| {
-                    r.node == self.placements[index].launch.node && r.up && r.current_role >= 3
+                    r.node == self.placements[index].launch.node
+                        && r.up
+                        && r.current_role.is_active()
                 })
         }) {
             swap.unknown = true;
@@ -3466,7 +3500,9 @@ impl Ledger {
         let mut endpoint = None;
         if body.error == 0 {
             if removing {
-                if placement.desired != Desired::Absent || body.replica.state != 3 {
+                if placement.desired != Desired::Absent
+                    || body.replica.state != NativeReplicaState::Dropped
+                {
                     return Err("Remove reply is not the requested disposed instance".into());
                 }
                 if placement.launch.profile.stateful()
@@ -3475,7 +3511,7 @@ impl Ledger {
                     return Err("DeleteReplica reply is not the native dropped description".into());
                 }
             } else {
-                if body.replica.state != 2 || !body.replica.up {
+                if body.replica.state != NativeReplicaState::Ready || !body.replica.up {
                     return Err("Add reply is not a ready replica".into());
                 }
                 let address: SocketAddr = body
@@ -3569,9 +3605,9 @@ impl Ledger {
             if replica.node != expected.replica.node
                 || replica.id != expected.replica.id
                 || replica.instance != expected.replica.instance
-                || replica.current_role != 2
-                || replica.previous_role != 1
-                || replica.state != 3
+                || replica.current_role != NativeReplicaRole::Idle
+                || replica.previous_role != NativeReplicaRole::None
+                || replica.state != NativeReplicaState::Dropped
                 || !replica.up
                 || !replica.service_endpoint.is_empty()
             {
@@ -3604,13 +3640,11 @@ impl Ledger {
                             .replicas
                             .0
                             .iter()
-                            .all(|r| r.up && r.state == 2)
-                        && c.body
-                            .configuration
-                            .replicas
-                            .0
-                            .iter()
-                            .any(|r| r.previous_role == 4 && r.current_role == 3)))
+                            .all(|r| r.up && r.state == NativeReplicaState::Ready)
+                        && c.body.configuration.replicas.0.iter().any(|r| {
+                            r.previous_role == NativeReplicaRole::Primary
+                                && r.current_role == NativeReplicaRole::Secondary
+                        })))
                     && c.body.configuration.unit == proof.disposal.body.unit
                     && c.body.configuration.service == proof.disposal.body.service
             })
@@ -3624,9 +3658,9 @@ impl Ledger {
                 .find(|r| r.node == placement.launch.node)
                 .ok_or("retirement proof omitted configured destination")?
                 .clone();
-            replica.state = 3;
+            replica.state = NativeReplicaState::Dropped;
             if config.body.configuration.unit.target == 3 {
-                if replica.current_role != 3 {
+                if replica.current_role != NativeReplicaRole::Secondary {
                     return Err("planned restart disposal requires a Secondary".into());
                 }
                 replica.first_lsn = proof.disposal.body.replica.first_lsn;
@@ -3789,12 +3823,9 @@ impl Ledger {
                 .as_ref()
                 .and_then(|s| {
                     self.placements.iter().position(|p| {
-                        s.body
-                            .configuration
-                            .replicas
-                            .0
-                            .iter()
-                            .any(|r| r.node == p.launch.node && r.previous_role == 4)
+                        s.body.configuration.replicas.0.iter().any(|r| {
+                            r.node == p.launch.node && r.previous_role == NativeReplicaRole::Primary
+                        })
                     })
                 })
                 .unwrap_or(0)
@@ -3821,12 +3852,9 @@ impl Ledger {
             .as_ref()
             .and_then(|s| {
                 self.placements.iter().position(|p| {
-                    s.body
-                        .configuration
-                        .replicas
-                        .0
-                        .iter()
-                        .any(|r| r.node == p.launch.node && r.current_role == 4)
+                    s.body.configuration.replicas.0.iter().any(|r| {
+                        r.node == p.launch.node && r.current_role == NativeReplicaRole::Primary
+                    })
                 })
             })
             .unwrap_or(0)
@@ -3840,8 +3868,11 @@ impl Ledger {
                 self.placements.iter().position(|p| {
                     s.body.configuration.replicas.0.iter().any(|r| {
                         r.node == p.launch.node
-                            && r.previous_role == 4
-                            && matches!(r.current_role, 1 | 3)
+                            && r.previous_role == NativeReplicaRole::Primary
+                            && matches!(
+                                r.current_role,
+                                NativeReplicaRole::None | NativeReplicaRole::Secondary
+                            )
                             && !r.up
                     })
                 })
@@ -3918,7 +3949,8 @@ impl Ledger {
                 p.loss_reported
                     && !self.known_spare_loss(p)
                     && active.body.configuration.replicas.0.iter().any(|r| {
-                        r.node == p.launch.node && (r.previous_role >= 3 || r.current_role >= 3)
+                        r.node == p.launch.node
+                            && (r.previous_role.is_active() || r.current_role.is_active())
                     })
             })
             .collect();
@@ -3946,7 +3978,7 @@ impl Ledger {
             .replicas
             .0
             .iter()
-            .find(|r| r.current_role == 4)
+            .find(|r| r.current_role == NativeReplicaRole::Primary)
             .ok_or("replacement requires a surviving Primary")?;
         if self.generation_pending()
             || self.idle_removal.is_some()
@@ -3989,9 +4021,9 @@ impl Ledger {
         let mut build = target.body()?;
         build.unit = previous.unit.clone();
         build.service = active.body.configuration.service.clone();
-        build.replica.previous_role = 1;
-        build.replica.current_role = 2;
-        build.replica.state = 1;
+        build.replica.previous_role = NativeReplicaRole::None;
+        build.replica.current_role = NativeReplicaRole::Idle;
+        build.replica.state = NativeReplicaState::InBuild;
         let repair = ReplicaRepair {
             predecessor: lost.body()?,
             old_profile: lost.profile.clone().ok_or("missing lost host profile")?,
@@ -4066,11 +4098,9 @@ impl Ledger {
             || self.idle_deletion.is_some()
             || !target.loss_reported
             || !target.remove_received
-            || !previous
-                .replicas
-                .0
-                .iter()
-                .any(|r| r.node == target.launch.node && r.current_role == 3)
+            || !previous.replicas.0.iter().any(|r| {
+                r.node == target.launch.node && r.current_role == NativeReplicaRole::Secondary
+            })
             || previous.replicas.0.len() != self.placements.len()
             || self.placements.iter().enumerate().any(|(i, p)| {
                 !p.link_alive
@@ -4108,8 +4138,8 @@ impl Ledger {
         for r in &mut body.configuration.replicas.0 {
             r.previous_role = r.current_role;
             if r.node == target.launch.node {
-                r.current_role = 1;
-                r.state = 3;
+                r.current_role = NativeReplicaRole::None;
+                r.state = NativeReplicaState::Dropped;
                 r.up = false;
             }
         }
@@ -4250,11 +4280,9 @@ impl Ledger {
             );
         }
         let previous = active.reply.as_ref().expect("completed configuration");
-        let in_cc = previous
-            .replicas
-            .0
-            .iter()
-            .any(|r| r.node == target.launch.node && r.current_role == 3 && !r.up);
+        let in_cc = previous.replicas.0.iter().any(|r| {
+            r.node == target.launch.node && r.current_role == NativeReplicaRole::Secondary && !r.up
+        });
         if !in_cc
             && previous.replicas.0.iter().any(|r| !r.up)
             && (previous.replicas.0.len() != previous.unit.minimum as usize
@@ -4263,7 +4291,7 @@ impl Ledger {
                     .replicas
                     .0
                     .iter()
-                    .any(|r| !r.up && r.current_role != 3))
+                    .any(|r| !r.up && r.current_role != NativeReplicaRole::Secondary))
         {
             return Err(
                 "repair the down current-configuration member before the removed placement".into(),
@@ -4291,7 +4319,7 @@ impl Ledger {
             for r in &mut body.configuration.replicas.0 {
                 r.previous_role = r.current_role;
                 if r.node == target.launch.node {
-                    r.current_role = 1;
+                    r.current_role = NativeReplicaRole::None;
                 }
             }
             Some(ActiveConfiguration {
@@ -4356,11 +4384,14 @@ impl Ledger {
         }
         let reply = swap.reply.as_ref().expect("completed failover");
         if reply.replicas.0.len() + 1 != self.placements.len()
-            || reply
-                .replicas
-                .0
-                .iter()
-                .any(|r| !r.up || r.state != 2 || !matches!(r.current_role, 3 | 4))
+            || reply.replicas.0.iter().any(|r| {
+                !r.up
+                    || r.state != NativeReplicaState::Ready
+                    || !matches!(
+                        r.current_role,
+                        NativeReplicaRole::Secondary | NativeReplicaRole::Primary
+                    )
+            })
         {
             return Err("repair requires exactly one missing configured member".into());
         }
@@ -4390,9 +4421,9 @@ impl Ledger {
         body.replica = self.placements[destination].body()?.replica;
         body.replica.id = next;
         body.replica.instance = next;
-        body.replica.previous_role = 1;
-        body.replica.current_role = 2;
-        body.replica.state = 1;
+        body.replica.previous_role = NativeReplicaRole::None;
+        body.replica.current_role = NativeReplicaRole::Idle;
+        body.replica.state = NativeReplicaState::InBuild;
         body.replica.up = true;
         body.replica.first_lsn = -1;
         body.replica.last_lsn = -1;
@@ -4487,9 +4518,9 @@ impl Ledger {
             return Ok(());
         }
         if body.error == 0
-            && (body.replica.current_role != 2
-                || body.replica.previous_role != 1
-                || body.replica.state != 2
+            && (body.replica.current_role != NativeReplicaRole::Idle
+                || body.replica.previous_role != NativeReplicaRole::None
+                || body.replica.state != NativeReplicaState::Ready
                 || !body.replica.up
                 || body.replica.version != expected.replica.version
                 || !body.replica.service_endpoint.is_empty()
@@ -4547,14 +4578,14 @@ impl Ledger {
         for r in &mut body.configuration.replicas.0 {
             r.previous_role = r.current_role;
             if !r.up || (repair.uses_spare() && r.node == repair.predecessor.replica.node) {
-                r.current_role = 1;
+                r.current_role = NativeReplicaRole::None;
                 r.up = false;
-                r.state = 3;
+                r.state = NativeReplicaState::Dropped;
             }
         }
         let mut replica = built.replica.clone();
-        replica.previous_role = 2;
-        replica.current_role = 3;
+        replica.previous_role = NativeReplicaRole::Idle;
+        replica.current_role = NativeReplicaRole::Secondary;
         body.configuration.replicas.0.push(replica);
         repair.configuration = Some(ActiveConfiguration {
             body: body.clone(),
@@ -4573,9 +4604,9 @@ impl Ledger {
         let config = repair.configuration.as_mut().expect("repair configuration");
         let mut expected = config.body.configuration.clone();
         expected.unit.previous = Epoch::default();
-        expected.replicas.0.retain(|r| r.current_role >= 3);
+        expected.replicas.0.retain(|r| r.current_role.is_active());
         for r in &mut expected.replicas.0 {
-            r.previous_role = 1;
+            r.previous_role = NativeReplicaRole::None;
         }
         if index != primary
             || !live
@@ -4677,7 +4708,7 @@ impl Ledger {
             return Ok(());
         }
         let mut replica = expected.replica.clone();
-        replica.state = 3;
+        replica.state = NativeReplicaState::Dropped;
         replica.replication_endpoint = body.replica.replication_endpoint.clone();
         if body.replica != replica || replica.replication_endpoint.is_empty() {
             return Err("repair RemoveReplicaReply changed the cancelled Idle".into());
@@ -4889,7 +4920,7 @@ impl Ledger {
         }
         let mut body = self.placements[0].body()?;
         body.replica = self.placements[destination].body()?.replica;
-        body.replica.current_role = 2;
+        body.replica.current_role = NativeReplicaRole::Idle;
         if body.replica.version != body.service.version {
             return Err("peer packages do not share the original deployment version".into());
         }
@@ -4952,7 +4983,7 @@ impl Ledger {
             .ready_replica
             .clone()
             .ok_or("missing original Primary reply")?;
-        primary.previous_role = 4;
+        primary.previous_role = NativeReplicaRole::Primary;
         let mut replicas = vec![primary];
         for idle in &self.idles {
             let reply = idle
@@ -4961,8 +4992,8 @@ impl Ledger {
                 .filter(|r| r.error == 0 && !idle.cancelled && !idle.unknown)
                 .ok_or("configuration requires successful FM Idle build")?;
             let mut secondary = reply.replica.clone();
-            secondary.previous_role = 2;
-            secondary.current_role = 3;
+            secondary.previous_role = NativeReplicaRole::Idle;
+            secondary.current_role = NativeReplicaRole::Secondary;
             replicas.push(secondary);
         }
         let mut body = self.placements[0].body()?;
@@ -5092,8 +5123,8 @@ impl Ledger {
             .ok_or("service version exhausted")?;
         for r in &mut body.configuration.replicas.0 {
             r.previous_role = r.current_role;
-            if r.current_role == 3 {
-                r.current_role = 1;
+            if r.current_role == NativeReplicaRole::Secondary {
+                r.current_role = NativeReplicaRole::None;
             }
         }
         self.placements[1].active_unit = Some(body.configuration.unit.clone());
@@ -5132,9 +5163,9 @@ impl Ledger {
             let config = repair.removal.as_mut().expect("removal");
             let mut expected = config.body.configuration.clone();
             expected.unit.previous = Epoch::default();
-            expected.replicas.0.retain(|r| r.current_role >= 3);
+            expected.replicas.0.retain(|r| r.current_role.is_active());
             for r in &mut expected.replicas.0 {
-                r.previous_role = 1;
+                r.previous_role = NativeReplicaRole::None;
             }
             if index != primary
                 || !live
@@ -5181,9 +5212,9 @@ impl Ledger {
         let mut expected = config.body.configuration.clone();
         expected.unit.previous = Epoch::default();
         for replica in &mut expected.replicas.0 {
-            replica.previous_role = 1;
+            replica.previous_role = NativeReplicaRole::None;
         }
-        expected.replicas.0.retain(|r| r.current_role >= 3);
+        expected.replicas.0.retain(|r| r.current_role.is_active());
         if body.unit != expected.unit || body.replicas != expected.replicas {
             return Ok(());
         }
@@ -5283,11 +5314,11 @@ impl Ledger {
                     .and_then(|c| c.reply.as_ref())
                     .and_then(|reply| {
                         self.placements.iter().position(|p| {
-                            reply
-                                .replicas
-                                .0
-                                .iter()
-                                .any(|r| r.node == p.launch.node && r.current_role == 3 && r.up)
+                            reply.replicas.0.iter().any(|r| {
+                                r.node == p.launch.node
+                                    && r.current_role == NativeReplicaRole::Secondary
+                                    && r.up
+                            })
                         })
                     })
                     .ok_or("Primary transfer requires a completed active Secondary")?
@@ -5338,7 +5369,7 @@ impl Ledger {
                     .replicas
                     .0
                     .iter()
-                    .any(|r| r.node == candidate && r.current_role == 4)
+                    .any(|r| r.node == candidate && r.current_role == NativeReplicaRole::Primary)
             {
                 if !self.healthy_transfer_members(&swap.body.configuration.replicas.0) {
                     return Err("Primary transfer requires healthy current members".into());
@@ -5366,7 +5397,7 @@ impl Ledger {
                 .replicas
                 .0
                 .iter()
-                .any(|r| r.node == candidate && r.current_role == 3)
+                .any(|r| r.node == candidate && r.current_role == NativeReplicaRole::Secondary)
             || !self.healthy_transfer_members(&reply.replicas.0)
         {
             return Err("Primary transfer requires a healthy current Secondary and every current member Running".into());
@@ -5383,7 +5414,11 @@ impl Ledger {
         body.configuration.replicas = reply.replicas.clone();
         for r in &mut body.configuration.replicas.0 {
             r.previous_role = r.current_role;
-            r.current_role = if r.node == candidate { 4 } else { 3 };
+            r.current_role = if r.node == candidate {
+                NativeReplicaRole::Primary
+            } else {
+                NativeReplicaRole::Secondary
+            };
         }
         body.phase0_duration = i64::MAX;
         for p in &mut self.placements {
@@ -5419,8 +5454,11 @@ impl Ledger {
     }
     fn healthy_transfer_members(&self, replicas: &[Replica]) -> bool {
         replicas.iter().all(|r| {
-            r.up && r.state == 2
-                && matches!(r.current_role, 3 | 4)
+            r.up && r.state == NativeReplicaState::Ready
+                && matches!(
+                    r.current_role,
+                    NativeReplicaRole::Secondary | NativeReplicaRole::Primary
+                )
                 && self.placements.iter().any(|p| {
                     p.launch.node == r.node
                         && p.link_alive
@@ -5512,7 +5550,7 @@ impl Ledger {
                     .replicas
                     .0
                     .iter()
-                    .filter(|r| r.current_role >= 3)
+                    .filter(|r| r.current_role.is_active())
                     .count()
             || swap
                 .body
@@ -5520,7 +5558,7 @@ impl Ledger {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.current_role >= 3)
+                .filter(|r| r.current_role.is_active())
                 .any(|expected| {
                     body.replicas
                         .0
@@ -5548,14 +5586,14 @@ impl Ledger {
             let restarted = !failover
                 && body.unit.target == 3
                 && body.unit.minimum == 2
-                && r.current_role == 3
+                && r.current_role == NativeReplicaRole::Secondary
                 && !r.up
-                && r.state == 3
+                && r.state == NativeReplicaState::Dropped
                 && body
                     .replicas
                     .0
                     .iter()
-                    .filter(|r| r.up && r.state == 2)
+                    .filter(|r| r.up && r.state == NativeReplicaState::Ready)
                     .count()
                     >= 2;
             if restarted {
@@ -5567,7 +5605,7 @@ impl Ledger {
             actual.last_lsn = expected.last_lsn;
             actual.service_endpoint = expected.service_endpoint.clone();
             if actual != *expected
-                || r.previous_role != 1
+                || r.previous_role != NativeReplicaRole::None
                 || (r.up
                     && if same_primary_node_down {
                         r.first_lsn != expected.first_lsn || r.last_lsn != expected.last_lsn
@@ -5577,7 +5615,7 @@ impl Ledger {
             {
                 return Ok(());
             }
-            if r.current_role == 4 {
+            if r.current_role == NativeReplicaRole::Primary {
                 let endpoint: std::net::SocketAddr = r
                     .service_endpoint
                     .parse()
@@ -5597,7 +5635,7 @@ impl Ledger {
                     .replicas
                     .0
                     .iter()
-                    .any(|r| r.node == p.launch.node && r.up && r.current_role >= 3)
+                    .any(|r| r.node == p.launch.node && r.up && r.current_role.is_active())
             {
                 continue;
             }
@@ -5612,7 +5650,8 @@ impl Ledger {
                 p.endpoint = None;
                 continue;
             }
-            p.endpoint = (replica.current_role == 4).then(|| replica.service_endpoint.clone());
+            p.endpoint = (replica.current_role == NativeReplicaRole::Primary)
+                .then(|| replica.service_endpoint.clone());
             p.ready_replica = Some(replica);
             p.active_unit = Some(body.unit.clone());
             p.observed = Observed::Running;
@@ -5677,12 +5716,10 @@ impl Ledger {
                     self.placements
                         .iter()
                         .position(|p| {
-                            swap.body
-                                .configuration
-                                .replicas
-                                .0
-                                .iter()
-                                .any(|r| r.node == p.launch.node && r.previous_role == 4)
+                            swap.body.configuration.replicas.0.iter().any(|r| {
+                                r.node == p.launch.node
+                                    && r.previous_role == NativeReplicaRole::Primary
+                            })
                         })
                         .map(|i| i + 1),
                 )
@@ -5769,9 +5806,9 @@ impl Ledger {
         let (replica, incarnation) = self.placements[1].launch.idle_successor()?;
         let mut body = self.placements[0].body()?;
         body.replica = self.placements[1].body_for(replica, incarnation)?.replica;
-        body.replica.previous_role = 1;
-        body.replica.current_role = 2;
-        body.replica.state = 1;
+        body.replica.previous_role = NativeReplicaRole::None;
+        body.replica.current_role = NativeReplicaRole::Idle;
+        body.replica.state = NativeReplicaState::InBuild;
         body.replica.up = true;
         body.replica.service_endpoint.clear();
         body.replica.replication_endpoint.clear();
@@ -5839,9 +5876,9 @@ impl Ledger {
             return Ok(());
         }
         if body.error == 0
-            && (body.replica.current_role != 2
-                || body.replica.previous_role != 1
-                || body.replica.state != 2
+            && (body.replica.current_role != NativeReplicaRole::Idle
+                || body.replica.previous_role != NativeReplicaRole::None
+                || body.replica.state != NativeReplicaState::Ready
                 || !body.replica.up
                 || body.replica.version != idle.body.replica.version
                 || !body.replica.service_endpoint.is_empty()
@@ -6028,7 +6065,7 @@ impl Ledger {
         }
         let mut body = self.placements[0].body()?;
         body.replica = self.placements[1].body()?.replica;
-        body.replica.current_role = 2;
+        body.replica.current_role = NativeReplicaRole::Idle;
         if body.replica.version != body.service.version {
             return Err("peer packages do not share the original deployment version".into());
         }
@@ -6075,14 +6112,14 @@ impl Ledger {
         {
             return Ok(());
         }
-        let echoed_creation = removal.body.replica.state == 1
+        let echoed_creation = removal.body.replica.state == NativeReplicaState::InBuild
             && removal.body.replica.replication_endpoint.is_empty()
             && body.replica == removal.body.replica;
         if !echoed_creation
             && (removal.failed_creation
-                || body.replica.current_role != 2
-                || body.replica.previous_role != 1
-                || body.replica.state != 3
+                || body.replica.current_role != NativeReplicaRole::Idle
+                || body.replica.previous_role != NativeReplicaRole::None
+                || body.replica.state != NativeReplicaState::Dropped
                 || !body.replica.up
                 || body.replica.version != removal.body.replica.version
                 || !body.replica.service_endpoint.is_empty()
@@ -6158,7 +6195,7 @@ impl Ledger {
             completion: Some(removal.reply.as_ref().map(|reply| {
                 if removal.failed_creation {
                     RemovalCompletion::FailedCreationRetired
-                } else if reply.replica.state == 1 {
+                } else if reply.replica.state == NativeReplicaState::InBuild {
                     RemovalCompletion::CreationCancelled
                 } else {
                     RemovalCompletion::ReplicatorRemoved

@@ -4,6 +4,7 @@ use crate::{
     wire,
 };
 use fube_ra::protocol::*;
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 use tokio::time::Instant;
@@ -1031,8 +1032,8 @@ impl Manager {
                     reply.error == 0
                         && reply.replica.id == self.ledger.placements[1].replica
                         && reply.replica.instance == self.ledger.placements[1].incarnation
-                        && reply.replica.current_role == 2
-                        && reply.replica.state == 1
+                        && reply.replica.current_role == NativeReplicaRole::Idle
+                        && reply.replica.state == NativeReplicaState::InBuild
                         && !reply.replica.replication_endpoint.is_empty()
                 })
                 && local.is_some_and(|local| local.open);

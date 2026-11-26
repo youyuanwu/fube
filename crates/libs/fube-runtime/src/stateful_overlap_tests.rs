@@ -1,4 +1,5 @@
 use super::*;
+use fube_core::protocol::NativeReplicaRole;
 
 #[tokio::test]
 async fn cancel_before_catchup_install_survives_blocked_configuration_callback() {
@@ -85,7 +86,7 @@ async fn primary_epoch_change_suppresses_old_build_reply_without_retiring_siblin
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut target = peer(&open.local, 2);
-    target.current_role = 2;
+    target.current_role = NativeReplicaRole::Idle;
     let build = control(&open, "ReplicatorBuildIdleReplica", vec![target]);
     h.send("ReplicatorBuildIdleReplica", &build).await;
     wait_event(&calls, "build", 1).await;
@@ -132,13 +133,13 @@ async fn abort_cancels_and_drains_build_before_per_replica_disposal_ack() {
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut target = peer(&open.local, 2);
-    target.current_role = 2;
+    target.current_role = NativeReplicaRole::Idle;
     let build = control(&open, "ReplicatorBuildIdleReplica", vec![target]);
     h.send("ReplicatorBuildIdleReplica", &build).await;
     wait_event(&calls, "build", 1).await;
     let mut close = open.clone();
     close.flags = 4;
-    close.local.current_role = 1;
+    close.local.current_role = NativeReplicaRole::None;
     h.send("ReplicaClose", &close).await;
     h.engine
         .shared
@@ -167,13 +168,13 @@ async fn query_observes_blocked_role_callback_without_protocol_locks_or_access_g
     let mut h = Harness::new().await;
     let calls = register(&h);
     let mut open = request(&h, 2, 1, 30);
-    open.local.current_role = 2;
+    open.local.current_role = NativeReplicaRole::Idle;
     h.send("ReplicaOpen", &open).await;
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut promote = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
-    promote.local.current_role = 4;
-    promote.remote.0[0].current_role = 4;
+    promote.local.current_role = NativeReplicaRole::Primary;
+    promote.remote.0[0].current_role = NativeReplicaRole::Primary;
     promote.unit.current.configuration += 1 << 32;
     promote.unit.previous = open.unit.current.clone();
     promote.flags = 2;

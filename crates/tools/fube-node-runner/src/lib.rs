@@ -245,7 +245,7 @@ impl Owner {
             "primary_swap_stage": state.and_then(|state| state.swap.as_ref())
                 .map(|swap| format!("{:?}", swap.stage)),
             "configuration_members": state.and_then(|state| state.reconfiguration.as_ref())
-                .map(|configuration| configuration.request.replicas.0.iter().filter(|replica| replica.current_role >= 3).count()),
+                .map(|configuration| configuration.request.replicas.0.iter().filter(|replica| replica.current_role.is_active()).count()),
             "generations": self.node.as_ref().map(|node| {
                 let state = node.generation_state();
                 serde_json::json!({

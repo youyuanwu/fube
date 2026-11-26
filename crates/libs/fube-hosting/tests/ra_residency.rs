@@ -3,6 +3,7 @@
 //! H1 equal-version registration lookup is real. No native execution, live node,
 //! deployment, Hosting event router, RAP/physical teardown or native wire receipt
 //! serialization is qualified. Old ra_bridge.rs remains simulated usage evidence.
+use fube_core::protocol::NativeReplicaState;
 mod common;
 #[path = "support/residency_bridge.rs"]
 mod residency_bridge;
@@ -193,7 +194,7 @@ fn body(
     body.replica.node = admission().local_node;
     body.replica.id = 40;
     body.replica.instance = 50;
-    body.replica.state = 1;
+    body.replica.state = NativeReplicaState::InBuild;
     body.replica.version = residency_bridge::version(version);
     body.service.version = residency_bridge::version(version);
     body.service.name = "fabric:/app/service".into();

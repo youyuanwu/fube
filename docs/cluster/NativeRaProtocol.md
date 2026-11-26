@@ -793,6 +793,13 @@ stored C++ enum/HRESULT value is 32-bit. Negative HRESULTs are sign-extended;
 do not zero-extend their u32 bit patterns. Integer serialization is the native
 stream's compression, not a fixed eight-byte error payload.
 
+Rust replica roles and states use the shared
+[`NativeReplicaRole`/`NativeReplicaState`](../../crates/libs/fube-core/src/protocol/replica.rs)
+types, with explicit signed-i64 serialization and lossless `Unrecognized(code)`
+wire values. Admission still rejects unsupported values. These native roles are
+not the public SDK `ReplicaRole`; conversion is explicit and checked, and the
+valid native `Unknown=0` is distinct from an unrecognized numeric code.
+
 This scalar rule does not override `ArrayUtility`: a vector of a type marked
 `DEFINE_AS_BLITTABLE` without a specific array utility is serialized as raw
 byte array, `count * sizeof(T)` ([serialization:134–164,4997–5001][serialization]).

@@ -1014,7 +1014,7 @@ mod tests {
         }
 
         fn disposed(mut reply: AddInstanceReply) -> AddInstanceReply {
-            reply.replica.state = 3;
+            reply.replica.state = NativeReplicaState::Dropped;
             reply.replica.up = false;
             reply.replica.version = VersionInstance::invalid();
             reply.replica.service_endpoint.clear();
@@ -1148,7 +1148,7 @@ mod tests {
                         replicas: ObjectArray(vec![ReplicaInfo {
                             description: Replica {
                                 up: false,
-                                state: 2,
+                                state: NativeReplicaState::Ready,
                                 version: VersionInstance::invalid(),
                                 ..body.replica
                             },

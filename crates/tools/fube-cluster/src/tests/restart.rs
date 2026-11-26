@@ -1,4 +1,6 @@
 use super::*;
+use fube_ra::protocol::NativeReplicaRole;
+use fube_ra::protocol::NativeReplicaState;
 
 #[tokio::test]
 async fn manual_spare_replacement_uses_public_controls_and_semantic_waits() {
@@ -233,16 +235,16 @@ fn completed(body: &DoReconfiguration) -> ConfigurationReply {
         error: 0,
     };
     reply.unit.previous = Epoch::default();
-    reply.replicas.0.retain(|r| r.current_role >= 3);
+    reply.replicas.0.retain(|r| r.current_role.is_active());
     for replica in &mut reply.replicas.0 {
-        replica.previous_role = 1;
+        replica.previous_role = NativeReplicaRole::None;
         if body.configuration.unit.current.configuration & !0xffff_ffff
             != body.configuration.unit.previous.configuration & !0xffff_ffff
         {
             replica.first_lsn = 0;
             replica.last_lsn = 0;
         }
-        replica.service_endpoint = if replica.current_role == 4 {
+        replica.service_endpoint = if replica.current_role == NativeReplicaRole::Primary {
             "127.0.0.1:23459".into()
         } else {
             String::new()
@@ -325,7 +327,7 @@ fn confirmed_node_down_reconfigures_without_the_dead_link_and_rejoin_is_incarnat
         assert!(ledger.begin_node_replica_rebuild(lost, lost).unwrap());
         let build = ledger.repair.as_ref().unwrap().build.body.clone();
         let mut replica = build.replica.clone();
-        replica.state = 2;
+        replica.state = NativeReplicaState::Ready;
         replica.first_lsn = 0;
         replica.last_lsn = 0;
         replica.replication_endpoint = "127.0.0.1:23460".into();
@@ -469,7 +471,7 @@ fn manual_node_recovery_is_scoped_retained_and_preserves_minimum() {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.current_role >= 3)
+                .filter(|r| r.current_role.is_active())
                 .count(),
             3
         );
@@ -524,7 +526,7 @@ fn manual_node_recovery_is_scoped_retained_and_preserves_minimum() {
         changed.node = Some(((lost + 1) % 3 + 1) as u8);
         assert!(ledger.accept(changed).is_err());
         let mut replica = owner.replica.clone();
-        replica.state = 2;
+        replica.state = NativeReplicaState::Ready;
         replica.replication_endpoint = "127.0.0.1:23460".into();
         ledger
             .idle_reply(
@@ -547,7 +549,7 @@ fn manual_node_recovery_is_scoped_retained_and_preserves_minimum() {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.current_role >= 3)
+                .filter(|r| r.current_role.is_active())
                 .count(),
             3
         );
@@ -734,7 +736,7 @@ fn scoped_cancellation_owns_the_exact_pending_rebuild() {
         Accepted::Duplicate(_)
     ));
     let mut removed = removal.replica;
-    removed.state = 3;
+    removed.state = NativeReplicaState::Dropped;
     removed.replication_endpoint = "127.0.0.1:23460".into();
     ledger
         .idle_removal_reply(

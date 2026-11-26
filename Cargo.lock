@@ -365,6 +365,8 @@ version = "0.1.0"
 dependencies = [
  "fubst",
  "furpc",
+ "serde",
+ "serde_json",
  "tokio",
  "tower-service",
  "uuid",
@@ -454,6 +456,7 @@ name = "fube-ra"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "fube-core",
  "fube-ra-store",
  "fubst",
  "furpc",

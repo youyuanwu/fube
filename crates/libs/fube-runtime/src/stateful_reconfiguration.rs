@@ -1,4 +1,5 @@
 use super::*;
+use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 
 const DEMOTE_COMPLETED: i64 = 0x80071d24u32 as i32 as i64;
 const STATE_CHANGED: i64 = 0x80071d28u32 as i32 as i64;
@@ -761,7 +762,11 @@ impl Registry {
                             && ((old.ready
                                 && request.remote.0.iter().any(|r| {
                                     r.node.id.0.as_slice() == incoming.node_id
-                                        && matches!(r.state, 0 | 1)
+                                        && matches!(
+                                            r.state,
+                                            NativeReplicaState::StandBy
+                                                | NativeReplicaState::InBuild
+                                        )
                                 }))
                                 || (!old.up && incoming.up)))
                     {
@@ -1621,7 +1626,7 @@ fn information(replica: &w::Replica, must_catch_up: bool) -> Result<NativeReplic
     if replica.id <= 0
         || replica.instance <= 0
         || replica.node.id.0.len() != 16
-        || !(0..=3).contains(&replica.state)
+        || !replica.state.is_known()
     {
         return Err(Error::Protocol("invalid remote replica descriptor"));
     }
@@ -1639,7 +1644,7 @@ fn information(replica: &w::Replica, must_catch_up: bool) -> Result<NativeReplic
         role: role(replica.current_role)?,
         previous_role: role(replica.previous_role)?,
         up: replica.up,
-        ready: replica.state == 2,
+        ready: replica.state == NativeReplicaState::Ready,
         address: replica.replication_endpoint.clone(),
         progress: ReplicationProgress {
             first: replica.first_lsn,
@@ -1664,19 +1669,19 @@ fn project(
     let mut local_seen = false;
     let (mut local_cc, mut local_pc) = (false, false);
     for replica in &request.remote.0 {
-        let mut info = information(replica, replica.current_role == 4)?;
+        let mut info = information(replica, replica.current_role == NativeReplicaRole::Primary)?;
         let (previous, count) = nodes.entry(info.node_id).or_insert((replica, 0));
         *count += 1;
         let fenced_replacement = |old: &w::Replica, fresh: &w::Replica| {
             old.node.instance < fresh.node.instance
-                && old.previous_role == 3
-                && old.current_role == 1
+                && old.previous_role == NativeReplicaRole::Secondary
+                && old.current_role == NativeReplicaRole::None
                 && !old.up
-                && old.state == 3
-                && fresh.previous_role == 2
-                && fresh.current_role == 3
+                && old.state == NativeReplicaState::Dropped
+                && fresh.previous_role == NativeReplicaRole::Idle
+                && fresh.current_role == NativeReplicaRole::Secondary
                 && fresh.up
-                && fresh.state == 2
+                && fresh.state == NativeReplicaState::Ready
                 && old.id < fresh.id
                 && old.instance < fresh.instance
         };
@@ -1688,13 +1693,13 @@ fn project(
         {
             return Err(Error::Protocol("duplicate configuration identity/node"));
         }
-        if replica.current_role >= 3 {
+        if replica.current_role.is_active() {
             ncc += 1;
-            ndcc += usize::from(replica.state != 3);
+            ndcc += usize::from(replica.state != NativeReplicaState::Dropped);
         }
-        if replica.previous_role >= 3 {
+        if replica.previous_role.is_active() {
             npc += 1;
-            ndpc += usize::from(replica.state != 3);
+            ndpc += usize::from(replica.state != NativeReplicaState::Dropped);
         }
         if replica.id == request.local.id {
             if replica.instance != request.local.instance
@@ -1705,22 +1710,24 @@ fn project(
                 return Err(Error::Protocol("configuration changed local owner"));
             }
             local_seen = true;
-            local_cc = replica.current_role >= 3 && replica.state != 3;
-            local_pc = replica.previous_role >= 3 && replica.state != 3;
+            local_cc =
+                replica.current_role.is_active() && replica.state != NativeReplicaState::Dropped;
+            local_pc =
+                replica.previous_role.is_active() && replica.state != NativeReplicaState::Dropped;
             continue;
         }
         remotes.push(info.clone());
-        if !replica.up || replica.state != 2 {
+        if !replica.up || replica.state != NativeReplicaState::Ready {
             continue;
         }
         info.role = ReplicaRole::ActiveSecondary;
-        if replica.current_role >= 3 {
+        if replica.current_role.is_active() {
             cc.push(info.clone());
         }
-        if replica.previous_role >= 3 {
+        if replica.previous_role.is_active() {
             let primary_change = api_epoch(&request.unit.current).primary()
                 != api_epoch(&request.unit.previous).primary();
-            if primary_change && replica.current_role < 3 && replica.last_lsn < 0 {
+            if primary_change && !replica.current_role.is_active() && replica.last_lsn < 0 {
                 continue;
             }
             info.must_catch_up = false;

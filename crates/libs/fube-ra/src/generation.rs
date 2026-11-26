@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::{NativeReplicaRole, NativeReplicaState};
 use fubst::serde::ObjectArray;
 
 /// Session-only ordinary-FM generations; these do not restore runtime authority.
@@ -70,7 +71,8 @@ impl LfumSnapshot {
 
 fn configuration(state: Option<&EntityState>) -> Option<FailoverUnitInfo> {
     let state = state.filter(|state| !state.local_deleted)?;
-    let dropped = state.phase == Phase::Closed || state.body.replica.state == 3;
+    let dropped =
+        state.phase == Phase::Closed || state.body.replica.state == NativeReplicaState::Dropped;
     let intermediate = state
         .intermediate_configuration
         .as_ref()
@@ -118,10 +120,16 @@ fn configuration(state: Option<&EntityState>) -> Option<FailoverUnitInfo> {
     let local = &state.body.replica;
     let report_from_primary = !dropped
         && local.up
-        && matches!(local.state, 0..=2)
-        && !(state.runtime.is_none() && local.state == 0)
-        && (local.previous_role == 4 || local.current_role == 4)
-        && (reconfiguring || (local.current_role == 4 && local.state != 0));
+        && matches!(
+            local.state,
+            NativeReplicaState::StandBy | NativeReplicaState::InBuild | NativeReplicaState::Ready
+        )
+        && !(state.runtime.is_none() && local.state == NativeReplicaState::StandBy)
+        && (local.previous_role == NativeReplicaRole::Primary
+            || local.current_role == NativeReplicaRole::Primary)
+        && (reconfiguring
+            || (local.current_role == NativeReplicaRole::Primary
+                && local.state != NativeReplicaState::StandBy));
     Some(FailoverUnitInfo {
         service: state.body.service.clone(),
         unit: state.body.unit.clone(),
@@ -134,7 +142,7 @@ fn configuration(state: Option<&EntityState>) -> Option<FailoverUnitInfo> {
                     description.first_lsn = -1;
                     description.last_lsn = -1;
                     let intermediate_role = if dropped {
-                        1
+                        NativeReplicaRole::None
                     } else {
                         state
                             .intermediate_configuration
@@ -146,18 +154,23 @@ fn configuration(state: Option<&EntityState>) -> Option<FailoverUnitInfo> {
                                         && replica.instance == description.instance
                                 })
                             })
-                            .map_or(1, |replica| replica.current_role)
+                            .map_or(NativeReplicaRole::None, |replica| replica.current_role)
                     };
                     if description.node == local.node && !dropped {
                         if local.up
-                            && ((report_from_primary && description.state == 0)
+                            && ((report_from_primary
+                                && description.state == NativeReplicaState::StandBy)
                                 || (!report_from_primary
-                                    && description.state == 2
-                                    && (description.previous_role == 4 || intermediate_role == 4)))
+                                    && description.state == NativeReplicaState::Ready
+                                    && (description.previous_role == NativeReplicaRole::Primary
+                                        || intermediate_role == NativeReplicaRole::Primary)))
                         {
-                            description.state = 1;
+                            description.state = NativeReplicaState::InBuild;
                         }
-                        if state.runtime.is_none() && local.up && description.state == 0 {
+                        if state.runtime.is_none()
+                            && local.up
+                            && description.state == NativeReplicaState::StandBy
+                        {
                             description.up = false;
                         }
                     }

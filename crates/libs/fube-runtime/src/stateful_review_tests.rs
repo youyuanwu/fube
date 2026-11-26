@@ -1,4 +1,5 @@
 use super::*;
+use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 
 #[tokio::test]
 async fn remote_reply_and_retry_bookkeeping_never_retain_final_participants_after_close() {
@@ -10,7 +11,7 @@ async fn remote_reply_and_retry_bookkeeping_never_retain_final_participants_afte
         h.receive("ReplicaOpenReply").await;
         h.engine.shared.stateful.wait_idle([2; 16]).await;
         let mut idle = peer(&open.local, 2);
-        idle.current_role = 2;
+        idle.current_role = NativeReplicaRole::Idle;
         let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle]);
         h.send("ReplicatorBuildIdleReplica", &build).await;
         h.receive("ReplicatorBuildIdleReplicaReply").await;
@@ -119,12 +120,12 @@ async fn caught_up_with_built_peer(
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut target = peer(&open.local, 2);
-    target.previous_role = 1;
+    target.previous_role = NativeReplicaRole::None;
     if !active_member {
-        target.current_role = 2;
+        target.current_role = NativeReplicaRole::Idle;
     }
     let mut idle = target.clone();
-    idle.current_role = 2;
+    idle.current_role = NativeReplicaRole::Idle;
     let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle]);
     h.send("ReplicatorBuildIdleReplica", &build).await;
     h.receive("ReplicatorBuildIdleReplicaReply").await;
@@ -151,7 +152,7 @@ async fn successful_remove_revokes_cached_configuration_proof_without_shrinking_
     let mut h = Harness::new().await;
     let (calls, open, mut update) = caught_up_with_built_peer(&mut h, 36, false).await;
     let mut removed = update.remote.0[1].clone();
-    removed.current_role = 2;
+    removed.current_role = NativeReplicaRole::Idle;
     let remove = control(&update, "ReplicatorRemoveIdleReplica", vec![removed]);
     h.send("ReplicatorRemoveIdleReplica", &remove).await;
     let reply: ProxyReply =
@@ -196,8 +197,8 @@ async fn unchanged_projected_proof_does_not_hide_changed_native_observations_and
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut dropped = peer(&open.local, 2);
     dropped.up = false;
-    dropped.state = 3;
-    dropped.previous_role = 1;
+    dropped.state = NativeReplicaState::Dropped;
+    dropped.previous_role = NativeReplicaRole::None;
     update.remote.0.push(dropped);
     h.send("UpdateConfiguration", &update).await;
     let reply: ProxyReply = from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
@@ -216,7 +217,7 @@ async fn late_configuration_during_remove_cannot_reinstall_pre_removal_receipt()
     let mut h = Harness::new().await;
     let (calls, _, update) = caught_up_with_built_peer(&mut h, 37, false).await;
     let mut removed = update.remote.0[1].clone();
-    removed.current_role = 2;
+    removed.current_role = NativeReplicaRole::Idle;
     let remove = control(&update, "ReplicatorRemoveIdleReplica", vec![removed]);
     h.send("ReplicatorRemoveIdleReplica", &remove).await;
     wait_event(&calls, "remove", 1).await;
@@ -239,7 +240,7 @@ async fn configured_peer_handoff_suppresses_stale_idle_remove_without_revoking_p
     let mut h = Harness::new().await;
     let (calls, _, update) = caught_up_with_built_peer(&mut h, 36, true).await;
     let mut idle = update.remote.0[1].clone();
-    idle.current_role = 2;
+    idle.current_role = NativeReplicaRole::Idle;
     let remove = control(&update, "ReplicatorRemoveIdleReplica", vec![idle]);
     h.send("ReplicatorRemoveIdleReplica", &remove).await;
     let reply: ProxyReply =
@@ -278,7 +279,7 @@ async fn equal_incarnation_build_retries_prove_cleanup_after_build_or_remove_fai
         h.receive("ReplicaOpenReply").await;
         h.engine.shared.stateful.wait_idle([2; 16]).await;
         let mut idle = peer(&open.local, 2);
-        idle.current_role = 2;
+        idle.current_role = NativeReplicaRole::Idle;
         let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle]);
         h.send("ReplicatorBuildIdleReplica", &build).await;
         let first: ProxyReply =
@@ -409,10 +410,10 @@ async fn same_epoch_demotion_retry_never_regrants_revoked_write_access() {
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut target = peer(&open.local, 2);
-    target.current_role = 4;
+    target.current_role = NativeReplicaRole::Primary;
     let mut local = open.local.clone();
-    local.current_role = 3;
-    local.previous_role = 4;
+    local.current_role = NativeReplicaRole::Secondary;
+    local.previous_role = NativeReplicaRole::Primary;
     let mut demote = control(&open, "UpdateConfiguration", vec![local.clone(), target]);
     demote.local = local;
     demote.unit.current.configuration += 1 << 32;

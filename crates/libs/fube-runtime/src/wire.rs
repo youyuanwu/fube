@@ -1,5 +1,6 @@
 //! Private source-corresponding hosting records. Native source baseline:
 //! 3988b451, Hosting2 and ServiceModel FABRIC_FIELDS declarations.
+pub use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 use fubst::serde::{ByteArray, Guid, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
 
@@ -203,12 +204,12 @@ pub struct Replica {
     pub node: Node,
     pub id: i64,
     pub instance: i64,
-    pub current_role: i64,
-    pub previous_role: i64,
+    pub current_role: NativeReplicaRole,
+    pub previous_role: NativeReplicaRole,
     pub up: bool,
     pub last_lsn: i64,
     pub first_lsn: i64,
-    pub state: i64,
+    pub state: NativeReplicaState,
     pub version: VersionInstance,
     pub service_endpoint: String,
     pub replication_endpoint: String,

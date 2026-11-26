@@ -1,6 +1,7 @@
 //! Adapter tests use controlled callbacks, not a purported empty-state policy.
 //! The actual sample custom replicator has its own controlled-peer test gate.
 use super::*;
+use fube_core::protocol::NativeReplicaRole;
 #[path = "stateful_control_tests.rs"]
 mod control_tests;
 #[path = "stateful_reporting_tests.rs"]
@@ -653,7 +654,7 @@ async fn stateful_fault_retry_outlives_callers_executor_and_stops_with_unit() {
     let mut h = Harness::new().await;
     let calls = register(&h);
     let mut open = request(&h, 2, 9, 0);
-    open.local.current_role = 2;
+    open.local.current_role = NativeReplicaRole::Idle;
     h.send("ReplicaOpen", &open).await;
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
@@ -852,7 +853,7 @@ async fn stateful_idle_open_never_grants_primary_access_and_drop_orders_none_bef
     let mut h = Harness::new().await;
     let calls = register(&h);
     let mut request = request(&h, 3, 1, 0);
-    request.local.current_role = 2;
+    request.local.current_role = NativeReplicaRole::Idle;
     h.send("ReplicaOpen", &request).await;
     let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(reply.error.error, 0);
@@ -865,7 +866,7 @@ async fn stateful_idle_open_never_grants_primary_access_and_drop_orders_none_bef
         )
     );
     request.flags = 8;
-    request.local.current_role = 1; // Native Close-only reconstructed descriptor.
+    request.local.current_role = NativeReplicaRole::None; // Native Close-only reconstructed descriptor.
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
     assert_eq!(
@@ -899,7 +900,7 @@ async fn stateful_failed_open_fences_handle_and_abort_preserves_stateless_siblin
     h.send("ReplicaOpen", &next).await;
     h.receive("ReplicaOpenReply").await;
     next.flags = 4;
-    next.local.current_role = 1;
+    next.local.current_role = NativeReplicaRole::None;
     h.send("ReplicaClose", &next).await;
     h.receive("ReplicaCloseReply").await;
     assert!(h.calls.partitions.lock().unwrap()[0].ensure_valid().is_ok());

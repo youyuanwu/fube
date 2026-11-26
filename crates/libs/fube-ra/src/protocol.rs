@@ -3,6 +3,7 @@
 //! Field order follows pinned native FABRIC_FIELDS, not declaration order.
 //! Scalar enums and ErrorCode values are LONG64; unknown values are retained.
 //! ErrorCode diagnostic strings are not serialized. No Federation routing.
+pub use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 use fubst::serde::{ByteArray, Derived, Guid, Inline, NativeEnum, ObjectArray, Pointer};
 use furpc::{
     header::{self, ACTION, ACTOR, HIGH_PRIORITY},
@@ -213,12 +214,12 @@ pub struct Replica {
     pub node: NodeInstance,
     pub id: i64,
     pub instance: i64,
-    pub current_role: i64,
-    pub previous_role: i64,
+    pub current_role: NativeReplicaRole,
+    pub previous_role: NativeReplicaRole,
     pub up: bool,
     pub last_lsn: i64,
     pub first_lsn: i64,
-    pub state: i64,
+    pub state: NativeReplicaState,
     pub version: VersionInstance,
     pub service_endpoint: String,
     pub replication_endpoint: String,
@@ -229,12 +230,12 @@ impl Default for Replica {
             node: NodeInstance::default(),
             id: -1,
             instance: -1,
-            current_role: 1,
-            previous_role: 1,
+            current_role: NativeReplicaRole::None,
+            previous_role: NativeReplicaRole::None,
             up: true,
             last_lsn: -1,
             first_lsn: -1,
-            state: 2,
+            state: NativeReplicaState::Ready,
             version: VersionInstance::invalid(),
             service_endpoint: String::new(),
             replication_endpoint: String::new(),
@@ -417,7 +418,7 @@ pub type DeleteReplicaReply = AddInstanceReply;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicaInfo {
     pub description: Replica,
-    pub intermediate_role: i64,
+    pub intermediate_role: NativeReplicaRole,
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FailoverUnitInfo {

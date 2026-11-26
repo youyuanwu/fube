@@ -1,3 +1,4 @@
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use super::*;
 use crate::fm::{Desired, IdleDeleteTarget, Observed};
 use fubst::serde::ObjectArray;
@@ -125,7 +126,7 @@ fn replicated_lfum_reconciles_every_original_node_and_rejects_partial_or_stale_m
                 unit: configuration.unit.clone(),
                 report_from_primary: index == 0,
                 replicas: ObjectArray(configuration.replicas.0.iter().cloned().map(|description| ReplicaInfo {
-                    description, intermediate_role: 1,
+                    description, intermediate_role: NativeReplicaRole::None,
                 }).collect()),
                 ..FailoverUnitInfo::default()
             }]),
@@ -142,7 +143,7 @@ fn replicated_lfum_reconciles_every_original_node_and_rejects_partial_or_stale_m
                 0 => { info.replicas.0.pop(); }
                 1 => info.replicas.0[1] = info.replicas.0[0].clone(),
                 2 => info.replicas.0[1].description.instance += 1,
-                3 => info.replicas.0[1].description.current_role = 2,
+                3 => info.replicas.0[1].description.current_role = NativeReplicaRole::Idle,
                 4 => info.replicas.0[1].description.last_lsn = 123,
                 5 => info.unit.current.configuration += 1,
                 6 => info.report_from_primary = !info.report_from_primary,
@@ -187,14 +188,14 @@ fn admitting_lfum_validates_sf_phase_roles_without_completing_configuration() {
                 report_from_primary: index == 0,
                 replicas: ObjectArray(request.replicas.0.iter().cloned().map(|mut description| {
                     description.first_lsn = -1; description.last_lsn = -1;
-                    ReplicaInfo { intermediate_role: if index == 0 { description.current_role } else { 1 }, description }
+                    ReplicaInfo { intermediate_role: if index == 0 { description.current_role } else { NativeReplicaRole::None }, description }
                 }).collect()),
                 local_deleted: false,
             }]),
         };
         let mut bad = body.clone();
         if index == 0 {
-            bad.units.0[0].replicas.0[1].intermediate_role = 1;
+            bad.units.0[0].replicas.0[1].intermediate_role = NativeReplicaRole::None;
         } else {
             bad.units.0[0].intermediate = request.unit.current;
         }
@@ -236,7 +237,7 @@ fn building_lfum_validates_original_idle_states_without_finishing_build_or_confi
                 report_from_primary: index == 0,
                 replicas: ObjectArray(replicas.iter().filter(|r|
                     index == 0 || r.node == ledger.placements[index].launch.node
-                ).cloned().map(|description| ReplicaInfo { description, intermediate_role: 1 }).collect()),
+                ).cloned().map(|description| ReplicaInfo { description, intermediate_role: NativeReplicaRole::None }).collect()),
                 ..FailoverUnitInfo::default()
             }]),
         };
@@ -246,9 +247,9 @@ fn building_lfum_validates_original_idle_states_without_finishing_build_or_confi
             match mutation {
                 0 => info.replicas.0[0].description.instance += 1,
                 1 => info.replicas.0[0].description.last_lsn = 12,
-                2 => info.replicas.0[0].description.current_role = 3,
-                3 => info.replicas.0[0].description.state = 3,
-                4 => info.replicas.0[0].intermediate_role = 2,
+                2 => info.replicas.0[0].description.current_role = NativeReplicaRole::Secondary,
+                3 => info.replicas.0[0].description.state = NativeReplicaState::Dropped,
+                4 => info.replicas.0[0].intermediate_role = NativeReplicaRole::Idle,
                 5 => info.report_from_primary = !info.report_from_primary,
                 _ => info.unit.current.configuration += 1,
             }
@@ -261,7 +262,7 @@ fn building_lfum_validates_original_idle_states_without_finishing_build_or_confi
     assert!(ledger.idles.iter().all(|idle| idle.reply.is_none()));
     for build in builds {
         let mut replica = build.replica;
-        replica.state = 2;
+        replica.state = NativeReplicaState::Ready;
         replica.replication_endpoint = "127.0.0.1:12346".into();
         ledger.idle_reply(0, AddReplicaReply { unit: build.unit, replica, error: 0 }).unwrap();
     }
@@ -301,7 +302,7 @@ fn failover_lfum_validates_original_phase_views_without_finishing_promotion() {
                     report_from_primary: index == 1,
                     replicas: ObjectArray(config.replicas.0.into_iter().map(|mut description| {
                         description.first_lsn = -1; description.last_lsn = -1;
-                        ReplicaInfo { intermediate_role: if activating && index == 1 { description.current_role } else { 1 }, description }
+                        ReplicaInfo { intermediate_role: if activating && index == 1 { description.current_role } else { NativeReplicaRole::None }, description }
                     }).collect()), local_deleted: false,
                 }]),
             };
@@ -311,7 +312,7 @@ fn failover_lfum_validates_original_phase_views_without_finishing_promotion() {
                     body.units.0.push(FailoverUnitInfo {
                         service: intent.service.clone(), unit: original.unit.clone(),
                         replicas: ObjectArray(vec![ReplicaInfo {
-                            description: crate::profile::dropped_replica(&original.replicas.0[0]), intermediate_role: 1,
+                            description: crate::profile::dropped_replica(&original.replicas.0[0]), intermediate_role: NativeReplicaRole::None,
                         }]), ..FailoverUnitInfo::default()
                     });
                 }
@@ -321,7 +322,7 @@ fn failover_lfum_validates_original_phase_views_without_finishing_promotion() {
                     match mutation {
                         0 => bad.units.0[0].replicas.0[0].description.instance += 1,
                         1 => bad.units.0[0].replicas.0[0].description.last_lsn = 12,
-                        2 => bad.units.0[0].replicas.0[0].description.previous_role = 2,
+                        2 => bad.units.0[0].replicas.0[0].description.previous_role = NativeReplicaRole::Idle,
                         3 => bad.units.0[0].report_from_primary = !bad.units.0[0].report_from_primary,
                         _ => bad.units.0[0].unit.current.configuration += 1,
                     }
@@ -351,7 +352,7 @@ fn planned_handoff_lfum_validates_each_committed_phase_without_completing_transf
             let previous = ledger.swap.as_ref().and_then(|s| s.reply.clone())
                 .unwrap_or_else(|| ledger.configuration.as_ref().unwrap().reply.clone().unwrap());
             let source = ledger.placements.iter().position(|p|
-                previous.replicas.0.iter().any(|r| r.node == p.launch.node && r.current_role == 4)).unwrap();
+                previous.replicas.0.iter().any(|r| r.node == p.launch.node && r.current_role == NativeReplicaRole::Primary)).unwrap();
             let intent = ledger.request_primary_transfer_to(destination, Instant::now()).unwrap();
             for phase in 0..6 {
                 ledger.begin_generation().unwrap();
@@ -374,18 +375,18 @@ fn planned_handoff_lfum_validates_each_committed_phase_without_completing_transf
                         for r in &mut config.replicas.0 { r.previous_role = r.current_role; }
                     } else {
                         if phase != 0 {
-                            config.replicas.0.iter_mut().find(|r| r.previous_role == 4).unwrap().service_endpoint.clear();
+                            config.replicas.0.iter_mut().find(|r| r.previous_role == NativeReplicaRole::Primary).unwrap().service_endpoint.clear();
                         }
                         if phase >= 3 && (index == destination || phase >= 4) {
-                            config.replicas.0.iter_mut().find(|r| r.current_role == 4).unwrap().service_endpoint = "127.0.0.1:23456".into();
+                            config.replicas.0.iter_mut().find(|r| r.current_role == NativeReplicaRole::Primary).unwrap().service_endpoint = "127.0.0.1:23456".into();
                         }
                         if index == source && phase == 0 {
                             primary = true;
                         } else if phase == 5 || (phase >= 4 && index != destination) {
                             config.unit.previous = Epoch::default();
-                            for r in &mut config.replicas.0 { r.previous_role = 1; }
+                            for r in &mut config.replicas.0 { r.previous_role = NativeReplicaRole::None; }
                         } else if index == source {
-                            config.replicas.0.iter_mut().find(|r| r.node == ledger.placements[source].launch.node).unwrap().state = 1;
+                            config.replicas.0.iter_mut().find(|r| r.node == ledger.placements[source].launch.node).unwrap().state = NativeReplicaState::InBuild;
                         }
                         if index == destination && phase == 4 { intermediate = config.unit.current; }
                     }
@@ -397,7 +398,7 @@ fn planned_handoff_lfum_validates_each_committed_phase_without_completing_transf
                             report_from_primary: primary, local_deleted: false,
                             replicas: ObjectArray(config.replicas.0.into_iter().map(|mut description| {
                                 description.first_lsn = -1; description.last_lsn = -1;
-                                ReplicaInfo { intermediate_role: if intermediate == Epoch::default() { 1 } else { description.current_role }, description }
+                                ReplicaInfo { intermediate_role: if intermediate == Epoch::default() { NativeReplicaRole::None } else { description.current_role }, description }
                             }).collect()),
                         }]),
                     };
@@ -410,14 +411,14 @@ fn planned_handoff_lfum_validates_each_committed_phase_without_completing_transf
                             2 => info.replicas.0[0].description.replication_endpoint = "foreign".into(),
                             3 => info.report_from_primary = !info.report_from_primary,
                             4 => info.unit.current.configuration += 1,
-                            5 => info.replicas.0[0].intermediate_role = 2,
+                            5 => info.replicas.0[0].intermediate_role = NativeReplicaRole::Idle,
                             6 => info.replicas.0[0].description.up = false,
                             7 => info.replicas.0[0] = info.replicas.0[1].clone(),
                             8 => info.local_deleted = true,
                             9 => info.service.persisted = true,
                             10 => info.unit.previous.configuration += 1,
                             11 => info.intermediate.configuration += 9,
-                            _ => info.replicas.0[0].description.previous_role = 2,
+                            _ => info.replicas.0[0].description.previous_role = NativeReplicaRole::Idle,
                         }
                         assert!(ledger.lfum_upload(index, bad).is_err(), "candidate {candidate} destination {destination} phase {phase} mutation {mutation}");
                         assert!(ledger.generation.as_ref().unwrap().uploads[index].is_none());
@@ -434,9 +435,9 @@ fn planned_handoff_lfum_validates_each_committed_phase_without_completing_transf
             };
             completed.unit.previous = Epoch::default();
             for r in &mut completed.replicas.0 {
-                r.previous_role = 1;
+                r.previous_role = NativeReplicaRole::None;
                 r.first_lsn = 1; r.last_lsn = 8;
-                r.service_endpoint = if r.current_role == 4 { "127.0.0.1:23456".into() } else { String::new() };
+                r.service_endpoint = if r.current_role == NativeReplicaRole::Primary { "127.0.0.1:23456".into() } else { String::new() };
             }
             ledger.configuration_reply(destination, completed).unwrap();
             assert_eq!(ledger.configuration_status()["ready"], true);
@@ -452,11 +453,11 @@ fn planned_handoff_lfum_validates_each_committed_phase_without_completing_transf
     };
     reply.unit.previous = Epoch::default();
     for r in &mut reply.replicas.0 {
-        r.previous_role = 1; r.first_lsn = 1; r.last_lsn = 8;
-        r.service_endpoint = if r.current_role == 4 { "127.0.0.1:23456".into() } else { String::new() };
+        r.previous_role = NativeReplicaRole::None; r.first_lsn = 1; r.last_lsn = 8;
+        r.service_endpoint = if r.current_role == NativeReplicaRole::Primary { "127.0.0.1:23456".into() } else { String::new() };
     }
     reply.replicas.0[2].up = false;
-    reply.replicas.0[2].state = 3;
+    reply.replicas.0[2].state = NativeReplicaState::Dropped;
     restarted.configuration_reply(1, reply).unwrap();
     assert_eq!(restarted.configuration_status()["ready"], true);
     assert!(restarted.begin_generation().is_err());
@@ -514,7 +515,7 @@ fn repair_lfum_inventory(cancelled: bool) {
                     unit: config.unit, service: config.service, report_from_primary: index == primary,
                     replicas: ObjectArray(config.replicas.0.into_iter().map(|mut description| {
                         description.first_lsn = -1; description.last_lsn = -1;
-                        ReplicaInfo { description, intermediate_role: 1 }
+                        ReplicaInfo { description, intermediate_role: NativeReplicaRole::None }
                     }).collect()), ..FailoverUnitInfo::default()
                 }] }),
             };
@@ -524,7 +525,7 @@ fn repair_lfum_inventory(cancelled: bool) {
                 bad.units.0[0].replicas = ObjectArray(initial.replicas.0.iter().cloned().map(|mut description| {
                     description.previous_role = description.current_role;
                     description.first_lsn = -1; description.last_lsn = -1;
-                    ReplicaInfo { description, intermediate_role: 1 }
+                    ReplicaInfo { description, intermediate_role: NativeReplicaRole::None }
                 }).collect());
                 assert!(ledger.lfum_upload(index, bad).is_err(), "old initial membership is not the repeated failover base");
             }
@@ -537,12 +538,12 @@ fn repair_lfum_inventory(cancelled: bool) {
     }
     let mut previous = ConfigurationReply { unit: failover.configuration.unit, replicas: failover.configuration.replicas, error: 0 };
     previous.unit.previous = Epoch::default();
-    previous.replicas.0.retain(|r| r.current_role >= 3);
+    previous.replicas.0.retain(|r| r.current_role.is_active());
     for r in &mut previous.replicas.0 {
-        r.previous_role = 1;
+        r.previous_role = NativeReplicaRole::None;
         r.first_lsn = 1;
         r.last_lsn = 8;
-        if r.current_role == 4 { r.service_endpoint = "127.0.0.1:12349".into(); }
+        if r.current_role == NativeReplicaRole::Primary { r.service_endpoint = "127.0.0.1:12349".into(); }
     }
     ledger.configuration_reply(primary, previous.clone()).unwrap();
     let old = ledger.placements[destination].body().unwrap();
@@ -562,7 +563,7 @@ fn repair_lfum_inventory(cancelled: bool) {
     };
     ledger.repaired_host(&receipt, 123).unwrap();
     let mut built = AddReplicaReply { unit: build.unit.clone(), replica: build.replica.clone(), error: 0 };
-    built.replica.state = 2;
+    built.replica.state = NativeReplicaState::Ready;
     built.replica.replication_endpoint = "127.0.0.1:12350".into();
     if cancelled {
         cancelled_repair_inventory(&mut ledger, &previous, &built);
@@ -583,13 +584,13 @@ fn repair_lfum_inventory(cancelled: bool) {
                 config = request.clone();
                 if phase == 2 || index == survivor {
                     config.unit.previous = Epoch::default();
-                    for r in &mut config.replicas.0 { r.previous_role = 1; }
+                    for r in &mut config.replicas.0 { r.previous_role = NativeReplicaRole::None; }
                 }
             } else {
                 if index == destination { config.replicas.0.clear(); }
                 if index != survivor {
                     let mut replica = built.replica.clone();
-                    if index == destination { replica.state = 1; }
+                    if index == destination { replica.state = NativeReplicaState::InBuild; }
                     config.replicas.0.push(replica);
                 }
             }
@@ -601,7 +602,7 @@ fn repair_lfum_inventory(cancelled: bool) {
                     service: config.service, unit: config.unit, intermediate, report_from_primary: index == primary,
                     replicas: ObjectArray(config.replicas.0.into_iter().map(|mut description| {
                         description.first_lsn = -1; description.last_lsn = -1;
-                        ReplicaInfo { intermediate_role: if intermediate == Epoch::default() { 1 } else { description.current_role }, description }
+                        ReplicaInfo { intermediate_role: if intermediate == Epoch::default() { NativeReplicaRole::None } else { description.current_role }, description }
                     }).collect()), local_deleted: false,
                 }]),
             };
@@ -612,7 +613,7 @@ fn repair_lfum_inventory(cancelled: bool) {
                     0 => info.replicas.0[0].description.instance += 1,
                     1 => info.replicas.0[0].description.last_lsn = 123,
                     2 => { info.replicas.0.pop(); }
-                    3 => info.replicas.0[0].intermediate_role = 2,
+                    3 => info.replicas.0[0].intermediate_role = NativeReplicaRole::Idle,
                     4 => info.report_from_primary = !info.report_from_primary,
                     5 => info.unit.current.configuration += 5,
                     6 => info.service.minimum = 1,
@@ -640,7 +641,7 @@ fn repair_lfum_inventory(cancelled: bool) {
     }
     let mut completed = request.unwrap();
     completed.unit.previous = Epoch::default();
-    for replica in &mut completed.replicas.0 { replica.previous_role = 1; }
+    for replica in &mut completed.replicas.0 { replica.previous_role = NativeReplicaRole::None; }
     ledger.configuration_reply(primary, ConfigurationReply {
         unit: completed.unit, replicas: completed.replicas, error: 0,
     }).unwrap();
@@ -656,7 +657,7 @@ fn cancelled_repair_inventory(ledger: &mut Ledger, previous: &ConfigurationReply
     let build = ledger.repair.as_ref().unwrap().build.body.clone();
     let removal = RemoveReplicaReply {
         unit: build.unit.clone(),
-        replica: Replica { state: 3, ..built.replica.clone() },
+        replica: Replica { state: NativeReplicaState::Dropped, ..built.replica.clone() },
         error: 0,
     };
     for phase in 0..3 {
@@ -679,7 +680,7 @@ fn cancelled_repair_inventory(ledger: &mut Ledger, previous: &ConfigurationReply
             let mut replicas = if index == destination { vec![] } else { previous.replicas.0.clone() };
             if index == destination || (index == primary && phase == 0) {
                 let mut replica = built.replica.clone();
-                replica.state = if index == primary { 3 } else { 1 };
+                replica.state = if index == primary { NativeReplicaState::Dropped } else { NativeReplicaState::InBuild };
                 replicas.push(replica);
             }
             let upload = LfumUpload {
@@ -692,7 +693,7 @@ fn cancelled_repair_inventory(ledger: &mut Ledger, previous: &ConfigurationReply
                         report_from_primary: index == primary,
                         replicas: ObjectArray(replicas.into_iter().map(|mut description| {
                             description.first_lsn = -1; description.last_lsn = -1;
-                            ReplicaInfo { description, intermediate_role: 1 }
+                            ReplicaInfo { description, intermediate_role: NativeReplicaRole::None }
                         }).collect()), ..FailoverUnitInfo::default()
                     }]
                 }),
@@ -771,7 +772,7 @@ fn lfum_reconciliation_requires_both_exact_inventories_and_retains_duplicate_rec
         node: ledger.placements[0].node_description.clone().unwrap(),
         units: ObjectArray(vec![FailoverUnitInfo {
             service: original.service, unit: original.unit,
-            replicas: ObjectArray(vec![ReplicaInfo { description: ledger.placements[0].ready_replica.clone().unwrap(), intermediate_role: 1 }]),
+            replicas: ObjectArray(vec![ReplicaInfo { description: ledger.placements[0].ready_replica.clone().unwrap(), intermediate_role: NativeReplicaRole::None }]),
             ..FailoverUnitInfo::default()
         }]),
         any_replica_found: true,
@@ -1153,7 +1154,7 @@ fn configured_three_ledger() -> Ledger {
     for destination in 1..3 {
         let body = ledger.request_idle_on(destination, Instant::now()).unwrap();
         let mut replica = body.replica;
-        replica.state = 2;
+        replica.state = NativeReplicaState::Ready;
         replica.replication_endpoint = format!("127.0.0.1:{}", 12346 + destination);
         ledger.idle_reply(0, AddReplicaReply { unit: body.unit, replica, error: 0 }).unwrap();
     }
@@ -1162,7 +1163,7 @@ fn configured_three_ledger() -> Ledger {
         unit: body.configuration.unit, replicas: body.configuration.replicas, error: 0,
     };
     reply.unit.previous = Epoch::default();
-    for r in &mut reply.replicas.0 { r.previous_role = 1; }
+    for r in &mut reply.replicas.0 { r.previous_role = NativeReplicaRole::None; }
     ledger.configuration_reply(0, reply).unwrap();
     ledger
 }
@@ -1226,7 +1227,7 @@ fn configured_ledger_in_pool(target: i32, minimum: i32, nodes: i32) -> Ledger {
     for destination in 1..target as usize {
         let body = ledger.request_idle_on(destination, Instant::now()).unwrap();
         let mut replica = body.replica;
-        replica.state = 2;
+        replica.state = NativeReplicaState::Ready;
         replica.replication_endpoint = format!("127.0.0.1:{}", 12346 + destination);
         ledger.idle_reply(0, AddReplicaReply { unit: body.unit, replica, error: 0 }).unwrap();
     }
@@ -1235,7 +1236,7 @@ fn configured_ledger_in_pool(target: i32, minimum: i32, nodes: i32) -> Ledger {
         unit: body.configuration.unit, replicas: body.configuration.replicas, error: 0,
     };
     reply.unit.previous = Epoch::default();
-    for r in &mut reply.replicas.0 { r.previous_role = 1; }
+    for r in &mut reply.replicas.0 { r.previous_role = NativeReplicaRole::None; }
     ledger.configuration_reply(0, reply).unwrap();
     ledger
 }
@@ -1261,7 +1262,7 @@ fn spare_replacement_requires_explicit_unused_placement_and_fences_each_further_
             assert!(ledger.start_repair_configuration(Instant::now()).unwrap().is_none());
             let build = ledger.repair.as_ref().unwrap().build.body.clone();
             let mut built = AddReplicaReply { unit: build.unit, replica: build.replica, error: 0 };
-            built.replica.state = 2;
+            built.replica.state = NativeReplicaState::Ready;
             built.replica.replication_endpoint = "127.0.0.1:12350".into();
             let mut stale = built.clone();
             stale.replica.instance += 1;
@@ -1285,8 +1286,8 @@ fn spare_replacement_requires_explicit_unused_placement_and_fences_each_further_
                 unit: request.configuration.unit, replicas: request.configuration.replicas, error: 0,
             };
             reply.unit.previous = Epoch::default();
-            reply.replicas.0.retain(|r| r.current_role >= 3);
-            for r in &mut reply.replicas.0 { r.previous_role = 1; }
+            reply.replicas.0.retain(|r| r.current_role.is_active());
+            for r in &mut reply.replicas.0 { r.previous_role = NativeReplicaRole::None; }
             if lose_at == 2 {
                 ledger.report(1, &stateful_loss_report(&ledger.placements[1])).unwrap();
             }
@@ -1319,12 +1320,12 @@ fn spare_restoration_after_failover_requires_the_exact_processed_removed_primary
                 error: 0,
             };
             reply.unit.previous = Epoch::default();
-            reply.replicas.0.retain(|r| r.current_role >= 3);
+            reply.replicas.0.retain(|r| r.current_role.is_active());
             for r in &mut reply.replicas.0 {
-                r.previous_role = 1;
+                r.previous_role = NativeReplicaRole::None;
                 r.first_lsn = 1;
                 r.last_lsn = 1;
-                r.service_endpoint = if r.current_role == 4 { "127.0.0.1:12349".into() } else { String::new() };
+                r.service_endpoint = if r.current_role == NativeReplicaRole::Primary { "127.0.0.1:12349".into() } else { String::new() };
             }
             ledger.configuration_reply(1, reply.clone()).unwrap();
             assert_eq!(ledger.configuration_status()["ready"], true);
@@ -1338,7 +1339,7 @@ fn spare_restoration_after_failover_requires_the_exact_processed_removed_primary
             let build = ledger.repair.as_ref().unwrap().build.body.clone();
             assert_eq!(build.unit, reply.unit);
             let mut built = AddReplicaReply { unit: build.unit, replica: build.replica, error: 0 };
-            built.replica.state = 2;
+            built.replica.state = NativeReplicaState::Ready;
             built.replica.replication_endpoint = "127.0.0.1:12350".into();
             if lose_at == 0 {
                 ledger.report(2, &stateful_loss_report(&ledger.placements[2])).unwrap();
@@ -1356,7 +1357,7 @@ fn spare_restoration_after_failover_requires_the_exact_processed_removed_primary
             let request = request.unwrap().configuration;
             assert_eq!((request.unit.target, request.unit.minimum), (target, minimum));
             assert_eq!(request.replicas.0.len(), target as usize);
-            assert_eq!(request.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), target as usize - 1);
+            assert_eq!(request.replicas.0.iter().filter(|r| r.previous_role.is_active()).count(), target as usize - 1);
             assert!(!request.replicas.0.iter().any(|r| r.node == old.replica.node));
             for old in &reply.replicas.0 {
                 let mut survivor = request.replicas.0.iter().find(|r| r.node == old.node).unwrap().clone();
@@ -1370,7 +1371,7 @@ fn spare_restoration_after_failover_requires_the_exact_processed_removed_primary
                 unit: request.unit, replicas: request.replicas, error: 0,
             };
             completed.unit.previous = Epoch::default();
-            for r in &mut completed.replicas.0 { r.previous_role = 1; }
+            for r in &mut completed.replicas.0 { r.previous_role = NativeReplicaRole::None; }
             ledger.configuration_reply(1, reply).unwrap();
             assert_eq!(ledger.repair_status()["ready"], false);
             ledger.configuration_reply(1, completed.clone()).unwrap();
@@ -1404,12 +1405,12 @@ fn sequential_spare_cycles_use_latest_membership_and_fence_history_and_further_l
                     let request = ledger.start_primary_failover(Instant::now()).unwrap().unwrap().configuration;
                     let mut reply = ConfigurationReply { unit: request.unit, replicas: request.replicas, error: 0 };
                     reply.unit.previous = Epoch::default();
-                    reply.replicas.0.retain(|r| r.current_role >= 3);
+                    reply.replicas.0.retain(|r| r.current_role.is_active());
                     for r in &mut reply.replicas.0 {
-                        r.previous_role = 1;
+                        r.previous_role = NativeReplicaRole::None;
                         r.first_lsn = 1;
                         r.last_lsn = 1;
-                        r.service_endpoint = if r.current_role == 4 { "127.0.0.1:12349".into() } else { String::new() };
+                        r.service_endpoint = if r.current_role == NativeReplicaRole::Primary { "127.0.0.1:12349".into() } else { String::new() };
                     }
                     ledger.configuration_reply(ledger.primary_index(), reply).unwrap();
                     assert_eq!(ledger.configuration_status()["ready"], true);
@@ -1446,7 +1447,7 @@ fn sequential_spare_cycles_use_latest_membership_and_fence_history_and_further_l
                 }
                 let build = ledger.repair.as_ref().unwrap().build.body.clone();
                 let mut built = AddReplicaReply { unit: build.unit, replica: build.replica, error: 0 };
-                built.replica.state = 2;
+                built.replica.state = NativeReplicaState::Ready;
                 built.replica.replication_endpoint = format!("127.0.0.1:{}", 12360 + cycle);
                 ledger.idle_reply(primary, built.clone()).unwrap();
                 if cycle == 1 && lose_at == 1 {
@@ -1461,11 +1462,11 @@ fn sequential_spare_cycles_use_latest_membership_and_fence_history_and_further_l
                 let request = request.unwrap().configuration;
                 assert!(request.replicas.0.iter().all(|r|
                     r.node == old.replica.node || !ledger.placements.iter().any(|p| p.launch.node == r.node && p.loss_reported)));
-                assert_eq!(request.replicas.0.iter().filter(|r| r.current_role >= 3).count(), target as usize);
+                assert_eq!(request.replicas.0.iter().filter(|r| r.current_role.is_active()).count(), target as usize);
                 let mut reply = ConfigurationReply { unit: request.unit, replicas: request.replicas, error: 0 };
                 reply.unit.previous = Epoch::default();
-                reply.replicas.0.retain(|r| r.current_role >= 3);
-                for r in &mut reply.replicas.0 { r.previous_role = 1; }
+                reply.replicas.0.retain(|r| r.current_role.is_active());
+                for r in &mut reply.replicas.0 { r.previous_role = NativeReplicaRole::None; }
                 if cycle == 1 {
                     ledger.configuration_reply(primary, history.as_ref().unwrap().4.clone()).unwrap();
                     assert_eq!(ledger.repair_status()["ready"], false);
@@ -1496,7 +1497,7 @@ fn configured_failover_removes_down_members_only_above_minimum() {
         let intent = ledger.start_primary_failover(Instant::now()).unwrap().unwrap();
         assert_eq!(intent.configuration.unit.previous, previous.unit.current);
         assert_eq!(intent.configuration.service, ledger.placements[0].body().unwrap().service);
-        assert_eq!(intent.configuration.replicas.0.iter().filter(|r| r.current_role >= 3).count(),
+        assert_eq!(intent.configuration.replicas.0.iter().filter(|r| r.current_role.is_active()).count(),
             (target as usize - 1 - secondary_losses).max(minimum as usize));
         for (replica, old) in intent.configuration.replicas.0.iter().zip(&previous.replicas.0) {
             assert_eq!(replica.previous_role, old.current_role);
@@ -1505,7 +1506,7 @@ fn configured_failover_removes_down_members_only_above_minimum() {
         }
         let old_primary = &intent.configuration.replicas.0[0];
         assert!(!old_primary.up);
-        assert_eq!(old_primary.current_role, if target == minimum { 3 } else { 1 });
+        assert_eq!(old_primary.current_role, if target == minimum { NativeReplicaRole::Secondary } else { NativeReplicaRole::None });
         assert_eq!(ledger.configuration_retry(Instant::now() + Duration::from_secs(11)), Some(intent));
     }
 }
@@ -1547,12 +1548,12 @@ fn configured_failover_redirects_only_exact_native_progress_and_replays_legacy_r
     let next = ledger.configuration_retry(Instant::now() + Duration::from_secs(11)).unwrap();
     let mut reply = ConfigurationReply { unit: next.configuration.unit, replicas: next.configuration.replicas, error: 0 };
     reply.unit.previous = Epoch::default();
-    reply.replicas.0.retain(|r| r.current_role >= 3);
+    reply.replicas.0.retain(|r| r.current_role.is_active());
     for r in &mut reply.replicas.0 {
-        r.previous_role = 1;
+        r.previous_role = NativeReplicaRole::None;
         r.first_lsn = 1;
         r.last_lsn = 9;
-        r.service_endpoint = if r.current_role == 4 { "127.0.0.1:12349".into() } else { String::new() };
+        r.service_endpoint = if r.current_role == NativeReplicaRole::Primary { "127.0.0.1:12349".into() } else { String::new() };
     }
     ledger.configuration_reply(1, reply.clone()).unwrap();
     assert_eq!(ledger.configuration_status()["ready"], false);
@@ -1577,8 +1578,8 @@ fn primary_loss_supersedes_only_unreplaced_secondary_removal_and_preserves_pc_cc
                 unit:removal.configuration.unit.clone(),replicas:removal.configuration.replicas.clone(),error:0,
             };
             late.unit.previous = Epoch::default();
-            late.replicas.0.retain(|r| r.current_role >= 3);
-            for r in &mut late.replicas.0 { r.previous_role = 1; }
+            late.replicas.0.retain(|r| r.current_role.is_active());
+            for r in &mut late.replicas.0 { r.previous_role = NativeReplicaRole::None; }
             match blocked {
                 1 => ledger.repair.as_mut().unwrap().host_requested = true,
                 2 => ledger.configuration_reply(0,late.clone()).unwrap(),
@@ -1611,7 +1612,7 @@ fn primary_loss_supersedes_only_unreplaced_secondary_removal_and_preserves_pc_cc
             for expected in &removal.configuration.replicas.0 {
                 let actual = intent.configuration.replicas.0.iter().find(|r| r.node == expected.node).unwrap();
                 assert_eq!(actual.previous_role,expected.previous_role);
-                assert_eq!(actual.current_role >= 3,expected.current_role >= 3);
+                assert_eq!(actual.current_role.is_active(),expected.current_role.is_active());
                 assert_eq!((actual.id,actual.instance),(expected.id,expected.instance));
             }
             let before = ledger.status();
@@ -1623,11 +1624,11 @@ fn primary_loss_supersedes_only_unreplaced_secondary_removal_and_preserves_pc_cc
                 unit:intent.configuration.unit,replicas:intent.configuration.replicas,error:0,
             };
             reply.unit.previous = Epoch::default();
-            reply.replicas.0.retain(|r| r.current_role >= 3);
+            reply.replicas.0.retain(|r| r.current_role.is_active());
             for r in &mut reply.replicas.0 {
-                r.previous_role = 1;
+                r.previous_role = NativeReplicaRole::None;
                 if r.up { r.first_lsn=1; r.last_lsn=8; r.service_endpoint.clear(); }
-                if r.current_role == 4 { r.service_endpoint="127.0.0.1:12349".into(); }
+                if r.current_role == NativeReplicaRole::Primary { r.service_endpoint="127.0.0.1:12349".into(); }
             }
             ledger.configuration_reply(2,reply).unwrap();
             assert_eq!(ledger.configuration_status()["ready"],true);
@@ -1671,8 +1672,8 @@ fn removal_supersession_lfum_preserves_known_views_and_cannot_supply_quorum_or_c
         }
         let mut completed_removal = removal.configuration.clone();
         completed_removal.unit.previous = Epoch::default();
-        completed_removal.replicas.0.retain(|r| r.current_role >= 3);
-        for r in &mut completed_removal.replicas.0 { r.previous_role = 1; }
+        completed_removal.replicas.0.retain(|r| r.current_role.is_active());
+        for r in &mut completed_removal.replicas.0 { r.previous_role = NativeReplicaRole::None; }
         let late = ConfigurationReply {
             unit: completed_removal.unit.clone(), replicas: completed_removal.replicas.clone(), error: 0,
         };
@@ -1694,10 +1695,10 @@ fn removal_supersession_lfum_preserves_known_views_and_cannot_supply_quorum_or_c
                             if phase == 3 { intermediate = expected.unit.current; }
                             if phase == 4 {
                                 expected.unit.previous = Epoch::default();
-                                expected.replicas.0.retain(|r| r.current_role >= 3);
-                                for r in &mut expected.replicas.0 { r.previous_role = 1; }
+                                expected.replicas.0.retain(|r| r.current_role.is_active());
+                                for r in &mut expected.replicas.0 { r.previous_role = NativeReplicaRole::None; }
                             }
-                            expected.replicas.0.iter_mut().find(|r| r.current_role == 4).unwrap().service_endpoint = "127.0.0.1:12349".into();
+                            expected.replicas.0.iter_mut().find(|r| r.current_role == NativeReplicaRole::Primary).unwrap().service_endpoint = "127.0.0.1:12349".into();
                         } else {
                             expected = completed_removal.clone();
                             expected.unit = intent.configuration.unit.clone();
@@ -1713,7 +1714,7 @@ fn removal_supersession_lfum_preserves_known_views_and_cannot_supply_quorum_or_c
                         let info = &mut upload.units.0[0];
                         info.report_from_primary = false;
                         info.replicas = ObjectArray(vec![ReplicaInfo {
-                            description: dropped_replica(original_replica), intermediate_role: 1,
+                            description: dropped_replica(original_replica), intermediate_role: NativeReplicaRole::None,
                         }]);
                     } else { upload.units.0.clear(); }
                 }
@@ -1743,11 +1744,11 @@ fn removal_supersession_lfum_preserves_known_views_and_cannot_supply_quorum_or_c
             assert_eq!(ledger.repair_status()["state"], "superseded");
             let mut completed = intent.configuration;
             completed.unit.previous = Epoch::default();
-            completed.replicas.0.retain(|r| r.current_role >= 3);
+            completed.replicas.0.retain(|r| r.current_role.is_active());
             for r in &mut completed.replicas.0 {
-                r.previous_role = 1;
+                r.previous_role = NativeReplicaRole::None;
                 if r.up { r.first_lsn = 1; r.last_lsn = 8; }
-                if r.current_role == 4 { r.service_endpoint = "127.0.0.1:12349".into(); }
+                if r.current_role == NativeReplicaRole::Primary { r.service_endpoint = "127.0.0.1:12349".into(); }
             }
             ledger.configuration_reply(2, ConfigurationReply { unit: completed.unit, replicas: completed.replicas, error: 0 }).unwrap();
             assert_eq!(ledger.configuration_status()["ready"], true);
@@ -1771,10 +1772,10 @@ fn removal_lfum_view(ledger: &Ledger, index: usize, configuration: &Configuratio
         any_replica_found: true,
         units: ObjectArray(vec![FailoverUnitInfo {
             unit: configuration.unit.clone(), service: configuration.service.clone(), intermediate,
-            report_from_primary: configuration.replicas.0.iter().any(|r| r.node == ledger.placements[index].launch.node && r.current_role == 4),
+            report_from_primary: configuration.replicas.0.iter().any(|r| r.node == ledger.placements[index].launch.node && r.current_role == NativeReplicaRole::Primary),
             replicas: ObjectArray(configuration.replicas.0.iter().cloned().map(|mut description| {
                 description.first_lsn = -1; description.last_lsn = -1;
-                ReplicaInfo { intermediate_role: if intermediate == Epoch::default() { 1 } else { description.current_role }, description }
+                ReplicaInfo { intermediate_role: if intermediate == Epoch::default() { NativeReplicaRole::None } else { description.current_role }, description }
             }).collect()), local_deleted: false,
         }]),
     }
@@ -1794,11 +1795,11 @@ fn sequential_restoration_keeps_partial_membership_exact_and_fences_additional_l
             assert!(ledger.begin_secondary_repair(0,Instant::now()).is_err());
             let mut completed=ConfigurationReply { unit:failover.configuration.unit,replicas:failover.configuration.replicas,error:0 };
             completed.unit.previous=Epoch::default();
-            completed.replicas.0.retain(|r| r.current_role>=3);
+            completed.replicas.0.retain(|r| r.current_role.is_active());
             for r in &mut completed.replicas.0 {
-                r.previous_role=1;
+                r.previous_role=NativeReplicaRole::None;
                 if r.up { r.first_lsn=1;r.last_lsn=8;r.service_endpoint.clear(); }
-                if r.current_role==4 {r.service_endpoint="127.0.0.1:12349".into();}
+                if r.current_role==NativeReplicaRole::Primary {r.service_endpoint="127.0.0.1:12349".into();}
             }
             ledger.configuration_reply(2,completed).unwrap();
             assert!(ledger.begin_secondary_repair(0,Instant::now()).is_err());
@@ -1818,8 +1819,8 @@ fn sequential_restoration_keeps_partial_membership_exact_and_fences_additional_l
                     if lose_at==1 {ledger.report(3,&stateful_loss_report(&ledger.placements[3])).unwrap();}
                     let mut reply=ConfigurationReply {unit:removal.configuration.unit,replicas:removal.configuration.replicas,error:0};
                     reply.unit.previous=Epoch::default();
-                    reply.replicas.0.retain(|r|r.current_role>=3);
-                    for r in &mut reply.replicas.0 {r.previous_role=1;}
+                    reply.replicas.0.retain(|r|r.current_role.is_active());
+                    for r in &mut reply.replicas.0 {r.previous_role=NativeReplicaRole::None;}
                     ledger.configuration_reply(2,reply).unwrap();
                     if lose_at==1 {
                         assert_eq!(ledger.repair_status()["removed"],false);
@@ -1844,7 +1845,7 @@ fn sequential_restoration_keeps_partial_membership_exact_and_fences_additional_l
                 }
                 let build=ledger.repair.as_ref().unwrap().build.body.clone();
                 let mut replica=build.replica;
-                replica.state=2;
+                replica.state=NativeReplicaState::Ready;
                 replica.replication_endpoint="127.0.0.1:12350".into();
                 ledger.idle_reply(2,AddReplicaReply {unit:build.unit,replica,error:0}).unwrap();
                 if matches!(lose_at,2|6) {
@@ -1858,7 +1859,7 @@ fn sequential_restoration_keeps_partial_membership_exact_and_fences_additional_l
                 if lose_at==3 {ledger.report(3,&stateful_loss_report(&ledger.placements[3])).unwrap();}
                 let mut reply=ConfigurationReply {unit:admitted.configuration.unit,replicas:admitted.configuration.replicas,error:0};
                 reply.unit.previous=Epoch::default();
-                for r in &mut reply.replicas.0 {r.previous_role=1;}
+                for r in &mut reply.replicas.0 {r.previous_role=NativeReplicaRole::None;}
                 ledger.configuration_reply(2,reply).unwrap();
                 if lose_at==3 {
                     assert_eq!(ledger.repair_status()["ready"],false);
@@ -1896,11 +1897,11 @@ fn minimum_restoration_builds_removed_placement_before_combined_removal_admissio
             let failover=ledger.start_primary_failover(Instant::now()).unwrap().unwrap();
             let mut completed=ConfigurationReply {unit:failover.configuration.unit,replicas:failover.configuration.replicas,error:0};
             completed.unit.previous=Epoch::default();
-            completed.replicas.0.retain(|r|r.current_role>=3);
+            completed.replicas.0.retain(|r|r.current_role.is_active());
             for r in &mut completed.replicas.0 {
-                r.previous_role=1;
+                r.previous_role=NativeReplicaRole::None;
                 if r.up {r.first_lsn=1;r.last_lsn=8;r.service_endpoint.clear();}
-                if r.current_role==4 {r.service_endpoint="127.0.0.1:12349".into();}
+                if r.current_role==NativeReplicaRole::Primary {r.service_endpoint="127.0.0.1:12349".into();}
             }
             let base=completed.clone();
             ledger.configuration_reply(2,completed).unwrap();
@@ -1934,7 +1935,7 @@ fn minimum_restoration_builds_removed_placement_before_combined_removal_admissio
                 }
                 let build=ledger.repair.as_ref().unwrap().build.body.clone();
                 let mut replica=build.replica;
-                replica.state=2;
+                replica.state=NativeReplicaState::Ready;
                 replica.replication_endpoint="127.0.0.1:12350".into();
                 let built=AddReplicaReply {unit:build.unit,replica,error:0};
                 let mut stale=built.clone();
@@ -1951,21 +1952,21 @@ fn minimum_restoration_builds_removed_placement_before_combined_removal_admissio
                 if lose_at==2 {assert!(request.is_none());break;}
                 let request=request.unwrap();
                 assert_eq!(request.configuration.service,secondary.service);
-                assert_eq!(request.configuration.replicas.0.iter().filter(|r|r.current_role>=3).count(),target as usize-1+step);
+                assert_eq!(request.configuration.replicas.0.iter().filter(|r|r.current_role.is_active()).count(),target as usize-1+step);
                 if step==0 {
                     assert_eq!(request.configuration.unit.previous,base.unit.current);
                     assert_eq!(request.configuration.unit.current.configuration,base.unit.current.configuration+1);
                     for old in &base.replicas.0 {
                         let actual=request.configuration.replicas.0.iter().find(|r|r.node==old.node).unwrap();
                         assert_eq!((actual.id,actual.instance,actual.previous_role),(old.id,old.instance,old.current_role));
-                        assert_eq!(actual.current_role,if old.up {old.current_role} else {1});
+                        assert_eq!(actual.current_role,if old.up {old.current_role} else {NativeReplicaRole::None});
                     }
                     assert_eq!(ledger.placements[0].observed,Observed::Lost);
                 }
                 let mut reply=ConfigurationReply {unit:request.configuration.unit,replicas:request.configuration.replicas,error:0};
                 reply.unit.previous=Epoch::default();
-                reply.replicas.0.retain(|r|r.current_role>=3);
-                for r in &mut reply.replicas.0 {r.previous_role=1;}
+                reply.replicas.0.retain(|r|r.current_role.is_active());
+                for r in &mut reply.replicas.0 {r.previous_role=NativeReplicaRole::None;}
                 let mut stale=reply.clone();
                 stale.unit.current.configuration-=1;
                 ledger.configuration_reply(2,stale).unwrap();
@@ -2025,8 +2026,8 @@ fn secondary_repair_requires_exact_loss_minimum_and_completed_removal_before_hos
             unit: removal.configuration.unit.clone(), replicas: removal.configuration.replicas.clone(),error:0,
         };
         reply.unit.previous = Epoch::default();
-        reply.replicas.0.retain(|r| r.current_role >= 3);
-        for r in &mut reply.replicas.0 { r.previous_role = 1; }
+        reply.replicas.0.retain(|r| r.current_role.is_active());
+        for r in &mut reply.replicas.0 { r.previous_role = NativeReplicaRole::None; }
         ledger.configuration_reply(1,reply.clone()).unwrap();
         let mut stale = reply.clone();
         stale.unit.current.configuration -= 1;
@@ -2039,7 +2040,7 @@ fn secondary_repair_requires_exact_loss_minimum_and_completed_removal_before_hos
         assert!(ledger.start_repair_configuration(Instant::now()).unwrap().is_none());
         let build = ledger.repair.as_ref().unwrap().build.body.clone();
         let mut replica = build.replica;
-        replica.state = 2;
+        replica.state = NativeReplicaState::Ready;
         replica.replication_endpoint = "127.0.0.1:12350".into();
         ledger.idle_reply(0,AddReplicaReply { unit:build.unit, replica,error:0 }).unwrap();
         let admitted = ledger.start_repair_configuration(Instant::now()).unwrap().unwrap();
@@ -2047,7 +2048,7 @@ fn secondary_repair_requires_exact_loss_minimum_and_completed_removal_before_hos
         assert_eq!(admitted.configuration.replicas.0.len(),target as usize);
         let mut reply = ConfigurationReply { unit:admitted.configuration.unit, replicas:admitted.configuration.replicas,error:0 };
         reply.unit.previous = Epoch::default();
-        for r in &mut reply.replicas.0 { r.previous_role = 1; }
+        for r in &mut reply.replicas.0 { r.previous_role = NativeReplicaRole::None; }
         ledger.configuration_reply(0,reply).unwrap();
         assert_eq!(ledger.repair_status()["ready"],true);
     }
@@ -2067,12 +2068,12 @@ fn primary_repair_requires_fresh_host_owned_build_and_exact_final_membership() {
             unit: body.configuration.unit, replicas: body.configuration.replicas, error: 0,
         };
         reply.unit.previous = Epoch::default();
-        reply.replicas.0.retain(|r| r.current_role >= 3);
+        reply.replicas.0.retain(|r| r.current_role.is_active());
         for r in &mut reply.replicas.0 {
-            r.previous_role = 1;
+            r.previous_role = NativeReplicaRole::None;
             r.first_lsn = 1;
             r.last_lsn = 8;
-            if r.current_role == 4 { r.service_endpoint = "127.0.0.1:12349".into(); }
+            if r.current_role == NativeReplicaRole::Primary { r.service_endpoint = "127.0.0.1:12349".into(); }
         }
         ledger.configuration_reply(1, reply).unwrap();
         assert!(ledger.begin_primary_repair(Instant::now()).is_err());
@@ -2109,7 +2110,7 @@ fn primary_repair_requires_fresh_host_owned_build_and_exact_final_membership() {
         assert!(!ledger.repaired_host(&receipt, 123).unwrap());
         assert!(ledger.start_repair_configuration(Instant::now()).unwrap().is_none());
         let mut built = AddReplicaReply { unit: build.unit, replica: build.replica, error: 0 };
-        built.replica.state = 2;
+        built.replica.state = NativeReplicaState::Ready;
         built.replica.replication_endpoint = "127.0.0.1:12350".into();
         ledger.idle_reply(0, built.clone()).unwrap();
         let mut stale = built.clone();
@@ -2125,7 +2126,7 @@ fn primary_repair_requires_fresh_host_owned_build_and_exact_final_membership() {
             replicas: configuration.configuration.replicas.clone(), error: 0,
         };
         final_reply.unit.previous = Epoch::default();
-        for r in &mut final_reply.replicas.0 { r.previous_role = 1; }
+        for r in &mut final_reply.replicas.0 { r.previous_role = NativeReplicaRole::None; }
         let mut partial = final_reply.clone();
         partial.replicas.0.pop();
         ledger.configuration_reply(1, partial).unwrap();
@@ -2150,7 +2151,7 @@ fn primary_repair_requires_fresh_host_owned_build_and_exact_final_membership() {
             assert_eq!(second.configuration.unit.previous, final_reply.unit.current);
             assert!(second.configuration.replicas.0.iter().any(|r| {
                 r.node == ledger.placements[0].launch.node && r.id == ledger.placements[0].replica
-                    && r.previous_role == 3 && r.current_role == 4
+                    && r.previous_role == NativeReplicaRole::Secondary && r.current_role == NativeReplicaRole::Primary
             }));
             ledger.configuration_reply(1, final_reply).unwrap();
             assert_eq!(ledger.configuration_status()["ready"], false);
@@ -2159,12 +2160,12 @@ fn primary_repair_requires_fresh_host_owned_build_and_exact_final_membership() {
                 unit: second.configuration.unit, replicas: second.configuration.replicas, error: 0,
             };
             reply.unit.previous = Epoch::default();
-            reply.replicas.0.retain(|r| r.current_role >= 3);
+            reply.replicas.0.retain(|r| r.current_role.is_active());
             for r in &mut reply.replicas.0 {
-                r.previous_role = 1;
+                r.previous_role = NativeReplicaRole::None;
                 r.first_lsn = 1;
                 r.last_lsn = 8;
-                r.service_endpoint = if r.current_role == 4 { "127.0.0.1:12351".into() } else { String::new() };
+                r.service_endpoint = if r.current_role == NativeReplicaRole::Primary { "127.0.0.1:12351".into() } else { String::new() };
             }
             ledger.configuration_reply(0, reply).unwrap();
             ledger.reply(1, AddInstanceReply {
@@ -2201,8 +2202,8 @@ fn primary_failover_requires_matched_loss_and_both_survivors_and_ignores_old_los
     ledger.report(0, &loss).unwrap();
     let body = ledger.start_primary_failover(Instant::now()).unwrap().unwrap();
     assert_eq!(body.configuration.unit.previous.data_loss, body.configuration.unit.current.data_loss);
-    assert_eq!(body.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), 3);
-    assert_eq!(body.configuration.replicas.0.iter().filter(|r| r.current_role >= 3).count(), 2);
+    assert_eq!(body.configuration.replicas.0.iter().filter(|r| r.previous_role.is_active()).count(), 3);
+    assert_eq!(body.configuration.replicas.0.iter().filter(|r| r.current_role.is_active()).count(), 2);
     ledger.report(0, &loss).unwrap();
     assert_eq!(ledger.configuration_status()["state"], "pending");
     assert_eq!(ledger.configuration_retry(Instant::now() + Duration::from_secs(11)), Some(body.clone()));
@@ -2211,12 +2212,12 @@ fn primary_failover_requires_matched_loss_and_both_survivors_and_ignores_old_los
         unit: body.configuration.unit.clone(), replicas: body.configuration.replicas.clone(), error: 0,
     };
     reply.unit.previous = Epoch::default();
-    reply.replicas.0.retain(|r| r.current_role >= 3);
+    reply.replicas.0.retain(|r| r.current_role.is_active());
     for r in &mut reply.replicas.0 {
-        r.previous_role = 1;
+        r.previous_role = NativeReplicaRole::None;
         r.first_lsn = 1;
         r.last_lsn = 8;
-        if r.current_role == 4 { r.service_endpoint = "127.0.0.1:12349".into(); }
+        if r.current_role == NativeReplicaRole::Primary { r.service_endpoint = "127.0.0.1:12349".into(); }
     }
     let mut partial = reply.clone();
     partial.replicas.0.pop();
@@ -2245,7 +2246,7 @@ fn three_replica_fm_keeps_build_identity_retries_and_final_completion_independen
     let second = ledger.request_idle_on(2, Instant::now()).unwrap();
     let ready = |request: &AddReplica| {
         let mut replica = request.replica.clone();
-        replica.state = 2;
+        replica.state = NativeReplicaState::Ready;
         replica.replication_endpoint = format!("127.0.0.1:{}", 12345 + replica.id);
         AddReplicaReply { unit: request.unit.clone(), replica, error: 0 }
     };
@@ -2270,7 +2271,7 @@ fn three_replica_fm_keeps_build_identity_retries_and_final_completion_independen
         unit: config.configuration.unit.clone(), replicas: config.configuration.replicas.clone(), error: 0,
     };
     reply.unit.previous = Epoch::default();
-    for r in &mut reply.replicas.0 { r.previous_role = 1; }
+    for r in &mut reply.replicas.0 { r.previous_role = NativeReplicaRole::None; }
     let mut incomplete = reply.clone();
     incomplete.replicas.0.pop();
     ledger.configuration_reply(0, incomplete).unwrap();
@@ -2317,7 +2318,7 @@ fn same_primary_configuration_requires_semantic_build_and_exact_current_reply() 
     let add = ledger.request_idle(now).unwrap();
     assert!(ledger.request_configuration(now).is_err());
     let mut replica = add.replica.clone();
-    replica.state = 2;
+    replica.state = NativeReplicaState::Ready;
     replica.replication_endpoint = "127.0.0.1:12346".into();
     ledger.idle_reply(0, AddReplicaReply { unit: add.unit, replica, error: 0 }).unwrap();
     let body = ledger.request_configuration(now).unwrap();
@@ -2328,7 +2329,7 @@ fn same_primary_configuration_requires_semantic_build_and_exact_current_reply() 
     let mut reply = ConfigurationReply { unit: body.configuration.unit.clone(),
         replicas: body.configuration.replicas.clone(), error: 0 };
     reply.unit.previous = Epoch::default();
-    for replica in &mut reply.replicas.0 { replica.previous_role = 1; }
+    for replica in &mut reply.replicas.0 { replica.previous_role = NativeReplicaRole::None; }
     let mut stale = reply.clone();
     stale.replicas.0[1].instance -= 1;
     ledger.configuration_reply(0, stale).unwrap();
@@ -2354,14 +2355,14 @@ fn planned_primary_transfer_requires_exact_native_completion_and_does_not_publis
     assert!(ledger.request_primary_transfer(now).is_err());
     let add = ledger.request_idle(now).unwrap();
     let mut secondary = add.replica.clone();
-    secondary.state = 2;
+    secondary.state = NativeReplicaState::Ready;
     secondary.replication_endpoint = "127.0.0.1:12346".into();
     ledger.idle_reply(0, AddReplicaReply { unit: add.unit, replica: secondary, error: 0 }).unwrap();
     let active = ledger.request_configuration(now).unwrap();
     assert!(ledger.request_primary_transfer(now).is_err());
     let mut reply = ConfigurationReply { unit: active.configuration.unit, replicas: active.configuration.replicas, error: 0 };
     reply.unit.previous = Epoch::default();
-    for r in &mut reply.replicas.0 { r.previous_role = 1; }
+    for r in &mut reply.replicas.0 { r.previous_role = NativeReplicaRole::None; }
     ledger.configuration_reply(0, reply.clone()).unwrap();
     let swap = ledger.request_primary_transfer(now).unwrap();
     assert_eq!(ledger.request_primary_transfer(now).unwrap(), swap);
@@ -2376,8 +2377,8 @@ fn planned_primary_transfer_requires_exact_native_completion_and_does_not_publis
     let mut reply = ConfigurationReply { unit: swap.configuration.unit, replicas: swap.configuration.replicas, error: 0 };
     reply.unit.previous = Epoch::default();
     for r in &mut reply.replicas.0 {
-        r.previous_role = 1; r.first_lsn = 0; r.last_lsn = 1;
-        r.service_endpoint = if r.current_role == 4 { "127.0.0.1:23456".into() } else { String::new() };
+        r.previous_role = NativeReplicaRole::None; r.first_lsn = 0; r.last_lsn = 1;
+        r.service_endpoint = if r.current_role == NativeReplicaRole::Primary { "127.0.0.1:23456".into() } else { String::new() };
     }
     let mut duplicate = reply.clone();
     duplicate.replicas.0[1] = duplicate.replicas.0[0].clone();
@@ -2398,11 +2399,11 @@ fn configured_planned_transfer_preserves_remaining_secondary_and_exact_completio
     for mut ledger in [configured_ledger(2, 1), configured_three_ledger(), configured_ledger(3, 2)] {
         let now = Instant::now();
         let request = ledger.request_primary_transfer(now).unwrap();
-        assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role == 4).count(), 1);
-        assert_eq!(request.configuration.replicas.0[0].current_role, 3);
-        assert_eq!(request.configuration.replicas.0[1].current_role, 4);
+        assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role == NativeReplicaRole::Primary).count(), 1);
+        assert_eq!(request.configuration.replicas.0[0].current_role, NativeReplicaRole::Secondary);
+        assert_eq!(request.configuration.replicas.0[1].current_role, NativeReplicaRole::Primary);
         assert!(request.configuration.replicas.0.iter().skip(2).all(|r|
-            r.previous_role == 3 && r.current_role == 3));
+            r.previous_role == NativeReplicaRole::Secondary && r.current_role == NativeReplicaRole::Secondary));
         assert_eq!(ledger.request_primary_transfer(now).unwrap(), request);
         let mut endpoint = AddInstance {
             unit: request.configuration.unit.clone(), service: request.configuration.service.clone(),
@@ -2417,14 +2418,14 @@ fn configured_planned_transfer_preserves_remaining_secondary_and_exact_completio
         };
         reply.unit.previous = Epoch::default();
         for r in &mut reply.replicas.0 {
-            r.previous_role = 1; r.first_lsn = 1; r.last_lsn = 8;
-            r.service_endpoint = if r.current_role == 4 { "127.0.0.1:23456".into() } else { String::new() };
+            r.previous_role = NativeReplicaRole::None; r.first_lsn = 1; r.last_lsn = 8;
+            r.service_endpoint = if r.current_role == NativeReplicaRole::Primary { "127.0.0.1:23456".into() } else { String::new() };
         }
         for invalid in 0..4 {
             let mut bad = reply.clone();
             match invalid {
                 0 => { bad.replicas.0.pop(); }
-                1 => bad.replicas.0[0].current_role = 4,
+                1 => bad.replicas.0[0].current_role = NativeReplicaRole::Primary,
                 2 => bad.replicas.0[0].instance += 1,
                 _ => bad.replicas.0[0].up = false,
             }
@@ -2462,8 +2463,8 @@ fn post_handoff_primary_failover_uses_completed_swap_and_retains_earlier_receipt
             };
             reply.unit.previous = Epoch::default();
             for r in &mut reply.replicas.0 {
-                r.previous_role = 1; r.first_lsn = 1; r.last_lsn = 8;
-                r.service_endpoint = if r.current_role == 4 { "127.0.0.1:23456".into() } else { String::new() };
+                r.previous_role = NativeReplicaRole::None; r.first_lsn = 1; r.last_lsn = 8;
+                r.service_endpoint = if r.current_role == NativeReplicaRole::Primary { "127.0.0.1:23456".into() } else { String::new() };
             }
             if blocked == 2 { ledger.lost(0, "handoff ownership became unknown before completion".into()); }
             if blocked != 1 {
@@ -2530,8 +2531,8 @@ fn repeated_planned_transfers_fence_old_completions_and_use_each_latest_primary(
             };
             reply.unit.previous = Epoch::default();
             for r in &mut reply.replicas.0 {
-                r.previous_role = 1; r.first_lsn = 1; r.last_lsn = 8;
-                r.service_endpoint = if r.current_role == 4 { endpoint.replica.service_endpoint.clone() } else { String::new() };
+                r.previous_role = NativeReplicaRole::None; r.first_lsn = 1; r.last_lsn = 8;
+                r.service_endpoint = if r.current_role == NativeReplicaRole::Primary { endpoint.replica.service_endpoint.clone() } else { String::new() };
             }
             ledger.configuration_reply(old_primary, reply.clone()).unwrap();
             assert_eq!(ledger.configuration_status()["state"], "pending");
@@ -2552,13 +2553,13 @@ fn configured_secondary_replacement_requires_retirement_delete_disposal_and_live
         let now = Instant::now();
         let add = ledger.request_idle(now).unwrap();
         let mut replica = add.replica.clone();
-        replica.state = 2;
+        replica.state = NativeReplicaState::Ready;
         replica.replication_endpoint = "127.0.0.1:12346".into();
         ledger.idle_reply(0, AddReplicaReply { unit: add.unit, replica, error: 0 }).unwrap();
         let activate = ledger.request_configuration(now).unwrap();
         let mut reply = ConfigurationReply { unit: activate.configuration.unit.clone(), replicas: activate.configuration.replicas.clone(), error: 0 };
         reply.unit.previous = Epoch::default();
-        for r in &mut reply.replicas.0 { r.previous_role = 1; }
+        for r in &mut reply.replicas.0 { r.previous_role = NativeReplicaRole::None; }
         ledger.configuration_reply(0, reply.clone()).unwrap();
         let retire = ledger.request_secondary_retirement(now).unwrap();
         assert_eq!(ledger.request_secondary_retirement(now).unwrap(), retire);
@@ -2566,14 +2567,14 @@ fn configured_secondary_replacement_requires_retirement_delete_disposal_and_live
         ledger.configuration_reply(0, reply).unwrap();
         assert_eq!(ledger.configuration_status()["state"], "pending");
         let mut proof = retirement(&ledger.placements[1]);
-        proof.disposal.body.replica.state = 3;
+        proof.disposal.body.replica.state = NativeReplicaState::Dropped;
         ledger.retirement(1, proof.clone(), 555).unwrap();
         assert!(ledger.placements[1].retirement.is_none());
         if missing == 0 { continue; }
         let mut reply = ConfigurationReply { unit: retire.configuration.unit, replicas: retire.configuration.replicas, error: 0 };
         reply.unit.previous = Epoch::default();
-        reply.replicas.0.retain(|r| r.current_role >= 3);
-        for r in &mut reply.replicas.0 { r.previous_role = 1; }
+        reply.replicas.0.retain(|r| r.current_role.is_active());
+        for r in &mut reply.replicas.0 { r.previous_role = NativeReplicaRole::None; }
         ledger.configuration_reply(0, reply).unwrap();
         assert!(ledger.request_idle_deletion_with_force(now, IdleDeleteTarget::Runtime, true).is_err());
         ledger.request_idle_deletion(now, IdleDeleteTarget::Runtime).unwrap();
@@ -2594,8 +2595,8 @@ fn configured_secondary_replacement_requires_retirement_delete_disposal_and_live
         } else {
             let next = ledger.request_idle_replacement(now).unwrap();
             assert!(next.replica.id > add.replica.id && next.replica.instance > add.replica.instance);
-            assert_eq!(next.replica.current_role, 2);
-            assert_eq!(next.replica.state, 1);
+            assert_eq!(next.replica.current_role, NativeReplicaRole::Idle);
+            assert_eq!(next.replica.state, NativeReplicaState::InBuild);
             assert!(next.replica.replication_endpoint.is_empty());
         }
     }
@@ -2612,13 +2613,13 @@ fn idle_replacement_requires_both_semantic_barriers_and_original_disposal() {
             replica: add.replica.clone(),
             error: 0,
         };
-        added.replica.state = 2;
+        added.replica.state = NativeReplicaState::Ready;
         added.replica.replication_endpoint = "127.0.0.1:12346".into();
         if missing != 0 { ledger.idle_reply(0, added.clone()).unwrap(); }
         let remove = ledger.request_idle_removal(now).unwrap();
         ledger.request_idle_deletion_with_force(now, IdleDeleteTarget::Runtime, missing == 6).unwrap();
         let mut removed = RemoveReplicaReply { unit: remove.unit, replica: remove.replica, error: 0 };
-        if !removed.replica.replication_endpoint.is_empty() { removed.replica.state = 3; }
+        if !removed.replica.replication_endpoint.is_empty() { removed.replica.state = NativeReplicaState::Dropped; }
         if missing != 1 { ledger.idle_removal_reply(0, removed.clone()).unwrap(); }
         let deleted = remove_reply(&ledger.placements[1]);
         if missing != 2 { ledger.reply(1, deleted.clone(), true).unwrap(); }
@@ -2669,7 +2670,7 @@ fn peer_host_loss_processes_only_owned_creation_and_never_completes_primary_remo
             assert!(ledger.report(1, &report).is_err());
             let add = ledger.request_idle(now).unwrap();
             let mut added = AddReplicaReply { unit: add.unit.clone(), replica: add.replica.clone(), error: 0 };
-            added.replica.state = 2;
+            added.replica.state = NativeReplicaState::Ready;
             added.replica.replication_endpoint = "127.0.0.1:23457".into();
             if add_acknowledged { ledger.idle_reply(0, added.clone()).unwrap(); }
             let removal = removing.then(|| ledger.request_idle_removal(now).unwrap());
@@ -2708,7 +2709,7 @@ fn peer_host_loss_processes_only_owned_creation_and_never_completes_primary_remo
             assert_eq!(ledger.idle_removal_status()["pending_remove"], removing);
             if let Some(removal) = removal {
                 let mut replica = removal.replica;
-                if add_acknowledged { replica.state = 3; }
+                if add_acknowledged { replica.state = NativeReplicaState::Dropped; }
                 ledger.idle_removal_reply(0, RemoveReplicaReply { unit: removal.unit, replica, error: 0 }).unwrap();
                 assert_eq!(ledger.idle_removal_status()["pending_remove"], false);
                 assert_eq!(ledger.idle_status()["state"], "lost");
@@ -2733,7 +2734,7 @@ fn peer_host_loss_rejects_foreign_reports_and_requires_the_original_live_destina
                 2 => info.replicas.0[0].description.node.instance += 1,
                 3 => info.unit.current.configuration += 1,
                 4 => info.local_deleted = true,
-                5 => info.replicas.0[0].description.current_role = 2,
+                5 => info.replicas.0[0].description.current_role = NativeReplicaRole::Idle,
                 _ => foreign.from_fmm = true,
             }
             assert!(ledger.report(1, &foreign).is_err());
@@ -2793,7 +2794,7 @@ fn idle_destination_delete_joins_independent_reply_and_disposal_without_clearing
             }
             ledger.idle_deletion_reply(0, reply.clone()).unwrap();
             let mut invalid = reply.clone();
-            invalid.replica.current_role = 2;
+            invalid.replica.current_role = NativeReplicaRole::Idle;
             assert!(ledger.reply(1, invalid, true).is_err());
             assert_eq!(ledger.idle_deletion_status()["destination_deleted"], false);
             let proof = retirement(&ledger.placements[1]);
@@ -2938,7 +2939,7 @@ fn absent_idle_cleanup_rejects_foreign_or_opened_proofs_and_retains_unknown_owne
         let mut ledger = peer_idle_ledger();
         let add = ledger.request_idle(now).unwrap();
         let mut reply = AddReplicaReply { unit: add.unit, replica: add.replica, error: if opened { 0 } else { -993 } };
-        reply.replica.state = 2;
+        reply.replica.state = NativeReplicaState::Ready;
         reply.replica.replication_endpoint = "127.0.0.1:23457".into();
         ledger.idle_reply(0, reply).unwrap();
         ledger.request_idle_removal(now).unwrap();
@@ -3333,7 +3334,7 @@ fn fm_idle_ledger_requires_semantic_ready_reply_and_fences_failure_loss_and_remo
         assert!(ledger.idle_retry(1, now + Duration::from_secs(30)).is_none());
         let mut reply = AddReplicaReply { unit: request.unit.clone(),
             replica: request.replica.clone(), error: 0 };
-        reply.replica.state = 2;
+        reply.replica.state = NativeReplicaState::Ready;
         reply.replica.replication_endpoint = "127.0.0.1:23457".into();
         let mut stale = reply.clone();
         stale.replica.instance -= 1;
@@ -3341,7 +3342,7 @@ fn fm_idle_ledger_requires_semantic_ready_reply_and_fences_failure_loss_and_remo
         ledger.idle_reply(1, reply.clone()).unwrap();
         assert_eq!(ledger.idle_status()["state"], "pending");
         let mut in_build = reply.clone();
-        in_build.replica.state = 1;
+        in_build.replica.state = NativeReplicaState::InBuild;
         assert!(ledger.idle_reply(0, in_build).is_err());
         match outcome {
             "cancelled" => ledger.idles.first_mut().unwrap().cancelled = true,
@@ -3386,7 +3387,7 @@ fn fm_idle_removal_keeps_pending_until_matching_reply_and_never_resurrects_add()
         let mut reply = RemoveReplicaReply {
             unit: request.unit.clone(), replica: request.replica.clone(), error: 0,
         };
-        reply.replica.state = 3;
+        reply.replica.state = NativeReplicaState::Dropped;
         reply.replica.replication_endpoint = "127.0.0.1:23457".into();
         let mut failed = reply.clone();
         failed.error = -992;
@@ -3403,7 +3404,7 @@ fn fm_idle_removal_keeps_pending_until_matching_reply_and_never_resurrects_add()
             ledger.idle_removal_reply(0, stale).unwrap();
         }
         let mut invalid = reply.clone();
-        invalid.replica.state = 2;
+        invalid.replica.state = NativeReplicaState::Ready;
         assert!(ledger.idle_removal_reply(0, invalid).is_err());
         assert_eq!(ledger.idle_removal_status()["state"], "pending");
         assert!(ledger.idle_removal_retry(0, now + Duration::from_secs(10)).is_none());
@@ -3419,7 +3420,7 @@ fn fm_idle_removal_keeps_pending_until_matching_reply_and_never_resurrects_add()
         assert_eq!(ledger.idle_removal_status()["pending_remove"], lost);
         assert!(ledger.idle_removal_retry(0, now + Duration::from_secs(150)).is_none());
         let mut late = reply.clone();
-        late.replica.state = 2;
+        late.replica.state = NativeReplicaState::Ready;
         ledger.idle_reply(0, late).unwrap();
         assert_eq!(ledger.idle_status()["ready"], false);
         assert_eq!(ledger.idle_status()["cleanup_required"], lost);
@@ -3457,7 +3458,7 @@ fn fm_in_create_removal_requires_exact_echo_and_keeps_completion_separate_from_o
         for field in 0..3 {
             let mut invalid = reply.clone();
             match field {
-                0 => invalid.replica.state = 2,
+                0 => invalid.replica.state = NativeReplicaState::Ready,
                 1 => invalid.replica.replication_endpoint = "unobserved".into(),
                 _ => invalid.replica.last_lsn += 1,
             }
@@ -3474,7 +3475,7 @@ fn fm_in_create_removal_requires_exact_echo_and_keeps_completion_separate_from_o
         assert_eq!(ledger.idle_removal_status()["completion"], if lost { Value::Null } else { json!("creation_cancelled") });
         assert_eq!(ledger.idle_removal_status()["destination_deleted"], false);
         let mut late = reply;
-        late.replica.state = 2;
+        late.replica.state = NativeReplicaState::Ready;
         late.replica.replication_endpoint = "127.0.0.1:23457".into();
         ledger.idle_reply(0, late).unwrap();
         assert_eq!(ledger.idle_status()["ready"], false);
@@ -3503,7 +3504,7 @@ fn failed_fm_add_marks_pending_remove_and_preserves_error_after_exact_cleanup_re
         let mut failure = AddReplicaReply {
             unit: request.unit.clone(), replica: request.replica.clone(), error: -993,
         };
-        failure.replica.state = 3;
+        failure.replica.state = NativeReplicaState::Dropped;
         failure.replica.up = false;
         failure.replica.version.instance += 1;
         ledger.idle_reply(1, failure.clone()).unwrap();
@@ -3521,7 +3522,7 @@ fn failed_fm_add_marks_pending_remove_and_preserves_error_after_exact_cleanup_re
             unit: request.unit.clone(), replica: request.replica.clone(), error: 0,
         };
         let mut rap_success = reply.clone();
-        rap_success.replica.state = 3;
+        rap_success.replica.state = NativeReplicaState::Dropped;
         rap_success.replica.replication_endpoint = "127.0.0.1:23457".into();
         assert!(ledger.idle_removal_reply(0, rap_success).is_err());
         let mut stale = reply.clone();
@@ -3549,7 +3550,7 @@ fn failed_fm_add_marks_pending_remove_and_preserves_error_after_exact_cleanup_re
         let original = ledger.status();
         ledger.idle_reply(0, failure.clone()).unwrap();
         failure.error = 0;
-        failure.replica.state = 2;
+        failure.replica.state = NativeReplicaState::Ready;
         failure.replica.replication_endpoint = "late".into();
         ledger.idle_reply(0, failure).unwrap();
         ledger.idle_removal_reply(0, reply).unwrap();
@@ -4226,8 +4227,8 @@ async fn fm_add_idle_copies_real_state_and_recovers_lost_reply_without_resurrect
                 if let Some(body) = dropped { break body; }
                 assert!(Instant::now() < end, "lost-reply deadline: {}", cluster.status());
             };
-            assert_eq!(dropped.replica.state, 2);
-            assert_eq!(dropped.replica.current_role, 2);
+            assert_eq!(dropped.replica.state, NativeReplicaState::Ready);
+            assert_eq!(dropped.replica.current_role, NativeReplicaRole::Idle);
             assert_eq!(cluster.ledger.idle_status()["state"], "pending");
             assert_eq!(cluster.ledger.placements[1].observed, Observed::Absent);
             until(&mut cluster, |cluster| {
@@ -4260,7 +4261,7 @@ async fn fm_add_idle_copies_real_state_and_recovers_lost_reply_without_resurrect
                     assert!(Instant::now() < end, "lost removal reply: {}", cluster.status());
                 };
                 assert_eq!(removed.error, 0);
-                assert_eq!(removed.replica.state, 3);
+                assert_eq!(removed.replica.state, NativeReplicaState::Dropped);
                 until(&mut cluster, |cluster| cluster.status()["peer_idle"]["state"] == "removed").await;
                 assert_eq!(cluster.ledger.idle_removal_status()["state"], "pending");
                 assert_eq!(cluster.ledger.idle_removal_status()["pending_remove"], true);
@@ -4361,7 +4362,7 @@ async fn fm_can_remove_ready_idle_without_waiting_for_open_telemetry() {
     }
     let add = cluster.ledger.request_idle(Instant::now()).unwrap();
     let mut replica = add.replica.clone();
-    replica.state = 2;
+    replica.state = NativeReplicaState::Ready;
     replica.replication_endpoint = "127.0.0.1:12346".into();
     cluster.ledger.idle_reply(0, AddReplicaReply {
         unit: add.unit, replica: replica.clone(), error: 0,
@@ -5133,7 +5134,7 @@ async fn immutable_configured_service_builds_initial_membership_without_resize()
                 resize.configuration.service.update_version += 1;
                 for replica in &mut resize.configuration.replicas.0 {
                     replica.previous_role = replica.current_role;
-                    if replica.current_role == 3 { replica.current_role = 1; }
+                    if replica.current_role == NativeReplicaRole::Secondary { replica.current_role = NativeReplicaRole::None; }
                 }
                 cluster.send_configuration(&resize).await?;
                 until(&mut cluster, |c| !c.ledger.placements[0].link_alive).await;
@@ -5220,11 +5221,11 @@ async fn configured_primary_failover_preserves_sizes_data_and_quorum_with_unavai
             assert!(cluster.ledger.placements.iter().all(|p| p.endpoint.is_none()));
             let request = cluster.ledger.swap.as_ref().unwrap().body.clone();
             assert_eq!(request.configuration.service, service);
-            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), target as usize);
-            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role >= 3).count(),
+            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role.is_active()).count(), target as usize);
+            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role.is_active()).count(),
                 (target as usize - 1 - secondary_losses).max(minimum as usize));
-            let former_primary = request.configuration.replicas.0.iter().find(|r| r.previous_role == 4).unwrap();
-            assert_eq!(former_primary.current_role, if target == minimum { 3 } else { 1 });
+            let former_primary = request.configuration.replicas.0.iter().find(|r| r.previous_role == NativeReplicaRole::Primary).unwrap();
+            assert_eq!(former_primary.current_role, if target == minimum { NativeReplicaRole::Secondary } else { NativeReplicaRole::None });
             assert!(!former_primary.up);
             let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11)).ok_or("missing failover retry")?;
             assert_eq!(retry, request);
@@ -5254,7 +5255,7 @@ async fn configured_primary_failover_preserves_sizes_data_and_quorum_with_unavai
             if target == minimum {
                 assert!(reply.replicas.0.iter().any(|r| r.node == former_primary.node
                     && r.id == former_primary.id && r.instance == former_primary.instance
-                    && r.current_role == 3 && !r.up));
+                    && r.current_role == NativeReplicaRole::Secondary && !r.up));
                 assert!(cluster.repair_primary_replica().await.is_err());
                 let lost = target as usize - 1;
                 let pid = cluster.ledger.placements[lost].profile.as_ref().unwrap().app_pid;
@@ -5379,9 +5380,9 @@ async fn manual_sequential_spares_restore_latest_membership_and_supply_real_vote
                 assert_eq!(repair.build.reply.as_ref(), Some(&built));
                 let request = repair.configuration.as_ref().unwrap().body.clone();
                 assert_eq!((request.configuration.unit.target, request.configuration.unit.minimum), (target, minimum));
-                assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(),
+                assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role.is_active()).count(),
                     spare - usize::from(was_primary && minimum < target));
-                assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role >= 3).count(), spare);
+                assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role.is_active()).count(), spare);
                 if let Some((old_build, old_request, _, old_final)) = &previous {
                     cluster.send_idle(old_build).await?;
                     cluster.send_configuration(old_request).await?;
@@ -5616,8 +5617,8 @@ async fn secondary_removal_primary_loss(lfum: bool) {
                 assert_eq!(intent.configuration.unit.previous,removal.configuration.unit.previous);
                 assert_eq!(intent.configuration.unit.current.configuration,removal.configuration.unit.current.configuration+0x1_0000_0001);
                 assert_eq!(intent.configuration.service,service);
-                assert_eq!(intent.configuration.replicas.0.iter().filter(|r| r.previous_role>=3).count(),5);
-                assert_eq!(intent.configuration.replicas.0.iter().filter(|r| r.current_role>=3).count(),4);
+                assert_eq!(intent.configuration.replicas.0.iter().filter(|r| r.previous_role.is_active()).count(),5);
+                assert_eq!(intent.configuration.replicas.0.iter().filter(|r| r.current_role.is_active()).count(),4);
                 assert_eq!(intent.configuration.replicas.0.iter().filter(|r| r.up).count(),3);
                 assert!(cluster.ledger.repair.is_none());
                 assert!(!cluster.ledger.repair_history.last().unwrap().host_requested);
@@ -5961,7 +5962,7 @@ async fn sequential_repair_after_removal_supersession_restores_target_and_later_
                 let lost=hold_peer_loss_frame(&mut cluster,2,"DoReconfigurationReply",Duration::from_secs(30)).await?;
                 assert_eq!(cluster.ledger.repair_status()["removed"],false);
                 let retry=cluster.ledger.configuration_retry(Instant::now()+Duration::from_secs(11)).ok_or("missing restoration removal retry")?;
-                assert_eq!(retry.configuration.replicas.0.iter().filter(|r| r.current_role>=3).count(),3);
+                assert_eq!(retry.configuration.replicas.0.iter().filter(|r| r.current_role.is_active()).count(),3);
                 cluster.send_configuration(&retry).await?;
                 Some(decode_do_reconfiguration_reply(&lost).map_err(err)?.0)
             } else {None};
@@ -5984,7 +5985,7 @@ async fn sequential_repair_after_removal_supersession_restores_target_and_later_
             if ready_idle_first && step==0 {
                 let request=&cluster.ledger.repair.as_ref().unwrap().configuration.as_ref().unwrap().body.configuration;
                 let down=request.replicas.0.iter().find(|r|r.node==cluster.children[0].launch.node).unwrap();
-                assert_eq!((down.previous_role,down.current_role,down.up),(3,1,false));
+                assert_eq!((down.previous_role,down.current_role,down.up),(NativeReplicaRole::Secondary,NativeReplicaRole::None,false));
                 assert_eq!(request.unit.previous,supersession.configuration.unit.current);
                 assert_eq!(request.unit.current.configuration,supersession.configuration.unit.current.configuration+1);
             }
@@ -6390,7 +6391,7 @@ async fn manual_configured_primary_repair_repeats_fresh_owner_cycles_without_res
                     let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11))
                         .ok_or("missing configured repair configuration retry")?;
                     assert_eq!(retry.configuration.service, service);
-                    assert_eq!(retry.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), target as usize - 1);
+                    assert_eq!(retry.configuration.replicas.0.iter().filter(|r| r.previous_role.is_active()).count(), target as usize - 1);
                     cluster.send_configuration(&retry).await?;
                 }
                 let completed = cluster.wait_operation(&rebuild, Duration::from_secs(30)).await?;
@@ -6551,8 +6552,8 @@ async fn three_replica_primary_repair_recopies_fresh_owner_and_restores_majority
         let request = cluster.ledger.repair.as_ref().unwrap().configuration.as_ref().unwrap().body.clone();
         assert_eq!(request.configuration.service.target, 3);
         assert_eq!(request.configuration.service.minimum, 2);
-        assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), 2);
-        assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role >= 3).count(), 3);
+        assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role.is_active()).count(), 2);
+        assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role.is_active()).count(), 3);
         assert_eq!(request.configuration.unit.previous.data_loss, request.configuration.unit.current.data_loss);
         let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11)).ok_or("missing repair retry")?;
         assert_eq!(retry, request);
@@ -6824,9 +6825,9 @@ async fn three_replica_primary_failover_preserves_data_and_never_promotes_withou
             assert!(cluster.ledger.placements.iter().all(|p| p.endpoint.is_none()));
             let request = cluster.ledger.swap.as_ref().unwrap().body.clone();
             assert_eq!(request.configuration.unit.previous.data_loss, request.configuration.unit.current.data_loss);
-            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role >= 3).count(), 3);
-            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role >= 3).count(), 2);
-            assert!(request.configuration.replicas.0.iter().any(|r| r.previous_role == 4 && r.current_role == 1 && !r.up && r.state == 3));
+            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.previous_role.is_active()).count(), 3);
+            assert_eq!(request.configuration.replicas.0.iter().filter(|r| r.current_role.is_active()).count(), 2);
+            assert!(request.configuration.replicas.0.iter().any(|r| r.previous_role == NativeReplicaRole::Primary && r.current_role == NativeReplicaRole::None && !r.up && r.state == NativeReplicaState::Dropped));
             let retry = cluster.ledger.configuration_retry(Instant::now() + Duration::from_secs(11))
                 .ok_or("missing native failover retry")?;
             assert_eq!(retry, request);
@@ -7261,7 +7262,7 @@ async fn manual_planned_handoff_drops_unresponsive_volatile_secondary_then_expli
         assert_eq!(cluster.ledger.configuration_status()["state"], "pending");
         assert!(cluster.ledger.placements.iter().all(|p| p.endpoint.is_none()));
         let dropped = reply.replicas.0.iter().find(|r| r.node == predecessor.replica.node).unwrap();
-        assert!(!dropped.up && dropped.state == 3 && dropped.current_role == 3);
+        assert!(!dropped.up && dropped.state == NativeReplicaState::Dropped && dropped.current_role == NativeReplicaRole::Secondary);
         assert_eq!((dropped.id, dropped.instance), (predecessor.replica.id, predecessor.replica.instance));
         cluster.send_configuration(&intent).await?;
         until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true
@@ -7411,7 +7412,7 @@ async fn manual_post_handoff_app_crash_repairs_same_node_then_transfers_with_fre
                 assert_eq!(cluster.wait_operation("rebuild", Duration::ZERO).await?, restored);
                 let request = cluster.ledger.swap.as_ref().unwrap().body.clone();
                 assert!(request.configuration.replicas.0.iter().any(|r| r.node == predecessor.replica.node
-                    && r.id > predecessor.replica.id && r.instance > predecessor.replica.instance && r.current_role == 4));
+                    && r.id > predecessor.replica.id && r.instance > predecessor.replica.instance && r.current_role == NativeReplicaRole::Primary));
                 cluster.send_configuration(&request).await?;
                 until(&mut cluster, |c| c.ledger.configuration_status()["ready"] == true).await;
                 assert_eq!(cluster.ledger.swap.as_ref().unwrap().reply.as_ref(), Some(&completed));
@@ -7871,7 +7872,7 @@ fn ready_reply(placement: &fm::Placement) -> AddInstanceReply {
     AddInstanceReply {
         unit: body.unit,
         replica: Replica {
-            state: 2,
+            state: NativeReplicaState::Ready,
             service_endpoint: "127.0.0.1:23456".into(),
             replication_endpoint: if body.service.stateful {
                 "127.0.0.1:23457".into()
@@ -7890,7 +7891,7 @@ fn remove_reply(placement: &fm::Placement) -> AddInstanceReply {
         id: reply.replica.id,
         instance: reply.replica.instance,
         up: false,
-        state: 3,
+        state: NativeReplicaState::Dropped,
         ..Replica::default()
     };
     reply
@@ -7947,7 +7948,7 @@ fn failed_registration_receipt(placement: &fm::Placement, error: i64) -> FailedR
 
 fn failed_open_receipt(placement: &fm::Placement, error: i64) -> FailedOpenReceipt {
     let mut disposal = retirement(placement).disposal;
-    disposal.body.replica.current_role = 2;
+    disposal.body.replica.current_role = NativeReplicaRole::Idle;
     FailedOpenReceipt {
         deployment: placement.launch.deployment.clone(), session: placement.launch.session.clone(),
         node: placement.launch.node.clone(), fm: placement.launch.fm.clone(), generation: placement.launch.generation.clone(),
@@ -7968,7 +7969,7 @@ fn absence_receipt(placement: &fm::Placement) -> AbsenceReceipt {
     body.unit.target = 0;
     body.unit.minimum = 0;
     body.replica = Replica { node: placement.launch.node.clone(), id: placement.replica,
-        instance: placement.incarnation, up: false, state: 3, ..Replica::default() };
+        instance: placement.incarnation, up: false, state: NativeReplicaState::Dropped, ..Replica::default() };
     AbsenceReceipt {
         deployment: placement.launch.deployment.clone(), session: placement.launch.session.clone(),
         node: placement.launch.node.clone(), fm: placement.launch.fm.clone(), generation: placement.launch.generation.clone(),
@@ -8093,7 +8094,7 @@ fn retired_native_frames_do_not_mutate_successor_and_identity_overflow_does_not_
             service: ledger.placements[0].body().unwrap().service,
             replicas: ObjectArray(vec![ReplicaInfo {
                 description: removed.replica,
-                intermediate_role: 1,
+                intermediate_role: NativeReplicaRole::None,
             }]),
             ..FailoverUnitInfo::default()
         }]),
@@ -8182,7 +8183,7 @@ fn semantic_completion_is_exact_and_writes_never_complete_an_operation() {
     assert_eq!(ledger.placements[0].desired, Desired::Absent);
     assert!(ledger.reply(0, reply.clone(), true).is_err());
     let mut disposed = reply;
-    disposed.replica.state = 3;
+    disposed.replica.state = NativeReplicaState::Dropped;
     disposed.replica.up = false;
     disposed.replica.version = VersionInstance::invalid();
     disposed.replica.service_endpoint.clear();
@@ -8769,7 +8770,7 @@ async fn primary_repair_lfum(cycles: usize, deactivate: bool) {
         assert_eq!(frozen_build[primary].units.0[0].replicas.0.len(), 3);
         assert_eq!(frozen_build[survivor].units.0[0].replicas.0.len(), 2);
         assert_eq!((frozen_build[destination].units.0[0].replicas.0[0].description.current_role,
-            frozen_build[destination].units.0[0].replicas.0[0].description.state), (2, 1));
+            frozen_build[destination].units.0[0].replicas.0[0].description.state), (NativeReplicaRole::Idle, NativeReplicaState::InBuild));
         cluster.ledger.idle_reply(primary, built.clone())?;
         until(&mut cluster, |c|
             c.status()["nodes"][primary]["retained_work"]["local_replica"]["configuration"]["stage"] == "Deactivate").await;
@@ -9091,11 +9092,11 @@ async fn real_lfum_during_planned_handoff_preserves_sf_phases_upload_owners_and_
             assert_eq!(cluster.ledger.generation.as_ref().unwrap().uploads[0].as_ref(), Some(&source_snapshot));
             assert!(!old.units.0[0].report_from_primary);
             let old_local = old.units.0[0].replicas.0.iter().find(|r| r.description.node == cluster.children[0].launch.node).unwrap();
-            assert_eq!(old_local.description.state, 1);
+            assert_eq!(old_local.description.state, NativeReplicaState::InBuild);
             assert!(old_local.description.service_endpoint.is_empty());
             let queried = decode_lfum_upload(&querying[third].message).map_err(err)?;
             assert_eq!(queried.units.0[0].unit, intent.configuration.unit);
-            assert!(queried.units.0[0].replicas.0.iter().any(|r| r.description.current_role == 4 && r.description.previous_role == 4));
+            assert!(queried.units.0[0].replicas.0.iter().any(|r| r.description.current_role == NativeReplicaRole::Primary && r.description.previous_role == NativeReplicaRole::Primary));
             assert!(!work[1].exists(), "missing progress cannot complete GetLSN");
             finish_lfum_round(&mut cluster, querying).await?;
             assert!(!work[1].exists(), "LFUM ACK cannot replace missing progress");
@@ -9288,7 +9289,7 @@ async fn manual_lfum_during_primary_failover_preserves_sf_phases_data_and_origin
         let queried = &frozen[2].units.0[0];
         assert_eq!(queried.intermediate, Epoch::default());
         assert!(queried.replicas.0.iter().any(|r| r.description.node == cluster.children[0].launch.node
-            && r.description.current_role == 4 && r.description.previous_role == 4 && r.description.up));
+            && r.description.current_role == NativeReplicaRole::Primary && r.description.previous_role == NativeReplicaRole::Primary && r.description.up));
         cluster.ledger.generation.as_mut().unwrap().reject(&frozen[0].generation)?;
         for _ in 0..2 { for index in 0..3 { cluster.retry_generation(index).await?; } }
         let current = hold_lfum_uploads(&mut cluster).await?;
@@ -9419,12 +9420,12 @@ async fn real_lfum_during_idle_build_preserves_sf_inventory_copy_and_original_ow
             let info = &body.units.0[0];
             assert_eq!(info.intermediate, Epoch::default());
             assert_eq!(info.report_from_primary, index == 0);
-            assert!(info.replicas.0.iter().all(|r| r.intermediate_role == 1
+            assert!(info.replicas.0.iter().all(|r| r.intermediate_role == NativeReplicaRole::None
                 && r.description.first_lsn == -1 && r.description.last_lsn == -1));
             if index != 0 {
                 assert_eq!(info.replicas.0.len(), 1);
                 let local = &info.replicas.0[0].description;
-                assert_eq!((local.current_role, local.state), (2, 1));
+                assert_eq!((local.current_role, local.state), (NativeReplicaRole::Idle, NativeReplicaState::InBuild));
                 assert!(frozen.units.0[0].replicas.0.iter().any(|r| r.description == *local));
             }
         }
@@ -9994,7 +9995,7 @@ fn stateful_delete_requires_both_original_inputs_before_explicit_fresh_recreatio
         for forged in 0..4 {
             let mut reply = correct.clone();
             match forged {
-                0 => reply.replica.current_role = 4,
+                0 => reply.replica.current_role = NativeReplicaRole::Primary,
                 1 => reply.replica.up = true,
                 2 => reply.replica.replication_endpoint = "127.0.0.1:23457".into(),
                 _ => reply.replica.instance += 1,
@@ -10336,7 +10337,7 @@ fn stateful_loss_report(placement: &fm::Placement) -> ReplicaUp {
             report_from_primary: false,
             replicas: ObjectArray(vec![ReplicaInfo {
                 description: remove_reply(placement).replica,
-                intermediate_role: 1,
+                intermediate_role: NativeReplicaRole::None,
             }]),
             local_deleted: false,
         }]),
@@ -10363,7 +10364,7 @@ fn stateful_loss_is_processed_not_echoed_and_native_deletion_never_supplies_disp
             match forged {
                 0 => info.replicas.0[0].description.up = true,
                 1 => info.replicas.0[0].description.instance -= 1,
-                2 => info.replicas.0[0].description.current_role = 4,
+                2 => info.replicas.0[0].description.current_role = NativeReplicaRole::Primary,
                 3 => info.local_deleted = true,
                 _ => info.unit.current.configuration += 1,
             }

@@ -1493,15 +1493,8 @@ pub(crate) fn api_epoch(epoch: &w::Epoch) -> Epoch {
         }
     }
 }
-fn role(value: i64) -> Result<ReplicaRole> {
-    match value {
-        0 => Ok(ReplicaRole::Unknown),
-        1 => Ok(ReplicaRole::None),
-        2 => Ok(ReplicaRole::IdleSecondary),
-        3 => Ok(ReplicaRole::ActiveSecondary),
-        4 => Ok(ReplicaRole::Primary),
-        _ => Err(Error::Protocol("invalid native replica role")),
-    }
+fn role(value: w::NativeReplicaRole) -> Result<ReplicaRole> {
+    value.try_into()
 }
 fn stale(current: &w::ProxyRequest, incoming: &w::ProxyRequest) -> bool {
     api_epoch(&current.unit.current) > api_epoch(&incoming.unit.current)

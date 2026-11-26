@@ -1,4 +1,5 @@
 //! Compiler-free consumer of independently native-produced fixtures.
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 mod support;
 
 #[path = "support/envelope.rs"]
@@ -91,7 +92,7 @@ impl Rich for NodeDescription {
 impl Rich for LegacyLoadReport {
     fn rich(&mut self, c: &mut i32) {
         self.unit.rich(c);
-        self.role = enumeration(c);
+        self.role = enumeration(c).into();
         self.metrics.rich(c);
     }
 }
@@ -290,9 +291,9 @@ fn rich_deletion() -> DeleteReplica {
     body.service.minimum = 1;
     body.service.stateful = true;
     body.service.persisted = false;
-    body.replica.current_role = 4;
-    body.replica.previous_role = 1;
-    body.replica.state = 2;
+    body.replica.current_role = NativeReplicaRole::Primary;
+    body.replica.previous_role = NativeReplicaRole::None;
+    body.replica.state = NativeReplicaState::Ready;
     body.replica.up = true;
     DeleteReplica::new(body, false)
 }
@@ -307,9 +308,9 @@ fn rich_creation(initial: bool) -> CreateReplica {
     body.service.minimum = 1;
     body.service.stateful = true;
     body.service.persisted = false;
-    body.replica.current_role = 2;
-    body.replica.previous_role = 1;
-    body.replica.state = 1;
+    body.replica.current_role = NativeReplicaRole::Idle;
+    body.replica.previous_role = NativeReplicaRole::None;
+    body.replica.state = NativeReplicaState::InBuild;
     body.replica.up = true;
     if initial {
         info.epoch = body.unit.current;
@@ -322,9 +323,9 @@ fn rich_creation_reply(error: i64) -> CreateReplicaReply {
     let mut reply = support::rich_reply(error);
     reply.unit.target = 1;
     reply.unit.minimum = 1;
-    reply.replica.current_role = 2;
-    reply.replica.previous_role = 1;
-    reply.replica.state = 1;
+    reply.replica.current_role = NativeReplicaRole::Idle;
+    reply.replica.previous_role = NativeReplicaRole::None;
+    reply.replica.state = NativeReplicaState::InBuild;
     reply.replica.up = true;
     reply
 }
@@ -337,7 +338,7 @@ fn rich_deletion_reply(error: i64) -> DeleteReplicaReply {
         node: body.replica.node,
         id: body.replica.id,
         instance: body.replica.instance,
-        state: 3,
+        state: NativeReplicaState::Dropped,
         up: false,
         ..Replica::default()
     };
@@ -1070,9 +1071,9 @@ fn replica_contracts(input: &Path, output: &Path) {
     request.service.minimum = 1;
     request.service.stateful = true;
     request.service.persisted = false;
-    request.replica.current_role = 2;
-    request.replica.previous_role = 1;
-    request.replica.state = 1;
+    request.replica.current_role = NativeReplicaRole::Idle;
+    request.replica.previous_role = NativeReplicaRole::None;
+    request.replica.state = NativeReplicaState::InBuild;
     request.replica.up = true;
     for (name, body) in [
         ("default-add-replica", AddReplica::default()),
@@ -1100,9 +1101,13 @@ fn replica_contracts(input: &Path, output: &Path) {
         let mut reply = support::rich_reply(error);
         reply.unit.target = 1;
         reply.unit.minimum = 1;
-        reply.replica.current_role = 2;
-        reply.replica.previous_role = 1;
-        reply.replica.state = if error == 0 { 2 } else { 1 };
+        reply.replica.current_role = NativeReplicaRole::Idle;
+        reply.replica.previous_role = NativeReplicaRole::None;
+        reply.replica.state = if error == 0 {
+            NativeReplicaState::Ready
+        } else {
+            NativeReplicaState::InBuild
+        };
         reply.replica.up = true;
         reply.replica.service_endpoint.clear();
         replies.push((format!("rich-add-replica-reply-{error}"), reply));
@@ -1166,9 +1171,9 @@ fn replica_contracts(input: &Path, output: &Path) {
         let mut reply = support::rich_reply(error);
         reply.unit.target = 1;
         reply.unit.minimum = 1;
-        reply.replica.current_role = 2;
-        reply.replica.previous_role = 1;
-        reply.replica.state = 3;
+        reply.replica.current_role = NativeReplicaRole::Idle;
+        reply.replica.previous_role = NativeReplicaRole::None;
+        reply.replica.state = NativeReplicaState::Dropped;
         reply.replica.up = true;
         reply.replica.service_endpoint.clear();
         replies.push((format!("rich-remove-replica-reply-{error}"), reply));
@@ -1552,14 +1557,14 @@ fn main() {
     check(input, output, "rich-request", support::rich_request());
     check(input, output, "default-reply", AddInstanceReply::default());
     let mut primary = support::rich_request();
-    primary.replica.current_role = 4;
-    primary.replica.previous_role = 1;
-    primary.replica.state = 1;
+    primary.replica.current_role = NativeReplicaRole::Primary;
+    primary.replica.previous_role = NativeReplicaRole::None;
+    primary.replica.state = NativeReplicaState::InBuild;
     primary.replica.up = true;
     let mut primary_reply = support::rich_reply(0);
-    primary_reply.replica.current_role = 4;
-    primary_reply.replica.previous_role = 1;
-    primary_reply.replica.state = 2;
+    primary_reply.replica.current_role = NativeReplicaRole::Primary;
+    primary_reply.replica.previous_role = NativeReplicaRole::None;
+    primary_reply.replica.state = NativeReplicaState::Ready;
     primary_reply.replica.up = true;
     check(input, output, "default-primary", AddPrimary::default());
     check(input, output, "rich-primary", primary.clone());

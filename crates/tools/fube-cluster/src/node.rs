@@ -14,6 +14,7 @@ use fube_node::{
     control::{ingress::Admission, peer_target, Adapter, LfumUploadState},
     local::Node,
 };
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use fube_ra::{entity as ra, protocol::*};
 use fube_ra_store::{MemoryBackend, Settings, Store};
 use std::{fs, path::Path, sync::Arc, time::Duration};
@@ -818,9 +819,9 @@ fn create_idle(launch: &Launch, node: &mut Node) -> Result<u64> {
         node: peer.node.clone(),
         id: peer.replica,
         instance: peer.incarnation,
-        previous_role: 1,
-        current_role: 2,
-        state: 1,
+        previous_role: NativeReplicaRole::None,
+        current_role: NativeReplicaRole::Idle,
+        state: NativeReplicaState::InBuild,
         up: true,
         version: package_version,
         ..Replica::default()
@@ -1410,7 +1411,7 @@ pub(crate) mod report_tests {
                     }
                     .map_err(err)?;
                     if body.error != 0
-                        || body.replica.state != 2
+                        || body.replica.state != NativeReplicaState::Ready
                         || body.replica.node != launch.node
                         || body.replica.instance != launch.incarnation
                         || body.replica.service_endpoint.is_empty()
@@ -1436,7 +1437,7 @@ pub(crate) mod report_tests {
                         decode_remove_instance_reply(&incoming.message)
                     }
                     .map_err(err)?;
-                    if body.error != 0 || body.replica.state != 3 {
+                    if body.error != 0 || body.replica.state != NativeReplicaState::Dropped {
                         return Err("real removal did not dispose the instance".into());
                     }
                     traffic.removed = true;
@@ -1661,7 +1662,7 @@ pub(crate) mod report_tests {
                     id: launch.replica,
                     instance: launch.incarnation,
                     up: false,
-                    state: 3,
+                    state: NativeReplicaState::Dropped,
                     ..Replica::default()
                 })
             || traffic.reports.iter().any(|report| report != &first)
@@ -1673,7 +1674,7 @@ pub(crate) mod report_tests {
         stale.dropped.0[0].replicas.0[0].description.id += 1;
         let mut nonclearing = first.clone();
         nonclearing.replicas.0 = std::mem::take(&mut nonclearing.dropped.0);
-        nonclearing.replicas.0[0].replicas.0[0].description.state = 2;
+        nonclearing.replicas.0[0].replicas.0[0].description.state = NativeReplicaState::Ready;
         nonclearing.replicas.0[0].replicas.0[0].description.up = true;
         for rejected in [stale, nonclearing.clone()] {
             acknowledge_without_sending_captured_report(launch, node, adapter, fm, link, &rejected)
@@ -1874,7 +1875,7 @@ pub(crate) mod report_tests {
                 service: body.service.clone(),
                 replicas: fubst::serde::ObjectArray(vec![ReplicaInfo {
                     description: Replica {
-                        state: 3,
+                        state: NativeReplicaState::Dropped,
                         up: false,
                         version: VersionInstance::invalid(),
                         ..body.replica.clone()
@@ -2567,7 +2568,7 @@ pub(crate) mod report_tests {
         if let Some(proof) = &disposal {
             if proof.body.replica.id != body.replica.id
                 || proof.body.replica.instance != body.replica.instance
-                || proof.body.replica.current_role != 4
+                || proof.body.replica.current_role != NativeReplicaRole::Primary
                 || proof.body.unit != body.unit
                 || tokio::net::TcpStream::connect(&endpoint).await.is_ok()
                 || tokio::net::TcpStream::connect(replication_address)
@@ -2613,7 +2614,7 @@ pub(crate) mod report_tests {
                 1 => info.replicas.0[0].description.instance -= 1,
                 2 => info.unit.current.configuration -= 1,
                 _ if expected_stage == ra::FmStage::ReplicaDropped => {
-                    info.replicas.0[0].description.state = 2;
+                    info.replicas.0[0].description.state = NativeReplicaState::Ready;
                 }
                 _ => info.replicas.0[0].description.node.instance += 1,
             }
@@ -3248,7 +3249,7 @@ pub(crate) mod report_tests {
         target: &mut Node,
     ) -> Result<()> {
         let mut original = add_body(&launches[1], &actual_profile(target)?);
-        original.replica.current_role = 2;
+        original.replica.current_role = NativeReplicaRole::Idle;
         let entity = original.unit.id.guid.0;
         let deactivation = ReplicaDeactivationInfo {
             epoch: original.unit.current,
@@ -3872,7 +3873,7 @@ pub(crate) mod report_tests {
                                 || proof.body.replica.node != original.body.replica.node
                                 || proof.body.replica.id != original.body.replica.id
                                 || proof.body.replica.instance != original.body.replica.instance
-                                || proof.body.replica.current_role != 2
+                                || proof.body.replica.current_role != NativeReplicaRole::Idle
                             { return Err("successful Close/Drop lost exact original disposal/accounting lineage".into()); }
                             let replication_address = original.body.replica.replication_endpoint.split_once('/')
                                 .ok_or("original Idle replication endpoint lacks actor suffix")?.0;
@@ -3900,7 +3901,7 @@ pub(crate) mod report_tests {
                         for stale_kind in 0..if expected_stage == ra::FmStage::ReplicaDropped { 2 } else { 1 } {
                             let mut stale = reply.clone();
                             if stale_kind == 1 {
-                                stale.replicas.0[0].replicas.0[0].description.state = 2;
+                                stale.replicas.0[0].replicas.0[0].description.state = NativeReplicaState::Ready;
                             } else {
                                 stale.replicas.0[0].replicas.0[0].description.instance -= 1;
                             }
@@ -4425,8 +4426,8 @@ pub(crate) mod report_tests {
                     .committed
                     .ok_or("destination disappeared")?;
                 if idle.phase != ra::Phase::Ready
-                    || idle.body.replica.current_role != 2
-                    || idle.body.replica.state != 1
+                    || idle.body.replica.current_role != NativeReplicaRole::Idle
+                    || idle.body.replica.state != NativeReplicaState::InBuild
                     || target.retained_usage() != 1
                     || target
                         .activation()
@@ -4811,7 +4812,7 @@ pub(crate) mod report_tests {
             let still_serving = data_request(&endpoint, b"read\n").await?;
             if still_serving != written
                 || source.snapshot(body.unit.id.guid.0).committed
-                    .is_none_or(|state| state.phase != ra::Phase::Ready || state.body.replica.current_role != 4)
+                    .is_none_or(|state| state.phase != ra::Phase::Ready || state.body.replica.current_role != NativeReplicaRole::Primary)
             {
                 return Err("peer loss changed healthy Primary serving".into());
             }

@@ -5,6 +5,7 @@
 //! runtimes. Native source grounding: EntityState/LockedEntityPtr, EntityMap and
 //! EntityJobItem; see the catalog's selected stateless decision/test tables.
 use crate::protocol::*;
+use crate::protocol::{NativeReplicaRole, NativeReplicaState};
 use fube_ra_store::{self as store, KeyValueStore, Output, Record, RecordId, Request};
 use fubst::serde::{from_slice, to_vec};
 use serde::{Deserialize, Serialize};
@@ -1987,7 +1988,7 @@ fn transition(
                             && body.replica.node == s.body.replica.node
                             && body.replica.id == s.body.replica.id
                             && body.replica.instance == s.body.replica.instance
-                            && body.replica.current_role == 2
+                            && body.replica.current_role == NativeReplicaRole::Idle
                     });
                     let fresh_idle = state.is_none()
                         && valid_stateful_sizes(&body.service)
@@ -2027,9 +2028,9 @@ fn transition(
                 || peer_creation.is_some()
                 || matches!(work.kind, Kind::OpenLocalStateful | Kind::OpenLocalPrimary);
             let role = match work.kind {
-                Kind::OpenLocalStateful | Kind::CreateReplica { .. } => 2,
-                Kind::OpenLocalPrimary | Kind::AddPrimary { .. } => 4,
-                _ => 1,
+                Kind::OpenLocalStateful | Kind::CreateReplica { .. } => NativeReplicaRole::Idle,
+                Kind::OpenLocalPrimary | Kind::AddPrimary { .. } => NativeReplicaRole::Primary,
+                _ => NativeReplicaRole::None,
             };
             if body.replica.node != admission.local_node {
                 return Err(Failure::Admission(
@@ -2060,7 +2061,7 @@ fn transition(
                 || body.service.persisted
                 || body.service.group
                 || body.replica.current_role != role
-                || body.replica.state != 1
+                || body.replica.state != NativeReplicaState::InBuild
                 || !body.replica.up
                 || body.replica.id < 0
                 || body.replica.instance < 0
@@ -2073,7 +2074,7 @@ fn transition(
                 }));
             }
             if local_stateful
-                && (body.replica.previous_role != 1
+                && (body.replica.previous_role != NativeReplicaRole::None
                     || body.service.partitions != 1
                     || !valid_stateful_sizes(&body.service)
                     || body.service.activation_mode != 0
@@ -2092,7 +2093,10 @@ fn transition(
                     "only local volatile initial Open with valid configured sizes",
                 ));
             }
-            if role == 4 && !fm_primary && body.unit.previous != Epoch::default() {
+            if role == NativeReplicaRole::Primary
+                && !fm_primary
+                && body.unit.previous != Epoch::default()
+            {
                 return Err(Failure::Unsupported(
                     "initial Primary cannot inherit a previous configuration",
                 ));
@@ -2839,7 +2843,7 @@ mod tests {
         body.replica.node = node.clone();
         body.replica.id = 1;
         body.replica.instance = 1;
-        body.replica.state = 1;
+        body.replica.state = NativeReplicaState::InBuild;
         body.replica.version = body.service.version.clone();
         body
     }

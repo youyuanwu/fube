@@ -237,8 +237,9 @@ impl Reporting {
         let request = self.request.lock().unwrap().clone();
         let primary = if request.service.stateful {
             match request.local.current_role {
-                4 => true,      // RAP Primary
-                2 | 3 => false, // RAP Idle / Secondary -> PLB Secondary
+                crate::wire::NativeReplicaRole::Primary => true,
+                crate::wire::NativeReplicaRole::Idle
+                | crate::wire::NativeReplicaRole::Secondary => false,
                 _ => {
                     return Err(Error::new(
                         crate::ErrorKind::InvalidState,

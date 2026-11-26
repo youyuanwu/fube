@@ -3,6 +3,8 @@ use fube_hosting::local::{Activation, Options};
 use fube_node::local::{EffectReceipt, Node};
 use fube_ra::{entity as ra, protocol::*};
 use fube_ra_store::{MemoryBackend, Settings, Store};
+use fube_runtime::extensions::NativeReplicaRole;
+use fube_runtime::extensions::NativeReplicaState;
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 struct Fixture {
@@ -159,7 +161,7 @@ fn body(node: &Node) -> AddInstance {
     b.replica.id = 40;
     b.replica.instance = 50;
     b.replica.up = true;
-    b.replica.state = 1;
+    b.replica.state = NativeReplicaState::InBuild;
     b.service.name = premise.service_name.clone();
     b.service.application = premise.application_name.clone();
     b.service.service_type = ServiceType {
@@ -203,9 +205,9 @@ fn body(node: &Node) -> AddInstance {
             fube_hosting::local::Profile::VolatileStatefulPrimaryLifecycle
                 | fube_hosting::local::Profile::VolatileStatefulFmPrimary
         ) {
-            4
+            NativeReplicaRole::Primary
         } else {
-            2
+            NativeReplicaRole::Idle
         };
     }
     b
@@ -400,7 +402,7 @@ async fn stateful_initial_primary_applies_acknowledges_and_reads_one_write_befor
         for invalid in 0..3 {
             let mut rejected = b.clone();
             match invalid {
-                0 => rejected.replica.current_role = 2,
+                0 => rejected.replica.current_role = NativeReplicaRole::Idle,
                 1 => rejected.service.minimum = 2,
                 _ => rejected.unit.previous = b.unit.current,
             }
@@ -430,7 +432,7 @@ async fn stateful_initial_primary_applies_acknowledges_and_reads_one_write_befor
         let opened = node.snapshot(b.unit.id.guid.0).committed.unwrap();
         assert_eq!(
             (opened.body.replica.current_role, opened.body.replica.state),
-            (4, 2)
+            (NativeReplicaRole::Primary, NativeReplicaState::Ready)
         );
         let address = primary_endpoint(&node);
         let replication = data_endpoint(&node).address;
@@ -949,7 +951,7 @@ async fn stateful_real_data_idle_denies_writes_and_joins_actual_provider_and_ser
         let mut b = body(&node);
         b.unit.current.configuration = (1 << 32) + 5;
         let mut primary = b.clone();
-        primary.replica.current_role = 4;
+        primary.replica.current_role = NativeReplicaRole::Primary;
         assert!(node.open_stateful(primary).is_err());
         assert_eq!(node.retained_usage(), 0);
         node.open_stateful(b.clone()).unwrap();
@@ -968,7 +970,7 @@ async fn stateful_real_data_idle_denies_writes_and_joins_actual_provider_and_ser
         let opened = node.snapshot(b.unit.id.guid.0).committed.unwrap();
         assert_eq!(
             (opened.body.replica.current_role, opened.body.replica.state),
-            (2, 1)
+            (NativeReplicaRole::Idle, NativeReplicaState::InBuild)
         );
         assert_eq!(opened.body.unit.current, b.unit.current);
         assert!(opened.body.replica.service_endpoint.is_empty());
@@ -1191,9 +1193,9 @@ async fn stateful_idle_open_close_replay_and_actual_disposal_preserve_nonprimary
             Err(fube_node::local::Error::Unsupported)
         ));
         let mut primary = b.clone();
-        primary.replica.current_role = 4;
+        primary.replica.current_role = NativeReplicaRole::Primary;
         let mut secondary = b.clone();
-        secondary.replica.current_role = 3;
+        secondary.replica.current_role = NativeReplicaRole::Secondary;
         let mut epoch = b.clone();
         epoch.unit.current.configuration = 0;
         let mut stateless = b.clone();
@@ -1227,7 +1229,7 @@ async fn stateful_idle_open_close_replay_and_actual_disposal_preserve_nonprimary
         let opened = node.snapshot(b.unit.id.guid.0).committed.unwrap();
         assert_eq!(
             (opened.body.replica.current_role, opened.body.replica.state),
-            (2, 1)
+            (NativeReplicaRole::Idle, NativeReplicaState::InBuild)
         );
         assert!(opened.body.replica.service_endpoint.is_empty());
         let address = opened.body.replica.replication_endpoint.clone();
@@ -1843,9 +1845,9 @@ async fn unsupported_and_near_wire_limit_adds_reject_before_selected_or_usage_ow
     for variant in 0..11 {
         let mut bad = b.clone();
         match variant {
-            0 => bad.replica.current_role = 0,
+            0 => bad.replica.current_role = NativeReplicaRole::Unknown,
             1 => bad.replica.up = false,
-            2 => bad.replica.state = 0,
+            2 => bad.replica.state = NativeReplicaState::StandBy,
             3 => bad.replica.id = -1,
             4 => bad.replica.instance = -1,
             5 => bad.service.constraints = "x".repeat(32_000),

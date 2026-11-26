@@ -32,10 +32,10 @@ def digest(path):
 def source_inputs():
     return sorted(
         [ROOT / "Cargo.toml", ROOT / "Cargo.lock"]
-        + [p for crate in ["fube-ra", "fube-ra-store", "furpc", "fubst"]
+        + [p for crate in ["fube-core", "fube-ra", "fube-ra-store", "furpc", "fubst"]
            for p in (ROOT / "crates/libs" / crate).rglob("*.rs")]
         + [ROOT / "crates/libs" / crate / "Cargo.toml"
-           for crate in ["fube-ra", "fube-ra-store", "furpc", "fubst"]]
+           for crate in ["fube-core", "fube-ra", "fube-ra-store", "furpc", "fubst"]]
         + list((ROOT / "tests/ra_protocol").glob("*.py"))
         + list(NATIVE.glob("*"))
         + list((ROOT / "tests/ra_protocol/helpers").glob("*"))

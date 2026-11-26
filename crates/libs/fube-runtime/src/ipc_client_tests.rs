@@ -1,5 +1,6 @@
 use super::*;
 use crate::wire::{ErrorReply, IdRequest};
+use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 use fubst::serde::{from_slice, to_vec, ByteArray, Guid, ObjectArray};
 use std::future::{ready, Ready};
 
@@ -372,12 +373,12 @@ fn proxy_reply() -> wire::ProxyReply {
             },
             id: 1,
             instance: 1,
-            current_role: 0,
-            previous_role: 0,
+            current_role: NativeReplicaRole::Unknown,
+            previous_role: NativeReplicaRole::Unknown,
             up: true,
             last_lsn: -1,
             first_lsn: -1,
-            state: 2,
+            state: NativeReplicaState::Ready,
             version: wire::VersionInstance {
                 version: wire::PackageVersion {
                     application: wire::ApplicationVersion {
