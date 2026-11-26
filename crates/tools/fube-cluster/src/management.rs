@@ -24,7 +24,6 @@ use tokio::{
 pub(crate) struct Manifest {
     pub schema_version: u32,
     pub launches: Vec<PathBuf>,
-    #[serde(default)]
     pub recovery_mode: crate::RecoveryMode,
 }
 
@@ -503,6 +502,26 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifests_require_explicit_manual_policy_and_reject_legacy() {
+        let mut value = serde_json::json!({
+            "schema_version":1,"launches":[],"recovery_mode":"manual"
+        });
+        assert!(serde_json::from_value::<Manifest>(value.clone()).is_ok());
+        value["recovery_mode"] = serde_json::json!("legacy");
+        assert!(serde_json::from_value::<Manifest>(value.clone())
+            .err()
+            .expect("Legacy policy must be rejected")
+            .to_string()
+            .contains("unknown variant"));
+        value.as_object_mut().unwrap().remove("recovery_mode");
+        assert!(serde_json::from_value::<Manifest>(value)
+            .err()
+            .expect("Missing policy must be rejected")
+            .to_string()
+            .contains("missing field"));
+    }
 
     #[tokio::test]
     async fn status_observation_deadlines_preserve_partial_writes_reads_and_request_identity() {

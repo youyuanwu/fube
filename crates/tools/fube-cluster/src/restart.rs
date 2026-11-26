@@ -108,7 +108,7 @@ impl Manager {
         }
         let failure = self.ledger.node_failures.last().unwrap();
         Ok(json!({"state":"down","node":index + 1,
-            "replica_reconfiguration":if failure.recovery_error.is_some() {"blocked"} else if body.is_some() {"pending"} else if self.ledger.recovery_mode == crate::RecoveryMode::Manual && failure.body.as_ref().is_some_and(|body| body.service.stateful) && failure.desired == Desired::Running {"not_requested"} else {"not_required"},
+            "replica_reconfiguration":if failure.recovery_error.is_some() {"blocked"} else if body.is_some() {"pending"} else if failure.body.as_ref().is_some_and(|body| body.service.stateful) && failure.desired == Desired::Running {"not_requested"} else {"not_required"},
             "error":failure.recovery_error}))
     }
 
@@ -472,7 +472,6 @@ impl Cluster {
         }
         let mut down = self.node_down(node).await?;
         if restore
-            && self.manager.ledger.recovery_mode == crate::RecoveryMode::Manual
             && matches!(
                 down["replica_reconfiguration"].as_str(),
                 Some("not_requested" | "recorded")

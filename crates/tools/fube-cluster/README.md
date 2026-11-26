@@ -81,10 +81,12 @@ controls are not exposed as FM management actions.
 
 ## Explicit NodeDown and restart
 
-The default `legacy` policy preserves the bundled behavior below. Select
-[`RecoveryMode::Manual`](src/scenario.rs) before library startup with
-`set_recovery_mode`, or pass `--manual-recovery` to the CLI, for the
-[explicit scenario controls](#manual-scenario-controls).
+Recovery is always [Manual](#manual-scenario-controls), for both library and
+foreground use. No recovery-mode flag is needed. Legacy scheduling and the
+`--manual-recovery` opt-in flag have been removed. Private FM manifests must
+explicitly declare `recovery_mode: "manual"`; missing or Legacy policies reject
+rather than silently reinterpreting old intent. Use a fresh deployment after
+the original owner has completed cleanup.
 
 The supervisor accepts these ordinary foreground commands:
 
@@ -108,17 +110,20 @@ processes.
 The event records **Down** only for the exact deployment/session/Node incarnation.
 Duplicate evidence is idempotent; stale evidence cannot take down a successor.
 
-The [FM node lifecycle](src/fm/node_lifecycle.rs) projects confirmed loss into
-native replica descriptions. With completed replicated membership and enough
-surviving quorum/minimum, it sends ordinary DoReconfiguration to a surviving RA.
+The [FM node lifecycle](src/fm/node_lifecycle.rs) records confirmed loss.
+Explicit `reconfigure-partition` intent projects it into native replica
+descriptions and sends ordinary DoReconfiguration to a surviving RA when
+completed membership and surviving quorum permit it.
 It does not wait for the dead RA's reply or manufacture deletion/disposal
 receipts. Same-Primary removal and Primary failover preserve configured sizes
 and complete through shared RA/RAP. The Down acknowledgment reports whether
-replica reconfiguration is pending, unnecessary or blocked; it is not recovery
+replica reconfiguration is not requested, unnecessary or blocked; it is not recovery
 completion.
 
-`restart-node` can explicitly stop/fence a live owner or reuse an already
-confirmed failure. It waits for the old membership removal, then creates a
+`restart-node` requires a previously confirmed NodeDown and cannot stop a live
+owner. Submit `stop-node`/`kill-node` and `node-down` first.
+Replicated rejoin requires completed survivor metadata
+describing the old member as down or removed. It then creates a
 higher Node instance, fresh session/capability, private directory and
 runtime/replica identities. FM remains alive. The new RA starts empty and must
 complete NodeUp/final empty inventory. Surviving Nodes
@@ -126,8 +131,8 @@ complete NodeUp/final empty inventory. Surviving Nodes
 own processes, applications and current serving authority. Old Links,
 invocations and unsent peer obligations never retarget.
 
-If a stateless instance was desired, FM issues a fresh AddInstance. A replicated
-volatile rejoin builds a fresh Idle from the surviving Primary and admits it
+Explicit `rebuild-replica` issues a fresh AddInstance for stateless recovery.
+For replicated volatile recovery it builds a fresh Idle from the surviving Primary and admits it
 through normal configuration completion. The restarted replica is not
 automatically promoted back to Primary. `node_controls` exposes retained command
 completion, while `configuration.ready` and `repair.ready` describe the native
@@ -135,7 +140,8 @@ recovery boundaries. Repeating an operation ID never restarts another process;
 changing its command content rejects.
 
 Recovery requires one failed member, stable completed membership and sufficient
-surviving quorum/minimum to remove the old incarnation. Active transition/LFUM
+surviving quorum for minimum-preserving failure metadata. A down member can
+remain at minimum until a copied replacement is admitted. Active transition/LFUM
 overlaps, multiple concurrent failures, singleton/all-copy volatile loss,
 persisted-state adoption, FM restart and automatic placement/restart are not
 enabled. Blocked recovery is explicit; minimum is never lowered and empty data
@@ -186,7 +192,7 @@ For app-host failure, the predecessor is the affected Node's current
 | Action | Additional fields | Boundary |
 | --- | --- | --- |
 | `create-partition` | `partition`, `node` | Create the profile's initial Primary/instance. Configured replicated creation includes the original Secondary builds and initial configuration. |
-| `reconfigure-partition` | `partition`, `predecessor` | Explicit survivor reconfiguration for confirmed NodeDown or supported Primary app-host failover; no replica creation. |
+| `reconfigure-partition` | `partition`, `predecessor`, optional `operation` | Explicit survivor reconfiguration for confirmed NodeDown or supported Primary app-host failover; `operation` identifies a pending Secondary-removal rebuild to supersede before replacement. No replica creation. |
 | `rebuild-replica` | `partition`, `predecessor`, destination `node` | Create/copy a fresh replacement and complete native configuration admission, or recreate a stateless instance on its fresh rejoined Node. |
 | `cancel-rebuild` | `operation` | Cancel the identified pending rebuild through native removal. Existing original-Node 3/2 app-host repair cancellation is supported; Node-rejoin/spare cancellation remains gated. |
 
@@ -198,6 +204,18 @@ object with `node`, `node_instance`, `replica` and `incarnation`; node number
 alone cannot select a historical failure. Changed content under an existing
 operation ID rejects. Pending completion is bound to the original
 configuration/replica owner, not whatever later recovery happens to be ready.
+
+`supersede_rebuild(op, partition, failed_primary, rebuild_operation)` uses
+`reconfigure-partition` with `operation`. It binds the exact failed Primary
+and original removal owner before any replacement starts. Both read quorums
+and original live Node/RA sessions remain required; lost transport authority
+cannot be revived. The old rebuild ends `superseded` with `superseded_by`
+identifying the new operation. Waiting on it reports a terminal error, not
+readmission. Wait on the new operation for actual native failover completion.
+
+```json
+{"op":"supersede-primary","action":"reconfigure-partition","partition":"<existing-partition-uuid>","predecessor":{"node":1,"node_instance":123,"replica":1,"incarnation":456},"operation":"remove-secondary"}
+```
 
 For example, after reporting and reconfiguring a failed member:
 
@@ -213,7 +231,7 @@ majority. At `minimum == target`, manual reconfiguration retains the fenced
 down member; removal and replacement admission are combined after real copy.
 Primary and Secondary whole-Node scenarios are covered at 3/3 and 4/4 without
 reopening surviving hosts. This remains a one-failure, stable-membership
-profile: interrupted/multiple-failure recovery and data-loss recreation are
+profile: general interrupted/multiple-failure recovery and data-loss recreation are
 not enabled. A returning singleton cannot turn lost volatile data into an
 empty "recovered" Primary.
 
@@ -247,7 +265,7 @@ wait_operation("rebuild-1", budget)
 Read the exact predecessor from the reported failure's status. The manual
 stateless, Primary/Secondary 3/3 and 4/4 scenarios use public process controls
 and semantic waits; application-data observations remain separate from command
-completion. Default/legacy scenarios remain compatibility coverage.
+completion. Additional lifecycle/protocol scenarios retain compatibility coverage.
 
 For an app-host failure, keep the original Node/RA sessions alive: do not
 report `node-down` or restart Node infrastructure. Drive observations until the
@@ -263,8 +281,8 @@ The [Manual app-host scenarios](src/tests.rs) cover repeated Primary/Secondary
 repair, no unsolicited failover or fresh-host creation, and lost build/final
 replies. They wait on the exact operation, not global `repair.ready`; data
 continuity and physical predecessor retirement are checked independently.
-Existing Legacy and interrupted-recovery scenarios remain compatibility and
-boundary coverage; this migration does not expand supported recovery.
+Existing lifecycle/protocol and unsupported-recovery scenarios retain
+compatibility and boundary coverage under the same Manual scheduling policy.
 
 For supported original-Node 3/2 Primary repair before admission, submit
 `cancel_rebuild("cancel", "rebuild")` and wait on `"cancel"`. Only the matched
@@ -291,14 +309,15 @@ the CLI does not add a `wait-operation` action. Infrastructure-only restart
 leaves the replica absent, and replaying old kill/restart IDs cannot target its
 successor. After explicit rebuild, a write with another Secondary physically
 fenced proves that the replacement supplies a real quorum vote. Existing
-Legacy foreground scenarios remain unchanged apart from shared fixture support.
+Existing foreground lifecycle scenarios use the same Manual default.
 
 Existing repair/replacement helpers reuse the same ledger/native repair
 primitives. `restart_node` remains a bundled library convenience workflow;
 `restart_node_infrastructure` is the process-only primitive. Existing foreground
-`restart-node` keeps its bundled behavior under `legacy`, while manual mode
-uses the process-only primitive. No existing default profile silently switches
-policy.
+`restart-node` always uses the process-only primitive. The library convenience
+workflow explicitly authorizes its reconfiguration/rebuild through shared controls.
+It can also fence a live owner as part of that explicitly requested workflow;
+the foreground infrastructure-only command cannot.
 
 The bundled library restart result exposes `rebuild_operation` when it
 authorizes restoration, so its actual recovery can also be awaited by operation
@@ -316,12 +335,12 @@ when another operation tries to join a pending build.
 | Family | Classification and boundary |
 | --- | --- |
 | Stable app-host/Node recovery, post-handoff repair, sequential spares, supported cancellation and LFUM overlaps | Manual coverage using exact predecessors and operation waits. Native copy/configuration and physical cleanup remain independent evidence. |
-| Healthy planned transfers and representative Legacy lifecycle/protocol fixtures | Compatibility coverage. Existing transfer helpers explicitly authorize native handoff; their configuration observations do not authorize or complete a scoped rebuild. |
-| Primary loss during pending Secondary removal and subsequent two-lineage restoration | Bounded Legacy qualification retained. Manual superseded-operation and multi-lineage intent semantics are not advertised by this migration. |
-| Cancellation during admission or Secondary/spare repair; general interrupted/multi-loss, data-loss and persisted recovery | Existing unsupported-profile gates remain unchanged. |
+| Healthy planned transfers and lifecycle/protocol fixtures | Explicit native workflows under the same Manual policy. Transfer configuration observations do not authorize or complete a scoped rebuild. |
+| Primary loss during pending Secondary removal and subsequent two-lineage restoration | Explicit operation-bound supersession before replacement, both read quorums, and separate original-placement rebuilds in minimum-preserving order. |
+| Cancellation during admission or Secondary/spare repair; other interrupted/multi-loss, data-loss and persisted recovery | Existing unsupported-profile gates remain unchanged. |
 
-Legacy remains the default; changing it is a separate policy decision.
-These migrations reuse native progress and add no recovery capability.
+Manual is the only policy. These migrations reuse existing native progress;
+there is no alternate automatic scheduler or recovery engine.
 
 ## Service profiles
 
@@ -363,10 +382,10 @@ or the retained create result, not registration or transport completion.
 Status exposes `replica_set: { target, minimum, immutable: true }`.
 For N = 1 the normal AddPrimary completion settles creation.
 
-Under the Legacy policy, after completed initial membership, explicit repair or
-qualified healthy 3/2 planned handoff, a matched Primary app-host
-loss can start no-data-loss failover on the original live Node/RA sessions.
-Manual policy requires explicit `reconfigure-partition` intent instead. Available
+After completed initial membership, explicit repair or qualified healthy 3/2
+planned handoff, a matched Primary app-host loss requires explicit
+`reconfigure-partition` intent for no-data-loss failover on the original live
+Node/RA sessions. Available
 Secondaries need not all have identical progress. RA collects per-member
 GetLSN/history, checks separate PC/CC read quorums, selects using deactivation
 history before LSN and can redirect the FM candidate with ChangeConfiguration.
@@ -418,14 +437,16 @@ app-host loss during pending Secondary removal can instead supersede removal:
 it retains the original PC and CC set (including the failed Primary as down S),
 checks both read quorums and completes normal GetLSN/history/catch-up and
 survivor phase commits. `repair.state` becomes `superseded`, not ready; the new
-Primary can serve. After completed supersession, explicitly restore the two known
-losses with `repair_secondary_replica(node)`: above minimum, repair the down CC
+Primary can serve. Submit `supersede_rebuild` naming the pending removal
+operation and exact failed Primary; observation alone cannot start this transition.
+After its operation completes, explicitly restore the two known
+losses with separate `rebuild_replica` operations: above minimum, repair the down CC
 Secondary (old Primary) first, then the previously removed placement. At minimum,
 rebuild the already-removed placement first: a fresh Ready Idle permits combined
 down-Secondary removal and Idle admission without shrinking CC below minimum.
 Then rebuild the old Primary's placement to restore target. For superseded 4/3,
-call `repair_secondary_replica(2)`, wait for `repair.ready`, then call
-`repair_secondary_replica(1)`. Each fresh-host/copy/admission cycle must finish
+rebuild the removed Node 2 predecessor, wait for that operation, then rebuild
+the old Primary on Node 1. Each fresh-host/copy/admission cycle must finish
 before the next starts. `repair.ready` is per-cycle;
 `repair.target_restored` identifies full target and `repair.remaining_lost`
 lists the remaining placements. CC removal still obeys minimum/Ready-Idle

@@ -15,7 +15,6 @@ use tokio::time::Instant;
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryMode {
     #[default]
-    Legacy,
     Manual,
 }
 
@@ -72,7 +71,7 @@ impl Cluster {
                 .ok_or_else(|| format!("operation {op} is not retained"))?;
             match outcome["state"].as_str() {
                 Some("complete" | "down") => return Ok(outcome.clone()),
-                Some("rejected" | "failed" | "unknown" | "cancelled") => {
+                Some("rejected" | "failed" | "unknown" | "cancelled" | "superseded") => {
                     return Err(format!(
                         "operation {op} ended as {}: {}",
                         outcome["state"], outcome["error"]
@@ -171,6 +170,24 @@ impl Cluster {
             partition: Some(partition.into()),
             predecessor: Some(predecessor),
             node: Some(destination),
+            ..Command::default()
+        })
+        .await
+    }
+
+    pub async fn supersede_rebuild(
+        &mut self,
+        op: &str,
+        partition: &str,
+        predecessor: ReplicaRef,
+        operation: &str,
+    ) -> Result<Value> {
+        self.execute_fm_command(Command {
+            op: op.into(),
+            action: "reconfigure-partition".into(),
+            partition: Some(partition.into()),
+            predecessor: Some(predecessor),
+            operation: Some(operation.into()),
             ..Command::default()
         })
         .await
@@ -289,6 +306,20 @@ impl Ledger {
         if self.failed_primary_index() == Some(index) {
             return Ok(None);
         }
+        if self.repair.as_ref().is_some_and(|repair| {
+            repair
+                .removal
+                .as_ref()
+                .is_some_and(|removal| removal.reply.is_none())
+        }) {
+            return Err(
+                "pending Secondary removal requires an explicit rebuild operation to supersede"
+                    .into(),
+            );
+        }
+        if self.primary_index() != index {
+            return Err("reconfiguration predecessor is not the failed current Primary".into());
+        }
         self.start_primary_failover(Instant::now())?
             .map(Some).ok_or_else(|| "no supported survivor failover transition; use explicit replica rebuild for Secondary app-host repair".into())
     }
@@ -325,6 +356,10 @@ impl Ledger {
         if destination != index {
             if self.begin_spare_replacement(destination, Some(index), Instant::now())? {
                 return Ok(Accepted::Build);
+            }
+        } else if self.restoration.is_some() {
+            if let Some(body) = self.begin_secondary_repair(index, Instant::now())? {
+                return Ok(Accepted::Reconfigure(Box::new(body)));
             }
         } else if self.failed_primary_index() == Some(index) {
             if self.begin_primary_repair(Instant::now())? {

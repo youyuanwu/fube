@@ -566,9 +566,6 @@ impl Manager {
         if let Err(error) = self.advance_initial_membership().await {
             self.ledger.lost(0, error);
         }
-        if self.ledger.recovery_mode == crate::RecoveryMode::Legacy {
-            self.start_failover().await;
-        }
         if let Err(error) = self.advance_repair().await {
             self.ledger
                 .lost(self.ledger.repair_destination_index().unwrap_or(0), error);
@@ -803,16 +800,6 @@ impl Manager {
             self.send_configuration(&body).await?;
         }
         Ok(())
-    }
-    pub(crate) async fn start_failover(&mut self) {
-        let failover = match self.ledger.start_primary_failover(Instant::now()) {
-            Ok(Some(body)) => self.send_configuration(&body).await,
-            Ok(None) => Ok(()),
-            Err(error) => Err(error),
-        };
-        if let Err(error) = failover {
-            self.ledger.lost(self.ledger.primary_index(), error);
-        }
     }
     /// Begin one live-session ordinary-FM inventory reconciliation. New
     /// mutations remain gated until all native LFUM uploads are processed.

@@ -191,10 +191,7 @@ impl Cluster {
                 "node-down" => self.node_down(node).await,
                 "stop-node" => self.terminate_node_owned(node, false).await,
                 "kill-node" => self.terminate_node_owned(node, true).await,
-                "restart-node" if self.manager.ledger.recovery_mode == RecoveryMode::Manual => {
-                    self.restart_node_infrastructure(node).await
-                }
-                "restart-node" => self.restart_node(node).await,
+                "restart-node" => self.restart_node_infrastructure(node).await,
                 _ => unreachable!(),
             }
             .map(|mut result| {
@@ -1007,7 +1004,8 @@ mod tests {
                 ledger.result("create"),
                 json!({
                     "op":"create", "state":"error", "native_error":-7,
-                    "replica":1, "incarnation":801
+                    "replica":1, "incarnation":801,
+                    "node_instance":ledger.placements[0].launch.node.instance
                 })
             );
             assert_eq!(ledger.placements[0].observed, Observed::Error);
@@ -1040,7 +1038,8 @@ mod tests {
                 ledger.result("delete"),
                 json!({
                     "op":"delete", "state":"complete", "observed":"absent",
-                    "replica":1, "incarnation":801, "cleanup":"verified_original_instance"
+                    "replica":1, "incarnation":801, "cleanup":"verified_original_instance",
+                    "node_instance":ledger.placements[0].launch.node.instance
                 })
             );
 
@@ -1062,7 +1061,8 @@ mod tests {
                 ledger.result("delete2"),
                 json!({
                     "op":"delete2", "state":"error", "native_error":-7,
-                    "replica":2, "incarnation":802
+                    "replica":2, "incarnation":802,
+                    "node_instance":ledger.placements[1].launch.node.instance
                 })
             );
             assert_eq!(ledger.placements[1].observed, Observed::Error);

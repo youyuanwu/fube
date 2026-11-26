@@ -1,5 +1,5 @@
 use clap::Parser;
-use fube_cluster::{Cluster, Command, Config, RecoveryMode, Result, ServiceProfile};
+use fube_cluster::{Cluster, Command, Config, Result, ServiceProfile};
 use serde_json::json;
 use std::{io::Write, path::PathBuf, time::Duration};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -49,10 +49,6 @@ struct Arguments {
     /// FM executable (defaults to fube-fm beside this controller).
     #[arg(long, conflicts_with = "internal_node")]
     fm_executable: Option<PathBuf>,
-
-    /// Require explicit partition recovery commands; Node restart admits infrastructure only.
-    #[arg(long, conflicts_with = "internal_node")]
-    manual_recovery: bool,
 
     #[arg(long, hide = true, conflicts_with_all = ["root", "app", "stateful_singleton", "stateful_peer_idle", "stateful_three", "stateful"])]
     internal_node: Option<PathBuf>,
@@ -122,7 +118,6 @@ async fn foreground(
     nodes: Option<usize>,
     remote_replica_progress_query_wait_ms: u32,
     fm_executable: Option<PathBuf>,
-    manual_recovery: bool,
 ) -> Result<bool> {
     let mut cluster = Cluster::with_node_pool(
         Config {
@@ -134,9 +129,6 @@ async fn foreground(
         },
         nodes.unwrap_or_else(|| profile.node_count()),
     )?;
-    if manual_recovery {
-        cluster.set_recovery_mode(RecoveryMode::Manual)?;
-    }
     let fm_executable = fm_executable.unwrap_or(
         std::env::current_exe()
             .map_err(|error| error.to_string())?
@@ -228,7 +220,6 @@ async fn run(arguments: Arguments) -> Result<bool> {
         arguments.nodes,
         arguments.remote_replica_progress_query_wait_ms,
         arguments.fm_executable,
-        arguments.manual_recovery,
     )
     .await
 }
@@ -257,21 +248,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manual_recovery_is_opt_in_and_requires_foreground_ownership() {
+    fn obsolete_recovery_mode_flags_are_rejected() {
         let base = ["fube-cluster", "--root", "/root", "--app", "/app"];
-        assert!(!Arguments::try_parse_from(base).unwrap().manual_recovery);
-        assert!(
-            Arguments::try_parse_from(base.into_iter().chain(["--manual-recovery"]))
-                .unwrap()
-                .manual_recovery
-        );
-        assert!(Arguments::try_parse_from([
-            "fube-cluster",
-            "--internal-node",
-            "/node.json",
-            "--manual-recovery",
-        ])
-        .is_err());
+        assert!(Arguments::try_parse_from(base).is_ok());
+        for flag in ["--manual-recovery", "--legacy-recovery"] {
+            assert!(Arguments::try_parse_from(base.into_iter().chain([flag])).is_err());
+        }
     }
 
     #[test]

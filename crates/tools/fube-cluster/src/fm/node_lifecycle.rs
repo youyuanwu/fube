@@ -99,10 +99,7 @@ impl Ledger {
         if let Some(repair) = &mut self.repair {
             repair.unknown = true;
         }
-        if self.recovery_mode == crate::RecoveryMode::Manual {
-            return Ok(None);
-        }
-        self.reconfigure_node_down(index)
+        Ok(None)
     }
 
     pub(crate) fn reconfigure_node_down(
@@ -137,11 +134,7 @@ impl Ledger {
             Err(error) => {
                 eprintln!("NodeDown recorded; replica recovery blocked: {error}");
                 self.node_failures[failure].recovery_error = Some(error.clone());
-                if self.recovery_mode == crate::RecoveryMode::Manual {
-                    Err(error)
-                } else {
-                    Ok(None)
-                }
+                Err(error)
             }
         }
     }
@@ -185,10 +178,7 @@ impl Ledger {
             })
         };
         let survivors: Vec<_> = previous.replicas.0.iter().filter(available).collect();
-        if survivors.len() < previous.replicas.0.len() / 2 + 1
-            || (self.recovery_mode == crate::RecoveryMode::Legacy
-                && survivors.len() < previous.unit.minimum as usize)
-        {
+        if survivors.len() < previous.replicas.0.len() / 2 + 1 {
             return Err("insufficient surviving quorum/minimum for volatile Node recovery".into());
         }
         if survivors.len() + 1 != previous.replicas.0.len() {
@@ -268,29 +258,7 @@ impl Ledger {
         {
             return Err("Node restart waits for completed membership and inventory work".into());
         }
-        if self.recovery_mode == crate::RecoveryMode::Legacy {
-            if let Some(error) = &failure.recovery_error {
-                return Err(format!("Node restart recovery is blocked: {error}"));
-            }
-            if failure
-                .body
-                .as_ref()
-                .is_some_and(|body| body.service.stateful)
-                && self.latest_completed_configuration().is_none_or(|c| {
-                    c.reply
-                        .as_ref()
-                        .unwrap()
-                        .replicas
-                        .0
-                        .iter()
-                        .any(|r| r.node.id == placement.launch.node.id)
-                })
-            {
-                return Err(
-                    "restart is waiting for completed removal of the old Node incarnation".into(),
-                );
-            }
-        } else if placement.launch.profile.mesh_peers()
+        if placement.launch.profile.mesh_peers()
             && failure.body.is_some()
             && self
                 .latest_completed_configuration()

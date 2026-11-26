@@ -37,14 +37,15 @@ impl Command {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.op.is_empty()
-            || self.op.len() > 64
-            || !self
-                .op
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-        {
-            return Err("operation identity must be 1..64 ASCII identifier bytes".into());
+        for operation in std::iter::once(&self.op).chain(self.operation.iter()) {
+            if operation.is_empty()
+                || operation.len() > 64
+                || !operation
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+            {
+                return Err("operation identity must be 1..64 ASCII identifier bytes".into());
+            }
         }
         if let Some(partition) = &self.partition {
             uuid::Uuid::parse_str(partition).map_err(crate::profile::err)?;
@@ -64,9 +65,7 @@ impl Command {
             ("create-partition", Some(1..=64)) if scoped && !predecessor && !cancellation => {
                 return Ok(())
             }
-            ("reconfigure-partition", None) if scoped && predecessor && !cancellation => {
-                return Ok(())
-            }
+            ("reconfigure-partition", None) if scoped && predecessor => return Ok(()),
             ("rebuild-replica", Some(1..=64)) if scoped && predecessor && !cancellation => {
                 return Ok(())
             }
@@ -174,7 +173,7 @@ pub struct Ledger {
     configuration_history: Vec<ActiveConfiguration>,
     pub(crate) repair: Option<ReplicaRepair>,
     pub(crate) repair_history: Vec<ReplicaRepair>,
-    restoration: Option<[AddInstance; 2]>,
+    pub(crate) restoration: Option<[AddInstance; 2]>,
     pub(crate) node_failures: Vec<NodeFailure>,
     node_reconfiguration: Option<Epoch>,
 }
@@ -1011,6 +1010,63 @@ impl Ledger {
             r.last_lsn = -1;
         }
         Ok(Some(body))
+    }
+
+    pub(crate) fn supersede_rebuild(
+        &mut self,
+        predecessor: usize,
+        operation: &str,
+        superseding_operation: &str,
+    ) -> Result<DoReconfiguration> {
+        let target = self
+            .operations
+            .iter()
+            .find(|target| target.command.op == operation)
+            .ok_or("unknown rebuild operation to supersede")?;
+        let repair = self
+            .repair
+            .as_ref()
+            .ok_or("no rebuild owner to supersede")?;
+        let removal = repair
+            .removal
+            .as_ref()
+            .ok_or("supersession requires pending Secondary removal")?;
+        if target.command.action != "rebuild-replica"
+            || !matches!(
+                target.outcome["state"].as_str(),
+                Some("pending" | "unknown")
+            )
+            || removal.reply.is_some()
+            || repair.base.is_some()
+            || repair.host_requested
+            || repair.profile.is_some()
+            || repair.build.reply.is_some()
+            || repair.configuration.is_some()
+            || json!(repair.build.body.replica.id) != target.outcome["replica"]
+            || json!(repair.build.body.replica.instance) != target.outcome["incarnation"]
+            || json!(repair.build.body.replica.node.instance) != target.outcome["node_instance"]
+            || !removal.body.configuration.replicas.0.iter().any(|replica| {
+                replica.node == self.placements[predecessor].launch.node
+                    && replica.id == self.placements[predecessor].replica
+                    && replica.instance == self.placements[predecessor].incarnation
+                    && replica.previous_role == 4
+                    && replica.current_role == 4
+            })
+        {
+            return Err("supersession must bind the original pending removal and exact failed Primary before replacement".into());
+        }
+        let mut outcome = target.outcome.clone();
+        let body = self.secondary_removal_failover()?.ok_or(
+            "supersession requires the original live sessions and both surviving read quorums",
+        )?;
+        self.install_primary_failover(body.clone(), Instant::now())?;
+        outcome["state"] = json!("superseded");
+        outcome["phase"] = json!("superseded");
+        outcome["superseded_by"] = json!(superseding_operation);
+        outcome["error"] =
+            json!("pending removal superseded by explicit Primary failure reconfiguration");
+        self.complete(operation, outcome);
+        Ok(body)
     }
 
     fn install_primary_failover(&mut self, body: DoReconfiguration, now: Instant) -> Result<()> {
@@ -2774,7 +2830,7 @@ impl Ledger {
     }
     pub fn new(launches: impl IntoIterator<Item = Launch>) -> Self {
         Self {
-            recovery_mode: crate::RecoveryMode::Legacy,
+            recovery_mode: crate::RecoveryMode::default(),
             placements: launches.into_iter().map(Placement::new).collect(),
             operations: vec![],
             generation: None,
@@ -2818,7 +2874,10 @@ impl Ledger {
                 Err("operation identity reused with different canonical content".into())
             };
         }
-        if self.generation_pending() && !matches!(command.action.as_str(), "status" | "quit") {
+        if self.generation_pending()
+            && !matches!(command.action.as_str(), "status" | "quit")
+            && !(command.action == "reconfigure-partition" && command.operation.is_some())
+        {
             return Err("generation rebuild is awaiting LFUM upload; mutations disabled".into());
         }
         let scenario = matches!(
@@ -2947,10 +3006,19 @@ impl Ledger {
             "status" => Accepted::Status,
             "quit" => Accepted::Quit,
             "reconfigure-partition" => {
-                match self.reconfigure_failed_replica(
-                    command.partition.as_ref().unwrap(),
-                    command.predecessor.as_ref().unwrap(),
-                )? {
+                let body = if let Some(operation) = &command.operation {
+                    let predecessor = self.predecessor_index(
+                        command.partition.as_ref().unwrap(),
+                        command.predecessor.as_ref().unwrap(),
+                    )?;
+                    Some(self.supersede_rebuild(predecessor, operation, &command.op)?)
+                } else {
+                    self.reconfigure_failed_replica(
+                        command.partition.as_ref().unwrap(),
+                        command.predecessor.as_ref().unwrap(),
+                    )?
+                };
+                match body {
                     Some(body) => Accepted::Reconfigure(Box::new(body)),
                     None => Accepted::Progress,
                 }
@@ -2998,6 +3066,9 @@ impl Ledger {
                 outcome["epoch"] = self.configuration_status()["request"]["configuration"]["unit"]
                     ["current"]
                     .clone();
+                if let Some(operation) = &command.operation {
+                    outcome["operation"] = json!(operation);
+                }
             }
             if command.action == "rebuild-replica"
                 && self.placements[usize::from(command.node.unwrap() - 1)]

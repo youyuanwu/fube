@@ -27,14 +27,9 @@ impl Foreground {
         Self::start_profile(root, false)
     }
     fn start_profile(root: &Path, stateful: bool) -> Self {
-        Self::start_options(root, stateful, None, false)
+        Self::start_options(root, stateful, None)
     }
-    fn start_options(
-        root: &Path,
-        stateful: bool,
-        sizes: Option<(i32, i32)>,
-        manual_recovery: bool,
-    ) -> Self {
+    fn start_options(root: &Path, stateful: bool, sizes: Option<(i32, i32)>) -> Self {
         let app = if stateful {
             support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP")
         } else {
@@ -61,9 +56,6 @@ impl Foreground {
             ]);
         } else if stateful {
             command.arg("--stateful-singleton");
-        }
-        if manual_recovery {
-            command.arg("--manual-recovery");
         }
         let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
@@ -165,10 +157,10 @@ fn contact(endpoint: &str) -> Value {
 #[test]
 fn foreground_configured_service_builds_four_replicas_from_one_create() {
     let root = support::parent().join(format!("configured-foreground-{}", uuid::Uuid::new_v4()));
-    let mut foreground = Foreground::start_options(&root, true, Some((4, 3)), false);
+    let mut foreground = Foreground::start_options(&root, true, Some((4, 3)));
     let ready = foreground.read();
     assert_eq!(ready["event"], "ready", "{ready}");
-    assert_eq!(ready["status"]["recovery_mode"], "legacy");
+    assert_eq!(ready["status"]["recovery_mode"], "manual");
     assert_eq!(ready["status"]["nodes"].as_array().unwrap().len(), 4);
     assert_eq!(ready["status"]["fm"]["separate_process"], true);
     let fm_pid = ready["status"]["fm"]["pid"].as_u64().unwrap() as u32;
@@ -214,7 +206,7 @@ fn foreground_configured_service_builds_four_replicas_from_one_create() {
     for owner in expected {
         owner.assert_gone();
     }
-    let mut next = Foreground::start_options(&root, true, Some((2, 1)), false);
+    let mut next = Foreground::start_options(&root, true, Some((2, 1)));
     assert_eq!(next.read()["event"], "ready");
     next.finish();
     fs::remove_dir_all(root).unwrap();
@@ -223,7 +215,7 @@ fn foreground_configured_service_builds_four_replicas_from_one_create() {
 #[test]
 fn manual_foreground_requires_scoped_recovery_and_replays_only_original_owners() {
     let root = support::parent().join(format!("manual-foreground-{}", uuid::Uuid::new_v4()));
-    let mut foreground = Foreground::start_options(&root, true, Some((3, 3)), true);
+    let mut foreground = Foreground::start_options(&root, true, Some((3, 3)));
     let ready = foreground.read();
     assert_eq!(ready["event"], "ready", "{ready}");
     assert_eq!(ready["status"]["recovery_mode"], "manual");

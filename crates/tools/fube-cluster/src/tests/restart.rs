@@ -252,16 +252,30 @@ fn confirmed_node_down_reconfigures_without_the_dead_link_and_rejoin_is_incarnat
             .accept(command("unproved-down", "node-down", Some(1)))
             .is_err());
         let proof = proof(&ledger, lost);
+        let reference = replica_ref(&ledger, lost);
+        let partition = ledger.placements[lost].launch.partition.clone();
         ledger.lost(lost, "transport closure is only uncertainty".into());
         assert_eq!(ledger.placements[lost].observed, Observed::Unknown);
         assert!(ledger
             .start_primary_failover(Instant::now())
             .unwrap()
             .is_none());
-        let request = ledger
+        assert!(ledger
             .record_node_down(lost, proof.clone())
             .unwrap()
-            .unwrap();
+            .is_none());
+        let Accepted::Reconfigure(request) = ledger
+            .accept(Command {
+                op: "reconfigure".into(),
+                action: "reconfigure-partition".into(),
+                partition: Some(partition),
+                predecessor: Some(reference),
+                ..Command::default()
+            })
+            .unwrap()
+        else {
+            panic!("explicit Node reconfiguration required");
+        };
         assert_eq!(ledger.placements[lost].observed, Observed::Down);
         assert!(!ledger.placements[lost].link_alive);
         assert!(ledger.prepare_node_restart(lost).is_err());
@@ -332,18 +346,21 @@ fn confirmed_node_down_reconfigures_without_the_dead_link_and_rejoin_is_incarnat
 }
 
 #[test]
-fn node_down_without_surviving_minimum_records_failure_but_never_fabricates_recovery() {
+fn node_down_requires_explicit_metadata_and_never_fabricates_surviving_quorum() {
     let mut ledger = configured_ledger(3, 3);
     let first_proof = proof(&ledger, 0);
     assert!(ledger.record_node_down(0, first_proof).unwrap().is_none());
     assert_eq!(ledger.placements[0].observed, Observed::Down);
     assert_eq!(ledger.configuration_status()["ready"], false);
-    assert!(ledger.node_failures[0]
-        .recovery_error
-        .as_ref()
-        .unwrap()
-        .contains("quorum/minimum"));
     assert!(ledger.prepare_node_restart(0).is_err());
+    let request = ledger.reconfigure_node_down(0).unwrap().unwrap();
+    assert_eq!(request.configuration.replicas.0.len(), 3);
+    assert!(request
+        .configuration
+        .replicas
+        .0
+        .iter()
+        .any(|replica| !replica.up));
     assert_eq!(
         ledger
             .configuration
@@ -359,6 +376,7 @@ fn node_down_without_surviving_minimum_records_failure_but_never_fabricates_reco
     let proof = proof(&ledger, 0);
     ledger.lost(1, "transport loss is not confirmed node death".into());
     assert!(ledger.record_node_down(0, proof).unwrap().is_none());
+    assert!(ledger.reconfigure_node_down(0).is_err());
     assert_eq!(ledger.placements[1].observed, Observed::Unknown);
     assert!(ledger.placements[1].node_down.is_none());
     assert!(ledger.node_failures[0]
@@ -535,6 +553,91 @@ fn manual_node_recovery_is_scoped_retained_and_preserves_minimum() {
         let mut another = rebuild;
         another.op = "stale-rebuild".into();
         assert!(ledger.accept(another).is_err());
+    }
+}
+
+#[test]
+fn scoped_supersession_binds_pending_removal_and_failed_primary_without_reviving_lost_authority() {
+    for lose_authority in [false, true] {
+        let mut ledger = configured_ledger(5, 3);
+        ledger.recovery_mode = crate::RecoveryMode::Manual;
+        let partition = ledger.placements[0].launch.partition.clone();
+        let secondary = replica_ref(&ledger, 1);
+        let primary = replica_ref(&ledger, 0);
+        for index in [1, 0] {
+            let old = ledger.placements[index].body().unwrap();
+            ledger
+                .report(index, &stateful_loss_report(&ledger.placements[index]))
+                .unwrap();
+            ledger
+                .reply(
+                    index,
+                    AddInstanceReply {
+                        unit: old.unit,
+                        replica: dropped_replica(&old.replica),
+                        error: 0,
+                    },
+                    true,
+                )
+                .unwrap();
+            if index == 1 {
+                assert!(matches!(
+                    ledger
+                        .accept(Command {
+                            op: "remove-secondary".into(),
+                            action: "rebuild-replica".into(),
+                            partition: Some(partition.clone()),
+                            predecessor: Some(secondary.clone()),
+                            node: Some(2),
+                            ..Command::default()
+                        })
+                        .unwrap(),
+                    Accepted::Reconfigure(_)
+                ));
+            }
+        }
+        ledger.refresh_scenario_operations();
+        assert_eq!(ledger.result("remove-secondary")["state"], "unknown");
+        let reconfigure = Command {
+            op: "supersede-primary".into(),
+            action: "reconfigure-partition".into(),
+            partition: Some(partition),
+            predecessor: Some(primary),
+            operation: Some("remove-secondary".into()),
+            ..Command::default()
+        };
+        let mut unbound = reconfigure.clone();
+        unbound.operation = None;
+        assert!(ledger.accept(unbound).is_err());
+        let mut wrong = reconfigure.clone();
+        wrong.predecessor = Some(secondary);
+        assert!(ledger.accept(wrong).is_err());
+        let mut missing = reconfigure.clone();
+        missing.operation = Some("missing".into());
+        assert!(ledger.accept(missing).is_err());
+        assert!(ledger.swap.is_none());
+        assert!(!ledger.repair.as_ref().unwrap().host_requested);
+        if lose_authority {
+            ledger.lost(4, "original control authority lost".into());
+            assert!(ledger.accept(reconfigure).is_err());
+            assert!(ledger.swap.is_none());
+        } else {
+            assert!(matches!(
+                ledger.accept(reconfigure.clone()).unwrap(),
+                Accepted::Reconfigure(_)
+            ));
+            assert_eq!(ledger.result("remove-secondary")["state"], "superseded");
+            assert_eq!(
+                ledger.result("remove-secondary")["superseded_by"],
+                "supersede-primary"
+            );
+            assert!(matches!(
+                ledger.accept(reconfigure).unwrap(),
+                Accepted::Duplicate(_)
+            ));
+            assert_eq!(ledger.result("supersede-primary")["state"], "pending");
+            assert!(!ledger.repair_history.last().unwrap().host_requested);
+        }
     }
 }
 
@@ -740,7 +843,7 @@ async fn manual_minimum_sized_node_recovery_requires_each_control_and_preserves_
         }
         let result = peer_idle_catch(async {
             assert!(cluster
-                .set_recovery_mode(crate::RecoveryMode::Legacy)
+                .set_recovery_mode(crate::RecoveryMode::Manual)
                 .is_err());
             assert_eq!(cluster.status()["recovery_mode"], "manual");
             let partition = cluster.status()["nodes"][0]["partition"]
@@ -959,6 +1062,13 @@ async fn explicit_stateless_node_controls_preserve_fm_and_use_fresh_owners() {
         assert_eq!(down["state"], "down");
         assert_eq!(cluster.status()["nodes"][0]["observed"], "down");
         let stale_proof = cluster.fenced_nodes[0].clone();
+        let partition = original["nodes"][0]["partition"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let predecessor =
+            serde_json::from_value(cluster.status()["node_failures"][0]["predecessor"].clone())
+                .map_err(err)?;
         assert_eq!(
             cluster
                 .execute(command("down-one", "node-down", Some(1)))
@@ -968,10 +1078,13 @@ async fn explicit_stateless_node_controls_preserve_fm_and_use_fresh_owners() {
         let restart = cluster
             .execute(command("restart-one", "restart-node", Some(1)))
             .await?;
-        until(&mut cluster, |c| {
-            c.status()["nodes"][0]["observed"] == "running"
-        })
-        .await;
+        assert_eq!(cluster.status()["nodes"][0]["observed"], "absent");
+        cluster
+            .rebuild_replica("rebuild-one", &partition, predecessor, 1)
+            .await?;
+        cluster
+            .wait_operation("rebuild-one", Duration::from_secs(30))
+            .await?;
         let current = cluster.status();
         assert_eq!(current["fm"]["pid"], original["fm"]["pid"]);
         assert_ne!(
@@ -986,7 +1099,8 @@ async fn explicit_stateless_node_controls_preserve_fm_and_use_fresh_owners() {
             current["nodes"][1]["node_pid"],
             original["nodes"][1]["node_pid"]
         );
-        assert_eq!(restart["state"], "pending");
+        assert_eq!(restart["state"], "complete");
+        assert_eq!(restart["replica_recovery"], "not_requested");
         assert_eq!(
             cluster
                 .execute(command("restart-one", "restart-node", Some(1)))
@@ -1024,13 +1138,32 @@ async fn explicit_stateless_node_controls_preserve_fm_and_use_fresh_owners() {
             .execute(command("restart-one", "node-down", Some(1)))
             .await
             .is_err());
+        assert!(cluster
+            .execute(command("unfenced-restart", "restart-node", Some(1)))
+            .await
+            .is_err());
+        cluster.stop_node("stop-live", 1).await?;
+        cluster
+            .execute(command("down-live", "node-down", Some(1)))
+            .await?;
         cluster
             .execute(command("restart-live", "restart-node", Some(1)))
             .await?;
-        until(&mut cluster, |c| {
-            c.status()["nodes"][0]["observed"] == "running"
-        })
-        .await;
+        let predecessor = serde_json::from_value(
+            cluster.status()["node_failures"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["predecessor"]
+                .clone(),
+        )
+        .map_err(err)?;
+        cluster
+            .rebuild_replica("rebuild-live", &partition, predecessor, 1)
+            .await?;
+        cluster
+            .wait_operation("rebuild-live", Duration::from_secs(30))
+            .await?;
         assert_ne!(
             cluster.status()["nodes"][0]["node_pid"],
             current["nodes"][0]["node_pid"]
@@ -1097,10 +1230,19 @@ async fn explicit_primary_and_secondary_node_restarts_rebuild_data_without_resta
                 .map_err(err)?;
             let down = cluster.node_down((lost + 1) as u8).await?;
             assert_eq!(down["state"], "down");
-            until(&mut cluster, |c| {
-                c.status()["configuration"]["ready"] == true
-            })
-            .await;
+            let partition = original["nodes"][lost]["partition"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let predecessor =
+                serde_json::from_value(cluster.status()["node_failures"][0]["predecessor"].clone())
+                    .map_err(err)?;
+            cluster
+                .reconfigure_partition("reconfigure", &partition, predecessor)
+                .await?;
+            cluster
+                .wait_operation("reconfigure", Duration::from_secs(30))
+                .await?;
             let status = cluster.status();
             let primary = status["nodes"]
                 .as_array()
@@ -1115,11 +1257,13 @@ async fn explicit_primary_and_secondary_node_restarts_rebuild_data_without_resta
                 .to_string();
             assert!(data_contact(&endpoint, b"read\n").contains("committed=1"));
             assert!(data_contact(&endpoint, b"write 2\n").contains("committed=2"));
-            cluster.restart_node((lost + 1) as u8).await?;
-            until_with_budget(&mut cluster, Duration::from_secs(30), |c| {
-                c.status()["repair"]["ready"] == true
-            })
-            .await;
+            let restarted = cluster.restart_node((lost + 1) as u8).await?;
+            cluster
+                .wait_operation(
+                    restarted["rebuild_operation"].as_str().unwrap(),
+                    Duration::from_secs(30),
+                )
+                .await?;
             let current = cluster.status();
             assert_eq!(current["configuration"]["ready"], true);
             assert_eq!(current["fm"], original["fm"]);
