@@ -800,6 +800,17 @@ wire values. Admission still rejects unsupported values. These native roles are
 not the public SDK `ReplicaRole`; conversion is explicit and checked, and the
 valid native `Unknown=0` is distinct from an unrecognized numeric code.
 
+RA/RAP consistency-unit descriptions use the shared
+[`NativePartitionKind`](../../crates/libs/fube-core/src/protocol/partition.rs)
+for `FABRIC_SERVICE_PARTITION_KIND`: Invalid=0, Singleton=1, Int64Range=2 and
+Named=3. This is not the service-description partition-scheme domain. The enum
+retains signed LONG64/numeric JSON and lossless unknown codes; consistency-unit
+defaults remain Singleton. Runtime converts the description's kind/range/name
+to the payload-bearing SDK `PartitionKind` through a checked boundary, while
+existing lifecycle range checks and local RA/Node Singleton profile restrictions
+remain authoritative. RAP queries still ignore nonidentity request fields;
+typing does not turn them into lifecycle admission or mutate the live context.
+
 RAP flags, query operations and API metadata use shared
 [`fube-core::protocol` types](../../crates/libs/fube-core/src/protocol/rap.rs).
 `NativeProxyFlags` and `NativeReplicatorOperation` are lossless bitmasks;

@@ -1851,7 +1851,7 @@ async fn unsupported_and_near_wire_limit_adds_reject_before_selected_or_usage_ow
     let (mut node, store) = fixture.node("").await;
     until(&mut node, |n| n.package_registration().registered).await;
     let b = body(&node);
-    for variant in 0..11 {
+    for variant in 0..14 {
         let mut bad = b.clone();
         match variant {
             0 => bad.replica.current_role = NativeReplicaRole::Unknown,
@@ -1860,14 +1860,17 @@ async fn unsupported_and_near_wire_limit_adds_reject_before_selected_or_usage_ow
             3 => bad.replica.id = -1,
             4 => bad.replica.instance = -1,
             5 => bad.service.constraints = "x".repeat(32_000),
-            6 => bad.unit.consistency.kind = 0,
+            6 => bad.unit.consistency.kind = NativePartitionKind::Invalid,
             7 => {
-                bad.unit.consistency.kind = 3;
+                bad.unit.consistency.kind = NativePartitionKind::Named;
                 bad.unit.consistency.name = "NotSingleton".into();
             }
-            8 => bad.unit.consistency.kind = 2,
+            8 => bad.unit.consistency.kind = NativePartitionKind::Int64Range,
             9 => bad.unit.consistency.low = 1,
-            _ => bad.unit.consistency.id.guid.0 = [9; 16],
+            10 => bad.unit.consistency.id.guid.0 = [9; 16],
+            11 => bad.unit.consistency.kind = NativePartitionKind::Unrecognized(-1),
+            12 => bad.unit.consistency.kind = NativePartitionKind::Unrecognized(i64::MIN),
+            _ => bad.unit.consistency.kind = NativePartitionKind::Unrecognized(i64::MAX),
         }
         assert!(node.add(bad).is_err());
         assert_eq!(node.statistics().accepted, 0);

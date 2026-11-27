@@ -19,8 +19,8 @@ use std::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use w::{
-    NativeApi, NativeApiName, NativeInterfaceName, NativeProxyFlags, NativeReplicatorOperation,
-    NativeServiceOperation,
+    NativeApi, NativeApiName, NativeInterfaceName, NativePartitionKind, NativeProxyFlags,
+    NativeReplicatorOperation, NativeServiceOperation,
 };
 #[path = "stateful_binding.rs"]
 pub(crate) mod binding;
@@ -567,8 +567,9 @@ impl Registry {
             ));
         }
         match request.unit.consistency.kind {
-            1 | 3 => {}
-            2 if request.unit.consistency.low <= request.unit.consistency.high => {}
+            NativePartitionKind::Singleton | NativePartitionKind::Named => {}
+            NativePartitionKind::Int64Range
+                if request.unit.consistency.low <= request.unit.consistency.high => {}
             _ => return Err(Error::Protocol("invalid stateful partition kind/range")),
         }
         Ok(())
@@ -733,15 +734,7 @@ impl Registry {
         unit.state.lock().unwrap().native = Some(native.clone());
         let partition = StatefulPartition {
             identity: identity.clone(),
-            kind: match request.unit.consistency.kind {
-                1 => PartitionKind::Singleton,
-                2 => PartitionKind::Int64Range {
-                    low: request.unit.consistency.low,
-                    high: request.unit.consistency.high,
-                },
-                3 => PartitionKind::Named(request.unit.consistency.name.clone()),
-                _ => unreachable!(),
-            },
+            kind: PartitionKind::try_from(&request.unit.consistency)?,
             valid: valid.clone(),
             authority: self.authority.clone(),
             status: snapshot.clone(),

@@ -340,15 +340,7 @@ impl NativeRuntimeIntegration {
         self.validate()?;
         let state = self.0.state.upgrade().ok_or(Error::Closed)?;
         let state = state.lock().unwrap();
-        let kind = match state.request.unit.consistency.kind {
-            1 => PartitionKind::Singleton,
-            2 => PartitionKind::Int64Range {
-                low: state.request.unit.consistency.low,
-                high: state.request.unit.consistency.high,
-            },
-            3 => PartitionKind::Named(state.request.unit.consistency.name.clone()),
-            _ => return Err(Error::Protocol("invalid native partition kind")),
-        };
+        let kind = PartitionKind::try_from(&state.request.unit.consistency)?;
         Ok(crate::instance_integration::observe_stateful(
             StatefulPartition {
                 identity: self.identity().clone(),

@@ -3,8 +3,8 @@
 //! Shared support depends only on public framework/runtime/transport contracts;
 //! it exposes no data engine, diagnostics, lifecycle hook or control setter.
 use fube_runtime::extensions::{
-    NativeApiDescription as ApiName, NativeApplicationHostType, NativeProxyFlags,
-    NativeReplicaRole, NativeReplicaState, NativeServicePackageActivationMode,
+    NativeApiDescription as ApiName, NativeApplicationHostType, NativePartitionKind,
+    NativeProxyFlags, NativeReplicaRole, NativeReplicaState, NativeServicePackageActivationMode,
 };
 use fube_runtime::{
     extensions::{
@@ -117,7 +117,7 @@ record!(ConsistencyUnit {
     low: i64,
     high: i64,
     name: String,
-    kind: i64
+    kind: NativePartitionKind
 });
 record!(Epoch {
     configuration: i64,
@@ -540,7 +540,7 @@ fn base(
                 low: 0,
                 high: 0,
                 name: String::new(),
-                kind: 1,
+                kind: NativePartitionKind::Singleton,
             },
             current: Epoch {
                 configuration: epoch.configuration_number,

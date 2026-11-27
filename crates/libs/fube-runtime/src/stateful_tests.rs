@@ -572,6 +572,65 @@ fn request(h: &Harness, partition: u8, incarnation: i64, mode: u8) -> ProxyReque
 }
 
 #[tokio::test]
+async fn stateful_partition_kind_admission_preserves_sdk_payloads_and_rejects_invalid_ranges() {
+    for (kind, low, high, expected) in [
+        (
+            NativePartitionKind::Named,
+            0,
+            0,
+            Some(PartitionKind::Named("owned-stateful-partition".into())),
+        ),
+        (
+            NativePartitionKind::Int64Range,
+            i64::MIN,
+            i64::MAX,
+            Some(PartitionKind::Int64Range {
+                low: i64::MIN,
+                high: i64::MAX,
+            }),
+        ),
+        (NativePartitionKind::Invalid, 0, 0, None),
+        (NativePartitionKind::Unrecognized(i64::MIN), 0, 0, None),
+        (NativePartitionKind::Unrecognized(i64::MAX), 0, 0, None),
+        (NativePartitionKind::Int64Range, 1, 0, None),
+    ] {
+        let mut h = Harness::new().await;
+        let calls = register(&h);
+        let mut request = request(&h, 2, 1, 0);
+        request.unit.consistency.kind = kind;
+        request.unit.consistency.low = low;
+        request.unit.consistency.high = high;
+        request.unit.consistency.name = "owned-stateful-partition".into();
+        h.send("ReplicaOpen", &request).await;
+        if let Some(expected) = expected {
+            let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
+            assert_eq!(reply.error.error, 0);
+            let partition = calls.sdk_partitions.lock().unwrap()[0].clone();
+            let native = calls.partitions.lock().unwrap()[0].clone();
+            let expected = expected.information(uuid::Uuid::from_bytes_le([2; 16]));
+            assert_eq!(partition.get_partition_information().unwrap(), expected);
+            assert_eq!(
+                native
+                    .observe_report()
+                    .unwrap()
+                    .0
+                    .get_partition_information()
+                    .unwrap(),
+                expected
+            );
+            h.send("ReplicaClose", &request).await;
+            h.receive("ReplicaCloseReply").await;
+            h.engine.quiesce().await.unwrap();
+        } else {
+            tokio::time::timeout(Duration::from_secs(2), h.engine.shared.connection.closed())
+                .await
+                .expect("invalid stateful partition must retire its session");
+            assert!(calls.events.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn owned_stateful_fault_uses_native_identity_epochs_and_generation_fences() {
     let mut h = Harness::new().await;
     let calls = register(&h);

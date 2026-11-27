@@ -14,6 +14,34 @@ use furpc::MessageId;
 use tokio::{net::TcpListener, sync::Notify};
 
 #[tokio::test]
+async fn stateless_partition_kind_admission_keeps_unknowns_and_existing_range_checks() {
+    let h = Harness::new().await;
+    let mut request = h.request(1, 1, 0);
+    for code in [i64::MIN, -1, 0, 1, 2, 3, 4, i64::MAX] {
+        request.unit.consistency.kind = NativePartitionKind::from(code);
+        let decoded: ProxyRequest = from_slice(&to_vec(&request).unwrap()).unwrap();
+        assert_eq!(decoded.unit.consistency.kind.code(), code);
+        assert_eq!(
+            validate(&h.engine.shared, &decoded).is_ok(),
+            (1..=3).contains(&code)
+        );
+    }
+    request.unit.consistency.low = 1;
+    request.unit.consistency.high = 0;
+    for kind in [
+        NativePartitionKind::Singleton,
+        NativePartitionKind::Named,
+        NativePartitionKind::Int64Range,
+    ] {
+        request.unit.consistency.kind = kind;
+        assert_eq!(
+            validate(&h.engine.shared, &request).is_ok(),
+            kind != NativePartitionKind::Int64Range
+        );
+    }
+}
+
+#[tokio::test]
 async fn stateless_flag_admission_retains_unknown_bits_until_rejection() {
     let h = Harness::new().await;
     let mut request = h.request(1, 1, 0);
@@ -825,7 +853,7 @@ impl Harness {
                     low: 0,
                     high: 0,
                     name: String::new(),
-                    kind: 1,
+                    kind: NativePartitionKind::Singleton,
                 },
                 current: Epoch {
                     configuration: 1,
@@ -1220,7 +1248,7 @@ async fn open_readiness_query_duplicate_close_and_partition_invalidation() {
     native_query.service.restart_wait = i64::MIN;
     native_query.service.quorum_wait = i64::MIN;
     native_query.service.standby_keep = i64::MIN;
-    native_query.unit.consistency.kind = 0;
+    native_query.unit.consistency.kind = NativePartitionKind::Invalid;
     h.send("RAPQuery", &native_query).await;
     let response = h.receive("RAPQueryReply").await;
     assert_ne!(
@@ -1231,6 +1259,7 @@ async fn open_readiness_query_duplicate_close_and_partition_invalidation() {
     assert_eq!(query.error, 0);
     assert_eq!(query.detail.instance_id, 100);
     assert_eq!(query.detail.operation, NativeServiceOperation::None);
+    native_query.unit.consistency.kind = NativePartitionKind::Unrecognized(i64::MIN);
     native_query.local.instance += 1;
     h.send("RAPQuery", &native_query).await;
     let newer_query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
@@ -1523,20 +1552,33 @@ async fn abort_panic_or_cleanup_timeout_never_acknowledges_disposal() {
 }
 
 #[tokio::test]
-async fn named_partition_wire_decode_preserves_owned_model_identity() {
-    let mut h = Harness::new().await;
-    let mut request = h.request(9, 1, 0);
-    request.unit.consistency.kind = 3;
-    request.unit.consistency.name = "owned-named-partition".into();
-    h.send("ReplicaOpen", &request).await;
-    h.receive("ReplicaOpenReply").await;
-    assert_eq!(
-        h.calls.partitions.lock().unwrap()[0].kind,
-        PartitionKind::Named("owned-named-partition".into())
-    );
-    h.send("ReplicaClose", &request).await;
-    h.receive("ReplicaCloseReply").await;
-    h.engine.quiesce().await.unwrap();
+async fn partition_kind_wire_decode_preserves_owned_model_identity() {
+    for (kind, expected) in [
+        (
+            NativePartitionKind::Named,
+            PartitionKind::Named("owned-named-partition".into()),
+        ),
+        (
+            NativePartitionKind::Int64Range,
+            PartitionKind::Int64Range {
+                low: i64::MIN,
+                high: i64::MAX,
+            },
+        ),
+    ] {
+        let mut h = Harness::new().await;
+        let mut request = h.request(9, 1, 0);
+        request.unit.consistency.kind = kind;
+        request.unit.consistency.low = i64::MIN;
+        request.unit.consistency.high = i64::MAX;
+        request.unit.consistency.name = "owned-named-partition".into();
+        h.send("ReplicaOpen", &request).await;
+        h.receive("ReplicaOpenReply").await;
+        assert_eq!(h.calls.partitions.lock().unwrap()[0].kind, expected);
+        h.send("ReplicaClose", &request).await;
+        h.receive("ReplicaCloseReply").await;
+        h.engine.quiesce().await.unwrap();
+    }
 }
 
 #[tokio::test]

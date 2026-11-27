@@ -2,8 +2,8 @@
 //! 3988b451, Hosting2 and ServiceModel FABRIC_FIELDS declarations.
 pub use fube_core::protocol::{
     NativeActivityType, NativeApi, NativeApiDescription as ApiName, NativeApiName,
-    NativeApplicationHostType, NativeInterfaceName, NativeProxyFlags, NativeReplicaRole,
-    NativeReplicaState, NativeReplicatorOperation, NativeServiceOperation,
+    NativeApplicationHostType, NativeInterfaceName, NativePartitionKind, NativeProxyFlags,
+    NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation, NativeServiceOperation,
     NativeServicePackageActivationMode,
 };
 use fubst::serde::{ByteArray, Guid, ObjectArray, Pointer};
@@ -183,7 +183,25 @@ pub struct ConsistencyUnit {
     pub low: i64,
     pub high: i64,
     pub name: String,
-    pub kind: i64,
+    pub kind: NativePartitionKind,
+}
+
+impl TryFrom<&ConsistencyUnit> for crate::PartitionKind {
+    type Error = crate::Error;
+
+    fn try_from(unit: &ConsistencyUnit) -> crate::Result<Self> {
+        match unit.kind {
+            NativePartitionKind::Singleton => Ok(Self::Singleton),
+            NativePartitionKind::Int64Range => Ok(Self::Int64Range {
+                low: unit.low,
+                high: unit.high,
+            }),
+            NativePartitionKind::Named => Ok(Self::Named(unit.name.clone())),
+            NativePartitionKind::Invalid | NativePartitionKind::Unrecognized(_) => {
+                Err(crate::Error::Protocol("invalid native partition kind"))
+            }
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Epoch {
@@ -436,6 +454,48 @@ pub struct HealthReply {
 mod tests {
     use super::*;
     use fubst::serde::{from_slice, to_vec};
+
+    #[test]
+    fn consistency_partition_conversion_preserves_payloads_and_rejects_unknown_kinds() {
+        let mut unit = ConsistencyUnit {
+            id: PartitionId { id: Guid([1; 16]) },
+            low: i64::MIN,
+            high: i64::MAX,
+            name: "owned-partition".into(),
+            kind: NativePartitionKind::Singleton,
+        };
+        for (kind, expected) in [
+            (
+                NativePartitionKind::Singleton,
+                crate::PartitionKind::Singleton,
+            ),
+            (
+                NativePartitionKind::Int64Range,
+                crate::PartitionKind::Int64Range {
+                    low: i64::MIN,
+                    high: i64::MAX,
+                },
+            ),
+            (
+                NativePartitionKind::Named,
+                crate::PartitionKind::Named("owned-partition".into()),
+            ),
+        ] {
+            unit.kind = kind;
+            let decoded: ConsistencyUnit = from_slice(&to_vec(&unit).unwrap()).unwrap();
+            assert_eq!(crate::PartitionKind::try_from(&decoded).unwrap(), expected);
+        }
+        for code in [i64::MIN, -1, 0, 4, i64::MAX] {
+            unit.kind = NativePartitionKind::from(code);
+            let decoded: ConsistencyUnit = from_slice(&to_vec(&unit).unwrap()).unwrap();
+            assert_eq!(decoded.kind.code(), code);
+            assert!(matches!(
+                crate::PartitionKind::try_from(&decoded),
+                Err(crate::Error::Protocol("invalid native partition kind"))
+            ));
+        }
+    }
+
     #[test]
     fn start_reply_recursive_maps_and_pointers_and_all_truncations() {
         let reply = StartReply {

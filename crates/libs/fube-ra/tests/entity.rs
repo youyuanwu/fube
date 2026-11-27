@@ -1502,6 +1502,28 @@ async fn local_stateful_idle_open_is_commit_gated_and_cannot_enable_primary_or_n
     assert!(executor.snapshot([1; 16]).committed.is_none());
     assert_eq!(hooks.calls.load(Ordering::SeqCst), 0);
 
+    for kind in [
+        NativePartitionKind::Invalid,
+        NativePartitionKind::Int64Range,
+        NativePartitionKind::Named,
+        NativePartitionKind::Unrecognized(i64::MIN),
+        NativePartitionKind::Unrecognized(i64::MAX),
+    ] {
+        let mut unsupported = request.clone();
+        unsupported.unit.consistency.kind = kind;
+        assert!(matches!(
+            executor
+                .submit(Command::OpenLocalStateful(Box::new(unsupported)))
+                .unwrap()
+                .wait(WAIT)
+                .await,
+            Err(Failure::Unsupported(_))
+        ));
+        assert!(executor.snapshot([1; 16]).committed.is_none());
+        assert!(executor.take_effects().is_empty());
+        assert_eq!(hooks.calls.load(Ordering::SeqCst), 0);
+    }
+
     let (entered, release) = hooks.pause(false);
     let open = executor
         .submit(Command::OpenLocalStateful(Box::new(request.clone())))

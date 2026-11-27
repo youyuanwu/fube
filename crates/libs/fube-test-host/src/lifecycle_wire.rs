@@ -2,7 +2,8 @@
 //! and Reliability/Failover/{common,ra}/ declarations at the pinned revision.
 use crate::wire::{PackageId, VersionInstance};
 pub use fube_ra::protocol::{
-    NativeApiDescription as ApiName, NativeProxyFlags, NativeServicePackageActivationMode,
+    NativeApiDescription as ApiName, NativePartitionKind, NativeProxyFlags,
+    NativeServicePackageActivationMode,
 };
 use fubst::serde::{ByteArray, EmptyObjectArray, Guid};
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ pub struct ConsistencyUnit {
     pub low: i64,
     pub high: i64,
     pub name: String,
-    pub kind: i64,
+    pub kind: NativePartitionKind,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Epoch {

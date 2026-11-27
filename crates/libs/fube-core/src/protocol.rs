@@ -53,6 +53,8 @@ mod hosting;
 pub use hosting::{
     NativeActivityType, NativeApplicationHostType, NativeServicePackageActivationMode,
 };
+mod partition;
+pub use partition::NativePartitionKind;
 mod replica;
 pub use replica::{NativeReplicaRole, NativeReplicaState};
 mod rap;

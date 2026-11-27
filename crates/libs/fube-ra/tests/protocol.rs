@@ -727,7 +727,7 @@ fn native_defaults_are_not_zeroed_rust_layouts() {
     assert_eq!(body.service.version.version.value.major, 1);
     assert_eq!(body.service.restart_wait, i64::MIN);
     assert_eq!(body.service.move_cost, 1);
-    assert_eq!(body.unit.consistency.kind, 1);
+    assert_eq!(body.unit.consistency.kind, NativePartitionKind::Singleton);
 }
 
 #[test]
@@ -757,6 +757,7 @@ fn errors_and_unknown_scalar_enum_values_are_lossless() {
     for mode in [-1, 2, i64::MIN, i64::MAX] {
         let mut request = support::rich_request();
         request.service.activation_mode = NativeServicePackageActivationMode::from(mode);
+        request.unit.consistency.kind = NativePartitionKind::from(mode);
         assert_eq!(
             from_slice::<AddInstance>(&to_vec(&request).unwrap()).unwrap(),
             request

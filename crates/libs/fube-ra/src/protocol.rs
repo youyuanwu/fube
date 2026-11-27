@@ -4,9 +4,9 @@
 //! Scalar enums and ErrorCode values are LONG64; unknown values are retained.
 //! ErrorCode diagnostic strings are not serialized. No Federation routing.
 pub use fube_core::protocol::{
-    NativeApi, NativeApiDescription, NativeApiName, NativeInterfaceName, NativeProxyFlags,
-    NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation, NativeServiceOperation,
-    NativeServicePackageActivationMode,
+    NativeApi, NativeApiDescription, NativeApiName, NativeInterfaceName, NativePartitionKind,
+    NativeProxyFlags, NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation,
+    NativeServiceOperation, NativeServicePackageActivationMode,
 };
 use fubst::serde::{ByteArray, Derived, Guid, Inline, NativeEnum, ObjectArray, Pointer};
 use furpc::{
@@ -100,7 +100,7 @@ pub struct ConsistencyUnit {
     pub low: i64,
     pub high: i64,
     pub name: String,
-    pub kind: i64,
+    pub kind: NativePartitionKind,
 }
 impl Default for ConsistencyUnit {
     fn default() -> Self {
@@ -109,7 +109,7 @@ impl Default for ConsistencyUnit {
             low: 0,
             high: 0,
             name: String::new(),
-            kind: 1,
+            kind: NativePartitionKind::Singleton,
         }
     }
 }

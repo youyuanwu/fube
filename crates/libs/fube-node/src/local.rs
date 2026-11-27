@@ -1932,7 +1932,7 @@ impl Node {
                 .host_predecessors
                 .last()
                 .is_some_and(|old| !stateful || body.service != old.service)
-            || body.unit.consistency.kind != 1
+            || body.unit.consistency.kind != NativePartitionKind::Singleton
             || !body.unit.consistency.name.is_empty()
             || body.unit.consistency.low != 0
             || body.unit.consistency.high != 0

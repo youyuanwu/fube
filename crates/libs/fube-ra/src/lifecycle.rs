@@ -650,7 +650,7 @@ pub(super) fn transition(
                     || !body.service.scaling.0.is_empty()
                     || body.replica.node != admission.local_node
                     || body.unit.consistency.id != body.unit.id
-                    || body.unit.consistency.kind != 1
+                    || body.unit.consistency.kind != NativePartitionKind::Singleton
                     || current.is_some_and(|original| {
                         (!original.fm_primary && original.peer_creation.is_none())
                             || body.service != original.body.service

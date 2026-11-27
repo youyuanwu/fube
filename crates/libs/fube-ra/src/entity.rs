@@ -2081,7 +2081,7 @@ fn transition(
                     || body.service.activation_mode
                         != NativeServicePackageActivationMode::SharedProcess
                     || !body.service.scaling.0.is_empty()
-                    || body.unit.consistency.kind != 1
+                    || body.unit.consistency.kind != NativePartitionKind::Singleton
                     || body.unit.consistency.id != body.unit.id
                     || !body.unit.consistency.name.is_empty()
                     || body.unit.consistency.low != 0

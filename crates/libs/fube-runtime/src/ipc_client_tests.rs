@@ -357,7 +357,7 @@ fn proxy_reply() -> wire::ProxyReply {
                 low: 0,
                 high: 0,
                 name: String::new(),
-                kind: 1,
+                kind: wire::NativePartitionKind::Singleton,
             },
             current: wire::Epoch {
                 configuration: 1,

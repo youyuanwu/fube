@@ -136,15 +136,7 @@ impl Engine {
                 return Err(Error::Closed);
             }
             let request = &state.request;
-            let kind = match request.unit.consistency.kind {
-                1 => PartitionKind::Singleton,
-                2 => PartitionKind::Int64Range {
-                    low: request.unit.consistency.low,
-                    high: request.unit.consistency.high,
-                },
-                3 => PartitionKind::Named(request.unit.consistency.name.clone()),
-                _ => return Err(Error::Protocol("invalid native partition kind")),
-            };
+            let kind = PartitionKind::try_from(&request.unit.consistency)?;
             let integration = crate::extensions::InstanceRuntimeIntegration {
                 partition: Partition {
                     identity: ServiceIdentity {
@@ -438,8 +430,9 @@ fn validate(shared: &Shared, request: &ProxyRequest) -> Result<()> {
         ));
     }
     match request.unit.consistency.kind {
-        1 | 3 => {}
-        2 if request.unit.consistency.low <= request.unit.consistency.high => {}
+        NativePartitionKind::Singleton | NativePartitionKind::Named => {}
+        NativePartitionKind::Int64Range
+            if request.unit.consistency.low <= request.unit.consistency.high => {}
         _ => return Err(Error::Protocol("invalid partition kind/range")),
     }
     Ok(())
@@ -881,15 +874,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
     unit.state.lock().unwrap().reporting = Some(reporting.clone());
     let partition = Partition {
         identity: identity.clone(),
-        kind: match request.unit.consistency.kind {
-            1 => PartitionKind::Singleton,
-            2 => PartitionKind::Int64Range {
-                low: request.unit.consistency.low,
-                high: request.unit.consistency.high,
-            },
-            3 => PartitionKind::Named(request.unit.consistency.name.clone()),
-            _ => unreachable!(),
-        },
+        kind: PartitionKind::try_from(&request.unit.consistency)?,
         valid: valid.clone(),
         authority: shared.authority.clone(),
         reporting,

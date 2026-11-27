@@ -47,7 +47,7 @@ impl ServiceUnit {
                         low: 0,
                         high: 0,
                         name: String::new(),
-                        kind: 1,
+                        kind: NativePartitionKind::Singleton,
                     },
                     current: Epoch {
                         configuration: 0,
