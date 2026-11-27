@@ -7,6 +7,7 @@ pub use fube_core::protocol::{
     NativeProxyFlags, NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation,
     NativeServiceCorrelationScheme, NativeServiceKind, NativeServiceLoadMetricWeight,
     NativeServiceOperation, NativeServicePackageActivationMode, NativeServicePartitionAccessStatus,
+    NativeSharedLogCreationFlags,
 };
 use fubst::serde::{ByteArray, Guid, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
@@ -100,7 +101,7 @@ pub struct SharedLog {
     pub size: i64,
     pub streams: u32,
     pub record: u32,
-    pub flags: u32,
+    pub flags: NativeSharedLogCreationFlags,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartReply {
@@ -511,7 +512,7 @@ mod tests {
 
     #[test]
     fn start_reply_recursive_maps_and_pointers_and_all_truncations() {
-        let reply = StartReply {
+        let mut reply = StartReply {
             node_id: "abcdef".into(),
             node_pid: 42,
             lease_handle: 123,
@@ -537,7 +538,7 @@ mod tests {
                 size: 1024,
                 streams: 128,
                 record: 512,
-                flags: 0,
+                flags: NativeSharedLogCreationFlags::NONE,
             })),
             system_log: Pointer(None),
         };
@@ -548,6 +549,14 @@ mod tests {
         assert_eq!(decoded.initial_ttl, 250_000_000);
         for n in 0..bytes.len() {
             assert!(from_slice::<StartReply>(&bytes[..n]).is_err());
+        }
+        for bits in [1u32, 2, 3, 0x8000_0000, 0x8000_0001, u32::MAX] {
+            reply.application_log.0.as_mut().unwrap().flags =
+                NativeSharedLogCreationFlags::from_bits_retain(bits);
+            let bytes = to_vec(&reply).unwrap();
+            let decoded: StartReply = from_slice(&bytes).unwrap();
+            assert_eq!(to_vec(&decoded).unwrap(), bytes);
+            assert_eq!(decoded.application_log.0.unwrap().flags.bits(), bits);
         }
     }
 }

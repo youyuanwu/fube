@@ -66,6 +66,8 @@ pub use service::{
     NativeMoveCost, NativePlacementPolicyType, NativeServiceCorrelationScheme, NativeServiceKind,
     NativeServiceLoadMetricWeight, NativeServicePartitionAccessStatus,
 };
+mod shared_log;
+pub use shared_log::NativeSharedLogCreationFlags;
 mod rap;
 pub use rap::{
     NativeApi, NativeApiDescription, NativeApiName, NativeInterfaceName, NativeProxyFlags,
@@ -73,6 +75,8 @@ pub use rap::{
 };
 mod uri;
 pub use uri::{NativeUriHostType, NativeUriType};
+mod upgrade;
+pub use upgrade::NativeUpgradeType;
 
 pub mod actor {
     //! Selected native `Transport::Actor` codes from

@@ -71,12 +71,50 @@ pub enum CloseMode {
     DeactivateNode = 9,
     Deactivate = 10,
 }
-#[derive(Serialize, Deserialize)]
+impl Serialize for CloseMode {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_i64(*self as i64)
+    }
+}
+#[derive(Serialize)]
 pub(super) struct LocalCloseRequest {
     pub unit: PartitionId,
-    pub mode: i64,
+    pub mode: CloseMode,
+}
+impl LocalCloseRequest {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Wire {
+            unit: PartitionId,
+            mode: i64,
+        }
+        let wire: Wire = from_slice(bytes)
+            .map_err(|_| Failure::Admission("invalid native lifecycle payload"))?;
+        Ok(Self {
+            unit: wire.unit,
+            mode: CloseMode::from_code(wire.mode)?,
+        })
+    }
 }
 impl CloseMode {
+    fn from_code(code: i64) -> Result<Self> {
+        match code {
+            1 => Ok(Self::Delete),
+            2 => Ok(Self::Obliterate),
+            3 => Ok(Self::ForceDelete),
+            4 => Ok(Self::ForceAbort),
+            5 => Ok(Self::Drop),
+            6 => Ok(Self::AppHostDown),
+            7 => Ok(Self::Close),
+            8 => Ok(Self::Abort),
+            9 => Ok(Self::DeactivateNode),
+            10 => Ok(Self::Deactivate),
+            _ => Err(Failure::Unsupported("unsupported local Close mode")),
+        }
+    }
     fn deletes(self) -> bool {
         matches!(self, Self::Delete | Self::ForceDelete)
     }
@@ -562,12 +600,12 @@ pub(super) fn transition(
     let invalid = |_| Failure::Admission("invalid native lifecycle payload");
     match &work.kind {
         Kind::LocalClose => {
-            let request: LocalCloseRequest = from_slice(&work.bytes).map_err(invalid)?;
+            let request = LocalCloseRequest::decode(&work.bytes)?;
             let mode = match request.mode {
-                4 => CloseMode::ForceAbort,
-                5 => CloseMode::Drop,
-                7 => CloseMode::Close,
-                8 => CloseMode::Abort,
+                mode @ (CloseMode::ForceAbort
+                | CloseMode::Drop
+                | CloseMode::Close
+                | CloseMode::Abort) => mode,
                 _ => return Err(Failure::Unsupported("unsupported local Close mode")),
             };
             if !admission.owner_ready || !admission.node_open {

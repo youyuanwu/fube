@@ -414,6 +414,15 @@ async fn actual_node_registration_lookup_all_five_consumers_and_owned_gated_resi
         .iter()
         .find(|s| s.id.service_type.name == "Probe")
         .unwrap();
+    assert_eq!(
+        widget
+            .last_disabled_report
+            .as_ref()
+            .unwrap()
+            .health_state
+            .code(),
+        1
+    );
     let Response::Lookup(lookup) = request(
         &handle,
         Input::Lookup(hosting::LookupRequest {
@@ -454,7 +463,7 @@ async fn actual_node_registration_lookup_all_five_consumers_and_owned_gated_resi
         .as_ref()
         .unwrap();
     assert_eq!(report.kind, hosting::DisabledReportKind::TypeDisabled);
-    assert_eq!(report.health_state, 3);
+    assert_eq!(report.health_state.code(), 3);
     request(&handle, Input::RemoveFailure("qualified-failure".into()));
     let enabled = receipt(&handle).await;
     assert!(matches!(

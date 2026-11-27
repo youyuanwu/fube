@@ -106,7 +106,7 @@ fn rich_ack() -> NodeUpAck {
                     value: Rollout { major: 2, minor: 3 },
                 },
                 instance: u64::MAX,
-                upgrade_type: -91,
+                upgrade_type: NativeUpgradeType::Unrecognized(-91),
                 monitored: true,
                 packages: ObjectArray(vec![ServicePackageUpgradeSpecification {
                     package_name: "UpgradePkg".into(),
@@ -245,7 +245,7 @@ fn source_node_up() -> Vec<u8> {
     e.finish()
 }
 
-fn source_ack() -> Vec<u8> {
+fn source_ack(upgrade_type: i64) -> Vec<u8> {
     let mut e = Encoder::new();
     e.object(|e| {
         e.object_array(&[()], |e, _| {
@@ -257,7 +257,7 @@ fn source_ack() -> Vec<u8> {
                 })?;
                 e.object(|e| source_rollout(e, 2, 3))?;
                 e.u64(u64::MAX)?;
-                e.i64(-91)?;
+                e.i64(upgrade_type)?;
                 e.boolean(true)?;
                 e.object_array(&[()], |e, _| {
                     e.string("UpgradePkg")?;
@@ -343,7 +343,7 @@ fn uri_classifier_typing_retains_components_and_inventory_only_profile_checks() 
 
 #[test]
 fn ack_matches_full_source_upgrade_closure_without_discarding_unsupported_data() {
-    let expected = source_ack();
+    let expected = source_ack(-91);
     assert_eq!(to_vec(&rich_ack()).unwrap(), expected);
     assert_eq!(from_slice::<NodeUpAck>(&expected).unwrap(), rich_ack());
     let message = node_up_ack_message(&rich_ack(), &generation()).unwrap();
@@ -351,6 +351,35 @@ fn ack_matches_full_source_upgrade_closure_without_discarding_unsupported_data()
     assert_eq!(decoded, rich_ack());
     assert_eq!(actual_generation, generation());
     assert!(decoded.validate_fresh_activated(&version()).is_err());
+}
+
+#[test]
+fn upgrade_type_typing_preserves_source_bytes_without_admitting_upgrades() {
+    assert_eq!(
+        ApplicationUpgradeSpecification::default().upgrade_type,
+        NativeUpgradeType::Rolling
+    );
+    for code in [0, 1, 2, 3, i64::MIN, -91, -1, 4, i64::MAX] {
+        let mut ack = rich_ack();
+        ack.upgrades.0[0].specification.upgrade_type = NativeUpgradeType::from(code);
+        let expected = source_ack(code);
+        assert_eq!(to_vec(&ack).unwrap(), expected);
+        assert_eq!(from_slice::<NodeUpAck>(&expected).unwrap(), ack);
+        let message = node_up_ack_message(&ack, &generation()).unwrap();
+        let (mut decoded, actual_generation) = decode_node_up_ack(&message).unwrap();
+        assert_eq!(decoded, ack);
+        assert_eq!(actual_generation, generation());
+        decoded.activated = true;
+        decoded.activation_sequence = 0;
+        assert!(matches!(
+            decoded.validate_fresh_activated(&version()),
+            Err(Error::Protocol(
+                "NodeUpAck application upgrades unsupported"
+            ))
+        ));
+        decoded.upgrades.0.clear();
+        decoded.validate_fresh_activated(&version()).unwrap();
+    }
 }
 
 fn generation() -> GenerationHeader {

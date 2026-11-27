@@ -1,5 +1,6 @@
 pub use fube_hosting::wire::{
     NativeActivityType, NativeApplicationHostType, NativeServicePackageActivationMode,
+    NativeSharedLogCreationFlags,
 };
 use fubst::serde::{EmptyObjectArray, Guid, Pointer};
 use serde::{Deserialize, Serialize};
@@ -75,7 +76,7 @@ pub struct SharedLog {
     pub size: i64,
     pub streams: u32,
     pub record_size: u32,
-    pub flags: u32,
+    pub flags: NativeSharedLogCreationFlags,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

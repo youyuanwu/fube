@@ -808,6 +808,15 @@ retain signed LONG64/numeric JSON and lossless unknowns. The ten-field URI
 record, including opaque components, signed port and counted path segments,
 is unchanged; this adds no parser, normalization, routing or bootstrap admission.
 
+RA bootstrap application-upgrade specifications use shared
+[`NativeUpgradeType`](../../crates/libs/fube-core/src/protocol/upgrade.rs)
+for native `ServiceModel::UpgradeType`: Invalid=0, Rolling=1,
+Rolling_ForceRestart=2 and Rolling_NotificationOnly=3. It retains signed
+LONG64/numeric JSON and lossless unknowns. The specification default stays
+Rolling, matching the native constructor; its twelve-field order is unchanged.
+Bootstrap admission still rejects every nonempty application-upgrade list,
+regardless of the upgrade type. Naming these values does not enable upgrades.
+
 RA/RAP consistency-unit descriptions use the shared
 [`NativePartitionKind`](../../crates/libs/fube-core/src/protocol/partition.rs)
 for `FABRIC_SERVICE_PARTITION_KIND`: Invalid=0, Singleton=1, Int64Range=2 and

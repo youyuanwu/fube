@@ -1305,10 +1305,7 @@ impl Executor {
             Command::CloseLocal { unit, mode } => (
                 unit.guid.0,
                 Kind::LocalClose,
-                to_vec(&lifecycle::LocalCloseRequest {
-                    unit,
-                    mode: mode as i64,
-                }),
+                to_vec(&lifecycle::LocalCloseRequest { unit, mode }),
             ),
             Command::HostingRegistered(body) => {
                 (body.unit.guid.0, Kind::HostingRegistered, to_vec(&body))
@@ -2746,6 +2743,116 @@ async fn entity_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Serialize)]
+    struct RawLocalCloseRequest<'a> {
+        unit: &'a PartitionId,
+        mode: i64,
+    }
+
+    #[test]
+    fn local_close_request_preserves_signed_long64_codes_and_decode_errors() {
+        let unit = PartitionId {
+            guid: fubst::serde::Guid([7; 16]),
+        };
+        for (mode, code) in [
+            (CloseMode::Delete, 1),
+            (CloseMode::Obliterate, 2),
+            (CloseMode::ForceDelete, 3),
+            (CloseMode::ForceAbort, 4),
+            (CloseMode::Drop, 5),
+            (CloseMode::AppHostDown, 6),
+            (CloseMode::Close, 7),
+            (CloseMode::Abort, 8),
+            (CloseMode::DeactivateNode, 9),
+            (CloseMode::Deactivate, 10),
+        ] {
+            let bytes = to_vec(&lifecycle::LocalCloseRequest {
+                unit: unit.clone(),
+                mode,
+            })
+            .unwrap();
+            let expected = to_vec(&RawLocalCloseRequest {
+                unit: &unit,
+                mode: code,
+            })
+            .unwrap();
+            assert_eq!(bytes, expected);
+            let decoded = lifecycle::LocalCloseRequest::decode(&bytes).unwrap();
+            assert_eq!(decoded.unit, unit);
+            assert_eq!(decoded.mode, mode);
+            for end in 0..bytes.len() {
+                assert!(matches!(
+                    lifecycle::LocalCloseRequest::decode(&bytes[..end]),
+                    Err(Failure::Admission("invalid native lifecycle payload"))
+                ));
+            }
+        }
+        for mode in [i64::MIN, -1, 0, 11, i64::MAX] {
+            let bytes = to_vec(&RawLocalCloseRequest { unit: &unit, mode }).unwrap();
+            assert!(matches!(
+                lifecycle::LocalCloseRequest::decode(&bytes),
+                Err(Failure::Unsupported("unsupported local Close mode"))
+            ));
+        }
+    }
+
+    #[test]
+    fn local_close_mode_rejection_precedes_readiness_and_missing_entity_checks() {
+        let unit = PartitionId::default();
+        let config = NativeConfig::new(&Settings::default());
+        for (owner_ready, node_open) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let admission = Admission {
+                local_node: NodeInstance::default(),
+                fm_source: NodeInstance::default(),
+                generation: GenerationNumber::default(),
+                owner_ready,
+                node_open,
+                node_activated: true,
+                fabric_upgrading: false,
+            };
+            for mode in [i64::MIN, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, i64::MAX] {
+                let (result, _) = watch::channel(Status::Pending);
+                let mut work = Submission {
+                    id: 1,
+                    entity: unit.guid.0,
+                    kind: Kind::LocalClose,
+                    bytes: to_vec(&RawLocalCloseRequest { unit: &unit, mode })
+                        .unwrap()
+                        .into_boxed_slice(),
+                    charge: 0,
+                    reserved_effects: 8,
+                    result,
+                };
+                let result = transition(&work, None, &admission, &config, &[]);
+                if matches!(mode, 4 | 5 | 7 | 8) {
+                    let result = result.unwrap();
+                    assert_eq!(
+                        result.disposition,
+                        if owner_ready && node_open {
+                            Disposition::IgnoredStale
+                        } else {
+                            Disposition::IgnoredNotReady
+                        }
+                    );
+                    assert!(matches!(result.update, Update::None));
+                    assert!(result.effects.is_empty());
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(Failure::Unsupported("unsupported local Close mode"))
+                    ));
+                }
+                work.bytes = Box::new([]);
+                assert!(matches!(
+                    transition(&work, None, &admission, &config, &[]),
+                    Err(Failure::Admission("invalid native lifecycle payload"))
+                ));
+            }
+        }
+    }
+
     #[test]
     fn completed_ticket_sender_close_after_pending_sample_is_not_owner_loss() {
         let (sender, receiver) = watch::channel(Status::Pending);

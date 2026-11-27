@@ -3,6 +3,7 @@
 //! reports or deployment; factory capability requires explicit owned admission.
 pub use fube_core::protocol::{
     NativeActivityType, NativeApplicationHostType, NativeServicePackageActivationMode,
+    NativeSharedLogCreationFlags,
 };
 use fubst::serde::{ByteArray, Guid, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
@@ -96,7 +97,7 @@ pub struct SharedLog {
     pub size: i64,
     pub streams: u32,
     pub record: u32,
-    pub flags: u32,
+    pub flags: NativeSharedLogCreationFlags,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartReply {

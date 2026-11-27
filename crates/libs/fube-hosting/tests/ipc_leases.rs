@@ -1,5 +1,6 @@
 use fube_core::protocol::NativeActivityType;
 use fube_core::protocol::NativeApplicationHostType;
+use fube_core::protocol::NativeHealthState;
 use fube_core::protocol::NativeServicePackageActivationMode;
 use fube_hosting::{ipc::*, wire, ClosedRegisteredEvent, Error};
 #[path = "support/ipc_wire.rs"]
@@ -455,6 +456,7 @@ async fn admitted_factory_lookup_duplicates_and_owned_health_disabled_sources() 
     );
     let source = owner.health_sources().unwrap().remove(0);
     let report = source.last_disabled_report.as_ref().unwrap();
+    assert_eq!(report.health_state, NativeHealthState::Ok);
     assert_eq!(report.property, "ServiceTypeRegistration:Widget");
     assert_eq!(report.application_name, "fabric:/RustApp");
     assert_eq!(report.node_name, "local");
@@ -787,6 +789,9 @@ async fn disabled_health_keeps_shared_entity_history_after_reported_type_is_remo
         .find(|s| s.id.service_type.name == "B")
         .unwrap();
     assert_eq!(a.entity_instance, b.entity_instance);
+    let registered = a.last_disabled_report.as_ref().unwrap();
+    assert_eq!(registered.kind, DisabledReportKind::Registered);
+    assert_eq!(registered.health_state, NativeHealthState::Ok);
     assert!(b.last_disabled_report.is_none());
     let first = owner
         .remove_declaration(&a.id, "prepared-package")
@@ -795,6 +800,7 @@ async fn disabled_health_keeps_shared_entity_history_after_reported_type_is_remo
     assert!(!first.entity_deleted);
     let report = first.disabled_report.unwrap();
     assert_eq!(report.kind, DisabledReportKind::DeleteEvent);
+    assert_eq!(report.health_state, NativeHealthState::Ok);
     assert_eq!(report.source, "System.Hosting");
     assert_eq!(report.property, "ServiceTypeRegistration:A");
     assert_eq!(report.ttl_ticks, Some(1_000_000));
@@ -807,6 +813,7 @@ async fn disabled_health_keeps_shared_entity_history_after_reported_type_is_remo
     assert!(last.entity_deleted);
     let report = last.disabled_report.unwrap();
     assert_eq!(report.kind, DisabledReportKind::DeleteEntity);
+    assert_eq!(report.health_state, NativeHealthState::Ok);
     assert_eq!(report.entity_instance, a.entity_instance);
     assert_eq!(report.property, "DeleteProperty");
     assert_eq!(report.ttl_ticks, Some(72_000_000_000));
@@ -1259,6 +1266,41 @@ async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_
     write_message(&mut peer.socket, &semantic).await.unwrap();
     disconnected(&server, &lease).await;
     assert_eq!(server.status(&lease).unwrap().loss, Some(Loss::Protocol));
+}
+
+#[tokio::test]
+async fn shared_log_creation_flags_remain_opaque_during_bootstrap_admission() {
+    for bits in [0u32, 1, 2, 3, 0x8000_0000, u32::MAX] {
+        let mut config = config(LOCAL_LEASE_DURATION);
+        let application = wire::SharedLog {
+            path: fubst::serde::ByteArray(vec![0; 1024]),
+            disk: Guid([2; 16]),
+            container: Guid([3; 16]),
+            size: 1024,
+            streams: 128,
+            record: 512,
+            flags: wire::NativeSharedLogCreationFlags::from_bits_retain(bits),
+        };
+        let system = wire::SharedLog {
+            flags: wire::NativeSharedLogCreationFlags::from_bits_retain(!bits),
+            ..application.clone()
+        };
+        config.node.application_log = Pointer(Some(application));
+        config.node.system_log = Pointer(Some(system));
+        let mut server = Server::bind("127.0.0.1:0".parse().unwrap(), config).unwrap();
+        let a = admission();
+        let lease = server.admit(a.clone()).unwrap();
+        let mut peer = Peer::connect(&server, a).await;
+        let reply = peer.start(300_000_000).await;
+        assert_eq!(reply.error, 0);
+        assert_eq!(reply.application_log.0.unwrap().flags.bits(), bits);
+        assert_eq!(reply.system_log.0.unwrap().flags.bits(), !bits);
+        assert_eq!(peer.finish().await, 0);
+        assert_eq!(peer.register().await, 0);
+        assert!(peer.poll().await.unwrap() > 0);
+        assert!(server.status(&lease).unwrap().registered_host);
+        server.stop().unwrap();
+    }
 }
 
 #[tokio::test]

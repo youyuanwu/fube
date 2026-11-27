@@ -8,7 +8,7 @@ pub use fube_core::protocol::{
     NativePartitionKind, NativePlacementPolicyType, NativeProxyFlags, NativeReplicaRole,
     NativeReplicaState, NativeReplicatorOperation, NativeServiceCorrelationScheme,
     NativeServiceLoadMetricWeight, NativeServiceOperation, NativeServicePackageActivationMode,
-    NativeUriHostType, NativeUriType,
+    NativeUpgradeType, NativeUriHostType, NativeUriType,
 };
 use fubst::serde::{ByteArray, Derived, Guid, Inline, NativeEnum, ObjectArray, Pointer};
 use furpc::{

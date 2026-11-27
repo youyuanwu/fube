@@ -219,7 +219,7 @@ fn rich_upgrade(c: &mut i32) -> UpgradeDescription {
             application: filled(c),
             version: filled(c),
             instance: filled(c),
-            upgrade_type: enumeration(c),
+            upgrade_type: NativeUpgradeType::from(enumeration(c)),
             monitored: filled(c),
             packages: ObjectArray(vec![rich_package_upgrade(c), rich_package_upgrade(c)]),
             application_name: filled(c),

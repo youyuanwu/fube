@@ -39,8 +39,8 @@
 
 use super::{
     codec_error, from_slice, reliability_message, unique, ApplicationId, ApplicationVersion,
-    GenerationHeader, NativeUriHostType, NativeUriType, PackageId, Rollout, Scalar,
-    VersionInstance, FM_ACTOR, GENERATION_HEADER,
+    GenerationHeader, NativeUpgradeType, NativeUriHostType, NativeUriType, PackageId, Rollout,
+    Scalar, VersionInstance, FM_ACTOR, GENERATION_HEADER,
 };
 use fubst::serde::{from_slice_with_budget, CountedStrings, ObjectArray};
 use furpc::{
@@ -242,7 +242,7 @@ pub struct ApplicationUpgradeSpecification {
     pub application: ApplicationId,
     pub version: ApplicationVersion,
     pub instance: u64,
-    pub upgrade_type: i64,
+    pub upgrade_type: NativeUpgradeType,
     pub monitored: bool,
     pub packages: ObjectArray<Vec<ServicePackageUpgradeSpecification>>,
     pub application_name: String,
@@ -259,7 +259,7 @@ impl Default for ApplicationUpgradeSpecification {
             application: ApplicationId::default(),
             version: ApplicationVersion::default(),
             instance: 0,
-            upgrade_type: 1,
+            upgrade_type: NativeUpgradeType::Rolling,
             monitored: false,
             packages: ObjectArray(vec![]),
             application_name: String::new(),
