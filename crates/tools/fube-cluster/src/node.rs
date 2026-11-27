@@ -2019,7 +2019,7 @@ pub(crate) mod report_tests {
         service.update_version = 1;
         service.metrics = fubst::serde::ObjectArray(vec![Metric {
             name: "LocalWork".into(),
-            weight: 1,
+            weight: NativeServiceLoadMetricWeight::Low,
             primary: 0,
             secondary: 0,
         }]);

@@ -726,8 +726,33 @@ fn native_defaults_are_not_zeroed_rust_layouts() {
     assert_eq!(body.replica.version.version.value.major, 0);
     assert_eq!(body.service.version.version.value.major, 1);
     assert_eq!(body.service.restart_wait, i64::MIN);
-    assert_eq!(body.service.move_cost, 1);
+    assert_eq!(body.service.move_cost, NativeMoveCost::Low);
     assert_eq!(body.unit.consistency.kind, NativePartitionKind::Singleton);
+}
+
+#[test]
+fn service_description_records_preserve_existing_zero_defaults_and_long64_fields() {
+    let mut scalar = fubst::Encoder::new();
+    scalar
+        .object(|e| {
+            e.string("")?;
+            e.i64(0)
+        })
+        .unwrap();
+    let scalar = scalar.finish();
+    assert_eq!(to_vec(&Correlation::default()).unwrap(), scalar);
+    assert_eq!(to_vec(&Placement::default()).unwrap(), scalar);
+
+    let mut metric = fubst::Encoder::new();
+    metric
+        .object(|e| {
+            e.string("")?;
+            e.i64(0)?;
+            e.u32(0)?;
+            e.u32(0)
+        })
+        .unwrap();
+    assert_eq!(to_vec(&Metric::default()).unwrap(), metric.finish());
 }
 
 #[test]
@@ -754,10 +779,14 @@ fn errors_and_unknown_scalar_enum_values_are_lossless() {
             reply
         );
     }
-    for mode in [-1, 2, i64::MIN, i64::MAX] {
+    for code in [-1, 2, 4, 6, i64::MIN, i64::MAX] {
         let mut request = support::rich_request();
-        request.service.activation_mode = NativeServicePackageActivationMode::from(mode);
-        request.unit.consistency.kind = NativePartitionKind::from(mode);
+        request.service.activation_mode = NativeServicePackageActivationMode::from(code);
+        request.unit.consistency.kind = NativePartitionKind::from(code);
+        request.service.correlations.0[0].scheme = NativeServiceCorrelationScheme::from(code);
+        request.service.metrics.0[0].weight = NativeServiceLoadMetricWeight::from(code);
+        request.service.placement.0[0].kind = NativePlacementPolicyType::from(code);
+        request.service.move_cost = NativeMoveCost::Unrecognized(u32::MAX);
         assert_eq!(
             from_slice::<AddInstance>(&to_vec(&request).unwrap()).unwrap(),
             request

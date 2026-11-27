@@ -39,7 +39,8 @@
 
 use super::{
     codec_error, from_slice, reliability_message, unique, ApplicationId, ApplicationVersion,
-    GenerationHeader, PackageId, Rollout, Scalar, VersionInstance, FM_ACTOR, GENERATION_HEADER,
+    GenerationHeader, NativeUriHostType, NativeUriType, PackageId, Rollout, Scalar,
+    VersionInstance, FM_ACTOR, GENERATION_HEADER,
 };
 use fubst::serde::{from_slice_with_budget, CountedStrings, ObjectArray};
 use furpc::{
@@ -128,10 +129,10 @@ impl FabricVersionInstance {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Uri {
-    pub kind: i64,
+    pub kind: NativeUriType,
     pub scheme: String,
     pub authority: String,
-    pub host_kind: i64,
+    pub host_kind: NativeUriHostType,
     pub host: String,
     pub port: i32,
     pub path: String,

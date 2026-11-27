@@ -62,12 +62,17 @@ pub use partition::NativePartitionKind;
 mod replica;
 pub use replica::{NativeReplicaRole, NativeReplicaState};
 mod service;
-pub use service::{NativeServiceKind, NativeServicePartitionAccessStatus};
+pub use service::{
+    NativeMoveCost, NativePlacementPolicyType, NativeServiceCorrelationScheme, NativeServiceKind,
+    NativeServiceLoadMetricWeight, NativeServicePartitionAccessStatus,
+};
 mod rap;
 pub use rap::{
     NativeApi, NativeApiDescription, NativeApiName, NativeInterfaceName, NativeProxyFlags,
     NativeReplicatorOperation, NativeServiceOperation,
 };
+mod uri;
+pub use uri::{NativeUriHostType, NativeUriType};
 
 pub mod actor {
     //! Selected native `Transport::Actor` codes from

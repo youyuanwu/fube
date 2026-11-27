@@ -48,10 +48,10 @@ fn rich_node_up() -> NodeUp {
         node: NodeDescription {
             upgrade_domain: "UD".into(),
             fault_domains: ObjectArray(vec![Uri {
-                kind: 2,
+                kind: NativeUriType::Rootless,
                 scheme: "fd".into(),
                 authority: "authority".into(),
-                host_kind: 3,
+                host_kind: NativeUriHostType::RegName,
                 host: "host".into(),
                 port: 123,
                 path: "/rack/node".into(),
@@ -313,6 +313,32 @@ fn node_up_matches_source_scopes_order_map_uri_and_package_closure() {
     let expected = source_node_up();
     assert_eq!(to_vec(&rich_node_up()).unwrap(), expected);
     assert_eq!(from_slice::<NodeUp>(&expected).unwrap(), rich_node_up());
+}
+
+#[test]
+fn uri_classifier_typing_retains_components_and_inventory_only_profile_checks() {
+    let mut node = rich_node_up();
+    node.packages.0.clear();
+    node.any_replica_found = false;
+    for (kind, host_kind) in [
+        (0, 0),
+        (1, 1),
+        (2, 2),
+        (3, 3),
+        (i64::MIN, i64::MAX),
+        (i64::MAX, i64::MIN),
+        (-1, 4),
+        (4, -1),
+    ] {
+        node.node.fault_domains.0[0].kind = NativeUriType::from(kind);
+        node.node.fault_domains.0[0].host_kind = NativeUriHostType::from(host_kind);
+        let message = node_up_message(&node).unwrap();
+        let mut decoded = decode_node_up(&message).unwrap();
+        assert_eq!(decoded, node);
+        decoded.validate_fresh_stateless().unwrap();
+        decoded.any_replica_found = true;
+        assert!(decoded.validate_fresh_stateless().is_err());
+    }
 }
 
 #[test]
@@ -582,10 +608,10 @@ fn compact_wire_arrays_cannot_amplify_past_default_allocation_budget() {
     let mut node = NodeUp::default();
     node.node.fault_domains = ObjectArray(vec![
         Uri {
-            kind: 0,
+            kind: NativeUriType::AuthorityAbEmpty,
             scheme: String::new(),
             authority: String::new(),
-            host_kind: 0,
+            host_kind: NativeUriHostType::None,
             host: String::new(),
             port: 0,
             path: String::new(),

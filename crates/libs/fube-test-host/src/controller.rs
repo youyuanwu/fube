@@ -98,7 +98,7 @@ impl ServiceUnit {
                     constraints: String::new(),
                     scaleout: 0,
                     metrics: EmptyObjectArray,
-                    move_cost: 0,
+                    move_cost: NativeMoveCost::Zero,
                     restart_wait: i64::MIN,
                     quorum_wait: i64::MIN,
                     update_version: 1,

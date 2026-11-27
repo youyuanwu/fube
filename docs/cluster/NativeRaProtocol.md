@@ -800,6 +800,14 @@ wire values. Admission still rejects unsupported values. These native roles are
 not the public SDK `ReplicaRole`; conversion is explicit and checked, and the
 valid native `Unknown=0` is distinct from an unrecognized numeric code.
 
+RA bootstrap URI classifiers use shared
+[`NativeUriType`/`NativeUriHostType`](../../crates/libs/fube-core/src/protocol/uri.rs),
+matching the native path-form and host domains rather than generic
+absolute/relative URL categories or application-host activation kinds. Both
+retain signed LONG64/numeric JSON and lossless unknowns. The ten-field URI
+record, including opaque components, signed port and counted path segments,
+is unchanged; this adds no parser, normalization, routing or bootstrap admission.
+
 RA/RAP consistency-unit descriptions use the shared
 [`NativePartitionKind`](../../crates/libs/fube-core/src/protocol/partition.rs)
 for `FABRIC_SERVICE_PARTITION_KIND`: Invalid=0, Singleton=1, Int64Range=2 and
@@ -821,6 +829,23 @@ Both preserve signed LONG64/numeric JSON and lossless unknowns. Explicit SDK
 access conversion only encodes the existing diagnostic result; it grants no
 access. SDK contracts, including `native_value()`, and each query branch's
 missing/stale/NotReady defaults remain unchanged.
+
+Service-description correlation schemes, metric weights and placement policy
+kinds use shared `NativeServiceCorrelationScheme`, `NativeServiceLoadMetricWeight`
+and `NativePlacementPolicyType` from the same module. They retain signed
+LONG64/numeric JSON and lossless unknowns without interpreting or enabling new
+placement behavior. The current Rust record defaults stay Invalid/Zero/Invalid;
+native C++ correlation/metric constructors instead select Affinity/Low, a
+pre-existing distinction not changed by this typing. Scaling pointer tags remain
+unchanged.
+
+`NativeMoveCost` uses separate **u32** serialization for native
+`ServiceDescription::defaultMoveCost_`, which is a `uint`, not a LONG64 enum
+field. It retains numeric JSON and `Unrecognized(u32)`, including the unsigned
+upper half, without adding newer SDK costs. RA service defaults stay Low=1;
+explicit model/test-host defaults stay Zero=0. Runtime converts the unchanged
+SDK Zero/Low/Medium/High profile to the same reserved `_MoveCost_` load metric.
+Unknown service-description values do not authorize additional reporting costs.
 
 Runtime `RAReportFault` bodies use shared
 [`NativeFaultType`](../../crates/libs/fube-core/src/protocol/fault.rs):

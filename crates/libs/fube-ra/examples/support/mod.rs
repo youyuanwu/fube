@@ -29,6 +29,13 @@ impl Rich for u32 {
         *self = 4_000_000_000 + next(c) as u32;
     }
 }
+impl Rich for NativeMoveCost {
+    fn rich(&mut self, c: &mut i32) {
+        let mut code = self.code();
+        code.rich(c);
+        *self = Self::from(code);
+    }
+}
 impl Rich for bool {
     fn rich(&mut self, c: &mut i32) {
         *self = next(c) % 2 == 0;

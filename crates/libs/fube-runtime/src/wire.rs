@@ -3,9 +3,10 @@
 pub use fube_core::protocol::{
     NativeActivityType, NativeApi, NativeApiDescription as ApiName, NativeApiName,
     NativeApplicationHostType, NativeFaultType, NativeHealthReportKind, NativeHealthState,
-    NativeInterfaceName, NativePartitionKind, NativeProxyFlags, NativeReplicaRole,
-    NativeReplicaState, NativeReplicatorOperation, NativeServiceKind, NativeServiceOperation,
-    NativeServicePackageActivationMode, NativeServicePartitionAccessStatus,
+    NativeInterfaceName, NativeMoveCost, NativePartitionKind, NativePlacementPolicyType,
+    NativeProxyFlags, NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation,
+    NativeServiceCorrelationScheme, NativeServiceKind, NativeServiceLoadMetricWeight,
+    NativeServiceOperation, NativeServicePackageActivationMode, NativeServicePartitionAccessStatus,
 };
 use fubst::serde::{ByteArray, Guid, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
@@ -246,19 +247,19 @@ pub struct ServiceType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Correlation {
     pub service: String,
-    pub scheme: i64,
+    pub scheme: NativeServiceCorrelationScheme,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metric {
     pub name: String,
-    pub weight: i64,
+    pub weight: NativeServiceLoadMetricWeight,
     pub primary: u32,
     pub secondary: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Placement {
     pub domain: String,
-    pub kind: i64,
+    pub kind: NativePlacementPolicyType,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Service {
@@ -278,7 +279,7 @@ pub struct Service {
     pub constraints: String,
     pub scaleout: i32,
     pub metrics: ObjectArray<Vec<Metric>>,
-    pub move_cost: u32,
+    pub move_cost: NativeMoveCost,
     pub restart_wait: i64,
     pub quorum_wait: i64,
     pub update_version: u64,

@@ -2,7 +2,7 @@
 //! and Reliability/Failover/{common,ra}/ declarations at the pinned revision.
 use crate::wire::{PackageId, VersionInstance};
 pub use fube_ra::protocol::{
-    NativeApiDescription as ApiName, NativePartitionKind, NativeProxyFlags,
+    NativeApiDescription as ApiName, NativeMoveCost, NativePartitionKind, NativeProxyFlags,
     NativeServicePackageActivationMode,
 };
 use fubst::serde::{ByteArray, EmptyObjectArray, Guid};
@@ -78,7 +78,7 @@ pub struct Service {
     pub constraints: String,
     pub scaleout: i32,
     pub metrics: EmptyObjectArray,
-    pub move_cost: u32,
+    pub move_cost: NativeMoveCost,
     pub restart_wait: i64,
     pub quorum_wait: i64,
     pub update_version: u64,

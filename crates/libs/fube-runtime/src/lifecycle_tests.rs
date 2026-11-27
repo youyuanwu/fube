@@ -288,7 +288,7 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
     let mut request = h.request(1, 1, 0);
     request.service.metrics.0.push(Metric {
         name: "Work".into(),
-        weight: 1,
+        weight: NativeServiceLoadMetricWeight::Low,
         primary: 0,
         secondary: 0,
     });
@@ -803,9 +803,17 @@ async fn fault_initial_failure_retry_and_cancellation_remain_observable() {
 async fn reporting_bounds_and_current_description_validation() {
     let mut h = Harness::new().await;
     let mut request = h.request(1, 1, 0);
+    request.service.correlations.0.push(Correlation {
+        service: "fabric:/Model/Other".into(),
+        scheme: NativeServiceCorrelationScheme::Unrecognized(i64::MIN),
+    });
+    request.service.placement.0.push(Placement {
+        domain: "fd:/existing-metadata".into(),
+        kind: NativePlacementPolicyType::Unrecognized(i64::MAX),
+    });
     request.service.metrics.0.push(Metric {
         name: "Work".into(),
-        weight: 1,
+        weight: NativeServiceLoadMetricWeight::Unrecognized(i64::MAX),
         primary: 0,
         secondary: 0,
     });
@@ -846,9 +854,16 @@ async fn reporting_bounds_and_current_description_validation() {
     ));
     drop(_permit);
     request.service.metrics.0.clear();
+    request.service.move_cost = NativeMoveCost::Unrecognized(u32::MAX);
     request.service.update_version += 1;
     h.send("ProxyUpdateServiceDescription", &request).await;
-    h.receive("ProxyUpdateServiceDescriptionReply").await;
+    let reply: UpdateServiceReply =
+        from_slice(&h.receive("ProxyUpdateServiceDescriptionReply").await.body).unwrap();
+    assert_eq!(reply.error, 0);
+    assert_eq!(
+        to_vec(&reply.service).unwrap(),
+        to_vec(&request.service).unwrap()
+    );
     assert!(partition
         .report_load(&[crate::LoadMetric {
             name: "Work".into(),
@@ -1006,7 +1021,7 @@ impl Harness {
                 constraints: String::new(),
                 scaleout: 0,
                 metrics: fubst::serde::ObjectArray(vec![]),
-                move_cost: 0,
+                move_cost: NativeMoveCost::Zero,
                 restart_wait: 0,
                 quorum_wait: 0,
                 update_version: 1,

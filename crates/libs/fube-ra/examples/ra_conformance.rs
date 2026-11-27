@@ -120,10 +120,10 @@ fn entry<K: Default + Rich, V: Default + Rich>(c: &mut i32) -> MapEntry<K, V> {
 
 fn rich_uri(c: &mut i32) -> Uri {
     Uri {
-        kind: enumeration(c),
+        kind: NativeUriType::from(enumeration(c)),
         scheme: filled(c),
         authority: filled(c),
-        host_kind: enumeration(c),
+        host_kind: NativeUriHostType::from(enumeration(c)),
         host: filled(c),
         port: filled(c),
         path: filled(c),

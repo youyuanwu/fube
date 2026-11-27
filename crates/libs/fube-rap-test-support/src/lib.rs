@@ -3,8 +3,10 @@
 //! Shared support depends only on public framework/runtime/transport contracts;
 //! it exposes no data engine, diagnostics, lifecycle hook or control setter.
 use fube_runtime::extensions::{
-    NativeApiDescription as ApiName, NativeApplicationHostType, NativePartitionKind,
-    NativeProxyFlags, NativeReplicaRole, NativeReplicaState, NativeServicePackageActivationMode,
+    NativeApiDescription as ApiName, NativeApplicationHostType, NativeMoveCost,
+    NativePartitionKind, NativePlacementPolicyType, NativeProxyFlags, NativeReplicaRole,
+    NativeReplicaState, NativeServiceCorrelationScheme, NativeServiceLoadMetricWeight,
+    NativeServicePackageActivationMode,
 };
 use fube_runtime::{
     extensions::{
@@ -155,24 +157,24 @@ record!(ServiceType {
 });
 record!(Correlation {
     service: String,
-    scheme: i64
+    scheme: NativeServiceCorrelationScheme
 });
 record!(Metric {
     name: String,
-    weight: i64,
+    weight: NativeServiceLoadMetricWeight,
     primary: u32,
     secondary: u32
 });
 record!(Placement {
     domain: String,
-    kind: i64
+    kind: NativePlacementPolicyType
 });
 record!(Service {
     name: String, instance: u64, service_type: ServiceType, application: String,
     version: VersionInstance, partitions: i32, target: i32, minimum: i32,
     stateful: bool, persisted: bool, initialization: ByteArray, group: bool,
     correlations: ObjectArray<Vec<Correlation>>, constraints: String, scaleout: i32,
-    metrics: ObjectArray<Vec<Metric>>, move_cost: u32, restart_wait: i64, quorum_wait: i64,
+    metrics: ObjectArray<Vec<Metric>>, move_cost: NativeMoveCost, restart_wait: i64, quorum_wait: i64,
     update_version: u64, placement: ObjectArray<Vec<Placement>>, standby_keep: i64,
     activation_mode: NativeServicePackageActivationMode, dns: String, scaling: EmptyObjectArray,
 });
@@ -595,7 +597,7 @@ fn base(
             constraints: String::new(),
             scaleout: 0,
             metrics: ObjectArray(vec![]),
-            move_cost: 0,
+            move_cost: NativeMoveCost::Zero,
             restart_wait: 0,
             quorum_wait: 0,
             update_version: 1,

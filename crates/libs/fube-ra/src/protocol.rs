@@ -4,9 +4,11 @@
 //! Scalar enums and ErrorCode values are LONG64; unknown values are retained.
 //! ErrorCode diagnostic strings are not serialized. No Federation routing.
 pub use fube_core::protocol::{
-    NativeApi, NativeApiDescription, NativeApiName, NativeInterfaceName, NativePartitionKind,
-    NativeProxyFlags, NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation,
-    NativeServiceOperation, NativeServicePackageActivationMode,
+    NativeApi, NativeApiDescription, NativeApiName, NativeInterfaceName, NativeMoveCost,
+    NativePartitionKind, NativePlacementPolicyType, NativeProxyFlags, NativeReplicaRole,
+    NativeReplicaState, NativeReplicatorOperation, NativeServiceCorrelationScheme,
+    NativeServiceLoadMetricWeight, NativeServiceOperation, NativeServicePackageActivationMode,
+    NativeUriHostType, NativeUriType,
 };
 use fubst::serde::{ByteArray, Derived, Guid, Inline, NativeEnum, ObjectArray, Pointer};
 use furpc::{
@@ -250,19 +252,19 @@ impl Default for Replica {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Correlation {
     pub service: String,
-    pub scheme: i64,
+    pub scheme: NativeServiceCorrelationScheme,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metric {
     pub name: String,
-    pub weight: i64,
+    pub weight: NativeServiceLoadMetricWeight,
     pub primary: u32,
     pub secondary: u32,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Placement {
     pub domain: String,
-    pub kind: i64,
+    pub kind: NativePlacementPolicyType,
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PartitionLoad {
@@ -327,7 +329,7 @@ pub struct Service {
     pub constraints: String,
     pub scaleout: i32,
     pub metrics: ObjectArray<Vec<Metric>>,
-    pub move_cost: u32,
+    pub move_cost: NativeMoveCost,
     pub restart_wait: i64,
     pub quorum_wait: i64,
     pub update_version: u64,
@@ -356,7 +358,7 @@ impl Default for Service {
             constraints: String::new(),
             scaleout: 0,
             metrics: ObjectArray::default(),
-            move_cost: 1,
+            move_cost: NativeMoveCost::Low,
             restart_wait: i64::MIN,
             quorum_wait: i64::MIN,
             update_version: 0,

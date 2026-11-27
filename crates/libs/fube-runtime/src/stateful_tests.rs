@@ -1229,7 +1229,7 @@ fn native_default_service(mut service: Service) -> Service {
     service.constraints.clear();
     service.scaleout = 0;
     service.metrics.0.clear();
-    service.move_cost = 0;
+    service.move_cost = NativeMoveCost::Zero;
     service.restart_wait = i64::MIN;
     service.quorum_wait = i64::MIN;
     service.update_version = 0;

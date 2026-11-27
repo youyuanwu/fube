@@ -204,16 +204,10 @@ impl Reporting {
         self.send_load(metrics, false).await
     }
     pub(crate) async fn move_cost(self: &Arc<Self>, cost: MoveCost) -> Result<()> {
-        let value = match cost {
-            MoveCost::Zero => 0,
-            MoveCost::Low => 1,
-            MoveCost::Medium => 2,
-            MoveCost::High => 3,
-        };
         self.send_load(
             &[LoadMetric {
                 name: "_MoveCost_".into(),
-                value,
+                value: NativeMoveCost::from(cost).code(),
             }],
             true,
         )

@@ -16,7 +16,7 @@ async fn opened(mode: u8, role: NativeReplicaRole) -> (Harness, Arc<StatefulCall
     open.local.current_role = role;
     open.service.metrics.0.push(Metric {
         name: "Work".into(),
-        weight: 1,
+        weight: NativeServiceLoadMetricWeight::Low,
         primary: 0,
         secondary: 0,
     });
@@ -484,7 +484,7 @@ async fn stateful_reporting_configured_primary_reports_before_service_change_rol
     open.unit.consistency.id.id = Guid(GUID_BYTES);
     open.service.metrics.0.push(Metric {
         name: "Work".into(),
-        weight: 1,
+        weight: NativeServiceLoadMetricWeight::Low,
         primary: 0,
         secondary: 0,
     });

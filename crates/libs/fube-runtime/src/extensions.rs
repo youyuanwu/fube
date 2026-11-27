@@ -40,7 +40,8 @@ pub use crate::stateful_api::{
 pub use fube_core::protocol::{
     NativeActivityType, NativeApi, NativeApiDescription, NativeApiName, NativeApplicationHostType,
     NativeFaultType, NativeHealthReportKind, NativeHealthState, NativeInterfaceName,
-    NativePartitionKind, NativeProxyFlags, NativeReplicaRole, NativeReplicaState,
-    NativeReplicatorOperation, NativeServiceKind, NativeServiceOperation,
-    NativeServicePackageActivationMode, NativeServicePartitionAccessStatus,
+    NativeMoveCost, NativePartitionKind, NativePlacementPolicyType, NativeProxyFlags,
+    NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation,
+    NativeServiceCorrelationScheme, NativeServiceKind, NativeServiceLoadMetricWeight,
+    NativeServiceOperation, NativeServicePackageActivationMode, NativeServicePartitionAccessStatus,
 };
