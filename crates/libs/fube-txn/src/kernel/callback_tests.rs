@@ -1049,6 +1049,68 @@ fn registry_operations(f: &Fixture, providers: &[i64]) -> Vec<Arc<dyn CopyOperat
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn copy_stage_prefix_keeps_length_errors_unsupported_status_and_exact_transition_owner() {
+    let mut invalid = vec![
+        (Vec::new(), Some("missing native copy stage")),
+        (vec![Vec::new()], Some("truncated native copy stage")),
+        (vec![vec![3, 0, 0]], Some("truncated native copy stage")),
+    ];
+    for code in [2i32, 5, 7, -1, i32::MIN] {
+        invalid.push((vec![code.to_le_bytes().to_vec()], None));
+    }
+    invalid.push((vec![3i32.to_be_bytes().to_vec()], None));
+    for (segments, length_error) in invalid {
+        let f = fixture(&["fabric:/point"]);
+        let operation: Arc<dyn CopyOperation> = Arc::new(Operation {
+            data: OperationData::new(segments).unwrap(),
+            id: 0,
+            journal: f.journal.clone(),
+        });
+        let error = observe(drain_state(
+            f.directory.clone(),
+            Arc::new(stages(&[operation])),
+        ))
+        .await
+        .err()
+        .unwrap();
+        if let Some(expected) = length_error {
+            assert!(matches!(error, crate::Error::InvalidInput(message) if message == expected));
+        } else {
+            assert_eq!(error.native_code(), Some(Status::NotImplemented.code()));
+        }
+        assert_eq!(events(&f.journal), ["Local:Begin"]);
+    }
+
+    let f = fixture(&["fabric:/point"]);
+    let mut operations = registry_operations(&f, &[7]);
+    let mut state_segments = operations[0].data().to_segments();
+    state_segments.last_mut().unwrap().extend([8, 9]);
+    operations[0] = Arc::new(Operation {
+        data: OperationData::new(state_segments).unwrap(),
+        id: 0,
+        journal: f.journal.clone(),
+    });
+    let transition: Arc<dyn CopyOperation> = Arc::new(Operation {
+        data: OperationData::new(vec![vec![4, 0, 0, 0, 8, 9]]).unwrap(),
+        id: 2,
+        journal: f.journal.clone(),
+    });
+    operations.push(transition.clone());
+    let result = observe(drain_state(
+        f.directory.clone(),
+        Arc::new(stages(&operations)),
+    ))
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(Arc::ptr_eq(&result, &transition));
+    assert!(events(&f.journal).contains(&"ACK:0".into()));
+    assert!(events(&f.journal).contains(&"ACK:1".into()));
+    assert!(!events(&f.journal).contains(&"ACK:2".into()));
+    assert!(completed(&f.points[0], CallbackKind::EndCopy));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn c01_registry_first_descending_names_null_and_header_only_then_explicit_dispose() {
     let f = fixture(&["fabric:/a", "fabric:/z", "fabric:/m"]);
     f.points[0].set_copy_stream(None);

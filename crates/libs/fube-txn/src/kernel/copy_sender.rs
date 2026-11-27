@@ -4,7 +4,7 @@
 //! Native CopyStream.cpp:167–351,381–510 and CheckpointManager544–710.
 use super::{
     copy_codec::{
-        add_stage, find_copy_mode, CopyContext, CopyHeader, CopyMetadata, CopyMode, Stage,
+        find_copy_mode, CopyContext, CopyHeader, CopyMessage, CopyMetadata, CopyMode, Stage,
     },
     memory_log::{Checkpoint, MemoryLog},
     runtime::VolatileRuntime,
@@ -196,7 +196,7 @@ impl CopySender {
                 return Err(Status::ObjectClosed.error());
             }
             if let Some(data) = next {
-                return add_stage(data, Stage::State).map(Some);
+                return CopyMessage::State(data).encode().map(Some);
             }
             let state = self.state.lock().unwrap().take();
             if let Some(state) = state {
@@ -270,8 +270,7 @@ impl CopySender {
             }
             return Ok(None);
         }
-        segments.push((Stage::Log as i32).to_le_bytes().to_vec());
-        OperationData::new(segments).map(Some)
+        CopyMessage::Log(segments).encode().map(Some)
     }
 }
 impl fube_data::IOperationDataStream for CopySender {

@@ -3099,7 +3099,7 @@ async fn phase3_actual_full_resurrects_retained_objects_and_checkpoint_cleans_st
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn phase3_native_explicit_context_sender_none_partial_preserves_lsn_and_disposes_reader() {
-    use super::copy_codec::{remove_stage, CopyHeader, Stage};
+    use super::copy_codec::{CopyHeader, CopyMessage, Stage};
     use fube_data::IOperationDataStream as _;
     let source = Fixture::start(uuid::Uuid::new_v4(), 1, ReplicaRole::Primary, false, rows()).await;
     source.configure(vec![]).await;
@@ -3170,8 +3170,9 @@ async fn phase3_native_explicit_context_sender_none_partial_preserves_lsn_and_di
     );
     let mut records = vec![];
     while let Some(packet) = partial.get_next(Cancellation::default()).await.unwrap() {
-        let (stage, data) = remove_stage(&packet).unwrap();
-        assert_eq!(stage, Stage::Log);
+        let CopyMessage::Log(data) = CopyMessage::decode(&packet).unwrap() else {
+            panic!("expected copied Log payload");
+        };
         records.extend(super::record::Record::decode_batch(&data).unwrap());
     }
     assert!(records

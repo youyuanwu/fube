@@ -6,8 +6,10 @@
 use super::{
     memory_log::{vector_bytes, ProgressEntry},
     native_bytes::{invalid, put_epoch, single, unsupported, Reader},
+    status::Status,
 };
-use crate::{Epoch, OperationData, Result};
+use crate::{Epoch, Error, OperationData, Result};
+use std::sync::Arc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub(crate) enum Stage {
@@ -154,7 +156,111 @@ impl CopyHeader {
         }
         Ok(Self { stage, primary })
     }
+    pub(crate) fn decode_operation(data: &OperationData) -> Result<Self> {
+        if data.segments().len() != 1 || data.bytes() != 16 {
+            return Err(Error::InvalidInput("native copy header length"));
+        }
+        Self::decode(data).map_err(|_| Status::NotImplemented.error())
+    }
 }
+
+/// Segmented native payloads, not FabricSerializable envelopes or ACK owners.
+/// The state-stage router borrows segments until it can return the exact transition.
+pub(crate) enum CopyMessage<P = OperationData> {
+    None(P),
+    State(P),
+    Progress(P),
+    FalseProgress(P),
+    Log(P),
+}
+pub(crate) struct CopyPayload<'a>(&'a [Arc<[u8]>]);
+impl CopyPayload<'_> {
+    pub(crate) fn into_owned(self) -> Result<OperationData> {
+        OperationData::new(self.0.iter().map(|segment| segment.to_vec()).collect())
+    }
+}
+impl<P> CopyMessage<P> {
+    fn new(stage: Stage, payload: P) -> Self {
+        match stage {
+            Stage::None => Self::None(payload),
+            Stage::State => Self::State(payload),
+            Stage::Progress => Self::Progress(payload),
+            Stage::FalseProgress => Self::FalseProgress(payload),
+            Stage::Log => Self::Log(payload),
+        }
+    }
+    fn stage(&self) -> Stage {
+        match self {
+            Self::None(_) => Stage::None,
+            Self::State(_) => Stage::State,
+            Self::Progress(_) => Stage::Progress,
+            Self::FalseProgress(_) => Stage::FalseProgress,
+            Self::Log(_) => Stage::Log,
+        }
+    }
+    fn into_payload(self) -> P {
+        match self {
+            Self::None(payload)
+            | Self::State(payload)
+            | Self::Progress(payload)
+            | Self::FalseProgress(payload)
+            | Self::Log(payload) => payload,
+        }
+    }
+}
+impl CopyMessage<Vec<Vec<u8>>> {
+    pub(crate) fn encode(self) -> Result<OperationData> {
+        let stage = self.stage();
+        let mut segments = self.into_payload();
+        segments.push((stage as i32).to_le_bytes().to_vec());
+        OperationData::new(segments)
+    }
+}
+impl CopyMessage {
+    pub(crate) fn encode(self) -> Result<OperationData> {
+        CopyMessage::new(self.stage(), self.into_payload().to_segments()).encode()
+    }
+    pub(crate) fn decode(data: &OperationData) -> Result<Self> {
+        CopyMessage::<CopyPayload<'_>>::decode_borrowed(data)?.into_owned()
+    }
+    pub(crate) fn decode_log(data: &OperationData) -> Result<OperationData> {
+        match CopyMessage::<CopyPayload<'_>>::decode_borrowed(data)
+            .map_err(|_| Status::NotImplemented.error())?
+        {
+            CopyMessage::Log(payload) => payload.into_owned(),
+            _ => Err(Status::NotImplemented.error()),
+        }
+    }
+}
+impl<'a> CopyMessage<CopyPayload<'a>> {
+    fn decode_borrowed(data: &'a OperationData) -> Result<Self> {
+        let (last, payload) = data.segments().split_last().ok_or_else(invalid)?;
+        let bytes = last.as_ref().try_into().map_err(|_| invalid())?;
+        Ok(Self::new(
+            Stage::read(i32::from_le_bytes(bytes))?,
+            CopyPayload(payload),
+        ))
+    }
+    pub(crate) fn decode_state(data: &'a OperationData) -> Result<Self> {
+        let (last, payload) = data
+            .segments()
+            .split_last()
+            .ok_or(Error::InvalidInput("missing native copy stage"))?;
+        let bytes = last
+            .get(..4)
+            .ok_or(Error::InvalidInput("truncated native copy stage"))?;
+        let stage = Stage::read(i32::from_le_bytes(bytes.try_into().unwrap()))
+            .map_err(|_| Status::NotImplemented.error())?;
+        Ok(Self::new(stage, CopyPayload(payload)))
+    }
+    pub(crate) fn into_owned(self) -> Result<CopyMessage> {
+        Ok(CopyMessage::new(
+            self.stage(),
+            self.into_payload().into_owned()?,
+        ))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct CopyMetadata {
     pub(crate) vector: Vec<ProgressEntry>,
@@ -178,14 +284,10 @@ impl CopyMetadata {
         ] {
             b.extend(value.to_le_bytes());
         }
-        add_stage(OperationData::new(vec![b])?, Stage::Progress)
+        CopyMessage::Progress(vec![b]).encode()
     }
-    pub(crate) fn decode(data: &OperationData) -> Result<Self> {
-        let (stage, payload) = remove_stage(data)?;
-        if stage != Stage::Progress {
-            return Err(invalid());
-        }
-        let mut r = Reader::new(single(&payload)?);
+    pub(crate) fn decode_payload(data: &OperationData) -> Result<Self> {
+        let mut r = Reader::new(single(data)?);
         if r.u32()? != 1 {
             return Err(unsupported("copy metadata version"));
         }
@@ -212,28 +314,6 @@ impl CopyMetadata {
         }
         Ok(())
     }
-}
-pub(crate) fn add_stage(data: OperationData, stage: Stage) -> Result<OperationData> {
-    let mut segments = data.to_segments();
-    segments.push((stage as i32).to_le_bytes().to_vec());
-    OperationData::new(segments)
-}
-pub(crate) fn remove_stage(data: &OperationData) -> Result<(Stage, OperationData)> {
-    let segments = data.segments();
-    let last = segments.last().ok_or_else(invalid)?;
-    if last.len() != 4 {
-        return Err(invalid());
-    }
-    let stage = Stage::read(i32::from_le_bytes(last[..].try_into().unwrap()))?;
-    Ok((
-        stage,
-        OperationData::new(
-            segments[..segments.len() - 1]
-                .iter()
-                .map(|s| s.to_vec())
-                .collect(),
-        )?,
-    ))
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FullReason {
@@ -368,4 +448,117 @@ pub(crate) fn find_copy_mode(source: &CopyContext, target: &CopyContext) -> Resu
         source: source_start,
         target: target_start,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_copy_messages_keep_segment_boundaries_native_bytes_and_borrowed_views() {
+        let payload = OperationData::new(vec![vec![1, 2, 3], Vec::new(), vec![4, 5]]).unwrap();
+        for stage in [
+            Stage::None,
+            Stage::State,
+            Stage::Progress,
+            Stage::FalseProgress,
+            Stage::Log,
+        ] {
+            let encoded = CopyMessage::new(stage, payload.clone()).encode().unwrap();
+            let mut expected = payload.to_segments();
+            expected.push((stage as i32).to_le_bytes().to_vec());
+            assert_eq!(encoded.to_segments(), expected);
+            let decoded = CopyMessage::decode(&encoded).unwrap();
+            assert_eq!(decoded.stage(), stage);
+            assert_eq!(decoded.into_payload(), payload);
+
+            let borrowed = CopyMessage::decode_state(&encoded).unwrap();
+            assert_eq!(borrowed.stage(), stage);
+            let view = borrowed.into_payload();
+            assert!(std::ptr::eq(view.0.as_ptr(), encoded.segments().as_ptr()));
+            assert_eq!(view.into_owned().unwrap(), payload);
+        }
+        assert_eq!(
+            CopyMessage::decode_log(&CopyMessage::Log(payload.clone()).encode().unwrap()).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn typed_copy_header_and_metadata_keep_their_distinct_native_framing() {
+        for stage in [Stage::None, Stage::State, Stage::Log] {
+            let header = CopyHeader {
+                stage,
+                primary: -17,
+            };
+            let data = header.encode().unwrap();
+            let mut expected = 1u32.to_le_bytes().to_vec();
+            expected.extend((stage as i32).to_le_bytes());
+            expected.extend((-17i64).to_le_bytes());
+            assert_eq!(data.to_segments(), [expected]);
+            let decoded = CopyHeader::decode_operation(&data).unwrap();
+            assert_eq!((decoded.stage, decoded.primary), (stage, -17));
+        }
+        let epoch = Epoch {
+            data_loss_number: 1,
+            configuration_number: 2,
+        };
+        let metadata = CopyMetadata {
+            vector: vec![ProgressEntry {
+                epoch,
+                lsn: 1,
+                primary: -17,
+                ticks: 42,
+            }],
+            starting_epoch: epoch,
+            starting: 1,
+            checkpoint: 2,
+            upto: 3,
+            highest_provider: 4,
+        };
+        let data = metadata.encode().unwrap();
+        let CopyMessage::Progress(payload) = CopyMessage::decode(&data).unwrap() else {
+            panic!("expected copy metadata");
+        };
+        let decoded = CopyMetadata::decode_payload(&payload).unwrap();
+        assert_eq!(decoded.encode().unwrap(), data);
+        assert!(CopyMetadata::decode_payload(&data).is_err());
+    }
+
+    #[test]
+    fn typed_copy_messages_count_stage_against_limits_and_keep_profile_errors() {
+        let limit = fube_data::Settings::default().operation_segments;
+        let payload = OperationData::new(vec![vec![]; limit]).unwrap();
+        assert!(matches!(
+            CopyMessage::State(payload).encode(),
+            Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationOperationTooLarge
+        ));
+        let data = CopyMessage::Log(vec![vec![]; limit - 1]).encode().unwrap();
+        assert_eq!(
+            CopyMessage::decode_log(&data).unwrap().segments().len(),
+            limit - 1
+        );
+        for code in [2i32, 3, 5, 99] {
+            let data = OperationData::new(vec![code.to_le_bytes().to_vec()]).unwrap();
+            if code == 99 {
+                assert!(matches!(
+                    CopyMessage::decode(&data),
+                    Err(error) if error.kind() == fube_runtime::ErrorKind::Unsupported && error.native_code().is_none()
+                ));
+            }
+            assert_eq!(
+                CopyMessage::decode_log(&data).unwrap_err().native_code(),
+                Some(Status::NotImplemented.code())
+            );
+        }
+        let data = OperationData::new(vec![vec![3, 0, 0, 0, 9]]).unwrap();
+        assert!(matches!(
+            CopyMessage::decode(&data),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            CopyMessage::decode_state(&data),
+            Ok(CopyMessage::State(_))
+        ));
+    }
 }
