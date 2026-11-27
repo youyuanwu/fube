@@ -1,4 +1,6 @@
 use super::*;
+use crate::protocol::{NativeReplicaRole, NativeReplicaState};
+use fube_core::protocol::NativeProxyFlags;
 use fubst::serde::ObjectArray;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +29,7 @@ pub struct ConfigurationCompletion {
     pub unit: FailoverUnit,
     pub local: Replica,
     pub replicas: ObjectArray<Vec<Replica>>,
-    pub flags: i64,
+    pub flags: NativeProxyFlags,
     pub error: i64,
 }
 
@@ -55,17 +57,27 @@ pub(super) fn secondary_removal(body: &Configuration) -> bool {
         .replicas
         .0
         .iter()
-        .filter(|r| r.previous_role == 3 && r.current_role == 1 && !r.up && r.state == 3)
+        .filter(|r| {
+            r.previous_role == NativeReplicaRole::Secondary
+                && r.current_role == NativeReplicaRole::None
+                && !r.up
+                && r.state == NativeReplicaState::Dropped
+        })
         .count();
     removed == 1
         || (removed == 0
             && body.replicas.0.len() == body.unit.minimum as usize
-            && body.replicas.0.iter().all(|r| r.current_role >= 3)
+            && body.replicas.0.iter().all(|r| r.current_role.is_active())
             && body
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.previous_role == 3 && r.current_role == 3 && !r.up && r.state == 3)
+                .filter(|r| {
+                    r.previous_role == NativeReplicaRole::Secondary
+                        && r.current_role == NativeReplicaRole::Secondary
+                        && !r.up
+                        && r.state == NativeReplicaState::Dropped
+                })
                 .count()
                 == 1)
 }
@@ -73,14 +85,14 @@ pub(super) fn secondary_removal(body: &Configuration) -> bool {
 fn fenced_replacement(old: &Replica, fresh: &Replica) -> bool {
     old.node.id == fresh.node.id
         && old.node.instance < fresh.node.instance
-        && old.previous_role == 3
-        && old.current_role == 1
+        && old.previous_role == NativeReplicaRole::Secondary
+        && old.current_role == NativeReplicaRole::None
         && !old.up
-        && old.state == 3
-        && fresh.previous_role == 2
-        && fresh.current_role == 3
+        && old.state == NativeReplicaState::Dropped
+        && fresh.previous_role == NativeReplicaRole::Idle
+        && fresh.current_role == NativeReplicaRole::Secondary
         && fresh.up
-        && fresh.state == 2
+        && fresh.state == NativeReplicaState::Ready
         && fresh.id > old.id
         && fresh.instance > old.instance
 }
@@ -109,8 +121,8 @@ pub fn replica_replacement_metadata(state: &EntityState) -> bool {
                     && secondary_removal(&c.request)
                     && c.request.replicas.0.iter().any(|r| {
                         r.node == state.body.replica.node
-                            && r.previous_role == 4
-                            && r.current_role == 4
+                            && r.previous_role == NativeReplicaRole::Primary
+                            && r.current_role == NativeReplicaRole::Primary
                     })))
     })
 }
@@ -145,12 +157,12 @@ fn secondary_transition(body: &Configuration, old: &EntityState) -> bool {
                             .replicas
                             .0
                             .iter()
-                            .filter(|r| r.current_role >= 3)
+                            .filter(|r| r.current_role.is_active())
                             .count()
                             < body.service.target as usize))
         })
         || (body.service == old.body.service
-            && old.body.replica.current_role == 2
+            && old.body.replica.current_role == NativeReplicaRole::Idle
             && old.peer_creation.as_ref().is_some_and(|p| {
                 p.deactivation.epoch != old.body.unit.current
                     && p.deactivation.epoch.data_loss == old.body.unit.current.data_loss
@@ -162,7 +174,7 @@ pub(super) fn stable(request: &Configuration) -> Configuration {
     let mut body = request.clone();
     body.unit.previous = Epoch::default();
     for replica in &mut body.replicas.0 {
-        replica.previous_role = 1;
+        replica.previous_role = NativeReplicaRole::None;
     }
     body
 }
@@ -175,16 +187,23 @@ fn local<'a>(body: &'a Configuration, node: &NodeInstance) -> Result<&'a Replica
 }
 fn initial_configuration(body: &Configuration, old: &EntityState) -> bool {
     old.reconfiguration.is_none()
-        && old.body.replica.current_role == if old.fm_primary { 4 } else { 2 }
+        && old.body.replica.current_role
+            == if old.fm_primary {
+                NativeReplicaRole::Primary
+            } else {
+                NativeReplicaRole::Idle
+            }
         && body.service == old.body.service
         && valid_stateful_sizes(&body.service)
         && body.replicas.0.len() == body.service.target as usize
         && body.replicas.0.len() >= 2
-        && body
-            .replicas
-            .0
-            .iter()
-            .all(|r| matches!((r.previous_role, r.current_role), (4, 4) | (2, 3)))
+        && body.replicas.0.iter().all(|r| {
+            matches!(
+                (r.previous_role, r.current_role),
+                (NativeReplicaRole::Primary, NativeReplicaRole::Primary)
+                    | (NativeReplicaRole::Idle, NativeReplicaRole::Secondary)
+            )
+        })
 }
 fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Result<()> {
     let old_epoch = old.body.unit.current;
@@ -193,17 +212,22 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
             .replicas
             .0
             .iter()
-            .filter(|r| r.previous_role == 2 && r.current_role == 3)
+            .filter(|r| {
+                r.previous_role == NativeReplicaRole::Idle
+                    && r.current_role == NativeReplicaRole::Secondary
+            })
             .count();
         let prior = completed_configuration(old);
         let removed = body
             .replicas
             .0
             .iter()
-            .filter(|r| r.current_role == 1)
+            .filter(|r| r.current_role == NativeReplicaRole::None)
             .count();
         let retaining = removed == 0;
-        if prior.is_none() && !(fresh == 1 && old.body.replica.current_role == 2) {
+        if prior.is_none()
+            && !(fresh == 1 && old.body.replica.current_role == NativeReplicaRole::Idle)
+        {
             return Err(Failure::Unsupported(
                 "Secondary removal requires completed membership or the fresh Idle",
             ));
@@ -215,9 +239,9 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
             .iter()
             .filter(|r| {
                 if prior.is_some() {
-                    r.current_role >= 3
+                    r.current_role.is_active()
                 } else {
-                    r.previous_role >= 3
+                    r.previous_role.is_active()
                 }
             })
             .collect();
@@ -237,30 +261,35 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
             || members.len() > body.service.target as usize
             || members.len() + fresh - removed < body.service.minimum as usize
             || members.len() + fresh - removed > body.service.target as usize
-            || local(body, primary)?.previous_role != 4
-            || local(body, primary)?.current_role != 4
+            || local(body, primary)?.previous_role != NativeReplicaRole::Primary
+            || local(body, primary)?.current_role != NativeReplicaRole::Primary
             || body.replicas.0.iter().enumerate().any(|(i, r)| {
                 r.id < 0
                     || r.instance < 0
                     || r.version != body.service.version
-                    || (r.current_role == 4 && r.node != *primary)
+                    || (r.current_role == NativeReplicaRole::Primary && r.node != *primary)
                     || body.replicas.0[..i].iter().any(|old| {
                         old.id == r.id
                             || (old.node.id == r.node.id
                                 && !fenced_replacement(old, r)
                                 && !fenced_replacement(r, old))
                     })
-                    || if r.current_role == 1 {
-                        r.previous_role != 3 || r.up || r.state != 3
-                    } else if retaining && r.current_role == 3 && !r.up {
-                        r.previous_role != 3 || r.state != 3
+                    || if r.current_role == NativeReplicaRole::None {
+                        r.previous_role != NativeReplicaRole::Secondary
+                            || r.up
+                            || r.state != NativeReplicaState::Dropped
+                    } else if retaining && r.current_role == NativeReplicaRole::Secondary && !r.up {
+                        r.previous_role != NativeReplicaRole::Secondary
+                            || r.state != NativeReplicaState::Dropped
                     } else {
                         !r.up
-                            || r.state != 2
+                            || r.state != NativeReplicaState::Ready
                             || r.replication_endpoint.is_empty()
                             || !matches!(
                                 (r.previous_role, r.current_role),
-                                (4, 4) | (3, 3) | (2, 3)
+                                (NativeReplicaRole::Primary, NativeReplicaRole::Primary)
+                                    | (NativeReplicaRole::Secondary, NativeReplicaRole::Secondary)
+                                    | (NativeReplicaRole::Idle, NativeReplicaRole::Secondary)
                             )
                     }
             })
@@ -288,14 +317,16 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                         && r.node != expected.node
                         && !fenced_replacement(actual, r)
                 })
-                || if actual.current_role == 1 {
-                    expected.current_role != 3 || actual.up || actual.state != 3
+                || if actual.current_role == NativeReplicaRole::None {
+                    expected.current_role != NativeReplicaRole::Secondary
+                        || actual.up
+                        || actual.state != NativeReplicaState::Dropped
                 } else {
                     actual.current_role != expected.current_role
                         || if retaining && !actual.up {
-                            actual.state != 3
+                            actual.state != NativeReplicaState::Dropped
                         } else {
-                            !actual.up || actual.state != 2
+                            !actual.up || actual.state != NativeReplicaState::Ready
                         }
                 }
             {
@@ -313,7 +344,12 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
         && body.service == old.body.service;
     let prior = completed_configuration(old);
     let repair_count = prior.map_or(body.replicas.0.len(), |c| {
-        c.replicas.0.iter().filter(|r| r.current_role >= 3).count() + 1
+        c.replicas
+            .0
+            .iter()
+            .filter(|r| r.current_role.is_active())
+            .count()
+            + 1
     });
     let three = body.unit.target == 3 && old.body.service.target == 1;
     if (!initial
@@ -348,11 +384,11 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
         ));
     }
     let p = local(body, primary)?;
-    if p.current_role != 4
-        || p.previous_role != 4
+    if p.current_role != NativeReplicaRole::Primary
+        || p.previous_role != NativeReplicaRole::Primary
         || body.replicas.0.iter().enumerate().any(|(i, r)| {
             !r.up
-                || r.state != 2
+                || r.state != NativeReplicaState::Ready
                 || r.id < 0
                 || r.instance < 0
                 || r.version != body.service.version
@@ -362,10 +398,12 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                     .any(|old| old.id == r.id || old.node.id == r.node.id)
                 || (r.node != *primary
                     && if body.unit.target >= 2 {
-                        r.current_role != 3
-                            || !(r.previous_role == 2 || (repair && r.previous_role == 3))
+                        r.current_role != NativeReplicaRole::Secondary
+                            || !(r.previous_role == NativeReplicaRole::Idle
+                                || (repair && r.previous_role == NativeReplicaRole::Secondary))
                     } else {
-                        r.current_role != 1 || r.previous_role != 3
+                        r.current_role != NativeReplicaRole::None
+                            || r.previous_role != NativeReplicaRole::Secondary
                     })
         })
     {
@@ -378,14 +416,14 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
             .replicas
             .0
             .iter()
-            .filter(|r| r.previous_role == 2)
+            .filter(|r| r.previous_role == NativeReplicaRole::Idle)
             .count()
             != 1
             || body
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.previous_role == 3)
+                .filter(|r| r.previous_role == NativeReplicaRole::Secondary)
                 .count()
                 != body.replicas.0.len() - 2
         {
@@ -394,7 +432,12 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
             ));
         }
         if let Some(prior) = prior {
-            for expected in prior.replicas.0.iter().filter(|r| r.current_role >= 3) {
+            for expected in prior
+                .replicas
+                .0
+                .iter()
+                .filter(|r| r.current_role.is_active())
+            {
                 let mut actual = local(body, &expected.node)?.clone();
                 if actual.previous_role != expected.current_role {
                     return Err(Failure::Admission(
@@ -410,14 +453,19 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                     ));
                 }
             }
-            if let Some(lost) = prior.replicas.0.iter().find(|r| r.current_role == 1) {
+            if let Some(lost) = prior
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.current_role == NativeReplicaRole::None)
+            {
                 let fresh = body
                     .replicas
                     .0
                     .iter()
                     .find(|r| r.node.id == lost.node.id)
                     .ok_or(Failure::Admission("repair omitted the lost logical Node"))?;
-                if fresh.previous_role != 2
+                if fresh.previous_role != NativeReplicaRole::Idle
                     || fresh.node.instance < lost.node.instance
                     || fresh.id <= lost.id
                     || fresh.instance <= lost.instance
@@ -427,7 +475,7 @@ fn shape(body: &Configuration, old: &EntityState, primary: &NodeInstance) -> Res
                     ));
                 }
             }
-        } else if old.body.replica.current_role != 2 {
+        } else if old.body.replica.current_role != NativeReplicaRole::Idle {
             return Err(Failure::Unsupported(
                 "repair requires completed failover or fresh Idle",
             ));
@@ -445,7 +493,7 @@ fn apply_body(state: &mut EntityState, body: &Configuration, node: &NodeInstance
     state.intermediate_configuration = None;
     Ok(())
 }
-fn configuration_effect(state: &EntityState, flags: i64) -> Effect {
+fn configuration_effect(state: &EntityState, flags: NativeProxyFlags) -> Effect {
     Effect::UpdateConfiguration {
         body: Box::new(
             state
@@ -468,8 +516,8 @@ fn reply(state: &EntityState) -> Effect {
             .expect("owned configuration")
             .request,
     );
-    if state.body.replica.current_role == 4 {
-        body.replicas.0.retain(|r| r.current_role >= 3);
+    if state.body.replica.current_role == NativeReplicaRole::Primary {
+        body.replicas.0.retain(|r| r.current_role.is_active());
         Effect::DoReconfigurationReply(ConfigurationReply {
             unit: body.unit,
             replicas: body.replicas,
@@ -490,7 +538,13 @@ fn local_primary(state: &EntityState) -> NodeInstance {
     state
         .reconfiguration
         .as_ref()
-        .and_then(|c| c.request.replicas.0.iter().find(|r| r.current_role == 4))
+        .and_then(|c| {
+            c.request
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
+        })
         .map(|r| r.node.clone())
         .or_else(|| state.peer_creation.as_ref().map(|p| p.source.clone()))
         .expect("admitted configuration Primary")
@@ -506,7 +560,7 @@ pub(super) fn deactivate_reply(state: &EntityState) -> Effect {
                 id: state.body.replica.id,
                 instance: state.body.replica.instance,
                 up: false,
-                state: 3,
+                state: NativeReplicaState::Dropped,
                 ..Replica::default()
             },
             error: 0,
@@ -516,9 +570,11 @@ pub(super) fn deactivate_reply(state: &EntityState) -> Effect {
 fn pending_effects(state: &EntityState) -> Vec<Effect> {
     let config = state.reconfiguration.as_ref().expect("owned configuration");
     let effect = match config.stage {
-        ConfigurationStage::Catchup => configuration_effect(state, 2),
-        ConfigurationStage::End => configuration_effect(state, 1),
-        ConfigurationStage::Secondary => configuration_effect(state, 0),
+        ConfigurationStage::Catchup => configuration_effect(state, NativeProxyFlags::CATCH_UP),
+        ConfigurationStage::End => {
+            configuration_effect(state, NativeProxyFlags::END_RECONFIGURATION)
+        }
+        ConfigurationStage::Secondary => configuration_effect(state, NativeProxyFlags::NONE),
         ConfigurationStage::Retiring => {
             if state.phase == Phase::Closed {
                 deactivate_reply(state)
@@ -534,7 +590,11 @@ fn pending_effects(state: &EntityState) -> Vec<Effect> {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.previous_role == 3 && r.up && !config.deactivated.contains(&r.node))
+                .filter(|r| {
+                    r.previous_role == NativeReplicaRole::Secondary
+                        && r.up
+                        && !config.deactivated.contains(&r.node)
+                })
                 .map(|target| Effect::PeerDeactivate {
                     target: target.node.clone(),
                     body: Box::new(Deactivate {
@@ -553,7 +613,7 @@ fn pending_effects(state: &EntityState) -> Vec<Effect> {
                 .0
                 .iter()
                 .filter(|target| {
-                    target.current_role == 3
+                    target.current_role == NativeReplicaRole::Secondary
                         && target.up
                         && !config.activated.contains(&target.node)
                 })
@@ -656,13 +716,10 @@ pub(super) fn transition(
                         "Secondary repair changed the Primary owner",
                     ));
                 }
-                if body
-                    .configuration
-                    .replicas
-                    .0
-                    .iter()
-                    .any(|r| r.previous_role == 2 && r.current_role == 3)
-                {
+                if body.configuration.replicas.0.iter().any(|r| {
+                    r.previous_role == NativeReplicaRole::Idle
+                        && r.current_role == NativeReplicaRole::Secondary
+                }) {
                     let fresh: Vec<_> = current
                         .remote_idles
                         .iter()
@@ -680,9 +737,9 @@ pub(super) fn transition(
                     };
                     let actual = local(&body.configuration, &fresh.target)?;
                     let mut expected = fresh.reply.as_ref().expect("Ready Idle").replica.clone();
-                    expected.previous_role = 2;
-                    expected.current_role = 3;
-                    expected.state = 2;
+                    expected.previous_role = NativeReplicaRole::Idle;
+                    expected.current_role = NativeReplicaRole::Secondary;
+                    expected.state = NativeReplicaState::Ready;
                     if actual != &expected {
                         return Err(Failure::Admission(
                             "Secondary repair changed its fresh build owner",
@@ -820,21 +877,23 @@ pub(super) fn transition(
             let repair = body.configuration.unit.target >= 2
                 && valid_stateful_sizes(&body.configuration.service)
                 && body.configuration.service == current.body.service
-                && (completed_primary_change(current) || current.body.replica.current_role == 2)
+                && (completed_primary_change(current)
+                    || current.body.replica.current_role == NativeReplicaRole::Idle)
                 && body.deactivation.epoch == body.configuration.unit.current
                 && body.deactivation.catchup_lsn >= 0;
             let continued_secondary = completed_primary_change(current)
-                && current.body.replica.current_role == 3
+                && current.body.replica.current_role == NativeReplicaRole::Secondary
                 && completed_configuration(current).is_some_and(|c| {
                     c.replicas
                         .0
                         .iter()
-                        .any(|r| r.node == *source && r.current_role == 4)
+                        .any(|r| r.node == *source && r.current_role == NativeReplicaRole::Primary)
                 })
                 && current.primary_deactivation
                     == Some((body.deactivation.epoch, body.deactivation.catchup_lsn));
             if (current.fm_primary
-                && !(completed_primary_change(current) && current.body.replica.current_role == 3))
+                && !(completed_primary_change(current)
+                    && current.body.replica.current_role == NativeReplicaRole::Secondary))
                 || (!repair
                     && !continued_secondary
                     && current.peer_creation.as_ref().is_none_or(|origin| {
@@ -887,7 +946,9 @@ pub(super) fn transition(
                 shape(&body.configuration, current, source)?;
             }
             let expected = local(&body.configuration, &admission.local_node)?;
-            if (!repair && !secondary_loss && current.body.replica.current_role != 2)
+            if (!repair
+                && !secondary_loss
+                && current.body.replica.current_role != NativeReplicaRole::Idle)
                 || expected.id != current.body.replica.id
                 || expected.instance != current.body.replica.instance
                 || expected.replication_endpoint != current.body.replica.replication_endpoint
@@ -898,7 +959,8 @@ pub(super) fn transition(
             let mut state = current.clone();
             if repair {
                 if !peers.contains(source)
-                    || local(&body.configuration, source)?.current_role != 4
+                    || local(&body.configuration, source)?.current_role
+                        != NativeReplicaRole::Primary
                     || (!completed_primary_change(current)
                         && current
                             .peer_creation
@@ -906,11 +968,9 @@ pub(super) fn transition(
                             .is_none_or(|p| p.source != *source))
                     || (completed_primary_change(current)
                         && current.swap.as_ref().is_none_or(|s| {
-                            !s.body
-                                .replicas
-                                .0
-                                .iter()
-                                .any(|r| r.node == *source && r.current_role == 4)
+                            !s.body.replicas.0.iter().any(|r| {
+                                r.node == *source && r.current_role == NativeReplicaRole::Primary
+                            })
                         }))
                 {
                     return Err(Failure::Admission(
@@ -997,19 +1057,18 @@ pub(super) fn transition(
                 if body.force
                     || (current.fm_primary
                         && !(completed_primary_change(current)
-                            && current.body.replica.current_role == 3))
-                    || expected.previous_role != 3
-                    || expected.current_role != 3
+                            && current.body.replica.current_role == NativeReplicaRole::Secondary))
+                    || expected.previous_role != NativeReplicaRole::Secondary
+                    || expected.current_role != NativeReplicaRole::Secondary
                     || expected.id != current.body.replica.id
                     || expected.instance != current.body.replica.instance
                     || (!secondary_loss
                         && body.deactivation.epoch != body.configuration.unit.current)
                     || (secondary_loss
                         && (completed_configuration(current).is_none_or(|c| {
-                            !c.replicas
-                                .0
-                                .iter()
-                                .any(|r| r.node == *source && r.current_role == 4)
+                            !c.replicas.0.iter().any(|r| {
+                                r.node == *source && r.current_role == NativeReplicaRole::Primary
+                            })
                         }) || current.primary_deactivation.map_or_else(
                             || {
                                 current
@@ -1031,11 +1090,9 @@ pub(super) fn transition(
                     )
                     || (!secondary_loss
                         && current.swap.as_ref().is_none_or(|s| {
-                            !s.body
-                                .replicas
-                                .0
-                                .iter()
-                                .any(|r| r.node == *source && r.current_role == 4)
+                            !s.body.replicas.0.iter().any(|r| {
+                                r.node == *source && r.current_role == NativeReplicaRole::Primary
+                            })
                         }))
                 {
                     return Err(Failure::Admission(
@@ -1126,8 +1183,8 @@ pub(super) fn transition(
             shape(&body.configuration, current, source)?;
             let replica = local(&body.configuration, &admission.local_node)?;
             let mut expected = current.body.replica.clone();
-            expected.previous_role = 3;
-            expected.current_role = 1;
+            expected.previous_role = NativeReplicaRole::Secondary;
+            expected.current_role = NativeReplicaRole::None;
             if replica != &expected {
                 return Err(Failure::Admission(
                     "retirement changed Secondary identity/endpoints",
@@ -1190,14 +1247,14 @@ pub(super) fn transition(
                 id: target.id,
                 instance: target.instance,
                 up: false,
-                state: 3,
+                state: NativeReplicaState::Dropped,
                 ..Replica::default()
             };
             if !current.fm_primary
                 || body.unit != config.request.unit
                 || body.replica != expected
                 || body.error != 0
-                || target.previous_role != 3
+                || target.previous_role != NativeReplicaRole::Secondary
                 || !target.up
                 || config.deactivated.contains(source)
             {
@@ -1211,7 +1268,7 @@ pub(super) fn transition(
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.previous_role == 3 && r.up)
+                .filter(|r| r.previous_role == NativeReplicaRole::Secondary && r.up)
                 .all(|r| config.deactivated.contains(&r.node))
             {
                 config.stage = if config.request.unit.target == 1 {
@@ -1221,7 +1278,7 @@ pub(super) fn transition(
                     .replicas
                     .0
                     .iter()
-                    .any(|r| r.up && r.current_role == 3)
+                    .any(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
                 {
                     ConfigurationStage::Activate
                 } else {
@@ -1270,7 +1327,7 @@ pub(super) fn transition(
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.current_role == 3 && r.up)
+                .filter(|r| r.current_role == NativeReplicaRole::Secondary && r.up)
                 .all(|r| config.activated.contains(&r.node))
             {
                 config.stage = ConfigurationStage::End;
@@ -1288,9 +1345,9 @@ pub(super) fn transition(
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             };
             let flags = match config.stage {
-                ConfigurationStage::Catchup => 2,
-                ConfigurationStage::End => 1,
-                ConfigurationStage::Secondary => 0,
+                ConfigurationStage::Catchup => NativeProxyFlags::CATCH_UP,
+                ConfigurationStage::End => NativeProxyFlags::END_RECONFIGURATION,
+                ConfigurationStage::Secondary => NativeProxyFlags::NONE,
                 _ => return Ok(Transition::ignored(Disposition::IgnoredStale)),
             };
             let mut local = body.local.clone();
@@ -1333,7 +1390,7 @@ pub(super) fn transition(
                             .replicas
                             .0
                             .iter()
-                            .any(|r| r.previous_role == 3 && r.up))
+                            .any(|r| r.previous_role == NativeReplicaRole::Secondary && r.up))
                 {
                     ConfigurationStage::Deactivate
                 } else if config
@@ -1341,7 +1398,7 @@ pub(super) fn transition(
                     .replicas
                     .0
                     .iter()
-                    .any(|r| r.up && r.current_role == 3)
+                    .any(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
                 {
                     ConfigurationStage::Activate
                 } else {
@@ -1357,7 +1414,7 @@ pub(super) fn transition(
                     .expect("configuration")
                     .replicas
                     .0
-                    .retain(|replica| replica.current_role >= 3);
+                    .retain(|replica| replica.current_role.is_active());
                 if state.fm_primary && config.request.unit.target == 1 {
                     state.remote_idles.clear();
                 }
@@ -1368,7 +1425,7 @@ pub(super) fn transition(
                             .replicas
                             .0
                             .iter()
-                            .any(|r| r.node == idle.target && r.current_role >= 3)
+                            .any(|r| r.node == idle.target && r.current_role.is_active())
                     });
                 }
                 state

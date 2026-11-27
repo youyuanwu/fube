@@ -1,9 +1,10 @@
+use crate::status::{ConfigurationState, RepairState};
 use crate::{
     fm::{Accepted, Bootstrap, Ledger, Observed},
     management::Operation,
     manager::Manager,
     profile::*,
-    Cluster, Command,
+    Cluster, Command, CommandAction, OperationPhase, OperationState,
 };
 use fube_ra::protocol::*;
 use serde::{Deserialize, Serialize};
@@ -30,57 +31,57 @@ pub struct ReplicaRef {
 
 impl Cluster {
     pub async fn stop_node(&mut self, op: &str, node: u8) -> Result<Value> {
-        self.execute(Command {
-            op: op.into(),
-            action: "stop-node".into(),
-            node: Some(node),
-            ..Command::default()
-        })
-        .await
+        self.execute(Command::new(op, CommandAction::StopNode { node }))
+            .await
     }
 
     pub async fn kill_node(&mut self, op: &str, node: u8) -> Result<Value> {
-        self.execute(Command {
-            op: op.into(),
-            action: "kill-node".into(),
-            node: Some(node),
-            ..Command::default()
-        })
-        .await
+        self.execute(Command::new(op, CommandAction::KillNode { node }))
+            .await
     }
 
     /// Wait for the retained semantic outcome, never local submission or replica registration.
     pub async fn wait_operation(&mut self, op: &str, budget: Duration) -> Result<Value> {
-        Command {
-            op: op.into(),
-            action: "status".into(),
-            ..Command::default()
-        }
-        .validate()?;
+        self.wait_operation_typed(op, budget)
+            .await
+            .map(|outcome| outcome.json())
+    }
+
+    pub async fn wait_operation_typed(
+        &mut self,
+        op: &str,
+        budget: Duration,
+    ) -> Result<crate::OperationOutcome> {
+        Command::new(op, CommandAction::Status).validate()?;
         let deadline = Instant::now()
             .checked_add(budget)
             .ok_or("operation wait budget exceeds the clock range")?;
         loop {
-            let status = self.status();
-            let outcome = status["operations"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(status["node_controls"].as_array().into_iter().flatten())
-                .find(|outcome| outcome["op"] == op)
+            let status = self.status_typed();
+            let outcome = status
+                .operations
+                .iter()
+                .chain(status.node_controls.iter().flatten())
+                .find(|outcome| outcome.op == op)
                 .ok_or_else(|| format!("operation {op} is not retained"))?;
-            match outcome["state"].as_str() {
-                Some("complete" | "down") => return Ok(outcome.clone()),
-                Some("rejected" | "failed" | "unknown" | "cancelled" | "superseded") => {
+            match outcome.state {
+                OperationState::Complete | OperationState::Down => return Ok(outcome.clone()),
+                OperationState::Rejected
+                | OperationState::Failed
+                | OperationState::Unknown
+                | OperationState::Cancelled
+                | OperationState::Superseded => {
                     return Err(format!(
                         "operation {op} ended as {}: {}",
-                        outcome["state"], outcome["error"]
+                        json!(outcome.state),
+                        outcome.error.as_ref().unwrap_or(&Value::Null)
                     ))
                 }
-                Some("pending") => {}
+                OperationState::Pending => {}
                 _ => {
                     return Err(format!(
-                        "operation {op} has an invalid retained outcome: {outcome}"
+                        "operation {op} has an invalid retained outcome: {}",
+                        outcome.json()
                     ))
                 }
             }
@@ -131,13 +132,13 @@ impl Cluster {
     }
 
     pub async fn create_partition(&mut self, op: &str, partition: &str, node: u8) -> Result<Value> {
-        self.execute_fm_command(Command {
-            op: op.into(),
-            action: "create-partition".into(),
-            node: Some(node),
-            partition: Some(partition.into()),
-            ..Command::default()
-        })
+        self.execute_fm_command(Command::new(
+            op,
+            CommandAction::CreatePartition {
+                partition: partition.into(),
+                node,
+            },
+        ))
         .await
     }
 
@@ -147,13 +148,14 @@ impl Cluster {
         partition: &str,
         predecessor: ReplicaRef,
     ) -> Result<Value> {
-        self.execute_fm_command(Command {
-            op: op.into(),
-            action: "reconfigure-partition".into(),
-            partition: Some(partition.into()),
-            predecessor: Some(predecessor),
-            ..Command::default()
-        })
+        self.execute_fm_command(Command::new(
+            op,
+            CommandAction::ReconfigurePartition {
+                partition: partition.into(),
+                predecessor,
+                operation: None,
+            },
+        ))
         .await
     }
 
@@ -164,14 +166,14 @@ impl Cluster {
         predecessor: ReplicaRef,
         destination: u8,
     ) -> Result<Value> {
-        self.execute_fm_command(Command {
-            op: op.into(),
-            action: "rebuild-replica".into(),
-            partition: Some(partition.into()),
-            predecessor: Some(predecessor),
-            node: Some(destination),
-            ..Command::default()
-        })
+        self.execute_fm_command(Command::new(
+            op,
+            CommandAction::RebuildReplica {
+                partition: partition.into(),
+                predecessor,
+                node: destination,
+            },
+        ))
         .await
     }
 
@@ -182,24 +184,24 @@ impl Cluster {
         predecessor: ReplicaRef,
         operation: &str,
     ) -> Result<Value> {
-        self.execute_fm_command(Command {
-            op: op.into(),
-            action: "reconfigure-partition".into(),
-            partition: Some(partition.into()),
-            predecessor: Some(predecessor),
-            operation: Some(operation.into()),
-            ..Command::default()
-        })
+        self.execute_fm_command(Command::new(
+            op,
+            CommandAction::ReconfigurePartition {
+                partition: partition.into(),
+                predecessor,
+                operation: Some(operation.into()),
+            },
+        ))
         .await
     }
 
     pub async fn cancel_rebuild(&mut self, op: &str, operation: &str) -> Result<Value> {
-        self.execute_fm_command(Command {
-            op: op.into(),
-            action: "cancel-rebuild".into(),
-            operation: Some(operation.into()),
-            ..Command::default()
-        })
+        self.execute_fm_command(Command::new(
+            op,
+            CommandAction::CancelRebuild {
+                operation: operation.into(),
+            },
+        ))
         .await
     }
 
@@ -374,105 +376,117 @@ impl Ledger {
     pub(crate) fn refresh_scenario_operations(&mut self) {
         let mut updates = Vec::new();
         for operation in &self.operations {
-            if operation.outcome["state"] != "pending" {
+            if operation.outcome.state != OperationState::Pending {
                 continue;
             }
             let command = &operation.command;
-            let progress = match command.action.as_str() {
-                "reconfigure-partition" => {
-                    let status = self.configuration_status();
-                    if status["request"]["configuration"]["unit"]["current"]
-                        != operation.outcome["epoch"]
+            let progress = match &command.action {
+                CommandAction::ReconfigurePartition { .. } => {
+                    let status = self.configuration_view();
+                    if Some(
+                        status
+                            .request
+                            .as_ref()
+                            .map(|request| request.configuration.unit.current),
+                    ) != operation.outcome.epoch
                     {
-                        Some(("unknown", "unknown"))
-                    } else if status["ready"] == true {
-                        Some(("complete", "ready"))
-                    } else if status["state"] == "unknown" {
-                        Some(("unknown", "unknown"))
+                        Some((OperationState::Unknown, OperationPhase::Unknown))
+                    } else if status.ready {
+                        Some((OperationState::Complete, OperationPhase::Ready))
+                    } else if status.state == ConfigurationState::Unknown {
+                        Some((OperationState::Unknown, OperationPhase::Unknown))
                     } else {
                         None
                     }
                 }
-                "rebuild-replica" => {
-                    if command.node.is_some_and(|node| {
-                        !self.placements[usize::from(node - 1)]
-                            .launch
-                            .profile
-                            .stateful()
-                    }) {
-                        let p = &self.placements[usize::from(command.node.unwrap() - 1)];
-                        if json!(p.launch.node.instance) != operation.outcome["node_instance"]
+                CommandAction::RebuildReplica { node, .. } => {
+                    if !self.placements[usize::from(node - 1)]
+                        .launch
+                        .profile
+                        .stateful()
+                    {
+                        let p = &self.placements[usize::from(node - 1)];
+                        if Some(p.launch.node.instance) != operation.outcome.node_instance
                             || p.loss_reported
                         {
-                            Some(("unknown", "unknown"))
+                            Some((OperationState::Unknown, OperationPhase::Unknown))
                         } else if p.observed == Observed::Running {
-                            Some(("complete", "ready"))
+                            Some((OperationState::Complete, OperationPhase::Ready))
                         } else {
                             None
                         }
                     } else {
-                        let status = self.repair_status();
+                        let status = self.repair_view();
                         let same = self.repair.as_ref().is_some_and(|repair| {
-                            json!(repair.build.body.replica.id) == operation.outcome["replica"]
-                                && json!(repair.build.body.replica.instance)
-                                    == operation.outcome["incarnation"]
-                                && json!(repair.build.body.replica.node.instance)
-                                    == operation.outcome["node_instance"]
+                            operation.outcome.owns_replica(&repair.build.body.replica)
                         });
-                        if !same || status["state"] == "unknown" {
-                            Some(("unknown", "unknown"))
-                        } else if status["ready"] == true {
-                            Some(("complete", "ready"))
-                        } else if status["state"] == "failed" {
-                            Some(("failed", "build_failed"))
-                        } else if status["replicator_removed"] == true {
-                            Some(("cancelled", "removed"))
-                        } else if status["built"] == true {
-                            Some(("pending", "admitting"))
+                        if !same || status.state == RepairState::Unknown {
+                            Some((OperationState::Unknown, OperationPhase::Unknown))
+                        } else if status.ready {
+                            Some((OperationState::Complete, OperationPhase::Ready))
+                        } else if status.state == RepairState::Failed {
+                            Some((OperationState::Failed, OperationPhase::BuildFailed))
+                        } else if self
+                            .repair
+                            .as_ref()
+                            .is_some_and(|repair| repair.replicator_removed())
+                        {
+                            Some((OperationState::Cancelled, OperationPhase::Removed))
+                        } else if self.repair.as_ref().is_some_and(|repair| {
+                            repair
+                                .build
+                                .reply
+                                .as_ref()
+                                .is_some_and(|reply| reply.error == 0)
+                        }) {
+                            Some((OperationState::Pending, OperationPhase::Admitting))
                         } else {
-                            Some(("pending", "building"))
+                            Some((OperationState::Pending, OperationPhase::Building))
                         }
                     }
                 }
-                "cancel-rebuild" => {
+                CommandAction::CancelRebuild { .. } => {
                     let same = self.repair.as_ref().is_some_and(|repair| {
-                        json!(repair.build.body.replica.id) == operation.outcome["replica"]
-                            && json!(repair.build.body.replica.instance)
-                                == operation.outcome["incarnation"]
-                            && json!(repair.build.body.replica.node.instance)
-                                == operation.outcome["node_instance"]
+                        operation.outcome.owns_replica(&repair.build.body.replica)
                     });
                     if !same {
-                        Some(("unknown", "unknown"))
-                    } else if self.repair_status()["replicator_removed"] == true {
-                        Some(("complete", "removed"))
-                    } else if self.repair_status()["state"] == "unknown" {
-                        Some(("unknown", "unknown"))
+                        Some((OperationState::Unknown, OperationPhase::Unknown))
+                    } else if self
+                        .repair
+                        .as_ref()
+                        .is_some_and(|repair| repair.replicator_removed())
+                    {
+                        Some((OperationState::Complete, OperationPhase::Removed))
+                    } else if self.repair_view().state == RepairState::Unknown {
+                        Some((OperationState::Unknown, OperationPhase::Unknown))
                     } else {
                         None
                     }
                 }
-                "create-partition" => Some((
-                    "pending",
-                    if command.node.is_some_and(|node| {
-                        self.placements[usize::from(node - 1)].observed == Observed::Running
-                    }) {
-                        "building_initial_membership"
+                CommandAction::CreatePartition { node, .. } => Some((
+                    OperationState::Pending,
+                    if self.placements[usize::from(node - 1)].observed == Observed::Running {
+                        OperationPhase::BuildingInitialMembership
                     } else {
-                        "opening"
+                        OperationPhase::Opening
                     },
                 )),
                 _ => None,
             };
             if let Some((state, phase)) = progress {
                 let mut outcome = operation.outcome.clone();
-                outcome["state"] = json!(state);
-                outcome["phase"] = json!(phase);
-                if state == "unknown" {
-                    outcome["error"] = json!("original recovery authority was lost or superseded");
+                outcome.state = state;
+                outcome.phase = Some(phase);
+                if state == OperationState::Unknown {
+                    outcome.error =
+                        Some(json!("original recovery authority was lost or superseded"));
                 }
-                if state == "failed" {
-                    outcome["error"] = self.repair_status()["build_reply"]["error"].clone();
+                if state == OperationState::Failed {
+                    outcome.error = Some(json!(self
+                        .repair
+                        .as_ref()
+                        .and_then(|repair| repair.build.reply.as_ref())
+                        .map(|reply| reply.error)));
                 }
                 updates.push((command.op.clone(), outcome));
             }
@@ -499,7 +513,7 @@ impl Manager {
         }
         Ok(
             json!({"state":"complete","kind":"node_restart","node":index + 1,
-            "node_instance":placement.launch.node.instance,"replica_recovery":"not_requested"}),
+            "node_instance":placement.launch.node.instance,"replica_recovery":crate::ReplicaRecovery::NotRequested}),
         )
     }
 }

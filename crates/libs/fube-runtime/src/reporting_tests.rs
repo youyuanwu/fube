@@ -332,7 +332,7 @@ async fn canonical_stateless_reporting_native_literals_immediate_and_per_record_
     request.unit.consistency.id.id = Guid(GUID_BYTES);
     request.service.metrics.0.push(Metric {
         name: "Work".into(),
-        weight: 1,
+        weight: NativeServiceLoadMetricWeight::Low,
         primary: 0,
         secondary: 0,
     });

@@ -31,8 +31,8 @@ pub struct NativeReplica {
     pub node_instance: u64,
     pub replica_id: i64,
     pub incarnation: i64,
-    pub role: i64,
-    pub previous_role: i64,
+    pub role: w::NativeReplicaRole,
+    pub previous_role: w::NativeReplicaRole,
     pub up: bool,
     pub ready: bool,
     pub address: String,
@@ -90,14 +90,8 @@ impl NativeReplicaSet {
         self.descriptor()?.sdk()
     }
 }
-fn native_role(role: ReplicaRole) -> i64 {
-    match role {
-        ReplicaRole::Unknown => 0,
-        ReplicaRole::None => 1,
-        ReplicaRole::IdleSecondary => 2,
-        ReplicaRole::ActiveSecondary => 3,
-        ReplicaRole::Primary => 4,
-    }
+fn native_role(role: ReplicaRole) -> w::NativeReplicaRole {
+    role.into()
 }
 impl From<&Epoch> for NativeEpoch {
     fn from(epoch: &Epoch) -> Self {
@@ -346,15 +340,7 @@ impl NativeRuntimeIntegration {
         self.validate()?;
         let state = self.0.state.upgrade().ok_or(Error::Closed)?;
         let state = state.lock().unwrap();
-        let kind = match state.request.unit.consistency.kind {
-            1 => PartitionKind::Singleton,
-            2 => PartitionKind::Int64Range {
-                low: state.request.unit.consistency.low,
-                high: state.request.unit.consistency.high,
-            },
-            3 => PartitionKind::Named(state.request.unit.consistency.name.clone()),
-            _ => return Err(Error::Protocol("invalid native partition kind")),
-        };
+        let kind = PartitionKind::try_from(&state.request.unit.consistency)?;
         Ok(crate::instance_integration::observe_stateful(
             StatefulPartition {
                 identity: self.identity().clone(),

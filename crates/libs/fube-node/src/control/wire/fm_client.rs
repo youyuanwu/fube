@@ -1,5 +1,7 @@
 //! Native FM effect profiles; fences, retries and semantic ACKs stay in Adapter.
 use super::{err, one_way, Link, Result, LIMIT};
+#[cfg(test)]
+use fube_ra::protocol::NativeReplicaRole;
 use fube_ra::{
     entity::Effect,
     protocol::{GenerationNumber, ReplicaUp, FM_ACTOR},
@@ -153,7 +155,7 @@ mod tests {
                 unit: base.unit.clone(),
                 replicas: ObjectArray(vec![ReplicaInfo {
                     description: base.replica.clone(),
-                    intermediate_role: 2,
+                    intermediate_role: NativeReplicaRole::Idle,
                 }]),
                 ..Default::default()
             }]),

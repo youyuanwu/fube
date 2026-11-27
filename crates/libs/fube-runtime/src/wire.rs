@@ -1,12 +1,21 @@
 //! Private source-corresponding hosting records. Native source baseline:
 //! 3988b451, Hosting2 and ServiceModel FABRIC_FIELDS declarations.
+pub use fube_core::protocol::{
+    NativeActivityType, NativeApi, NativeApiDescription as ApiName, NativeApiName,
+    NativeApplicationHostType, NativeFaultType, NativeHealthReportKind, NativeHealthState,
+    NativeInterfaceName, NativeMoveCost, NativePartitionKind, NativePlacementPolicyType,
+    NativeProxyFlags, NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation,
+    NativeServiceCorrelationScheme, NativeServiceKind, NativeServiceLoadMetricWeight,
+    NativeServiceOperation, NativeServicePackageActivationMode, NativeServicePartitionAccessStatus,
+    NativeSharedLogCreationFlags,
+};
 use fubst::serde::{ByteArray, Guid, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostContext {
     pub id: String,
-    pub kind: i64,
+    pub kind: NativeApplicationHostType,
     pub pid: u32,
     pub container: bool,
     pub activator: bool,
@@ -24,7 +33,7 @@ pub struct PackageId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Activation {
     pub guid: Guid,
-    pub mode: i64,
+    pub mode: NativeServicePackageActivationMode,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackageInstance {
@@ -73,7 +82,7 @@ pub struct RuntimeContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartRequest {
     pub id: String,
-    pub kind: i64,
+    pub kind: NativeApplicationHostType,
     pub pid: u32,
     pub timeout: i64,
     pub container: bool,
@@ -92,7 +101,7 @@ pub struct SharedLog {
     pub size: i64,
     pub streams: u32,
     pub record: u32,
-    pub flags: u32,
+    pub flags: NativeSharedLogCreationFlags,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartReply {
@@ -138,7 +147,7 @@ pub struct ActivityId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Activity {
     pub id: ActivityId,
-    pub kind: i64,
+    pub kind: NativeActivityType,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnregisterHost {
@@ -177,7 +186,25 @@ pub struct ConsistencyUnit {
     pub low: i64,
     pub high: i64,
     pub name: String,
-    pub kind: i64,
+    pub kind: NativePartitionKind,
+}
+
+impl TryFrom<&ConsistencyUnit> for crate::PartitionKind {
+    type Error = crate::Error;
+
+    fn try_from(unit: &ConsistencyUnit) -> crate::Result<Self> {
+        match unit.kind {
+            NativePartitionKind::Singleton => Ok(Self::Singleton),
+            NativePartitionKind::Int64Range => Ok(Self::Int64Range {
+                low: unit.low,
+                high: unit.high,
+            }),
+            NativePartitionKind::Named => Ok(Self::Named(unit.name.clone())),
+            NativePartitionKind::Invalid | NativePartitionKind::Unrecognized(_) => {
+                Err(crate::Error::Protocol("invalid native partition kind"))
+            }
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Epoch {
@@ -203,12 +230,12 @@ pub struct Replica {
     pub node: Node,
     pub id: i64,
     pub instance: i64,
-    pub current_role: i64,
-    pub previous_role: i64,
+    pub current_role: NativeReplicaRole,
+    pub previous_role: NativeReplicaRole,
     pub up: bool,
     pub last_lsn: i64,
     pub first_lsn: i64,
-    pub state: i64,
+    pub state: NativeReplicaState,
     pub version: VersionInstance,
     pub service_endpoint: String,
     pub replication_endpoint: String,
@@ -221,19 +248,19 @@ pub struct ServiceType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Correlation {
     pub service: String,
-    pub scheme: i64,
+    pub scheme: NativeServiceCorrelationScheme,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metric {
     pub name: String,
-    pub weight: i64,
+    pub weight: NativeServiceLoadMetricWeight,
     pub primary: u32,
     pub secondary: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Placement {
     pub domain: String,
-    pub kind: i64,
+    pub kind: NativePlacementPolicyType,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Service {
@@ -253,13 +280,13 @@ pub struct Service {
     pub constraints: String,
     pub scaleout: i32,
     pub metrics: ObjectArray<Vec<Metric>>,
-    pub move_cost: u32,
+    pub move_cost: NativeMoveCost,
     pub restart_wait: i64,
     pub quorum_wait: i64,
     pub update_version: u64,
     pub placement: ObjectArray<Vec<Placement>>,
     pub standby_keep: i64,
-    pub activation_mode: i64,
+    pub activation_mode: NativeServicePackageActivationMode,
     pub dns: String,
     pub scaling: fubst::serde::EmptyObjectArray,
 }
@@ -270,13 +297,7 @@ pub struct ProxyRequest {
     pub local: Replica,
     pub remote: ObjectArray<Vec<Replica>>,
     pub service: Service,
-    pub flags: i64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiName {
-    pub api: i64,
-    pub interface: i64,
-    pub metadata: String,
+    pub flags: NativeProxyFlags,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyError {
@@ -290,7 +311,7 @@ pub struct ProxyReply {
     pub local: Replica,
     pub remote: ObjectArray<Vec<Replica>>,
     pub error: ProxyError,
-    pub flags: i64,
+    pub flags: NativeProxyFlags,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicaMessage {
@@ -309,17 +330,17 @@ pub struct UpdateServiceReply {
 pub struct EmptyRecord {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicaDetail {
-    pub kind: i64,
+    pub kind: NativeServiceKind,
     pub service: String,
     pub partition: Guid,
     pub replica_id: i64,
     pub instance_id: i64,
-    pub operation: i64,
+    pub operation: NativeServiceOperation,
     pub operation_start: i64,
-    pub replicator_operation: i64,
+    pub replicator_operation: NativeReplicatorOperation,
     pub loads: ObjectArray<Vec<ReportedLoad>>,
-    pub read_status: i64,
-    pub write_status: i64,
+    pub read_status: NativeServicePartitionAccessStatus,
+    pub write_status: NativeServicePartitionAccessStatus,
     pub replicator: Pointer<EmptyRecord>,
     pub replica: Pointer<EmptyRecord>,
     pub deployed_replica: Pointer<EmptyRecord>,
@@ -373,7 +394,7 @@ pub struct LoadBody {
 pub struct FaultBody {
     pub unit: FailoverUnit,
     pub local: Replica,
-    pub fault: i64,
+    pub fault: NativeFaultType,
     pub activity: Activity,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,6 +410,17 @@ pub enum HealthEntity {
     #[serde(rename = "3")]
     Partition { partition: Guid },
 }
+
+impl HealthEntity {
+    pub fn kind(&self) -> NativeHealthReportKind {
+        match self {
+            Self::Replica { .. } => NativeHealthReportKind::StatefulServiceReplica,
+            Self::Instance { .. } => NativeHealthReportKind::StatelessServiceInstance,
+            Self::Partition { .. } => NativeHealthReportKind::Partition,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attributes {
     pub values: fubst::serde::EmptyObjectArray,
@@ -399,7 +431,7 @@ pub struct EntityHealth {
     pub source: String,
     pub property: String,
     pub ttl: i64,
-    pub state: i64,
+    pub state: NativeHealthState,
     pub description: String,
     pub sequence: i64,
     pub time: i64,
@@ -413,7 +445,7 @@ pub struct HealthBody {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResult {
-    pub kind: i64,
+    pub kind: NativeHealthReportKind,
     pub source: String,
     pub sequence: i64,
     pub entity_property: String,
@@ -421,7 +453,7 @@ pub struct HealthResult {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamResult {
-    pub kind: i64,
+    pub kind: NativeHealthReportKind,
     pub source: String,
     pub instance: i64,
     pub upto: i64,
@@ -436,9 +468,51 @@ pub struct HealthReply {
 mod tests {
     use super::*;
     use fubst::serde::{from_slice, to_vec};
+
+    #[test]
+    fn consistency_partition_conversion_preserves_payloads_and_rejects_unknown_kinds() {
+        let mut unit = ConsistencyUnit {
+            id: PartitionId { id: Guid([1; 16]) },
+            low: i64::MIN,
+            high: i64::MAX,
+            name: "owned-partition".into(),
+            kind: NativePartitionKind::Singleton,
+        };
+        for (kind, expected) in [
+            (
+                NativePartitionKind::Singleton,
+                crate::PartitionKind::Singleton,
+            ),
+            (
+                NativePartitionKind::Int64Range,
+                crate::PartitionKind::Int64Range {
+                    low: i64::MIN,
+                    high: i64::MAX,
+                },
+            ),
+            (
+                NativePartitionKind::Named,
+                crate::PartitionKind::Named("owned-partition".into()),
+            ),
+        ] {
+            unit.kind = kind;
+            let decoded: ConsistencyUnit = from_slice(&to_vec(&unit).unwrap()).unwrap();
+            assert_eq!(crate::PartitionKind::try_from(&decoded).unwrap(), expected);
+        }
+        for code in [i64::MIN, -1, 0, 4, i64::MAX] {
+            unit.kind = NativePartitionKind::from(code);
+            let decoded: ConsistencyUnit = from_slice(&to_vec(&unit).unwrap()).unwrap();
+            assert_eq!(decoded.kind.code(), code);
+            assert!(matches!(
+                crate::PartitionKind::try_from(&decoded),
+                Err(crate::Error::Protocol("invalid native partition kind"))
+            ));
+        }
+    }
+
     #[test]
     fn start_reply_recursive_maps_and_pointers_and_all_truncations() {
-        let reply = StartReply {
+        let mut reply = StartReply {
             node_id: "abcdef".into(),
             node_pid: 42,
             lease_handle: 123,
@@ -464,7 +538,7 @@ mod tests {
                 size: 1024,
                 streams: 128,
                 record: 512,
-                flags: 0,
+                flags: NativeSharedLogCreationFlags::NONE,
             })),
             system_log: Pointer(None),
         };
@@ -475,6 +549,14 @@ mod tests {
         assert_eq!(decoded.initial_ttl, 250_000_000);
         for n in 0..bytes.len() {
             assert!(from_slice::<StartReply>(&bytes[..n]).is_err());
+        }
+        for bits in [1u32, 2, 3, 0x8000_0000, 0x8000_0001, u32::MAX] {
+            reply.application_log.0.as_mut().unwrap().flags =
+                NativeSharedLogCreationFlags::from_bits_retain(bits);
+            let bytes = to_vec(&reply).unwrap();
+            let decoded: StartReply = from_slice(&bytes).unwrap();
+            assert_eq!(to_vec(&decoded).unwrap(), bytes);
+            assert_eq!(decoded.application_log.0.unwrap().flags.bits(), bits);
         }
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::{NativeReplicaRole, NativeReplicaState};
 
 pub(super) fn lost_replica_replacement(
     old: &EntityState,
@@ -27,18 +28,18 @@ pub(super) fn lost_replica_replacement(
             c.replicas
                 .0
                 .iter()
-                .any(|r| r.node == *source && r.current_role == 4)
-                && c.replicas
-                    .0
-                    .iter()
-                    .any(|r| r.node == old.body.replica.node && r.current_role == 3)
+                .any(|r| r.node == *source && r.current_role == NativeReplicaRole::Primary)
+                && c.replicas.0.iter().any(|r| {
+                    r.node == old.body.replica.node
+                        && r.current_role == NativeReplicaRole::Secondary
+                })
         });
     let promoted = reconfiguration::replica_replacement_metadata(old)
         && active.is_some_and(|c| {
             c.replicas
                 .0
                 .iter()
-                .any(|r| r.node == *source && r.current_role == 3)
+                .any(|r| r.node == *source && r.current_role == NativeReplicaRole::Secondary)
         })
         && old.body.unit.current.older_than(history.epoch)
         && old.body.unit.current.data_loss == history.epoch.data_loss
@@ -72,10 +73,15 @@ pub(super) fn lost_replica_replacement(
         && reconfiguration::replica_replacement_metadata(old)
         && active.is_some_and(|c| {
             c.unit.target >= 2
-                && c.replicas
-                    .0
-                    .iter()
-                    .any(|r| r.node == *source && r.current_role == if secondary { 4 } else { 3 })
+                && c.replicas.0.iter().any(|r| {
+                    r.node == *source
+                        && r.current_role
+                            == if secondary {
+                                NativeReplicaRole::Primary
+                            } else {
+                                NativeReplicaRole::Secondary
+                            }
+                })
         })
         && body.service == old.body.service
         && body.replica.node == old.body.replica.node
@@ -178,10 +184,13 @@ impl EntityState {
     /// Original opened-peer lineage for admission, not cleanup or replacement proof.
     pub fn peer_opened_lifetime(&self) -> bool {
         self.peer_creation.as_ref().is_some_and(|peer| {
-            (self.body.replica.current_role == 2
-                || (matches!(self.body.replica.current_role, 1 | 3)
-                    && self.reconfiguration.is_some())
-                || (self.body.replica.current_role == 4 && self.swap.is_some()))
+            (self.body.replica.current_role == NativeReplicaRole::Idle
+                || (matches!(
+                    self.body.replica.current_role,
+                    NativeReplicaRole::None | NativeReplicaRole::Secondary
+                ) && self.reconfiguration.is_some())
+                || (self.body.replica.current_role == NativeReplicaRole::Primary
+                    && self.swap.is_some()))
                 && match self.phase {
                     Phase::Ready => self.runtime.is_some() && self.usage.is_some(),
                     Phase::Closing | Phase::Closed => peer.close_started_open || peer.host_down,
@@ -271,7 +280,7 @@ impl RemoteIdle {
             if !self.ready {
                 return None;
             }
-            reply.replica.state = 2;
+            reply.replica.state = NativeReplicaState::Ready;
         }
         Some(reply)
     }
@@ -371,7 +380,9 @@ impl Executor {
                 || snapshot.committed.as_ref().is_some_and(|state| {
                     state.configuration.as_ref().is_some_and(|configuration| {
                         configuration.replicas.0.iter().any(|replica| {
-                            &replica.node == previous && replica.up && replica.current_role >= 3
+                            &replica.node == previous
+                                && replica.up
+                                && replica.current_role.is_active()
                         })
                     }) || state.reconfiguration.as_ref().is_some_and(|configuration| {
                         configuration.stage != ConfigurationStage::Complete
@@ -505,7 +516,12 @@ fn create_remote(
         c.unit.current == current.body.unit.current
             && valid_stateful_sizes(&c.service)
             && c.unit.target >= 2
-            && c.replicas.0.iter().filter(|r| r.current_role >= 3).count() <= c.unit.target as usize
+            && c.replicas
+                .0
+                .iter()
+                .filter(|r| r.current_role.is_active())
+                .count()
+                <= c.unit.target as usize
             && !c
                 .replicas
                 .0
@@ -515,18 +531,18 @@ fn create_remote(
                 c.replicas
                     .0
                     .iter()
-                    .any(|r| r.node == idle.target && r.current_role >= 3)
+                    .any(|r| r.node == idle.target && r.current_role.is_active())
             })
     });
     let repair = spare
         || (completed_primary_failover(current)
             || reconfiguration::completed_secondary_removal(current))
-            && current.body.replica.current_role == 4
+            && current.body.replica.current_role == NativeReplicaRole::Primary
             && reconfiguration::completed_configuration(current).is_some_and(|c| {
                 !c.replicas
                     .0
                     .iter()
-                    .any(|r| r.node == target.node && r.current_role >= 3)
+                    .any(|r| r.node == target.node && r.current_role.is_active())
             })
             && current
                 .reconfiguration
@@ -538,10 +554,16 @@ fn create_remote(
                         (r.node == target.node
                             || (r.node.id == target.node.id
                                 && r.node.instance < target.node.instance
-                                && matches!(r.current_role, 1 | 3)
-                                && r.state == 3))
+                                && matches!(
+                                    r.current_role,
+                                    NativeReplicaRole::None | NativeReplicaRole::Secondary
+                                )
+                                && r.state == NativeReplicaState::Dropped))
                             && !r.up
-                            && matches!(r.current_role, 1 | 3)
+                            && matches!(
+                                r.current_role,
+                                NativeReplicaRole::None | NativeReplicaRole::Secondary
+                            )
                             && target.id > r.id
                             && target.instance > r.instance
                     })
@@ -578,8 +600,8 @@ fn create_remote(
     if current.phase != Phase::Ready
         || !current.fm_primary
         || (current.peer_creation.is_some() && !repair)
-        || current.body.replica.current_role != 4
-        || current.body.replica.state != 2
+        || current.body.replica.current_role != NativeReplicaRole::Primary
+        || current.body.replica.state != NativeReplicaState::Ready
         || current.runtime.is_none()
         || current.body.replica.replication_endpoint.is_empty()
         || peer != Some(&target.node)
@@ -587,9 +609,9 @@ fn create_remote(
         || target.id == current.body.replica.id
         || target.id < 0
         || target.instance < 0
-        || target.current_role != 2
-        || target.previous_role != 1
-        || target.state != 1
+        || target.current_role != NativeReplicaRole::Idle
+        || target.previous_role != NativeReplicaRole::None
+        || target.state != NativeReplicaState::InBuild
         || !target.up
         || target.version != current.body.service.version
         || !target.service_endpoint.is_empty()
@@ -814,9 +836,9 @@ pub(super) fn complete_remote(
         return start_build(Some(current), admission, peer);
     }
     if body.error == 0
-        && (body.replica.current_role != 2
-            || body.replica.previous_role != 1
-            || body.replica.state != 1
+        && (body.replica.current_role != NativeReplicaRole::Idle
+            || body.replica.previous_role != NativeReplicaRole::None
+            || body.replica.state != NativeReplicaState::InBuild
             || !body.replica.up
             || body.replica.version.version != expected.replica.version.version
             || !body.replica.service_endpoint.is_empty()
@@ -886,7 +908,7 @@ pub(super) fn start_build(
         .ok_or(Failure::Unsupported("no original runtime"))?;
     if current.phase != Phase::Ready
         || !current.fm_primary
-        || current.body.replica.current_role != 4
+        || current.body.replica.current_role != NativeReplicaRole::Primary
         || (current.peer_creation.is_some()
             && !completed_primary_change(current)
             && !reconfiguration::completed_secondary_removal(current))
@@ -971,7 +993,11 @@ pub(super) fn complete_build(
         .expect("opened remote")
         .replica
         .clone();
-    description.state = if event.error == 0 { 2 } else { 1 };
+    description.state = if event.error == 0 {
+        NativeReplicaState::Ready
+    } else {
+        NativeReplicaState::InBuild
+    };
     let effects = remote
         .add_reply()
         .map(Effect::AddReplicaReply)
@@ -999,7 +1025,7 @@ fn removable_idle(current: &EntityState, target: &NodeInstance) -> bool {
                     .replicas
                     .0
                     .iter()
-                    .any(|r| r.node == *target && r.current_role >= 3)
+                    .any(|r| r.node == *target && r.current_role.is_active())
         })
 }
 
@@ -1032,7 +1058,7 @@ pub(super) fn start_removal(
         .ok_or(Failure::Unsupported("no original runtime"))?;
     if current.phase != Phase::Ready
         || !current.fm_primary
-        || current.body.replica.current_role != 4
+        || current.body.replica.current_role != NativeReplicaRole::Primary
         || peer != Some(&remote.target)
     {
         return Err(Failure::Unsupported(
@@ -1049,7 +1075,7 @@ pub(super) fn start_removal(
     let mut removal = remote.removal.clone().unwrap_or_else(|| {
         let mut replica = reply.replica.clone();
         // Native RA InDrop maps to Dropped on the RAP wire, not remote deletion.
-        replica.state = 3;
+        replica.state = NativeReplicaState::Dropped;
         RemoteRemoval {
             body: current.body.clone(),
             replica,
@@ -1110,8 +1136,8 @@ pub(super) fn remove_from_fm(
     let remote = current
         .remote_idle(&body.replica.node)
         .ok_or(Failure::Unsupported("unknown-Idle removal is gated"))?;
-    if current.body.replica.current_role != 4
-        || current.body.replica.state != 2
+    if current.body.replica.current_role != NativeReplicaRole::Primary
+        || current.body.replica.state != NativeReplicaState::Ready
         || current.runtime.is_none()
         || !removable_idle(current, &remote.target)
         || peer != Some(&remote.target)
@@ -1132,7 +1158,10 @@ pub(super) fn remove_from_fm(
     if body.unit != current.body.unit
         || body.service != current.body.service
         || replica != *expected
-        || !matches!(body.replica.state, 1 | 2)
+        || !matches!(
+            body.replica.state,
+            NativeReplicaState::InBuild | NativeReplicaState::Ready
+        )
         || (!body.replica.replication_endpoint.is_empty()
             && remote.reply.as_ref().is_none_or(|opened| {
                 body.replica.replication_endpoint != opened.replica.replication_endpoint

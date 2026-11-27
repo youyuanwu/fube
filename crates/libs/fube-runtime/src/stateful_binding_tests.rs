@@ -4,6 +4,8 @@ use crate::extensions::{
     CallLane, CallOrigin, ExecutionRuntime, NativeControlBinding, NativeInvocation,
     NativeInvocationKind,
 };
+use fube_core::protocol::NativeProxyFlags;
+use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 use std::time::Instant;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -86,8 +88,8 @@ async fn exact_runtime_control_check_rejects_revocation_at_actual_lower_queued_m
         .to_string();
         let remote = cause == "remote";
         if remote {
-            target.current_role = 2;
-            target.previous_role = 0;
+            target.current_role = NativeReplicaRole::Idle;
+            target.previous_role = NativeReplicaRole::Unknown;
         }
         let action = if remote {
             "ReplicatorBuildIdleReplica"
@@ -235,15 +237,15 @@ async fn native_issuer_freezes_full_epochs_memberships_and_fences_old_proofs() {
         .is_err());
     native.install_binding(actor, &binder).unwrap();
     let mut local = open.local.clone();
-    local.previous_role = 3;
+    local.previous_role = NativeReplicaRole::Secondary;
     let mut remote = peer(&local, 2);
     remote.first_lsn = -1;
     remote.last_lsn = -1;
     let mut dropped = peer(&local, 3);
-    dropped.state = 3;
+    dropped.state = NativeReplicaState::Dropped;
     dropped.up = false;
     let mut configuration = control(&open, "UpdateConfiguration", vec![local, remote, dropped]);
-    configuration.flags = 2;
+    configuration.flags = NativeProxyFlags::CATCH_UP;
     configuration.unit.current.configuration += 1;
     configuration.unit.previous = open.unit.current.clone();
     h.send("UpdateConfiguration", &configuration).await;
@@ -304,12 +306,12 @@ async fn issuer_rejects_ambiguous_id_and_retained_generation_after_close() {
     let partition = calls.partitions.lock().unwrap()[0].clone();
     let native = partition.clone();
     let mut first = peer(&open.local, 2);
-    first.current_role = 2;
-    first.previous_role = 0;
+    first.current_role = NativeReplicaRole::Idle;
+    first.previous_role = NativeReplicaRole::Unknown;
     let mut second = peer(&open.local, 3);
     second.id = first.id;
-    second.current_role = 2;
-    second.previous_role = 0;
+    second.current_role = NativeReplicaRole::Idle;
+    second.previous_role = NativeReplicaRole::Unknown;
     for replica in [first.clone(), second.clone()] {
         let build = control(&open, "ReplicatorBuildIdleReplica", vec![replica]);
         h.send("ReplicatorBuildIdleReplica", &build).await;
@@ -418,8 +420,8 @@ async fn scope_fixture() -> (
     h.receive("UpdateConfigurationReply").await;
     let p = proofs.lock().unwrap()[0].clone();
     let mut idle = peer(&open.local, 2);
-    idle.current_role = 2;
-    idle.previous_role = 0;
+    idle.current_role = NativeReplicaRole::Idle;
+    idle.previous_role = NativeReplicaRole::Unknown;
     let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle]);
     h.send("ReplicatorBuildIdleReplica", &build).await;
     h.receive("ReplicatorBuildIdleReplicaReply").await;

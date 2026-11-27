@@ -96,6 +96,8 @@
 //! }
 //! ```
 
+use fube_core::protocol::NativeActivityType;
+use fube_core::protocol::NativeApplicationHostType;
 mod api;
 mod context;
 mod diagnostics;
@@ -343,7 +345,7 @@ impl Runtime {
             .start_register_application_host(
                 furpc::Request::new(StartRequest {
                     id: activation.host_id.clone(),
-                    kind: 1,
+                    kind: NativeApplicationHostType::ActivatedSingleCodePackage,
                     pid: std::process::id(),
                     timeout: 300_000_000,
                     container: false,
@@ -730,7 +732,7 @@ impl Runtime {
                                 guid: fubst::serde::Guid(uuid::Uuid::new_v4().to_bytes_le()),
                                 index: 0,
                             },
-                            kind: 0,
+                            kind: NativeActivityType::Unknown,
                         },
                         id: self.activation.host_id.clone(),
                     }),

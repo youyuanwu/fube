@@ -1,5 +1,10 @@
 use super::*;
-use crate::wire::{ErrorReply, IdRequest};
+use crate::wire::{ErrorReply, IdRequest, NativeFaultType};
+use fube_core::protocol::NativeActivityType;
+use fube_core::protocol::NativeApiName;
+use fube_core::protocol::NativeInterfaceName;
+use fube_core::protocol::NativeProxyFlags;
+use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 use fubst::serde::{from_slice, to_vec, ByteArray, Guid, ObjectArray};
 use std::future::{ready, Ready};
 
@@ -352,7 +357,7 @@ fn proxy_reply() -> wire::ProxyReply {
                 low: 0,
                 high: 0,
                 name: String::new(),
-                kind: 1,
+                kind: wire::NativePartitionKind::Singleton,
             },
             current: wire::Epoch {
                 configuration: 1,
@@ -372,12 +377,12 @@ fn proxy_reply() -> wire::ProxyReply {
             },
             id: 1,
             instance: 1,
-            current_role: 0,
-            previous_role: 0,
+            current_role: NativeReplicaRole::Unknown,
+            previous_role: NativeReplicaRole::Unknown,
             up: true,
             last_lsn: -1,
             first_lsn: -1,
-            state: 2,
+            state: NativeReplicaState::Ready,
             version: wire::VersionInstance {
                 version: wire::PackageVersion {
                     application: wire::ApplicationVersion {
@@ -395,12 +400,12 @@ fn proxy_reply() -> wire::ProxyReply {
             error: 0,
             message: String::new(),
             api: wire::ApiName {
-                api: 0,
-                interface: 0,
+                api: NativeApiName::Invalid,
+                interface: NativeInterfaceName::Invalid,
                 metadata: String::new(),
             },
         },
-        flags: 0,
+        flags: NativeProxyFlags::NONE,
     }
 }
 
@@ -409,13 +414,13 @@ fn fault_report() -> FaultReport {
     FaultReport::prepare(wire::FaultBody {
         unit: reply.unit,
         local: reply.local,
-        fault: 1,
+        fault: NativeFaultType::Transient,
         activity: wire::Activity {
             id: wire::ActivityId {
                 guid: Guid([7; 16]),
                 index: 17,
             },
-            kind: 2,
+            kind: NativeActivityType::ServiceReportFaultEvent,
         },
     })
     .unwrap()
@@ -545,7 +550,7 @@ async fn prepared_rap_payload_retries_share_original_bytes_without_native_reseri
             .copied()
             .collect::<Vec<_>>();
         let body = from_slice::<wire::FaultBody>(&bytes).unwrap();
-        assert_eq!(body.fault, 1);
+        assert_eq!(body.fault, NativeFaultType::Transient);
         assert_eq!(body.activity.id.index, 17);
     }
 }

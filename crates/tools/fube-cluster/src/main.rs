@@ -170,7 +170,7 @@ async fn serve(cluster: &mut Cluster) -> Result<Option<String>> {
                     Err(error) => output(&json!({"state":"rejected","error":error.to_string()}))?,
                     Ok(command) => {
                         let op = command.op.clone();
-                        let stopping = command.action == "quit";
+                        let stopping = matches!(command.request(), Ok(request) if matches!(request.action, fube_cluster::CommandAction::Quit));
                         match cluster.execute(command).await {
                             Ok(result) => {
                                 output(&result)?;

@@ -3,6 +3,13 @@
 //! Field order follows pinned native FABRIC_FIELDS, not declaration order.
 //! Scalar enums and ErrorCode values are LONG64; unknown values are retained.
 //! ErrorCode diagnostic strings are not serialized. No Federation routing.
+pub use fube_core::protocol::{
+    NativeApi, NativeApiDescription, NativeApiName, NativeInterfaceName, NativeMoveCost,
+    NativePartitionKind, NativePlacementPolicyType, NativeProxyFlags, NativeReplicaRole,
+    NativeReplicaState, NativeReplicatorOperation, NativeServiceCorrelationScheme,
+    NativeServiceLoadMetricWeight, NativeServiceOperation, NativeServicePackageActivationMode,
+    NativeUpgradeType, NativeUriHostType, NativeUriType,
+};
 use fubst::serde::{ByteArray, Derived, Guid, Inline, NativeEnum, ObjectArray, Pointer};
 use furpc::{
     header::{self, ACTION, ACTOR, HIGH_PRIORITY},
@@ -95,7 +102,7 @@ pub struct ConsistencyUnit {
     pub low: i64,
     pub high: i64,
     pub name: String,
-    pub kind: i64,
+    pub kind: NativePartitionKind,
 }
 impl Default for ConsistencyUnit {
     fn default() -> Self {
@@ -104,7 +111,7 @@ impl Default for ConsistencyUnit {
             low: 0,
             high: 0,
             name: String::new(),
-            kind: 1,
+            kind: NativePartitionKind::Singleton,
         }
     }
 }
@@ -213,12 +220,12 @@ pub struct Replica {
     pub node: NodeInstance,
     pub id: i64,
     pub instance: i64,
-    pub current_role: i64,
-    pub previous_role: i64,
+    pub current_role: NativeReplicaRole,
+    pub previous_role: NativeReplicaRole,
     pub up: bool,
     pub last_lsn: i64,
     pub first_lsn: i64,
-    pub state: i64,
+    pub state: NativeReplicaState,
     pub version: VersionInstance,
     pub service_endpoint: String,
     pub replication_endpoint: String,
@@ -229,12 +236,12 @@ impl Default for Replica {
             node: NodeInstance::default(),
             id: -1,
             instance: -1,
-            current_role: 1,
-            previous_role: 1,
+            current_role: NativeReplicaRole::None,
+            previous_role: NativeReplicaRole::None,
             up: true,
             last_lsn: -1,
             first_lsn: -1,
-            state: 2,
+            state: NativeReplicaState::Ready,
             version: VersionInstance::invalid(),
             service_endpoint: String::new(),
             replication_endpoint: String::new(),
@@ -245,19 +252,19 @@ impl Default for Replica {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Correlation {
     pub service: String,
-    pub scheme: i64,
+    pub scheme: NativeServiceCorrelationScheme,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metric {
     pub name: String,
-    pub weight: i64,
+    pub weight: NativeServiceLoadMetricWeight,
     pub primary: u32,
     pub secondary: u32,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Placement {
     pub domain: String,
-    pub kind: i64,
+    pub kind: NativePlacementPolicyType,
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PartitionLoad {
@@ -322,13 +329,13 @@ pub struct Service {
     pub constraints: String,
     pub scaleout: i32,
     pub metrics: ObjectArray<Vec<Metric>>,
-    pub move_cost: u32,
+    pub move_cost: NativeMoveCost,
     pub restart_wait: i64,
     pub quorum_wait: i64,
     pub update_version: u64,
     pub placement: ObjectArray<Vec<Placement>>,
     pub standby_keep: i64,
-    pub activation_mode: i64,
+    pub activation_mode: NativeServicePackageActivationMode,
     pub dns: String,
     pub scaling: ObjectArray<Vec<ScalingPolicy>>,
 }
@@ -351,13 +358,13 @@ impl Default for Service {
             constraints: String::new(),
             scaleout: 0,
             metrics: ObjectArray::default(),
-            move_cost: 1,
+            move_cost: NativeMoveCost::Low,
             restart_wait: i64::MIN,
             quorum_wait: i64::MIN,
             update_version: 0,
             placement: ObjectArray::default(),
             standby_keep: i64::MIN,
-            activation_mode: 0,
+            activation_mode: NativeServicePackageActivationMode::SharedProcess,
             dns: String::new(),
             scaling: ObjectArray::default(),
         }
@@ -417,7 +424,7 @@ pub type DeleteReplicaReply = AddInstanceReply;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicaInfo {
     pub description: Replica,
-    pub intermediate_role: i64,
+    pub intermediate_role: NativeReplicaRole,
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FailoverUnitInfo {

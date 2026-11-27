@@ -31,6 +31,11 @@ These are additional trusted-session gates, not native cryptographic
 authentication. Stateful/persisted/group execution and FMM remain disabled.
 Remove does **not** apply Add's upgrade/deactivation veto.
 
+The private trusted-local `CloseLocal` request carries `CloseMode` with its
+existing signed numeric encoding, not a new native message or enum domain.
+Only ForceAbort, Drop, Close and Abort are admitted; unsupported modes still
+reject before readiness and missing-entity checks. Durable format 2 is unchanged.
+
 The [registration handoff](../../crates/libs/fube-ra/src/lifecycle.rs#L474-L584)
 is explicit: `Open` requests registration only. The adapter may perform runtime
 Open **only after** a matching successful Registered event publishes RuntimeOpen.

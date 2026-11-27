@@ -1,6 +1,7 @@
 //! Experimental standalone node-side host for one trusted native stateless app.
 //! Native-free model tests do not establish native FabricRuntime compatibility.
 
+use fube_hosting::wire::NativeApplicationHostType;
 mod controller;
 mod deployment;
 mod hosting_leases;
@@ -240,7 +241,7 @@ impl Registration {
                     !self.started
                         && request.host == host
                         && request.pid == pid
-                        && request.kind == 1
+                        && request.kind == NativeApplicationHostType::ActivatedSingleCodePackage
                         && !request.container
                         && !request.activator
                         && request.timeout > 0,
@@ -287,7 +288,7 @@ impl Registration {
                         && context.host
                             == wire::HostContext {
                                 host: host.into(),
-                                kind: 1,
+                                kind: NativeApplicationHostType::ActivatedSingleCodePackage,
                                 pid,
                                 container: false,
                                 activator: false,

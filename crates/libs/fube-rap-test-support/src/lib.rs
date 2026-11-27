@@ -2,6 +2,12 @@
 //! traverse real Runtime IPC/issuer/binder paths; this is NOT deployed SF proof.
 //! Shared support depends only on public framework/runtime/transport contracts;
 //! it exposes no data engine, diagnostics, lifecycle hook or control setter.
+use fube_runtime::extensions::{
+    NativeApiDescription as ApiName, NativeApplicationHostType, NativeMoveCost,
+    NativePartitionKind, NativePlacementPolicyType, NativeProxyFlags, NativeReplicaRole,
+    NativeReplicaState, NativeServiceCorrelationScheme, NativeServiceLoadMetricWeight,
+    NativeServicePackageActivationMode,
+};
 use fube_runtime::{
     extensions::{
         attach_runtime, NativeIntegrationProvider, NativeReplicaDescriptor,
@@ -32,7 +38,7 @@ macro_rules! record {
 }
 record!(HostContext {
     id: String,
-    kind: i64,
+    kind: NativeApplicationHostType,
     pid: u32,
     container: bool,
     activator: bool
@@ -47,7 +53,7 @@ record!(PackageId {
 });
 record!(Activation {
     guid: Guid,
-    mode: i64
+    mode: NativeServicePackageActivationMode
 });
 record!(PackageInstance {
     package: PackageId,
@@ -113,7 +119,7 @@ record!(ConsistencyUnit {
     low: i64,
     high: i64,
     name: String,
-    kind: i64
+    kind: NativePartitionKind
 });
 record!(Epoch {
     configuration: i64,
@@ -135,12 +141,12 @@ record!(Replica {
     node: Node,
     id: i64,
     instance: i64,
-    current_role: i64,
-    previous_role: i64,
+    current_role: fube_runtime::extensions::NativeReplicaRole,
+    previous_role: fube_runtime::extensions::NativeReplicaRole,
     up: bool,
     last_lsn: i64,
     first_lsn: i64,
-    state: i64,
+    state: fube_runtime::extensions::NativeReplicaState,
     version: VersionInstance,
     service_endpoint: String,
     replication_endpoint: String,
@@ -151,39 +157,34 @@ record!(ServiceType {
 });
 record!(Correlation {
     service: String,
-    scheme: i64
+    scheme: NativeServiceCorrelationScheme
 });
 record!(Metric {
     name: String,
-    weight: i64,
+    weight: NativeServiceLoadMetricWeight,
     primary: u32,
     secondary: u32
 });
 record!(Placement {
     domain: String,
-    kind: i64
+    kind: NativePlacementPolicyType
 });
 record!(Service {
     name: String, instance: u64, service_type: ServiceType, application: String,
     version: VersionInstance, partitions: i32, target: i32, minimum: i32,
     stateful: bool, persisted: bool, initialization: ByteArray, group: bool,
     correlations: ObjectArray<Vec<Correlation>>, constraints: String, scaleout: i32,
-    metrics: ObjectArray<Vec<Metric>>, move_cost: u32, restart_wait: i64, quorum_wait: i64,
+    metrics: ObjectArray<Vec<Metric>>, move_cost: NativeMoveCost, restart_wait: i64, quorum_wait: i64,
     update_version: u64, placement: ObjectArray<Vec<Placement>>, standby_keep: i64,
-    activation_mode: i64, dns: String, scaling: EmptyObjectArray,
+    activation_mode: NativeServicePackageActivationMode, dns: String, scaling: EmptyObjectArray,
 });
-record!(ProxyRequest { runtime: String, unit: FailoverUnit, local: Replica, remote: ObjectArray<Vec<Replica>>, service: Service, flags: i64 });
-record!(ApiName {
-    api: i64,
-    interface: i64,
-    metadata: String
-});
+record!(ProxyRequest { runtime: String, unit: FailoverUnit, local: Replica, remote: ObjectArray<Vec<Replica>>, service: Service, flags: NativeProxyFlags });
 record!(ProxyError {
     error: i64,
     message: String,
     api: ApiName
 });
-record!(ProxyReply { unit: FailoverUnit, local: Replica, remote: ObjectArray<Vec<Replica>>, error: ProxyError, flags: i64 });
+record!(ProxyReply { unit: FailoverUnit, local: Replica, remote: ObjectArray<Vec<Replica>>, error: ProxyError, flags: NativeProxyFlags });
 record!(ReplicaMessage {
     unit: FailoverUnit,
     local: Replica,
@@ -494,14 +495,8 @@ impl Drop for Host {
         }
     }
 }
-fn native_role(role: ReplicaRole) -> i64 {
-    match role {
-        ReplicaRole::Unknown => 0,
-        ReplicaRole::None => 1,
-        ReplicaRole::Primary => 4,
-        ReplicaRole::IdleSecondary => 2,
-        ReplicaRole::ActiveSecondary => 3,
-    }
+fn native_role(role: ReplicaRole) -> NativeReplicaRole {
+    role.into()
 }
 fn peer(replica: NativeReplicaDescriptor, version: &VersionInstance) -> Replica {
     Replica {
@@ -516,7 +511,11 @@ fn peer(replica: NativeReplicaDescriptor, version: &VersionInstance) -> Replica 
         up: replica.up,
         last_lsn: replica.progress.last,
         first_lsn: replica.progress.first,
-        state: if replica.ready { 2 } else { 1 },
+        state: if replica.ready {
+            NativeReplicaState::Ready
+        } else {
+            NativeReplicaState::InBuild
+        },
         version: version.clone(),
         service_endpoint: String::new(),
         replication_endpoint: replica.address,
@@ -543,7 +542,7 @@ fn base(
                 low: 0,
                 high: 0,
                 name: String::new(),
-                kind: 1,
+                kind: NativePartitionKind::Singleton,
             },
             current: Epoch {
                 configuration: epoch.configuration_number,
@@ -564,15 +563,15 @@ fn base(
             id: source.replica_id,
             instance: source.native_incarnation,
             current_role: if role == ReplicaRole::ActiveSecondary {
-                2
+                NativeReplicaRole::Idle
             } else {
                 native_role(role)
             },
-            previous_role: 0,
+            previous_role: NativeReplicaRole::Unknown,
             up: true,
             last_lsn: -1,
             first_lsn: -1,
-            state: 2,
+            state: NativeReplicaState::Ready,
             version: version.clone(),
             service_endpoint: String::new(),
             replication_endpoint: String::new(),
@@ -598,17 +597,17 @@ fn base(
             constraints: String::new(),
             scaleout: 0,
             metrics: ObjectArray(vec![]),
-            move_cost: 0,
+            move_cost: NativeMoveCost::Zero,
             restart_wait: 0,
             quorum_wait: 0,
             update_version: 1,
             placement: ObjectArray(vec![]),
             standby_keep: 0,
-            activation_mode: 0,
+            activation_mode: NativeServicePackageActivationMode::SharedProcess,
             dns: String::new(),
             scaling: EmptyObjectArray,
         },
-        flags: 0,
+        flags: NativeProxyFlags::NONE,
     }
 }
 fn control(base: &ProxyRequest) -> ProxyRequest {
@@ -619,7 +618,7 @@ fn control(base: &ProxyRequest) -> ProxyRequest {
     request.service.application.clear();
     request.service.service_type.name.clear();
     request.service.stateful = false;
-    request.flags = 0;
+    request.flags = NativeProxyFlags::NONE;
     request
 }
 async fn send(stream: &ModelPeer, action: &str, request: &ProxyRequest) -> Result<()> {
@@ -750,15 +749,15 @@ async fn serve(
                 let action = match command.action {
                     Action::Open => {
                         // Model startup is one final native Open attempt, even if its frame is retried.
-                        request.flags = 4;
+                        request.flags = NativeProxyFlags::ABORT;
                         "ReplicaOpen"
                     },
                     Action::Close => "ReplicaClose",
                     Action::Configure(configuration) => {
-                        request.flags = 1; // native end-reconfiguration/current configuration
+                        request.flags = NativeProxyFlags::END_RECONFIGURATION; // native end-reconfiguration/current configuration
                         request.unit.previous = Epoch { data_loss: 0, configuration: 0 };
                         request.unit.current = Epoch { data_loss: configuration.epoch.data_loss_number, configuration: configuration.epoch.configuration_number };
-                        let mut me = request.local.clone(); me.state = 2;
+                        let mut me = request.local.clone(); me.state = NativeReplicaState::Ready;
                         if configuration.local_member { request.remote.0.push(me); }
                         request.remote.0.extend(configuration.replicas.into_iter().map(|r| peer(r, &request.local.version)));
                         assert_eq!(configuration.write_quorum, request.remote.0.len()/2 + 1);
@@ -766,30 +765,30 @@ async fn serve(
                         "UpdateConfiguration"
                     },
                     Action::CatchUp(current, previous) => {
-                        request.flags = 2;
+                        request.flags = NativeProxyFlags::CATCH_UP;
                         request.unit.current = Epoch { data_loss: current.epoch.data_loss_number, configuration: current.epoch.configuration_number };
                         request.unit.previous = if previous.epoch == fube_runtime::Epoch::INVALID { Epoch { data_loss: 0, configuration: 0 } } else { Epoch { data_loss: previous.epoch.data_loss_number, configuration: previous.epoch.configuration_number } };
                         let mut me = request.local.clone();
-                        me.state = 2;
-                        me.previous_role = if previous.local_member { 4 } else { 0 };
+                        me.state = NativeReplicaState::Ready;
+                        me.previous_role = if previous.local_member { NativeReplicaRole::Primary } else { NativeReplicaRole::Unknown };
                         if current.local_member || previous.local_member {
-                            if !current.local_member { me.current_role = 1; }
+                            if !current.local_member { me.current_role = NativeReplicaRole::None; }
                             request.remote.0.push(me);
                         }
                         for item in current.replicas {
                             let mut native = peer(item, &request.local.version);
-                            native.previous_role = previous.replicas.iter().find(|p| p.replica_id == native.id && p.node_id.as_slice() == native.node.id.0).map_or(0, |p| native_role(p.role));
+                            native.previous_role = previous.replicas.iter().find(|p| p.replica_id == native.id && p.node_id.as_slice() == native.node.id.0).map_or(NativeReplicaRole::Unknown, |p| native_role(p.role));
                             request.remote.0.push(native);
                         }
                         for item in previous.replicas {
                             if request.remote.0.iter().any(|r| r.id == item.replica_id) { continue; }
                             let mut native = peer(item, &request.local.version);
                             native.previous_role = native.current_role;
-                            native.current_role = 1;
+                            native.current_role = NativeReplicaRole::None;
                             request.remote.0.push(native);
                         }
-                        let cc = request.remote.0.iter().filter(|r| r.current_role >= 3).count();
-                        let pc = request.remote.0.iter().filter(|r| r.previous_role >= 3).count();
+                        let cc = request.remote.0.iter().filter(|r| r.current_role.is_active()).count();
+                        let pc = request.remote.0.iter().filter(|r| r.previous_role.is_active()).count();
                         assert_eq!(current.write_quorum, cc / 2 + 1);
                         assert_eq!(previous.write_quorum, if pc == 0 { 0 } else { pc / 2 + 1 });
                         request.unit.target = cc as i32;
@@ -798,14 +797,14 @@ async fn serve(
                     Action::Build(replica) => { request.remote.0.push(peer(replica, &request.local.version)); "ReplicatorBuildIdleReplica" },
                     Action::Remove(replica) => { request.remote.0.push(peer(replica, &request.local.version)); "ReplicatorRemoveIdleReplica" },
                     Action::Role(role) => {
-                        request.local.current_role = native_role(role); request.local.state = 2;
+                        request.local.current_role = native_role(role); request.local.state = NativeReplicaState::Ready;
                         request.remote.0.push(request.local.clone());
                         "UpdateConfiguration"
                     },
                     Action::Epoch(epoch) => {
                         request.unit.current = Epoch { data_loss: epoch.data_loss_number, configuration: epoch.configuration_number };
-                        if request.local.current_role == 4 {
-                            request.flags = 2;
+                        if request.local.current_role == NativeReplicaRole::Primary {
+                            request.flags = NativeProxyFlags::CATCH_UP;
                             request.remote.0.push(request.local.clone());
                             "UpdateConfiguration"
                         } else {

@@ -1,3 +1,4 @@
+use crate::status::{NodeDownStatus, RepairState, ReplicaReconfiguration};
 use crate::{
     fm::Desired,
     management::Operation,
@@ -5,7 +6,7 @@ use crate::{
     process_control::{self, NodeControl},
     profile::*,
     wire::{self, Target},
-    Cluster, Command,
+    Cluster, Command, CommandAction, Observed, OperationOutcome, OperationState, ReplicaRecovery,
 };
 use serde_json::{json, Value};
 use std::{fs, time::Duration};
@@ -69,6 +70,16 @@ impl Manager {
         index: usize,
         receipt: NodeDownReceipt,
     ) -> Result<Value> {
+        self.node_down_typed(index, receipt)
+            .await
+            .map(|status| json!(status))
+    }
+
+    pub(crate) async fn node_down_typed(
+        &mut self,
+        index: usize,
+        receipt: NodeDownReceipt,
+    ) -> Result<NodeDownStatus> {
         if let Some(failure) = self
             .ledger
             .node_failures
@@ -78,9 +89,24 @@ impl Manager {
             if failure.receipt != receipt || failure.index != index {
                 return Err("NodeDown receipt changed for a fenced incarnation".into());
             }
-            return Ok(json!({"state":"down","node":index + 1,"duplicate":true,
-                "replica_reconfiguration":if failure.recovery_error.is_some() {"blocked"} else if failure.desired == Desired::Absent || failure.body.as_ref().is_none_or(|body| !body.service.stateful) {"not_required"} else {"recorded"},
-                "error":failure.recovery_error}));
+            return Ok(NodeDownStatus {
+                state: OperationState::Down,
+                node: (index + 1) as u8,
+                duplicate: Some(true),
+                replica_reconfiguration: if failure.recovery_error.is_some() {
+                    ReplicaReconfiguration::Blocked
+                } else if failure.desired == Desired::Absent
+                    || failure
+                        .body
+                        .as_ref()
+                        .is_none_or(|body| !body.service.stateful)
+                {
+                    ReplicaReconfiguration::NotRequired
+                } else {
+                    ReplicaReconfiguration::Recorded
+                },
+                error: failure.recovery_error.clone(),
+            });
         }
         if self.finished.is_some() {
             return Err("NodeDown requires the live original FM".into());
@@ -107,9 +133,26 @@ impl Manager {
             self.send_configuration(body).await?;
         }
         let failure = self.ledger.node_failures.last().unwrap();
-        Ok(json!({"state":"down","node":index + 1,
-            "replica_reconfiguration":if failure.recovery_error.is_some() {"blocked"} else if body.is_some() {"pending"} else if failure.body.as_ref().is_some_and(|body| body.service.stateful) && failure.desired == Desired::Running {"not_requested"} else {"not_required"},
-            "error":failure.recovery_error}))
+        Ok(NodeDownStatus {
+            state: OperationState::Down,
+            node: (index + 1) as u8,
+            duplicate: None,
+            replica_reconfiguration: if failure.recovery_error.is_some() {
+                ReplicaReconfiguration::Blocked
+            } else if body.is_some() {
+                ReplicaReconfiguration::Pending
+            } else if failure
+                .body
+                .as_ref()
+                .is_some_and(|body| body.service.stateful)
+                && failure.desired == Desired::Running
+            {
+                ReplicaReconfiguration::NotRequested
+            } else {
+                ReplicaReconfiguration::NotRequired
+            },
+            error: failure.recovery_error.clone(),
+        })
     }
 
     pub(crate) async fn prepare_node_restart(&mut self, index: usize) -> Result<Launch> {
@@ -167,27 +210,27 @@ impl Manager {
                 .as_ref()
                 .ok_or("restarted Node had no replica to restore")?;
             let op = format!("restart-rebuild-{}", launch.session);
-            self.execute(Command {
-                op: op.clone(),
-                action: "rebuild-replica".into(),
-                node: Some((index + 1) as u8),
-                partition: Some(launch.partition),
-                predecessor: Some(crate::ReplicaRef {
+            self.execute(Command::new(
+                &op,
+                CommandAction::RebuildReplica {
                     node: (index + 1) as u8,
-                    node_instance: failure.receipt.node.instance,
-                    replica: body.replica.id,
-                    incarnation: body.replica.instance,
-                }),
-                ..Command::default()
-            })
+                    partition: launch.partition,
+                    predecessor: crate::ReplicaRef {
+                        node: (index + 1) as u8,
+                        node_instance: failure.receipt.node.instance,
+                        replica: body.replica.id,
+                        incarnation: body.replica.instance,
+                    },
+                },
+            ))
             .await?;
             rebuild_operation = Some(op);
         }
         Ok(
-            json!({"state":if restore_replica {"pending"} else {"complete"},"kind":"node_restart","node":index + 1,
+            json!({"state":if restore_replica { OperationState::Pending } else { OperationState::Complete },"kind":"node_restart","node":index + 1,
             "node_instance":self.children[index].launch.node.instance,
             "rebuild_operation":rebuild_operation,
-            "replica_recovery":if restore_replica {"pending"} else {"not_required"}}),
+            "replica_recovery":if restore_replica { ReplicaRecovery::Pending } else { ReplicaRecovery::NotRequired }}),
         )
     }
 }
@@ -234,7 +277,7 @@ impl Cluster {
             return Err("owned Node termination did not prove process-group retirement".into());
         }
         Ok(
-            json!({"state":"complete","kind":if force {"node_kill"} else {"node_stop"},
+            json!({"state":OperationState::Complete,"kind":if force {"node_kill"} else {"node_stop"},
             "node":node,"node_instance":launch.node.instance,"node_pid":pid,
             "node_group_drained":true,"forced":status.cleanup_forced,"node_down":"not_reported"}),
         )
@@ -242,35 +285,41 @@ impl Cluster {
 
     pub(crate) fn refresh_node_controls(&mut self) {
         if !self.driver_commands.iter().any(|(command, result)| {
-            command.action == "restart-node"
-                && matches!(result, Some(Ok(outcome)) if outcome["state"] == "pending")
+            matches!(command.action, CommandAction::RestartNode { .. })
+                && matches!(result, Some(Ok(outcome)) if outcome.state == OperationState::Pending)
         }) {
             return;
         }
-        let status = self
-            .remote
-            .as_ref()
-            .map_or_else(|| self.manager.status(), crate::management::Client::status);
+        let status = self.remote.as_ref().map_or_else(
+            || self.manager.status_typed(),
+            crate::management::Client::status_typed,
+        );
         for (command, result) in &mut self.driver_commands {
             let Some(Ok(outcome)) = result else {
                 continue;
             };
-            if command.action != "restart-node" || outcome["state"] != "pending" {
+            if !matches!(command.action, CommandAction::RestartNode { .. })
+                || outcome.state != OperationState::Pending
+            {
                 continue;
             }
-            let node = &status["nodes"][usize::from(command.node.unwrap() - 1)];
-            if node["node_instance"] != outcome["node_instance"]
-                || matches!(node["observed"].as_str(), Some("down" | "unknown"))
-            {
-                outcome["state"] = json!("unknown");
-                outcome["error"] = json!("restarted Node lost authority before recovery completed");
-            } else if node["admitted"] == true
-                && (node["desired"] == "absent"
-                    || (node["observed"] == "running"
-                        && (!self.config.profile.stateful() || status["repair"]["ready"] == true)))
-            {
-                outcome["state"] = json!("complete");
-                outcome["replica_recovery"] = json!("ready");
+            let node = status.nodes.get(usize::from(command.node().unwrap() - 1));
+            if node.is_none_or(|node| {
+                Some(node.node_instance) != outcome.node_instance
+                    || matches!(node.observed, Observed::Down | Observed::Unknown)
+            }) {
+                outcome.state = OperationState::Unknown;
+                outcome.error = Some(json!(
+                    "restarted Node lost authority before recovery completed"
+                ));
+            } else if node.is_some_and(|node| {
+                node.admitted
+                    && (node.desired == Desired::Absent
+                        || (node.observed == Observed::Running
+                            && (!self.config.profile.stateful() || status.repair.ready)))
+            }) {
+                outcome.state = OperationState::Complete;
+                outcome.replica_recovery = Some(ReplicaRecovery::Ready);
             }
         }
     }
@@ -285,6 +334,10 @@ impl Cluster {
 
     /// Report a terminated, independently fenced original owner. Never kills a live Node.
     pub async fn node_down(&mut self, node: u8) -> Result<Value> {
+        self.node_down_typed(node).await.map(|status| json!(status))
+    }
+
+    pub(crate) async fn node_down_typed(&mut self, node: u8) -> Result<NodeDownStatus> {
         let index = self.node_index(node)?;
         let launch = self.manager.children[index].launch.clone();
         let metadata: Metadata = if let Some(remote) = &mut self.remote {
@@ -338,14 +391,17 @@ impl Cluster {
             self.fenced_nodes.push(receipt.clone());
         }
         let acknowledgement = if let Some(remote) = &mut self.remote {
-            remote
-                .request(Operation::NodeDown {
-                    index,
-                    receipt: receipt.clone(),
-                })
-                .await?
+            serde_json::from_value::<NodeDownStatus>(
+                remote
+                    .request(Operation::NodeDown {
+                        index,
+                        receipt: receipt.clone(),
+                    })
+                    .await?,
+            )
+            .map_err(err)?
         } else {
-            self.manager.node_down(index, receipt.clone()).await?
+            self.manager.node_down_typed(index, receipt.clone()).await?
         };
         self.fence_peer_routes(index, &receipt).await?;
         Ok(acknowledgement)
@@ -431,18 +487,15 @@ impl Cluster {
         } else {
             self.manager.drive().await;
         }
-        let status = self.status();
+        let status = self.status_typed();
         if self.config.profile.stateful()
-            && status["nodes"]
-                .as_array()
-                .is_some_and(|nodes| nodes.iter().any(|node| node["created_lifetime"] == true))
-            && (status["configuration"]["ready"] != true
-                || (status["repair"]["state"] != "absent" && status["repair"]["ready"] != true)
-                || status["generation_handshake"]
-                    .as_object()
-                    .is_some_and(|generation| {
-                        generation.get("complete") != Some(&Value::Bool(true))
-                    }))
+            && status.nodes.iter().any(|node| node.created_lifetime)
+            && (!status.configuration.ready
+                || (status.repair.state != RepairState::Absent && !status.repair.ready)
+                || status
+                    .generation_handshake
+                    .as_ref()
+                    .is_some_and(|generation| !generation.complete))
             && self.processes[index]
                 .as_mut()
                 .ok_or("missing original Node owner")?
@@ -470,11 +523,11 @@ impl Cluster {
                 process.cleanup().map_err(err)?;
             }
         }
-        let mut down = self.node_down(node).await?;
+        let mut down = self.node_down_typed(node).await?;
         if restore
             && matches!(
-                down["replica_reconfiguration"].as_str(),
-                Some("not_requested" | "recorded")
+                down.replica_reconfiguration,
+                ReplicaReconfiguration::NotRequested | ReplicaReconfiguration::Recorded
             )
         {
             let launch = self.manager.children[index].launch.clone();
@@ -491,18 +544,21 @@ impl Cluster {
                     predecessor,
                 )
                 .await?;
-            down["replica_reconfiguration"] = result["state"].clone();
+            let result: OperationOutcome = serde_json::from_value(result).map_err(err)?;
+            down.replica_reconfiguration = result.state.into();
         }
-        if restore && down["replica_reconfiguration"] == "blocked" {
+        if restore && down.replica_reconfiguration == ReplicaReconfiguration::Blocked {
             return Err(format!(
                 "NodeDown recorded, restart recovery blocked: {}",
-                down["error"]
+                json!(down.error)
             ));
         }
-        if restore && self.config.profile.stateful() && down["replica_reconfiguration"] == "pending"
+        if restore
+            && self.config.profile.stateful()
+            && down.replica_reconfiguration == ReplicaReconfiguration::Pending
         {
             let until = Instant::now() + Duration::from_secs(30);
-            while self.status()["configuration"]["ready"] != true {
+            while !self.status_typed().configuration.ready {
                 self.drive().await;
                 if Instant::now() >= until {
                     return Err("restart is waiting for survivor reconfiguration completion".into());

@@ -4,6 +4,7 @@
 //! RA/ReconfigurationAgent.cpp:987-1033, ServiceTypeRegistrationWrapper.cpp:78-157,
 //! Hosting.ServiceTypeMapEntity.cpp:16-80. No live Hosting event consumer, IPC,
 //! package ownership, RAP handler or deployed interoperability is qualified.
+use fube_core::protocol::NativeReplicaState;
 mod common;
 use common::*;
 use fube_hosting as h1;
@@ -78,7 +79,7 @@ fn body(id: u8, t: &h1::TypeInstance, v: &h1::VersionInstance) -> wire::AddInsta
     b.replica.node = admission().local_node;
     b.replica.id = 40;
     b.replica.instance = 50;
-    b.replica.state = 1;
+    b.replica.state = NativeReplicaState::InBuild;
     b.replica.version = version(v);
     b.service.version = version(v);
     b.service.name = "fabric:/app/stateless".into();

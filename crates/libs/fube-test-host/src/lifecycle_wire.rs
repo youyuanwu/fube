@@ -1,6 +1,10 @@
 //! Native RA12 stateless subset. Source: ServiceModel/reliability/failover/
 //! and Reliability/Failover/{common,ra}/ declarations at the pinned revision.
 use crate::wire::{PackageId, VersionInstance};
+pub use fube_ra::protocol::{
+    NativeApiDescription as ApiName, NativeMoveCost, NativePartitionKind, NativeProxyFlags,
+    NativeServicePackageActivationMode,
+};
 use fubst::serde::{ByteArray, EmptyObjectArray, Guid};
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +18,7 @@ pub struct ConsistencyUnit {
     pub low: i64,
     pub high: i64,
     pub name: String,
-    pub kind: i64,
+    pub kind: NativePartitionKind,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Epoch {
@@ -41,12 +45,12 @@ pub struct Replica {
     pub node: Node,
     pub id: i64,
     pub instance: i64,
-    pub current_role: i64,
-    pub previous_role: i64,
+    pub current_role: fube_ra::protocol::NativeReplicaRole,
+    pub previous_role: fube_ra::protocol::NativeReplicaRole,
     pub up: bool,
     pub last_lsn: i64,
     pub first_lsn: i64,
-    pub state: i64,
+    pub state: fube_ra::protocol::NativeReplicaState,
     pub version: VersionInstance,
     pub service_endpoint: String,
     pub replication_endpoint: String,
@@ -74,13 +78,13 @@ pub struct Service {
     pub constraints: String,
     pub scaleout: i32,
     pub metrics: EmptyObjectArray,
-    pub move_cost: u32,
+    pub move_cost: NativeMoveCost,
     pub restart_wait: i64,
     pub quorum_wait: i64,
     pub update_version: u64,
     pub placement: EmptyObjectArray,
     pub standby_keep: i64,
-    pub activation_mode: i64,
+    pub activation_mode: NativeServicePackageActivationMode,
     pub dns: String,
     pub scaling: EmptyObjectArray,
 }
@@ -91,13 +95,7 @@ pub struct ProxyRequest {
     pub local: Replica,
     pub remote: EmptyObjectArray,
     pub service: Service,
-    pub flags: i64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiName {
-    pub api: i64,
-    pub interface: i64,
-    pub metadata: String,
+    pub flags: NativeProxyFlags,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyError {
@@ -111,5 +109,5 @@ pub struct ProxyReply {
     pub local: Replica,
     pub remote: EmptyObjectArray,
     pub error: ProxyError,
-    pub flags: i64,
+    pub flags: NativeProxyFlags,
 }

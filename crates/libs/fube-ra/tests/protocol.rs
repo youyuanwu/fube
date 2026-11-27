@@ -1,3 +1,4 @@
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 #[path = "../examples/support/envelope.rs"]
 mod envelope;
 #[path = "../examples/support/mod.rs"]
@@ -212,8 +213,8 @@ fn remove_replica_uses_replica_body_not_delete_scopes_and_distinct_native_header
     }
     for error in [0, -2_147_017_398] {
         let mut reply = support::rich_reply(error);
-        reply.replica.current_role = 2;
-        reply.replica.state = 3;
+        reply.replica.current_role = NativeReplicaRole::Idle;
+        reply.replica.state = NativeReplicaState::Dropped;
         for owner in [Owner::Fm, Owner::Fmm] {
             let message = remove_replica_reply_message(&reply, owner).unwrap();
             assert!(!headers(&message).iter().any(|h| h.id == GENERATION_HEADER));
@@ -275,8 +276,8 @@ fn add_replica_is_a_distinct_native_fm_action_with_ready_idle_reply_and_strict_h
     }
     for error in [0, -2_147_017_398, i64::MIN, i64::MAX] {
         let mut reply = support::rich_reply(error);
-        reply.replica.current_role = 2;
-        reply.replica.state = 2;
+        reply.replica.current_role = NativeReplicaRole::Idle;
+        reply.replica.state = NativeReplicaState::Ready;
         for owner in [Owner::Fm, Owner::Fmm] {
             let message = add_replica_reply_message(&reply, owner).unwrap();
             assert!(!headers(&message).iter().any(|h| h.id == GENERATION_HEADER));
@@ -293,9 +294,9 @@ fn add_replica_is_a_distinct_native_fm_action_with_ready_idle_reply_and_strict_h
 #[test]
 fn peer_creation_preserves_native_scopes_deactivation_and_reply_values() {
     let mut base = support::rich_request();
-    base.replica.current_role = 2;
-    base.replica.previous_role = 1;
-    base.replica.state = 1;
+    base.replica.current_role = NativeReplicaRole::Idle;
+    base.replica.previous_role = NativeReplicaRole::None;
+    base.replica.state = NativeReplicaState::InBuild;
     base.service.stateful = true;
     base.service.persisted = false;
     for (epoch, catchup_lsn) in [
@@ -329,9 +330,9 @@ fn peer_creation_preserves_native_scopes_deactivation_and_reply_values() {
     }
     for error in [0, -2_147_017_398, -2_147_017_441, i64::MIN, i64::MAX] {
         let mut reply = support::rich_reply(error);
-        reply.replica.current_role = 2;
-        reply.replica.previous_role = 1;
-        reply.replica.state = 1;
+        reply.replica.current_role = NativeReplicaRole::Idle;
+        reply.replica.previous_role = NativeReplicaRole::None;
+        reply.replica.state = NativeReplicaState::InBuild;
         reply.replica.replication_endpoint = "127.0.0.2:45678/idle-π".into();
         let generation = support::rich_generation(false);
         let message = create_replica_reply_message(&reply, &generation).unwrap();
@@ -719,14 +720,39 @@ fn generation_handshake_rejects_bad_headers_shapes_truncation_and_fmm_update() {
 fn native_defaults_are_not_zeroed_rust_layouts() {
     let body = AddInstance::default();
     assert_eq!(body.replica.id, -1);
-    assert_eq!(body.replica.current_role, 1);
-    assert_eq!(body.replica.state, 2);
+    assert_eq!(body.replica.current_role, NativeReplicaRole::None);
+    assert_eq!(body.replica.state, NativeReplicaState::Ready);
     assert!(body.replica.up);
     assert_eq!(body.replica.version.version.value.major, 0);
     assert_eq!(body.service.version.version.value.major, 1);
     assert_eq!(body.service.restart_wait, i64::MIN);
-    assert_eq!(body.service.move_cost, 1);
-    assert_eq!(body.unit.consistency.kind, 1);
+    assert_eq!(body.service.move_cost, NativeMoveCost::Low);
+    assert_eq!(body.unit.consistency.kind, NativePartitionKind::Singleton);
+}
+
+#[test]
+fn service_description_records_preserve_existing_zero_defaults_and_long64_fields() {
+    let mut scalar = fubst::Encoder::new();
+    scalar
+        .object(|e| {
+            e.string("")?;
+            e.i64(0)
+        })
+        .unwrap();
+    let scalar = scalar.finish();
+    assert_eq!(to_vec(&Correlation::default()).unwrap(), scalar);
+    assert_eq!(to_vec(&Placement::default()).unwrap(), scalar);
+
+    let mut metric = fubst::Encoder::new();
+    metric
+        .object(|e| {
+            e.string("")?;
+            e.i64(0)?;
+            e.u32(0)?;
+            e.u32(0)
+        })
+        .unwrap();
+    assert_eq!(to_vec(&Metric::default()).unwrap(), metric.finish());
 }
 
 #[test]
@@ -745,10 +771,25 @@ fn full_nested_nondefault_schema_and_scaling_roundtrip() {
 fn errors_and_unknown_scalar_enum_values_are_lossless() {
     for error in [0, -2_147_017_398, -2_147_017_441, i64::MIN, i64::MAX] {
         let mut reply = support::rich_reply(error);
-        reply.replica.current_role = 987_654;
+        reply.replica.current_role = NativeReplicaRole::Unrecognized(987_654);
+        reply.replica.previous_role = NativeReplicaRole::Unrecognized(-7);
+        reply.replica.state = NativeReplicaState::Unrecognized(987_655);
         assert_eq!(
             from_slice::<AddInstanceReply>(&to_vec(&reply).unwrap()).unwrap(),
             reply
+        );
+    }
+    for code in [-1, 2, 4, 6, i64::MIN, i64::MAX] {
+        let mut request = support::rich_request();
+        request.service.activation_mode = NativeServicePackageActivationMode::from(code);
+        request.unit.consistency.kind = NativePartitionKind::from(code);
+        request.service.correlations.0[0].scheme = NativeServiceCorrelationScheme::from(code);
+        request.service.metrics.0[0].weight = NativeServiceLoadMetricWeight::from(code);
+        request.service.placement.0[0].kind = NativePlacementPolicyType::from(code);
+        request.service.move_cost = NativeMoveCost::Unrecognized(u32::MAX);
+        assert_eq!(
+            from_slice::<AddInstance>(&to_vec(&request).unwrap()).unwrap(),
+            request
         );
     }
 }
@@ -919,8 +960,8 @@ fn delete_replica_preserves_inherited_body_and_distinct_factory_owner_asymmetry(
     primary.unit.minimum = 1;
     primary.service.target = 1;
     primary.service.minimum = 1;
-    primary.replica.current_role = 4;
-    primary.replica.state = 2;
+    primary.replica.current_role = NativeReplicaRole::Primary;
+    primary.replica.state = NativeReplicaState::Ready;
     let body = DeleteReplica::new(primary, false);
     for from_fmm in [false, true] {
         let generation = support::rich_generation(from_fmm);
@@ -946,7 +987,7 @@ fn delete_replica_preserves_inherited_body_and_distinct_factory_owner_asymmetry(
             node: reply.replica.node,
             id: reply.replica.id,
             instance: reply.replica.instance,
-            state: 3,
+            state: NativeReplicaState::Dropped,
             up: false,
             ..Replica::default()
         };
@@ -1537,7 +1578,7 @@ fn complete_load_legacy_and_modern_map_scopes_roundtrip_and_reject_bad_node_ids(
         unit: PartitionId {
             guid: Guid([0xa5; 16]),
         },
-        role: 4,
+        role: NativeReplicaRole::Primary,
         metrics: ObjectArray(vec![LoadMetricValue {
             name: "legacy".into(),
             value: u32::MAX,

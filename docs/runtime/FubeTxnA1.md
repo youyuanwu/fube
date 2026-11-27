@@ -81,6 +81,19 @@ and rollback remain provider responsibilities.
 | Full state3→metadata4→log7, original copied LSN vs lower replication metadata; no custom image/Done packet | SecondaryDrainManager.cpp:906–1100; [runtime.rs:723–914](../../crates/libs/fube-txn/src/kernel/runtime.rs#L723-L914) |
 | Ordered Barrier checkpoint selection; Prepare/Apply/stability/Perform/End/Complete and reader-safe truncation | [maintenance.rs](../../crates/libs/fube-txn/src/kernel/maintenance.rs#L114), [checkpoint.rs](../../crates/libs/fube-txn/src/kernel/checkpoint.rs#L120) |
 
+Copy framing is centralized in
+[`copy_codec.rs`](../../crates/libs/fube-txn/src/kernel/copy_codec.rs):
+`CopyHeader` decodes the initial header, and typed `CopyMessage` variants frame
+State, Progress and Log payloads (with known None/FalseProgress stages still
+subject to consumer admission). Payload views borrow immutable segments during
+state routing; owned payloads are materialized only when required. Metadata is
+decoded after the existing state-transition checks. The native format remains
+segmented `OperationData` with little-endian i32 stage values, not a
+FabricSerializable envelope. Exact trailer versus state-prefix length rules and
+profile-specific errors remain unchanged. Decoding/encoding never acknowledges
+an operation: the original `IOperation` owner still controls ACK and retirement,
+including the exact Progress transition retained through log/checkpoint setup.
+
 ### Public boundary and foundation dispatch
 
 The old `create_with_lifecycle`/private bootstrap-rebase recipe and lower

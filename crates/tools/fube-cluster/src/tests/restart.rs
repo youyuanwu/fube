@@ -1,4 +1,6 @@
 use super::*;
+use fube_ra::protocol::NativeReplicaRole;
+use fube_ra::protocol::NativeReplicaState;
 
 #[tokio::test]
 async fn manual_spare_replacement_uses_public_controls_and_semantic_waits() {
@@ -152,8 +154,8 @@ async fn operation_wait_deadline_does_not_cancel_or_complete_pending_work() {
     let fixture = Fixture::new("operation-wait-deadline");
     let mut cluster = Cluster::new(fixture.config()).unwrap();
     cluster.manager.ledger.operations.push(fm::Operation {
-        command: command("pending", "create", Some(1)),
-        outcome: json!({"op":"pending","state":"pending"}),
+        command: command("pending", "create", Some(1)).request().unwrap(),
+        outcome: crate::OperationOutcome::new("pending", crate::OperationState::Pending),
     });
     assert!(cluster
         .wait_operation("pending", Duration::from_millis(10))
@@ -170,10 +172,10 @@ async fn operation_wait_deadline_does_not_cancel_or_complete_pending_work() {
         .wait_operation("pending", Duration::MAX)
         .await
         .is_err());
-    cluster
-        .manager
-        .ledger
-        .complete("pending", json!({"op":"pending","state":"complete"}));
+    cluster.manager.ledger.complete(
+        "pending",
+        crate::OperationOutcome::new("pending", crate::OperationState::Complete),
+    );
     assert_eq!(
         cluster
             .wait_operation("pending", Duration::ZERO)
@@ -189,17 +191,24 @@ async fn operation_wait_deadline_does_not_cancel_or_complete_pending_work() {
 async fn operation_wait_reports_original_failure_uncertainty_and_cancellation() {
     let fixture = Fixture::new("operation-wait-failure");
     let mut cluster = Cluster::new(fixture.config()).unwrap();
-    for state in ["failed", "unknown", "cancelled", "rejected"] {
+    for state in [
+        crate::OperationState::Failed,
+        crate::OperationState::Unknown,
+        crate::OperationState::Cancelled,
+        crate::OperationState::Rejected,
+    ] {
+        let name = serde_json::to_value(state).unwrap();
+        let name = name.as_str().unwrap();
         cluster.manager.ledger.operations.push(fm::Operation {
-            command: command(state, "create", Some(1)),
-            outcome: json!({"op":state,"state":state,"error":"original owner ended"}),
+            command: command(name, "create", Some(1)).request().unwrap(),
+            outcome: crate::OperationOutcome::new(name, state).with_error("original owner ended"),
         });
         let error = cluster
-            .wait_operation(state, Duration::ZERO)
+            .wait_operation(name, Duration::ZERO)
             .await
             .unwrap_err();
         assert!(
-            error.contains(state) && error.contains("original owner ended"),
+            error.contains(name) && error.contains("original owner ended"),
             "{error}"
         );
     }
@@ -226,16 +235,16 @@ fn completed(body: &DoReconfiguration) -> ConfigurationReply {
         error: 0,
     };
     reply.unit.previous = Epoch::default();
-    reply.replicas.0.retain(|r| r.current_role >= 3);
+    reply.replicas.0.retain(|r| r.current_role.is_active());
     for replica in &mut reply.replicas.0 {
-        replica.previous_role = 1;
+        replica.previous_role = NativeReplicaRole::None;
         if body.configuration.unit.current.configuration & !0xffff_ffff
             != body.configuration.unit.previous.configuration & !0xffff_ffff
         {
             replica.first_lsn = 0;
             replica.last_lsn = 0;
         }
-        replica.service_endpoint = if replica.current_role == 4 {
+        replica.service_endpoint = if replica.current_role == NativeReplicaRole::Primary {
             "127.0.0.1:23459".into()
         } else {
             String::new()
@@ -318,7 +327,7 @@ fn confirmed_node_down_reconfigures_without_the_dead_link_and_rejoin_is_incarnat
         assert!(ledger.begin_node_replica_rebuild(lost, lost).unwrap());
         let build = ledger.repair.as_ref().unwrap().build.body.clone();
         let mut replica = build.replica.clone();
-        replica.state = 2;
+        replica.state = NativeReplicaState::Ready;
         replica.first_lsn = 0;
         replica.last_lsn = 0;
         replica.replication_endpoint = "127.0.0.1:23460".into();
@@ -462,7 +471,7 @@ fn manual_node_recovery_is_scoped_retained_and_preserves_minimum() {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.current_role >= 3)
+                .filter(|r| r.current_role.is_active())
                 .count(),
             3
         );
@@ -517,7 +526,7 @@ fn manual_node_recovery_is_scoped_retained_and_preserves_minimum() {
         changed.node = Some(((lost + 1) % 3 + 1) as u8);
         assert!(ledger.accept(changed).is_err());
         let mut replica = owner.replica.clone();
-        replica.state = 2;
+        replica.state = NativeReplicaState::Ready;
         replica.replication_endpoint = "127.0.0.1:23460".into();
         ledger
             .idle_reply(
@@ -540,7 +549,7 @@ fn manual_node_recovery_is_scoped_retained_and_preserves_minimum() {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.current_role >= 3)
+                .filter(|r| r.current_role.is_active())
                 .count(),
             3
         );
@@ -727,7 +736,7 @@ fn scoped_cancellation_owns_the_exact_pending_rebuild() {
         Accepted::Duplicate(_)
     ));
     let mut removed = removal.replica;
-    removed.state = 3;
+    removed.state = NativeReplicaState::Dropped;
     removed.replication_endpoint = "127.0.0.1:23460".into();
     ledger
         .idle_removal_reply(

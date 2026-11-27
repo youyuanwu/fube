@@ -4,8 +4,10 @@ use super::super::reporting_tests::{
 };
 use super::*;
 use crate::{ErrorKind, HealthInformation, HealthReportSendOption, LoadMetric, MoveCost};
+use fube_core::protocol::NativeProxyFlags;
+use fube_core::protocol::NativeReplicaRole;
 
-async fn opened(mode: u8, role: i64) -> (Harness, Arc<StatefulCalls>, ProxyRequest) {
+async fn opened(mode: u8, role: NativeReplicaRole) -> (Harness, Arc<StatefulCalls>, ProxyRequest) {
     let mut h = Harness::new().await;
     let calls = register(&h);
     let mut open = request(&h, 2, 17, mode);
@@ -14,7 +16,7 @@ async fn opened(mode: u8, role: i64) -> (Harness, Arc<StatefulCalls>, ProxyReque
     open.local.current_role = role;
     open.service.metrics.0.push(Metric {
         name: "Work".into(),
-        weight: 1,
+        weight: NativeServiceLoadMetricWeight::Low,
         primary: 0,
         secondary: 0,
     });
@@ -26,19 +28,19 @@ async fn opened(mode: u8, role: i64) -> (Harness, Arc<StatefulCalls>, ProxyReque
 
 #[tokio::test]
 async fn stateful_reporting_native_current_role_selects_secondary_during_pending_demotion() {
-    let (mut h, calls, open) = opened(21, 4).await;
+    let (mut h, calls, open) = opened(21, NativeReplicaRole::Primary).await;
     let integration = calls.partitions.lock().unwrap()[0].clone();
     let mut local = open.local.clone();
-    local.current_role = 3;
-    local.previous_role = 4;
+    local.current_role = NativeReplicaRole::Secondary;
+    local.previous_role = NativeReplicaRole::Primary;
     let mut primary = control_tests::peer(&local, 2);
-    primary.current_role = 4;
+    primary.current_role = NativeReplicaRole::Primary;
     let mut demote =
         control_tests::control(&open, "UpdateConfiguration", vec![local.clone(), primary]);
     demote.local = local;
     demote.unit.current.configuration += 1 << 32;
     demote.unit.previous = open.unit.current.clone();
-    demote.flags = 2;
+    demote.flags = NativeProxyFlags::CATCH_UP;
     h.send("UpdateConfiguration", &demote).await;
     control_tests::wait_event(&calls, "waitAll", 1).await;
     let status = integration.status().unwrap();
@@ -61,11 +63,11 @@ async fn stateful_reporting_native_current_role_selects_secondary_during_pending
             query.local.id = 101;
             query.local.instance = 18;
         }
-        query.local.current_role = 4;
+        query.local.current_role = NativeReplicaRole::Primary;
         h.send("RAPQuery", &query).await;
         let reply: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
         if query.unit.current.configuration > demote.unit.current.configuration {
-            assert_eq!(reply.local.current_role, 3);
+            assert_eq!(reply.local.current_role, NativeReplicaRole::Secondary);
             assert_eq!((reply.local.id, reply.local.instance), (100, 17));
         } else {
             assert_ne!(reply.error, 0);
@@ -120,7 +122,7 @@ async fn stateful_reporting_native_current_role_selects_secondary_during_pending
 
 #[tokio::test]
 async fn stateful_reporting_private_configuration_primary_secondary_idle_roles_and_native_arrays() {
-    for initial_role in [4, 2] {
+    for initial_role in [NativeReplicaRole::Primary, NativeReplicaRole::Idle] {
         let (mut h, calls, open) = opened(20, initial_role).await;
         let integration = calls.partitions.lock().unwrap()[0].clone();
         let mut diagnostics = integration.status().unwrap();
@@ -136,13 +138,13 @@ async fn stateful_reporting_private_configuration_primary_secondary_idle_roles_a
             diagnostics.service_role,
             integration.status().unwrap().service_role
         );
-        for role in [initial_role, 3] {
-            if role == 3 {
+        for role in [initial_role, NativeReplicaRole::Secondary] {
+            if role == NativeReplicaRole::Secondary {
                 let mut local = open.local.clone();
-                local.current_role = 3;
+                local.current_role = NativeReplicaRole::Secondary;
                 local.previous_role = initial_role;
                 let mut primary = control_tests::peer(&local, 2);
-                primary.current_role = 4;
+                primary.current_role = NativeReplicaRole::Primary;
                 let mut demote = control_tests::control(
                     &open,
                     "UpdateConfiguration",
@@ -151,7 +153,7 @@ async fn stateful_reporting_private_configuration_primary_secondary_idle_roles_a
                 demote.local = local;
                 demote.unit.current.configuration += 1 << 32;
                 demote.unit.previous = open.unit.current.clone();
-                demote.flags = 2;
+                demote.flags = NativeProxyFlags::CATCH_UP;
                 h.send("UpdateConfiguration", &demote).await;
                 let reply: ProxyReply =
                     from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
@@ -183,7 +185,13 @@ async fn stateful_reporting_private_configuration_primary_secondary_idle_roles_a
                     });
                 let (result, message) = tokio::join!(call, h.receive("RAPReportLoad"));
                 result.unwrap();
-                assert_load(&message, true, role == 4, name, value);
+                assert_load(
+                    &message,
+                    true,
+                    role == NativeReplicaRole::Primary,
+                    name,
+                    value,
+                );
                 assert!(observation
                     .result()
                     .unwrap()
@@ -229,7 +237,7 @@ async fn stateful_reporting_private_configuration_primary_secondary_idle_roles_a
 
 #[tokio::test]
 async fn stateful_reporting_all_health_targets_options_exact_results_and_stale_generation() {
-    let (mut h, calls, mut open) = opened(20, 4).await;
+    let (mut h, calls, mut open) = opened(20, NativeReplicaRole::Primary).await;
     let integration = calls.partitions.lock().unwrap()[0].clone();
     let mut records = Vec::new();
     for kind in [1, 3] {
@@ -383,7 +391,7 @@ async fn stateful_reporting_all_health_targets_options_exact_results_and_stale_g
 
 #[tokio::test]
 async fn stateful_reporting_verified_ttl_sequence_validation_wrong_kind_and_uncertain_timeout() {
-    let (mut h, calls, _) = opened(20, 4).await;
+    let (mut h, calls, _) = opened(20, NativeReplicaRole::Primary).await;
     let integration = calls.partitions.lock().unwrap()[0].clone();
     for ttl in [0, 3] {
         let (partition, record) = integration.observe_report().unwrap();
@@ -476,7 +484,7 @@ async fn stateful_reporting_configured_primary_reports_before_service_change_rol
     open.unit.consistency.id.id = Guid(GUID_BYTES);
     open.service.metrics.0.push(Metric {
         name: "Work".into(),
-        weight: 1,
+        weight: NativeServiceLoadMetricWeight::Low,
         primary: 0,
         secondary: 0,
     });
@@ -547,8 +555,8 @@ async fn stateful_reporting_configured_primary_reports_before_service_change_rol
 
 #[tokio::test]
 async fn stateful_reporting_unknown_none_configuration_roles_reject_without_emission_or_fallback() {
-    for native_role in [0, 1] {
-        let (mut h, calls, open) = opened(20, 4).await;
+    for native_role in [NativeReplicaRole::Unknown, NativeReplicaRole::None] {
+        let (mut h, calls, open) = opened(20, NativeReplicaRole::Primary).await;
         let integration = calls.partitions.lock().unwrap()[0].clone();
         let mut current = open.clone();
         current.local.current_role = native_role;
@@ -561,7 +569,7 @@ async fn stateful_reporting_unknown_none_configuration_roles_reject_without_emis
         let status = integration.status().unwrap();
         assert_eq!(
             status.current_role,
-            if native_role == 0 {
+            if native_role == NativeReplicaRole::Unknown {
                 ReplicaRole::Unknown
             } else {
                 ReplicaRole::None

@@ -133,6 +133,12 @@ State is stored privately under ignored `build/oneboxes/NAME/`, including
 directory is not teardown and prevents safe resumption. Use `--state-root PATH`
 **before** the subcommand for another private, ignored location.
 
+Lifecycle controls use separate `ClusterPhase` and `BaselineState` enums over
+the unchanged schema-1 journal strings. The state dictionary and JSON remain
+compatibility records; node-volume `allocated`/`configured` phases and native
+baseline observations are separate domains. Typing does not authorize recovery,
+resubmission of an ambiguous baseline, or replacement of retained resources.
+
 Operations serialize with a per-name filesystem lock. Missing volumes, changed
 image/account identities, edited frozen inputs, and interrupted deployments are
 errors, not permission to bootstrap over retained data. Retained starts do not

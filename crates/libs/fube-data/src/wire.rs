@@ -130,8 +130,6 @@ const SECURITY_NEGOTIATION: u16 = 0x8048;
 const MAX_OPERATION_BYTES: usize = 1024 * 1024;
 const MAX_SEGMENTS: usize = 1024;
 const MAX_BATCH_OPERATIONS: usize = 1024;
-const NORMAL: u32 = 1;
-const END_OF_STREAM: u32 = 2;
 const INVALID_ATOMIC_GROUP: i64 = -1;
 
 /// Full native demultiplexing identity, including the replica incarnation.
@@ -290,13 +288,125 @@ fn validate_address(address: &str) -> Result<()> {
     Ok(())
 }
 
+/// Concrete native operation kinds, not combinable flags or the atomic-group mask.
+///
+/// The wire codec recognizes these kinds; the engine's volatile profile delivers
+/// only Normal operations through the separate SDK [`crate::OperationType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum NativeOperationKind {
+    Normal = 0x0001,
+    EndOfStream = 0x0002,
+    CreateAtomicGroup = 0x0010,
+    AtomicGroupOperation = 0x0020,
+    CommitAtomicGroup = 0x0040,
+    RollbackAtomicGroup = 0x0080,
+}
+
+impl NativeOperationKind {
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+
+    fn read(value: u32) -> fubst::Result<Self> {
+        match value {
+            0x0001 => Ok(Self::Normal),
+            0x0002 => Ok(Self::EndOfStream),
+            0x0010 => Ok(Self::CreateAtomicGroup),
+            0x0020 => Ok(Self::AtomicGroupOperation),
+            0x0040 => Ok(Self::CommitAtomicGroup),
+            0x0080 => Ok(Self::RollbackAtomicGroup),
+            _ => Err(fubst::Error::Protocol(
+                "invalid operation type or atomic group",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeOperationMetadata {
+    kind: NativeOperationKind,
+    sequence: i64,
+    atomic_group: i64,
+}
+
+impl NativeOperationMetadata {
+    fn copy(sequence: i64, last: bool) -> Self {
+        Self {
+            kind: if last {
+                NativeOperationKind::EndOfStream
+            } else {
+                NativeOperationKind::Normal
+            },
+            sequence,
+            atomic_group: INVALID_ATOMIC_GROUP,
+        }
+    }
+
+    fn write(self, encoder: &mut Encoder) -> fubst::Result<()> {
+        self.validate()?;
+        let mut bytes = [0; 32];
+        bytes[..4].copy_from_slice(&self.kind.code().to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.sequence.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.atomic_group.to_le_bytes());
+        encoder.byte_array(&bytes)
+    }
+
+    fn read(decoder: &mut Decoder<'_>) -> fubst::Result<Self> {
+        let bytes = decoder.byte_array()?;
+        if bytes.len() != 32 || bytes[24..].iter().any(|b| *b != 0) {
+            return Err(fubst::Error::Protocol(
+                "invalid Linux FABRIC_OPERATION_METADATA ABI",
+            ));
+        }
+        // Bytes 4..8 are native ABI padding; native stack objects need not zero it.
+        let metadata = Self {
+            kind: NativeOperationKind::read(u32::from_le_bytes(bytes[..4].try_into().unwrap()))?,
+            sequence: i64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            atomic_group: i64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    fn validate(self) -> fubst::Result<()> {
+        if self.atomic_group < INVALID_ATOMIC_GROUP {
+            return Err(fubst::Error::Protocol(
+                "invalid operation type or atomic group",
+            ));
+        }
+        positive_sequence(self.sequence)
+    }
+
+    fn validate_copy(self, last: bool) -> fubst::Result<()> {
+        // The native receiver explicitly overwrites Type with EOS when isLast.
+        if self.atomic_group != INVALID_ATOMIC_GROUP
+            || !(self.kind == NativeOperationKind::Normal
+                || (last && self.kind == NativeOperationKind::EndOfStream))
+        {
+            return Err(fubst::Error::Protocol("invalid copy operation metadata"));
+        }
+        Ok(())
+    }
+}
+
 /// An operation's native metadata and provider-defined buffer segmentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireOperation {
     pub sequence: i64,
-    pub kind: u32,
+    pub kind: NativeOperationKind,
     pub atomic_group: i64,
     pub data: Vec<Vec<u8>>,
+}
+
+impl WireOperation {
+    fn metadata(&self) -> NativeOperationMetadata {
+        NativeOperationMetadata {
+            kind: self.kind,
+            sequence: self.sequence,
+            atomic_group: self.atomic_group,
+        }
+    }
 }
 
 /// The eight native classic actions. ACKs intentionally contain no epoch.
@@ -444,7 +554,7 @@ impl Packet {
                             "noncontiguous or heterogeneous replication batch",
                         ));
                     }
-                    validate_metadata(operation.kind, operation.atomic_group)?;
+                    operation.metadata().validate()?;
                     let operation_sizes = segment_sizes(&operation.data)?;
                     sizes.extend_from_slice(&operation_sizes);
                     if sizes.len() > MAX_COLLECTION_COUNT {
@@ -463,7 +573,7 @@ impl Packet {
                     }
                 }
                 let header = object(|e| {
-                    write_metadata(e, first.kind, first.sequence, first.atomic_group)?;
+                    first.metadata().write(e)?;
                     write_epoch(e, *primary_epoch)?;
                     write_epoch(e, *operation_epoch)?;
                     e.u32_array(&sizes)?;
@@ -491,7 +601,7 @@ impl Packet {
                 let header = object(|e| {
                     e.i64(*target)?;
                     write_epoch(e, *epoch)?;
-                    write_metadata(e, copy_kind(*last), *sequence, INVALID_ATOMIC_GROUP)?;
+                    NativeOperationMetadata::copy(*sequence, *last).write(e)?;
                     e.u32_array(&sizes)?;
                     e.boolean(*last)?;
                     Ok(())
@@ -525,7 +635,7 @@ impl Packet {
                 positive_sequence(*sequence)?;
                 let sizes = segment_sizes(data)?;
                 message.headers.push(Header::object(COPY_CONTEXT, |e| {
-                    write_metadata(e, copy_kind(*last), *sequence, INVALID_ATOMIC_GROUP)?;
+                    NativeOperationMetadata::copy(*sequence, *last).write(e)?;
                     e.u32_array(&sizes)?;
                     e.boolean(*last)?;
                     Ok(())
@@ -664,11 +774,11 @@ impl Packet {
                 let (target, epoch, sequence, sizes, last) = read_object(header, |d| {
                     let target = d.i64()?;
                     let epoch = read_epoch(d)?;
-                    let metadata = read_metadata(d)?;
+                    let metadata = NativeOperationMetadata::read(d)?;
                     let sizes = d.u32_array()?;
                     let last = d.boolean()?;
-                    validate_copy_metadata(metadata, last)?;
-                    Ok((target, epoch, metadata.1, sizes, last))
+                    metadata.validate_copy(last)?;
+                    Ok((target, epoch, metadata.sequence, sizes, last))
                 })?;
                 Body::Copy {
                     epoch,
@@ -681,11 +791,11 @@ impl Packet {
             "CopyContextOperation" => {
                 let (sequence, sizes, last) =
                     required_header(message, COPY_CONTEXT)?.read(|d| {
-                        let metadata = read_metadata(d)?;
+                        let metadata = NativeOperationMetadata::read(d)?;
                         let sizes = d.u32_array()?;
                         let last = d.boolean()?;
-                        validate_copy_metadata(metadata, last)?;
-                        Ok((metadata.1, sizes, last))
+                        metadata.validate_copy(last)?;
+                        Ok((metadata.sequence, sizes, last))
                     })?;
                 Body::CopyContext {
                     sequence,
@@ -865,65 +975,6 @@ fn validate_epoch(epoch: Epoch) -> fubst::Result<()> {
     Ok(())
 }
 
-fn write_metadata(
-    encoder: &mut Encoder,
-    kind: u32,
-    sequence: i64,
-    group: i64,
-) -> fubst::Result<()> {
-    validate_metadata(kind, group)?;
-    positive_sequence(sequence)?;
-    let mut bytes = [0; 32];
-    bytes[..4].copy_from_slice(&kind.to_le_bytes());
-    bytes[8..16].copy_from_slice(&sequence.to_le_bytes());
-    bytes[16..24].copy_from_slice(&group.to_le_bytes());
-    encoder.byte_array(&bytes)
-}
-
-fn read_metadata(decoder: &mut Decoder<'_>) -> fubst::Result<(u32, i64, i64)> {
-    let bytes = decoder.byte_array()?;
-    if bytes.len() != 32 || bytes[24..].iter().any(|b| *b != 0) {
-        return Err(fubst::Error::Protocol(
-            "invalid Linux FABRIC_OPERATION_METADATA ABI",
-        ));
-    }
-    // Bytes 4..8 are native ABI padding; native stack objects need not zero it.
-    let kind = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-    let sequence = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    let group = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    validate_metadata(kind, group)?;
-    positive_sequence(sequence)?;
-    Ok((kind, sequence, group))
-}
-
-fn validate_metadata(kind: u32, group: i64) -> fubst::Result<()> {
-    if !matches!(kind, NORMAL | END_OF_STREAM | 0x10 | 0x20 | 0x40 | 0x80) || group < -1 {
-        return Err(fubst::Error::Protocol(
-            "invalid operation type or atomic group",
-        ));
-    }
-    Ok(())
-}
-
-fn copy_kind(last: bool) -> u32 {
-    if last {
-        END_OF_STREAM
-    } else {
-        NORMAL
-    }
-}
-
-fn validate_copy_metadata(
-    (kind, _sequence, group): (u32, i64, i64),
-    last: bool,
-) -> fubst::Result<()> {
-    // The native receiver explicitly overwrites Type with EOS when isLast.
-    if group != INVALID_ATOMIC_GROUP || !(kind == NORMAL || (last && kind == END_OF_STREAM)) {
-        return Err(fubst::Error::Protocol("invalid copy operation metadata"));
-    }
-    Ok(())
-}
-
 fn positive_sequence(sequence: i64) -> fubst::Result<()> {
     if sequence <= 0 {
         return Err(fubst::Error::Protocol("nonpositive operation sequence"));
@@ -1050,7 +1101,7 @@ fn decode_replication(message: &Message) -> Result<Body> {
         counts,
         completed,
     ) = read_object(header, |d| {
-        let metadata = read_metadata(d)?;
+        let metadata = NativeOperationMetadata::read(d)?;
         let primary_epoch = read_epoch(d)?;
         let operation_epoch = read_epoch(d)?;
         let sizes = d.u32_array()?;
@@ -1061,9 +1112,9 @@ fn decode_replication(message: &Message) -> Result<Body> {
                 primary_epoch,
                 operation_epoch,
                 sizes,
-                metadata.1,
-                metadata.1,
-                metadata.1,
+                metadata.sequence,
+                metadata.sequence,
+                metadata.sequence,
                 vec![count],
                 0,
             ));
@@ -1085,9 +1136,9 @@ fn decode_replication(message: &Message) -> Result<Body> {
                 primary_epoch,
                 operation_epoch,
                 sizes,
-                metadata.1,
-                metadata.1,
-                metadata.1,
+                metadata.sequence,
+                metadata.sequence,
+                metadata.sequence,
                 vec![count],
                 completed,
             ));
@@ -1105,7 +1156,7 @@ fn decode_replication(message: &Message) -> Result<Body> {
         ))
     })?;
     validate_batch(first, last, batch_end, completed, counts.len())?;
-    if metadata.1 != first {
+    if metadata.sequence != first {
         return Err(Error::Protocol("operation metadata does not match batch"));
     }
     let count = counts
@@ -1139,8 +1190,8 @@ fn decode_replication(message: &Message) -> Result<Body> {
             sequence: first
                 .checked_add(index as i64)
                 .ok_or(Error::Protocol("batch sequence overflow"))?,
-            kind: metadata.0,
-            atomic_group: metadata.2,
+            kind: metadata.kind,
+            atomic_group: metadata.atomic_group,
             data: split_segments(operation_sizes, &payload[payload_offset..payload_end])?,
         });
         segment_offset = end;

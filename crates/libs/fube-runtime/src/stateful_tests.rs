@@ -1,6 +1,10 @@
 //! Adapter tests use controlled callbacks, not a purported empty-state policy.
 //! The actual sample custom replicator has its own controlled-peer test gate.
 use super::*;
+use fube_core::protocol::NativeActivityType;
+use fube_core::protocol::NativeProxyFlags;
+use fube_core::protocol::NativeReplicaRole;
+use fube_core::protocol::NativeServicePackageActivationMode;
 #[path = "stateful_control_tests.rs"]
 mod control_tests;
 #[path = "stateful_reporting_tests.rs"]
@@ -568,6 +572,65 @@ fn request(h: &Harness, partition: u8, incarnation: i64, mode: u8) -> ProxyReque
 }
 
 #[tokio::test]
+async fn stateful_partition_kind_admission_preserves_sdk_payloads_and_rejects_invalid_ranges() {
+    for (kind, low, high, expected) in [
+        (
+            NativePartitionKind::Named,
+            0,
+            0,
+            Some(PartitionKind::Named("owned-stateful-partition".into())),
+        ),
+        (
+            NativePartitionKind::Int64Range,
+            i64::MIN,
+            i64::MAX,
+            Some(PartitionKind::Int64Range {
+                low: i64::MIN,
+                high: i64::MAX,
+            }),
+        ),
+        (NativePartitionKind::Invalid, 0, 0, None),
+        (NativePartitionKind::Unrecognized(i64::MIN), 0, 0, None),
+        (NativePartitionKind::Unrecognized(i64::MAX), 0, 0, None),
+        (NativePartitionKind::Int64Range, 1, 0, None),
+    ] {
+        let mut h = Harness::new().await;
+        let calls = register(&h);
+        let mut request = request(&h, 2, 1, 0);
+        request.unit.consistency.kind = kind;
+        request.unit.consistency.low = low;
+        request.unit.consistency.high = high;
+        request.unit.consistency.name = "owned-stateful-partition".into();
+        h.send("ReplicaOpen", &request).await;
+        if let Some(expected) = expected {
+            let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
+            assert_eq!(reply.error.error, 0);
+            let partition = calls.sdk_partitions.lock().unwrap()[0].clone();
+            let native = calls.partitions.lock().unwrap()[0].clone();
+            let expected = expected.information(uuid::Uuid::from_bytes_le([2; 16]));
+            assert_eq!(partition.get_partition_information().unwrap(), expected);
+            assert_eq!(
+                native
+                    .observe_report()
+                    .unwrap()
+                    .0
+                    .get_partition_information()
+                    .unwrap(),
+                expected
+            );
+            h.send("ReplicaClose", &request).await;
+            h.receive("ReplicaCloseReply").await;
+            h.engine.quiesce().await.unwrap();
+        } else {
+            tokio::time::timeout(Duration::from_secs(2), h.engine.shared.connection.closed())
+                .await
+                .expect("invalid stateful partition must retire its session");
+            assert!(calls.events.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn owned_stateful_fault_uses_native_identity_epochs_and_generation_fences() {
     let mut h = Harness::new().await;
     let calls = register(&h);
@@ -600,12 +663,15 @@ async fn owned_stateful_fault_uses_native_identity_epochs_and_generation_fences(
     assert_eq!(result.unwrap().attempts, 1);
     assert_eq!(message.metadata().unwrap().actor, 12);
     let fault: FaultBody = from_slice(&message.body).unwrap();
-    assert_eq!(fault.fault, 1);
+    assert_eq!(fault.fault, NativeFaultType::Transient);
     assert_eq!(to_vec(&fault.unit).unwrap(), to_vec(&current.unit).unwrap());
     assert_eq!((fault.local.id, fault.local.instance), (100, 17));
     assert_eq!(fault.local.node.id.0, current.local.node.id.0);
     assert_eq!(fault.local.node.instance, current.local.node.instance);
-    assert_eq!(fault.activity.kind, 2);
+    assert_eq!(
+        fault.activity.kind,
+        NativeActivityType::ServiceReportFaultEvent
+    );
     assert_eq!(
         partition
             .report_fault(FaultType::Transient)
@@ -653,7 +719,7 @@ async fn stateful_fault_retry_outlives_callers_executor_and_stops_with_unit() {
     let mut h = Harness::new().await;
     let calls = register(&h);
     let mut open = request(&h, 2, 9, 0);
-    open.local.current_role = 2;
+    open.local.current_role = NativeReplicaRole::Idle;
     h.send("ReplicaOpen", &open).await;
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
@@ -700,7 +766,7 @@ async fn stateful_fault_retry_outlives_callers_executor_and_stops_with_unit() {
     let body: FaultBody = from_slice(&message.body).unwrap();
     assert_eq!(
         (body.local.id, body.local.instance, body.fault),
-        (100, 9, 1)
+        (100, 9, NativeFaultType::Transient)
     );
     while partition.fault_delivery().unwrap().attempts < 2 {
         tokio::task::yield_now().await;
@@ -831,11 +897,23 @@ async fn stateful_open_order_endpoints_access_duplicate_and_graceful_isolation()
             query.detail.replica_id,
             query.detail.instance_id
         ),
-        (2, 100, -1)
+        (NativeServiceKind::Stateful, 100, -1)
     );
     assert_eq!(
         (query.detail.read_status, query.detail.write_status),
-        (1, 1)
+        (
+            NativeServicePartitionAccessStatus::Granted,
+            NativeServicePartitionAccessStatus::Granted
+        )
+    );
+    let mut unknown = query.detail.clone();
+    unknown.kind = NativeServiceKind::Unrecognized(i64::MIN);
+    unknown.read_status = NativeServicePartitionAccessStatus::Unrecognized(-1);
+    unknown.write_status = NativeServicePartitionAccessStatus::Unrecognized(i64::MAX);
+    let decoded: ReplicaDetail = from_slice(&to_vec(&unknown).unwrap()).unwrap();
+    assert_eq!(
+        (decoded.kind, decoded.read_status, decoded.write_status),
+        (unknown.kind, unknown.read_status, unknown.write_status)
     );
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
@@ -852,7 +930,7 @@ async fn stateful_idle_open_never_grants_primary_access_and_drop_orders_none_bef
     let mut h = Harness::new().await;
     let calls = register(&h);
     let mut request = request(&h, 3, 1, 0);
-    request.local.current_role = 2;
+    request.local.current_role = NativeReplicaRole::Idle;
     h.send("ReplicaOpen", &request).await;
     let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(reply.error.error, 0);
@@ -864,8 +942,8 @@ async fn stateful_idle_open_never_grants_primary_access_and_drop_orders_none_bef
             crate::ServicePartitionAccessStatus::NotPrimary
         )
     );
-    request.flags = 8;
-    request.local.current_role = 1; // Native Close-only reconstructed descriptor.
+    request.flags = NativeProxyFlags::DROP;
+    request.local.current_role = NativeReplicaRole::None; // Native Close-only reconstructed descriptor.
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
     assert_eq!(
@@ -898,8 +976,8 @@ async fn stateful_failed_open_fences_handle_and_abort_preserves_stateless_siblin
     let mut next = request(&h, 2, 2, 0);
     h.send("ReplicaOpen", &next).await;
     h.receive("ReplicaOpenReply").await;
-    next.flags = 4;
-    next.local.current_role = 1;
+    next.flags = NativeProxyFlags::ABORT;
+    next.local.current_role = NativeReplicaRole::None;
     h.send("ReplicaClose", &next).await;
     h.receive("ReplicaCloseReply").await;
     assert!(h.calls.partitions.lock().unwrap()[0].ensure_valid().is_ok());
@@ -924,7 +1002,7 @@ async fn stateful_abort_cancels_open_owner_and_fences_old_incarnation() {
     tokio::time::timeout(Duration::from_secs(2), calls.open_entered.notified())
         .await
         .unwrap();
-    request.flags = 4;
+    request.flags = NativeProxyFlags::ABORT;
     h.send("ReplicaClose", &request).await;
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_ne!(failed.error.error, 0);
@@ -932,7 +1010,7 @@ async fn stateful_abort_cancels_open_owner_and_fences_old_incarnation() {
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
-    request.flags = 0;
+    request.flags = NativeProxyFlags::NONE;
     request.local.instance = 2;
     request.service.initialization.0 = vec![0];
     h.send("ReplicaOpen", &request).await;
@@ -956,7 +1034,7 @@ async fn cancelled_open_returning_control_aborts_replicator_before_service_and_c
     tokio::time::timeout(Duration::from_secs(2), calls.open_entered.notified())
         .await
         .unwrap();
-    open.flags = 8;
+    open.flags = NativeProxyFlags::DROP;
     h.send("ReplicaClose", &open).await;
     let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_ne!(reply.error.error, 0);
@@ -1022,7 +1100,7 @@ async fn stateful_close_error_is_normalized_only_after_abort_and_panic_never_ack
     request.service.initialization.0 = vec![11];
     h.send("ReplicaOpen", &request).await;
     h.receive("ReplicaOpenReply").await;
-    request.flags = 4;
+    request.flags = NativeProxyFlags::ABORT;
     h.send("ReplicaClose", &request).await;
     h.engine.shared.connection.closed().await;
     assert!(h.engine.shared.authority.check().is_err());
@@ -1069,7 +1147,7 @@ async fn close_between_gate_and_generation_install_cannot_be_overwritten() {
     let mut request = request(&h, 2, 1, 0);
     h.send("ReplicaOpen", &request).await;
     hook.reached.notified().await;
-    request.flags = 4;
+    request.flags = NativeProxyFlags::ABORT;
     h.send("ReplicaClose", &request).await;
     tokio::time::timeout(Duration::from_secs(1), async {
         while h.engine.shared.stateful.close_through([2; 16]) != 1 {
@@ -1085,7 +1163,7 @@ async fn close_between_gate_and_generation_install_cannot_be_overwritten() {
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
-    request.flags = 0;
+    request.flags = NativeProxyFlags::NONE;
     request.local.instance = 2;
     h.send("ReplicaOpen", &request).await;
     let next: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
@@ -1151,13 +1229,13 @@ fn native_default_service(mut service: Service) -> Service {
     service.constraints.clear();
     service.scaleout = 0;
     service.metrics.0.clear();
-    service.move_cost = 0;
+    service.move_cost = NativeMoveCost::Zero;
     service.restart_wait = i64::MIN;
     service.quorum_wait = i64::MIN;
     service.update_version = 0;
     service.placement.0.clear();
     service.standby_keep = i64::MIN;
-    service.activation_mode = 0;
+    service.activation_mode = NativeServicePackageActivationMode::SharedProcess;
     service.dns.clear();
     service
 }
@@ -1167,6 +1245,22 @@ async fn stateful_query_default_metadata_is_not_ready_until_replicator_owner_exi
     let mut h = Harness::new().await;
     let calls = register(&h);
     let request = request(&h, 2, 1, 8);
+    h.send("RAPQuery", &request).await;
+    let missing: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    assert_ne!(missing.error, 0);
+    assert_eq!(
+        (
+            missing.detail.kind,
+            missing.detail.read_status,
+            missing.detail.write_status
+        ),
+        (
+            NativeServiceKind::Stateful,
+            NativeServicePartitionAccessStatus::Invalid,
+            NativeServicePartitionAccessStatus::Invalid
+        )
+    );
+    assert!(calls.events.lock().unwrap().is_empty());
     h.send("ReplicaOpen", &request).await;
     tokio::time::timeout(Duration::from_secs(1), async {
         while calls.partitions.lock().unwrap().is_empty() {
@@ -1180,6 +1274,18 @@ async fn stateful_query_default_metadata_is_not_ready_until_replicator_owner_exi
     h.send("RAPQuery", &query).await;
     let early: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
     assert_eq!(early.error, 0x80071bc7u32 as i32 as i64);
+    assert_eq!(
+        (
+            early.detail.kind,
+            early.detail.read_status,
+            early.detail.write_status
+        ),
+        (
+            NativeServiceKind::Stateful,
+            NativeServicePartitionAccessStatus::ReconfigurationPending,
+            NativeServicePartitionAccessStatus::ReconfigurationPending
+        )
+    );
     calls.release.notify_one();
     h.receive("ReplicaOpenReply").await;
     h.send("RAPQuery", &query).await;
@@ -1191,6 +1297,29 @@ async fn stateful_query_default_metadata_is_not_ready_until_replicator_owner_exi
             ready.detail.replica_id,
             ready.detail.instance_id
         ),
-        (2, 100, -1)
+        (NativeServiceKind::Stateful, 100, -1)
+    );
+    assert_eq!(
+        (ready.detail.read_status, ready.detail.write_status),
+        (
+            NativeServicePartitionAccessStatus::Granted,
+            NativeServicePartitionAccessStatus::Granted
+        )
+    );
+    query.local.instance = 0;
+    h.send("RAPQuery", &query).await;
+    let stale: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    assert_ne!(stale.error, 0);
+    assert_eq!(
+        (
+            stale.detail.kind,
+            stale.detail.read_status,
+            stale.detail.write_status
+        ),
+        (
+            NativeServiceKind::Stateful,
+            NativeServicePartitionAccessStatus::Invalid,
+            NativeServicePartitionAccessStatus::Invalid
+        )
     );
 }

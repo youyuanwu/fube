@@ -1,5 +1,6 @@
 use super::*;
 use crate::profile::{NodeDownReceipt, Peer};
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 
 pub(crate) struct NodeFailure {
     pub index: usize,
@@ -66,7 +67,7 @@ impl Ledger {
             desired: if placement.launch.profile.stateful() && affects_membership == Some(false) {
                 Desired::Absent
             } else {
-                placement.desired.clone()
+                placement.desired
             },
             receipt: receipt.clone(),
             replacement: None,
@@ -82,7 +83,11 @@ impl Ledger {
         let operations = [placement.create_op.clone(), placement.delete_op.clone()];
         self.node_failures.push(failure);
         for operation in operations.into_iter().flatten() {
-            self.complete(&operation, json!({"op":operation,"state":"unknown","error":"owned Node incarnation is confirmed down"}));
+            self.complete(
+                &operation,
+                crate::OperationOutcome::new(&operation, crate::OperationState::Unknown)
+                    .with_error("owned Node incarnation is confirmed down"),
+            );
         }
         if !self.placements[index].launch.profile.stateful()
             || !self.placements[index].created
@@ -188,14 +193,18 @@ impl Ledger {
         }
         let primary = survivors
             .iter()
-            .find(|r| r.current_role == 4)
-            .or_else(|| survivors.iter().find(|r| r.current_role == 3))
+            .find(|r| r.current_role == NativeReplicaRole::Primary)
+            .or_else(|| {
+                survivors
+                    .iter()
+                    .find(|r| r.current_role == NativeReplicaRole::Secondary)
+            })
             .ok_or("no surviving Primary candidate")?;
         let primary_changed = previous
             .replicas
             .0
             .iter()
-            .any(|r| &r.node == lost && r.current_role == 4);
+            .any(|r| &r.node == lost && r.current_role == NativeReplicaRole::Primary);
         let mut body = active.body.clone();
         body.configuration.unit = previous.unit.clone();
         body.configuration.unit.previous = previous.unit.current;
@@ -210,14 +219,14 @@ impl Ledger {
             replica.previous_role = replica.current_role;
             if &replica.node == lost {
                 replica.current_role = if survivors.len() >= previous.unit.minimum as usize {
-                    1
+                    NativeReplicaRole::None
                 } else {
-                    3
+                    NativeReplicaRole::Secondary
                 };
                 replica.up = false;
-                replica.state = 3;
+                replica.state = NativeReplicaState::Dropped;
             } else if replica.node == primary.node {
-                replica.current_role = 4;
+                replica.current_role = NativeReplicaRole::Primary;
             }
             replica.first_lsn = -1;
             replica.last_lsn = -1;
@@ -347,7 +356,7 @@ impl Ledger {
         self.node_failures
             .iter()
             .find(|f| f.replacement.as_ref().is_some_and(|l| &l.node == node))
-            .map(|f| f.desired.clone())
+            .map(|f| f.desired)
             .ok_or("Node is not an admitted restart")
             .map_err(str::to_owned)
     }
@@ -411,7 +420,7 @@ impl Ledger {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.up && r.current_role >= 3)
+                .filter(|r| r.up && r.current_role.is_active())
                 .any(|r| {
                     self.placements
                         .iter()
@@ -424,7 +433,7 @@ impl Ledger {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.up && r.current_role >= 3)
+                .filter(|r| r.up && r.current_role.is_active())
                 .count()
                 < previous.replicas.0.len() / 2 + 1
         {
@@ -433,9 +442,9 @@ impl Ledger {
         let mut build = target.body()?;
         build.unit = previous.unit.clone();
         build.service = active.body.configuration.service.clone();
-        build.replica.previous_role = 1;
-        build.replica.current_role = 2;
-        build.replica.state = 1;
+        build.replica.previous_role = NativeReplicaRole::None;
+        build.replica.current_role = NativeReplicaRole::Idle;
+        build.replica.state = NativeReplicaState::InBuild;
         let repair = ReplicaRepair {
             predecessor,
             old_profile: failure

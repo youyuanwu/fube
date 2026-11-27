@@ -5,7 +5,7 @@
 //! SecondaryDrainManager.cpp:974–1100. Native header-first routing and trailing
 //! state/progress stages are reused; negotiation and full log/ACK pumps are not.
 
-use super::{named, status::Status, transaction::own};
+use super::{copy_codec::CopyMessage, named, status::Status, transaction::own};
 use crate::{
     internal::IStateProviderManager, ApiFuture, Cancellation, Error, IOperationDataStream,
     OperationData, Result, StateProviderId,
@@ -115,21 +115,9 @@ pub(crate) fn drain_state(
         let mut number = 0i64;
         loop {
             let data = operation.data();
-            let stage = data
-                .segments()
-                .last()
-                .ok_or(Error::InvalidInput("missing native copy stage"))?;
-            if stage.len() < 4 {
-                return Err(Error::InvalidInput("truncated native copy stage"));
-            }
-            match u32::from_le_bytes(stage[..4].try_into().expect("4 bytes")) {
-                3 => {
-                    let payload = OperationData::new(
-                        data.segments()[..data.segments().len() - 1]
-                            .iter()
-                            .map(|segment| segment.to_vec())
-                            .collect(),
-                    )?;
+            match CopyMessage::decode_state(data)? {
+                CopyMessage::State(payload) => {
+                    let payload = payload.into_owned()?;
                     manager.set_current_state(number, payload).await?;
                     operation.acknowledge();
                     number = number
@@ -140,7 +128,7 @@ pub(crate) fn drain_state(
                         .await?
                         .ok_or_else(|| Status::Cancelled.error())?;
                 }
-                4 => {
+                CopyMessage::Progress(_) => {
                     manager.end_setting_current_state().await?;
                     return Ok(Some(operation));
                 }

@@ -1,4 +1,5 @@
 use super::{ipc, ra, rap, Error, Result};
+use fube_ra::protocol::NativeProxyFlags;
 use fube_ra::protocol::Service;
 use fubst::serde::ObjectArray;
 
@@ -45,7 +46,7 @@ impl RapClient {
             } => ("ReplicaClose", rap::request(registration, body, *flags)),
             ra::Effect::UpdateServiceDescription { body, registration } => (
                 "ProxyUpdateServiceDescription",
-                rap::request(registration, body, 0),
+                rap::request(registration, body, NativeProxyFlags::NONE),
             ),
             ra::Effect::BuildIdle { body, replica, .. } => (
                 "ReplicatorBuildIdleReplica",
@@ -68,7 +69,7 @@ impl RapClient {
                     local: body.replica.clone(),
                     remote: ObjectArray(vec![]),
                     service: Service::default(),
-                    flags: 0,
+                    flags: NativeProxyFlags::NONE,
                 },
             ),
             _ => return Err(Error::Unsupported),
@@ -121,7 +122,7 @@ mod tests {
                     token: 1,
                     body: body.clone(),
                     registration: registration.clone(),
-                    flags: 4,
+                    flags: NativeProxyFlags::ABORT,
                 },
                 "ReplicaOpen",
                 "runtime",
@@ -134,7 +135,7 @@ mod tests {
                     token: 2,
                     body: body.clone(),
                     registration: registration.clone(),
-                    flags: 8,
+                    flags: NativeProxyFlags::DROP,
                 },
                 "ReplicaClose",
                 "runtime",
@@ -208,7 +209,7 @@ mod tests {
                     }),
                     local: Box::new(body.replica.clone()),
                     registration,
-                    flags: 3,
+                    flags: NativeProxyFlags::END_RECONFIGURATION | NativeProxyFlags::CATCH_UP,
                 },
                 "UpdateConfiguration",
                 "",
@@ -228,7 +229,7 @@ mod tests {
                     local: body.replica.clone(),
                     remote: ObjectArray(replicas),
                     service,
-                    flags,
+                    flags: NativeProxyFlags::from_bits_retain(flags),
                 })
                 .unwrap(),
                 "{action}"

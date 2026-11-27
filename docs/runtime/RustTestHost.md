@@ -666,6 +666,15 @@ For stateful profiles, provision isolated valid log paths/settings rather than
 all-zero stand-ins.
 [Shared-log schema][shared-log]; [optional log-manager inputs][log-manager].
 
+Hosting, runtime and test-host records share
+[`NativeSharedLogCreationFlags`](../../crates/libs/fube-core/src/protocol/shared_log.rs).
+This is unsigned **u32**/numeric JSON, not a LONG64 enum. The pinned KTL
+[creation flag][log-creation-flags] is `FlagSparseFile=1`; zero means no flags.
+Unknown bits, including the unsigned upper half, remain lossless metadata.
+Native [storage configuration][shared-log-validation] accepts only zero or
+`FlagSparseFile`; codec recognition and bootstrap forwarding do not perform
+that admission, create storage, or enable additional storage profiles.
+
 Return an explicit unsupported-capability failure if an app requests a local
 FabricClient/gateway operation the profile does not implement. Leaving the
 client address empty and allowing fallback to a real cluster is not isolation.
@@ -906,6 +915,8 @@ source maps. Additional bootstrap/materialization evidence follows.
 [principal-file]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/PrincipalsDescription.cpp#L327-L413
 [start-reply]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Hosting2/StartRegisterApplicationHostReply.h#L85-L124
 [shared-log]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ktllogger/SharedLogSettings.h#L33-L130
+[log-creation-flags]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ktllogger/sys/inc/ktllogger.h#L1380-L1385
+[shared-log-validation]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ktllogger/sys/ktlshim/OverlayManager.cpp#L3412-L3421
 [health-decoder]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/client/HealthReportingComponent.cpp#L314-L416
 [health-reply]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/management/HealthManager/ReportHealthReplyMessageBody.h#L12-L47
 [proxy-map]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/LocalFailoverUnitProxyMap.cpp#L58-L150

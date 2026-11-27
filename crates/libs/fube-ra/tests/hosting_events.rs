@@ -1,5 +1,7 @@
 //! Real serialized consumer decisions over committed RA state. Lookup/runtime
 //! attachment premises below are qualification-only; no H2/RAP/deployment claim.
+use fube_core::protocol::NativeProxyFlags;
+use fube_ra::protocol::NativeReplicaState;
 use fube_ra::{entity::*, protocol::*};
 use fube_ra_store::{MemoryBackend, Settings as StoreSettings, Store};
 use std::{sync::Arc, time::Duration};
@@ -46,7 +48,7 @@ fn body() -> AddInstance {
     b.replica.node = admission().local_node;
     b.replica.id = 40;
     b.replica.instance = 50;
-    b.replica.state = 1;
+    b.replica.state = NativeReplicaState::InBuild;
     b.replica.version = VersionInstance::default();
     b.service.name = "fabric:/App/service".into();
     b.service.service_type = ServiceType {
@@ -495,7 +497,10 @@ async fn local_runtime_close_is_ordinary_and_host_close_finishes_distinctly() {
     assert!(matches!(
         executor.take_effects().as_slice(),
         [Dispatched {
-            effect: Effect::Close { flags: 0, .. },
+            effect: Effect::Close {
+                flags: NativeProxyFlags::NONE,
+                ..
+            },
             ..
         }]
     ));

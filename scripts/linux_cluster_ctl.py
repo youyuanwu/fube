@@ -2,6 +2,7 @@
 
 import argparse
 from contextlib import contextmanager
+from enum import Enum
 import hashlib
 import json
 import math
@@ -31,7 +32,27 @@ PACKAGE_SHA = "fbcb0b8d52e84b7e2bf9c336d9e0ece8cb9ff7fa1de53367d56c6ff8ab850c83"
 FABRIC_SHA = "c1bdc6523fea1a3711b2a4cd4d7cfa57c1133254a23c521c8054ad4d1ff0249f"
 PACKAGE = f"/opt/sf-install/servicefabric_{RUNTIME}.deb"
 NODES = ("n0", "n1", "n2")
-PHASES = ("allocating", "starting", "baseline", "ready", "down", "destroying", "destroyed")
+
+
+class ClusterPhase(str, Enum):
+    ALLOCATING = "allocating"
+    STARTING = "starting"
+    BASELINE = "baseline"
+    READY = "ready"
+    DOWN = "down"
+    DESTROYING = "destroying"
+    DESTROYED = "destroyed"
+
+
+class BaselineState(str, Enum):
+    NOT_STARTED = "not-started"
+    SUBMITTING = "submitting"
+    ACCEPTED = "accepted"
+    COMPLETE = "complete"
+
+
+PHASES = tuple(phase.value for phase in ClusterPhase)
+BASELINE_STATES = tuple(state.value for state in BaselineState)
 SEED_VOLUME = """
 import json, os, pathlib, sys
 p = pathlib.Path('/var/lib/sf-node')
@@ -188,6 +209,14 @@ class Cluster:
         self.state.update(changes)
         write_json(self.path, self.state)
 
+    @property
+    def phase(self) -> ClusterPhase:
+        return ClusterPhase(self.state["phase"])
+
+    @property
+    def baseline_state(self) -> BaselineState:
+        return BaselineState(self.state["baseline"])
+
     def event(self, event, **values):
         with open(
             self.directory / "events.jsonl", "a",
@@ -211,12 +240,12 @@ class Cluster:
                 or state.get("shutdown_timeout", 45) not in (45, SHUTDOWN_TIMEOUT) \
                 or not re.fullmatch(r"[0-9a-f]{32}", state.get("owner", "")):
             raise ValueError("Invalid cluster identity/state")
-        if state["phase"] == "destroyed":
+        if self.phase is ClusterPhase.DESTROYED:
             return
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", state.get("image", "")) \
                 or state.get("runtime_version") != RUNTIME or state.get("manifest_version") != "1":
             raise ValueError("Unsupported image/runtime/manifest identity")
-        if state.get("baseline") not in ("not-started", "submitting", "accepted", "complete"):
+        if state.get("baseline") not in BASELINE_STATES:
             raise ValueError("Invalid native baseline journal")
         expected, nodes = self.definition(state, self.directory)
         if state.get("nodes") != nodes:
@@ -329,12 +358,12 @@ class Cluster:
                 if (volume.get("Labels") or {}).get(OWNER_LABEL) != self.state["owner"]:
                     raise ValueError("Volume allocation collided with a foreign owner")
             self.helper(node, SEED_VOLUME)
-        self.save(phase="starting")
+        self.save(phase=ClusterPhase.STARTING.value)
 
     def create(self, subnet, image, timeout, *, on_allocated=None):
         if self.path.exists():
             self.load()
-            if self.state["phase"] != "destroyed":
+            if self.phase is not ClusterPhase.DESTROYED:
                 raise ValueError("Cluster already exists; use up to resume it")
         elif self.directory.exists():
             raise ValueError("State directory exists without an allocation record; preserve and inspect it")
@@ -352,8 +381,8 @@ class Cluster:
         self.state = {
             "schema": 1, "name": self.name, "project": self.project,
             "owner": uuid.uuid4().hex, "image": image_id, "subnet": str(check_subnet(subnet, [])),
-            "runtime_version": RUNTIME, "manifest_version": "1", "phase": "allocating",
-            "baseline": "not-started", "publish_gateway": True,
+            "runtime_version": RUNTIME, "manifest_version": "1", "phase": ClusterPhase.ALLOCATING.value,
+            "baseline": BaselineState.NOT_STARTED.value, "publish_gateway": True,
             "shutdown_timeout": SHUTDOWN_TIMEOUT,
         }
         _, nodes = self.definition(self.state, self.directory)
@@ -448,21 +477,21 @@ class Cluster:
             raise ValueError("Cannot determine native baseline; inspect last-status.json")
         states = {gateway["baseline"] for gateway in gateways.values()}
         if states == {"complete"}:
-            self.save(baseline="complete")
+            self.save(baseline=BaselineState.COMPLETE.value)
             return
         if not states.issubset({"uninitialized", "active", "complete"}):
             raise ValueError("Conflicting native baseline; refusing mutation")
         if "active" in states:
-            self.save(phase="baseline", baseline="accepted")
+            self.save(phase=ClusterPhase.BASELINE.value, baseline=BaselineState.ACCEPTED.value)
             return
         if states != {"uninitialized"}:
             raise ValueError("Gateways disagree on native baseline; retry after convergence")
-        if self.state["baseline"] in ("submitting", "accepted", "complete"):
+        if self.baseline_state in (BaselineState.SUBMITTING, BaselineState.ACCEPTED, BaselineState.COMPLETE):
             raise ValueError(
                 "Baseline submission is ambiguous or lost; inspect native progress. "
                 "Refusing to submit it again or reset data"
             )
-        self.save(phase="baseline")
+        self.save(phase=ClusterPhase.BASELINE.value)
         endpoint = "http://" + self.state["nodes"][0]["node_ip"] + ":19080"
         self.sfctl("cluster", "select", "--endpoint", endpoint)
         upload_name = "baseline-" + self.state["owner"]
@@ -483,7 +512,7 @@ class Cluster:
         if provision:
             self.sfctl("application", "upload", "--path", upload, "--timeout", "300", timeout=320)
             self.sfctl("cluster", "provision", *provision, "--timeout", "180", timeout=200)
-        self.save(baseline="submitting")
+        self.save(baseline=BaselineState.SUBMITTING.value)
         self.event("baseline-submit")
         self.sfctl(
             "cluster", "upgrade", "--code-version", RUNTIME, "--config-version", "1",
@@ -493,20 +522,20 @@ class Cluster:
             "--upgrade-timeout", "PT600S", "--replica-set-check-timeout", "120",
             "--unhealthy-nodes", "0", "--unhealthy-applications", "0", "--warning-as-error",
         )
-        self.save(baseline="accepted")
+        self.save(baseline=BaselineState.ACCEPTED.value)
 
     def up(self, timeout, restart_nodes=()):
-        if self.state["phase"] in ("destroying", "destroyed"):
+        if self.phase in (ClusterPhase.DESTROYING, ClusterPhase.DESTROYED):
             raise ValueError("Cluster is being/has been destroyed; cannot resume it")
         self.deadline = time.monotonic() + timeout
         self.retain_image()
-        self.resources(require_volumes=self.state["phase"] != "allocating")
+        self.resources(require_volumes=self.phase is not ClusterPhase.ALLOCATING)
         self.subnet_check()
-        if self.state["phase"] == "allocating":
+        if self.phase is ClusterPhase.ALLOCATING:
             self.allocate()
         for node in self.state["nodes"]:
             self.helper(node, READ_VOLUME, readonly=True)
-        self.save(phase="starting")
+        self.save(phase=ClusterPhase.STARTING.value)
         self.compose("up", "-d", "--no-build", "--pull", "never", *self.services)
         if restart_nodes:
             self.event("explicit-node-restart", nodes=list(restart_nodes))
@@ -518,8 +547,8 @@ class Cluster:
                 self.establish_baseline()
                 self.wait(True)
         self.save(
-            phase="ready",
-            baseline="complete" if self.requires_baseline else self.state["baseline"],
+            phase=ClusterPhase.READY.value,
+            baseline=BaselineState.COMPLETE.value if self.requires_baseline else self.baseline_state.value,
         )
         self.event("ready")
         return {"name": self.name, "project": self.project, "ready": True,
@@ -527,9 +556,11 @@ class Cluster:
                 "manifest_version": "1", "state": str(self.directory)}
 
     def status(self):
-        if self.state["phase"] == "destroyed":
-            return {"name": self.name, "phase": "destroyed", "ready": False}
-        containers, _, _ = self.resources(require_volumes=self.state["phase"] not in ("allocating", "destroying"))
+        if self.phase is ClusterPhase.DESTROYED:
+            return {"name": self.name, "phase": ClusterPhase.DESTROYED.value, "ready": False}
+        containers, _, _ = self.resources(
+            require_volumes=self.phase not in (ClusterPhase.ALLOCATING, ClusterPhase.DESTROYING),
+        )
         summary = {
             container["Config"]["Labels"]["com.docker.compose.service"]: {
                 "status": container["State"]["Status"], "exit_code": container["State"]["ExitCode"],
@@ -546,13 +577,13 @@ class Cluster:
         return result
 
     def down(self):
-        if self.state["phase"] == "destroyed":
+        if self.phase is ClusterPhase.DESTROYED:
             raise ValueError("Cluster has already been destroyed")
-        if self.state["phase"] == "destroying":
+        if self.phase is ClusterPhase.DESTROYING:
             raise ValueError("Destroy is incomplete; repeat destroy, not down")
-        self.resources(require_volumes=self.state["phase"] != "allocating")
+        self.resources(require_volumes=self.phase is not ClusterPhase.ALLOCATING)
         self.compose("stop", "--timeout", str(self.state.get("shutdown_timeout", 45)))
-        containers, _, _ = self.resources(require_volumes=self.state["phase"] != "allocating")
+        containers, _, _ = self.resources(require_volumes=self.phase is not ClusterPhase.ALLOCATING)
         exits = {
             container["Config"]["Labels"]["com.docker.compose.service"]: container["State"]["ExitCode"]
             for container in containers
@@ -560,8 +591,8 @@ class Cluster:
         }
         self.compose("down", "--timeout", str(self.state.get("shutdown_timeout", 45)))
         # Preserve allocating so up can finish an interrupted initial allocation.
-        if self.state["phase"] != "allocating":
-            self.save(phase="down")
+        if self.phase is not ClusterPhase.ALLOCATING:
+            self.save(phase=ClusterPhase.DOWN.value)
         self.event("down", node_exit_codes=exits)
         if any(code != 0 for code in exits.values()):
             raise ValueError(
@@ -572,20 +603,20 @@ class Cluster:
     def destroy(self, confirmation):
         if confirmation != self.name:
             raise ValueError("Destructive action requires --confirm with the exact cluster name")
-        if self.state["phase"] != "destroyed":
+        if self.phase is not ClusterPhase.DESTROYED:
             _, volumes, _ = self.resources(require_volumes=False)
             retained_image = self.image_tag_id()
-            self.save(phase="destroying")
+            self.save(phase=ClusterPhase.DESTROYING.value)
             self.compose("down", "--timeout", str(self.state.get("shutdown_timeout", 45)))
             for volume in volumes:
                 run(["docker", "volume", "rm", volume["Name"]])
             if retained_image:
                 run(["docker", "image", "rm", self.image_tag])
-            self.save(phase="destroyed")
+            self.save(phase=ClusterPhase.DESTROYED.value)
         for name in ("ClusterManifest.xml", "compose.json", "last-status.json"):
             (self.directory / name).unlink(missing_ok=True)
         self.event("destroyed")
-        return {"name": self.name, "phase": "destroyed", "data_deleted": True}
+        return {"name": self.name, "phase": ClusterPhase.DESTROYED.value, "data_deleted": True}
 
 
 def positive_timeout(value):

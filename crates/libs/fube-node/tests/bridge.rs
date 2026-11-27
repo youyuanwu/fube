@@ -1,7 +1,11 @@
 //! Actual owned node/Hosting/RA paths with explicit trusted qualification
 //! readiness and simulated FT creation. No H2 acquisition/RAP/FM completion.
+use fube_hosting::wire::NativeActivityType;
+use fube_hosting::wire::NativeApplicationHostType;
+use fube_hosting::wire::NativeServicePackageActivationMode;
 use fube_hosting::{self as hosting, ipc::*, wire};
 use fube_node::{Config, Handle, Input, Node, Response};
+use fube_ra::protocol::NativeReplicaState;
 use fube_ra::{entity as ra, protocol as p};
 use fube_ra_store::{
     Backend, BackendContext, MemoryBackend, Output, Request as StoreRequest,
@@ -91,7 +95,7 @@ fn host_admission() -> Admission {
         deadlines: RequestDeadlines::Propagated,
         host: wire::HostContext {
             id: uuid::Uuid::new_v4().to_string(),
-            kind: 1,
+            kind: NativeApplicationHostType::ActivatedSingleCodePackage,
             pid: std::process::id(),
             container: false,
             activator: false,
@@ -108,7 +112,7 @@ fn host_admission() -> Admission {
                     },
                     activation: wire::Activation {
                         guid: Guid([0; 16]),
-                        mode: 0,
+                        mode: NativeServicePackageActivationMode::SharedProcess,
                     },
                     public_id: String::new(),
                 },
@@ -160,7 +164,7 @@ fn ra_body() -> p::AddInstance {
     b.replica.node = ra_admission().local_node;
     b.replica.id = 40;
     b.replica.instance = 50;
-    b.replica.state = 1;
+    b.replica.state = NativeReplicaState::InBuild;
     b.replica.version = p::VersionInstance::default();
     b.service.name = "fabric:/App/service".into();
     b.service.service_type = p::ServiceType {
@@ -410,6 +414,15 @@ async fn actual_node_registration_lookup_all_five_consumers_and_owned_gated_resi
         .iter()
         .find(|s| s.id.service_type.name == "Probe")
         .unwrap();
+    assert_eq!(
+        widget
+            .last_disabled_report
+            .as_ref()
+            .unwrap()
+            .health_state
+            .code(),
+        1
+    );
     let Response::Lookup(lookup) = request(
         &handle,
         Input::Lookup(hosting::LookupRequest {
@@ -450,7 +463,7 @@ async fn actual_node_registration_lookup_all_five_consumers_and_owned_gated_resi
         .as_ref()
         .unwrap();
     assert_eq!(report.kind, hosting::DisabledReportKind::TypeDisabled);
-    assert_eq!(report.health_state, 3);
+    assert_eq!(report.health_state.code(), 3);
     request(&handle, Input::RemoveFailure("qualified-failure".into()));
     let enabled = receipt(&handle).await;
     assert!(matches!(
@@ -492,7 +505,7 @@ async fn actual_node_registration_lookup_all_five_consumers_and_owned_gated_resi
                         guid: Guid([2; 16]),
                         index: 1,
                     },
-                    kind: 0,
+                    kind: NativeActivityType::Unknown,
                 },
             },
         )
@@ -735,7 +748,7 @@ async fn full_fanout_budget_preserves_empty_closure_head_and_uncollected_receipt
                         guid: Guid([2; 16]),
                         index: 1,
                     },
-                    kind: 0,
+                    kind: NativeActivityType::Unknown,
                 },
             },
         )

@@ -169,6 +169,11 @@ class OneboxTests(unittest.TestCase):
                     self.cluster.up(900)
                 baseline.assert_not_called()
                 self.assertEqual(self.cluster.state["baseline"], journal)
+                self.assertIs(self.cluster.phase, ctl.ClusterPhase.READY)
+                self.assertIs(self.cluster.baseline_state, ctl.BaselineState(journal))
+                recorded = json.loads(self.cluster.path.read_text())
+                self.assertEqual(recorded["phase"], "ready")
+                self.assertEqual(recorded["baseline"], journal)
 
     def test_status_executes_probe_in_the_existing_container(self):
         containers = [{

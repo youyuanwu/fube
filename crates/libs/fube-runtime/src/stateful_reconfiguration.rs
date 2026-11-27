@@ -1,4 +1,8 @@
 use super::*;
+use fube_core::protocol::{
+    NativeProxyFlags, NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation,
+    NativeServiceOperation,
+};
 
 const DEMOTE_COMPLETED: i64 = 0x80071d24u32 as i32 as i64;
 const STATE_CHANGED: i64 = 0x80071d28u32 as i32 as i64;
@@ -61,11 +65,17 @@ impl Registry {
             return Err(Error::Protocol("invalid native stateful control context"));
         }
         let valid_shape = match action {
-            "UpdateConfiguration" => request.flags & !3 == 0 && !request.remote.0.is_empty(),
-            "ReplicatorBuildIdleReplica" | "ReplicatorRemoveIdleReplica" => {
-                request.flags == 0 && request.remote.0.len() == 1
+            "UpdateConfiguration" => {
+                request
+                    .flags
+                    .difference(NativeProxyFlags::END_RECONFIGURATION | NativeProxyFlags::CATCH_UP)
+                    .is_empty()
+                    && !request.remote.0.is_empty()
             }
-            _ => request.flags == 0 && request.remote.0.is_empty(),
+            "ReplicatorBuildIdleReplica" | "ReplicatorRemoveIdleReplica" => {
+                request.flags.is_empty() && request.remote.0.len() == 1
+            }
+            _ => request.flags.is_empty() && request.remote.0.is_empty(),
         };
         if !valid_shape {
             return Err(Error::Protocol(
@@ -121,7 +131,8 @@ impl Registry {
                     return Ok(());
                 };
                 let (replicator, cancel) = participants(unit)?;
-                let mut failed_api = (6, 4);
+                let mut failed_api =
+                    NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::UpdateEpoch);
                 let mut revision = primary_fence(unit);
                 let result = async {
                     if action == "ReplicatorUpdateEpochAndGetStatus" {
@@ -131,7 +142,8 @@ impl Registry {
                         revision = primary_fence(unit);
                         self.update_epoch(unit, &replicator, &cancel).await?;
                     }
-                    failed_api = (12, 4);
+                    failed_api =
+                        NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::GetStatus);
                     self.progress(unit, replicator).await
                 }
                 .await;
@@ -227,8 +239,9 @@ impl Registry {
                 return Err(Error::Closed);
             }
             state.role_changing = true;
-            state.error_api = (6, 4);
-            state.replicator_operation = 8;
+            state.error_api =
+                NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::UpdateEpoch);
+            state.replicator_operation = NativeReplicatorOperation::UPDATE_EPOCH;
             epoch
         };
         let replicator = replicator.clone();
@@ -244,7 +257,7 @@ impl Registry {
         if result.is_ok() {
             state.last_primary_epoch = epoch;
         }
-        state.replicator_operation = 1;
+        state.replicator_operation = NativeReplicatorOperation::NONE;
         result
     }
 
@@ -262,7 +275,8 @@ impl Registry {
                 return Err(Error::Closed);
             }
             state.role_changing = true;
-            state.error_api = (12, 4);
+            state.error_api =
+                NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::GetStatus);
             state.native.clone()
         };
         let progress = self
@@ -324,7 +338,7 @@ impl Registry {
                 return Ok(());
             }
             let mut response = request;
-            response.flags = 0;
+            response.flags = NativeProxyFlags::NONE;
             #[cfg(test)]
             {
                 let hook = self.configuration_reply_hook.lock().unwrap().take();
@@ -340,7 +354,10 @@ impl Registry {
                     response,
                     result.err(),
                     ReplyControl {
-                        api: Some((13, 4)),
+                        api: Some(NativeApi::new(
+                            NativeInterfaceName::Replicator,
+                            NativeApiName::UpdateCatchupConfiguration,
+                        )),
                         revision: Some(revision),
                     },
                 )
@@ -375,18 +392,20 @@ impl Registry {
             let primary = requested == ReplicaRole::Primary
                 && old_service == requested
                 && old_replicator == requested
-                && request.flags & 1 == 0;
+                && !request
+                    .flags
+                    .contains(NativeProxyFlags::END_RECONFIGURATION);
             (
                 primary
                     && same_epoch
-                    && request.flags & 2 != 0
+                    && request.flags.contains(NativeProxyFlags::CATCH_UP)
                     && status.catch_up == CatchUpResult::DataLossReported,
                 primary
-                    && request.flags & 2 != 0
+                    && request.flags.contains(NativeProxyFlags::CATCH_UP)
                     && status.configuration_stage == ConfigurationStage::Current,
                 primary
                     && same_epoch
-                    && request.flags & 2 != 0
+                    && request.flags.contains(NativeProxyFlags::CATCH_UP)
                     && status.catch_up == CatchUpResult::Completed,
             )
         };
@@ -404,7 +423,7 @@ impl Registry {
                         message: "state changed on data loss".into(),
                     }),
                     ReplyControl {
-                        api: Some((0, 0)),
+                        api: Some(NativeApi::default()),
                         revision: Some(revision),
                     },
                 )
@@ -437,7 +456,10 @@ impl Registry {
                     request,
                     result.err(),
                     ReplyControl {
-                        api: Some((13, 4)),
+                        api: Some(NativeApi::new(
+                            NativeInterfaceName::Replicator,
+                            NativeApiName::UpdateCatchupConfiguration,
+                        )),
                         revision: Some(revision),
                     },
                 )
@@ -450,7 +472,7 @@ impl Registry {
         {
             return Ok(());
         }
-        let mut failed_api = (0, 0);
+        let mut failed_api = NativeApi::default();
         let result = async {
             if requested == ReplicaRole::ActiveSecondary && old_replicator == ReplicaRole::Primary {
                 {
@@ -460,18 +482,31 @@ impl Registry {
                     // Only a newer native epoch can enter PreWriteRevoke.
                     // A retry must not undo an already completed revocation.
                 }
-                failed_api = (13, 4);
+                failed_api = NativeApi::new(
+                    NativeInterfaceName::Replicator,
+                    NativeApiName::UpdateCatchupConfiguration,
+                );
                 self.configuration(unit, &replicator, &request, false, &cancel)
                     .await?;
-                failed_api = (9, 4);
+                failed_api = NativeApi::new(
+                    NativeInterfaceName::Replicator,
+                    NativeApiName::CatchupReplicaSet,
+                );
                 self.catch_up(unit, &replicator, ReplicaSetQuorumMode::All, true, &cancel)
                     .await?;
-                failed_api = (6, 4);
+                failed_api =
+                    NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::UpdateEpoch);
                 self.update_epoch(unit, &replicator, &cancel).await?;
-                failed_api = (13, 4);
+                failed_api = NativeApi::new(
+                    NativeInterfaceName::Replicator,
+                    NativeApiName::UpdateCatchupConfiguration,
+                );
                 self.configuration(unit, &replicator, &request, false, &cancel)
                     .await?;
-                failed_api = (9, 4);
+                failed_api = NativeApi::new(
+                    NativeInterfaceName::Replicator,
+                    NativeApiName::CatchupReplicaSet,
+                );
                 self.catch_up(unit, &replicator, ReplicaSetQuorumMode::All, false, &cancel)
                     .await?;
                 let changed = self
@@ -488,7 +523,8 @@ impl Registry {
                     let state = unit.state.lock().unwrap();
                     state.status.lock().unwrap().configuration_stage = ConfigurationStage::Current;
                 }
-                failed_api = (12, 4);
+                failed_api =
+                    NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::GetStatus);
                 self.progress(unit, replicator.clone()).await?;
             } else if requested == ReplicaRole::Primary
                 && (old_replicator != ReplicaRole::Primary || old_service != ReplicaRole::Primary)
@@ -500,10 +536,16 @@ impl Registry {
                 }
                 self.promote(unit, &replicator, &request, &cancel, &mut failed_api)
                     .await?;
-                failed_api = (13, 4);
+                failed_api = NativeApi::new(
+                    NativeInterfaceName::Replicator,
+                    NativeApiName::UpdateCatchupConfiguration,
+                );
                 self.configuration(unit, &replicator, &request, false, &cancel)
                     .await?;
-                failed_api = (9, 4);
+                failed_api = NativeApi::new(
+                    NativeInterfaceName::Replicator,
+                    NativeApiName::CatchupReplicaSet,
+                );
                 self.catch_up(
                     unit,
                     &replicator,
@@ -523,30 +565,44 @@ impl Registry {
                     .await;
                 failed_api = role_failure_api(unit, requested);
                 changed?;
-                if request.flags & 2 != 0 {
-                    failed_api = (12, 4);
+                if request.flags.contains(NativeProxyFlags::CATCH_UP) {
+                    failed_api =
+                        NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::GetStatus);
                     self.progress(unit, replicator.clone()).await?;
                 }
-            } else if request.flags & 1 != 0 {
-                failed_api = (14, 4);
+            } else if request
+                .flags
+                .contains(NativeProxyFlags::END_RECONFIGURATION)
+            {
+                failed_api = NativeApi::new(
+                    NativeInterfaceName::Replicator,
+                    NativeApiName::UpdateCurrentConfiguration,
+                );
                 self.configuration(unit, &replicator, &request, true, &cancel)
                     .await?;
                 let state = unit.state.lock().unwrap();
                 let mut status = state.status.lock().unwrap();
                 status.catch_up = CatchUpResult::Completed;
                 status.configuration_stage = ConfigurationStage::Current;
-            } else if request.flags & 2 != 0 {
+            } else if request.flags.contains(NativeProxyFlags::CATCH_UP) {
                 {
                     let state = unit.state.lock().unwrap();
                     let mut status = state.status.lock().unwrap();
                     status.catch_up = CatchUpResult::NotStarted;
                 }
-                failed_api = (6, 4);
+                failed_api =
+                    NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::UpdateEpoch);
                 self.update_epoch(unit, &replicator, &cancel).await?;
-                failed_api = (13, 4);
+                failed_api = NativeApi::new(
+                    NativeInterfaceName::Replicator,
+                    NativeApiName::UpdateCatchupConfiguration,
+                );
                 self.configuration(unit, &replicator, &request, false, &cancel)
                     .await?;
-                failed_api = (9, 4);
+                failed_api = NativeApi::new(
+                    NativeInterfaceName::Replicator,
+                    NativeApiName::CatchupReplicaSet,
+                );
                 self.catch_up(
                     unit,
                     &replicator,
@@ -565,7 +621,14 @@ impl Registry {
                     .unwrap()
                     .configuration_stage
                     == ConfigurationStage::Current;
-                failed_api = (if current { 14 } else { 13 }, 4);
+                failed_api = NativeApi::new(
+                    NativeInterfaceName::Replicator,
+                    if current {
+                        NativeApiName::UpdateCurrentConfiguration
+                    } else {
+                        NativeApiName::UpdateCatchupConfiguration
+                    },
+                );
                 self.configuration(unit, &replicator, &request, current, &cancel)
                     .await?;
             }
@@ -586,7 +649,11 @@ impl Registry {
             request,
             result.err(),
             ReplyControl {
-                api: Some(if control_error { (0, 0) } else { failed_api }),
+                api: Some(if control_error {
+                    NativeApi::default()
+                } else {
+                    failed_api
+                }),
                 revision: Some(revision),
             },
         )
@@ -599,7 +666,7 @@ impl Registry {
         replicator: &Arc<dyn IPrimaryReplicator>,
         request: &w::ProxyRequest,
         cancel: &Cancellation,
-        failed_api: &mut (i64, i64),
+        failed_api: &mut NativeApi,
     ) -> Result<()> {
         let epoch = api_epoch(&request.unit.current).primary();
         let old = unit
@@ -611,16 +678,18 @@ impl Registry {
             .unwrap()
             .replicator_role;
         if old != ReplicaRole::Primary {
-            *failed_api = (8, 4);
+            *failed_api =
+                NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::ChangeRole);
             {
                 let mut state = unit.state.lock().unwrap();
-                state.error_api = (8, 4);
-                state.replicator_operation = 4;
+                state.error_api =
+                    NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::ChangeRole);
+                state.replicator_operation = NativeReplicatorOperation::CHANGE_ROLE;
             }
             self.change_replicator_role(unit, ReplicaRole::Primary, epoch, cancel)
                 .await?;
         }
-        *failed_api = (6, 4);
+        *failed_api = NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::UpdateEpoch);
         self.update_epoch(unit, replicator, cancel).await?;
         let service = unit
             .state
@@ -631,11 +700,17 @@ impl Registry {
             .ok_or(Error::Closed)?;
         {
             let mut state = unit.state.lock().unwrap();
-            state.error_api = (8, 1);
-            state.operation = 4;
+            state.error_api = NativeApi::new(
+                NativeInterfaceName::StatefulServiceReplica,
+                NativeApiName::ChangeRole,
+            );
+            state.operation = NativeServiceOperation::ChangeRole;
             state.operation_start = super::super::lifecycle::filetime();
         }
-        *failed_api = (8, 1);
+        *failed_api = NativeApi::new(
+            NativeInterfaceName::StatefulServiceReplica,
+            NativeApiName::ChangeRole,
+        );
         let operation_cancel = cancel.clone();
         let changed = self
             .complete(async move {
@@ -644,7 +719,7 @@ impl Registry {
                     .await
             })
             .await;
-        unit.state.lock().unwrap().operation = 1;
+        unit.state.lock().unwrap().operation = NativeServiceOperation::None;
         let address = changed?;
         if address.is_empty() {
             return Err(Error::InvalidInput(
@@ -661,7 +736,8 @@ impl Registry {
         let previous = api_epoch(&request.unit.previous);
         if previous != Epoch::INVALID && previous.data_loss_number != request.unit.current.data_loss
         {
-            *failed_api = (7, 4);
+            *failed_api =
+                NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::OnDataLoss);
             if self.data_loss(unit, replicator, cancel).await? {
                 {
                     let state = unit.state.lock().unwrap();
@@ -706,8 +782,9 @@ impl Registry {
             }
             state.role_changing = true;
             state.ready = false;
-            state.error_api = (7, 4);
-            state.replicator_operation = 64;
+            state.error_api =
+                NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::OnDataLoss);
+            state.replicator_operation = NativeReplicatorOperation::ON_DATA_LOSS;
         }
         let replicator = replicator.clone();
         let operation_cancel = cancel.clone();
@@ -717,7 +794,7 @@ impl Registry {
         {
             let mut state = unit.state.lock().unwrap();
             state.role_changing = false;
-            state.replicator_operation = 1;
+            state.replicator_operation = NativeReplicatorOperation::NONE;
             if result.is_ok() && !cancel.is_cancelled() {
                 state.ready = true;
             }
@@ -761,7 +838,11 @@ impl Registry {
                             && ((old.ready
                                 && request.remote.0.iter().any(|r| {
                                     r.node.id.0.as_slice() == incoming.node_id
-                                        && matches!(r.state, 0 | 1)
+                                        && matches!(
+                                            r.state,
+                                            NativeReplicaState::StandBy
+                                                | NativeReplicaState::InBuild
+                                        )
                                 }))
                                 || (!old.up && incoming.up)))
                     {
@@ -781,7 +862,14 @@ impl Registry {
             }
             state.configuring = true;
             state.applied_configuration = None;
-            state.error_api = (if current_only { 14 } else { 13 }, 4);
+            state.error_api = NativeApi::new(
+                NativeInterfaceName::Replicator,
+                if current_only {
+                    NativeApiName::UpdateCurrentConfiguration
+                } else {
+                    NativeApiName::UpdateCatchupConfiguration
+                },
+            );
             state.status.lock().unwrap().configuration = remotes;
             let revision = state.full_revision.load(Ordering::Acquire);
             receipt.revision = revision;
@@ -891,8 +979,11 @@ impl Registry {
                 cancel: cancel.clone(),
                 sequence,
             });
-            state.error_api = (9, 4);
-            state.replicator_operation = 128;
+            state.error_api = NativeApi::new(
+                NativeInterfaceName::Replicator,
+                NativeApiName::CatchupReplicaSet,
+            );
+            state.replicator_operation = NativeReplicatorOperation::WAIT_FOR_CATCH_UP;
             (
                 cancel,
                 sequence,
@@ -916,7 +1007,7 @@ impl Registry {
         {
             state.catch_up_operation = None;
         }
-        state.replicator_operation = 1;
+        state.replicator_operation = NativeReplicatorOperation::NONE;
         let current = state.full_revision.load(Ordering::Acquire) == revision;
         if result.is_ok() && !cancel.is_cancelled() && !lifetime.is_cancelled() && current {
             let mut status = state.status.lock().unwrap();
@@ -1023,7 +1114,7 @@ impl Registry {
             request,
             error,
             ReplyControl {
-                api: Some((0, 0)),
+                api: Some(NativeApi::default()),
                 revision: Some(revision),
             },
         )
@@ -1155,7 +1246,7 @@ impl Registry {
                     request,
                     None,
                     ReplyControl {
-                        api: Some((0, 0)),
+                        api: Some(NativeApi::default()),
                         revision: Some(revision),
                     },
                 )
@@ -1222,7 +1313,7 @@ impl Registry {
             request,
             result.err(),
             ReplyControl {
-                api: Some((0, 0)),
+                api: Some(NativeApi::default()),
                 revision: Some(revision),
             },
         )
@@ -1359,7 +1450,7 @@ impl Registry {
                     request,
                     None,
                     ReplyControl {
-                        api: Some((0, 0)),
+                        api: Some(NativeApi::default()),
                         revision: Some(revision),
                     },
                 )
@@ -1369,7 +1460,10 @@ impl Registry {
         else {
             return Ok(());
         };
-        unit.state.lock().unwrap().error_api = (11, 4);
+        unit.state.lock().unwrap().error_api = NativeApi::new(
+            NativeInterfaceName::Replicator,
+            NativeApiName::RemoveReplica,
+        );
         let operation_info = info.clone();
         let purpose = if emit_reply {
             ReplicaRemoval::Idle
@@ -1444,7 +1538,10 @@ impl Registry {
             request,
             result.err(),
             ReplyControl {
-                api: Some((11, 4)),
+                api: Some(NativeApi::new(
+                    NativeInterfaceName::Replicator,
+                    NativeApiName::RemoveReplica,
+                )),
                 revision: Some(revision),
             },
         )
@@ -1612,16 +1709,23 @@ fn primary_fence(unit: &Unit) -> RevisionFence {
         None,
     )
 }
-fn role_failure_api(unit: &Unit, requested: ReplicaRole) -> (i64, i64) {
+fn role_failure_api(unit: &Unit, requested: ReplicaRole) -> NativeApi {
     let state = unit.state.lock().unwrap();
     let role = state.status.lock().unwrap().replicator_role;
-    (8, if role == requested { 1 } else { 4 })
+    NativeApi::new(
+        if role == requested {
+            NativeInterfaceName::StatefulServiceReplica
+        } else {
+            NativeInterfaceName::Replicator
+        },
+        NativeApiName::ChangeRole,
+    )
 }
 fn information(replica: &w::Replica, must_catch_up: bool) -> Result<NativeReplicaDescriptor> {
     if replica.id <= 0
         || replica.instance <= 0
         || replica.node.id.0.len() != 16
-        || !(0..=3).contains(&replica.state)
+        || !replica.state.is_known()
     {
         return Err(Error::Protocol("invalid remote replica descriptor"));
     }
@@ -1639,7 +1743,7 @@ fn information(replica: &w::Replica, must_catch_up: bool) -> Result<NativeReplic
         role: role(replica.current_role)?,
         previous_role: role(replica.previous_role)?,
         up: replica.up,
-        ready: replica.state == 2,
+        ready: replica.state == NativeReplicaState::Ready,
         address: replica.replication_endpoint.clone(),
         progress: ReplicationProgress {
             first: replica.first_lsn,
@@ -1664,19 +1768,19 @@ fn project(
     let mut local_seen = false;
     let (mut local_cc, mut local_pc) = (false, false);
     for replica in &request.remote.0 {
-        let mut info = information(replica, replica.current_role == 4)?;
+        let mut info = information(replica, replica.current_role == NativeReplicaRole::Primary)?;
         let (previous, count) = nodes.entry(info.node_id).or_insert((replica, 0));
         *count += 1;
         let fenced_replacement = |old: &w::Replica, fresh: &w::Replica| {
             old.node.instance < fresh.node.instance
-                && old.previous_role == 3
-                && old.current_role == 1
+                && old.previous_role == NativeReplicaRole::Secondary
+                && old.current_role == NativeReplicaRole::None
                 && !old.up
-                && old.state == 3
-                && fresh.previous_role == 2
-                && fresh.current_role == 3
+                && old.state == NativeReplicaState::Dropped
+                && fresh.previous_role == NativeReplicaRole::Idle
+                && fresh.current_role == NativeReplicaRole::Secondary
                 && fresh.up
-                && fresh.state == 2
+                && fresh.state == NativeReplicaState::Ready
                 && old.id < fresh.id
                 && old.instance < fresh.instance
         };
@@ -1688,13 +1792,13 @@ fn project(
         {
             return Err(Error::Protocol("duplicate configuration identity/node"));
         }
-        if replica.current_role >= 3 {
+        if replica.current_role.is_active() {
             ncc += 1;
-            ndcc += usize::from(replica.state != 3);
+            ndcc += usize::from(replica.state != NativeReplicaState::Dropped);
         }
-        if replica.previous_role >= 3 {
+        if replica.previous_role.is_active() {
             npc += 1;
-            ndpc += usize::from(replica.state != 3);
+            ndpc += usize::from(replica.state != NativeReplicaState::Dropped);
         }
         if replica.id == request.local.id {
             if replica.instance != request.local.instance
@@ -1705,22 +1809,24 @@ fn project(
                 return Err(Error::Protocol("configuration changed local owner"));
             }
             local_seen = true;
-            local_cc = replica.current_role >= 3 && replica.state != 3;
-            local_pc = replica.previous_role >= 3 && replica.state != 3;
+            local_cc =
+                replica.current_role.is_active() && replica.state != NativeReplicaState::Dropped;
+            local_pc =
+                replica.previous_role.is_active() && replica.state != NativeReplicaState::Dropped;
             continue;
         }
         remotes.push(info.clone());
-        if !replica.up || replica.state != 2 {
+        if !replica.up || replica.state != NativeReplicaState::Ready {
             continue;
         }
         info.role = ReplicaRole::ActiveSecondary;
-        if replica.current_role >= 3 {
+        if replica.current_role.is_active() {
             cc.push(info.clone());
         }
-        if replica.previous_role >= 3 {
+        if replica.previous_role.is_active() {
             let primary_change = api_epoch(&request.unit.current).primary()
                 != api_epoch(&request.unit.previous).primary();
-            if primary_change && replica.current_role < 3 && replica.last_lsn < 0 {
+            if primary_change && !replica.current_role.is_active() && replica.last_lsn < 0 {
                 continue;
             }
             info.must_catch_up = false;

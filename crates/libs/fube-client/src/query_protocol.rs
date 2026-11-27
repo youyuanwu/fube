@@ -11,6 +11,16 @@ use crate::{
     query_arguments::QueryArguments, DomainFailure, PagedQuery, Paging, QueryDescription, QueryPage,
 };
 
+crate::native::lossless_enum!(
+    /// FABRIC_QUERY_RESULT_KIND from internal FabricTypes_.idl at native pin 3988b451.
+    /// Invalid is also the native empty/error-envelope default, not a List or Item.
+    pub(crate) enum NativeQueryResultKind {
+        Invalid = 0,
+        Item = 1,
+        List = 2,
+    }
+);
+
 /// Native payload type IDs from ServiceModel/QueryResultHelpersEnum.h.
 pub(crate) mod result_tags {
     pub(crate) const NODE: i32 = 1;
@@ -284,7 +294,7 @@ fn decode_list<T: DeserializeOwned, const TAG: i32, const STRICT_PAGING: bool>(
                 .map_err(Into::into)
         },
     )?;
-    if result.kind != 2 {
+    if result.kind != NativeQueryResultKind::List {
         return Err("query result is not a List".into());
     }
     Ok(QueryPage {
@@ -312,7 +322,7 @@ impl<T: DeserializeOwned + Send + 'static, const TAG: i32, const ACTOR_ID: i64> 
             decode::<FixedTag<ItemPayload<T>, TAG>, _>(body, false, true, |FixedTag(payload)| {
                 validate(payload.item.0.ok_or("null query item")?).map_err(Into::into)
             })?;
-        if result.kind != 1 || result.paging.is_some() {
+        if result.kind != NativeQueryResultKind::Item || result.paging.is_some() {
             return Err("query result is not an unpaged Item".into());
         }
         result
@@ -343,14 +353,14 @@ pub(crate) struct PagingStatus {
 
 #[derive(Deserialize)]
 pub(crate) struct QueryResultEnvelope<T> {
-    pub kind: i64,
+    pub kind: NativeQueryResultKind,
     pub payload: Pointer<T>,
     pub error: i64,
     pub paging: Pointer<RawTagged<PagingStatus>>,
 }
 
 struct QueryResult<T> {
-    kind: i64,
+    kind: NativeQueryResultKind,
     payload: Option<T>,
     paging: Option<String>,
 }
@@ -395,6 +405,146 @@ mod tests {
     use super::*;
     use crate::*;
     use std::num::NonZeroU64;
+
+    #[test]
+    fn query_kinds_preserve_numeric_json_and_unknown_values() {
+        for code in [i64::MIN, -1, 0, 1, 2, 3, i64::MAX] {
+            let json = code.to_string();
+            let kind: NativeQueryResultKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind.as_raw(), code);
+            assert_eq!(serde_json::to_string(&kind).unwrap(), json);
+        }
+        for json in ["null", "\"List\"", "1.5", "18446744073709551615"] {
+            assert!(serde_json::from_str::<NativeQueryResultKind>(json).is_err());
+        }
+    }
+
+    // Model-only reply validation: no native byte fixtures or model peers.
+    type ModelList = ListReply<u32, 0>;
+    type ModelItem = ItemReply<u32, 0, 0>;
+
+    fn model_record(value: u32) -> std::result::Result<u32, &'static str> {
+        if value == 0 {
+            Err("invalid model record")
+        } else {
+            Ok(value)
+        }
+    }
+
+    fn list_model(kind: NativeQueryResultKind, error: i64) -> <ModelList as Reply>::Body {
+        QueryResultEnvelope {
+            kind,
+            payload: Pointer(Some(FixedTag(ListPayload {
+                items: ObjectArray(vec![42]),
+                item: Pointer(None),
+            }))),
+            error,
+            paging: Pointer(None),
+        }
+    }
+
+    fn item_model(kind: NativeQueryResultKind, error: i64) -> <ModelItem as Reply>::Body {
+        QueryResultEnvelope {
+            kind,
+            payload: Pointer(Some(FixedTag(ItemPayload {
+                _list: EmptyObjectArray,
+                item: Pointer(Some(42)),
+            }))),
+            error,
+            paging: Pointer(None),
+        }
+    }
+
+    fn paging_model(type_info: Vec<u8>) -> Pointer<RawTagged<PagingStatus>> {
+        Pointer(Some(RawTagged {
+            type_info,
+            value: PagingStatus {
+                token: "next".into(),
+            },
+        }))
+    }
+
+    #[test]
+    fn query_reply_models_require_the_expected_kind_but_preserve_domain_error_priority() {
+        for code in [i64::MIN, -1, 0, 1, 2, 3, i64::MAX] {
+            let kind = NativeQueryResultKind::from_raw(code);
+            let mut list = list_model(kind, 0);
+            list.paging = paging_model(vec![]);
+            let result = ModelList::decode_body(list, model_record);
+            if kind == NativeQueryResultKind::List {
+                let page = result.unwrap_or_else(|_| panic!("valid List model rejected"));
+                assert_eq!(page.items, [42]);
+                assert_eq!(page.continuation_token.as_deref(), Some("next"));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ReplyError::Protocol("query result is not a List"))
+                ));
+            }
+            let result = ModelItem::decode_body(item_model(kind, 0), model_record);
+            if kind == NativeQueryResultKind::Item {
+                assert!(matches!(result, Ok(42)));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ReplyError::Protocol("query result is not an unpaged Item"))
+                ));
+            }
+            let mut list = list_model(kind, -77);
+            list.payload = Pointer(None);
+            assert!(matches!(
+                ModelList::decode_body(list, model_record),
+                Err(ReplyError::Domain(DomainFailure { code: -77, .. }))
+            ));
+            let mut item = item_model(kind, -77);
+            item.payload = Pointer(None);
+            item.paging = paging_model(vec![1]);
+            assert!(matches!(
+                ModelItem::decode_body(item, model_record),
+                Err(ReplyError::Domain(DomainFailure { code: -77, .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_reply_models_are_not_hidden_by_query_kind_or_domain_errors() {
+        let mut list = list_model(NativeQueryResultKind::Unrecognized(-9), -77);
+        list.payload.0.as_mut().unwrap().0.items.0[0] = 0;
+        assert!(matches!(
+            ModelList::decode_body(list, model_record),
+            Err(ReplyError::Protocol("invalid model record"))
+        ));
+        let mut list = list_model(NativeQueryResultKind::List, -77);
+        list.payload.0.as_mut().unwrap().0.item = Pointer(Some(Empty {}));
+        assert!(matches!(
+            ModelList::decode_body(list, model_record),
+            Err(ReplyError::Protocol("list has a single-item payload"))
+        ));
+        let mut list = list_model(NativeQueryResultKind::Unrecognized(-9), -77);
+        list.paging = paging_model(vec![1]);
+        assert!(matches!(
+            ModelList::decode_body(list, model_record),
+            Err(ReplyError::Protocol("unexpected paging status type"))
+        ));
+        let mut list = list_model(NativeQueryResultKind::List, -77);
+        list.paging = paging_model(vec![]);
+        assert!(matches!(
+            UnpagedListReply::<u32, 0>::decode_body(list, model_record),
+            Err(ReplyError::Protocol("unpaged list has paging status"))
+        ));
+        let mut item = item_model(NativeQueryResultKind::Unrecognized(-9), -77);
+        item.payload.0.as_mut().unwrap().0.item = Pointer(None);
+        assert!(matches!(
+            ModelItem::decode_body(item, model_record),
+            Err(ReplyError::Protocol("null query item"))
+        ));
+        let mut item = item_model(NativeQueryResultKind::Item, 0);
+        item.paging = paging_model(vec![]);
+        assert!(matches!(
+            ModelItem::decode_body(item, model_record),
+            Err(ReplyError::Protocol("query result is not an unpaged Item"))
+        ));
+    }
 
     #[test]
     fn declarations_define_native_named_json_and_round_trips() {

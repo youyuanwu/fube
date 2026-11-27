@@ -1,6 +1,7 @@
 //! Managed source ownership for explicitly construction-time disabled reporting.
 //! This is not enabled report processing or an HM acknowledgment.
 use crate::*;
+use fube_core::protocol::NativeHealthState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisabledReportKind {
@@ -13,7 +14,7 @@ pub enum DisabledReportKind {
 pub struct DisabledReport {
     pub kind: DisabledReportKind,
     pub source: &'static str,
-    pub health_state: i64,
+    pub health_state: NativeHealthState,
     pub sequence: u64,
     pub entity_instance: u64,
     pub node_id: String,
@@ -204,9 +205,9 @@ impl DisabledHealth {
             kind,
             source: "System.Hosting",
             health_state: if kind == DisabledReportKind::TypeDisabled {
-                3
+                NativeHealthState::Error
             } else {
-                1
+                NativeHealthState::Ok
             },
             sequence,
             entity_instance: s.entity_instance,
@@ -260,7 +261,7 @@ impl DisabledHealth {
                 DisabledReportKind::DeleteEvent
             },
             source: "System.Hosting",
-            health_state: 1,
+            health_state: NativeHealthState::Ok,
             sequence,
             entity_instance: source.entity_instance,
             node_id: node.node_id.clone(),

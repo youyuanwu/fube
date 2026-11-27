@@ -37,3 +37,11 @@ pub use crate::stateful_api::{
     ReplicaDiagnostics, ReplicaIdentity, ReplicaLifecycle, ReplicaRemoval, ReplicationProgress,
     StatefulCallbackGuard,
 };
+pub use fube_core::protocol::{
+    NativeActivityType, NativeApi, NativeApiDescription, NativeApiName, NativeApplicationHostType,
+    NativeFaultType, NativeHealthReportKind, NativeHealthState, NativeInterfaceName,
+    NativeMoveCost, NativePartitionKind, NativePlacementPolicyType, NativeProxyFlags,
+    NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation,
+    NativeServiceCorrelationScheme, NativeServiceKind, NativeServiceLoadMetricWeight,
+    NativeServiceOperation, NativeServicePackageActivationMode, NativeServicePartitionAccessStatus,
+};

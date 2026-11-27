@@ -7,7 +7,7 @@
 //! memory/checkpoint execution back the supported public service/registry facade.
 use super::{
     checkpoint::await_all,
-    copy_codec::{remove_stage, CopyContext, CopyMetadata, Stage},
+    copy_codec::{CopyContext, CopyHeader, CopyMessage, CopyMetadata, Stage},
     copy_sender::LazyCopy,
     identity,
     maintenance::{LogSettings, Maintenance},
@@ -594,23 +594,13 @@ impl VolatileRuntime {
             return Ok(());
         };
         let data = header.get_data()?;
-        if data.segments().len() != 1 || data.bytes() != 16 {
-            return Err(Error::InvalidInput("native copy header length"));
-        }
-        let bytes = &data.segments()[0];
-        if u32::from_le_bytes(bytes[..4].try_into().unwrap()) != 1 {
-            return Err(Status::NotImplemented.error());
-        }
-        let stage = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        if stage != 2 && stage != 3 && stage != 7 {
-            return Err(Status::NotImplemented.error());
-        }
+        let stage = CopyHeader::decode_operation(&data)?.stage;
         header.acknowledge()?;
         self.retire_operation(header, "copy", true); // actual public capture BEFORE next poll
-        if stage == 3 {
+        if stage == Stage::State {
             return self.drain_full(stream).await;
         }
-        if stage == 2 {
+        if stage == Stage::None {
             if stream
                 .get_operation(Cancellation::default())
                 .await?
@@ -622,19 +612,7 @@ impl VolatileRuntime {
         }
         while let Some(operation) = stream.get_operation(Cancellation::default()).await? {
             let data = operation.get_data()?;
-            let segments = data.segments();
-            if segments
-                .last()
-                .is_none_or(|stage| stage.as_ref() != 7i32.to_le_bytes())
-            {
-                return Err(Status::NotImplemented.error());
-            }
-            let batch = OperationData::new(
-                segments[..segments.len() - 1]
-                    .iter()
-                    .map(|s| s.to_vec())
-                    .collect(),
-            )?;
+            let batch = CopyMessage::decode_log(&data)?;
             let records = Record::decode_batch(&batch)?;
             for record in &records {
                 KernelManager::preflight_replay(record)?;
@@ -732,9 +710,8 @@ impl VolatileRuntime {
         let mut number = 0i64;
         let metadata = loop {
             let data = operation.get_data()?;
-            let (stage, payload) = remove_stage(&data)?;
-            match stage {
-                Stage::State => {
+            match CopyMessage::decode(&data)? {
+                CopyMessage::State(payload) => {
                     if !began {
                         self.owner
                             .manager
@@ -758,11 +735,11 @@ impl VolatileRuntime {
                     };
                     operation = next;
                 }
-                Stage::Progress => {
+                CopyMessage::Progress(payload) => {
                     if !began {
                         return Err(Status::InvalidOperation.error());
                     }
-                    let metadata = CopyMetadata::decode(&data)?;
+                    let metadata = CopyMetadata::decode_payload(&payload)?;
                     self.owner
                         .manager
                         .directory
@@ -825,10 +802,9 @@ impl VolatileRuntime {
                 return Err(error);
             }
             while let Some(operation) = self.next_copy_log(&stream).await? {
-                let (stage, payload) = remove_stage(&operation.get_data()?)?;
-                if stage != Stage::Log {
+                let CopyMessage::Log(payload) = CopyMessage::decode(&operation.get_data()?)? else {
                     return Err(Status::NotImplemented.error());
-                }
+                };
                 let records = Record::decode_batch(&payload)?;
                 for record in &records {
                     KernelManager::preflight_replay(record)?;

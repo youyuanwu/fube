@@ -1,6 +1,7 @@
 //! Native stateless creation policy. Source decisions and evidence classes:
 //! SpecResearch.md and docs/cluster/RaStatelessOpening.md.
 use super::*;
+use crate::protocol::{NativeReplicaRole, NativeReplicaState};
 
 const fn hr(value: u32) -> i64 {
     value as i32 as i64
@@ -16,7 +17,7 @@ pub const HOSTING_NOT_FOUND: i64 = hr(0x80071cf0);
 pub const HOSTING_SERVICE_TYPE_DISABLED: i64 = hr(0x80071d33);
 pub const APPLICATION_INSTANCE_DELETED: i64 = hr(0x80071cca);
 pub const PROXY_STATE_CHANGED_ON_DATA_LOSS: i64 = hr(0x80071d28);
-pub const ABORT: i64 = 4;
+pub const ABORT: NativeProxyFlags = NativeProxyFlags::ABORT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
@@ -65,11 +66,11 @@ impl RetryPolicy {
     pub fn clear(self, count: u64) -> bool {
         i128::from(count) >= i128::from(self.warning) || i128::from(count) >= i128::from(self.error)
     }
-    pub fn flags(self, count: u64) -> i64 {
+    pub fn flags(self, count: u64) -> NativeProxyFlags {
         if i128::from(count) == i128::from(self.drop) - 1 {
             ABORT
         } else {
-            0
+            NativeProxyFlags::NONE
         }
     }
 }
@@ -80,12 +81,7 @@ pub enum Action {
 }
 
 /// Trusted ProxyErrorCode detail, not a newly enabled proxy wire codec.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApiNameDescription {
-    pub api: i64,
-    pub interface: i64,
-    pub metadata: String,
-}
+pub use fube_core::protocol::NativeApiDescription as ApiNameDescription;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyErrorDetail {
     pub message: String,
@@ -319,7 +315,7 @@ pub(super) fn complete(
         || !current.body.replica.up
         || event.unit.current.older_than(current.body.unit.current)
         || event.replica.instance != current.body.replica.instance
-        || event.replica.state == 0
+        || event.replica.state == NativeReplicaState::StandBy
     // native StandBy, not pre-Ready normalization
     {
         return Ok(Transition::ignored(Disposition::IgnoredStale));
@@ -345,8 +341,8 @@ pub(super) fn complete(
         }
         if event.error == PROXY_STATE_CHANGED_ON_DATA_LOSS
             || (event.error == 0
-                && (event.replica.state != 1
-                    || if current.body.replica.current_role == 4 {
+                && (event.replica.state != NativeReplicaState::InBuild
+                    || if current.body.replica.current_role == NativeReplicaRole::Primary {
                         event.replica.service_endpoint.is_empty()
                             || event.replica.replication_endpoint.is_empty()
                     } else if current.peer_creation.is_some() {
@@ -370,11 +366,12 @@ pub(super) fn complete(
     state.phase = Phase::Ready;
     lifecycle::mutate_body(&mut state, |body| {
         // Native initial Primary becomes Ready; a newly opened Idle stays InBuild.
-        body.replica.state = if body.service.stateful && body.replica.current_role == 2 {
-            1
-        } else {
-            2
-        };
+        body.replica.state =
+            if body.service.stateful && body.replica.current_role == NativeReplicaRole::Idle {
+                NativeReplicaState::InBuild
+            } else {
+                NativeReplicaState::Ready
+            };
         body.replica.service_endpoint = event.replica.service_endpoint;
         body.replica.replication_endpoint = event.replica.replication_endpoint;
     });

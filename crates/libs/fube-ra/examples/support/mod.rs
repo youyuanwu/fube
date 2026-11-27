@@ -29,6 +29,13 @@ impl Rich for u32 {
         *self = 4_000_000_000 + next(c) as u32;
     }
 }
+impl Rich for NativeMoveCost {
+    fn rich(&mut self, c: &mut i32) {
+        let mut code = self.code();
+        code.rich(c);
+        *self = Self::from(code);
+    }
+}
 impl Rich for bool {
     fn rich(&mut self, c: &mut i32) {
         *self = next(c) % 2 == 0;
@@ -73,9 +80,13 @@ impl<T: Rich + Default> Rich for ObjectArray<Vec<T>> {
             .collect();
     }
 }
+fn enum_sample<T: From<i64>>(counter: &mut i32) -> T {
+    i64::from(next(counter) % 5).into()
+}
+
 macro_rules! field {
     ($v:ident, $c:ident, [$f:ident]) => {
-        $v.$f = i64::from(next($c) % 5);
+        $v.$f = enum_sample($c);
     };
     ($v:ident, $c:ident, $f:ident) => {
         $v.$f.rich($c);
@@ -181,7 +192,7 @@ impl Rich for Service {
         self.update_version.rich(c);
         self.placement.rich(c);
         self.standby_keep.rich(c);
-        self.activation_mode = i64::from(next(c) % 5);
+        self.activation_mode = enum_sample(c);
         self.dns.rich(c);
         let null = ScalingPolicy {
             trigger: Pointer(None),

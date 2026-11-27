@@ -971,10 +971,11 @@ impl Server {
         let reservation = Reservation::acquire(&self.shared, ADMISSION_BYTES)?;
         if uuid::Uuid::parse_str(&host.id).is_err()
             || host.pid == 0
-            || host.kind != 1
+            || host.kind != wire::NativeApplicationHostType::ActivatedSingleCodePackage
             || host.container
             || host.activator
-            || admission.code.id.package.activation.mode != 0
+            || admission.code.id.package.activation.mode
+                != wire::NativeServicePackageActivationMode::SharedProcess
             || admission.code.id.package.activation.guid.0 != [0; 16]
             || !admission.code.id.package.public_id.is_empty()
             || !valid_string(&admission.code.application_name)
@@ -1538,7 +1539,7 @@ fn dispatch(
         RpcCall::Start(value) => {
             if !host_matches(&value.id)
                 || value.pid != entry.admission.host.pid
-                || value.kind != 1
+                || value.kind != wire::NativeApplicationHostType::ActivatedSingleCodePackage
                 || value.container
                 || value.activator
                 || value.timeout <= 0
@@ -1708,7 +1709,7 @@ fn dispatch(
                 "{}:{}:{}",
                 uuid::Uuid::from_bytes_le(value.activity.id.guid.0),
                 value.activity.id.index,
-                value.activity.kind
+                value.activity.kind.code()
             );
             match state.core.unregister_host(&value.id, &activity) {
                 Ok(removed) => {
@@ -1820,7 +1821,7 @@ mod fence_tests {
             deadlines: RequestDeadlines::Propagated,
             host: wire::HostContext {
                 id: uuid::Uuid::new_v4().to_string(),
-                kind: 1,
+                kind: wire::NativeApplicationHostType::ActivatedSingleCodePackage,
                 pid: 1,
                 container: false,
                 activator: false,
@@ -1837,7 +1838,7 @@ mod fence_tests {
                         },
                         activation: wire::Activation {
                             guid: fubst::serde::Guid([0; 16]),
-                            mode: 0,
+                            mode: wire::NativeServicePackageActivationMode::SharedProcess,
                         },
                         public_id: String::new(),
                     },
@@ -2100,7 +2101,7 @@ mod fence_tests {
         let body = Body::from_bytes(
             to_vec(&wire::StartRequest {
                 id: admission.host.id.clone(),
-                kind: 1,
+                kind: wire::NativeApplicationHostType::ActivatedSingleCodePackage,
                 pid: admission.host.pid,
                 timeout: 10_000_000,
                 container: false,

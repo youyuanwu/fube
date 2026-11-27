@@ -52,10 +52,10 @@ async fn phase3_interrupted_after_begin_state_eos_is_cancelled_without_replicati
     let partition = uuid::Uuid::new_v4();
     let target = Fixture::start(partition, 2, ReplicaRole::IdleSecondary, false, Spy::new()).await;
     let version = OperationData::new(vec![vec![1, 0, 0, 0, 0]]).unwrap();
-    let state = super::copy_codec::add_stage(
+    let state = super::copy_codec::CopyMessage::State(
         super::named::encode_copy(super::provider::REGISTRY_ID, &version).unwrap(),
-        super::copy_codec::Stage::State,
     )
+    .encode()
     .unwrap();
     let source = Source::start(partition, vec![header(3), state], None).await;
     source
@@ -1314,6 +1314,136 @@ fn descriptor(target: &Fixture) -> fube_runtime::extensions::NativeReplicaDescri
         must_catch_up: false,
         address: target.host.replication_address().unwrap(),
         progress: fube_runtime::extensions::ReplicationProgress { first: 1, last: 1 },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typed_copy_stage_admission_preserves_header_and_exact_log_trailer_rejection_without_ack() {
+    let mut cases = Vec::new();
+    for stage in [4, 5, -1, i32::MIN] {
+        cases.push((vec![header(stage)], false, false));
+    }
+    let bytes = header(7).to_segments().remove(0);
+    cases.push((
+        vec![OperationData::new(vec![bytes[..15].to_vec()]).unwrap()],
+        false,
+        true,
+    ));
+    let mut extended = bytes.clone();
+    extended.push(0);
+    cases.push((
+        vec![OperationData::new(vec![extended]).unwrap()],
+        false,
+        true,
+    ));
+    cases.push((
+        vec![OperationData::new(vec![bytes[..8].to_vec(), bytes[8..].to_vec()]).unwrap()],
+        false,
+        true,
+    ));
+    for trailer in [
+        vec![7, 0, 0],
+        vec![7, 0, 0, 0, 0],
+        7i32.to_be_bytes().to_vec(),
+        3i32.to_le_bytes().to_vec(),
+        (-1i32).to_le_bytes().to_vec(),
+    ] {
+        cases.push((
+            vec![header(7), OperationData::new(vec![trailer]).unwrap()],
+            true,
+            false,
+        ));
+    }
+    for (records, header_acknowledged, invalid_header_length) in cases {
+        let partition = uuid::Uuid::new_v4();
+        let target =
+            Fixture::start(partition, 2, ReplicaRole::IdleSecondary, false, Spy::new()).await;
+        let source = Source::start(partition, records, None).await;
+        let sender = source.host.clone();
+        let member = descriptor(&target);
+        let cancel = Cancellation::default();
+        let token = cancel.clone();
+        let building = tokio::spawn(async move { sender.build(member, token).await });
+        until(|| {
+            target
+                .runtime
+                .generation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|generation| generation.copy_done.is_completed())
+        })
+        .await;
+        let generation = target
+            .runtime
+            .generation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        let error = generation
+            .copy_done
+            .wait()
+            .await
+            .as_ref()
+            .clone()
+            .unwrap_err();
+        let acknowledgments = target.runtime.operation_events.lock().unwrap().clone();
+        let began = target
+            .runtime
+            .owner
+            .manager
+            .directory
+            .copy_progress()
+            .is_some();
+        cancel.cancel();
+        let _ = building.await.unwrap();
+        source.host.remove(descriptor(&target)).await.unwrap();
+        let lower = target.runtime.replicator();
+        target
+            .native
+            .execution()
+            .try_reserve()
+            .unwrap()
+            .run_owned(move || {
+                lower.abort();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let _ = target.runtime.terminal.wait().await;
+        target
+            .runtime
+            .cleanup_done
+            .wait()
+            .await
+            .as_ref()
+            .clone()
+            .unwrap();
+        drop(source.host);
+        drop(target.host);
+
+        if invalid_header_length {
+            assert!(matches!(
+                error,
+                Error::InvalidInput("native copy header length")
+            ));
+        } else {
+            assert_eq!(
+                error.native_code(),
+                Some(super::status::Status::NotImplemented.code())
+            );
+        }
+        assert_eq!(
+            acknowledgments,
+            if header_acknowledged {
+                vec![("copy", 1, true)]
+            } else {
+                vec![]
+            }
+        );
+        assert!(!began);
     }
 }
 

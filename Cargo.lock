@@ -363,8 +363,11 @@ dependencies = [
 name = "fube-core"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "fubst",
  "furpc",
+ "serde",
+ "serde_json",
  "tokio",
  "tower-service",
  "uuid",
@@ -454,6 +457,7 @@ name = "fube-ra"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "fube-core",
  "fube-ra-store",
  "fubst",
  "furpc",

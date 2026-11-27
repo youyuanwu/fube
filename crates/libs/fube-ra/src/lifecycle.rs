@@ -2,6 +2,7 @@
 //! mappings are in docs/cluster/RaStatelessRemoval.md; these are trusted adapter
 //! events, not a live Hosting/RAP implementation.
 use super::*;
+use crate::protocol::{NativeReplicaRole, NativeReplicaState};
 use fubst::serde::ObjectArray;
 
 pub const APPLICATION_HOST_CRASH: i64 = -2_147_017_573;
@@ -70,12 +71,50 @@ pub enum CloseMode {
     DeactivateNode = 9,
     Deactivate = 10,
 }
-#[derive(Serialize, Deserialize)]
+impl Serialize for CloseMode {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_i64(*self as i64)
+    }
+}
+#[derive(Serialize)]
 pub(super) struct LocalCloseRequest {
     pub unit: PartitionId,
-    pub mode: i64,
+    pub mode: CloseMode,
+}
+impl LocalCloseRequest {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Wire {
+            unit: PartitionId,
+            mode: i64,
+        }
+        let wire: Wire = from_slice(bytes)
+            .map_err(|_| Failure::Admission("invalid native lifecycle payload"))?;
+        Ok(Self {
+            unit: wire.unit,
+            mode: CloseMode::from_code(wire.mode)?,
+        })
+    }
 }
 impl CloseMode {
+    fn from_code(code: i64) -> Result<Self> {
+        match code {
+            1 => Ok(Self::Delete),
+            2 => Ok(Self::Obliterate),
+            3 => Ok(Self::ForceDelete),
+            4 => Ok(Self::ForceAbort),
+            5 => Ok(Self::Drop),
+            6 => Ok(Self::AppHostDown),
+            7 => Ok(Self::Close),
+            8 => Ok(Self::Abort),
+            9 => Ok(Self::DeactivateNode),
+            10 => Ok(Self::Deactivate),
+            _ => Err(Failure::Unsupported("unsupported local Close mode")),
+        }
+    }
     fn deletes(self) -> bool {
         matches!(self, Self::Delete | Self::ForceDelete)
     }
@@ -120,7 +159,7 @@ pub(super) fn canonical(state: &EntityState, dropped: bool) -> Replica {
         let mut replica = state.body.replica.clone();
         replica.up = !dropped;
         if dropped {
-            replica.state = 3;
+            replica.state = NativeReplicaState::Dropped;
             replica.service_endpoint.clear();
             replica.replication_endpoint.clear();
         }
@@ -131,7 +170,11 @@ pub(super) fn canonical(state: &EntityState, dropped: bool) -> Replica {
         id: state.body.replica.id,
         instance: state.body.replica.instance,
         up: !dropped,
-        state: if dropped { 3 } else { 2 },
+        state: if dropped {
+            NativeReplicaState::Dropped
+        } else {
+            NativeReplicaState::Ready
+        },
         ..Replica::default()
     }
 }
@@ -154,7 +197,7 @@ pub(super) fn dropped_description(state: &EntityState) -> Replica {
         id: state.body.replica.id,
         instance: state.body.replica.instance,
         up: false,
-        state: 3,
+        state: NativeReplicaState::Dropped,
         ..Replica::default()
     }
 }
@@ -167,7 +210,7 @@ fn report(state: &EntityState) -> ReplicaUp {
             report_from_primary: false,
             replicas: ObjectArray(vec![ReplicaInfo {
                 description: dropped_description(state),
-                intermediate_role: 1,
+                intermediate_role: NativeReplicaRole::None,
             }]),
             // Native TryGetConfigurationInternal deliberately uses false here.
             local_deleted: false,
@@ -281,14 +324,14 @@ pub(super) fn close_retry(state: &EntityState, effects: &mut Vec<Effect>) {
                 .close_mode
                 .is_some_and(|mode| mode.force() || mode == CloseMode::Abort)
             {
-                4
+                NativeProxyFlags::ABORT
             } else if matches!(
                 state.close_mode,
                 Some(CloseMode::Close | CloseMode::DeactivateNode)
             ) {
-                0
+                NativeProxyFlags::NONE
             } else {
-                8
+                NativeProxyFlags::DROP
             },
         });
     } else {
@@ -357,9 +400,12 @@ fn start_close_inner(
         return;
     }
     let was_creating = state.phase == Phase::Opening;
-    if (matches!(state.body.replica.current_role, 2 | 3)
-        || (state.body.replica.current_role == 4 && state.swap.is_some())
-        || (state.body.replica.current_role == 1
+    if (matches!(
+        state.body.replica.current_role,
+        NativeReplicaRole::Idle | NativeReplicaRole::Secondary
+    ) || (state.body.replica.current_role == NativeReplicaRole::Primary
+        && state.swap.is_some())
+        || (state.body.replica.current_role == NativeReplicaRole::None
             && state
                 .reconfiguration
                 .as_ref()
@@ -399,7 +445,9 @@ fn start_close_inner(
     state.close_token = token;
     state.close_failures = 0;
     state.close_warning = false;
-    mutate_body(state, |body| body.replica.state = 3);
+    mutate_body(state, |body| {
+        body.replica.state = NativeReplicaState::Dropped
+    });
     if mode == CloseMode::AppHostDown || (state.runtime.is_none() && (mode.force() || was_creating))
     {
         finish_close(state, effects);
@@ -552,12 +600,12 @@ pub(super) fn transition(
     let invalid = |_| Failure::Admission("invalid native lifecycle payload");
     match &work.kind {
         Kind::LocalClose => {
-            let request: LocalCloseRequest = from_slice(&work.bytes).map_err(invalid)?;
+            let request = LocalCloseRequest::decode(&work.bytes)?;
             let mode = match request.mode {
-                4 => CloseMode::ForceAbort,
-                5 => CloseMode::Drop,
-                7 => CloseMode::Close,
-                8 => CloseMode::Abort,
+                mode @ (CloseMode::ForceAbort
+                | CloseMode::Drop
+                | CloseMode::Close
+                | CloseMode::Abort) => mode,
                 _ => return Err(Failure::Unsupported("unsupported local Close mode")),
             };
             if !admission.owner_ready || !admission.node_open {
@@ -605,7 +653,7 @@ pub(super) fn transition(
                     });
                 let idle_delete = current.is_some_and(|state| {
                     state.peer_creation.is_some()
-                        && state.body.replica.current_role == 2
+                        && state.body.replica.current_role == NativeReplicaRole::Idle
                         && state.reconfiguration.is_none()
                         && state.swap.is_none()
                         && state.body.service == body.service
@@ -635,11 +683,12 @@ pub(super) fn transition(
                                     .as_ref()
                                     .is_none_or(|c| c.stage != ConfigurationStage::Complete)
                         }))
-                    || body.service.activation_mode != 0
+                    || body.service.activation_mode
+                        != NativeServicePackageActivationMode::SharedProcess
                     || !body.service.scaling.0.is_empty()
                     || body.replica.node != admission.local_node
                     || body.unit.consistency.id != body.unit.id
-                    || body.unit.consistency.kind != 1
+                    || body.unit.consistency.kind != NativePartitionKind::Singleton
                     || current.is_some_and(|original| {
                         (!original.fm_primary && original.peer_creation.is_none())
                             || body.service != original.body.service
@@ -653,7 +702,7 @@ pub(super) fn transition(
                     ));
                 }
                 if let Some(original) = current.filter(|state| state.peer_creation.is_some()) {
-                    if original.body.replica.current_role != 2
+                    if original.body.replica.current_role != NativeReplicaRole::Idle
                         && !active_delete
                         && !(original.phase == Phase::Closed
                             && original.reconfiguration.as_ref().is_some_and(|c| {
@@ -1073,7 +1122,7 @@ pub(super) fn transition(
                     || replica.instance != current.body.replica.instance
                     || replica.up
                     || ((dropped || current.fm_stage == FmStage::ReplicaDropped)
-                        && replica.state != 3)
+                        && replica.state != NativeReplicaState::Dropped)
                 {
                     return Ok(Transition::ignored(Disposition::IgnoredStale));
                 }
@@ -1088,7 +1137,8 @@ pub(super) fn transition(
             // Same directly required helper as Add. Delayed acknowledgments may
             // carry an older description; ineligible update is not ack rejection.
             let description_changed = description::update(&mut state, &info.service, &mut effects);
-            if (state.fm_stage == FmStage::ReplicaDropped && replica.state == 3)
+            if (state.fm_stage == FmStage::ReplicaDropped
+                && replica.state == NativeReplicaState::Dropped)
                 || (state.fm_stage == FmStage::ReplicaDown
                     && !replica.up
                     && replica.instance == state.body.replica.instance)
@@ -1098,7 +1148,7 @@ pub(super) fn transition(
             let before = state.clone();
             let started = if dropped {
                 start_close(&mut state, CloseMode::ForceDelete, work.id, &mut effects)
-            } else if state.phase == Phase::Closed && replica.state == 3 {
+            } else if state.phase == Phase::Closed && replica.state == NativeReplicaState::Dropped {
                 start_close(&mut state, CloseMode::Delete, work.id, &mut effects)
             } else {
                 false

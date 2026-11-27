@@ -1,4 +1,9 @@
 use super::*;
+use fube_core::protocol::NativeActivityType;
+use fube_core::protocol::NativeProxyFlags;
+use fube_core::protocol::NativeServiceOperation;
+use fube_core::protocol::NativeServicePackageActivationMode;
+use fube_core::protocol::{NativeReplicaRole, NativeReplicaState};
 #[path = "reporting_tests.rs"]
 mod reporting_tests;
 #[path = "stateful_tests.rs"]
@@ -7,6 +12,49 @@ use fube_rap_test_support::transport::{message, ModelPeer, Received as Message};
 use fubst::serde::{from_slice, to_vec};
 use furpc::MessageId;
 use tokio::{net::TcpListener, sync::Notify};
+
+#[tokio::test]
+async fn stateless_partition_kind_admission_keeps_unknowns_and_existing_range_checks() {
+    let h = Harness::new().await;
+    let mut request = h.request(1, 1, 0);
+    for code in [i64::MIN, -1, 0, 1, 2, 3, 4, i64::MAX] {
+        request.unit.consistency.kind = NativePartitionKind::from(code);
+        let decoded: ProxyRequest = from_slice(&to_vec(&request).unwrap()).unwrap();
+        assert_eq!(decoded.unit.consistency.kind.code(), code);
+        assert_eq!(
+            validate(&h.engine.shared, &decoded).is_ok(),
+            (1..=3).contains(&code)
+        );
+    }
+    request.unit.consistency.low = 1;
+    request.unit.consistency.high = 0;
+    for kind in [
+        NativePartitionKind::Singleton,
+        NativePartitionKind::Named,
+        NativePartitionKind::Int64Range,
+    ] {
+        request.unit.consistency.kind = kind;
+        assert_eq!(
+            validate(&h.engine.shared, &request).is_ok(),
+            kind != NativePartitionKind::Int64Range
+        );
+    }
+}
+
+#[tokio::test]
+async fn stateless_flag_admission_retains_unknown_bits_until_rejection() {
+    let h = Harness::new().await;
+    let mut request = h.request(1, 1, 0);
+    for bits in [16, 18, i64::MIN, i64::MIN | 4, -1] {
+        request.flags = NativeProxyFlags::from_bits_retain(bits);
+        let decoded: ProxyRequest = from_slice(&to_vec(&request).unwrap()).unwrap();
+        assert_eq!(decoded.flags.bits(), bits);
+        assert!(matches!(
+            validate(&h.engine.shared, &decoded),
+            Err(Error::Protocol(_))
+        ));
+    }
+}
 
 #[derive(Default)]
 struct Calls {
@@ -169,12 +217,30 @@ impl Drop for Harness {
 }
 
 #[tokio::test]
-async fn canonical_invalid_fault_after_permanent_is_rejected_without_changing_stage_or_sending() {
+async fn canonical_invalid_fault_is_rejected_before_first_stage_and_after_permanent_without_sending(
+) {
     let mut h = Harness::new().await;
     let request = h.request(1, 1, 0);
     h.send("ReplicaOpen", &request).await;
     h.receive("ReplicaOpenReply").await;
     let partition = h.calls.partitions.lock().unwrap()[0].clone();
+    let canonical: Arc<dyn IStatelessServicePartition> = Arc::new(partition.clone());
+    h.engine
+        .shared
+        .execution
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            assert!(matches!(
+                canonical.report_fault(FaultType::Invalid),
+                Err(Error::InvalidInput("invalid fault type"))
+            ));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(partition.fault_delivery().is_none());
+    h.no_reply().await;
     let canonical: Arc<dyn IStatelessServicePartition> = Arc::new(partition.clone());
     let permit = h.engine.shared.execution.try_reserve().unwrap();
     let reported = permit.run_owned(move || {
@@ -183,7 +249,10 @@ async fn canonical_invalid_fault_after_permanent_is_rejected_without_changing_st
     });
     let (result, message) = tokio::join!(reported, h.receive("RAReportFault"));
     result.unwrap();
-    assert_eq!(from_slice::<FaultBody>(&message.body).unwrap().fault, 2);
+    assert_eq!(
+        from_slice::<FaultBody>(&message.body).unwrap().fault,
+        NativeFaultType::Permanent
+    );
     let before = partition.fault_delivery().unwrap();
     let canonical: Arc<dyn IStatelessServicePartition> = Arc::new(partition.clone());
     h.engine
@@ -219,7 +288,7 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
     let mut request = h.request(1, 1, 0);
     request.service.metrics.0.push(Metric {
         name: "Work".into(),
-        weight: 1,
+        weight: NativeServiceLoadMetricWeight::Low,
         primary: 0,
         secondary: 0,
     });
@@ -255,14 +324,59 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
     let query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
     assert_eq!(query.detail.loads.0.len(), 2);
 
-    for code in [0, 0x80071c47u32 as i32 as i64] {
+    for (time_to_live, sequence, expected) in [
+        (
+            Some(Duration::ZERO),
+            crate::HealthSequence::Explicit(45),
+            "invalid health TTL",
+        ),
+        (
+            None,
+            crate::HealthSequence::Explicit(0),
+            "health sequence must be positive",
+        ),
+        (
+            None,
+            crate::HealthSequence::Explicit(45),
+            "invalid health state",
+        ),
+    ] {
+        let report = crate::HealthReport {
+            state: crate::HealthState::Invalid,
+            time_to_live,
+            sequence,
+            ..health_report()
+        };
+        assert!(matches!(
+            partition.report_health(&report).await,
+            Err(Error::InvalidInput(message)) if message == expected
+        ));
+    }
+    h.no_reply().await;
+
+    for (state, expected, sequence, code) in [
+        (crate::HealthState::Ok, NativeHealthState::Ok, 45, 0),
+        (
+            crate::HealthState::Warning,
+            NativeHealthState::Warning,
+            46,
+            0,
+        ),
+        (crate::HealthState::Error, NativeHealthState::Error, 47, 0),
+        (
+            crate::HealthState::Warning,
+            NativeHealthState::Warning,
+            45,
+            0x80071c47u32 as i32 as i64,
+        ),
+    ] {
         let report = crate::HealthReport {
             source: "User".into(),
             property: "Ready".into(),
-            state: crate::HealthState::Warning,
+            state,
             description: "detail".into(),
             time_to_live: None,
-            sequence: crate::HealthSequence::Explicit(45),
+            sequence: crate::HealthSequence::Explicit(sequence),
             remove_when_expired: true,
         };
         let p = partition.clone();
@@ -272,7 +386,7 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
         let body: HealthBody = from_slice(&message.body).unwrap();
         let report = &body.reports.0[0];
         assert_eq!(report.ttl, i64::MAX);
-        assert_eq!(report.state, 2);
+        assert_eq!(report.state, expected);
         let entity = &report.entity.0.as_ref().unwrap().0;
         assert!(
             matches!(entity, HealthEntity::Instance { instance: 100, partition } if *partition == request.unit.id.id)
@@ -284,7 +398,7 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
                     "OperationSuccessAction",
                     to_vec(&HealthReply {
                         results: ObjectArray(vec![HealthResult {
-                            kind: 2,
+                            kind: NativeHealthReportKind::StatelessServiceInstance,
                             source: report.source.clone(),
                             sequence: report.sequence,
                             entity_property: format!(
@@ -302,7 +416,7 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
             .unwrap();
         let result = operation.await.unwrap();
         if code == 0 {
-            assert_eq!(result.unwrap().sequence, 45);
+            assert_eq!(result.unwrap().sequence, sequence);
         } else {
             assert!(matches!(result, Err(Error::Remote { code: actual, .. }) if actual == code));
         }
@@ -313,9 +427,12 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
     );
     assert_eq!(result.unwrap().attempts, 1);
     let fault: FaultBody = from_slice(&message.body).unwrap();
-    assert_eq!(fault.fault, 1); // public COM Transient=2 must NOT leak here
+    assert_eq!(fault.fault, NativeFaultType::Transient);
     assert_eq!(fault.local.instance, 1);
-    assert_eq!(fault.activity.kind, 2);
+    assert_eq!(
+        fault.activity.kind,
+        NativeActivityType::ServiceReportFaultEvent
+    );
     assert_eq!(
         partition
             .report_fault(FaultType::Transient)
@@ -329,7 +446,10 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
         h.receive("RAReportFault")
     );
     result.unwrap();
-    assert_eq!(from_slice::<FaultBody>(&message.body).unwrap().fault, 2);
+    assert_eq!(
+        from_slice::<FaultBody>(&message.body).unwrap().fault,
+        NativeFaultType::Permanent
+    );
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
     assert!(partition.fault_delivery().unwrap().cancelled);
@@ -389,7 +509,7 @@ async fn abort_cancels_outstanding_health_without_retiring_sibling_authority() {
     };
     let task = tokio::spawn(async move { target.report_health(&health_report()).await });
     let original = h.receive("ReportHealth").await;
-    target_request.flags = 4;
+    target_request.flags = NativeProxyFlags::ABORT;
     h.send("ReplicaClose", &target_request).await;
     let result = tokio::time::timeout(Duration::from_millis(100), task)
         .await
@@ -409,7 +529,7 @@ async fn abort_cancels_outstanding_health_without_retiring_sibling_authority() {
                 "OperationSuccessAction",
                 to_vec(&HealthReply {
                     results: ObjectArray(vec![HealthResult {
-                        kind: 2,
+                        kind: NativeHealthReportKind::StatelessServiceInstance,
                         source: sent.reports.0[0].source.clone(),
                         sequence: sent.reports.0[0].sequence,
                         entity_property: format!(
@@ -504,7 +624,7 @@ async fn health_validation_and_unmatched_results_never_acknowledge() {
     let mut report = health_report();
     report.source = "System.Forged".into();
     assert!(p.report_health(&report).await.is_err());
-    for wrong in 0..5 {
+    for wrong in 0..11 {
         let p = p.clone();
         let task = tokio::spawn(async move { p.report_health(&health_report()).await });
         let message = h.receive("ReportHealth").await;
@@ -513,37 +633,64 @@ async fn health_validation_and_unmatched_results_never_acknowledge() {
         assert_eq!(sent.ttl, 30_000_000);
         assert!(sent.sequence > 0);
         let mut result = HealthResult {
-            kind: 2,
+            kind: NativeHealthReportKind::StatelessServiceInstance,
             source: sent.source.clone(),
             sequence: sent.sequence,
             entity_property: format!(
                 "{}+100+Ready",
                 uuid::Uuid::from_bytes_le(request.unit.id.id.0)
             ),
-            error: 0,
+            error: -123,
         };
         match wrong {
-            0 => result.kind = 3,
+            0 => result.kind = NativeHealthReportKind::Partition,
             1 => result.source = "other".into(),
             2 => result.sequence -= 1,
             3 => result.entity_property = "other".into(),
+            5 => result.kind = NativeHealthReportKind::Invalid,
+            6 | 9 => result.kind = NativeHealthReportKind::Unrecognized(i64::MIN),
+            7 => result.kind = NativeHealthReportKind::Unrecognized(i64::MAX),
+            8 => result.kind = NativeHealthReportKind::Cluster,
             _ => {}
         }
+        let results = match wrong {
+            4 => vec![],
+            10 => vec![result.clone(), result],
+            _ => vec![result],
+        };
+        let streams = if wrong == 9 {
+            vec![StreamResult {
+                kind: NativeHealthReportKind::Unrecognized(i64::MAX),
+                source: sent.source.clone(),
+                instance: 1,
+                upto: sent.sequence,
+            }]
+        } else {
+            vec![]
+        };
         message
             .respond(
                 fube_rap_test_support::transport::message(
                     16,
                     "OperationSuccessAction",
                     to_vec(&HealthReply {
-                        results: ObjectArray(if wrong == 4 { vec![] } else { vec![result] }),
-                        streams: ObjectArray(vec![]),
+                        results: ObjectArray(results),
+                        streams: ObjectArray(streams),
                     })
                     .unwrap(),
                 )
                 .unwrap(),
             )
             .unwrap();
-        assert!(matches!(task.await.unwrap(), Err(Error::Protocol(_))));
+        let expected = if matches!(wrong, 4 | 9 | 10) {
+            "unexpected health result cardinality"
+        } else {
+            "health result identity mismatch"
+        };
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(Error::Protocol(message)) if message == expected
+        ));
     }
 }
 
@@ -570,7 +717,10 @@ async fn fault_pending_duplicates_and_permanent_upgrade_share_one_worker() {
     poll_pending_once(duplicate.as_mut()).await;
     poll_pending_once(upgrade.as_mut()).await;
     let message = h.receive("RAReportFault").await;
-    assert_eq!(from_slice::<FaultBody>(&message.body).unwrap().fault, 2);
+    assert_eq!(
+        from_slice::<FaultBody>(&message.body).unwrap().fault,
+        NativeFaultType::Permanent
+    );
     assert!(matches!(first.await, Err(Error::InvalidInput(_))));
     assert!(matches!(duplicate.await, Err(Error::InvalidInput(_))));
     assert!(upgrade.await.unwrap().superseded_transient);
@@ -640,7 +790,10 @@ async fn fault_initial_failure_retry_and_cancellation_remain_observable() {
         h.receive("RAReportFault")
     );
     assert!(result.unwrap().superseded_transient);
-    assert_eq!(from_slice::<FaultBody>(&message.body).unwrap().fault, 2);
+    assert_eq!(
+        from_slice::<FaultBody>(&message.body).unwrap().fault,
+        NativeFaultType::Permanent
+    );
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
     assert!(p.fault_delivery().unwrap().cancelled);
@@ -650,9 +803,17 @@ async fn fault_initial_failure_retry_and_cancellation_remain_observable() {
 async fn reporting_bounds_and_current_description_validation() {
     let mut h = Harness::new().await;
     let mut request = h.request(1, 1, 0);
+    request.service.correlations.0.push(Correlation {
+        service: "fabric:/Model/Other".into(),
+        scheme: NativeServiceCorrelationScheme::Unrecognized(i64::MIN),
+    });
+    request.service.placement.0.push(Placement {
+        domain: "fd:/existing-metadata".into(),
+        kind: NativePlacementPolicyType::Unrecognized(i64::MAX),
+    });
     request.service.metrics.0.push(Metric {
         name: "Work".into(),
-        weight: 1,
+        weight: NativeServiceLoadMetricWeight::Unrecognized(i64::MAX),
         primary: 0,
         secondary: 0,
     });
@@ -693,9 +854,16 @@ async fn reporting_bounds_and_current_description_validation() {
     ));
     drop(_permit);
     request.service.metrics.0.clear();
+    request.service.move_cost = NativeMoveCost::Unrecognized(u32::MAX);
     request.service.update_version += 1;
     h.send("ProxyUpdateServiceDescription", &request).await;
-    h.receive("ProxyUpdateServiceDescriptionReply").await;
+    let reply: UpdateServiceReply =
+        from_slice(&h.receive("ProxyUpdateServiceDescriptionReply").await.body).unwrap();
+    assert_eq!(reply.error, 0);
+    assert_eq!(
+        to_vec(&reply.service).unwrap(),
+        to_vec(&request.service).unwrap()
+    );
     assert!(partition
         .report_load(&[crate::LoadMetric {
             name: "Work".into(),
@@ -802,7 +970,7 @@ impl Harness {
                     low: 0,
                     high: 0,
                     name: String::new(),
-                    kind: 1,
+                    kind: NativePartitionKind::Singleton,
                 },
                 current: Epoch {
                     configuration: 1,
@@ -822,12 +990,12 @@ impl Harness {
                 },
                 id: 100,
                 instance: incarnation,
-                current_role: 4,
-                previous_role: 0,
+                current_role: NativeReplicaRole::Primary,
+                previous_role: NativeReplicaRole::Unknown,
                 up: true,
                 last_lsn: -1,
                 first_lsn: -1,
-                state: 2,
+                state: NativeReplicaState::Ready,
                 version: version.clone(),
                 service_endpoint: String::new(),
                 replication_endpoint: String::new(),
@@ -853,23 +1021,23 @@ impl Harness {
                 constraints: String::new(),
                 scaleout: 0,
                 metrics: fubst::serde::ObjectArray(vec![]),
-                move_cost: 0,
+                move_cost: NativeMoveCost::Zero,
                 restart_wait: 0,
                 quorum_wait: 0,
                 update_version: 1,
                 placement: fubst::serde::ObjectArray(vec![]),
                 standby_keep: 0,
-                activation_mode: 0,
+                activation_mode: NativeServicePackageActivationMode::SharedProcess,
                 dns: String::new(),
                 scaling: fubst::serde::EmptyObjectArray,
             },
-            flags: 0,
+            flags: NativeProxyFlags::NONE,
         }
     }
     async fn send(&mut self, action: &str, request: &ProxyRequest) {
         let mut request = request.clone();
         if action == "RAPQuery" {
-            request.flags = 0;
+            request.flags = NativeProxyFlags::NONE;
         }
         let message = message(12, action, to_vec(&request).unwrap()).unwrap();
         if action == "RAPQuery" {
@@ -1166,6 +1334,21 @@ async fn true_open_and_factory_errors_remain_failed_and_dispose_created_instance
 async fn open_readiness_query_duplicate_close_and_partition_invalidation() {
     let mut h = Harness::new().await;
     let mut request = h.request(1, 1, 0);
+    h.send("RAPQuery", &request).await;
+    let missing: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    assert_ne!(missing.error, 0);
+    assert_eq!(
+        (
+            missing.detail.kind,
+            missing.detail.read_status,
+            missing.detail.write_status
+        ),
+        (
+            NativeServiceKind::Invalid,
+            NativeServicePartitionAccessStatus::Invalid,
+            NativeServicePartitionAccessStatus::Invalid
+        )
+    );
     h.send("ReplicaOpen", &request).await;
     let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(reply.error.error, 0);
@@ -1197,7 +1380,7 @@ async fn open_readiness_query_duplicate_close_and_partition_invalidation() {
     native_query.service.restart_wait = i64::MIN;
     native_query.service.quorum_wait = i64::MIN;
     native_query.service.standby_keep = i64::MIN;
-    native_query.unit.consistency.kind = 0;
+    native_query.unit.consistency.kind = NativePartitionKind::Invalid;
     h.send("RAPQuery", &native_query).await;
     let response = h.receive("RAPQueryReply").await;
     assert_ne!(
@@ -1206,8 +1389,21 @@ async fn open_readiness_query_duplicate_close_and_partition_invalidation() {
     );
     let query: QueryReply = from_slice(&response.body).unwrap();
     assert_eq!(query.error, 0);
+    assert_eq!(
+        (
+            query.detail.kind,
+            query.detail.read_status,
+            query.detail.write_status
+        ),
+        (
+            NativeServiceKind::Stateless,
+            NativeServicePartitionAccessStatus::Invalid,
+            NativeServicePartitionAccessStatus::Invalid
+        )
+    );
     assert_eq!(query.detail.instance_id, 100);
-    assert_eq!(query.detail.operation, 1);
+    assert_eq!(query.detail.operation, NativeServiceOperation::None);
+    native_query.unit.consistency.kind = NativePartitionKind::Unrecognized(i64::MIN);
     native_query.local.instance += 1;
     h.send("RAPQuery", &native_query).await;
     let newer_query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
@@ -1219,6 +1415,18 @@ async fn open_readiness_query_duplicate_close_and_partition_invalidation() {
     h.send("RAPQuery", &native_query).await;
     let stale_query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
     assert_ne!(stale_query.error, 0);
+    assert_eq!(
+        (
+            stale_query.detail.kind,
+            stale_query.detail.read_status,
+            stale_query.detail.write_status
+        ),
+        (
+            NativeServiceKind::Invalid,
+            NativeServicePartitionAccessStatus::Invalid,
+            NativeServicePartitionAccessStatus::Invalid
+        )
+    );
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
     assert_eq!(h.calls.closes.load(Ordering::SeqCst), 1);
@@ -1246,14 +1454,14 @@ async fn independent_units_progress_and_abort_fences_late_open() {
     .unwrap();
     h.send("RAPQuery", &blocked).await;
     let opening: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
-    assert_eq!(opening.detail.operation, 2);
+    assert_eq!(opening.detail.operation, NativeServiceOperation::Open);
     assert!(opening.local.service_endpoint.is_empty());
     let other = h.request(2, 1, 0);
     h.send("ReplicaOpen", &other).await;
     let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(reply.unit.id.id, Guid([2; 16]));
     let mut abort = blocked.clone();
-    abort.flags = 4;
+    abort.flags = NativeProxyFlags::ABORT;
     h.send("ReplicaClose", &abort).await;
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(failed.error.error, OBJECT_CLOSED);
@@ -1402,7 +1610,7 @@ async fn query_tracks_actual_abort_cleanup_and_graceful_close_operations() {
         if mode != 5 {
             h.receive("ReplicaOpenReply").await;
             if mode == 4 {
-                request.flags = 4
+                request.flags = NativeProxyFlags::ABORT
             }
 
             h.send("ReplicaClose", &request).await;
@@ -1411,7 +1619,11 @@ async fn query_tracks_actual_abort_cleanup_and_graceful_close_operations() {
             loop {
                 let u = unit(&h.engine.shared, &request, false).unwrap();
                 if let Some(u) = u {
-                    let expected = if mode == 7 { 8 } else { 16 };
+                    let expected = if mode == 7 {
+                        NativeServiceOperation::Close
+                    } else {
+                        NativeServiceOperation::Abort
+                    };
                     if u.state.lock().unwrap().operation_kind == expected
                         && if mode == 7 {
                             h.calls.closes.load(Ordering::SeqCst) > 0
@@ -1436,7 +1648,14 @@ async fn query_tracks_actual_abort_cleanup_and_graceful_close_operations() {
         });
         h.send("RAPQuery", &request).await;
         let query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
-        assert_eq!(query.detail.operation, if mode == 7 { 8 } else { 16 });
+        assert_eq!(
+            query.detail.operation,
+            if mode == 7 {
+                NativeServiceOperation::Close
+            } else {
+                NativeServiceOperation::Abort
+            }
+        );
         assert!(query.detail.operation_start > 0);
         h.calls.abort_release.store(true, Ordering::Release);
         h.calls.release.cancel();
@@ -1457,7 +1676,7 @@ async fn abort_panic_or_cleanup_timeout_never_acknowledges_disposal() {
         let mut request = h.request(1, 1, mode);
         h.send("ReplicaOpen", &request).await;
         h.receive("ReplicaOpenReply").await;
-        request.flags = 4;
+        request.flags = NativeProxyFlags::ABORT;
         h.send("ReplicaClose", &request).await;
         let retired =
             tokio::time::timeout(Duration::from_secs(1), h.engine.shared.connection.closed()).await;
@@ -1489,20 +1708,33 @@ async fn abort_panic_or_cleanup_timeout_never_acknowledges_disposal() {
 }
 
 #[tokio::test]
-async fn named_partition_wire_decode_preserves_owned_model_identity() {
-    let mut h = Harness::new().await;
-    let mut request = h.request(9, 1, 0);
-    request.unit.consistency.kind = 3;
-    request.unit.consistency.name = "owned-named-partition".into();
-    h.send("ReplicaOpen", &request).await;
-    h.receive("ReplicaOpenReply").await;
-    assert_eq!(
-        h.calls.partitions.lock().unwrap()[0].kind,
-        PartitionKind::Named("owned-named-partition".into())
-    );
-    h.send("ReplicaClose", &request).await;
-    h.receive("ReplicaCloseReply").await;
-    h.engine.quiesce().await.unwrap();
+async fn partition_kind_wire_decode_preserves_owned_model_identity() {
+    for (kind, expected) in [
+        (
+            NativePartitionKind::Named,
+            PartitionKind::Named("owned-named-partition".into()),
+        ),
+        (
+            NativePartitionKind::Int64Range,
+            PartitionKind::Int64Range {
+                low: i64::MIN,
+                high: i64::MAX,
+            },
+        ),
+    ] {
+        let mut h = Harness::new().await;
+        let mut request = h.request(9, 1, 0);
+        request.unit.consistency.kind = kind;
+        request.unit.consistency.low = i64::MIN;
+        request.unit.consistency.high = i64::MAX;
+        request.unit.consistency.name = "owned-named-partition".into();
+        h.send("ReplicaOpen", &request).await;
+        h.receive("ReplicaOpenReply").await;
+        assert_eq!(h.calls.partitions.lock().unwrap()[0].kind, expected);
+        h.send("ReplicaClose", &request).await;
+        h.receive("ReplicaCloseReply").await;
+        h.engine.quiesce().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1585,7 +1817,7 @@ async fn locally_revoked_admitted_stateless_success_preserves_siblings_and_close
         .await
         .unwrap();
         let mut close = request.clone();
-        close.flags = 4;
+        close.flags = NativeProxyFlags::ABORT;
         h.send("ReplicaClose", &close).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while valid.load(Ordering::Acquire) {
@@ -1684,17 +1916,17 @@ async fn prepared_fault_report_preserves_original_payload_across_retry_writes() 
     let mut body = FaultBody {
         unit: request.unit,
         local: request.local,
-        fault: 1,
+        fault: NativeFaultType::Transient,
         activity: Activity {
             id: ActivityId {
                 guid: Guid([7; 16]),
                 index: 17,
             },
-            kind: 2,
+            kind: NativeActivityType::ServiceReportFaultEvent,
         },
     };
     let report = crate::ipc_client::FaultReport::prepare(body.clone()).unwrap();
-    body.fault = 2;
+    body.fault = NativeFaultType::Permanent;
     body.activity.id.guid = Guid([8; 16]);
     let connection = h.engine.shared.connection.clone();
     connection
@@ -1723,7 +1955,7 @@ async fn prepared_fault_report_preserves_original_payload_across_retry_writes() 
         retried.metadata().unwrap().id
     );
     let received: FaultBody = from_slice(&retried.body).unwrap();
-    assert_eq!(received.fault, 1);
+    assert_eq!(received.fault, NativeFaultType::Transient);
     assert_ne!(received.fault, body.fault);
     assert_eq!(received.activity.id.guid.0, [7; 16]);
     assert_ne!(received.activity.id.guid.0, body.activity.id.guid.0);

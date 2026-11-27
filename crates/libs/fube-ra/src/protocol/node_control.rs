@@ -48,7 +48,7 @@ pub struct LoadMetricValue {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegacyLoadReport {
     pub unit: PartitionId,
-    pub role: i64,
+    pub role: NativeReplicaRole,
     // ReportLoadInfo deliberately does not serialize its isStateful_ member.
     pub metrics: ObjectArray<Vec<LoadMetricValue>>,
 }

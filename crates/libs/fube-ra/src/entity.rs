@@ -5,6 +5,8 @@
 //! runtimes. Native source grounding: EntityState/LockedEntityPtr, EntityMap and
 //! EntityJobItem; see the catalog's selected stateless decision/test tables.
 use crate::protocol::*;
+use crate::protocol::{NativeReplicaRole, NativeReplicaState};
+use fube_core::protocol::NativeProxyFlags;
 use fube_ra_store::{self as store, KeyValueStore, Output, Record, RecordId, Request};
 use fubst::serde::{from_slice, to_vec};
 use serde::{Deserialize, Serialize};
@@ -282,7 +284,7 @@ pub struct OpenCompletion {
     pub unit: FailoverUnit,
     pub replica: Replica,
     pub error: i64,
-    pub flags: i64,
+    pub flags: NativeProxyFlags,
     pub detail: ProxyErrorDetail,
 }
 pub enum Command {
@@ -738,7 +740,7 @@ pub enum Effect {
     UpdateConfiguration {
         body: Box<Configuration>,
         local: Box<Replica>,
-        flags: i64,
+        flags: NativeProxyFlags,
         registration: RuntimeRegistration,
     },
     AddReplicaReply(AddReplicaReply),
@@ -807,13 +809,13 @@ pub enum Effect {
         token: u64,
         body: Arc<AddInstance>,
         registration: RuntimeRegistration,
-        flags: i64,
+        flags: NativeProxyFlags,
     },
     Close {
         token: u64,
         body: Arc<AddInstance>,
         registration: RuntimeRegistration,
-        flags: i64,
+        flags: NativeProxyFlags,
     },
     /// Owned original-session RAP obligation, independent of the node/FM reply.
     /// The captured body remains sendable even if a subsequent Close clears pending.
@@ -1303,10 +1305,7 @@ impl Executor {
             Command::CloseLocal { unit, mode } => (
                 unit.guid.0,
                 Kind::LocalClose,
-                to_vec(&lifecycle::LocalCloseRequest {
-                    unit,
-                    mode: mode as i64,
-                }),
+                to_vec(&lifecycle::LocalCloseRequest { unit, mode }),
             ),
             Command::HostingRegistered(body) => {
                 (body.unit.guid.0, Kind::HostingRegistered, to_vec(&body))
@@ -1987,7 +1986,7 @@ fn transition(
                             && body.replica.node == s.body.replica.node
                             && body.replica.id == s.body.replica.id
                             && body.replica.instance == s.body.replica.instance
-                            && body.replica.current_role == 2
+                            && body.replica.current_role == NativeReplicaRole::Idle
                     });
                     let fresh_idle = state.is_none()
                         && valid_stateful_sizes(&body.service)
@@ -2027,9 +2026,9 @@ fn transition(
                 || peer_creation.is_some()
                 || matches!(work.kind, Kind::OpenLocalStateful | Kind::OpenLocalPrimary);
             let role = match work.kind {
-                Kind::OpenLocalStateful | Kind::CreateReplica { .. } => 2,
-                Kind::OpenLocalPrimary | Kind::AddPrimary { .. } => 4,
-                _ => 1,
+                Kind::OpenLocalStateful | Kind::CreateReplica { .. } => NativeReplicaRole::Idle,
+                Kind::OpenLocalPrimary | Kind::AddPrimary { .. } => NativeReplicaRole::Primary,
+                _ => NativeReplicaRole::None,
             };
             if body.replica.node != admission.local_node {
                 return Err(Failure::Admission(
@@ -2060,7 +2059,7 @@ fn transition(
                 || body.service.persisted
                 || body.service.group
                 || body.replica.current_role != role
-                || body.replica.state != 1
+                || body.replica.state != NativeReplicaState::InBuild
                 || !body.replica.up
                 || body.replica.id < 0
                 || body.replica.instance < 0
@@ -2073,12 +2072,13 @@ fn transition(
                 }));
             }
             if local_stateful
-                && (body.replica.previous_role != 1
+                && (body.replica.previous_role != NativeReplicaRole::None
                     || body.service.partitions != 1
                     || !valid_stateful_sizes(&body.service)
-                    || body.service.activation_mode != 0
+                    || body.service.activation_mode
+                        != NativeServicePackageActivationMode::SharedProcess
                     || !body.service.scaling.0.is_empty()
-                    || body.unit.consistency.kind != 1
+                    || body.unit.consistency.kind != NativePartitionKind::Singleton
                     || body.unit.consistency.id != body.unit.id
                     || !body.unit.consistency.name.is_empty()
                     || body.unit.consistency.low != 0
@@ -2092,7 +2092,10 @@ fn transition(
                     "only local volatile initial Open with valid configured sizes",
                 ));
             }
-            if role == 4 && !fm_primary && body.unit.previous != Epoch::default() {
+            if role == NativeReplicaRole::Primary
+                && !fm_primary
+                && body.unit.previous != Epoch::default()
+            {
                 return Err(Failure::Unsupported(
                     "initial Primary cannot inherit a previous configuration",
                 ));
@@ -2740,6 +2743,116 @@ async fn entity_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Serialize)]
+    struct RawLocalCloseRequest<'a> {
+        unit: &'a PartitionId,
+        mode: i64,
+    }
+
+    #[test]
+    fn local_close_request_preserves_signed_long64_codes_and_decode_errors() {
+        let unit = PartitionId {
+            guid: fubst::serde::Guid([7; 16]),
+        };
+        for (mode, code) in [
+            (CloseMode::Delete, 1),
+            (CloseMode::Obliterate, 2),
+            (CloseMode::ForceDelete, 3),
+            (CloseMode::ForceAbort, 4),
+            (CloseMode::Drop, 5),
+            (CloseMode::AppHostDown, 6),
+            (CloseMode::Close, 7),
+            (CloseMode::Abort, 8),
+            (CloseMode::DeactivateNode, 9),
+            (CloseMode::Deactivate, 10),
+        ] {
+            let bytes = to_vec(&lifecycle::LocalCloseRequest {
+                unit: unit.clone(),
+                mode,
+            })
+            .unwrap();
+            let expected = to_vec(&RawLocalCloseRequest {
+                unit: &unit,
+                mode: code,
+            })
+            .unwrap();
+            assert_eq!(bytes, expected);
+            let decoded = lifecycle::LocalCloseRequest::decode(&bytes).unwrap();
+            assert_eq!(decoded.unit, unit);
+            assert_eq!(decoded.mode, mode);
+            for end in 0..bytes.len() {
+                assert!(matches!(
+                    lifecycle::LocalCloseRequest::decode(&bytes[..end]),
+                    Err(Failure::Admission("invalid native lifecycle payload"))
+                ));
+            }
+        }
+        for mode in [i64::MIN, -1, 0, 11, i64::MAX] {
+            let bytes = to_vec(&RawLocalCloseRequest { unit: &unit, mode }).unwrap();
+            assert!(matches!(
+                lifecycle::LocalCloseRequest::decode(&bytes),
+                Err(Failure::Unsupported("unsupported local Close mode"))
+            ));
+        }
+    }
+
+    #[test]
+    fn local_close_mode_rejection_precedes_readiness_and_missing_entity_checks() {
+        let unit = PartitionId::default();
+        let config = NativeConfig::new(&Settings::default());
+        for (owner_ready, node_open) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let admission = Admission {
+                local_node: NodeInstance::default(),
+                fm_source: NodeInstance::default(),
+                generation: GenerationNumber::default(),
+                owner_ready,
+                node_open,
+                node_activated: true,
+                fabric_upgrading: false,
+            };
+            for mode in [i64::MIN, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, i64::MAX] {
+                let (result, _) = watch::channel(Status::Pending);
+                let mut work = Submission {
+                    id: 1,
+                    entity: unit.guid.0,
+                    kind: Kind::LocalClose,
+                    bytes: to_vec(&RawLocalCloseRequest { unit: &unit, mode })
+                        .unwrap()
+                        .into_boxed_slice(),
+                    charge: 0,
+                    reserved_effects: 8,
+                    result,
+                };
+                let result = transition(&work, None, &admission, &config, &[]);
+                if matches!(mode, 4 | 5 | 7 | 8) {
+                    let result = result.unwrap();
+                    assert_eq!(
+                        result.disposition,
+                        if owner_ready && node_open {
+                            Disposition::IgnoredStale
+                        } else {
+                            Disposition::IgnoredNotReady
+                        }
+                    );
+                    assert!(matches!(result.update, Update::None));
+                    assert!(result.effects.is_empty());
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(Failure::Unsupported("unsupported local Close mode"))
+                    ));
+                }
+                work.bytes = Box::new([]);
+                assert!(matches!(
+                    transition(&work, None, &admission, &config, &[]),
+                    Err(Failure::Admission("invalid native lifecycle payload"))
+                ));
+            }
+        }
+    }
+
     #[test]
     fn completed_ticket_sender_close_after_pending_sample_is_not_owner_loss() {
         let (sender, receiver) = watch::channel(Status::Pending);
@@ -2839,7 +2952,7 @@ mod tests {
         body.replica.node = node.clone();
         body.replica.id = 1;
         body.replica.instance = 1;
-        body.replica.state = 1;
+        body.replica.state = NativeReplicaState::InBuild;
         body.replica.version = body.service.version.clone();
         body
     }

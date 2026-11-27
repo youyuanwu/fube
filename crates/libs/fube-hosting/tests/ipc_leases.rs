@@ -1,3 +1,7 @@
+use fube_core::protocol::NativeActivityType;
+use fube_core::protocol::NativeApplicationHostType;
+use fube_core::protocol::NativeHealthState;
+use fube_core::protocol::NativeServicePackageActivationMode;
 use fube_hosting::{ipc::*, wire, ClosedRegisteredEvent, Error};
 #[path = "support/ipc_wire.rs"]
 mod ipc_wire;
@@ -40,7 +44,7 @@ fn admission() -> Admission {
         deadlines: RequestDeadlines::Propagated,
         host: wire::HostContext {
             id: uuid::Uuid::new_v4().to_string(),
-            kind: 1,
+            kind: NativeApplicationHostType::ActivatedSingleCodePackage,
             pid: std::process::id(),
             container: false,
             activator: false,
@@ -57,7 +61,7 @@ fn admission() -> Admission {
                     },
                     activation: wire::Activation {
                         guid: Guid([0; 16]),
-                        mode: 0,
+                        mode: NativeServicePackageActivationMode::SharedProcess,
                     },
                     public_id: String::new(),
                 },
@@ -78,6 +82,61 @@ fn admission() -> Admission {
         },
     }
 }
+
+#[test]
+fn native_host_and_activation_codes_remain_lossless_without_widening_admission() {
+    #[derive(Serialize)]
+    struct RawHost<'a> {
+        id: &'a str,
+        kind: i64,
+        pid: u32,
+        container: bool,
+        activator: bool,
+    }
+    #[derive(Serialize)]
+    struct RawActivation {
+        guid: Guid,
+        mode: i64,
+    }
+    let mut server = server(LOCAL_LEASE_DURATION);
+    let accepted = server.admit(admission()).unwrap();
+    server.release(accepted).unwrap();
+    for kind in [0, 2, 3, 4, -1, i64::MIN, i64::MAX] {
+        let mut request = admission();
+        let bytes = to_vec(&RawHost {
+            id: &request.host.id,
+            kind,
+            pid: request.host.pid,
+            container: false,
+            activator: false,
+        })
+        .unwrap();
+        request.host = from_slice(&bytes).unwrap();
+        assert_eq!(request.host.kind.code(), kind);
+        assert_eq!(to_vec(&request.host).unwrap(), bytes);
+        assert!(
+            matches!(server.admit(request), Err(Error::UnsupportedCapability)),
+            "host type {kind}"
+        );
+    }
+    for mode in [1, 2, -1, i64::MIN, i64::MAX] {
+        let mut request = admission();
+        let bytes = to_vec(&RawActivation {
+            guid: Guid([0; 16]),
+            mode,
+        })
+        .unwrap();
+        request.code.id.package.activation = from_slice(&bytes).unwrap();
+        assert_eq!(request.code.id.package.activation.mode.code(), mode);
+        assert_eq!(to_vec(&request.code.id.package.activation).unwrap(), bytes);
+        assert!(
+            matches!(server.admit(request), Err(Error::UnsupportedCapability)),
+            "activation mode {mode}"
+        );
+    }
+    server.stop().unwrap();
+}
+
 fn server(duration: Duration) -> Server {
     Server::bind("127.0.0.1:0".parse().unwrap(), config(duration)).unwrap()
 }
@@ -397,6 +456,7 @@ async fn admitted_factory_lookup_duplicates_and_owned_health_disabled_sources() 
     );
     let source = owner.health_sources().unwrap().remove(0);
     let report = source.last_disabled_report.as_ref().unwrap();
+    assert_eq!(report.health_state, NativeHealthState::Ok);
     assert_eq!(report.property, "ServiceTypeRegistration:Widget");
     assert_eq!(report.application_name, "fabric:/RustApp");
     assert_eq!(report.node_name, "local");
@@ -482,7 +542,10 @@ async fn factory_context_and_consumer_withdrawal_are_fail_closed_with_residuals(
         match change {
             0 => request.context.code.code_sequence += 1,
             1 => request.context.code.version.instance += 1,
-            2 => request.id.package.activation.mode = 1,
+            2 => {
+                request.id.package.activation.mode =
+                    NativeServicePackageActivationMode::ExclusiveProcess
+            }
             3 => request.context.host.pid += 1,
             _ => {}
         }
@@ -726,6 +789,9 @@ async fn disabled_health_keeps_shared_entity_history_after_reported_type_is_remo
         .find(|s| s.id.service_type.name == "B")
         .unwrap();
     assert_eq!(a.entity_instance, b.entity_instance);
+    let registered = a.last_disabled_report.as_ref().unwrap();
+    assert_eq!(registered.kind, DisabledReportKind::Registered);
+    assert_eq!(registered.health_state, NativeHealthState::Ok);
     assert!(b.last_disabled_report.is_none());
     let first = owner
         .remove_declaration(&a.id, "prepared-package")
@@ -734,6 +800,7 @@ async fn disabled_health_keeps_shared_entity_history_after_reported_type_is_remo
     assert!(!first.entity_deleted);
     let report = first.disabled_report.unwrap();
     assert_eq!(report.kind, DisabledReportKind::DeleteEvent);
+    assert_eq!(report.health_state, NativeHealthState::Ok);
     assert_eq!(report.source, "System.Hosting");
     assert_eq!(report.property, "ServiceTypeRegistration:A");
     assert_eq!(report.ttl_ticks, Some(1_000_000));
@@ -746,6 +813,7 @@ async fn disabled_health_keeps_shared_entity_history_after_reported_type_is_remo
     assert!(last.entity_deleted);
     let report = last.disabled_report.unwrap();
     assert_eq!(report.kind, DisabledReportKind::DeleteEntity);
+    assert_eq!(report.health_state, NativeHealthState::Ok);
     assert_eq!(report.entity_instance, a.entity_instance);
     assert_eq!(report.property, "DeleteProperty");
     assert_eq!(report.ttl_ticks, Some(72_000_000_000));
@@ -1201,6 +1269,41 @@ async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_
 }
 
 #[tokio::test]
+async fn shared_log_creation_flags_remain_opaque_during_bootstrap_admission() {
+    for bits in [0u32, 1, 2, 3, 0x8000_0000, u32::MAX] {
+        let mut config = config(LOCAL_LEASE_DURATION);
+        let application = wire::SharedLog {
+            path: fubst::serde::ByteArray(vec![0; 1024]),
+            disk: Guid([2; 16]),
+            container: Guid([3; 16]),
+            size: 1024,
+            streams: 128,
+            record: 512,
+            flags: wire::NativeSharedLogCreationFlags::from_bits_retain(bits),
+        };
+        let system = wire::SharedLog {
+            flags: wire::NativeSharedLogCreationFlags::from_bits_retain(!bits),
+            ..application.clone()
+        };
+        config.node.application_log = Pointer(Some(application));
+        config.node.system_log = Pointer(Some(system));
+        let mut server = Server::bind("127.0.0.1:0".parse().unwrap(), config).unwrap();
+        let a = admission();
+        let lease = server.admit(a.clone()).unwrap();
+        let mut peer = Peer::connect(&server, a).await;
+        let reply = peer.start(300_000_000).await;
+        assert_eq!(reply.error, 0);
+        assert_eq!(reply.application_log.0.unwrap().flags.bits(), bits);
+        assert_eq!(reply.system_log.0.unwrap().flags.bits(), !bits);
+        assert_eq!(peer.finish().await, 0);
+        assert_eq!(peer.register().await, 0);
+        assert!(peer.poll().await.unwrap() > 0);
+        assert!(server.status(&lease).unwrap().registered_host);
+        server.stop().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn finite_frames_and_registration_outcomes() {
     let mut server = server(LOCAL_LEASE_DURATION);
     let a = admission();
@@ -1245,7 +1348,7 @@ async fn finite_frames_and_registration_outcomes() {
                         guid: Guid([1; 16]),
                         index: 9,
                     },
-                    kind: 0,
+                    kind: NativeActivityType::Unknown,
                 },
             },
         )
@@ -1388,7 +1491,7 @@ async fn foreign_id_only_mutation_and_duplicate_cannot_steal_runtime() {
                         guid: Guid([0; 16]),
                         index: 0,
                     },
-                    kind: 0,
+                    kind: NativeActivityType::Unknown,
                 },
             })
             .unwrap()
@@ -1484,7 +1587,7 @@ async fn truncated_start_requests_never_register() {
     let a = admission();
     let body = to_vec(&wire::StartRequest {
         id: a.host.id.clone(),
-        kind: 1,
+        kind: NativeApplicationHostType::ActivatedSingleCodePackage,
         pid: a.host.pid,
         timeout: 300_000_000,
         container: false,
@@ -1649,7 +1752,10 @@ async fn fields_dropped_by_h1_are_checked_before_wire_registration() {
             0 => context.code.code_sequence += 1,
             1 => context.code.application_name = "fabric:/Wrong".into(),
             2 => context.host.activator = true,
-            _ => context.code.id.package.activation.mode = 1,
+            _ => {
+                context.code.id.package.activation.mode =
+                    NativeServicePackageActivationMode::ExclusiveProcess
+            }
         }
         let request = peer.frame(
             9,
@@ -1765,7 +1871,7 @@ async fn decode_projection_and_reply_budgets_reject_before_allocation() {
                 "StartRegisterApplicationHostRequest",
                 to_vec(&wire::StartRequest {
                     id: h.id,
-                    kind: 1,
+                    kind: NativeApplicationHostType::ActivatedSingleCodePackage,
                     pid: h.pid,
                     timeout: 300_000_000,
                     container: false,
@@ -1868,7 +1974,7 @@ async fn blocked_writer_does_not_hold_registration_deadline() {
             "StartRegisterApplicationHostRequest",
             to_vec(&wire::StartRequest {
                 id: a.host.id.clone(),
-                kind: 1,
+                kind: NativeApplicationHostType::ActivatedSingleCodePackage,
                 pid: a.host.pid,
                 timeout: 1_000_000,
                 container: false,

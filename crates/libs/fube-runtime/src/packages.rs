@@ -683,7 +683,8 @@ fn description(
 pub(crate) fn load(activation: &ActivationContext, deployment: &Path) -> Result<PackageSnapshot> {
     let code: &CodeContext = &activation.runtime.code;
     if !deployment.is_absolute()
-        || code.id.package.activation.mode != 0
+        || code.id.package.activation.mode
+            != crate::wire::NativeServicePackageActivationMode::SharedProcess
         || code.id.package.activation.guid.0 != [0; 16]
         || !code.id.package.public_id.is_empty()
     {

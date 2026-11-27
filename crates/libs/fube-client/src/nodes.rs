@@ -55,86 +55,71 @@ impl std::fmt::Display for NodeId {
 #[serde(transparent)]
 pub struct NodeTimestamp(pub i64);
 
-macro_rules! native_enum {
-    ($(#[$meta:meta])* $name:ident { $($(#[$variant_meta:meta])* $variant:ident = $value:expr),* $(,)? }) => {
-        $(#[$meta])*
-        /// Serde uses the signed i64 code in native and JSON formats, retaining unknown values.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        #[non_exhaustive]
-        pub enum $name {
-            $($(#[$variant_meta])* $variant,)*
-            /// A numeric value not named by the profiled native source.
-            Unrecognized(i64),
-        }
-        impl $name {
-            pub(crate) fn from_raw(value: i64) -> Self {
-                match value {
-                    $($value => Self::$variant,)*
-                    other => Self::Unrecognized(other),
-                }
-            }
-            /// Return the native signed value, including unrecognized values.
-            pub fn as_raw(self) -> i64 {
-                match self {
-                    $(Self::$variant => $value,)*
-                    Self::Unrecognized(other) => other,
-                }
-            }
-        }
-        impl Serialize for $name {
-            fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-                serializer.serialize_i64(self.as_raw())
-            }
-        }
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-                i64::deserialize(deserializer).map(Self::from_raw)
-            }
-        }
-    };
-}
-
-native_enum!(
+crate::native::lossless_enum!(
     /// Native node state, distinct from the bits in [`NodeStatusFilter`].
-    NodeStatus {
-        Invalid = 0, Up = 1, Down = 2, Enabling = 3, Disabling = 4,
-        Disabled = 5, Unknown = 6, Removed = 7,
+    pub enum NodeStatus {
+        Invalid = 0,
+        Up = 1,
+        Down = 2,
+        Enabling = 3,
+        Disabling = 4,
+        Disabled = 5,
+        Unknown = 6,
+        Removed = 7,
     }
 );
-native_enum!(
+crate::native::lossless_enum!(
     /// Native health assessment; `Unknown` is a named value, not a fallback.
     /// The default is Unknown; deserialization still preserves explicit codes.
     #[derive(Default)]
-    HealthState {
-        Invalid = 0, Ok = 1, Warning = 2, Error = 3,
+    pub enum HealthState {
+        Invalid = 0,
+        Ok = 1,
+        Warning = 2,
+        Error = 3,
         #[default]
         Unknown = 65535,
     }
 );
-native_enum!(
+crate::native::lossless_enum!(
     /// Requested or effective action for native node deactivation.
-    NodeDeactivationIntent {
-        Invalid = 0, Pause = 1, Restart = 2, RemoveData = 3, RemoveNode = 4,
+    pub enum NodeDeactivationIntent {
+        Invalid = 0,
+        Pause = 1,
+        Restart = 2,
+        RemoveData = 3,
+        RemoveNode = 4,
     }
 );
-native_enum!(
+crate::native::lossless_enum!(
     /// Progress of the node's native deactivation safety checks and action.
-    NodeDeactivationStatus {
-        None = 0, SafetyCheckInProgress = 1, SafetyCheckComplete = 2, Completed = 3,
+    pub enum NodeDeactivationStatus {
+        None = 0,
+        SafetyCheckInProgress = 1,
+        SafetyCheckComplete = 2,
+        Completed = 3,
     }
 );
-native_enum!(
+crate::native::lossless_enum!(
     /// Native subsystem that owns a node deactivation task.
-    NodeDeactivationTaskType {
-        Invalid = 0, Infrastructure = 1, Repair = 2, Client = 3,
+    pub enum NodeDeactivationTaskType {
+        Invalid = 0,
+        Infrastructure = 1,
+        Repair = 2,
+        Client = 3,
     }
 );
-native_enum!(
+crate::native::lossless_enum!(
     /// Native safety-check discriminant; unknown structural kinds fail decoding.
-    SafetyCheckKind {
-        Invalid = 0, EnsureSeedNodeQuorum = 1, EnsurePartitionQuorum = 2,
-        WaitForPrimaryPlacement = 3, WaitForPrimarySwap = 4,
-        WaitForReconfiguration = 5, WaitForInBuildReplica = 6, EnsureAvailability = 7,
+    pub enum SafetyCheckKind {
+        Invalid = 0,
+        EnsureSeedNodeQuorum = 1,
+        EnsurePartitionQuorum = 2,
+        WaitForPrimaryPlacement = 3,
+        WaitForPrimarySwap = 4,
+        WaitForReconfiguration = 5,
+        WaitForInBuildReplica = 6,
+        EnsureAvailability = 7,
     }
 );
 

@@ -3,6 +3,7 @@ use fube_local_host::process::OwnedApp;
 use fube_node::control::wire::{self, Link};
 use fube_node_runner::{Config, Fm, Identity, Placement};
 use fube_ra::protocol::*;
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use fubst::serde::ObjectArray;
 use furpc::Message;
 use serde_json::Value;
@@ -417,9 +418,12 @@ struct RemovalLfum {
 
 fn completed_removal_view(mut configuration: Configuration) -> Configuration {
     configuration.unit.previous = Epoch::default();
-    configuration.replicas.0.retain(|r| r.current_role >= 3);
+    configuration
+        .replicas
+        .0
+        .retain(|r| r.current_role.is_active());
     for r in &mut configuration.replicas.0 {
-        r.previous_role = 1;
+        r.previous_role = NativeReplicaRole::None;
     }
     configuration
 }
@@ -449,10 +453,10 @@ fn assert_removal_lfum(body: &LfumUpload, node: &NodeInstance, lost: bool, remov
                     id: replica.id,
                     instance: replica.instance,
                     up: false,
-                    state: 3,
+                    state: NativeReplicaState::Dropped,
                     ..Replica::default()
                 },
-                intermediate_role: 1,
+                intermediate_role: NativeReplicaRole::None,
             }]
         {
             assert!([
@@ -470,7 +474,8 @@ fn assert_removal_lfum(body: &LfumUpload, node: &NodeInstance, lost: bool, remov
             return;
         }
         assert_eq!(
-            replica.current_role, 4,
+            replica.current_role,
+            NativeReplicaRole::Primary,
             "deleted removal destination cannot report a live membership"
         );
     }
@@ -481,10 +486,12 @@ fn assert_removal_lfum(body: &LfumUpload, node: &NodeInstance, lost: bool, remov
         (removal.intent.clone(), Some(&removal.intent)),
         (stable.clone(), None),
     ];
-    let primary = removal
-        .supersession
-        .as_ref()
-        .and_then(|f| f.replicas.0.iter().find(|r| r.current_role == 4));
+    let primary = removal.supersession.as_ref().and_then(|f| {
+        f.replicas
+            .0
+            .iter()
+            .find(|r| r.current_role == NativeReplicaRole::Primary)
+    });
     if let Some(failover) = removal.supersession.as_ref().filter(|_| !lost) {
         views.extend([
             (failover.clone(), None),
@@ -523,7 +530,7 @@ fn assert_removal_lfum(body: &LfumUpload, node: &NodeInstance, lost: bool, remov
                         .replicas
                         .0
                         .iter()
-                        .any(|r| &r.node == node && r.current_role == 4)
+                        .any(|r| &r.node == node && r.current_role == NativeReplicaRole::Primary)
                 || info.intermediate != intermediate.map_or(Epoch::default(), |c| c.unit.current)
             {
                 return false;
@@ -531,7 +538,9 @@ fn assert_removal_lfum(body: &LfumUpload, node: &NodeInstance, lost: bool, remov
             for r in &mut view.replicas.0 {
                 r.first_lsn = -1;
                 r.last_lsn = -1;
-                if primary.is_some_and(|p| p.node == r.node) && r.current_role == 4 {
+                if primary.is_some_and(|p| p.node == r.node)
+                    && r.current_role == NativeReplicaRole::Primary
+                {
                     let Some(actual) = info
                         .replicas
                         .0
@@ -550,7 +559,7 @@ fn assert_removal_lfum(body: &LfumUpload, node: &NodeInstance, lost: bool, remov
                 .map(|description| {
                     let role = intermediate
                         .and_then(|c| c.replicas.0.iter().find(|r| r.node == description.node))
-                        .map_or(1, |r| r.current_role);
+                        .map_or(NativeReplicaRole::None, |r| r.current_role);
                     ReplicaInfo {
                         description,
                         intermediate_role: role,
@@ -685,11 +694,9 @@ impl FmFixture {
                             .is_some_and(|b| b.replica.node == node)
                         && body.units.0.is_empty();
                     let closed = self.failover.as_ref().is_some_and(|intent| {
-                        intent
-                            .replicas
-                            .0
-                            .iter()
-                            .any(|r| r.node == node && r.previous_role == 4)
+                        intent.replicas.0.iter().any(|r| {
+                            r.node == node && r.previous_role == NativeReplicaRole::Primary
+                        })
                     });
                     let expected = self
                         .repair_build
@@ -707,16 +714,14 @@ impl FmFixture {
                                     let mut configuration = request.clone();
                                     configuration.unit = complete;
                                     for r in &mut configuration.replicas.0 {
-                                        r.previous_role = 1;
+                                        r.previous_role = NativeReplicaRole::None;
                                     }
                                     return configuration;
                                 }
                             }
-                            let primary = previous
-                                .replicas
-                                .0
-                                .iter()
-                                .any(|r| r.node == node && r.current_role == 4);
+                            let primary = previous.replicas.0.iter().any(|r| {
+                                r.node == node && r.current_role == NativeReplicaRole::Primary
+                            });
                             let fresh = build.replica.node == node;
                             let mut replicas = if fresh {
                                 vec![]
@@ -742,19 +747,16 @@ impl FmFixture {
                         })
                         .or_else(|| {
                             self.failover.as_ref().map(|intent| {
-                                if intent
-                                    .replicas
-                                    .0
-                                    .iter()
-                                    .any(|r| r.node == node && r.current_role == 4)
-                                {
+                                if intent.replicas.0.iter().any(|r| {
+                                    r.node == node && r.current_role == NativeReplicaRole::Primary
+                                }) {
                                     intent.clone()
                                 } else if self.failover_ending {
                                     let mut body = intent.clone();
                                     body.unit.previous = Epoch::default();
-                                    body.replicas.0.retain(|r| r.current_role >= 3);
+                                    body.replicas.0.retain(|r| r.current_role.is_active());
                                     for r in &mut body.replicas.0 {
-                                        r.previous_role = 1;
+                                        r.previous_role = NativeReplicaRole::None;
                                     }
                                     body
                                 } else {
@@ -850,12 +852,18 @@ impl FmFixture {
                                     &expected.replication_endpoint
                                 )
                             );
-                            assert!(actual.up && matches!(actual.state, 1 | 2));
+                            assert!(
+                                actual.up
+                                    && matches!(
+                                        actual.state,
+                                        NativeReplicaState::InBuild | NativeReplicaState::Ready
+                                    )
+                            );
                             assert_eq!((actual.first_lsn, actual.last_lsn), (-1, -1));
                             if info.unit == complete {
                                 assert_eq!(
                                     (actual.previous_role, actual.current_role),
-                                    (1, expected.current_role)
+                                    (NativeReplicaRole::None, expected.current_role)
                                 );
                             } else if info.unit == previous.unit {
                                 let old = previous
@@ -878,7 +886,7 @@ impl FmFixture {
                             assert_eq!(
                                 replicas[0].intermediate_role,
                                 if info.intermediate == Epoch::default() {
-                                    1
+                                    NativeReplicaRole::None
                                 } else {
                                     actual.current_role
                                 }
@@ -890,7 +898,8 @@ impl FmFixture {
                                 .replicas
                                 .0
                                 .iter()
-                                .any(|r| r.node == node && r.current_role == 4));
+                                .any(|r| r.node == node
+                                    && r.current_role == NativeReplicaRole::Primary));
                         }
                     } else if closed {
                         assert!(body.any_replica_found);
@@ -911,10 +920,10 @@ impl FmFixture {
                                         id: original.id,
                                         instance: original.instance,
                                         up: false,
-                                        state: 3,
+                                        state: NativeReplicaState::Dropped,
                                         ..Replica::default()
                                     },
-                                    intermediate_role: 1,
+                                    intermediate_role: NativeReplicaRole::None,
                                 }]
                             );
                         }
@@ -926,7 +935,7 @@ impl FmFixture {
                         assert_eq!(info.service, primary(&self.configurations[index]).service);
                         let primary = configuration.replicas.0.iter().any(|r| {
                             r.node == self.configurations[index].node.identity.native().unwrap()
-                                && r.current_role == 4
+                                && r.current_role == NativeReplicaRole::Primary
                         });
                         assert_eq!(
                             info.intermediate,
@@ -949,19 +958,18 @@ impl FmFixture {
                             info.report_from_primary,
                             configuration.replicas.0.iter().any(|r| r.node
                                 == self.configurations[index].node.identity.native().unwrap()
-                                && r.current_role == 4)
+                                && r.current_role == NativeReplicaRole::Primary)
                         );
                         for expected in &configuration.replicas.0 {
                             let mut expected = expected.clone();
                             expected.first_lsn = -1;
                             expected.last_lsn = -1;
-                            if expected.current_role == 4
+                            if expected.current_role == NativeReplicaRole::Primary
                                 && self.failover.as_ref().is_some_and(|intent| {
-                                    intent
-                                        .replicas
-                                        .0
-                                        .iter()
-                                        .any(|r| r.node == expected.node && r.current_role == 4)
+                                    intent.replicas.0.iter().any(|r| {
+                                        r.node == expected.node
+                                            && r.current_role == NativeReplicaRole::Primary
+                                    })
                                 })
                             {
                                 expected.service_endpoint = info
@@ -974,7 +982,9 @@ impl FmFixture {
                                     .service_endpoint
                                     .clone();
                             }
-                            if self.initial_builds.is_some() && expected.current_role == 2 {
+                            if self.initial_builds.is_some()
+                                && expected.current_role == NativeReplicaRole::Idle
+                            {
                                 let actual = &info
                                     .replicas
                                     .0
@@ -986,7 +996,8 @@ impl FmFixture {
                                 expected.replication_endpoint = actual.replication_endpoint.clone();
                             }
                             if self.repair_build.as_ref().is_some_and(|build| {
-                                build.replica.node == expected.node && expected.current_role == 2
+                                build.replica.node == expected.node
+                                    && expected.current_role == NativeReplicaRole::Idle
                             }) {
                                 let actual = &info
                                     .replicas
@@ -996,25 +1007,29 @@ impl FmFixture {
                                     .unwrap()
                                     .description;
                                 assert!(
-                                    matches!(actual.state, 1 | 2)
-                                        || self.repair_cancelled && actual.state == 3
+                                    matches!(
+                                        actual.state,
+                                        NativeReplicaState::InBuild | NativeReplicaState::Ready
+                                    ) || self.repair_cancelled
+                                        && actual.state == NativeReplicaState::Dropped
                                 );
                                 if expected.node == node {
                                     assert!(
-                                        actual.state == 1
-                                            || self.repair_deleting && actual.state == 3
+                                        actual.state == NativeReplicaState::InBuild
+                                            || self.repair_deleting
+                                                && actual.state == NativeReplicaState::Dropped
                                     );
                                 }
                                 if self.repair_deleting
                                     && expected.node == node
-                                    && actual.state == 3
+                                    && actual.state == NativeReplicaState::Dropped
                                 {
                                     expected = Replica {
                                         node: expected.node,
                                         id: expected.id,
                                         instance: expected.instance,
                                         up: false,
-                                        state: 3,
+                                        state: NativeReplicaState::Dropped,
                                         ..Replica::default()
                                     };
                                 } else {
@@ -1025,7 +1040,7 @@ impl FmFixture {
                                 }
                             }
                             let intermediate_role = if info.intermediate == Epoch::default() {
-                                1
+                                NativeReplicaRole::None
                             } else {
                                 expected.current_role
                             };
@@ -1098,7 +1113,7 @@ impl FmFixture {
                             assert_eq!(replica.instance, config.node.replica_instance);
                         }
                         assert!(!replica.up);
-                        assert_eq!(replica.state, 3);
+                        assert_eq!(replica.state, NativeReplicaState::Dropped);
                         if !retired
                             && !self.stopping
                             && !self.deleted[index]
@@ -1182,7 +1197,7 @@ impl FmFixture {
                     let build = self.repair_build.as_ref().unwrap();
                     assert_eq!(body.unit, build.unit);
                     let mut expected = build.replica.clone();
-                    expected.state = 3;
+                    expected.state = NativeReplicaState::Dropped;
                     expected.replication_endpoint = body.replica.replication_endpoint.clone();
                     assert!(!expected.replication_endpoint.is_empty());
                     assert_eq!(body.replica, expected);
@@ -1227,7 +1242,7 @@ impl FmFixture {
                                 id: build.replica.id,
                                 instance: build.replica.instance,
                                 up: false,
-                                state: 3,
+                                state: NativeReplicaState::Dropped,
                                 ..Replica::default()
                             }
                         );
@@ -1308,8 +1323,8 @@ fn primary(config: &Config) -> AddPrimary {
     body.replica.node = config.node.identity.native().unwrap();
     body.replica.id = config.node.replica_id;
     body.replica.instance = config.node.replica_instance;
-    body.replica.current_role = 4;
-    body.replica.state = 1;
+    body.replica.current_role = NativeReplicaRole::Primary;
+    body.replica.state = NativeReplicaState::InBuild;
     body.replica.version = VersionInstance {
         instance: config.package_version_instance,
         ..VersionInstance::default()
@@ -1341,8 +1356,8 @@ fn idle_request(primary: &AddPrimary, config: &Config) -> AddReplica {
         node: config.node.identity.native().unwrap(),
         id: config.node.replica_id,
         instance: config.node.replica_instance,
-        current_role: 2,
-        state: 1,
+        current_role: NativeReplicaRole::Idle,
+        state: NativeReplicaState::InBuild,
         version: primary.service.version.clone(),
         ..Replica::default()
     };
@@ -1406,11 +1421,11 @@ async fn standalone_configured_sizes_preserve_membership_failover_lfum_and_delet
             assert_eq!(fm.builds.last(), Some(&held));
         }
         let mut replicas = vec![original.replica.clone()];
-        replicas[0].previous_role = 4;
+        replicas[0].previous_role = NativeReplicaRole::Primary;
         for built in &fm.builds {
             let mut replica = built.replica.clone();
-            replica.previous_role = 2;
-            replica.current_role = 3;
+            replica.previous_role = NativeReplicaRole::Idle;
+            replica.current_role = NativeReplicaRole::Secondary;
             replicas.push(replica);
         }
         let mut unit = body.unit.clone();
@@ -1543,12 +1558,12 @@ async fn standalone_configured_sizes_preserve_membership_failover_lfum_and_delet
             failover.unit.current.configuration += 0x1_0000_0001;
             for replica in &mut failover.replicas.0 {
                 replica.previous_role = replica.current_role;
-                if replica.current_role == 4 {
-                    replica.current_role = 3;
+                if replica.current_role == NativeReplicaRole::Primary {
+                    replica.current_role = NativeReplicaRole::Secondary;
                     replica.up = false;
-                    replica.state = 3;
+                    replica.state = NativeReplicaState::Dropped;
                 } else if replica.node == candidate {
-                    replica.current_role = 4;
+                    replica.current_role = NativeReplicaRole::Primary;
                 }
                 replica.first_lsn = -1;
                 replica.last_lsn = -1;
@@ -1556,7 +1571,7 @@ async fn standalone_configured_sizes_preserve_membership_failover_lfum_and_delet
             let mut count = failover.replicas.0.len();
             for replica in &mut failover.replicas.0 {
                 if !replica.up && count > minimum as usize {
-                    replica.current_role = 1;
+                    replica.current_role = NativeReplicaRole::None;
                     count -= 1;
                 }
             }
@@ -1588,7 +1603,7 @@ async fn standalone_configured_sizes_preserve_membership_failover_lfum_and_delet
             .replicas
             .0
             .iter()
-            .find(|r| r.current_role == 4)
+            .find(|r| r.current_role == NativeReplicaRole::Primary)
             .unwrap()
             .service_endpoint;
         assert!(application(endpoint, "read")
@@ -1681,7 +1696,7 @@ async fn planned_handoff(
         .replicas
         .0
         .iter()
-        .find(|r| r.current_role == 4)
+        .find(|r| r.current_role == NativeReplicaRole::Primary)
         .unwrap();
     let source = fixture
         .configs
@@ -1694,7 +1709,11 @@ async fn planned_handoff(
     intent.unit.current.configuration += 0x1_0000_0001;
     for replica in &mut intent.replicas.0 {
         replica.previous_role = replica.current_role;
-        replica.current_role = if replica.node == candidate_node { 4 } else { 3 };
+        replica.current_role = if replica.node == candidate_node {
+            NativeReplicaRole::Primary
+        } else {
+            NativeReplicaRole::Secondary
+        };
     }
     let request = DoReconfiguration {
         configuration: intent,
@@ -1750,11 +1769,11 @@ async fn configured_membership(fm: &mut FmFixture, fixture: &mut Fixture) -> DoR
         fm.until(fixture, |fm| fm.builds.len() == destination).await;
     }
     let mut replicas = vec![fm.primary.as_ref().unwrap().replica.clone()];
-    replicas[0].previous_role = 4;
+    replicas[0].previous_role = NativeReplicaRole::Primary;
     for built in &fm.builds {
         let mut replica = built.replica.clone();
-        replica.previous_role = 2;
-        replica.current_role = 3;
+        replica.previous_role = NativeReplicaRole::Idle;
+        replica.current_role = NativeReplicaRole::Secondary;
         replicas.push(replica);
     }
     let mut unit = body.unit.clone();
@@ -1872,7 +1891,7 @@ async fn standalone_lfum_during_removal_supersession_preserves_pc_uploads_quorum
             .replicas
             .0
             .iter()
-            .find(|r| r.current_role == 4)
+            .find(|r| r.current_role == NativeReplicaRole::Primary)
             .unwrap()
             .service_endpoint
             .clone();
@@ -1932,9 +1951,9 @@ async fn standalone_lfum_during_removal_supersession_preserves_pc_uploads_quorum
         for r in &mut removal.replicas.0 {
             r.previous_role = r.current_role;
             if r.node == fixture.configs[1].node.identity.native().unwrap() {
-                r.current_role = 1;
+                r.current_role = NativeReplicaRole::None;
                 r.up = false;
-                r.state = 3;
+                r.state = NativeReplicaState::Dropped;
             }
         }
         fm.removal = Some(RemovalLfum {
@@ -2023,9 +2042,9 @@ async fn standalone_lfum_during_removal_supersession_preserves_pc_uploads_quorum
                 .iter()
                 .filter(|r| {
                     if previous {
-                        r.previous_role >= 3
+                        r.previous_role.is_active()
                     } else {
-                        r.current_role >= 3
+                        r.current_role.is_active()
                     }
                 })
                 .collect();
@@ -2041,11 +2060,11 @@ async fn standalone_lfum_during_removal_supersession_preserves_pc_uploads_quorum
             failover.unit.current.configuration += 0x1_0000_0001;
             for r in &mut failover.replicas.0 {
                 if r.node == fixture.configs[0].node.identity.native().unwrap() {
-                    r.current_role = 3;
+                    r.current_role = NativeReplicaRole::Secondary;
                     r.up = false;
-                    r.state = 3;
+                    r.state = NativeReplicaState::Dropped;
                 } else if r.node == fixture.configs[2].node.identity.native().unwrap() {
-                    r.current_role = 4;
+                    r.current_role = NativeReplicaRole::Primary;
                 }
                 r.first_lsn = -1;
                 r.last_lsn = -1;
@@ -2180,7 +2199,7 @@ async fn standalone_lfum_during_removal_supersession_preserves_pc_uploads_quorum
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
                 .unwrap()
                 .service_endpoint
                 .clone();
@@ -2334,7 +2353,7 @@ async fn standalone_repeated_planned_handoffs_coordinate_all_members_and_replay_
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
                 .unwrap()
                 .service_endpoint;
             assert!(application(endpoint, "read")
@@ -2353,7 +2372,7 @@ async fn standalone_repeated_planned_handoffs_coordinate_all_members_and_replay_
             .replicas
             .0
             .iter()
-            .find(|r| r.current_role == 4)
+            .find(|r| r.current_role == NativeReplicaRole::Primary)
             .unwrap()
             .service_endpoint
             .clone();
@@ -2452,7 +2471,7 @@ async fn standalone_lfum_during_planned_handoff_preserves_sf_phases_upload_owner
             .replicas
             .0
             .iter()
-            .find(|r| r.current_role == 4)
+            .find(|r| r.current_role == NativeReplicaRole::Primary)
             .unwrap()
             .service_endpoint
             .clone();
@@ -2507,7 +2526,11 @@ async fn standalone_lfum_during_planned_handoff_preserves_sf_phases_upload_owner
         let candidate_node = fixture.configs[candidate].node.identity.native().unwrap();
         for r in &mut intent.replicas.0 {
             r.previous_role = r.current_role;
-            r.current_role = if r.node == candidate_node { 4 } else { 3 };
+            r.current_role = if r.node == candidate_node {
+                NativeReplicaRole::Primary
+            } else {
+                NativeReplicaRole::Secondary
+            };
         }
         let request = DoReconfiguration {
             configuration: intent.clone(),
@@ -2603,7 +2626,7 @@ async fn standalone_lfum_during_planned_handoff_preserves_sf_phases_upload_owner
             .iter()
             .find(|r| r.description.node == fixture.configs[0].node.identity.native().unwrap())
             .unwrap();
-        assert_eq!(local.description.state, 1);
+        assert_eq!(local.description.state, NativeReplicaState::InBuild);
         assert!(local.description.service_endpoint.is_empty());
         let queried = &fm.uploaded[third].as_ref().unwrap().units.0[0];
         assert_eq!(queried.unit, intent.unit);
@@ -2611,7 +2634,8 @@ async fn standalone_lfum_during_planned_handoff_preserves_sf_phases_upload_owner
             .replicas
             .0
             .iter()
-            .any(|r| r.description.current_role == 4 && r.description.previous_role == 4));
+            .any(|r| r.description.current_role == NativeReplicaRole::Primary
+                && r.description.previous_role == NativeReplicaRole::Primary));
         assert!(!work[1].0.exists());
         acknowledge_rollover(&mut fm, &mut fixture).await;
         assert!(
@@ -2772,7 +2796,7 @@ async fn standalone_lfum_during_planned_handoff_preserves_sf_phases_upload_owner
             .replicas
             .0
             .iter()
-            .find(|r| r.current_role == 4)
+            .find(|r| r.current_role == NativeReplicaRole::Primary)
             .unwrap()
             .service_endpoint
             .clone();
@@ -2875,7 +2899,7 @@ async fn post_handoff_standalone_app_crash_repairs_same_node_then_transfers() {
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
                 .unwrap()
                 .service_endpoint;
             assert!(application(endpoint, "write").await.contains("committed=1"));
@@ -2892,7 +2916,7 @@ async fn post_handoff_standalone_app_crash_repairs_same_node_then_transfers() {
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
                 .unwrap()
                 .service_endpoint
                 .clone();
@@ -2958,11 +2982,11 @@ async fn post_handoff_standalone_app_crash_repairs_same_node_then_transfers() {
                 for r in &mut configuration.replicas.0 {
                     r.previous_role = r.current_role;
                     if r.node == predecessor.replica.node {
-                        r.current_role = 1;
+                        r.current_role = NativeReplicaRole::None;
                         r.up = false;
-                        r.state = 3;
+                        r.state = NativeReplicaState::Dropped;
                     } else if r.node == node {
-                        r.current_role = 4;
+                        r.current_role = NativeReplicaRole::Primary;
                     }
                     r.first_lsn = -1;
                     r.last_lsn = -1;
@@ -3014,7 +3038,7 @@ async fn post_handoff_standalone_app_crash_repairs_same_node_then_transfers() {
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
                 .unwrap()
                 .service_endpoint
                 .clone();
@@ -3079,7 +3103,7 @@ async fn post_handoff_standalone_app_crash_repairs_same_node_then_transfers() {
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
                 .unwrap()
                 .service_endpoint
                 .clone();
@@ -3190,7 +3214,11 @@ async fn standalone_planned_handoff_drops_missing_progress_then_rebuilds_an_expl
     let candidate = fixture.configs[1].node.identity.native().unwrap();
     for r in &mut intent.replicas.0 {
         r.previous_role = r.current_role;
-        r.current_role = if r.node == candidate { 4 } else { 3 };
+        r.current_role = if r.node == candidate {
+            NativeReplicaRole::Primary
+        } else {
+            NativeReplicaRole::Secondary
+        };
     }
     let request = DoReconfiguration {
         configuration: intent,
@@ -3230,7 +3258,11 @@ async fn standalone_planned_handoff_drops_missing_progress_then_rebuilds_an_expl
         .find(|r| r.node == lost)
         .unwrap()
         .clone();
-    assert!(!dropped.up && dropped.state == 3 && dropped.current_role == 3);
+    assert!(
+        !dropped.up
+            && dropped.state == NativeReplicaState::Dropped
+            && dropped.current_role == NativeReplicaRole::Secondary
+    );
     assert_eq!(fm.configured.len(), 1);
     fm.hold_configuration = false;
     fm.send(
@@ -3248,7 +3280,7 @@ async fn standalone_planned_handoff_drops_missing_progress_then_rebuilds_an_expl
         .replicas
         .0
         .iter()
-        .find(|r| r.current_role == 4)
+        .find(|r| r.current_role == NativeReplicaRole::Primary)
         .unwrap()
         .service_endpoint
         .clone();
@@ -3288,12 +3320,12 @@ async fn standalone_planned_handoff_drops_missing_progress_then_rebuilds_an_expl
     for r in &mut repair.replicas.0 {
         r.previous_role = r.current_role;
         if r.node == lost {
-            r.current_role = 1;
+            r.current_role = NativeReplicaRole::None;
         }
     }
     let mut fresh = built.replica;
-    fresh.previous_role = 2;
-    fresh.current_role = 3;
+    fresh.previous_role = NativeReplicaRole::Idle;
+    fresh.current_role = NativeReplicaRole::Secondary;
     repair.replicas.0.push(fresh);
     let repair = DoReconfiguration {
         configuration: repair,
@@ -3408,11 +3440,11 @@ async fn standalone_sequential_spares_restore_latest_membership_without_reopenin
                 .await;
         }
         let mut replicas = vec![original.replica.clone()];
-        replicas[0].previous_role = 4;
+        replicas[0].previous_role = NativeReplicaRole::Primary;
         for built in &fm.builds {
             let mut r = built.replica.clone();
-            r.previous_role = 2;
-            r.current_role = 3;
+            r.previous_role = NativeReplicaRole::Idle;
+            r.current_role = NativeReplicaRole::Secondary;
             replicas.push(r);
         }
         let mut unit = body.unit.clone();
@@ -3493,7 +3525,12 @@ async fn standalone_sequential_spares_restore_latest_membership_without_reopenin
                     membership.replicas.0.iter().any(|r| {
                         r.node == config.node.identity.native().unwrap()
                             && r.node != old.node
-                            && r.current_role == if was_primary { 3 } else { 4 }
+                            && r.current_role
+                                == if was_primary {
+                                    NativeReplicaRole::Secondary
+                                } else {
+                                    NativeReplicaRole::Primary
+                                }
                             && r.up
                     })
                 })
@@ -3510,11 +3547,15 @@ async fn standalone_sequential_spares_restore_latest_membership_without_reopenin
                 for r in &mut config.replicas.0 {
                     r.previous_role = r.current_role;
                     if r.node == old.node {
-                        r.current_role = if minimum == target { 3 } else { 1 };
+                        r.current_role = if minimum == target {
+                            NativeReplicaRole::Secondary
+                        } else {
+                            NativeReplicaRole::None
+                        };
                         r.up = false;
-                        r.state = 3;
+                        r.state = NativeReplicaState::Dropped;
                     } else if r.node == fixture.configs[selected].node.identity.native().unwrap() {
-                        r.current_role = 4;
+                        r.current_role = NativeReplicaRole::Primary;
                     }
                     r.first_lsn = -1;
                     r.last_lsn = -1;
@@ -3539,7 +3580,7 @@ async fn standalone_sequential_spares_restore_latest_membership_without_reopenin
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
                 .unwrap()
                 .service_endpoint
                 .clone();
@@ -3553,7 +3594,7 @@ async fn standalone_sequential_spares_restore_latest_membership_without_reopenin
                 .await;
             fm.until(&mut fixture, |fm| fm.held_build.is_some()).await;
             let held = fm.held_build.take().unwrap();
-            assert_eq!(held.replica.current_role, 2);
+            assert_eq!(held.replica.current_role, NativeReplicaRole::Idle);
             assert_eq!(fixture.status(spare)["replica_role"], 2);
             fm.hold_build = false;
             fm.send(selected, add_replica_message(&build, &generation).unwrap())
@@ -3572,21 +3613,21 @@ async fn standalone_sequential_spares_restore_latest_membership_without_reopenin
             for r in &mut replacement.replicas.0 {
                 r.previous_role = r.current_role;
                 if r.node == old.node {
-                    r.current_role = 1;
+                    r.current_role = NativeReplicaRole::None;
                     r.up = false;
-                    r.state = 3;
+                    r.state = NativeReplicaState::Dropped;
                 }
             }
             let mut fresh = held.replica;
-            fresh.previous_role = 2;
-            fresh.current_role = 3;
+            fresh.previous_role = NativeReplicaRole::Idle;
+            fresh.current_role = NativeReplicaRole::Secondary;
             replacement.replicas.0.push(fresh);
             assert_eq!(
                 replacement
                     .replicas
                     .0
                     .iter()
-                    .filter(|r| r.previous_role >= 3)
+                    .filter(|r| r.previous_role.is_active())
                     .count(),
                 target as usize - usize::from(was_primary && minimum < target)
             );
@@ -3595,7 +3636,7 @@ async fn standalone_sequential_spares_restore_latest_membership_without_reopenin
                     .replicas
                     .0
                     .iter()
-                    .filter(|r| r.current_role >= 3)
+                    .filter(|r| r.current_role.is_active())
                     .count(),
                 target as usize
             );
@@ -3675,7 +3716,7 @@ async fn standalone_sequential_spares_restore_latest_membership_without_reopenin
                     .replicas
                     .0
                     .iter()
-                    .find(|r| r.current_role == 4)
+                    .find(|r| r.current_role == NativeReplicaRole::Primary)
                     .unwrap()
                     .service_endpoint
                     .clone();
@@ -4131,9 +4172,9 @@ async fn restore_original(
     let mut replica = predecessor.replica.clone();
     replica.id = next;
     replica.instance = next;
-    replica.previous_role = 1;
-    replica.current_role = 2;
-    replica.state = 1;
+    replica.previous_role = NativeReplicaRole::None;
+    replica.current_role = NativeReplicaRole::Idle;
+    replica.state = NativeReplicaState::InBuild;
     replica.up = true;
     replica.first_lsn = -1;
     replica.last_lsn = -1;
@@ -4203,8 +4244,8 @@ async fn restore_original(
         replica.previous_role = replica.current_role;
     }
     let mut replica = built.replica;
-    replica.previous_role = 2;
-    replica.current_role = 3;
+    replica.previous_role = NativeReplicaRole::Idle;
+    replica.current_role = NativeReplicaRole::Secondary;
     replicas.0.push(replica);
     let request = DoReconfiguration {
         configuration: Configuration {
@@ -4272,9 +4313,9 @@ async fn remove_lost_secondary(
     for replica in &mut configuration.replicas.0 {
         replica.previous_role = replica.current_role;
         if replica.node == predecessor.replica.node {
-            replica.current_role = 1;
+            replica.current_role = NativeReplicaRole::None;
             replica.up = false;
-            replica.state = 3;
+            replica.state = NativeReplicaState::Dropped;
         }
     }
     let generation = fm.configurations[primary_node].generation().unwrap();
@@ -4334,7 +4375,7 @@ async fn cancel_repair_with_lfum(
         .replicas
         .0
         .iter()
-        .find(|r| r.current_role == 4)
+        .find(|r| r.current_role == NativeReplicaRole::Primary)
         .unwrap()
         .service_endpoint
         .clone();
@@ -4588,8 +4629,8 @@ async fn repair_with_lfum(
         node: fixture.configs[destination].node.identity.native().unwrap(),
         id: next,
         instance: next,
-        current_role: 2,
-        state: 1,
+        current_role: NativeReplicaRole::Idle,
+        state: NativeReplicaState::InBuild,
         version: build.service.version.clone(),
         ..Replica::default()
     };
@@ -4635,7 +4676,7 @@ async fn repair_with_lfum(
     if let Some(built) = &built {
         assert_eq!(built.replica.id, next);
         assert_eq!(built.replica.instance, next);
-        assert_eq!(built.replica.state, 2);
+        assert_eq!(built.replica.state, NativeReplicaState::Ready);
     }
     let fresh = fixture.status(destination);
     assert_ne!(
@@ -4728,8 +4769,8 @@ async fn repair_with_lfum(
         r.previous_role = r.current_role;
     }
     let mut replica = built.replica.clone();
-    replica.previous_role = 2;
-    replica.current_role = 3;
+    replica.previous_role = NativeReplicaRole::Idle;
+    replica.current_role = NativeReplicaRole::Secondary;
     request.replicas.0.push(replica);
     let configuration = DoReconfiguration {
         configuration: request.clone(),
@@ -4805,7 +4846,7 @@ async fn repair_with_lfum(
             .replicas
             .0
             .iter()
-            .find(|r| r.current_role == 4)
+            .find(|r| r.current_role == NativeReplicaRole::Primary)
             .unwrap()
             .service_endpoint;
         assert!(application(endpoint, "write-more")
@@ -4946,7 +4987,7 @@ async fn repair_with_lfum(
         .replicas
         .0
         .iter()
-        .find(|r| r.current_role == 4)
+        .find(|r| r.current_role == NativeReplicaRole::Primary)
         .unwrap()
         .service_endpoint;
     assert!(application(endpoint, "read")
@@ -5025,7 +5066,7 @@ async fn journey(fault: Fault) {
             let idle = &fm.uploaded[index].as_ref().unwrap().units.0[0].replicas.0[0];
             assert_eq!(
                 (idle.description.current_role, idle.description.state),
-                (2, 1)
+                (NativeReplicaRole::Idle, NativeReplicaState::InBuild)
             );
             assert!(primary_upload.replicas.0.contains(idle));
         }
@@ -5068,11 +5109,11 @@ async fn journey(fault: Fault) {
         }
     }
     let mut replicas = vec![fm.primary.as_ref().unwrap().replica.clone()];
-    replicas[0].previous_role = 4;
+    replicas[0].previous_role = NativeReplicaRole::Primary;
     for build in &fm.builds {
         let mut replica = build.replica.clone();
-        replica.previous_role = 2;
-        replica.current_role = 3;
+        replica.previous_role = NativeReplicaRole::Idle;
+        replica.current_role = NativeReplicaRole::Secondary;
         replicas.push(replica);
     }
     let mut unit = body.unit.clone();
@@ -5296,11 +5337,11 @@ async fn journey(fault: Fault) {
         for replica in &mut failover.configuration.replicas.0 {
             replica.previous_role = replica.current_role;
             if replica.node == fixture.configs[selected].node.identity.native().unwrap() {
-                replica.current_role = 1;
+                replica.current_role = NativeReplicaRole::None;
                 replica.up = false;
-                replica.state = 3;
+                replica.state = NativeReplicaState::Dropped;
             } else if replica.node == fixture.configs[candidate].node.identity.native().unwrap() {
-                replica.current_role = 4;
+                replica.current_role = NativeReplicaRole::Primary;
             }
             replica.first_lsn = -1;
             replica.last_lsn = -1;
@@ -5368,7 +5409,7 @@ async fn journey(fault: Fault) {
             .replicas
             .0
             .iter()
-            .find(|replica| replica.current_role == 4)
+            .find(|replica| replica.current_role == NativeReplicaRole::Primary)
             .unwrap();
         assert_eq!(
             new_primary.node,
@@ -5501,13 +5542,13 @@ async fn journey(fault: Fault) {
                 for replica in &mut request.replicas.0 {
                     replica.previous_role = replica.current_role;
                     if replica.node == predecessor.replica.node {
-                        replica.current_role = 1;
+                        replica.current_role = NativeReplicaRole::None;
                         replica.up = false;
-                        replica.state = 3;
+                        replica.state = NativeReplicaState::Dropped;
                     } else if replica.node
                         == fixture.configs[selected].node.identity.native().unwrap()
                     {
-                        replica.current_role = 4;
+                        replica.current_role = NativeReplicaRole::Primary;
                     }
                     replica.first_lsn = -1;
                     replica.last_lsn = -1;
@@ -5623,7 +5664,7 @@ async fn journey(fault: Fault) {
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
                 .unwrap()
                 .service_endpoint;
             assert_eq!(
@@ -5631,7 +5672,7 @@ async fn journey(fault: Fault) {
                     .replicas
                     .0
                     .iter()
-                    .find(|r| r.current_role == 4)
+                    .find(|r| r.current_role == NativeReplicaRole::Primary)
                     .unwrap()
                     .node,
                 fixture.configs[repaired_primary]
@@ -5704,7 +5745,7 @@ async fn journey(fault: Fault) {
                 .replicas
                 .0
                 .iter()
-                .find(|replica| replica.current_role == 4)
+                .find(|replica| replica.current_role == NativeReplicaRole::Primary)
                 .unwrap()
                 .service_endpoint
                 .clone();
@@ -5744,12 +5785,12 @@ async fn journey(fault: Fault) {
             for replica in &mut replicas.0 {
                 replica.previous_role = replica.current_role;
                 if replica.node == fixture.configs[candidate].node.identity.native().unwrap() {
-                    replica.current_role = 1;
+                    replica.current_role = NativeReplicaRole::None;
                     replica.up = false;
-                    replica.state = 3;
+                    replica.state = NativeReplicaState::Dropped;
                 } else if replica.node == fixture.configs[selected].node.identity.native().unwrap()
                 {
-                    replica.current_role = 4;
+                    replica.current_role = NativeReplicaRole::Primary;
                 }
                 replica.first_lsn = -1;
                 replica.last_lsn = -1;
@@ -5775,7 +5816,7 @@ async fn journey(fault: Fault) {
                 .replicas
                 .0
                 .iter()
-                .find(|replica| replica.current_role == 4)
+                .find(|replica| replica.current_role == NativeReplicaRole::Primary)
                 .unwrap();
             assert!(application(&primary.service_endpoint, "read")
                 .await
@@ -5860,8 +5901,8 @@ async fn journey(fault: Fault) {
                 }
                 Fault::Resize => invalid.configuration.unit.target = 4,
                 Fault::Promotion => {
-                    invalid.configuration.replicas.0[0].current_role = 3;
-                    invalid.configuration.replicas.0[1].current_role = 4;
+                    invalid.configuration.replicas.0[0].current_role = NativeReplicaRole::Secondary;
+                    invalid.configuration.replicas.0[1].current_role = NativeReplicaRole::Primary;
                 }
                 Fault::ForeignInstance => invalid.configuration.replicas.0[1].node.instance += 1,
                 _ => unreachable!(),

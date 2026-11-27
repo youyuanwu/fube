@@ -1,4 +1,5 @@
 use fube_ra::protocol::*;
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
@@ -570,7 +571,7 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
     body.replica.node = launch.node.clone();
     body.replica.id = launch.replica;
     body.replica.instance = launch.incarnation;
-    body.replica.state = 1;
+    body.replica.state = NativeReplicaState::InBuild;
     body.replica.version = profile.version.clone();
     body.service.name = launch.profile.service().into();
     body.service.application = APPLICATION.into();
@@ -582,7 +583,7 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
     body.service.minimum = minimum;
     if launch.profile.stateful() {
         body.service.stateful = true;
-        body.replica.current_role = 4;
+        body.replica.current_role = NativeReplicaRole::Primary;
         body.unit.current.configuration = (1 << 32) + 1;
     }
     body
@@ -594,7 +595,7 @@ pub fn dropped_replica(replica: &Replica) -> Replica {
         id: replica.id,
         instance: replica.instance,
         up: false,
-        state: 3,
+        state: NativeReplicaState::Dropped,
         ..Replica::default()
     }
 }
@@ -614,8 +615,8 @@ pub fn absent_replica_body(body: &AddInstance) -> AddInstance {
 
 pub fn pre_open_cancelled_body(body: &AddInstance) -> AddInstance {
     let mut body = body.clone();
-    body.replica.current_role = 2;
-    body.replica.state = 3;
+    body.replica.current_role = NativeReplicaRole::Idle;
+    body.replica.state = NativeReplicaState::Dropped;
     body.replica.up = false;
     body
 }
@@ -736,7 +737,7 @@ impl FailedOpenReceipt {
         let failure = &self.deletion.failure;
         let disposal = &failure.disposal;
         let mut original = add_body(launch, profile);
-        original.replica.current_role = 2;
+        original.replica.current_role = NativeReplicaRole::Idle;
         if launch.profile != ServiceProfile::StatefulPeerIdle
             || launch.placement != 2
             || launch.peers.is_empty()

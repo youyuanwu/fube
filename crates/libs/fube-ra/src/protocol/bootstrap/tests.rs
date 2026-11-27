@@ -48,10 +48,10 @@ fn rich_node_up() -> NodeUp {
         node: NodeDescription {
             upgrade_domain: "UD".into(),
             fault_domains: ObjectArray(vec![Uri {
-                kind: 2,
+                kind: NativeUriType::Rootless,
                 scheme: "fd".into(),
                 authority: "authority".into(),
-                host_kind: 3,
+                host_kind: NativeUriHostType::RegName,
                 host: "host".into(),
                 port: 123,
                 path: "/rack/node".into(),
@@ -106,7 +106,7 @@ fn rich_ack() -> NodeUpAck {
                     value: Rollout { major: 2, minor: 3 },
                 },
                 instance: u64::MAX,
-                upgrade_type: -91,
+                upgrade_type: NativeUpgradeType::Unrecognized(-91),
                 monitored: true,
                 packages: ObjectArray(vec![ServicePackageUpgradeSpecification {
                     package_name: "UpgradePkg".into(),
@@ -245,7 +245,7 @@ fn source_node_up() -> Vec<u8> {
     e.finish()
 }
 
-fn source_ack() -> Vec<u8> {
+fn source_ack(upgrade_type: i64) -> Vec<u8> {
     let mut e = Encoder::new();
     e.object(|e| {
         e.object_array(&[()], |e, _| {
@@ -257,7 +257,7 @@ fn source_ack() -> Vec<u8> {
                 })?;
                 e.object(|e| source_rollout(e, 2, 3))?;
                 e.u64(u64::MAX)?;
-                e.i64(-91)?;
+                e.i64(upgrade_type)?;
                 e.boolean(true)?;
                 e.object_array(&[()], |e, _| {
                     e.string("UpgradePkg")?;
@@ -316,8 +316,34 @@ fn node_up_matches_source_scopes_order_map_uri_and_package_closure() {
 }
 
 #[test]
+fn uri_classifier_typing_retains_components_and_inventory_only_profile_checks() {
+    let mut node = rich_node_up();
+    node.packages.0.clear();
+    node.any_replica_found = false;
+    for (kind, host_kind) in [
+        (0, 0),
+        (1, 1),
+        (2, 2),
+        (3, 3),
+        (i64::MIN, i64::MAX),
+        (i64::MAX, i64::MIN),
+        (-1, 4),
+        (4, -1),
+    ] {
+        node.node.fault_domains.0[0].kind = NativeUriType::from(kind);
+        node.node.fault_domains.0[0].host_kind = NativeUriHostType::from(host_kind);
+        let message = node_up_message(&node).unwrap();
+        let mut decoded = decode_node_up(&message).unwrap();
+        assert_eq!(decoded, node);
+        decoded.validate_fresh_stateless().unwrap();
+        decoded.any_replica_found = true;
+        assert!(decoded.validate_fresh_stateless().is_err());
+    }
+}
+
+#[test]
 fn ack_matches_full_source_upgrade_closure_without_discarding_unsupported_data() {
-    let expected = source_ack();
+    let expected = source_ack(-91);
     assert_eq!(to_vec(&rich_ack()).unwrap(), expected);
     assert_eq!(from_slice::<NodeUpAck>(&expected).unwrap(), rich_ack());
     let message = node_up_ack_message(&rich_ack(), &generation()).unwrap();
@@ -325,6 +351,35 @@ fn ack_matches_full_source_upgrade_closure_without_discarding_unsupported_data()
     assert_eq!(decoded, rich_ack());
     assert_eq!(actual_generation, generation());
     assert!(decoded.validate_fresh_activated(&version()).is_err());
+}
+
+#[test]
+fn upgrade_type_typing_preserves_source_bytes_without_admitting_upgrades() {
+    assert_eq!(
+        ApplicationUpgradeSpecification::default().upgrade_type,
+        NativeUpgradeType::Rolling
+    );
+    for code in [0, 1, 2, 3, i64::MIN, -91, -1, 4, i64::MAX] {
+        let mut ack = rich_ack();
+        ack.upgrades.0[0].specification.upgrade_type = NativeUpgradeType::from(code);
+        let expected = source_ack(code);
+        assert_eq!(to_vec(&ack).unwrap(), expected);
+        assert_eq!(from_slice::<NodeUpAck>(&expected).unwrap(), ack);
+        let message = node_up_ack_message(&ack, &generation()).unwrap();
+        let (mut decoded, actual_generation) = decode_node_up_ack(&message).unwrap();
+        assert_eq!(decoded, ack);
+        assert_eq!(actual_generation, generation());
+        decoded.activated = true;
+        decoded.activation_sequence = 0;
+        assert!(matches!(
+            decoded.validate_fresh_activated(&version()),
+            Err(Error::Protocol(
+                "NodeUpAck application upgrades unsupported"
+            ))
+        ));
+        decoded.upgrades.0.clear();
+        decoded.validate_fresh_activated(&version()).unwrap();
+    }
 }
 
 fn generation() -> GenerationHeader {
@@ -582,10 +637,10 @@ fn compact_wire_arrays_cannot_amplify_past_default_allocation_budget() {
     let mut node = NodeUp::default();
     node.node.fault_domains = ObjectArray(vec![
         Uri {
-            kind: 0,
+            kind: NativeUriType::AuthorityAbEmpty,
             scheme: String::new(),
             authority: String::new(),
-            host_kind: 0,
+            host_kind: NativeUriHostType::None,
             host: String::new(),
             port: 0,
             path: String::new(),

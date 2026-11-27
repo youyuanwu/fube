@@ -2,6 +2,7 @@
 use crate::ipc_client::{deadline_after, native_error, Check, FaultReport};
 use crate::{api::FaultType, lease::Authority, wire::*};
 use crate::{Error, Result};
+use fube_core::protocol::NativeActivityType;
 use fubst::serde::{EmptyObjectArray, NativeEnum, ObjectArray, Pointer};
 use furpc::{HeaderId, HeaderRecord, Request};
 use std::{
@@ -203,16 +204,10 @@ impl Reporting {
         self.send_load(metrics, false).await
     }
     pub(crate) async fn move_cost(self: &Arc<Self>, cost: MoveCost) -> Result<()> {
-        let value = match cost {
-            MoveCost::Zero => 0,
-            MoveCost::Low => 1,
-            MoveCost::Medium => 2,
-            MoveCost::High => 3,
-        };
         self.send_load(
             &[LoadMetric {
                 name: "_MoveCost_".into(),
-                value,
+                value: NativeMoveCost::from(cost).code(),
             }],
             true,
         )
@@ -237,8 +232,9 @@ impl Reporting {
         let request = self.request.lock().unwrap().clone();
         let primary = if request.service.stateful {
             match request.local.current_role {
-                4 => true,      // RAP Primary
-                2 | 3 => false, // RAP Idle / Secondary -> PLB Secondary
+                crate::wire::NativeReplicaRole::Primary => true,
+                crate::wire::NativeReplicaRole::Idle
+                | crate::wire::NativeReplicaRole::Secondary => false,
                 _ => {
                     return Err(Error::new(
                         crate::ErrorKind::InvalidState,
@@ -373,10 +369,9 @@ impl Reporting {
         let request = self.request.lock().unwrap().clone();
         let partition = request.unit.id.id;
         let id = uuid::Uuid::from_bytes_le(partition.0);
-        let (kind, entity, entity_id) = match target {
-            HealthTarget::Partition => (3, HealthEntity::Partition { partition }, id.to_string()),
+        let (entity, entity_id) = match target {
+            HealthTarget::Partition => (HealthEntity::Partition { partition }, id.to_string()),
             HealthTarget::Instance if !request.service.stateful => (
-                2,
                 HealthEntity::Instance {
                     partition,
                     instance: request.local.id,
@@ -384,7 +379,6 @@ impl Reporting {
                 format!("{id}+{}", request.local.id),
             ),
             HealthTarget::Replica if request.service.stateful => (
-                1,
                 HealthEntity::Replica {
                     partition,
                     replica: request.local.id,
@@ -398,6 +392,7 @@ impl Reporting {
                 ))
             }
         };
+        let kind = entity.kind();
         let entity_property = format!("{entity_id}+{}", report.property);
         let body = HealthBody {
             reports: ObjectArray(vec![EntityHealth {
@@ -409,9 +404,7 @@ impl Reporting {
                     HealthState::Invalid => {
                         return Err(Error::InvalidInput("invalid health state"))
                     }
-                    HealthState::Ok => 1,
-                    HealthState::Warning => 2,
-                    HealthState::Error => 3,
+                    state => NativeHealthState::from(state),
                 },
                 description: report.description.clone(),
                 sequence,
@@ -481,11 +474,10 @@ impl Reporting {
     }
     pub(crate) async fn fault(self: &Arc<Self>, fault: FaultType) -> Result<FaultDelivery> {
         self.check()?;
-        let native_fault = match fault {
-            FaultType::Invalid => return Err(Error::InvalidInput("invalid fault type")),
-            FaultType::Transient => 1,
-            FaultType::Permanent => 2,
-        };
+        let native_fault = NativeFaultType::from(fault);
+        if native_fault == NativeFaultType::Invalid {
+            return Err(Error::InvalidInput("invalid fault type"));
+        }
         let (first, changed, receiver) = {
             let mut stage = self.fault.lock().unwrap();
             if let Some(existing) = stage
@@ -505,7 +497,7 @@ impl Reporting {
                             guid: fubst::serde::Guid(uuid::Uuid::new_v4().to_bytes_le()),
                             index: 0,
                         },
-                        kind: 2,
+                        kind: NativeActivityType::ServiceReportFaultEvent,
                     },
                 })?;
                 if let Some(old) = &*stage {

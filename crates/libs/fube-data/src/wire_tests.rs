@@ -82,13 +82,13 @@ fn replication() -> Packet {
         operations: vec![
             WireOperation {
                 sequence: 7,
-                kind: NORMAL,
+                kind: NativeOperationKind::Normal,
                 atomic_group: -1,
                 data: vec![vec![], b"ab".to_vec()],
             },
             WireOperation {
                 sequence: 8,
-                kind: NORMAL,
+                kind: NativeOperationKind::Normal,
                 atomic_group: -1,
                 data: vec![b"c".to_vec()],
             },
@@ -409,7 +409,14 @@ fn all_classic_actions_roundtrip_empty_and_zero_length_provider_buffers() {
         }
         roundtrip(single);
     }
-    for kind in [NORMAL, END_OF_STREAM, 0x10, 0x20, 0x40, 0x80] {
+    for kind in [
+        NativeOperationKind::Normal,
+        NativeOperationKind::EndOfStream,
+        NativeOperationKind::CreateAtomicGroup,
+        NativeOperationKind::AtomicGroupOperation,
+        NativeOperationKind::CommitAtomicGroup,
+        NativeOperationKind::RollbackAtomicGroup,
+    ] {
         let mut value = replication();
         if let Body::Replication { operations, .. } = &mut value.body {
             for operation in operations {
@@ -712,6 +719,104 @@ fn abi_sizes_reserved_pointers_types_sequences_and_native_padding() {
 }
 
 #[test]
+fn typed_native_metadata_keeps_u32_abi_and_rejects_non_operation_values() {
+    for (kind, code) in [
+        (NativeOperationKind::Normal, 0x0001u32),
+        (NativeOperationKind::EndOfStream, 0x0002),
+        (NativeOperationKind::CreateAtomicGroup, 0x0010),
+        (NativeOperationKind::AtomicGroupOperation, 0x0020),
+        (NativeOperationKind::CommitAtomicGroup, 0x0040),
+        (NativeOperationKind::RollbackAtomicGroup, 0x0080),
+    ] {
+        let metadata = NativeOperationMetadata {
+            kind,
+            sequence: 7,
+            atomic_group: 42,
+        };
+        let mut expected = hex(METADATA_SEVEN);
+        expected[2..6].copy_from_slice(&code.to_le_bytes());
+        expected[18..26].copy_from_slice(&42i64.to_le_bytes());
+        let mut encoder = Encoder::new();
+        metadata.write(&mut encoder).unwrap();
+        assert_eq!(encoder.finish(), expected);
+
+        expected[6..10].copy_from_slice(&[0xab, 0xcd, 0xef, 0x12]);
+        let mut decoder = Decoder::new(&expected);
+        let decoded = NativeOperationMetadata::read(&mut decoder).unwrap();
+        decoder.finish().unwrap();
+        assert_eq!(
+            (decoded.kind, decoded.sequence, decoded.atomic_group),
+            (kind, 7, 42)
+        );
+    }
+
+    for code in [0u32, 3, 0x11, 0x30, 0xf0, 0x100, 0x8000_0000, u32::MAX] {
+        let mut bytes = hex(METADATA_SEVEN);
+        bytes[2..6].copy_from_slice(&code.to_le_bytes());
+        assert!(matches!(
+            NativeOperationMetadata::read(&mut Decoder::new(&bytes)),
+            Err(fubst::Error::Protocol(
+                "invalid operation type or atomic group"
+            ))
+        ));
+    }
+}
+
+#[test]
+fn typed_copy_metadata_keeps_last_override_and_rejects_atomic_kinds_and_groups() {
+    for copy_context in [false, true] {
+        for last in [false, true] {
+            for kind in [1u32, 2, 0x10, 0x20, 0x40, 0x80] {
+                for group in [-1i64, 0] {
+                    let mut metadata = hex(METADATA_SEVEN);
+                    metadata[2..6].copy_from_slice(&kind.to_le_bytes());
+                    metadata[18..26].copy_from_slice(&group.to_le_bytes());
+                    let mut fields = if copy_context {
+                        vec![]
+                    } else {
+                        [hex("09 13"), hex(EPOCH_PRIMARY)].concat()
+                    };
+                    fields.extend(metadata);
+                    fields.extend(hex("88 01 02"));
+                    fields.push(if last { 0x42 } else { 0x72 });
+                    let (action, header) = if copy_context {
+                        ("CopyContextOperation", COPY_CONTEXT)
+                    } else {
+                        ("CopyOperation", COPY_OPERATION)
+                    };
+                    let message = fixture_message(
+                        action,
+                        Some((header, native_object(&fields))),
+                        b"ab".to_vec(),
+                    );
+                    let decoded = Packet::decode_parts(&message);
+                    if group == -1 && (kind == 1 || (last && kind == 2)) {
+                        let expected = if copy_context {
+                            Body::CopyContext {
+                                sequence: 7,
+                                data: vec![b"ab".to_vec()],
+                                last,
+                            }
+                        } else {
+                            Body::Copy {
+                                epoch: primary_epoch(),
+                                target: 19,
+                                sequence: 7,
+                                data: vec![b"ab".to_vec()],
+                                last,
+                            }
+                        };
+                        assert_eq!(decoded.unwrap().body, expected);
+                    } else {
+                        assert!(decoded.is_err(), "{action}, {kind:x}, {group}, {last}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn copy_metadata_preserves_native_last_override_and_rejects_bad_sequences() {
     let valid = packet(Body::Copy {
         epoch: primary_epoch(),
@@ -732,7 +837,7 @@ fn copy_metadata_preserves_native_last_override_and_rejects_bad_sequences() {
     let metadata_offset = 2 + hex(EPOCH_PRIMARY).len() + 2;
     for (offset, bytes) in [
         (metadata_offset, 0u32.to_le_bytes().to_vec()),
-        (metadata_offset, END_OF_STREAM.to_le_bytes().to_vec()),
+        (metadata_offset, 2u32.to_le_bytes().to_vec()),
         (metadata_offset + 8, 0i64.to_le_bytes().to_vec()),
         (metadata_offset + 8, (-1i64).to_le_bytes().to_vec()),
         (metadata_offset + 16, 0i64.to_le_bytes().to_vec()),
@@ -779,7 +884,12 @@ fn batch_header(
     completed: i64,
 ) -> Vec<u8> {
     object(|e| {
-        write_metadata(e, NORMAL, 7, -1)?;
+        NativeOperationMetadata {
+            kind: NativeOperationKind::Normal,
+            sequence: 7,
+            atomic_group: -1,
+        }
+        .write(e)?;
         write_epoch(e, primary_epoch())?;
         write_epoch(e, operation_epoch())?;
         e.u32_array(sizes)?;
@@ -901,7 +1011,7 @@ fn operation_batch_and_aggregate_limits_apply_before_provider_allocation() {
     let operations: Vec<_> = (0..MAX_BATCH_OPERATIONS)
         .map(|index| WireOperation {
             sequence: index as i64 + 1,
-            kind: NORMAL,
+            kind: NativeOperationKind::Normal,
             atomic_group: -1,
             data: vec![],
         })
@@ -917,7 +1027,7 @@ fn operation_batch_and_aggregate_limits_apply_before_provider_allocation() {
     if let Body::Replication { operations, .. } = &mut value.body {
         operations.push(WireOperation {
             sequence: MAX_BATCH_OPERATIONS as i64 + 1,
-            kind: NORMAL,
+            kind: NativeOperationKind::Normal,
             atomic_group: -1,
             data: vec![],
         });
@@ -941,7 +1051,7 @@ fn operation_batch_and_aggregate_limits_apply_before_provider_allocation() {
     let operations = (0..4)
         .map(|index| WireOperation {
             sequence: index + 1,
-            kind: NORMAL,
+            kind: NativeOperationKind::Normal,
             atomic_group: -1,
             data: vec![vec![0; MAX_OPERATION_BYTES]],
         })

@@ -18,6 +18,11 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use w::{
+    NativeApi, NativeApiName, NativeInterfaceName, NativePartitionKind, NativeProxyFlags,
+    NativeReplicatorOperation, NativeServiceKind, NativeServiceOperation,
+    NativeServicePartitionAccessStatus,
+};
 #[path = "stateful_binding.rs"]
 pub(crate) mod binding;
 #[path = "stateful_reconfiguration.rs"]
@@ -36,7 +41,7 @@ struct State {
     service_open: bool,
     generation: u64,
     live: Option<OwnedSemaphorePermit>,
-    operation: i64,
+    operation: NativeServiceOperation,
     operation_start: i64,
     close_through: i64,
     last_primary_epoch: Epoch,
@@ -44,8 +49,8 @@ struct State {
     catch_up_operation: Option<reconfiguration::Pending>,
     remotes: HashMap<[u8; 16], reconfiguration::Remote>,
     endpoint_pending: Option<Cancellation>,
-    error_api: (i64, i64),
-    replicator_operation: i64,
+    error_api: NativeApi,
+    replicator_operation: NativeReplicatorOperation,
     sequence: u64,
     full_revision: Arc<AtomicU64>,
     primary_revision: Arc<AtomicU64>,
@@ -66,7 +71,7 @@ struct Unit {
 }
 #[derive(Default)]
 struct ReplyControl {
-    api: Option<(i64, i64)>,
+    api: Option<NativeApi>,
     revision: Option<RevisionFence>,
 }
 type RevisionFence = (Arc<AtomicU64>, u64, Option<Cancellation>);
@@ -351,7 +356,7 @@ impl Registry {
     pub(crate) fn query_reply(&self, request: &w::ProxyRequest) -> Result<w::QueryReply> {
         self.authority.check()?;
         if request.runtime != self.current.snapshot().runtime.id
-            || request.flags != 0
+            || !request.flags.is_empty()
             || !request.remote.0.is_empty()
             || request.local.node.id.0.len() != 16
         {
@@ -404,7 +409,7 @@ impl Registry {
                                 generation: 0,
                                 native: None,
                                 live: None,
-                                operation: 1,
+                                operation: NativeServiceOperation::None,
                                 operation_start: 0,
                                 close_through: 0,
                                 last_primary_epoch: Epoch::INVALID,
@@ -412,8 +417,11 @@ impl Registry {
                                 catch_up_operation: None,
                                 remotes: HashMap::new(),
                                 endpoint_pending: None,
-                                error_api: (1, 1),
-                                replicator_operation: 1,
+                                error_api: NativeApi::new(
+                                    NativeInterfaceName::StatefulServiceReplica,
+                                    NativeApiName::Open,
+                                ),
+                                replicator_operation: NativeReplicatorOperation::NONE,
                                 sequence: 0,
                                 full_revision: Arc::new(AtomicU64::new(0)),
                                 primary_revision: Arc::new(AtomicU64::new(0)),
@@ -457,7 +465,7 @@ impl Registry {
         }
         if action == "ReplicaClose" {
             self.metrics.closes.fetch_add(1, Ordering::Relaxed);
-            if request.flags & 4 != 0 {
+            if request.flags.contains(NativeProxyFlags::ABORT) {
                 self.metrics.aborts.fetch_add(1, Ordering::Relaxed);
             }
             // Close-for-business and cancel before trying operation ownership.
@@ -547,7 +555,7 @@ impl Registry {
             || request.service.service_type.package != current.runtime.code.id.package.package
             || request.service.application != current.application_name
             || !request.remote.0.is_empty()
-            || request.flags & !15 != 0
+            || !request.flags.difference(NativeProxyFlags::all()).is_empty()
             || request.service.minimum < 1
             || request.service.target < request.service.minimum
             || request.service.target as usize > MAX_REPLICA_SET_SIZE
@@ -560,8 +568,9 @@ impl Registry {
             ));
         }
         match request.unit.consistency.kind {
-            1 | 3 => {}
-            2 if request.unit.consistency.low <= request.unit.consistency.high => {}
+            NativePartitionKind::Singleton | NativePartitionKind::Named => {}
+            NativePartitionKind::Int64Range
+                if request.unit.consistency.low <= request.unit.consistency.high => {}
             _ => return Err(Error::Protocol("invalid stateful partition kind/range")),
         }
         Ok(())
@@ -571,7 +580,7 @@ impl Registry {
         self.metrics.opens.fetch_add(1, Ordering::Relaxed);
         let role = role(request.local.current_role)?;
         if !matches!(role, ReplicaRole::Primary | ReplicaRole::IdleSecondary)
-            || request.flags & !4 != 0
+            || !request.flags.difference(NativeProxyFlags::ABORT).is_empty()
             || api_epoch(&request.unit.current) == Epoch::INVALID
         {
             return Err(Error::Protocol("invalid volatile stateful Open"));
@@ -606,7 +615,13 @@ impl Registry {
         };
         if let Some(result) = existing {
             return self
-                .reply(unit, ProxyReplyKind::ReplicaOpen, request, result.err(), 1)
+                .reply(
+                    unit,
+                    ProxyReplyKind::ReplicaOpen,
+                    request,
+                    result.err(),
+                    None,
+                )
                 .await;
         }
         #[cfg(test)]
@@ -642,9 +657,12 @@ impl Registry {
                     status.lifecycle = ReplicaLifecycle::Opening;
                     status.current_role = role;
                 }
-                state.operation = 2;
-                state.error_api = (1, 1);
-                state.replicator_operation = 1;
+                state.operation = NativeServiceOperation::Open;
+                state.error_api = NativeApi::new(
+                    NativeInterfaceName::StatefulServiceReplica,
+                    NativeApiName::Open,
+                );
+                state.replicator_operation = NativeReplicatorOperation::NONE;
                 state.last_primary_epoch = Epoch::INVALID;
                 state.cancellation_epoch = None;
                 state.catch_up_operation = None;
@@ -675,7 +693,7 @@ impl Registry {
                     ProxyReplyKind::ReplicaOpen,
                     request,
                     Some(Error::Closed),
-                    1,
+                    None,
                 )
                 .await;
         };
@@ -717,15 +735,7 @@ impl Registry {
         unit.state.lock().unwrap().native = Some(native.clone());
         let partition = StatefulPartition {
             identity: identity.clone(),
-            kind: match request.unit.consistency.kind {
-                1 => PartitionKind::Singleton,
-                2 => PartitionKind::Int64Range {
-                    low: request.unit.consistency.low,
-                    high: request.unit.consistency.high,
-                },
-                3 => PartitionKind::Named(request.unit.consistency.name.clone()),
-                _ => unreachable!(),
-            },
+            kind: PartitionKind::try_from(&request.unit.consistency)?,
             valid: valid.clone(),
             authority: self.authority.clone(),
             status: snapshot.clone(),
@@ -791,9 +801,10 @@ impl Registry {
                     return Err(Error::Closed);
                 }
                 state.service_open = true;
-                state.operation = 1;
-                state.error_api = (1, 4);
-                state.replicator_operation = 2;
+                state.operation = NativeServiceOperation::None;
+                state.error_api =
+                    NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::Open);
+                state.replicator_operation = NativeReplicatorOperation::OPEN;
             }
             if cancel.is_cancelled() || !valid.load(Ordering::Acquire) {
                 return Err(Error::Closed);
@@ -882,8 +893,8 @@ impl Registry {
             if state.generation != generation {
                 return Err(Error::Protocol("stale stateful Open completion"));
             }
-            state.operation = 1;
-            state.replicator_operation = 1;
+            state.operation = NativeServiceOperation::None;
+            state.replicator_operation = NativeReplicatorOperation::NONE;
             state.status.lock().unwrap().lifecycle = if outcome.is_ok() || state_changed {
                 ReplicaLifecycle::Open
             } else {
@@ -892,7 +903,7 @@ impl Registry {
             if outcome.is_err() && !state_changed {
                 state.live = None;
                 state.service_open = false;
-                state.open_retry = request.flags & 4 == 0
+                state.open_retry = !request.flags.contains(NativeProxyFlags::ABORT)
                     && !cancelled_before_cleanup
                     && state.close_through < request.local.instance;
                 (state.service.take(), state.replicator.take())
@@ -906,7 +917,7 @@ impl Registry {
             ProxyReplyKind::ReplicaOpen,
             request,
             outcome.err(),
-            if state_changed { 0 } else { 1 },
+            state_changed.then_some(NativeApi::default()),
         )
         .await
     }
@@ -931,15 +942,18 @@ impl Registry {
         if old_service_role != role {
             {
                 let mut state = unit.state.lock().unwrap();
-                state.error_api = (8, 1);
-                state.operation = 4;
+                state.error_api = NativeApi::new(
+                    NativeInterfaceName::StatefulServiceReplica,
+                    NativeApiName::ChangeRole,
+                );
+                state.operation = NativeServiceOperation::ChangeRole;
                 state.operation_start = super::lifecycle::filetime();
             }
             let operation_cancel = cancel.clone();
             let result = self
                 .complete(async move { service.change_role(role, operation_cancel).await })
                 .await;
-            unit.state.lock().unwrap().operation = 1;
+            unit.state.lock().unwrap().operation = NativeServiceOperation::None;
             let endpoint = result?;
             if role == ReplicaRole::Primary && endpoint.is_empty() {
                 return Err(Error::InvalidInput(
@@ -972,8 +986,9 @@ impl Registry {
                 return Err(Error::Closed);
             }
             state.role_changing = true;
-            state.error_api = (8, 4);
-            state.replicator_operation = 4;
+            state.error_api =
+                NativeApi::new(NativeInterfaceName::Replicator, NativeApiName::ChangeRole);
+            state.replicator_operation = NativeReplicatorOperation::CHANGE_ROLE;
             state.replicator.clone().ok_or(Error::Closed)?
         };
         let operation_cancel = cancel.clone();
@@ -982,7 +997,7 @@ impl Registry {
             .await;
         let mut state = unit.state.lock().unwrap();
         state.role_changing = false;
-        state.replicator_operation = 1;
+        state.replicator_operation = NativeReplicatorOperation::NONE;
         if role != ReplicaRole::None
             && (cancel.is_cancelled() || !state.valid.load(Ordering::Acquire))
         {
@@ -1011,7 +1026,11 @@ impl Registry {
         }
         let (service, replicator, open, replicator_open, snapshot) = {
             let mut state = unit.state.lock().unwrap();
-            state.operation = if request.flags & 4 != 0 { 16 } else { 8 };
+            state.operation = if request.flags.contains(NativeProxyFlags::ABORT) {
+                NativeServiceOperation::Abort
+            } else {
+                NativeServiceOperation::Close
+            };
             state.operation_start = super::lifecycle::filetime();
             let replicator_open = state.status.lock().unwrap().replicator_open;
             (
@@ -1023,7 +1042,12 @@ impl Registry {
             )
         };
         let cleanup = Cancellation::default();
-        let role_result = if request.flags & 12 != 0 && open && replicator_open {
+        let role_result = if request
+            .flags
+            .intersects(NativeProxyFlags::ABORT | NativeProxyFlags::DROP)
+            && open
+            && replicator_open
+        {
             self.change_role(
                 unit,
                 ReplicaRole::None,
@@ -1039,8 +1063,8 @@ impl Registry {
             if let Some(replicator) = &replicator {
                 {
                     let mut state = unit.state.lock().unwrap();
-                    state.operation = 1;
-                    state.replicator_operation = 16;
+                    state.operation = NativeServiceOperation::None;
+                    state.replicator_operation = NativeReplicatorOperation::CLOSE;
                 }
                 let replicator = replicator.clone();
                 let operation_cancel = cleanup.clone();
@@ -1053,13 +1077,13 @@ impl Registry {
                         state.status.lock().unwrap().replicator_open = false;
                     }
                 }
-                unit.state.lock().unwrap().replicator_operation = 1;
+                unit.state.lock().unwrap().replicator_operation = NativeReplicatorOperation::NONE;
                 result?;
             }
             if let Some(service) = &service {
                 {
                     let mut state = unit.state.lock().unwrap();
-                    state.operation = 8;
+                    state.operation = NativeServiceOperation::Close;
                     state.operation_start = super::lifecycle::filetime();
                 }
                 let service = service.clone();
@@ -1067,12 +1091,12 @@ impl Registry {
                 let result = self
                     .complete(async move { service.close(operation_cancel).await })
                     .await;
-                unit.state.lock().unwrap().operation = 1;
+                unit.state.lock().unwrap().operation = NativeServiceOperation::None;
                 result?;
             }
             Ok::<_, Error>(())
         };
-        if request.flags & 4 != 0 {
+        if request.flags.contains(NativeProxyFlags::ABORT) {
             drop(graceful);
             dispose(
                 replicator.clone(),
@@ -1103,8 +1127,8 @@ impl Registry {
             }
             state.live = None;
             state.service_open = false;
-            state.operation = 1;
-            state.replicator_operation = 1;
+            state.operation = NativeServiceOperation::None;
+            state.replicator_operation = NativeReplicatorOperation::NONE;
             let mut status = snapshot.lock().unwrap();
             status.lifecycle = ReplicaLifecycle::Closed;
             status.replicator_open = false;
@@ -1122,12 +1146,12 @@ impl Registry {
         if let Some(native) = &unit.state.lock().unwrap().native {
             native.retire_ledger();
         }
-        self.reply(unit, ProxyReplyKind::ReplicaClose, request, None, 2)
+        self.reply(unit, ProxyReplyKind::ReplicaClose, request, None, None)
             .await
     }
 
     async fn update(&self, unit: &Unit, request: w::ProxyRequest) -> Result<()> {
-        if request.flags != 0 {
+        if !request.flags.is_empty() {
             return Err(Error::Protocol("invalid stateful service update flags"));
         }
         let (response, valid) = {
@@ -1201,17 +1225,17 @@ impl Registry {
         let mut error = 0x80071d4au32 as i32 as i64;
         let mut local = request.local.clone();
         let mut detail = w::ReplicaDetail {
-            kind: 2,
+            kind: NativeServiceKind::Stateful,
             service: String::new(),
             partition: Guid([0; 16]),
             replica_id: -1,
             instance_id: -1,
-            operation: 0,
+            operation: NativeServiceOperation::Invalid,
             operation_start: 0,
-            replicator_operation: 0,
+            replicator_operation: NativeReplicatorOperation::INVALID,
             loads: ObjectArray(vec![]),
-            read_status: 0,
-            write_status: 0,
+            read_status: NativeServicePartitionAccessStatus::Invalid,
+            write_status: NativeServicePartitionAccessStatus::Invalid,
             replicator: Pointer(None),
             replica: Pointer(None),
             deployed_replica: Pointer(None),
@@ -1237,11 +1261,16 @@ impl Registry {
                 detail.operation_start = state.operation_start;
                 detail.replicator_operation = state.replicator_operation;
                 if state.remotes.values().any(|remote| remote.building()) {
-                    detail.replicator_operation = (detail.replicator_operation & !1) | 256;
+                    detail
+                        .replicator_operation
+                        .remove(NativeReplicatorOperation::NONE);
+                    detail
+                        .replicator_operation
+                        .insert(NativeReplicatorOperation::BUILD);
                 }
                 let (read, write) = status.access();
-                detail.read_status = read.native_value();
-                detail.write_status = write.native_value();
+                detail.read_status = NativeServicePartitionAccessStatus::from(read);
+                detail.write_status = NativeServicePartitionAccessStatus::from(write);
             }
         }
         Ok(w::QueryReply {
@@ -1259,7 +1288,7 @@ impl Registry {
         kind: ProxyReplyKind,
         request: w::ProxyRequest,
         error: Option<Error>,
-        api: i64,
+        api: Option<NativeApi>,
     ) -> Result<()> {
         self.reply_guarded(
             unit,
@@ -1267,7 +1296,7 @@ impl Registry {
             request,
             error,
             ReplyControl {
-                api: (api == 0).then_some((0, 0)),
+                api,
                 revision: None,
             },
         )
@@ -1311,11 +1340,12 @@ impl Registry {
             error: w::ProxyError {
                 error: error.as_ref().map_or(0, native_error),
                 message: error.map_or_else(String::new, |error| error.to_string()),
-                api: w::ApiName {
-                    api: if failed { failed_api.0 } else { 0 },
-                    interface: if failed { failed_api.1 } else { 0 },
-                    metadata: String::new(),
-                },
+                api: if failed {
+                    failed_api
+                } else {
+                    NativeApi::default()
+                }
+                .into(),
             },
         };
         let authority = Arc::downgrade(&self.authority);
@@ -1438,23 +1468,23 @@ async fn dispose(
             if let Some(replicator) = &replicator {
                 if let Some(state) = &monitor {
                     let mut state = state.lock().unwrap();
-                    state.operation = 1;
-                    state.replicator_operation = 32;
+                    state.operation = NativeServiceOperation::None;
+                    state.replicator_operation = NativeReplicatorOperation::ABORT;
                 }
                 replicator.abort();
                 if let Some(state) = &monitor {
-                    state.lock().unwrap().replicator_operation = 1;
+                    state.lock().unwrap().replicator_operation = NativeReplicatorOperation::NONE;
                 }
             }
             if let Some(service) = &service {
                 if let Some(state) = &monitor {
                     let mut state = state.lock().unwrap();
-                    state.operation = 16;
+                    state.operation = NativeServiceOperation::Abort;
                     state.operation_start = super::lifecycle::filetime();
                 }
                 service.abort();
                 if let Some(state) = &monitor {
-                    state.lock().unwrap().operation = 1;
+                    state.lock().unwrap().operation = NativeServiceOperation::None;
                 }
             }
             cleanup
@@ -1493,15 +1523,8 @@ pub(crate) fn api_epoch(epoch: &w::Epoch) -> Epoch {
         }
     }
 }
-fn role(value: i64) -> Result<ReplicaRole> {
-    match value {
-        0 => Ok(ReplicaRole::Unknown),
-        1 => Ok(ReplicaRole::None),
-        2 => Ok(ReplicaRole::IdleSecondary),
-        3 => Ok(ReplicaRole::ActiveSecondary),
-        4 => Ok(ReplicaRole::Primary),
-        _ => Err(Error::Protocol("invalid native replica role")),
-    }
+fn role(value: w::NativeReplicaRole) -> Result<ReplicaRole> {
+    value.try_into()
 }
 fn stale(current: &w::ProxyRequest, incoming: &w::ProxyRequest) -> bool {
     api_epoch(&current.unit.current) > api_epoch(&incoming.unit.current)

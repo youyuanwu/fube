@@ -793,6 +793,124 @@ stored C++ enum/HRESULT value is 32-bit. Negative HRESULTs are sign-extended;
 do not zero-extend their u32 bit patterns. Integer serialization is the native
 stream's compression, not a fixed eight-byte error payload.
 
+Rust replica roles and states use the shared
+[`NativeReplicaRole`/`NativeReplicaState`](../../crates/libs/fube-core/src/protocol/replica.rs)
+types, with explicit signed-i64 serialization and lossless `Unrecognized(code)`
+wire values. Admission still rejects unsupported values. These native roles are
+not the public SDK `ReplicaRole`; conversion is explicit and checked, and the
+valid native `Unknown=0` is distinct from an unrecognized numeric code.
+
+RA bootstrap URI classifiers use shared
+[`NativeUriType`/`NativeUriHostType`](../../crates/libs/fube-core/src/protocol/uri.rs),
+matching the native path-form and host domains rather than generic
+absolute/relative URL categories or application-host activation kinds. Both
+retain signed LONG64/numeric JSON and lossless unknowns. The ten-field URI
+record, including opaque components, signed port and counted path segments,
+is unchanged; this adds no parser, normalization, routing or bootstrap admission.
+
+RA bootstrap application-upgrade specifications use shared
+[`NativeUpgradeType`](../../crates/libs/fube-core/src/protocol/upgrade.rs)
+for native `ServiceModel::UpgradeType`: Invalid=0, Rolling=1,
+Rolling_ForceRestart=2 and Rolling_NotificationOnly=3. It retains signed
+LONG64/numeric JSON and lossless unknowns. The specification default stays
+Rolling, matching the native constructor; its twelve-field order is unchanged.
+Bootstrap admission still rejects every nonempty application-upgrade list,
+regardless of the upgrade type. Naming these values does not enable upgrades.
+
+RA/RAP consistency-unit descriptions use the shared
+[`NativePartitionKind`](../../crates/libs/fube-core/src/protocol/partition.rs)
+for `FABRIC_SERVICE_PARTITION_KIND`: Invalid=0, Singleton=1, Int64Range=2 and
+Named=3. This is not the service-description partition-scheme domain. The enum
+retains signed LONG64/numeric JSON and lossless unknown codes; consistency-unit
+defaults remain Singleton. Runtime converts the description's kind/range/name
+to the payload-bearing SDK `PartitionKind` through a checked boundary, while
+existing lifecycle range checks and local RA/Node Singleton profile restrictions
+remain authoritative. RAP queries still ignore nonidentity request fields;
+typing does not turn them into lifecycle admission or mutate the live context.
+
+RAP deployed-replica query details use shared
+[`NativeServiceKind` and `NativeServicePartitionAccessStatus`](../../crates/libs/fube-core/src/protocol/service.rs).
+These represent public `FABRIC_SERVICE_KIND` and
+`FABRIC_SERVICE_PARTITION_ACCESS_STATUS`, not RAP-internal access-state enums.
+Service kinds are Invalid=0, Stateless=1 and Stateful=2; access codes remain
+Invalid=0, Granted=1, ReconfigurationPending=2, NotPrimary=3 and NoWriteQuorum=4.
+Both preserve signed LONG64/numeric JSON and lossless unknowns. Explicit SDK
+access conversion only encodes the existing diagnostic result; it grants no
+access. SDK contracts, including `native_value()`, and each query branch's
+missing/stale/NotReady defaults remain unchanged.
+
+Service-description correlation schemes, metric weights and placement policy
+kinds use shared `NativeServiceCorrelationScheme`, `NativeServiceLoadMetricWeight`
+and `NativePlacementPolicyType` from the same module. They retain signed
+LONG64/numeric JSON and lossless unknowns without interpreting or enabling new
+placement behavior. The current Rust record defaults stay Invalid/Zero/Invalid;
+native C++ correlation/metric constructors instead select Affinity/Low, a
+pre-existing distinction not changed by this typing. Scaling pointer tags remain
+unchanged.
+
+`NativeMoveCost` uses separate **u32** serialization for native
+`ServiceDescription::defaultMoveCost_`, which is a `uint`, not a LONG64 enum
+field. It retains numeric JSON and `Unrecognized(u32)`, including the unsigned
+upper half, without adding newer SDK costs. RA service defaults stay Low=1;
+explicit model/test-host defaults stay Zero=0. Runtime converts the unchanged
+SDK Zero/Low/Medium/High profile to the same reserved `_MoveCost_` load metric.
+Unknown service-description values do not authorize additional reporting costs.
+
+Runtime `RAReportFault` bodies use shared
+[`NativeFaultType`](../../crates/libs/fube-core/src/protocol/fault.rs):
+Invalid=0, Transient=1 and Permanent=2, with signed LONG64/numeric JSON and
+lossless unknown wire codes. SDK `FaultType` instead uses Permanent=1 and
+Transient=2; explicit conversion follows native `FaultType::FromPublicAPI`.
+Representing Invalid does not admit a report: runtime rejects it before fault
+stage creation or coalescing, including after a prior Permanent report.
+Fault retry payload ownership, duplicate coalescing, Permanent supersession and
+the original generation/lease fences remain unchanged.
+
+Runtime health-report state fields use shared
+[`NativeHealthState`](../../crates/libs/fube-core/src/protocol/health.rs):
+Invalid=0, Ok=1, Warning=2, Error=3 and native Unknown=65535. Unknown is distinct
+from an unrecognized numeric code; both retain signed LONG64/numeric JSON wire
+values. Explicit SDK conversion leaves the public `HealthState` unchanged,
+and outbound reports still admit only Ok/Warning/Error. Invalid rejection stays
+after the existing TTL/sequence/target checks on the internal reporting path;
+public SDK validation and exact HM result correlation/error handling are unchanged.
+
+Health entity pointers and HM result/sequence-stream kinds share
+`NativeHealthReportKind` (`FABRIC_HEALTH_REPORT_KIND`, not the separate
+`FABRIC_HEALTH_ENTITY_KIND`). Expected reply kinds come from the typed
+`HealthEntity`, not a parallel numeric tag. Entity pointer type information stays
+four-byte native enum data, with a matching LONG64 body kind; HM scalar kind
+fields retain signed LONG64/numeric JSON and lossless unknowns. Naming the other
+native report kinds does not enable their entities or sequence streams: only the
+existing Replica/Instance/Partition reports are emitted. Cardinality is checked
+before exact result identity, then the native per-report error.
+
+RAP flags, query operations and API metadata use shared
+[`fube-core::protocol` types](../../crates/libs/fube-core/src/protocol/rap.rs).
+`NativeProxyFlags` and `NativeReplicatorOperation` are lossless bitmasks;
+`NativeServiceOperation` is single-choice, as in native
+`ServiceOperationManager::GetQueryInformation`. Replicator `NONE=1` is an idle
+marker, distinct from `INVALID=0`, and is removed when reporting active builds.
+`NativeApiName` and `NativeInterfaceName` are separate lossless scalar enums;
+`NativeApi` replaces internal numeric pairs and `NativeApiDescription` preserves
+the native API/interface/opaque-metadata field order. All retain numeric JSON and
+signed LONG64 encoding. Request/reply admission still uses each action's original
+allowed mask; `difference(allowed).is_empty()` checks unknown bits without
+silently truncating them. This typing does not expand supported RAP actions,
+recovery profiles or native interoperability claims.
+
+Hosting contexts use shared
+[`NativeApplicationHostType`, `NativeServicePackageActivationMode` and
+`NativeActivityType`](../../crates/libs/fube-core/src/protocol/hosting.rs).
+Host types describe nonactivated, single-code-package, multi-code-package and
+in-process activation; container/activator booleans remain independent.
+The activation mode is shared with RA/RAP service descriptions. Checked native
+environment-name parsing preserves case-insensitive names, without enabling
+other host types or exclusive execution. These scalars retain signed LONG64 and
+numeric JSON, including unrecognized codes; original single-code-package and
+SharedProcess admission remains authoritative. Activity kinds remain diagnostic
+metadata, including unknown values, not cleanup or recovery permission.
+
 This scalar rule does not override `ArrayUtility`: a vector of a type marked
 `DEFINE_AS_BLITTABLE` without a specific array utility is serialized as raw
 byte array, `count * sizeof(T)` ([serialization:134–164,4997–5001][serialization]).

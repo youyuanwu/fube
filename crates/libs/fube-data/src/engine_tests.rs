@@ -232,6 +232,17 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
     let sp = Arc::new(Provider::default());
     let primary = engine(partition, 1, pp.clone());
     let secondary = engine(partition, 2, sp.clone());
+    let bounded_unknown = "x".repeat(32);
+    for kind in ["arbitrary", bounded_unknown.as_str()] {
+        assert!(matches!(
+            primary.qualification_probe(kind, None).await,
+            Err(Error::Closed)
+        ));
+    }
+    assert!(matches!(
+        primary.qualification_probe(&"x".repeat(33), None).await,
+        Err(Error::InvalidInput("probe kind bound"))
+    ));
     primary
         .change_role(EPOCH, ReplicaRole::Primary, cancel())
         .await
@@ -240,6 +251,12 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
         .update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
+    assert!(matches!(
+        primary.qualification_probe("arbitrary", None).await,
+        Err(Error::InvalidInput(
+            "probe requires native-selected live peer"
+        ))
+    ));
     secondary
         .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
@@ -274,16 +291,29 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
             .is_empty());
     }
     for kind in ["stale_copy_ack", "wrong_sender", "wrong_target"] {
-        secondary.qualification_probe(kind, Some(1)).await.unwrap();
+        let receipt = secondary.qualification_probe(kind, Some(1)).await.unwrap();
+        assert_eq!(receipt["kind"], kind);
+        assert_eq!(receipt["qualification_only"], true);
     }
-    assert!(primary
-        .qualification_probe("arbitrary", None)
-        .await
-        .is_err());
-    assert!(primary
-        .qualification_probe("stale_epoch", Some(99))
-        .await
-        .is_err());
+    for (node, kind) in [
+        (&primary, "arbitrary"),
+        (&primary, bounded_unknown.as_str()),
+        (&primary, "stale_copy_ack"),
+        (&secondary, "stale_epoch"),
+    ] {
+        assert!(matches!(
+            node.qualification_probe(kind, None).await,
+            Err(Error::InvalidInput("unsupported role/probe kind"))
+        ));
+    }
+    for kind in ["arbitrary", "stale_epoch"] {
+        assert!(matches!(
+            primary.qualification_probe(kind, Some(99)).await,
+            Err(Error::InvalidInput(
+                "probe requires native-selected live peer"
+            ))
+        ));
+    }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(primary.snapshot().progress, before.progress);
     assert_eq!(primary.snapshot().peers.len(), before.peers.len());
@@ -3768,13 +3798,75 @@ fn replication(epoch: Epoch, original: Epoch, sequence: i64, data: u8) -> Body {
         operation_epoch: original,
         operations: vec![WireOperation {
             sequence,
-            kind: 1,
+            kind: NativeOperationKind::Normal,
             atomic_group: -1,
             data: vec![vec![data]],
         }],
         batch_end: sequence,
         completed: 0,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typed_wire_metadata_does_not_enable_atomic_or_eos_service_operations() {
+    let provider = Arc::new(Provider::default());
+    let (secondary, network, primary, _incoming) =
+        initialized_raw_secondary(provider.clone()).await;
+    for (kind, atomic_group) in [
+        (NativeOperationKind::EndOfStream, -1),
+        (NativeOperationKind::CreateAtomicGroup, -1),
+        (NativeOperationKind::AtomicGroupOperation, -1),
+        (NativeOperationKind::CommitAtomicGroup, -1),
+        (NativeOperationKind::RollbackAtomicGroup, -1),
+        (NativeOperationKind::Normal, 0),
+        (NativeOperationKind::Normal, 42),
+    ] {
+        raw_send(
+            &network,
+            &primary,
+            &secondary,
+            Body::Replication {
+                primary_epoch: EPOCH,
+                operation_epoch: EPOCH,
+                operations: vec![WireOperation {
+                    sequence: 1,
+                    kind,
+                    atomic_group,
+                    data: vec![b"unsupported".to_vec()],
+                }],
+                batch_end: 1,
+                completed: 0,
+            },
+        );
+    }
+    raw_send(
+        &network,
+        &primary,
+        &secondary,
+        replication(EPOCH, EPOCH, 1, 7),
+    );
+    let operation = timeout(
+        std::time::Duration::from_secs(3),
+        secondary.replication_stream().next(cancel()),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let metadata = crate::IOperation::get_metadata(&operation).unwrap();
+    assert_eq!(metadata.operation_type, crate::OperationType::Normal);
+    assert_eq!(metadata.sequence_number, 1);
+    assert_eq!(metadata.atomic_group_id, -1);
+    assert_eq!(operation.data.to_segments(), vec![vec![7]]);
+    until(|| secondary.snapshot().progress.received == 1).await;
+    assert_eq!(secondary.snapshot().progress.applied, 0);
+    assert!(secondary.snapshot().fault.is_none());
+    provider.last.store(1, Ordering::Release);
+    operation.acknowledge().unwrap();
+    until(|| secondary.snapshot().progress.applied == 1).await;
+    drop(operation);
+    abort_owned(&secondary).await;
+    network.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4745,7 +4837,7 @@ fn replication_data(primary: Epoch, original: Epoch, sequence: i64, data: &Opera
         operation_epoch: original,
         operations: vec![WireOperation {
             sequence,
-            kind: 1,
+            kind: NativeOperationKind::Normal,
             atomic_group: -1,
             data: data.to_segments(),
         }],

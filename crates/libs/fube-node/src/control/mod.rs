@@ -5,6 +5,7 @@
 //! compositions retain original furpc sessions and process ownership. The adapter
 //! retains bounded sends, timers and ACK observations.
 
+use fube_ra::protocol::NativeReplicaRole;
 pub mod ingress;
 pub mod wire;
 
@@ -709,7 +710,7 @@ impl Adapter {
                         || snapshot.committed.is_none_or(|s| {
                             s.phase != ra::Phase::Ready
                                 || s.body.as_ref() != body.as_ref()
-                                || s.body.replica.current_role != 4
+                                || s.body.replica.current_role != NativeReplicaRole::Primary
                                 || s.swap.as_ref().is_none_or(|swap| !swap.endpoint_available)
                         })
                     {
@@ -722,7 +723,7 @@ impl Adapter {
                     if snapshot.fenced
                         || snapshot.committed.is_none_or(|state| {
                             state.phase != ra::Phase::Ready
-                                || state.body.replica.current_role != 4
+                                || state.body.replica.current_role != NativeReplicaRole::Primary
                                 || state.body.unit != body.unit
                                 || if state.reconfiguration.as_ref().is_some_and(|config| {
                                     config.request.unit.current == body.unit.current

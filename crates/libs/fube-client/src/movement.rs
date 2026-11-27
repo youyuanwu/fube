@@ -2,7 +2,7 @@
 //! Source: client/FabricClientImpl.cpp:1354-1393 and FM QueryHelper.cpp:16-60.
 use crate::{
     query_arguments::validate_node_name,
-    query_protocol::{Query, Reply, ReplyEnvelope, ReplyError, ReplyResult},
+    query_protocol::{NativeQueryResultKind, Query, Reply, ReplyEnvelope, ReplyError, ReplyResult},
     DomainFailure, QueryDescription,
 };
 use fubst::serde::{Pointer, RawTagged};
@@ -54,7 +54,7 @@ pub(crate) struct EmptyReply;
 pub(crate) struct Empty {}
 #[derive(Deserialize)]
 pub(crate) struct Envelope {
-    kind: i64,
+    kind: NativeQueryResultKind,
     payload: Pointer<RawTagged<Empty>>,
     error: i64,
     paging: Pointer<RawTagged<Empty>>,
@@ -70,7 +70,10 @@ impl Reply for EmptyReply {
         result: Envelope,
         _: fn(()) -> std::result::Result<(), &'static str>,
     ) -> ReplyResult<()> {
-        if result.kind != 0 || result.payload.0.is_some() || result.paging.0.is_some() {
+        if result.kind != NativeQueryResultKind::Invalid
+            || result.payload.0.is_some()
+            || result.paging.0.is_some()
+        {
             return Err("movement reply is not an empty QueryResult".into());
         }
         if result.error != 0 {
@@ -86,6 +89,69 @@ impl Reply for EmptyReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_reply_models_validate_native_invalid_shape_before_domain_errors() {
+        for code in [i64::MIN, -1, 0, 1, 2, 3, i64::MAX] {
+            for error in [0, -77] {
+                let result = EmptyReply::decode_body(
+                    Envelope {
+                        kind: NativeQueryResultKind::from_raw(code),
+                        payload: Pointer(None),
+                        error,
+                        paging: Pointer(None),
+                    },
+                    Ok,
+                );
+                if code != 0 {
+                    assert!(matches!(
+                        result,
+                        Err(ReplyError::Protocol(
+                            "movement reply is not an empty QueryResult"
+                        ))
+                    ));
+                } else if error != 0 {
+                    assert!(matches!(
+                        result,
+                        Err(ReplyError::Domain(DomainFailure { code: -77, .. }))
+                    ));
+                } else {
+                    assert!(result.is_ok());
+                }
+            }
+        }
+        for (payload, paging) in [
+            (
+                Pointer(Some(RawTagged {
+                    type_info: vec![],
+                    value: Empty {},
+                })),
+                Pointer(None),
+            ),
+            (
+                Pointer(None),
+                Pointer(Some(RawTagged {
+                    type_info: vec![],
+                    value: Empty {},
+                })),
+            ),
+        ] {
+            assert!(matches!(
+                EmptyReply::decode_body(
+                    Envelope {
+                        kind: NativeQueryResultKind::Invalid,
+                        payload,
+                        error: -77,
+                        paging
+                    },
+                    Ok,
+                ),
+                Err(ReplyError::Protocol(
+                    "movement reply is not an empty QueryResult"
+                ))
+            ));
+        }
+    }
 
     #[test]
     fn movement_requires_a_partition_and_explicit_native_node() {

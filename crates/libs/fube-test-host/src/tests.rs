@@ -1,4 +1,5 @@
 use super::*;
+use fube_hosting::wire::NativeApplicationHostType;
 use furpc::{ActorId, HeaderId, HeaderRecord, MessageId};
 
 fn message(headers: &[HeaderRecord], body: Vec<u8>) -> Message {
@@ -103,7 +104,7 @@ fn reject_unowned_identity_unsupported_actions_and_bad_state() {
 fn truncated_start_requests_never_succeed() {
     let bytes = to_vec(&wire::HostStart {
         host: "owned".into(),
-        kind: 1,
+        kind: NativeApplicationHostType::ActivatedSingleCodePackage,
         pid: 42,
         timeout: 1,
         container: false,
@@ -230,7 +231,7 @@ fn registration_admits_only_manifest_code_and_type_context() {
         id: "actual-runtime".into(),
         host: wire::HostContext {
             host: "owned".into(),
-            kind: 1,
+            kind: NativeApplicationHostType::ActivatedSingleCodePackage,
             pid: 42,
             container: false,
             activator: false,

@@ -4,6 +4,7 @@ use crate::{
     wire,
 };
 use fube_ra::protocol::*;
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 use tokio::time::Instant;
@@ -617,7 +618,7 @@ impl Manager {
                 let body = self.ledger.request_idle_on(destination, Instant::now())?;
                 self.send_idle(&body).await?;
             }
-        } else if self.ledger.idle_status()["ready"] == true {
+        } else if self.ledger.idle_view().ready {
             let body = self.ledger.request_configuration(Instant::now())?;
             self.send_configuration(&body).await?;
         }
@@ -984,25 +985,35 @@ impl Manager {
         )
     }
     pub fn status(&self) -> Value {
-        let mut status = self.ledger.status();
-        status["deployment"] = json!(self.deployment);
-        if let Some(nodes) = status["nodes"].as_array_mut() {
-            for (index, node) in nodes.iter_mut().enumerate() {
+        self.status_typed().json()
+    }
+
+    pub fn status_typed(&self) -> crate::status::ClusterStatus {
+        use crate::status::{ConfigurationKind, NodeObservation, PeerIdleState, PeerIdleStatus};
+        let mut status = self.ledger.status_typed();
+        status
+            .details
+            .insert("deployment".into(), json!(self.deployment));
+        {
+            for (index, node) in status.nodes.iter_mut().enumerate() {
                 if let Some(child) = self.children.get(index) {
-                    node["node_pid"] = json!(child.node_pid);
+                    node.details
+                        .insert("node_pid".into(), json!(child.node_pid));
                     let path = child.launch.directory.join("observation.json");
                     if path.exists() {
-                        match read_json::<Value>(&path) {
+                        match read_json::<NodeObservation>(&path) {
                             Ok(observation)
-                                if observation["deployment"] == child.launch.deployment
-                                    && observation["session"] == child.launch.session
-                                    && observation["node_pid"] == json!(child.node_pid) =>
+                                if observation.deployment == child.launch.deployment
+                                    && observation.session == child.launch.session
+                                    && observation.node_pid == child.node_pid =>
                             {
-                                node["retained_work"] = observation;
+                                node.retained_work = Some(observation);
                             }
                             _ => {
-                                node["observation_error"] =
-                                    json!("invalid source-bound observation");
+                                node.details.insert(
+                                    "observation_error".into(),
+                                    json!("invalid source-bound observation"),
+                                );
                             }
                         }
                     }
@@ -1010,69 +1021,138 @@ impl Manager {
             }
         }
         if self.profile == ServiceProfile::StatefulPeerIdle {
-            let source = &status["nodes"][0]["retained_work"];
-            let target = &status["nodes"][1]["retained_work"];
-            let reply = &source["peer_idle"]["reply"];
-            let failed =
-                self.peer_idle_requested && reply["error"].as_i64().is_some_and(|error| error != 0);
+            let source = status.nodes[0].retained_work.as_ref();
+            let target = status.nodes[1].retained_work.as_ref();
+            let peer = source.and_then(|source| source.peer_idle.as_ref());
+            let local = target.and_then(|target| target.local_replica.as_ref());
+            let reply = peer.and_then(|peer| peer.reply.as_ref());
+            let failed = self.peer_idle_requested && reply.is_some_and(|reply| reply.error != 0);
             let opened = self.peer_idle_requested
-                && reply["error"] == 0
-                && reply["replica"]["id"] == self.ledger.placements[1].replica
-                && reply["replica"]["instance"] == self.ledger.placements[1].incarnation
-                && reply["replica"]["current_role"] == 2
-                && reply["replica"]["state"] == 1
-                && reply["replica"]["replication_endpoint"]
-                    .as_str()
-                    .is_some_and(|value| !value.is_empty())
-                && target["local_replica"]["open"] == true;
-            let removing = source["peer_idle"]["removal"].is_object();
-            let removed = removing && source["peer_idle"]["removal"]["result"] == 0;
+                && reply.is_some_and(|reply| {
+                    reply.error == 0
+                        && reply.replica.id == self.ledger.placements[1].replica
+                        && reply.replica.instance == self.ledger.placements[1].incarnation
+                        && reply.replica.current_role == NativeReplicaRole::Idle
+                        && reply.replica.state == NativeReplicaState::InBuild
+                        && !reply.replica.replication_endpoint.is_empty()
+                })
+                && local.is_some_and(|local| local.open);
+            let removal = peer.and_then(|peer| peer.removal.as_ref());
+            let removing = removal.is_some();
+            let removed = removal.is_some_and(|removal| removal.result == Some(0));
             let destination_lost = self.ledger.placements[1].loss_reported;
-            let configuration = self.ledger.configuration_status();
-            let configured = configuration["ready"] == true
-                && configuration["kind"] == "same_primary_configuration";
-            let retired = configuration["ready"] == true
-                && configuration["kind"] == "same_primary_retirement"
+            let configuration = self.ledger.configuration_view();
+            let configured = configuration.ready
+                && configuration.kind == Some(ConfigurationKind::SamePrimaryConfiguration);
+            let retired = configuration.ready
+                && configuration.kind == Some(ConfigurationKind::SamePrimaryRetirement)
                 && self.ledger.idle_predecessor.is_none();
             let built = !destination_lost
                 && opened
                 && !removing
-                && source["peer_idle"]["build"]["result"] == 0;
-            status["peer_idle"] = json!({
-                "requested":self.peer_idle_requested,
-                "state": if configured { "active_secondary" } else if retired { "retired_secondary" } else if destination_lost { "lost" } else if removed { "removed" } else if removing { "removing" } else if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
-                "error": if failed { reply["error"].clone() } else { Value::Null },
-                "built":built, "serving":false,
-                "active_secondary":configured,
-                "build":source["peer_idle"]["build"],
-                "fm":self.ledger.idle_status(),
-                "fm_removal":self.ledger.idle_removal_status(),
-                "fm_deletion":self.ledger.idle_deletion_status(),
-                "ready":!destination_lost && source["peer_idle"]["ready"] == true,
-                "destination_lost":destination_lost,
-                "removal":source["peer_idle"]["removal"],
-                "source":source["peer_idle"], "target":target["local_replica"],
-                "peer_link_alive":[source["peer_link_alive"],target["peer_link_alive"]],
-                "peer_error":[source["peer_error"],target["peer_error"]],
-                "command_error":[source["peer_command_error"],target["peer_command_error"]],
+                && peer
+                    .and_then(|peer| peer.build.as_ref())
+                    .is_some_and(|build| build.result == Some(0));
+            let observation_detail = |observation: Option<&NodeObservation>, key: &str| {
+                observation
+                    .and_then(|observation| observation.details.get(key))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            };
+            status.peer_idle = Some(PeerIdleStatus {
+                state: if configured {
+                    PeerIdleState::ActiveSecondary
+                } else if retired {
+                    PeerIdleState::RetiredSecondary
+                } else if destination_lost {
+                    PeerIdleState::Lost
+                } else if removed {
+                    PeerIdleState::Removed
+                } else if removing {
+                    PeerIdleState::Removing
+                } else if failed {
+                    PeerIdleState::Failed
+                } else if opened {
+                    PeerIdleState::Open
+                } else if self.peer_idle_requested {
+                    PeerIdleState::Pending
+                } else {
+                    PeerIdleState::Absent
+                },
+                built,
+                ready: !destination_lost && peer.is_some_and(|peer| peer.ready),
+                source: peer.cloned(),
+                target: local.cloned(),
+                details: [
+                    ("requested".into(), json!(self.peer_idle_requested)),
+                    (
+                        "error".into(),
+                        json!(if failed {
+                            reply.map(|reply| reply.error)
+                        } else {
+                            None
+                        }),
+                    ),
+                    ("serving".into(), json!(false)),
+                    ("active_secondary".into(), json!(configured)),
+                    (
+                        "build".into(),
+                        json!(peer.and_then(|peer| peer.build.as_ref())),
+                    ),
+                    ("fm".into(), json!(self.ledger.idle_view())),
+                    ("fm_removal".into(), json!(self.ledger.idle_removal_view())),
+                    (
+                        "fm_deletion".into(),
+                        json!(self.ledger.idle_deletion_view()),
+                    ),
+                    ("destination_lost".into(), json!(destination_lost)),
+                    ("removal".into(), json!(removal)),
+                    (
+                        "peer_link_alive".into(),
+                        json!([
+                            observation_detail(source, "peer_link_alive"),
+                            observation_detail(target, "peer_link_alive")
+                        ]),
+                    ),
+                    (
+                        "peer_error".into(),
+                        json!([
+                            observation_detail(source, "peer_error"),
+                            observation_detail(target, "peer_error")
+                        ]),
+                    ),
+                    (
+                        "command_error".into(),
+                        json!([
+                            observation_detail(source, "peer_command_error"),
+                            observation_detail(target, "peer_command_error")
+                        ]),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
             });
         }
         status
     }
     /// FM AddReplica owns peer creation, RAP build and semantic Ready-Idle completion.
     pub async fn add_idle_replica(&mut self) -> Result<Value> {
-        let current = self.ledger.idle_status();
+        let current = self.ledger.idle_view();
         if self.ledger.configuration.is_some()
             || self.finished.is_some()
             || self.children.len() != 2
             || self.profile != ServiceProfile::StatefulPeerIdle
-            || (self.ledger.idle_removal.is_some() && current["state"] != "failed")
+            || (self.ledger.idle_removal.is_some()
+                && current.state != crate::status::IdleState::Failed)
             || self.peer_idle_requested && self.ledger.idles.is_empty()
         {
             return Err("FM AddReplica requires the original unused peer-idle profile".into());
         }
-        if current["state"] != "absent" && current["state"] != "pending" {
-            return Ok(current);
+        if !matches!(
+            current.state,
+            crate::status::IdleState::Absent | crate::status::IdleState::Pending
+        ) {
+            return Ok(json!(current));
         }
         let body = self.ledger.request_idle(Instant::now())?;
         self.peer_idle_requested = true;
@@ -1111,9 +1191,11 @@ impl Manager {
         {
             return Err("Idle replacement requires the original peer-idle profile".into());
         }
-        let current = self.ledger.idle_status();
-        if self.ledger.idle_predecessor.is_some() && current["state"] == "ready" {
-            return Ok(current);
+        let current = self.ledger.idle_view();
+        if self.ledger.idle_predecessor.is_some()
+            && current.state == crate::status::IdleState::Ready
+        {
+            return Ok(json!(current));
         }
         let body = self.ledger.request_idle_replacement(Instant::now())?;
         self.peer_idle_requested = true;
@@ -1128,7 +1210,7 @@ impl Manager {
             return Err("configuration requires the original running cluster".into());
         }
         let body = self.ledger.request_configuration(Instant::now())?;
-        if self.ledger.configuration_status()["ready"] == true {
+        if self.ledger.configuration_view().ready {
             return Ok(self.ledger.configuration_status());
         }
         if let Err(error) = self.send_configuration(&body).await {
@@ -1142,7 +1224,7 @@ impl Manager {
             return Err("Primary transfer requires the original running cluster".into());
         }
         let body = self.ledger.request_primary_transfer(Instant::now())?;
-        if self.ledger.configuration_status()["ready"] != true {
+        if !self.ledger.configuration_view().ready {
             if let Err(error) = self.send_configuration(&body).await {
                 self.ledger.lost(self.ledger.primary_index(), error.clone());
                 return Err(error);
@@ -1164,7 +1246,7 @@ impl Manager {
         let body = self
             .ledger
             .request_primary_transfer_to(usize::from(destination - 1), Instant::now())?;
-        if self.ledger.configuration_status()["ready"] != true {
+        if !self.ledger.configuration_view().ready {
             if let Err(error) = self.send_configuration(&body).await {
                 self.ledger.lost(self.ledger.primary_index(), error.clone());
                 return Err(error);
@@ -1177,7 +1259,7 @@ impl Manager {
             return Err("Secondary retirement requires the original running cluster".into());
         }
         let body = self.ledger.request_secondary_retirement(Instant::now())?;
-        if self.ledger.configuration_status()["ready"] != true {
+        if !self.ledger.configuration_view().ready {
             if let Err(error) = self.send_configuration(&body).await {
                 self.ledger.lost(0, error.clone());
                 return Err(error);
@@ -1204,16 +1286,25 @@ impl Manager {
         {
             return Err("FM RemoveReplica requires the original peer-idle profile".into());
         }
-        let current = self.ledger.idle_removal_status();
-        if current["state"] == "removed" || current["state"] == "unknown" {
-            return Ok(current);
+        let current = self.ledger.idle_removal_view();
+        if matches!(
+            current.state,
+            crate::status::RemovalState::Removed | crate::status::RemovalState::Unknown
+        ) {
+            return Ok(json!(current));
         }
         if self.ledger.idle_removal.is_none()
             && !matches!(
-                self.ledger.idle_status()["state"].as_str(),
-                Some("pending" | "ready" | "failed" | "lost")
+                self.ledger.idle_view().state,
+                crate::status::IdleState::Pending
+                    | crate::status::IdleState::Ready
+                    | crate::status::IdleState::Failed
+                    | crate::status::IdleState::Lost
             )
-            && self.status()["peer_idle"]["state"] != "open"
+            && !self
+                .status_typed()
+                .peer_idle
+                .is_some_and(|peer| peer.state == crate::status::PeerIdleState::Open)
         {
             return Err("FM removal requires original FM creation or an opened/lost Idle".into());
         }
@@ -1235,34 +1326,51 @@ impl Manager {
         {
             return Err("FM Idle deletion requires the original peer-idle profile".into());
         }
-        let current = self.ledger.idle_deletion_status();
-        if current["state"] == "deleted" || current["state"] == "unknown" {
-            return Ok(current);
+        let current = self.ledger.idle_deletion_view();
+        if matches!(
+            current.state,
+            crate::status::DeletionState::Deleted | crate::status::DeletionState::Unknown
+        ) {
+            return Ok(json!(current));
         }
         let mut target_kind = fm::IdleDeleteTarget::Runtime;
         if self.ledger.idle_deletion.is_none() {
-            let status = self.status();
-            let target = &status["peer_idle"]["target"];
-            let unobserved = target.is_null() && self.ledger.idle_absence_allowed();
-            let registered_open = target["phase"] == "Opening"
-                && target["registration"].is_object()
-                && target["retained_usage"] == 1;
-            let pre_registration = target["phase"] == "Opening"
-                && target["registration"].is_null()
-                && target["retained_usage"] == 0
-                && self.ledger.idle_absence_allowed();
-            let failed_registration = target["phase"] == "Closed"
-                && target["pre_open_failure"]["error"]
-                    .as_i64()
-                    .is_some_and(|error| self.ledger.idle_failed_creation_error() == Some(error));
-            let failed_open = target["phase"] == "Closed"
-                && target["runtime_open_failure"]["error"]
-                    .as_i64()
-                    .is_some_and(|error| self.ledger.idle_failed_creation_error() == Some(error));
-            let terminal = target["phase"] == "Closed"
-                || target["phase"] == "Closing"
-                || target["phase"] == "Opening";
-            if target["open"] != true
+            use crate::status::ReplicaPhase;
+            let status = self.status_typed();
+            let target = status
+                .peer_idle
+                .as_ref()
+                .and_then(|peer| peer.target.as_ref());
+            let unobserved = target.is_none() && self.ledger.idle_absence_allowed();
+            let registered_open = target.is_some_and(|target| {
+                target.phase == ReplicaPhase::Opening
+                    && target.registration.as_ref().is_some_and(Value::is_object)
+                    && target.retained_usage == 1
+            });
+            let pre_registration = target.is_some_and(|target| {
+                target.phase == ReplicaPhase::Opening
+                    && target.registration.is_none()
+                    && target.retained_usage == 0
+            }) && self.ledger.idle_absence_allowed();
+            let failed_registration = target.is_some_and(|target| {
+                target.phase == ReplicaPhase::Closed
+                    && target.pre_open_failure.as_ref().is_some_and(|failure| {
+                        self.ledger.idle_failed_creation_error() == Some(failure.error)
+                    })
+            });
+            let failed_open = target.is_some_and(|target| {
+                target.phase == ReplicaPhase::Closed
+                    && target.runtime_open_failure.as_ref().is_some_and(|failure| {
+                        self.ledger.idle_failed_creation_error() == Some(failure.error)
+                    })
+            });
+            let terminal = target.is_some_and(|target| {
+                matches!(
+                    target.phase,
+                    ReplicaPhase::Closed | ReplicaPhase::Closing | ReplicaPhase::Opening
+                )
+            });
+            if !target.is_some_and(|target| target.open)
                 && !registered_open
                 && !pre_registration
                 && !unobserved
@@ -1321,7 +1429,7 @@ impl Manager {
                     self.ledger.lost(index, error);
                 }
             }
-            Accepted::Duplicate(outcome) => return Ok(outcome),
+            Accepted::Duplicate(outcome) => return Ok(outcome.json()),
             Accepted::Create(index, body) => {
                 let factory = if self.children[index].launch.profile.stateful() {
                     NodeRequest::add_primary
@@ -1358,33 +1466,46 @@ impl Manager {
                 if let Err(error) = self.send_configuration(&body).await {
                     self.ledger
                         .lost(self.ledger.configuration_target_index(), error.clone());
-                    self.ledger
-                        .complete(&op, json!({"op":op,"state":"unknown","error":error}));
+                    self.ledger.complete(
+                        &op,
+                        crate::OperationOutcome::new(&op, crate::OperationState::Unknown)
+                            .with_error(error.clone()),
+                    );
                     return Err(error);
                 }
             }
             Accepted::Build => {
                 if let Err(error) = self.request_repair_build().await {
-                    self.ledger
-                        .complete(&op, json!({"op":op,"state":"unknown","error":error}));
+                    self.ledger.complete(
+                        &op,
+                        crate::OperationOutcome::new(&op, crate::OperationState::Unknown)
+                            .with_error(error.clone()),
+                    );
                     return Err(error);
                 }
             }
             Accepted::Cancel(body) => {
                 if let Err(error) = self.send_idle_removal(&body).await {
                     self.ledger.lost(self.ledger.primary_index(), error.clone());
-                    self.ledger
-                        .complete(&op, json!({"op":op,"state":"unknown","error":error}));
+                    self.ledger.complete(
+                        &op,
+                        crate::OperationOutcome::new(&op, crate::OperationState::Unknown)
+                            .with_error(error.clone()),
+                    );
                     return Err(error);
                 }
             }
             Accepted::Progress => {}
             Accepted::Status => {
-                self.ledger
-                    .complete(&op, json!({"op":op,"state":"complete","kind":"status"}));
-                let outcome = json!({"op":op,"state":"complete","status":self.status()});
+                self.ledger.complete(
+                    &op,
+                    crate::OperationOutcome::new(&op, crate::OperationState::Complete)
+                        .detail("kind", "status"),
+                );
+                let outcome = crate::OperationOutcome::new(&op, crate::OperationState::Complete)
+                    .detail("status", self.status_typed());
                 self.ledger.complete(&op, outcome.clone());
-                return Ok(outcome);
+                return Ok(outcome.json());
             }
             Accepted::Quit => {}
         }

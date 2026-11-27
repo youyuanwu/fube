@@ -1,4 +1,6 @@
 use super::*;
+use crate::protocol::{NativeReplicaRole, NativeReplicaState};
+use fube_core::protocol::NativeProxyFlags;
 use std::time::Instant;
 
 const GET_LSN_NOT_FOUND: i64 = 0x8007_1cf0_u32 as i32 as i64;
@@ -63,7 +65,7 @@ pub(super) fn forced_deactivation_reply(state: &EntityState) -> Option<Effect> {
                 id: state.body.replica.id,
                 instance: state.body.replica.instance,
                 up: false,
-                state: 3,
+                state: NativeReplicaState::Dropped,
                 ..Replica::default()
             },
             error: 0,
@@ -136,16 +138,16 @@ fn forced_deactivation(
     let local = replica(&request.configuration, &admission.local_node)?;
     if current.body.service.persisted
         || request.deactivation != ReplicaDeactivationInfo::default()
-        || local.current_role != 3
+        || local.current_role != NativeReplicaRole::Secondary
         || local.id != current.body.replica.id
         || local.instance != current.body.replica.instance
-        || replica(&request.configuration, source)?.current_role != 4
+        || replica(&request.configuration, source)?.current_role != NativeReplicaRole::Primary
         || request
             .configuration
             .replicas
             .0
             .iter()
-            .any(|r| r.previous_role != 1)
+            .any(|r| r.previous_role != NativeReplicaRole::None)
         || current
             .progress_query
             .as_ref()
@@ -246,7 +248,7 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
     let mut stable;
     let old = if !removal {
         stable = reconfiguration::stable(active);
-        stable.replicas.0.retain(|r| r.current_role >= 3);
+        stable.replicas.0.retain(|r| r.current_role.is_active());
         &stable
     } else {
         active
@@ -268,14 +270,14 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
                     .replicas
                     .0
                     .iter()
-                    .filter(|r| r.previous_role >= 3)
+                    .filter(|r| r.previous_role.is_active())
                     .count()
                     != body.replicas.0.len()
                 || body
                     .replicas
                     .0
                     .iter()
-                    .filter(|r| r.current_role >= 3)
+                    .filter(|r| r.current_role.is_active())
                     .count()
                     != body.replicas.0.len() - 1
                 || body.replicas.0.iter().filter(|r| !r.up).count() != 2
@@ -303,23 +305,43 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
             || body.replicas.0[..i]
                 .iter()
                 .any(|other| other.node.id == r.node.id || other.id == r.id)
-            || if expected.current_role == 4 {
-                r.up || r.state != 3
-                    || !matches!(r.current_role, 1 | 3)
-                    || (interrupted && r.current_role != 3)
-            } else if removal && expected.current_role == 1 {
-                r.up || r.state != 3 || r.current_role != 1
+            || if expected.current_role == NativeReplicaRole::Primary {
+                r.up || r.state != NativeReplicaState::Dropped
+                    || !matches!(
+                        r.current_role,
+                        NativeReplicaRole::None | NativeReplicaRole::Secondary
+                    )
+                    || (interrupted && r.current_role != NativeReplicaRole::Secondary)
+            } else if removal && expected.current_role == NativeReplicaRole::None {
+                r.up || r.state != NativeReplicaState::Dropped
+                    || r.current_role != NativeReplicaRole::None
             } else if interrupted {
                 if r.up {
-                    r.state != 2 || !matches!(r.current_role, 3 | 4)
+                    r.state != NativeReplicaState::Ready
+                        || !matches!(
+                            r.current_role,
+                            NativeReplicaRole::Secondary | NativeReplicaRole::Primary
+                        )
                 } else {
-                    removal || r.state != 3 || r.current_role != 1
+                    removal
+                        || r.state != NativeReplicaState::Dropped
+                        || r.current_role != NativeReplicaRole::None
                 }
             } else {
                 if r.up {
-                    r.state != 2 || !matches!(r.current_role, 3 | 4)
+                    r.state != NativeReplicaState::Ready
+                        || !matches!(
+                            r.current_role,
+                            NativeReplicaRole::Secondary | NativeReplicaRole::Primary
+                        )
                 } else {
-                    !matches!(r.state, 2 | 3) || !matches!(r.current_role, 1 | 3)
+                    !matches!(
+                        r.state,
+                        NativeReplicaState::Ready | NativeReplicaState::Dropped
+                    ) || !matches!(
+                        r.current_role,
+                        NativeReplicaRole::None | NativeReplicaRole::Secondary
+                    )
                 }
             }
         {
@@ -327,7 +349,7 @@ fn validate_failover(body: &Configuration, state: &EntityState) -> Result<()> {
                 "failover changed original membership or surviving replica identity",
             ));
         }
-        primaries += usize::from(r.current_role == 4);
+        primaries += usize::from(r.current_role == NativeReplicaRole::Primary);
     }
     if primaries != 1 {
         return Err(Failure::Admission(
@@ -375,8 +397,8 @@ fn progress_query(
             if request.unit.current.older_than(current.body.unit.current) {
                 return Ok(Some(Transition::ignored(Disposition::IgnoredStale)));
             }
-            if replica(membership, source)?.current_role != 3
-                || current.body.replica.current_role != 3
+            if replica(membership, source)?.current_role != NativeReplicaRole::Secondary
+                || current.body.replica.current_role != NativeReplicaRole::Secondary
                 || request.replica.node != admission.local_node
                 || request.replica.id != current.body.replica.id
                 || request.replica.instance != current.body.replica.instance
@@ -463,7 +485,7 @@ fn progress_query(
             let query = current.progress_query.as_ref().expect("query");
             if query.reply.is_some()
                 || event.unit != current.body.unit
-                || event.flags != 0
+                || !event.flags.is_empty()
                 || !event.replicas.0.is_empty()
                 || !same_replica(&event.local, &current.body.replica)
             {
@@ -508,7 +530,7 @@ fn progress_query(
             let body: Activate = from_slice(&work.bytes)
                 .map_err(|_| Failure::Admission("invalid planned activation"))?;
             let Some(active) = reconfiguration::completed_configuration(current).filter(|c| {
-                current.body.replica.current_role == 3
+                current.body.replica.current_role == NativeReplicaRole::Secondary
                     && body.configuration.unit.current.configuration & !0xffff_ffff
                         != c.unit.current.configuration & !0xffff_ffff
             }) else {
@@ -531,9 +553,13 @@ fn progress_query(
             let primary = replica(&body.configuration, source)?;
             let mut intent = body.configuration.clone();
             for r in &mut intent.replicas.0 {
-                if !r.up && r.state == 3 && r.current_role == 3 && r.node != admission.local_node {
+                if !r.up
+                    && r.state == NativeReplicaState::Dropped
+                    && r.current_role == NativeReplicaRole::Secondary
+                    && r.node != admission.local_node
+                {
                     r.up = true;
-                    r.state = 2;
+                    r.state = NativeReplicaState::Ready;
                 }
             }
             let mut original_endpoint = primary.clone();
@@ -542,9 +568,10 @@ fn progress_query(
             validate(&intent, current)?;
             if current.progress_query.as_ref().is_some_and(|query| {
                 body.configuration.unit != query.request.unit || *source != query.source
-            }) || primary.current_role != 4
+            }) || primary.current_role != NativeReplicaRole::Primary
                 || primary.service_endpoint.is_empty()
-                || replica(&body.configuration, &admission.local_node)?.current_role != 3
+                || replica(&body.configuration, &admission.local_node)?.current_role
+                    != NativeReplicaRole::Secondary
                 || body.deactivation.epoch != body.configuration.unit.current
                 || body.deactivation.catchup_lsn < 0
             {
@@ -593,8 +620,9 @@ fn progress_query(
                 || body.configuration.unit != query.request.unit
                 || *source != query.source
                 || query.reply.is_none()
-                || replica(&body.configuration, source)?.current_role != 4
-                || replica(&body.configuration, &admission.local_node)?.current_role != 3
+                || replica(&body.configuration, source)?.current_role != NativeReplicaRole::Primary
+                || replica(&body.configuration, &admission.local_node)?.current_role
+                    != NativeReplicaRole::Secondary
                 || body.deactivation.epoch != body.configuration.unit.current
                 || body.deactivation.catchup_lsn
                     < query
@@ -725,7 +753,7 @@ pub(super) fn handles(work: &Submission, state: Option<&EntityState>) -> Result<
             state.is_some_and(|s| {
                 s.swap.is_some()
                     || s.progress_query.is_some()
-                    || (s.body.replica.current_role == 3
+                    || (s.body.replica.current_role == NativeReplicaRole::Secondary
                         && body.configuration.unit.current.configuration & !0xffff_ffff
                             != s.body.unit.current.configuration & !0xffff_ffff)
             })
@@ -774,10 +802,9 @@ fn apply(state: &mut EntityState, node: &NodeInstance) -> Result<()> {
             replica.first_lsn = -1;
             replica.last_lsn = -1;
         }
-        configuration
-            .replicas
-            .0
-            .retain(|replica| replica.node == *node || replica.previous_role != 2);
+        configuration.replicas.0.retain(|replica| {
+            replica.node == *node || replica.previous_role != NativeReplicaRole::Idle
+        });
     }
     state.configuration = Some(configuration);
     state.intermediate_configuration = matches!(
@@ -835,7 +862,7 @@ fn validate(body: &Configuration, state: &EntityState) -> Result<()> {
         "swap requires completed active membership",
     ))?;
     let mut old = stable(active);
-    old.replicas.0.retain(|r| r.current_role >= 3);
+    old.replicas.0.retain(|r| r.current_role.is_active());
     if !matches!((old.unit.target, old.unit.minimum), (2, 1) | (3, 2))
         || body.replicas.0.len() != old.unit.target as usize
         || old.replicas.0.len() != body.replicas.0.len()
@@ -862,14 +889,14 @@ fn validate(body: &Configuration, state: &EntityState) -> Result<()> {
         .replicas
         .0
         .iter()
-        .filter(|r| r.current_role == 4)
+        .filter(|r| r.current_role == NativeReplicaRole::Primary)
         .count()
         != 1
         || body
             .replicas
             .0
             .iter()
-            .filter(|r| r.current_role == 4)
+            .filter(|r| r.current_role == NativeReplicaRole::Primary)
             .count()
             != 1
     {
@@ -885,20 +912,28 @@ fn validate(body: &Configuration, state: &EntityState) -> Result<()> {
         normalized.first_lsn = expected.first_lsn;
         normalized.last_lsn = expected.last_lsn;
         if r.service_endpoint == expected.service_endpoint
-            || (expected.current_role == 4 && r.current_role == 3 && r.service_endpoint.is_empty())
+            || (expected.current_role == NativeReplicaRole::Primary
+                && r.current_role == NativeReplicaRole::Secondary
+                && r.service_endpoint.is_empty())
         {
             normalized.service_endpoint = expected.service_endpoint.clone();
         }
         if normalized != *expected
             || r.previous_role != expected.current_role
-            || !matches!(expected.current_role, 3 | 4)
-            || if expected.current_role == 4 {
-                r.current_role != 3
+            || !matches!(
+                expected.current_role,
+                NativeReplicaRole::Secondary | NativeReplicaRole::Primary
+            )
+            || if expected.current_role == NativeReplicaRole::Primary {
+                r.current_role != NativeReplicaRole::Secondary
             } else {
-                !matches!(r.current_role, 3 | 4)
+                !matches!(
+                    r.current_role,
+                    NativeReplicaRole::Secondary | NativeReplicaRole::Primary
+                )
             }
             || !r.up
-            || r.state != 2
+            || r.state != NativeReplicaState::Ready
             || body.replicas.0[..index]
                 .iter()
                 .any(|other| other.node.id == r.node.id || other.id == r.id)
@@ -910,7 +945,7 @@ fn validate(body: &Configuration, state: &EntityState) -> Result<()> {
     }
     Ok(())
 }
-fn configuration_effect(state: &EntityState, flags: i64) -> Effect {
+fn configuration_effect(state: &EntityState, flags: NativeProxyFlags) -> Effect {
     let body = &state.swap.as_ref().expect("swap").rap;
     Effect::UpdateConfiguration {
         body: Box::new(body.clone()),
@@ -933,7 +968,7 @@ fn stable(body: &Configuration) -> Configuration {
     let mut result = body.clone();
     result.unit.previous = Epoch::default();
     for r in &mut result.replicas.0 {
-        r.previous_role = 1;
+        r.previous_role = NativeReplicaRole::None;
     }
     result
 }
@@ -956,14 +991,16 @@ fn get_lsn_request(state: &EntityState, remote: &Replica) -> Effect {
 fn effects(state: &EntityState) -> Vec<Effect> {
     let swap = state.swap.as_ref().expect("swap");
     let mut result = match swap.stage {
-        SwapStage::Demote | SwapStage::Catchup => vec![configuration_effect(state, 2)],
+        SwapStage::Demote | SwapStage::Catchup => {
+            vec![configuration_effect(state, NativeProxyFlags::CATCH_UP)]
+        }
         SwapStage::Continue => vec![Effect::PeerContinueSwap {
             target: swap
                 .body
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
                 .expect("new Primary")
                 .node
                 .clone(),
@@ -977,7 +1014,7 @@ fn effects(state: &EntityState) -> Vec<Effect> {
             for remote in swap.body.replicas.0.iter().filter(|r| {
                 r.node != state.body.replica.node
                     && r.up
-                    && r.current_role >= 3
+                    && r.current_role.is_active()
                     && !swap
                         .remote_progress
                         .iter()
@@ -999,7 +1036,7 @@ fn effects(state: &EntityState) -> Vec<Effect> {
                 .0
                 .iter()
                 .filter(|r| {
-                    r.current_role == 3
+                    r.current_role == NativeReplicaRole::Secondary
                         && r.up
                         && !swap.restarting.contains(&r.node)
                         && !swap.activated.contains(&r.node)
@@ -1019,7 +1056,11 @@ fn effects(state: &EntityState) -> Vec<Effect> {
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.current_role == 3 && r.up && !swap.deactivated.contains(&r.node))
+                .filter(|r| {
+                    r.current_role == NativeReplicaRole::Secondary
+                        && r.up
+                        && !swap.deactivated.contains(&r.node)
+                })
                 .map(|target| Effect::PeerDeactivate {
                     target: target.node.clone(),
                     body: Box::new(Deactivate {
@@ -1036,7 +1077,7 @@ fn effects(state: &EntityState) -> Vec<Effect> {
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
                 .expect("new Primary");
             vec![Effect::PeerDeactivateReply {
                 target: target.node.clone(),
@@ -1047,16 +1088,19 @@ fn effects(state: &EntityState) -> Vec<Effect> {
                         id: state.body.replica.id,
                         instance: state.body.replica.instance,
                         up: false,
-                        state: 3,
+                        state: NativeReplicaState::Dropped,
                         ..Replica::default()
                     },
                     error: 0,
                 }),
             }]
         }
-        SwapStage::Secondary => vec![configuration_effect(state, 0)],
-        SwapStage::End => vec![configuration_effect(state, 1)],
-        SwapStage::Complete if state.body.replica.current_role == 4 => {
+        SwapStage::Secondary => vec![configuration_effect(state, NativeProxyFlags::NONE)],
+        SwapStage::End => vec![configuration_effect(
+            state,
+            NativeProxyFlags::END_RECONFIGURATION,
+        )],
+        SwapStage::Complete if state.body.replica.current_role == NativeReplicaRole::Primary => {
             vec![Effect::DoReconfigurationReply(ConfigurationReply {
                 unit: state.body.unit.clone(),
                 replicas: swap.body.replicas.clone(),
@@ -1069,7 +1113,7 @@ fn effects(state: &EntityState) -> Vec<Effect> {
                 .replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4)
+                .find(|r| r.current_role == NativeReplicaRole::Primary)
                 .expect("Primary")
                 .node
                 .clone(),
@@ -1084,7 +1128,7 @@ fn effects(state: &EntityState) -> Vec<Effect> {
         for target in &swap.restarting {
             let mut configuration = swap.intent.clone();
             for r in &mut configuration.replicas.0 {
-                r.previous_role = 1;
+                r.previous_role = NativeReplicaRole::None;
             }
             result.push(Effect::PeerDeactivate {
                 target: target.clone(),
@@ -1134,9 +1178,9 @@ fn advance_get_lsn(state: &mut EntityState, config: &NativeConfig) -> Result<()>
             .iter()
             .filter(|r| {
                 if previous {
-                    r.previous_role >= 3
+                    r.previous_role.is_active()
                 } else {
-                    r.current_role >= 3
+                    r.current_role.is_active()
                 }
             })
             .collect();
@@ -1151,7 +1195,7 @@ fn advance_get_lsn(state: &mut EntityState, config: &NativeConfig) -> Result<()>
     }
     if elapsed(swap) < config.node(NodeProperty::RemoteReplicaProgressQueryWaitTicks)
         && swap.body.replicas.0.iter().any(|r| {
-            r.up && r.current_role >= 3
+            r.up && r.current_role.is_active()
                 && r.node != local.node
                 && !swap
                     .remote_progress
@@ -1258,7 +1302,7 @@ fn planned_secondary_restarts(swap: &PrimarySwap) -> Vec<NodeInstance> {
         .replicas
         .0
         .iter()
-        .filter(|r| r.up && r.current_role == 3)
+        .filter(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
         .filter(|r| {
             swap.remote_progress
                 .iter()
@@ -1281,7 +1325,7 @@ fn finish_activation(swap: &mut PrimarySwap) {
             .replicas
             .0
             .iter()
-            .filter(|r| r.up && r.current_role == 3)
+            .filter(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
             .all(|r| swap.activated.contains(&r.node))
     {
         swap.stage = SwapStage::End;
@@ -1339,12 +1383,13 @@ pub(super) fn transition(
             body.replicas
                 .0
                 .iter()
-                .find(|r| r.current_role == 4 && r.node != admission.local_node)
+                .find(|r| {
+                    r.current_role == NativeReplicaRole::Primary && r.node != admission.local_node
+                })
                 .or_else(|| {
-                    body.replicas
-                        .0
-                        .iter()
-                        .find(|r| r.up && r.current_role >= 3 && r.node != admission.local_node)
+                    body.replicas.0.iter().find(|r| {
+                        r.up && r.current_role.is_active() && r.node != admission.local_node
+                    })
                 })
                 .and_then(|r| peers.iter().find(|p| **p == r.node))
         })
@@ -1410,7 +1455,8 @@ pub(super) fn transition(
                 let replay = if from_fm
                     && !swap.failover
                     && swap.stage != SwapStage::Demote
-                    && replica(&swap.intent, &admission.local_node)?.previous_role == 4
+                    && replica(&swap.intent, &admission.local_node)?.previous_role
+                        == NativeReplicaRole::Primary
                 {
                     let mut copy = current.clone();
                     copy.swap.as_mut().expect("swap").stage = SwapStage::Continue;
@@ -1424,12 +1470,14 @@ pub(super) fn transition(
                     disposition: Disposition::Applied,
                 });
             }
-            let failover = body
-                .configuration
-                .replicas
-                .0
-                .iter()
-                .any(|r| r.previous_role == 4 && matches!(r.current_role, 1 | 3) && !r.up);
+            let failover = body.configuration.replicas.0.iter().any(|r| {
+                r.previous_role == NativeReplicaRole::Primary
+                    && matches!(
+                        r.current_role,
+                        NativeReplicaRole::None | NativeReplicaRole::Secondary
+                    )
+                    && !r.up
+            });
             if failover {
                 validate_failover(&body.configuration, current)?;
             } else {
@@ -1438,19 +1486,23 @@ pub(super) fn transition(
             let local = replica(&body.configuration, &admission.local_node)?;
             if failover {
                 if !from_fm
-                    || local.previous_role != 3
-                    || local.current_role != 4
+                    || local.previous_role != NativeReplicaRole::Secondary
+                    || local.current_role != NativeReplicaRole::Primary
                     || body.phase0_duration != i64::MAX
                 {
                     return Err(Failure::Unsupported(
                         "failover requires FM promotion of an original ActiveSecondary",
                     ));
                 }
-            } else if (from_fm && (local.previous_role != 4 || body.phase0_duration != i64::MAX))
+            } else if (from_fm
+                && (local.previous_role != NativeReplicaRole::Primary
+                    || body.phase0_duration != i64::MAX))
                 || (!from_fm
-                    && (local.current_role != 4
-                        || replica(&body.configuration, source)?.previous_role != 4
-                        || replica(&body.configuration, source)?.current_role != 3
+                    && (local.current_role != NativeReplicaRole::Primary
+                        || replica(&body.configuration, source)?.previous_role
+                            != NativeReplicaRole::Primary
+                        || replica(&body.configuration, source)?.current_role
+                            != NativeReplicaRole::Secondary
                         || body.phase0_duration <= 0
                         || body.phase0_duration == i64::MAX))
             {
@@ -1520,7 +1572,7 @@ pub(super) fn transition(
             };
             if !matches!(swap.stage, SwapStage::GetLsn | SwapStage::Continue)
                 || body.unit != current.body.unit
-                || body.flags != 0
+                || !body.flags.is_empty()
                 || !body.replicas.0.is_empty()
                 || !same_replica(&body.local, &current.body.replica)
             {
@@ -1593,7 +1645,7 @@ pub(super) fn transition(
             if reported_unit != swap.body.unit
                 || (body.replica.error != 0 && !unknown)
                 || !expected.up
-                || expected.current_role != 3
+                || expected.current_role != NativeReplicaRole::Secondary
                 || !same_replica(&body.replica.replica, expected)
                 || (!unknown
                     && (body.replica.replica.first_lsn < 0
@@ -1626,9 +1678,9 @@ pub(super) fn transition(
                 return stale();
             };
             let flags = match swap.stage {
-                SwapStage::Demote | SwapStage::Catchup => 2,
-                SwapStage::Secondary => 0,
-                SwapStage::End => 1,
+                SwapStage::Demote | SwapStage::Catchup => NativeProxyFlags::CATCH_UP,
+                SwapStage::Secondary => NativeProxyFlags::NONE,
+                SwapStage::End => NativeProxyFlags::END_RECONFIGURATION,
                 _ => return stale(),
             };
             if body.unit != swap.rap.unit
@@ -1642,8 +1694,10 @@ pub(super) fn transition(
             if body.error != 0 {
                 return Ok(lifecycle::changed(state, vec![], false));
             }
-            if (body.local.current_role == 4 && body.local.service_endpoint.is_empty())
-                || (body.local.current_role == 3 && !body.local.service_endpoint.is_empty())
+            if (body.local.current_role == NativeReplicaRole::Primary
+                && body.local.service_endpoint.is_empty())
+                || (body.local.current_role == NativeReplicaRole::Secondary
+                    && !body.local.service_endpoint.is_empty())
                 || body.local.first_lsn < 0
                 || body.local.last_lsn < 0
             {
@@ -1683,7 +1737,7 @@ pub(super) fn transition(
                         .replicas
                         .0
                         .iter()
-                        .any(|r| r.up && r.current_role == 3);
+                        .any(|r| r.up && r.current_role == NativeReplicaRole::Secondary);
                     let s = state.swap.as_mut().expect("swap");
                     s.stage = if !has_remote {
                         s.rap = s.body.clone();
@@ -1698,7 +1752,7 @@ pub(super) fn transition(
                     let s = state.swap.as_mut().expect("swap");
                     s.body = stable(&s.body);
                     if s.failover {
-                        s.body.replicas.0.retain(|r| r.current_role >= 3);
+                        s.body.replicas.0.retain(|r| r.current_role.is_active());
                     }
                     s.endpoint.clear(&mut s.endpoint_available);
                     s.stage = SwapStage::Complete;
@@ -1709,7 +1763,7 @@ pub(super) fn transition(
                 .swap
                 .as_ref()
                 .is_some_and(|s| s.stage == SwapStage::Complete)
-                && state.body.replica.current_role == 4
+                && state.body.replica.current_role == NativeReplicaRole::Primary
             {
                 state.fm_primary = true;
             }
@@ -1726,7 +1780,7 @@ pub(super) fn transition(
             let Some(swap) = &current.swap else {
                 return stale();
             };
-            if replica(&swap.intent, source)?.current_role != 4
+            if replica(&swap.intent, source)?.current_role != NativeReplicaRole::Primary
                 || body.configuration.unit != swap.intent.unit
                 || body.configuration.service != swap.intent.service
                 || body.configuration.replicas.0.len() != swap.intent.replicas.0.len()
@@ -1739,7 +1793,11 @@ pub(super) fn transition(
             for r in &body.configuration.replicas.0 {
                 let expected = replica(&swap.rap, &r.node)?;
                 let mut actual = r.clone();
-                if !r.up && r.state == 3 && r.current_role == 3 && r.node != admission.local_node {
+                if !r.up
+                    && r.state == NativeReplicaState::Dropped
+                    && r.current_role == NativeReplicaRole::Secondary
+                    && r.node != admission.local_node
+                {
                     actual.up = expected.up;
                     actual.state = expected.state;
                 }
@@ -1793,7 +1851,7 @@ pub(super) fn transition(
                 return stale();
             };
             if body.force
-                || replica(&swap.intent, source)?.current_role != 4
+                || replica(&swap.intent, source)?.current_role != NativeReplicaRole::Primary
                 || body.configuration != swap.intent
                 || deactivation(current)? != body.deactivation
             {
@@ -1825,7 +1883,7 @@ pub(super) fn transition(
                     id: remote.id,
                     instance: remote.instance,
                     up: false,
-                    state: 3,
+                    state: NativeReplicaState::Dropped,
                     ..Replica::default()
                 };
                 if body.unit != swap.body.unit || body.replica != expected || body.error != 0 {
@@ -1834,7 +1892,7 @@ pub(super) fn transition(
                 let s = state.swap.as_mut().expect("swap");
                 let mut dropped = remote.clone();
                 dropped.up = false;
-                dropped.state = 3;
+                dropped.state = NativeReplicaState::Dropped;
                 replace(&mut s.body, dropped)?;
                 s.restarting.retain(|node| node != source);
                 if s.stage == SwapStage::Activate {
@@ -1857,11 +1915,11 @@ pub(super) fn transition(
                 id: remote.id,
                 instance: remote.instance,
                 up: false,
-                state: 3,
+                state: NativeReplicaState::Dropped,
                 ..Replica::default()
             };
             if !remote.up
-                || remote.current_role != 3
+                || remote.current_role != NativeReplicaRole::Secondary
                 || swap.deactivated.contains(peer)
                 || body.unit != swap.body.unit
                 || body.replica != expected
@@ -1875,7 +1933,7 @@ pub(super) fn transition(
                 .replicas
                 .0
                 .iter()
-                .filter(|r| r.up && r.current_role == 3)
+                .filter(|r| r.up && r.current_role == NativeReplicaRole::Secondary)
                 .all(|r| s.deactivated.contains(&r.node))
             {
                 s.stage = SwapStage::Activate;
@@ -1900,7 +1958,7 @@ pub(super) fn transition(
             let expected = stable(&swap.body);
             let remote = replica(&expected, peer)?;
             if !remote.up
-                || remote.current_role != 3
+                || remote.current_role != NativeReplicaRole::Secondary
                 || swap.restarting.contains(peer)
                 || swap.activated.contains(peer)
                 || body.unit != expected.unit
@@ -1934,7 +1992,8 @@ pub(super) fn transition(
                 registration: current.runtime.clone().expect("runtime"),
             };
             let Some(swap) = current.swap.as_ref().filter(|s| {
-                s.stage == SwapStage::Catchup && current.body.replica.current_role == 4
+                s.stage == SwapStage::Catchup
+                    && current.body.replica.current_role == NativeReplicaRole::Primary
             }) else {
                 return Ok(Transition {
                     update: Update::None,

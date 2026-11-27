@@ -1,4 +1,7 @@
 use crate::{ipc::Session, lifecycle_wire::*, require, wire, HostError, Result};
+use fube_hosting::wire::NativeServicePackageActivationMode;
+use fube_ra::protocol::NativeProxyFlags;
+use fube_ra::protocol::{NativeReplicaRole, NativeReplicaState};
 use fubst::serde::{to_vec, ByteArray, EmptyObjectArray, Guid};
 use furpc::Message;
 use std::{
@@ -44,7 +47,7 @@ impl ServiceUnit {
                         low: 0,
                         high: 0,
                         name: String::new(),
-                        kind: 1,
+                        kind: NativePartitionKind::Singleton,
                     },
                     current: Epoch {
                         configuration: 0,
@@ -64,12 +67,12 @@ impl ServiceUnit {
                     },
                     id: 1,
                     instance: 1,
-                    current_role: 1,
-                    previous_role: 1,
+                    current_role: NativeReplicaRole::None,
+                    previous_role: NativeReplicaRole::None,
                     up: true,
                     last_lsn: -1,
                     first_lsn: -1,
-                    state: 1,
+                    state: NativeReplicaState::InBuild,
                     version: runtime.code.version.clone(),
                     service_endpoint: String::new(),
                     replication_endpoint: String::new(),
@@ -95,17 +98,17 @@ impl ServiceUnit {
                     constraints: String::new(),
                     scaleout: 0,
                     metrics: EmptyObjectArray,
-                    move_cost: 0,
+                    move_cost: NativeMoveCost::Zero,
                     restart_wait: i64::MIN,
                     quorum_wait: i64::MIN,
                     update_version: 1,
                     placement: EmptyObjectArray,
                     standby_keep: i64::MIN,
-                    activation_mode: 0,
+                    activation_mode: NativeServicePackageActivationMode::SharedProcess,
                     dns: String::new(),
                     scaling: EmptyObjectArray,
                 },
-                flags: 0,
+                flags: NativeProxyFlags::NONE,
             },
         }
     }
@@ -124,8 +127,12 @@ impl ServiceUnit {
             self.state == UnitState::Open,
             "Close/Abort not legal in current unit state",
         )?;
-        self.request.flags = if abort { 4 } else { 0 };
-        self.request.local.state = 2; // Native closing ReplicaDescription defaults to Ready.
+        self.request.flags = if abort {
+            NativeProxyFlags::ABORT
+        } else {
+            NativeProxyFlags::NONE
+        };
+        self.request.local.state = NativeReplicaState::Ready; // Native closing ReplicaDescription defaults to Ready.
         self.state = UnitState::ClosePending;
         session.one_way(12, "ReplicaClose", to_vec(&self.request)?)
     }
@@ -155,8 +162,8 @@ impl ServiceUnit {
                 && reply.local.id == self.request.local.id
                 && reply.local.instance == self.request.local.instance
                 && reply.flags == self.request.flags
-                && reply.local.current_role == 1
-                && reply.local.previous_role == 1
+                && reply.local.current_role == NativeReplicaRole::None
+                && reply.local.previous_role == NativeReplicaRole::None
                 && reply.local.replication_endpoint.is_empty()
                 && reply.local.version == self.request.local.version,
             "stale/mismatched lifecycle reply identity/flags",
@@ -225,6 +232,8 @@ fn require_connection_refused(connection: std::io::Result<TcpStream>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fube_hosting::wire::NativeApplicationHostType;
+    use fube_ra::protocol::{NativeApiName, NativeInterfaceName};
     use furpc::{header, ActorId, Body};
 
     fn unit() -> ServiceUnit {
@@ -233,7 +242,7 @@ mod tests {
                 id: "observed-runtime".into(),
                 host: wire::HostContext {
                     host: "owned".into(),
-                    kind: 1,
+                    kind: NativeApplicationHostType::ActivatedSingleCodePackage,
                     pid: 42,
                     container: false,
                     activator: false,
@@ -256,12 +265,12 @@ mod tests {
                 code: 0,
                 message: String::new(),
                 api: ApiName {
-                    api: 0,
-                    interface: 0,
+                    api: NativeApiName::Invalid,
+                    interface: NativeInterfaceName::Invalid,
                     metadata: String::new(),
                 },
             },
-            flags: 0,
+            flags: NativeProxyFlags::NONE,
         }
     }
     fn message(reply: &ProxyReply, action: &str) -> Message {
@@ -284,7 +293,7 @@ mod tests {
                 0 => wrong.local.instance += 1,
                 1 => wrong.local.id += 1,
                 2 => wrong.unit.id.id = Guid([42; 16]),
-                3 => wrong.flags = 4,
+                3 => wrong.flags = NativeProxyFlags::ABORT,
                 4 => wrong.unit.current.configuration += 1,
                 _ => wrong.local.node.instance += 1,
             }

@@ -203,6 +203,51 @@ pub(crate) mod tagged_pointer_slots {
     }
 }
 
+macro_rules! lossless_enum {
+    (
+        $(#[$meta:meta])*
+        $visibility:vis enum $name:ident {
+            $($(#[$variant_meta:meta])* $variant:ident = $value:expr),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        /// Serde uses the signed i64 code in native and JSON formats, retaining unknown values.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[non_exhaustive]
+        $visibility enum $name {
+            $($(#[$variant_meta])* $variant,)*
+            /// A numeric value not named by the profiled native source.
+            Unrecognized(i64),
+        }
+        impl $name {
+            pub(crate) fn from_raw(value: i64) -> Self {
+                match value {
+                    $($value => Self::$variant,)*
+                    other => Self::Unrecognized(other),
+                }
+            }
+            /// Return the native signed value, including unrecognized values.
+            pub fn as_raw(self) -> i64 {
+                match self {
+                    $(Self::$variant => $value,)*
+                    Self::Unrecognized(other) => other,
+                }
+            }
+        }
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+                serializer.serialize_i64(self.as_raw())
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+                <i64 as serde::Deserialize>::deserialize(deserializer).map(Self::from_raw)
+            }
+        }
+    };
+}
+pub(crate) use lossless_enum;
+
 macro_rules! strict_enum {
     (
         $(#[$meta:meta])*
