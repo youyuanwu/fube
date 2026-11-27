@@ -2,9 +2,10 @@
 //! 3988b451, Hosting2 and ServiceModel FABRIC_FIELDS declarations.
 pub use fube_core::protocol::{
     NativeActivityType, NativeApi, NativeApiDescription as ApiName, NativeApiName,
-    NativeApplicationHostType, NativeInterfaceName, NativePartitionKind, NativeProxyFlags,
-    NativeReplicaRole, NativeReplicaState, NativeReplicatorOperation, NativeServiceOperation,
-    NativeServicePackageActivationMode,
+    NativeApplicationHostType, NativeFaultType, NativeHealthReportKind, NativeHealthState,
+    NativeInterfaceName, NativePartitionKind, NativeProxyFlags, NativeReplicaRole,
+    NativeReplicaState, NativeReplicatorOperation, NativeServiceKind, NativeServiceOperation,
+    NativeServicePackageActivationMode, NativeServicePartitionAccessStatus,
 };
 use fubst::serde::{ByteArray, Guid, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
@@ -327,7 +328,7 @@ pub struct UpdateServiceReply {
 pub struct EmptyRecord {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicaDetail {
-    pub kind: i64,
+    pub kind: NativeServiceKind,
     pub service: String,
     pub partition: Guid,
     pub replica_id: i64,
@@ -336,8 +337,8 @@ pub struct ReplicaDetail {
     pub operation_start: i64,
     pub replicator_operation: NativeReplicatorOperation,
     pub loads: ObjectArray<Vec<ReportedLoad>>,
-    pub read_status: i64,
-    pub write_status: i64,
+    pub read_status: NativeServicePartitionAccessStatus,
+    pub write_status: NativeServicePartitionAccessStatus,
     pub replicator: Pointer<EmptyRecord>,
     pub replica: Pointer<EmptyRecord>,
     pub deployed_replica: Pointer<EmptyRecord>,
@@ -391,7 +392,7 @@ pub struct LoadBody {
 pub struct FaultBody {
     pub unit: FailoverUnit,
     pub local: Replica,
-    pub fault: i64,
+    pub fault: NativeFaultType,
     pub activity: Activity,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,6 +408,17 @@ pub enum HealthEntity {
     #[serde(rename = "3")]
     Partition { partition: Guid },
 }
+
+impl HealthEntity {
+    pub fn kind(&self) -> NativeHealthReportKind {
+        match self {
+            Self::Replica { .. } => NativeHealthReportKind::StatefulServiceReplica,
+            Self::Instance { .. } => NativeHealthReportKind::StatelessServiceInstance,
+            Self::Partition { .. } => NativeHealthReportKind::Partition,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attributes {
     pub values: fubst::serde::EmptyObjectArray,
@@ -417,7 +429,7 @@ pub struct EntityHealth {
     pub source: String,
     pub property: String,
     pub ttl: i64,
-    pub state: i64,
+    pub state: NativeHealthState,
     pub description: String,
     pub sequence: i64,
     pub time: i64,
@@ -431,7 +443,7 @@ pub struct HealthBody {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResult {
-    pub kind: i64,
+    pub kind: NativeHealthReportKind,
     pub source: String,
     pub sequence: i64,
     pub entity_property: String,
@@ -439,7 +451,7 @@ pub struct HealthResult {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamResult {
-    pub kind: i64,
+    pub kind: NativeHealthReportKind,
     pub source: String,
     pub instance: i64,
     pub upto: i64,

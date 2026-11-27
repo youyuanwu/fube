@@ -375,10 +375,9 @@ impl Reporting {
         let request = self.request.lock().unwrap().clone();
         let partition = request.unit.id.id;
         let id = uuid::Uuid::from_bytes_le(partition.0);
-        let (kind, entity, entity_id) = match target {
-            HealthTarget::Partition => (3, HealthEntity::Partition { partition }, id.to_string()),
+        let (entity, entity_id) = match target {
+            HealthTarget::Partition => (HealthEntity::Partition { partition }, id.to_string()),
             HealthTarget::Instance if !request.service.stateful => (
-                2,
                 HealthEntity::Instance {
                     partition,
                     instance: request.local.id,
@@ -386,7 +385,6 @@ impl Reporting {
                 format!("{id}+{}", request.local.id),
             ),
             HealthTarget::Replica if request.service.stateful => (
-                1,
                 HealthEntity::Replica {
                     partition,
                     replica: request.local.id,
@@ -400,6 +398,7 @@ impl Reporting {
                 ))
             }
         };
+        let kind = entity.kind();
         let entity_property = format!("{entity_id}+{}", report.property);
         let body = HealthBody {
             reports: ObjectArray(vec![EntityHealth {
@@ -411,9 +410,7 @@ impl Reporting {
                     HealthState::Invalid => {
                         return Err(Error::InvalidInput("invalid health state"))
                     }
-                    HealthState::Ok => 1,
-                    HealthState::Warning => 2,
-                    HealthState::Error => 3,
+                    state => NativeHealthState::from(state),
                 },
                 description: report.description.clone(),
                 sequence,
@@ -483,11 +480,10 @@ impl Reporting {
     }
     pub(crate) async fn fault(self: &Arc<Self>, fault: FaultType) -> Result<FaultDelivery> {
         self.check()?;
-        let native_fault = match fault {
-            FaultType::Invalid => return Err(Error::InvalidInput("invalid fault type")),
-            FaultType::Transient => 1,
-            FaultType::Permanent => 2,
-        };
+        let native_fault = NativeFaultType::from(fault);
+        if native_fault == NativeFaultType::Invalid {
+            return Err(Error::InvalidInput("invalid fault type"));
+        }
         let (first, changed, receiver) = {
             let mut stage = self.fault.lock().unwrap();
             if let Some(existing) = stage

@@ -1114,7 +1114,7 @@ fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
     let mut error = 0x80071d4au32 as i32 as i64;
     let mut local = request.local.clone();
     let mut detail = ReplicaDetail {
-        kind: 0,
+        kind: NativeServiceKind::Invalid,
         service: String::new(),
         partition: Guid([0; 16]),
         replica_id: 0,
@@ -1123,8 +1123,8 @@ fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
         operation_start: 0,
         replicator_operation: NativeReplicatorOperation::INVALID,
         loads: ObjectArray(vec![]),
-        read_status: 0,
-        write_status: 0,
+        read_status: NativeServicePartitionAccessStatus::Invalid,
+        write_status: NativeServicePartitionAccessStatus::Invalid,
         replicator: Pointer(None),
         replica: Pointer(None),
         deployed_replica: Pointer(None),
@@ -1142,7 +1142,7 @@ fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
         if error == 0 {
             local = state.request.local.clone();
             local.service_endpoint = state.endpoint.clone();
-            detail.kind = 1;
+            detail.kind = NativeServiceKind::Stateless;
             detail.service = state.request.service.name.clone();
             detail.partition = state.request.unit.id.id;
             detail.replica_id = -1;

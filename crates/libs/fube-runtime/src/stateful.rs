@@ -20,7 +20,8 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use w::{
     NativeApi, NativeApiName, NativeInterfaceName, NativePartitionKind, NativeProxyFlags,
-    NativeReplicatorOperation, NativeServiceOperation,
+    NativeReplicatorOperation, NativeServiceKind, NativeServiceOperation,
+    NativeServicePartitionAccessStatus,
 };
 #[path = "stateful_binding.rs"]
 pub(crate) mod binding;
@@ -1224,7 +1225,7 @@ impl Registry {
         let mut error = 0x80071d4au32 as i32 as i64;
         let mut local = request.local.clone();
         let mut detail = w::ReplicaDetail {
-            kind: 2,
+            kind: NativeServiceKind::Stateful,
             service: String::new(),
             partition: Guid([0; 16]),
             replica_id: -1,
@@ -1233,8 +1234,8 @@ impl Registry {
             operation_start: 0,
             replicator_operation: NativeReplicatorOperation::INVALID,
             loads: ObjectArray(vec![]),
-            read_status: 0,
-            write_status: 0,
+            read_status: NativeServicePartitionAccessStatus::Invalid,
+            write_status: NativeServicePartitionAccessStatus::Invalid,
             replicator: Pointer(None),
             replica: Pointer(None),
             deployed_replica: Pointer(None),
@@ -1268,8 +1269,8 @@ impl Registry {
                         .insert(NativeReplicatorOperation::BUILD);
                 }
                 let (read, write) = status.access();
-                detail.read_status = read.native_value();
-                detail.write_status = write.native_value();
+                detail.read_status = NativeServicePartitionAccessStatus::from(read);
+                detail.write_status = NativeServicePartitionAccessStatus::from(write);
             }
         }
         Ok(w::QueryReply {

@@ -49,6 +49,10 @@ macro_rules! native_enum {
     };
 }
 
+mod fault;
+pub use fault::NativeFaultType;
+mod health;
+pub use health::{NativeHealthReportKind, NativeHealthState};
 mod hosting;
 pub use hosting::{
     NativeActivityType, NativeApplicationHostType, NativeServicePackageActivationMode,
@@ -57,6 +61,8 @@ mod partition;
 pub use partition::NativePartitionKind;
 mod replica;
 pub use replica::{NativeReplicaRole, NativeReplicaState};
+mod service;
+pub use service::{NativeServiceKind, NativeServicePartitionAccessStatus};
 mod rap;
 pub use rap::{
     NativeApi, NativeApiDescription, NativeApiName, NativeInterfaceName, NativeProxyFlags,

@@ -1190,7 +1190,7 @@ async fn data_loss_callback_failure_reports_transient_fault_before_failed_open_c
     let fault: FaultBody = from_slice(&h.receive("RAReportFault").await.body).unwrap();
     assert_eq!(
         (fault.fault, fault.local.id, fault.local.instance),
-        (1, 100, 1)
+        (NativeFaultType::Transient, 100, 1)
     );
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(failed.error.error, -995);

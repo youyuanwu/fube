@@ -663,7 +663,7 @@ async fn owned_stateful_fault_uses_native_identity_epochs_and_generation_fences(
     assert_eq!(result.unwrap().attempts, 1);
     assert_eq!(message.metadata().unwrap().actor, 12);
     let fault: FaultBody = from_slice(&message.body).unwrap();
-    assert_eq!(fault.fault, 1);
+    assert_eq!(fault.fault, NativeFaultType::Transient);
     assert_eq!(to_vec(&fault.unit).unwrap(), to_vec(&current.unit).unwrap());
     assert_eq!((fault.local.id, fault.local.instance), (100, 17));
     assert_eq!(fault.local.node.id.0, current.local.node.id.0);
@@ -766,7 +766,7 @@ async fn stateful_fault_retry_outlives_callers_executor_and_stops_with_unit() {
     let body: FaultBody = from_slice(&message.body).unwrap();
     assert_eq!(
         (body.local.id, body.local.instance, body.fault),
-        (100, 9, 1)
+        (100, 9, NativeFaultType::Transient)
     );
     while partition.fault_delivery().unwrap().attempts < 2 {
         tokio::task::yield_now().await;
@@ -897,11 +897,23 @@ async fn stateful_open_order_endpoints_access_duplicate_and_graceful_isolation()
             query.detail.replica_id,
             query.detail.instance_id
         ),
-        (2, 100, -1)
+        (NativeServiceKind::Stateful, 100, -1)
     );
     assert_eq!(
         (query.detail.read_status, query.detail.write_status),
-        (1, 1)
+        (
+            NativeServicePartitionAccessStatus::Granted,
+            NativeServicePartitionAccessStatus::Granted
+        )
+    );
+    let mut unknown = query.detail.clone();
+    unknown.kind = NativeServiceKind::Unrecognized(i64::MIN);
+    unknown.read_status = NativeServicePartitionAccessStatus::Unrecognized(-1);
+    unknown.write_status = NativeServicePartitionAccessStatus::Unrecognized(i64::MAX);
+    let decoded: ReplicaDetail = from_slice(&to_vec(&unknown).unwrap()).unwrap();
+    assert_eq!(
+        (decoded.kind, decoded.read_status, decoded.write_status),
+        (unknown.kind, unknown.read_status, unknown.write_status)
     );
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
@@ -1233,6 +1245,22 @@ async fn stateful_query_default_metadata_is_not_ready_until_replicator_owner_exi
     let mut h = Harness::new().await;
     let calls = register(&h);
     let request = request(&h, 2, 1, 8);
+    h.send("RAPQuery", &request).await;
+    let missing: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    assert_ne!(missing.error, 0);
+    assert_eq!(
+        (
+            missing.detail.kind,
+            missing.detail.read_status,
+            missing.detail.write_status
+        ),
+        (
+            NativeServiceKind::Stateful,
+            NativeServicePartitionAccessStatus::Invalid,
+            NativeServicePartitionAccessStatus::Invalid
+        )
+    );
+    assert!(calls.events.lock().unwrap().is_empty());
     h.send("ReplicaOpen", &request).await;
     tokio::time::timeout(Duration::from_secs(1), async {
         while calls.partitions.lock().unwrap().is_empty() {
@@ -1246,6 +1274,18 @@ async fn stateful_query_default_metadata_is_not_ready_until_replicator_owner_exi
     h.send("RAPQuery", &query).await;
     let early: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
     assert_eq!(early.error, 0x80071bc7u32 as i32 as i64);
+    assert_eq!(
+        (
+            early.detail.kind,
+            early.detail.read_status,
+            early.detail.write_status
+        ),
+        (
+            NativeServiceKind::Stateful,
+            NativeServicePartitionAccessStatus::ReconfigurationPending,
+            NativeServicePartitionAccessStatus::ReconfigurationPending
+        )
+    );
     calls.release.notify_one();
     h.receive("ReplicaOpenReply").await;
     h.send("RAPQuery", &query).await;
@@ -1257,6 +1297,29 @@ async fn stateful_query_default_metadata_is_not_ready_until_replicator_owner_exi
             ready.detail.replica_id,
             ready.detail.instance_id
         ),
-        (2, 100, -1)
+        (NativeServiceKind::Stateful, 100, -1)
+    );
+    assert_eq!(
+        (ready.detail.read_status, ready.detail.write_status),
+        (
+            NativeServicePartitionAccessStatus::Granted,
+            NativeServicePartitionAccessStatus::Granted
+        )
+    );
+    query.local.instance = 0;
+    h.send("RAPQuery", &query).await;
+    let stale: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    assert_ne!(stale.error, 0);
+    assert_eq!(
+        (
+            stale.detail.kind,
+            stale.detail.read_status,
+            stale.detail.write_status
+        ),
+        (
+            NativeServiceKind::Stateful,
+            NativeServicePartitionAccessStatus::Invalid,
+            NativeServicePartitionAccessStatus::Invalid
+        )
     );
 }

@@ -207,7 +207,10 @@ async fn query_observes_blocked_role_callback_without_protocol_locks_or_access_g
     );
     assert_eq!(
         (active.detail.read_status, active.detail.write_status),
-        (2, 2)
+        (
+            NativeServicePartitionAccessStatus::ReconfigurationPending,
+            NativeServicePartitionAccessStatus::ReconfigurationPending
+        )
     );
     calls.release.notify_one();
     let mut notification = None;
@@ -261,7 +264,10 @@ async fn query_observes_service_close_after_replicator_close_without_locking_cal
     );
     assert_eq!(
         (closing.detail.read_status, closing.detail.write_status),
-        (3, 3)
+        (
+            NativeServicePartitionAccessStatus::NotPrimary,
+            NativeServicePartitionAccessStatus::NotPrimary
+        )
     );
     calls.release.notify_one();
     h.receive("ReplicaCloseReply").await;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::wire::{ErrorReply, IdRequest};
+use crate::wire::{ErrorReply, IdRequest, NativeFaultType};
 use fube_core::protocol::NativeActivityType;
 use fube_core::protocol::NativeApiName;
 use fube_core::protocol::NativeInterfaceName;
@@ -414,7 +414,7 @@ fn fault_report() -> FaultReport {
     FaultReport::prepare(wire::FaultBody {
         unit: reply.unit,
         local: reply.local,
-        fault: 1,
+        fault: NativeFaultType::Transient,
         activity: wire::Activity {
             id: wire::ActivityId {
                 guid: Guid([7; 16]),
@@ -550,7 +550,7 @@ async fn prepared_rap_payload_retries_share_original_bytes_without_native_reseri
             .copied()
             .collect::<Vec<_>>();
         let body = from_slice::<wire::FaultBody>(&bytes).unwrap();
-        assert_eq!(body.fault, 1);
+        assert_eq!(body.fault, NativeFaultType::Transient);
         assert_eq!(body.activity.id.index, 17);
     }
 }

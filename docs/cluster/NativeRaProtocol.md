@@ -811,6 +811,46 @@ existing lifecycle range checks and local RA/Node Singleton profile restrictions
 remain authoritative. RAP queries still ignore nonidentity request fields;
 typing does not turn them into lifecycle admission or mutate the live context.
 
+RAP deployed-replica query details use shared
+[`NativeServiceKind` and `NativeServicePartitionAccessStatus`](../../crates/libs/fube-core/src/protocol/service.rs).
+These represent public `FABRIC_SERVICE_KIND` and
+`FABRIC_SERVICE_PARTITION_ACCESS_STATUS`, not RAP-internal access-state enums.
+Service kinds are Invalid=0, Stateless=1 and Stateful=2; access codes remain
+Invalid=0, Granted=1, ReconfigurationPending=2, NotPrimary=3 and NoWriteQuorum=4.
+Both preserve signed LONG64/numeric JSON and lossless unknowns. Explicit SDK
+access conversion only encodes the existing diagnostic result; it grants no
+access. SDK contracts, including `native_value()`, and each query branch's
+missing/stale/NotReady defaults remain unchanged.
+
+Runtime `RAReportFault` bodies use shared
+[`NativeFaultType`](../../crates/libs/fube-core/src/protocol/fault.rs):
+Invalid=0, Transient=1 and Permanent=2, with signed LONG64/numeric JSON and
+lossless unknown wire codes. SDK `FaultType` instead uses Permanent=1 and
+Transient=2; explicit conversion follows native `FaultType::FromPublicAPI`.
+Representing Invalid does not admit a report: runtime rejects it before fault
+stage creation or coalescing, including after a prior Permanent report.
+Fault retry payload ownership, duplicate coalescing, Permanent supersession and
+the original generation/lease fences remain unchanged.
+
+Runtime health-report state fields use shared
+[`NativeHealthState`](../../crates/libs/fube-core/src/protocol/health.rs):
+Invalid=0, Ok=1, Warning=2, Error=3 and native Unknown=65535. Unknown is distinct
+from an unrecognized numeric code; both retain signed LONG64/numeric JSON wire
+values. Explicit SDK conversion leaves the public `HealthState` unchanged,
+and outbound reports still admit only Ok/Warning/Error. Invalid rejection stays
+after the existing TTL/sequence/target checks on the internal reporting path;
+public SDK validation and exact HM result correlation/error handling are unchanged.
+
+Health entity pointers and HM result/sequence-stream kinds share
+`NativeHealthReportKind` (`FABRIC_HEALTH_REPORT_KIND`, not the separate
+`FABRIC_HEALTH_ENTITY_KIND`). Expected reply kinds come from the typed
+`HealthEntity`, not a parallel numeric tag. Entity pointer type information stays
+four-byte native enum data, with a matching LONG64 body kind; HM scalar kind
+fields retain signed LONG64/numeric JSON and lossless unknowns. Naming the other
+native report kinds does not enable their entities or sequence streams: only the
+existing Replica/Instance/Partition reports are emitted. Cardinality is checked
+before exact result identity, then the native per-report error.
+
 RAP flags, query operations and API metadata use shared
 [`fube-core::protocol` types](../../crates/libs/fube-core/src/protocol/rap.rs).
 `NativeProxyFlags` and `NativeReplicatorOperation` are lossless bitmasks;
