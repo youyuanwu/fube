@@ -6,7 +6,10 @@
 // does not qualify native interoperability.
 
 use super::*;
-use crate::{wire::WireOperation, Epoch};
+use crate::{
+    wire::{NativeOperationKind, WireOperation},
+    Epoch,
+};
 use std::{io::Read, time::Instant};
 use tokio::{io::AsyncWriteExt, time::sleep};
 
@@ -156,7 +159,7 @@ fn operation(address: &str, from: i64, to: i64, bytes: usize) -> Packet {
             },
             operations: vec![WireOperation {
                 sequence: 1,
-                kind: 1,
+                kind: NativeOperationKind::Normal,
                 atomic_group: -1,
                 data: vec![vec![31; bytes], vec![], vec![7]],
             }],

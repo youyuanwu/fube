@@ -3,7 +3,7 @@ use fube_data as data_contract;
 use fube_data::hosting::Removal;
 use fube_data::{
     hosting::testing::PeerTransport,
-    wire::{Actor, Body, Endpoint, Packet, WireOperation},
+    wire::{Actor, Body, Endpoint, NativeOperationKind, Packet, WireOperation},
 };
 use fube_data::{
     IOperationDataStream, IStateProvider, MemoryProvider, Mutation, OperationData, Settings,
@@ -1425,7 +1425,7 @@ async fn owned_lower_secondary_controls_use_traffic_admission_epoch_without_prov
                 operation_epoch: EPOCH,
                 operations: vec![WireOperation {
                     sequence: 1,
-                    kind: 1,
+                    kind: NativeOperationKind::Normal,
                     atomic_group: -1,
                     data: vec![vec![1]],
                 }],

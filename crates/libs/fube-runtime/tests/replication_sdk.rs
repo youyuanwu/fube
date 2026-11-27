@@ -1002,7 +1002,7 @@ async fn standard_provider_sync_shapes_one_owner_copy_gap_early_lsn_and_explicit
 async fn canonical_destination_some_empty_is_not_legacy_eos_and_ack_gap_is_preserved() {
     use fube_data::{
         transport::PeerTransport,
-        wire::{Actor, Body, Endpoint, Packet, WireOperation},
+        wire::{Actor, Body, Endpoint, NativeOperationKind, Packet, WireOperation},
     };
     let partition = uuid::Uuid::new_v4();
     let secondary = Fixture::new(partition, 2, ReplicaRole::IdleSecondary).await;
@@ -1085,7 +1085,7 @@ async fn canonical_destination_some_empty_is_not_legacy_eos_and_ack_gap_is_prese
         operation_epoch: EPOCH,
         operations: vec![WireOperation {
             sequence: 1,
-            kind: 1,
+            kind: NativeOperationKind::Normal,
             atomic_group: -1,
             data: vec![],
         }],

@@ -79,7 +79,7 @@ use crate::{
     queue::OperationQueue,
     quorum::{configuration_progress, ConfigurationProgress, PeerProgress},
     transport::{Incoming, PeerTransport, SourceTarget},
-    wire::{Actor, Body, Endpoint, Packet, WireOperation},
+    wire::{Actor, Body, Endpoint, NativeOperationKind, Packet, WireOperation},
     Acknowledgment, Cancellation, Epoch, Error, IOperationDataStream, IStateProvider, Operation,
     OperationData, OperationStream, Progress, ReplicaRole, Result, Settings,
 };
@@ -2828,7 +2828,7 @@ impl Owner {
                     operation_epoch: sent_epoch,
                     operations: vec![WireOperation {
                         sequence,
-                        kind: 1,
+                        kind: NativeOperationKind::Normal,
                         atomic_group: -1,
                         data: payload.to_segments(),
                     }],
@@ -3416,7 +3416,7 @@ impl Owner {
                         operation_epoch: entry.epoch,
                         operations: vec![WireOperation {
                             sequence: entry.sequence,
-                            kind: 1,
+                            kind: NativeOperationKind::Normal,
                             atomic_group: -1,
                             data: entry.data.to_segments(),
                         }],
@@ -3673,7 +3673,7 @@ impl Owner {
                 if operation_epoch > primary_epoch
                     || operations
                         .iter()
-                        .any(|op| op.kind != 1 || op.atomic_group != -1)
+                        .any(|op| op.kind != NativeOperationKind::Normal || op.atomic_group != -1)
                 {
                     return;
                 }
@@ -4770,7 +4770,7 @@ impl Owner {
                                         operation_epoch: operation.epoch,
                                         operations: vec![WireOperation {
                                             sequence,
-                                            kind: 1,
+                                            kind: NativeOperationKind::Normal,
                                             atomic_group: -1,
                                             data: operation.data.to_segments(),
                                         }],

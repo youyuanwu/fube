@@ -3768,13 +3768,75 @@ fn replication(epoch: Epoch, original: Epoch, sequence: i64, data: u8) -> Body {
         operation_epoch: original,
         operations: vec![WireOperation {
             sequence,
-            kind: 1,
+            kind: NativeOperationKind::Normal,
             atomic_group: -1,
             data: vec![vec![data]],
         }],
         batch_end: sequence,
         completed: 0,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typed_wire_metadata_does_not_enable_atomic_or_eos_service_operations() {
+    let provider = Arc::new(Provider::default());
+    let (secondary, network, primary, _incoming) =
+        initialized_raw_secondary(provider.clone()).await;
+    for (kind, atomic_group) in [
+        (NativeOperationKind::EndOfStream, -1),
+        (NativeOperationKind::CreateAtomicGroup, -1),
+        (NativeOperationKind::AtomicGroupOperation, -1),
+        (NativeOperationKind::CommitAtomicGroup, -1),
+        (NativeOperationKind::RollbackAtomicGroup, -1),
+        (NativeOperationKind::Normal, 0),
+        (NativeOperationKind::Normal, 42),
+    ] {
+        raw_send(
+            &network,
+            &primary,
+            &secondary,
+            Body::Replication {
+                primary_epoch: EPOCH,
+                operation_epoch: EPOCH,
+                operations: vec![WireOperation {
+                    sequence: 1,
+                    kind,
+                    atomic_group,
+                    data: vec![b"unsupported".to_vec()],
+                }],
+                batch_end: 1,
+                completed: 0,
+            },
+        );
+    }
+    raw_send(
+        &network,
+        &primary,
+        &secondary,
+        replication(EPOCH, EPOCH, 1, 7),
+    );
+    let operation = timeout(
+        std::time::Duration::from_secs(3),
+        secondary.replication_stream().next(cancel()),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let metadata = crate::IOperation::get_metadata(&operation).unwrap();
+    assert_eq!(metadata.operation_type, crate::OperationType::Normal);
+    assert_eq!(metadata.sequence_number, 1);
+    assert_eq!(metadata.atomic_group_id, -1);
+    assert_eq!(operation.data.to_segments(), vec![vec![7]]);
+    until(|| secondary.snapshot().progress.received == 1).await;
+    assert_eq!(secondary.snapshot().progress.applied, 0);
+    assert!(secondary.snapshot().fault.is_none());
+    provider.last.store(1, Ordering::Release);
+    operation.acknowledge().unwrap();
+    until(|| secondary.snapshot().progress.applied == 1).await;
+    drop(operation);
+    abort_owned(&secondary).await;
+    network.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4745,7 +4807,7 @@ fn replication_data(primary: Epoch, original: Epoch, sequence: i64, data: &Opera
         operation_epoch: original,
         operations: vec![WireOperation {
             sequence,
-            kind: 1,
+            kind: NativeOperationKind::Normal,
             atomic_group: -1,
             data: data.to_segments(),
         }],

@@ -55,6 +55,16 @@ have no FabricRuntime, FabricCommon, COM or native replicator dependency.
 See [crate exports](../../crates/libs/fube-data/src/lib.rs),
 [peer transport](../../crates/libs/fube-data/src/transport.rs).
 
+Classic replication uses typed `wire::NativeOperationKind` values and a shared
+metadata codec for replication, copy and copy-context messages. Metadata retains
+the native Linux 32-byte ABI: a u32 kind, padding, signed sequence/atomic-group
+IDs and a null reserved pointer, not FabricSerializable LONG64 enum fields.
+Invalid, combined, mask and unknown kinds still reject; decoding a known
+atomic-group kind does not authorize engine delivery. The volatile engine and
+public SDK `OperationType` remain Normal-only with atomic-group ID `-1`.
+Copy's existing Normal/last-item EOS admission and native last-item override
+remain separate from replication admission.
+
 `ReplicationEndpointOptions::advertised_ip` optionally selects the IP published
 in the replication endpoint and native ListenInstance while preserving the
 actual bound port and replica/actor identity. A wildcard `listen_address`
