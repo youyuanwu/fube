@@ -134,6 +134,56 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "inputs changed"):
             self.cluster.load()
 
+    def test_typed_journal_states_preserve_schema_one_json_and_node_volume_phases(self):
+        original = copy.deepcopy(self.cluster.state)
+        for phase in ("allocating", "starting", "baseline", "ready", "down", "destroying", "destroyed"):
+            for baseline in ("not-started", "submitting", "accepted", "complete"):
+                with self.subTest(phase=phase, baseline=baseline):
+                    self.cluster.state = copy.deepcopy(original)
+                    self.cluster.save(phase=phase, baseline=baseline)
+                    self.cluster.load()
+                    self.assertIs(self.cluster.phase, ctl.ClusterPhase(phase))
+                    self.assertIs(self.cluster.baseline_state, ctl.BaselineState(baseline))
+                    expected = {**original, "phase": phase, "baseline": baseline}
+                    self.assertEqual(self.cluster.state, expected)
+                    self.assertEqual(json.loads(self.cluster.path.read_text()), expected)
+
+    def test_journal_domain_rejection_preserves_identity_runtime_and_baseline_error_order(self):
+        original = copy.deepcopy(self.cluster.state)
+        for changes, error in (
+            ({"phase": "allocated", "runtime_version": "wrong", "baseline": "active"},
+             "Invalid cluster identity/state"),
+            ({"phase": "configured"}, "Invalid cluster identity/state"),
+            ({"phase": "not-started"}, "Invalid cluster identity/state"),
+            ({"phase": None}, "Invalid cluster identity/state"),
+            ({"phase": []}, "Invalid cluster identity/state"),
+            ({"phase": "Ready"}, "Invalid cluster identity/state"),
+            ({"runtime_version": "wrong", "baseline": "active"},
+             "Unsupported image/runtime/manifest identity"),
+            ({"baseline": "active"}, "Invalid native baseline journal"),
+            ({"baseline": "ready"}, "Invalid native baseline journal"),
+            ({"baseline": None}, "Invalid native baseline journal"),
+            ({"baseline": []}, "Invalid native baseline journal"),
+        ):
+            with self.subTest(changes=changes), patch.object(ctl, "run") as run:
+                self.cluster.state = {**copy.deepcopy(original), **changes}
+                self.cluster.save()
+                with self.assertRaisesRegex(ValueError, error):
+                    self.cluster.load()
+                run.assert_not_called()
+
+    def test_destroyed_tombstone_does_not_require_live_journal_fields(self):
+        self.cluster.state = {
+            key: self.cluster.state[key] for key in ("schema", "name", "project", "owner")
+        }
+        self.cluster.save(phase="destroyed")
+        with patch.object(self.cluster, "definition") as definition, patch.object(ctl, "run") as run:
+            self.cluster.load()
+            self.assertIs(self.cluster.phase, ctl.ClusterPhase.DESTROYED)
+            self.assertEqual(self.cluster.status(), {"name": "test", "phase": "destroyed", "ready": False})
+            definition.assert_not_called()
+            run.assert_not_called()
+
     def test_edited_compose_or_inventory_rejected(self):
         compose = json.loads((self.directory / "compose.json").read_text())
         compose["services"]["n0"]["network_mode"] = "host"
@@ -297,13 +347,15 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(self.cluster.state["baseline"], "accepted" if state == "active" else "complete")
 
     def test_ambiguous_submission_is_not_retried(self):
-        self.cluster.save(baseline="submitting")
-        with patch.object(self.cluster, "probe", return_value={
-            "gateways": {name: {"baseline": "uninitialized"} for name in ctl.NODES}
-        }), patch.object(self.cluster, "sfctl") as sfctl:
-            with self.assertRaisesRegex(ValueError, "ambiguous"):
-                self.cluster.establish_baseline()
-            sfctl.assert_not_called()
+        for baseline in ("submitting", "accepted", "complete"):
+            with self.subTest(baseline=baseline):
+                self.cluster.save(baseline=baseline)
+                with patch.object(self.cluster, "probe", return_value={
+                    "gateways": {name: {"baseline": "uninitialized"} for name in ctl.NODES}
+                }), patch.object(self.cluster, "sfctl") as sfctl:
+                    with self.assertRaisesRegex(ValueError, "ambiguous"):
+                        self.cluster.establish_baseline()
+                    sfctl.assert_not_called()
 
     def test_provisioned_versions_are_reused_before_first_submission(self):
         self.cluster.save(baseline="not-started")

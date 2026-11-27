@@ -36,15 +36,87 @@ pub(crate) struct GatewayFailureBody {
     pub(crate) diagnostic: String,
 }
 
+crate::native::lossless_enum! {
+    /// Naming::UserServiceState at native pin 3988b451.
+    enum NativeUserServiceState {
+        Invalid = 0,
+        None = 1,
+        Creating = 2,
+        Deleting = 3,
+        Created = 4,
+        Updating = 5,
+        ForceDeleting = 6,
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct NameExistsReplyBody {
     pub exists: bool,
-    _user_service_state: i64,
+    _user_service_state: NativeUserServiceState,
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{NameExistsReplyBody, NativeUserServiceState};
     use crate::{Error, NamingUri};
+
+    #[test]
+    fn name_exists_metadata_retains_known_and_unknown_signed_states() {
+        use NativeUserServiceState::*;
+
+        for (code, state) in [
+            (0, Invalid),
+            (1, None),
+            (2, Creating),
+            (3, Deleting),
+            (4, Created),
+            (5, Updating),
+            (6, ForceDeleting),
+            (7, Unrecognized(7)),
+            (-1, Unrecognized(-1)),
+            (i64::MIN, Unrecognized(i64::MIN)),
+            (i64::MAX, Unrecognized(i64::MAX)),
+        ] {
+            for exists in [false, true] {
+                let reply: NameExistsReplyBody = serde_json::from_value(serde_json::json!({
+                    "exists": exists,
+                    "_user_service_state": code,
+                }))
+                .unwrap();
+                assert_eq!(reply.exists, exists);
+                assert_eq!(reply._user_service_state, state);
+                assert_eq!(
+                    serde_json::to_value(reply._user_service_state).unwrap(),
+                    serde_json::json!(code)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn name_exists_metadata_still_requires_a_signed_integer_state() {
+        for state in [
+            serde_json::Value::Null,
+            serde_json::json!("Created"),
+            serde_json::json!(true),
+            serde_json::json!(4.5),
+            serde_json::json!(u64::MAX),
+        ] {
+            assert!(
+                serde_json::from_value::<NameExistsReplyBody>(serde_json::json!({
+                    "exists": true,
+                    "_user_service_state": state,
+                }))
+                .is_err()
+            );
+        }
+        assert!(
+            serde_json::from_value::<NameExistsReplyBody>(serde_json::json!({
+                "exists": true,
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn uri_rejects_every_unsupported_grammar_class() {

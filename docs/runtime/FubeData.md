@@ -764,6 +764,13 @@ requests 400 and unavailable authority/admission 503. Diagnostics distinguish
 engine and provider progress. These are development fixtures, not a secured
 production HTTP interface. The actual replication/copy transport is Fabric TCP.
 
+Replication probes keep the external `stale_epoch`, `wrong_sender`,
+`stale_copy_ack` and `wrong_target` labels and JSON receipts, but carry a private
+typed kind inside the engine. Unrecognized text remains subject to the original
+byte bound and owner/peer/epoch/sequence checks before kind rejection. All probe
+controls remain qualification-only; a receipt proves local socket acceptance,
+not peer parsing, membership changes, application ACK or progress.
+
 ## Native oracle and COM boundary
 
 Only [`native-replicator-oracle`](../../crates/samples/native-replicator-oracle)

@@ -9,9 +9,19 @@ use crate::{
     ServiceKind,
 };
 
+crate::native::strict_enum! {
+    /// Outgoing FABRIC_PARTITION_KEY_TYPE at native pin 3988b451, not a partition kind/scheme.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NativePartitionKeyType {
+        None = 1,
+        Int64 = 2,
+        String = 3,
+    }
+}
+
 #[derive(Serialize)]
 struct Key<'a> {
-    kind: i64,
+    kind: NativePartitionKeyType,
     integer: i64,
     name: &'a str,
     whole_service: bool,
@@ -47,19 +57,19 @@ impl Serialize for ResolutionRequest {
     ) -> std::result::Result<S::Ok, S::Error> {
         let key = match &self.key {
             PartitionKey::Singleton => Key {
-                kind: 1,
+                kind: NativePartitionKeyType::None,
                 integer: 0,
                 name: "",
                 whole_service: false,
             },
             PartitionKey::Int64(value) => Key {
-                kind: 2,
+                kind: NativePartitionKeyType::Int64,
                 integer: *value,
                 name: "",
                 whole_service: false,
             },
             PartitionKey::Named(value) => Key {
-                kind: 3,
+                kind: NativePartitionKeyType::String,
                 integer: 0,
                 name: value,
                 whole_service: false,
@@ -225,6 +235,37 @@ impl ResolveReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolution_key_json_preserves_key_type_payload_and_single_partition_scope() {
+        let name: NamingUri = "fabric:/App/Service".parse().unwrap();
+        for (key, kind, integer, string) in [
+            (PartitionKey::Singleton, 1, 0, ""),
+            (PartitionKey::Int64(i64::MIN), 2, i64::MIN, ""),
+            (PartitionKey::Int64(0), 2, 0, ""),
+            (PartitionKey::Int64(i64::MAX), 2, i64::MAX, ""),
+            (PartitionKey::Named("-42".into()), 3, 0, "-42"),
+            (
+                PartitionKey::Named("blue/green?key#part".into()),
+                3,
+                0,
+                "blue/green?key#part",
+            ),
+        ] {
+            let request = ResolutionRequest::new(&name, &key, None).unwrap();
+            let json = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                json["request"]["key"],
+                serde_json::json!({
+                    "kind": kind,
+                    "integer": integer,
+                    "name": string,
+                    "whole_service": false,
+                })
+            );
+        }
+    }
+
     #[test]
     fn opaque_roles_empty_and_invalid_identities() {
         let mut entry = TableEntry {

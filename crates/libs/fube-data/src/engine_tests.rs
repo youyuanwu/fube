@@ -232,6 +232,17 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
     let sp = Arc::new(Provider::default());
     let primary = engine(partition, 1, pp.clone());
     let secondary = engine(partition, 2, sp.clone());
+    let bounded_unknown = "x".repeat(32);
+    for kind in ["arbitrary", bounded_unknown.as_str()] {
+        assert!(matches!(
+            primary.qualification_probe(kind, None).await,
+            Err(Error::Closed)
+        ));
+    }
+    assert!(matches!(
+        primary.qualification_probe(&"x".repeat(33), None).await,
+        Err(Error::InvalidInput("probe kind bound"))
+    ));
     primary
         .change_role(EPOCH, ReplicaRole::Primary, cancel())
         .await
@@ -240,6 +251,12 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
         .update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
+    assert!(matches!(
+        primary.qualification_probe("arbitrary", None).await,
+        Err(Error::InvalidInput(
+            "probe requires native-selected live peer"
+        ))
+    ));
     secondary
         .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
@@ -274,16 +291,29 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
             .is_empty());
     }
     for kind in ["stale_copy_ack", "wrong_sender", "wrong_target"] {
-        secondary.qualification_probe(kind, Some(1)).await.unwrap();
+        let receipt = secondary.qualification_probe(kind, Some(1)).await.unwrap();
+        assert_eq!(receipt["kind"], kind);
+        assert_eq!(receipt["qualification_only"], true);
     }
-    assert!(primary
-        .qualification_probe("arbitrary", None)
-        .await
-        .is_err());
-    assert!(primary
-        .qualification_probe("stale_epoch", Some(99))
-        .await
-        .is_err());
+    for (node, kind) in [
+        (&primary, "arbitrary"),
+        (&primary, bounded_unknown.as_str()),
+        (&primary, "stale_copy_ack"),
+        (&secondary, "stale_epoch"),
+    ] {
+        assert!(matches!(
+            node.qualification_probe(kind, None).await,
+            Err(Error::InvalidInput("unsupported role/probe kind"))
+        ));
+    }
+    for kind in ["arbitrary", "stale_epoch"] {
+        assert!(matches!(
+            primary.qualification_probe(kind, Some(99)).await,
+            Err(Error::InvalidInput(
+                "probe requires native-selected live peer"
+            ))
+        ));
+    }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(primary.snapshot().progress, before.progress);
     assert_eq!(primary.snapshot().peers.len(), before.peers.len());

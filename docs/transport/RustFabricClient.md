@@ -123,7 +123,12 @@ the reply uses its native object schema. Nested unit values remain unsupported
 and empty structs retain native object framing.
 Gateway Actor, activity and protocol 1.1 remain method-owned native headers.
 NameExists sends the structured native NamingUri and requires NamingGateway's
-NameOperationReply. CreateName/DeleteName reuse the same checked URI and reply
+NameOperationReply. Its reply metadata uses a private, lossless
+`Naming::UserServiceState` enum (`Invalid=0` through `ForceDeleting=6`) with
+signed LONG64/numeric JSON encoding. Unrecognized signed codes remain accepted;
+the public result is still only the name-existence boolean, not service-state
+admission or a user-service query.
+CreateName/DeleteName reuse the same checked URI and reply
 envelope, but `FubstEncoder<NamingUri>` / `FubstDecoder<()>` requires zero success-body bytes.
 DeleteName adds native explicit-delete header `0x8033` with `true`; creation
 does not add that header. These writes use the same deadline, source/settlement
@@ -487,6 +492,11 @@ the selection and private native refresh metadata, never previous endpoints.
 Public edits to service/partition/version identity cannot rebind that metadata.
 Named keys reject empty/NUL values; native body byte/string widths, rather than
 the retired standalone 32768-unit construction ceiling, bound serialization.
+
+Outgoing key discriminators use a private `FABRIC_PARTITION_KEY_TYPE` domain:
+`None=1`, `Int64=2` and `String=3`, distinct from `PartitionKind` and partition
+schemes. Signed LONG64/numeric JSON encoding, inactive key fields and
+`whole_service=false` remain unchanged; no whole-service selection is enabled.
 
 Resolution uses a dedicated native `FubstEncoder<ResolutionRequest>` and `FubstDecoder<ResolveReply>`,
 not the query envelope. NamingGateway actor 5 and `ResolveServiceRequest` reply

@@ -840,9 +840,9 @@ impl Engine {
         kind: &str,
         target: Option<i64>,
     ) -> ServiceFuture<'_, serde_json::Value> {
-        let kind = kind.to_owned();
+        let kind = ProbeKind::from(kind);
         Box::pin(async move {
-            if kind.len() > 32 {
+            if kind.as_str().len() > 32 {
                 return Err(Error::InvalidInput("probe kind bound"));
             }
             timeout(self.settings.callback_timeout, async {
@@ -1467,11 +1467,47 @@ struct Submit {
     reply: Option<Reply<Replication>>,
 }
 
+#[cfg(feature = "qualification")]
+enum ProbeKind {
+    StaleEpoch,
+    WrongSender,
+    StaleCopyAck,
+    WrongTarget,
+    /// Retain unknown text so owner admission still precedes kind rejection.
+    Unrecognized(String),
+}
+
+#[cfg(feature = "qualification")]
+impl From<&str> for ProbeKind {
+    fn from(kind: &str) -> Self {
+        match kind {
+            "stale_epoch" => Self::StaleEpoch,
+            "wrong_sender" => Self::WrongSender,
+            "stale_copy_ack" => Self::StaleCopyAck,
+            "wrong_target" => Self::WrongTarget,
+            kind => Self::Unrecognized(kind.to_owned()),
+        }
+    }
+}
+
+#[cfg(feature = "qualification")]
+impl ProbeKind {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::StaleEpoch => "stale_epoch",
+            Self::WrongSender => "wrong_sender",
+            Self::StaleCopyAck => "stale_copy_ack",
+            Self::WrongTarget => "wrong_target",
+            Self::Unrecognized(kind) => kind,
+        }
+    }
+}
+
 enum Command {
     InitialProgress(Option<OwnedCallPermit>, InitialQuery, Reply<i64>),
     #[cfg(feature = "qualification")]
     Probe {
-        kind: String,
+        kind: ProbeKind,
         target: Option<i64>,
         reply: Reply<(
             serde_json::Value,
@@ -2762,7 +2798,7 @@ impl Owner {
     #[cfg(feature = "qualification")]
     fn qualification_probe(
         &self,
-        kind: &str,
+        kind: &ProbeKind,
         target: Option<i64>,
     ) -> Result<(
         serde_json::Value,
@@ -2803,7 +2839,7 @@ impl Owner {
         let mut destination = peer.clone();
         let mut sent_epoch = epoch;
         let body = match kind {
-            "stale_epoch" if primary => {
+            ProbeKind::StaleEpoch if primary => {
                 sent_epoch = if epoch.configuration_number >= 0x1_0000_0000 {
                     Epoch {
                         configuration_number: epoch.configuration_number - 0x1_0000_0000,
@@ -2836,7 +2872,7 @@ impl Owner {
                     completed: progress.completed,
                 }
             }
-            "wrong_sender" => {
+            ProbeKind::WrongSender => {
                 from.actor.incarnation = uuid::Uuid::new_v4();
                 if primary {
                     Body::RequestAck
@@ -2850,14 +2886,14 @@ impl Owner {
                     }
                 }
             }
-            "stale_copy_ack" if !primary => Body::Ack {
+            ProbeKind::StaleCopyAck if !primary => Body::Ack {
                 received: progress.received,
                 applied: progress.applied,
                 copy_received: 0,
                 copy_applied: 0,
                 error: 0,
             },
-            "wrong_target" => {
+            ProbeKind::WrongTarget => {
                 destination.actor.incarnation = uuid::Uuid::new_v4();
                 Body::RequestAck
             }
@@ -2877,7 +2913,7 @@ impl Owner {
         }
         let completion = result?;
         Ok((
-            serde_json::json!({"qualification_only":true,"kind":kind,
+            serde_json::json!({"qualification_only":true,"kind":kind.as_str(),
                 "from":from.to_string(),"target":destination.to_string(),"admission_only":false,
                 "native_selected_peer":peer.to_string(),"sequence":sequence,
                 "native_epoch":{"data_loss_number":epoch.data_loss_number,"configuration_number":epoch.configuration_number},
