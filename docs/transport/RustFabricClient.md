@@ -43,6 +43,15 @@ scenarios and independent report validators remain. Historical offline-wire
 coverage descriptions below refer to retired tests, not current qualification.
 The fubst and furpc crates retain their own codec/transport tests.
 
+Query envelopes and retained query results share a lossless native result-kind
+enum: `Invalid=0`, `Item=1`, `List=2`, plus unrecognized signed codes. Empty
+movement replies require the native `Invalid` default with null payload/paging.
+The client reuses its signed-i64 enum codec without a Core/runtime dependency.
+Payload and paging validation still precede native domain errors for lists/items;
+their expected-kind checks follow those errors, while empty movement replies
+validate their complete shape first. Non-wire model checks preserve these
+distinctions; they do not constitute new native onebox interoperability evidence.
+
 ## 1. What is implemented
 
 ### Separate furpc-backed client
